@@ -1,0 +1,1 @@
+https://github.com/openobserve/openobserve/archive/refs/heads/main.zip

@@ -1,0 +1,899 @@
+﻿<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<!-- eslint-disable vue/v-on-event-hyphenation -->
+<!-- eslint-disable vue/attribute-hyphenation -->
+<template>
+  <div data-test="function-list-page" class="flex h-full min-h-0 flex-col">
+    <OPageLayout
+      v-if="!showAddJSTransformDialog"
+      :title="t('function.header')"
+      icon="function"
+      :subtitle="t('function.subtitle')"
+      tabs-below
+      bleed
+    >
+      <template #header-tabs>
+        <PipelineSectionTabs />
+      </template>
+      <template #actions>
+        <OButton
+          variant="primary"
+          size="sm"
+          data-test="function-list-add-function-btn"
+          @click="showAddUpdateFn({})"
+        >
+          {{ t(`function.add`) }}
+        </OButton>
+      </template>
+      <div class="min-h-0 w-full flex-1 overflow-hidden">
+        <div class="h-full">
+          <OTable
+            ref="oTableRef"
+            :frame="false"
+            :data="visibleRows"
+            :columns="columns"
+            row-key="name"
+            :loading="loading"
+            :forbidden="forbidden"
+            pagination="client"
+            :current-page="currentPage"
+            @update:current-page="onPageChange"
+            :page-size="pageSize"
+            :page-size-options="pageSizeOptions"
+            selection="multiple"
+            v-model:selected-ids="selectedFunctionIds"
+            show-index
+            :show-global-filter="false"
+            :default-columns="false"
+            width="100%"
+            class="h-full w-full"
+          >
+            <template #toolbar>
+              <div class="flex w-full min-w-0 items-center gap-2 max-md:contents">
+                <OSearchInput
+                  data-test="functions-list-search-input"
+                  v-model="filterQuery"
+                  class="flex-1"
+                  :placeholder="t('function.search')"
+                />
+              </div>
+            </template>
+            <template #toolbar-trailing>
+              <ORefreshButton
+                layout="inline"
+                variant="outline"
+                :last-run-at="lastUpdatedAt"
+                :loading="fetching"
+                shortcut-id="functionsRefresh"
+                data-test="functions-list-refresh-btn"
+                @click="refreshJSTransforms"
+              />
+            </template>
+            <template #empty>
+              <OEmptyState
+                size="hero"
+                preset="no-functions"
+                :filtered="!!filterQuery"
+                @action="
+                  (id) => (id === 'clear-filters' ? (filterQuery = '') : showAddUpdateFn({}))
+                "
+              />
+            </template>
+
+            <template #cell-name="{ row, value }">
+              <span
+                class="text-text-body"
+                :data-test="`function-list-name-cell-${row?.name ?? value}`"
+                >{{ value }}</span
+              >
+            </template>
+
+            <!-- Language of the transform. Its own column (sortable + hideable)
+                   rather than a glyph on the name, so JS vs VRL reads at a glance. -->
+            <template #cell-transType="{ row }">
+              <OBadge
+                size="xs"
+                :variant="row?.transType === '1' ? 'amber-soft' : 'blue-soft'"
+                :data-test="`function-list-type-badge-${row?.transType === '1' ? 'js' : 'vrl'}`"
+              >
+                {{ row?.transType === "1" ? raw("JavaScript") : t("function.vrl") }}
+              </OBadge>
+            </template>
+
+            <template #cell-actions="{ row }">
+              <div class="actions-container flex items-center">
+                <OButton
+                  variant="ghost"
+                  size="icon-sm"
+                  :title="t('function.updateTitle')"
+                  data-test="function-list-edit-function-btn"
+                  data-row-action="edit"
+                  class="max-md:hidden"
+                  @click="showAddUpdateFn({ row })"
+                  icon-left="edit"
+                />
+                <OButton
+                  variant="ghost-destructive"
+                  size="icon-sm"
+                  :title="t('function.delete')"
+                  data-test="function-list-delete-function-btn"
+                  data-row-action="delete"
+                  class="max-md:hidden"
+                  @click="showDeleteDialogFn({ row })"
+                  icon-left="delete"
+                />
+                <OButton
+                  variant="ghost"
+                  size="icon-sm"
+                  icon-left="account-tree"
+                  :title="t('function.associatedPipelines')"
+                  data-row-action="view"
+                  class="max-md:hidden"
+                  @click="getAssociatedPipelines({ row })"
+                />
+                <ODropdown side="bottom" align="end">
+                  <template #trigger>
+                    <OButton
+                      icon-left="more-vert"
+                      variant="ghost"
+                      size="icon-xs-sq"
+                      class="md:hidden"
+                      data-test="function-list-row-more-actions"
+                      @click.stop
+                    />
+                  </template>
+                  <ODropdownItem
+                    icon-left="edit"
+                    class="md:hidden"
+                    data-test="function-list-edit-function-btn-menu"
+                    @select="showAddUpdateFn({ row })"
+                  >
+                    <span>{{ t("function.updateTitle") }}</span>
+                  </ODropdownItem>
+                  <ODropdownItem
+                    icon-left="delete"
+                    variant="destructive"
+                    class="md:hidden"
+                    data-test="function-list-delete-function-btn-menu"
+                    @select="showDeleteDialogFn({ row })"
+                  >
+                    <span>{{ t("function.delete") }}</span>
+                  </ODropdownItem>
+                  <ODropdownItem
+                    icon-left="account-tree"
+                    class="md:hidden"
+                    data-test="function-list-associated-pipelines-menu"
+                    @select="getAssociatedPipelines({ row })"
+                  >
+                    <span>{{ t("function.associatedPipelines") }}</span>
+                  </ODropdownItem>
+                </ODropdown>
+              </div>
+            </template>
+
+            <template #bottom>
+              <div class="flex w-full items-center justify-between py-2">
+                <div class="me-4 flex items-center text-xs font-normal max-md:hidden">
+                  {{ resultTotal }} {{ t("function.header") }}
+                </div>
+                <OButton
+                  v-if="selectedFunctions.length > 0"
+                  data-test="function-list-delete-functions-btn"
+                  variant="outline-destructive"
+                  size="sm"
+                  :loading="bulkDeleteLoading"
+                  @click="openBulkDeleteDialog"
+                  icon-left="delete"
+                >
+                  {{ t("common.delete") }}
+                </OButton>
+              </div>
+            </template>
+          </OTable>
+        </div>
+      </div>
+    </OPageLayout>
+    <div v-else class="min-h-0 flex-1">
+      <AddFunction
+        v-model="formData"
+        :isUpdated="isUpdated"
+        class="p-2"
+        @update:list="refreshList"
+        @cancel:hideform="hideForm"
+        @sendToAiChat="sendToAiChat"
+      />
+    </div>
+    <ConfirmDialog
+      :title="t('function.deleteTransformDialogTitle')"
+      :message="t('function.deleteTransformConfirmMessage')"
+      @update:ok="deleteFn"
+      @update:cancel="confirmDelete = false"
+      v-model="confirmDelete"
+    />
+
+    <ConfirmDialog
+      :title="t('function.deleteFunctionsDialogTitle')"
+      :message="t('functions.confirmDeleteFunctions', { count: selectedFunctions.length })"
+      @update:ok="bulkDeleteFunctions"
+      @update:cancel="confirmBulkDelete = false"
+      v-model="confirmBulkDelete"
+    />
+
+    <ODialog
+      data-test="function-list-force-delete-dialog"
+      v-model:open="confirmForceDelete"
+      persistent
+      size="md"
+      :title="t('common.pipelinesAssociatedWith', { name: selectedDelete?.name })"
+    >
+      <div v-if="transformedPipelineList.length > 0" class="max-h-50 overflow-y-auto">
+        <ul class="scrollable-list m-0 flex list-none flex-col p-0">
+          <li
+            v-for="(pipeline, index) in transformedPipelineList"
+            :key="pipeline.value"
+            @click="onPipelineSelect(pipeline)"
+            class="hover:bg-muted/50 flex cursor-pointer items-center px-3 py-2"
+            :data-test="`function-list-pipeline-item-${pipeline.value}`"
+          >
+            <span class="text-sm">{{ index + 1 }}. {{ pipeline.label }}</span>
+          </li>
+        </ul>
+      </div>
+      <div v-else>
+        <div class="text-center text-xl font-semibold">
+          {{ t("function.noPipelinesAssociated") }}
+        </div>
+      </div>
+    </ODialog>
+  </div>
+</template>
+
+<script lang="ts">
+import { defineAsyncComponent, defineComponent, ref, computed, watch } from "vue";
+import { useStore } from "vuex";
+import { useRouter } from "vue-router";
+import { useI18nTyped, raw } from "@/types/i18n";
+
+import OTable from "@/lib/core/Table/OTable.vue";
+import type { OTableColumnDef } from "@/lib/core/Table/OTable.types";
+import jsTransformService from "../../services/jstransform";
+import OEmptyState from "@/lib/core/EmptyState/OEmptyState.vue";
+import ConfirmDialog from "../ConfirmDialog.vue";
+import segment from "../../services/segment_analytics";
+import { getImageURL, verifyOrganizationStatus } from "../../utils/zincutils";
+import { useReo } from "@/services/reodotdev_analytics";
+import searchState from "@/composables/useLogs/searchState";
+import OButton from "@/lib/core/Button/OButton.vue";
+import OBadge from "@/lib/core/Badge/OBadge.vue";
+import ODialog from "@/lib/overlay/Dialog/ODialog.vue";
+import ODropdown from "@/lib/overlay/Dropdown/ODropdown.vue";
+import ODropdownItem from "@/lib/overlay/Dropdown/ODropdownItem.vue";
+import OSearchInput from "@/lib/forms/SearchInput/OSearchInput.vue";
+import OPageLayout from "@/lib/core/PageLayout/OPageLayout.vue";
+import PipelineSectionTabs from "@/components/pipeline/PipelineSectionTabs.vue";
+import ORefreshButton from "@/lib/core/RefreshButton/ORefreshButton.vue";
+import { toast } from "@/lib/feedback/Toast/useToast";
+import { useShortcuts } from "@/lib/vue-shortcut-manager";
+import { focusSearchInput, isInputFocused } from "@/utils/keyboardShortcuts";
+import { useMutation, useQuery } from "@tanstack/vue-query";
+import {
+  bulkDeleteFunctionsMutation,
+  deleteFunctionMutation,
+  functionsQuery,
+} from "@/services/jstransform.queries";
+import { useOrgId } from "@/composables/query/useOrgId";
+
+export default defineComponent({
+  name: "functionList",
+  components: {
+    OEmptyState,
+    OPageLayout,
+    PipelineSectionTabs,
+    OTable,
+    AddFunction: defineAsyncComponent(() => import("./AddFunction.vue")),
+    ConfirmDialog,
+    OButton,
+    OBadge,
+    ODialog,
+    ODropdown,
+    ODropdownItem,
+    OSearchInput,
+    ORefreshButton,
+  },
+  emits: [
+    "updated:fields",
+    "update:changeRecordPerPage",
+    "update:maxRecordToReturn",
+    "sendToAiChat",
+  ],
+  setup(props, { emit }) {
+    const store = useStore();
+    const { t } = useI18nTyped();
+    const router = useRouter();
+    const formData: any = ref({});
+    const showAddJSTransformDialog: any = ref(false);
+    const selectedDelete: any = ref(null);
+    const isUpdated: any = ref(false);
+    const confirmDelete = ref<boolean>(false);
+    const confirmForceDelete = ref<boolean>(false);
+    const confirmBulkDelete = ref<boolean>(false);
+    const bulkDeleteLoading = ref<boolean>(false);
+    const { searchObj } = searchState();
+    const pipelineList = ref([]);
+    const selectedPipeline = ref("");
+    const filterQuery = ref("");
+    const { track } = useReo();
+    const columns: OTableColumnDef[] = [
+      {
+        id: "name",
+        accessorKey: "name",
+        header: t("common.name"),
+        sortable: true,
+        meta: { align: "left", autoWidth: true },
+      },
+      {
+        id: "transType",
+        accessorKey: "transType",
+        header: t("common.type"),
+        sortable: true,
+        size: 120,
+        meta: { align: "left" },
+      },
+      {
+        id: "actions",
+        header: t("function.actions"),
+        isAction: true,
+        size: 150,
+        meta: { align: "center", cellClass: "actions-column", actionCount: 3 },
+      },
+    ];
+
+    const onPipelineSelect = (pipeline: any) => {
+      const routeUrl = router.resolve({
+        name: "pipelineEditor",
+        query: {
+          id: pipeline.value,
+          name: pipeline.label,
+          org_identifier: store.state.selectedOrganization.identifier,
+        },
+      }).href;
+
+      window.open(routeUrl, "_blank");
+    };
+
+    const orgId = useOrgId();
+
+    // Plain ref, not URL/store-backed: only the OTable v-if branch unmounts on add/edit, not FunctionList itself.
+    const currentPage = ref(1);
+    const onPageChange = (page: number) => {
+      currentPage.value = page;
+    };
+    const oTableRef: any = ref(null);
+    // setTimeout(0) is a macrotask, so it runs after TanStack's own deferred auto-reset-on-data-change (its own microtask queue), letting the restored page win.
+    const restorePageIndex = () => {
+      setTimeout(() => {
+        oTableRef.value?.table?.setPageIndex(currentPage.value - 1);
+      }, 0);
+    };
+
+    // The list is the query, not a copy of it. Anything that invalidates
+    // ["org", id, "functions"] — this page's writes, the two in the Logs search
+    // bar, the function form — repaints these rows with no wiring here.
+    // `Object.assign` rather than a spread: `queryOptions()` brands its key with
+    // the result type, and spreading into a fresh literal drops the brand (data
+    // degrades to `unknown`). Assigning onto the returned object keeps it.
+    const functions = useQuery(() =>
+      Object.assign(functionsQuery(orgId.value), { enabled: !!orgId.value }),
+    );
+
+    // TanStack's own distinction, bound straight to the two UI affordances:
+    // `isPending` is the cold read (OTable swaps in its skeleton), `isFetching`
+    // is any request in flight, including one with rows already on screen.
+    const loading = functions.isPending;
+    // A 403 lands in the query's error rather than a loader's catch, so derive the no-access state from it.
+    const forbidden = computed(() => {
+      const e: any = functions.error.value;
+      return e?.status === 403 || e?.response?.status === 403;
+    });
+    const fetching = functions.isFetching;
+    // Epoch ms of the last successful read — drives the button's "1m ago" label.
+    const lastUpdatedAt = functions.dataUpdatedAt;
+    // main restored the page inside the old chain's `.finally`; the query has no
+    // such hook, so the same restore rides the cold read settling instead.
+    watch(
+      loading,
+      (isLoading) => {
+        if (isLoading) return;
+        restorePageIndex();
+      },
+      { once: true },
+    );
+
+    const jsTransforms = computed(() =>
+      (functions.data.value ?? []).map((data: any) => ({
+        name: data.name,
+        function: data.function,
+        params: data.params,
+        transType: data.transType.toString(),
+        actions: "",
+      })),
+    );
+
+    // Was a manual `.catch` on every read. The query owns its own error now, so
+    // this fires once per failure however the read was triggered.
+    watch(functions.error, (err: any) => {
+      if (!err) return;
+      console.error("Error while pulling function", err);
+      if (err?.response?.status && err?.response?.status != 403) {
+        toast({
+          variant: "error",
+          message: t("toastMessages.functions.errorWhilePullingFunction"),
+        });
+      }
+    });
+
+    // Bridge for consumers still reading `searchObj.data.transforms`.
+    watch(jsTransforms, (rows) => (searchObj.data.transforms = rows), { immediate: true });
+
+    // The ?action= deep links open a dialog off the first non-empty result, so
+    // they are latched: a cached paint followed by a fresh one must not open it
+    // twice. Was folded into the row mapping, which ran on every paint.
+    let deepLinkOpened = false;
+    watch(
+      functions.data,
+      (list) => {
+        if (!list || deepLinkOpened) return;
+        const { action, name } = router.currentRoute.value.query;
+        if (action == "add") {
+          deepLinkOpened = true;
+          showAddUpdateFn({ row: undefined });
+        } else if (action == "update") {
+          const row = list.find((data: any) => data.name == name);
+          if (row) {
+            deepLinkOpened = true;
+            showAddUpdateFn({ row });
+          }
+        }
+      },
+      { immediate: true },
+    );
+
+    // Bound to the refresh button: always reaches the server.
+    const refreshJSTransforms = () => functions.refetch();
+
+    const resultTotal = ref<number>(0);
+    const pageSize = ref(20);
+    const pageSizeOptions = [20, 50, 100, 250, 500];
+
+    const selectedFunctionIds = ref<string[]>([]);
+    const selectedFunctions = computed({
+      get: () =>
+        (jsTransforms.value || []).filter((row: any) =>
+          selectedFunctionIds.value.includes(row.name),
+        ),
+      set: (val) => {
+        selectedFunctionIds.value = val.map((row: any) => row.name);
+      },
+    });
+
+    const addTransform = () => {
+      showAddJSTransformDialog.value = true;
+    };
+
+    const transformedPipelineList = computed(() => {
+      return pipelineList.value.map((pipeline: any) => ({
+        label: pipeline.name,
+        value: pipeline.id,
+      }));
+    });
+
+    const showAddUpdateFn = (props: any) => {
+      formData.value = props.row;
+      let action;
+      if (!props.row) {
+        isUpdated.value = false;
+        action = "Add Function";
+        router.push({
+          name: "functionList",
+          query: {
+            action: "add",
+            org_identifier: store.state.selectedOrganization.identifier,
+          },
+        });
+        track("Button Click", {
+          button: "Add Function",
+          page: "Functions",
+        });
+      } else {
+        isUpdated.value = true;
+        action = "Update Function";
+        router.push({
+          name: "functionList",
+          query: {
+            action: "update",
+            name: props.row.name,
+            org_identifier: store.state.selectedOrganization.identifier,
+          },
+        });
+        track("Button Click", {
+          button: "Update Function",
+          page: "Functions",
+        });
+      }
+      addTransform();
+
+      segment.track("Button Click", {
+        button: action,
+        user_org: store.state.selectedOrganization.identifier,
+        user_id: store.state.userInfo.email,
+        page: "Functions",
+      });
+    };
+
+    const refreshList = () => {
+      router.push({
+        name: "functionList",
+        query: {
+          org_identifier: store.state.selectedOrganization.identifier,
+        },
+      });
+      showAddJSTransformDialog.value = false;
+      // No reload call: the save mutation invalidated the scope, so the mounted
+      // query has already refetched.
+    };
+
+    const hideForm = () => {
+      showAddJSTransformDialog.value = false;
+      router.replace({
+        name: "functionList",
+        query: {
+          org_identifier: store.state.selectedOrganization.identifier,
+        },
+      });
+    };
+
+    const deleteFunction = useMutation(() => deleteFunctionMutation(orgId.value));
+
+    const deleteFn = () => {
+      deleteFunction
+        .mutateAsync(selectedDelete.value.name)
+        .then((res: any) => {
+          if (res.data.code == 200) {
+            toast({
+              variant: "success",
+              message: res.data.message,
+            });
+          } else {
+            toast({
+              variant: "error",
+              message: res.data.message,
+            });
+          }
+        })
+        .catch((err) => {
+          if (err.response.data.code == 409) {
+            toast({
+              variant: "error",
+              message: t("toastMessages.functions.functionDeletionAssociatedPipelines"),
+              timeout: 10000,
+              action: {
+                label: t("toastMessages.functions.view"),
+                handler: () => {
+                  forceRemoveFunction(err.response.data["message"]);
+                },
+              },
+            });
+            return;
+          }
+          if (err.response.status != 403) {
+            toast({
+              variant: "error",
+              message:
+                raw(JSON.stringify(err.response.data["message"])) ||
+                t("functions.functionDeletionFailed"),
+            });
+          }
+        });
+
+      segment.track("Button Click", {
+        button: "Delete Function",
+        user_org: store.state.selectedOrganization.identifier,
+        user_id: store.state.userInfo.email,
+        function_name: selectedDelete.value.name,
+        is_ingest_func: selectedDelete.value.ingest,
+        page: "Functions",
+      });
+    };
+
+    const showDeleteDialogFn = (props: any) => {
+      selectedDelete.value = props.row;
+      confirmDelete.value = true;
+    };
+
+    const getAssociatedPipelines = (props: any) => {
+      selectedDelete.value = props.row;
+      jsTransformService
+        .getAssociatedPipelines(store.state.selectedOrganization.identifier, props.row.name)
+        .then((res: any) => {
+          pipelineList.value = res.data.list;
+          confirmForceDelete.value = true;
+        })
+        .catch((err) => {
+          console.log(err);
+        });
+    };
+
+    const forceRemoveFunction = (message: any) => {
+      const match = message.match(/\[([^\]]+)\]/);
+      if (match) {
+        // Convert the matched string to an array of pipeline names
+        pipelineList.value = JSON.parse(match[0].replace(/'/g, '"'));
+      }
+
+      confirmForceDelete.value = true;
+    };
+
+    const closeDialog = () => {
+      confirmForceDelete.value = false;
+    };
+
+    const forceDeleteFn = () => {};
+
+    const sendToAiChat = (value: any) => {
+      emit("sendToAiChat", value);
+    };
+
+    const filterData = (rows: any, terms: any) => {
+      var filtered = [];
+      terms = terms.toLowerCase();
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i]["name"].toLowerCase().includes(terms)) {
+          filtered.push(rows[i]);
+        }
+      }
+      return filtered;
+    };
+
+    const visibleRows = computed(() => {
+      if (!filterQuery.value) return jsTransforms.value || [];
+      return filterData(jsTransforms.value || [], filterQuery.value);
+    });
+    const hasVisibleRows = computed(() => visibleRows.value.length > 0);
+
+    // Watch visibleRows to sync resultTotal with search filter
+    watch(
+      visibleRows,
+      (newVisibleRows) => {
+        resultTotal.value = newVisibleRows.length;
+      },
+      { immediate: true },
+    );
+
+    const openBulkDeleteDialog = () => {
+      confirmBulkDelete.value = true;
+    };
+
+    const bulkDelete = useMutation(() => bulkDeleteFunctionsMutation(orgId.value));
+
+    const bulkDeleteFunctions = async () => {
+      bulkDeleteLoading.value = true;
+      const dismiss = toast({
+        variant: "loading",
+        message: t("toastMessages.functions.deletingFunctions"),
+        timeout: 0,
+      });
+
+      try {
+        if (selectedFunctions.value.length === 0) {
+          toast({
+            variant: "error",
+            message: t("toastMessages.functions.noFunctionsSelectedForDeletion"),
+          });
+          dismiss();
+          return;
+        }
+
+        // Extract function names for the API call (BE supports names)
+        const payload = {
+          ids: selectedFunctions.value.map((f: any) => f.name),
+        };
+
+        const response = await bulkDelete.mutateAsync(payload.ids);
+
+        dismiss();
+
+        // Handle response based on successful/unsuccessful arrays
+        if (response.data) {
+          const { successful = [], unsuccessful = [] } = response.data;
+          const successCount = successful.length;
+          const failCount = unsuccessful.length;
+
+          if (failCount > 0 && successCount > 0) {
+            // Partial success
+            toast({
+              variant: "warning",
+              message: t("toastMessages.functions.functionsDeletedWithFailures", {
+                count: successCount,
+                failed: failCount,
+              }),
+              timeout: 5000,
+            });
+          } else if (failCount > 0) {
+            // All failed
+            toast({
+              variant: "error",
+              message: t("toastMessages.functions.failedToDeleteFunctions", { count: failCount }),
+            });
+          } else {
+            // All successful
+            toast({
+              variant: "success",
+              message: t("toastMessages.functions.functionsDeletedSuccessfully", {
+                count: successCount,
+              }),
+            });
+          }
+        } else {
+          // Fallback success message
+          toast({
+            variant: "success",
+            message: t("toastMessages.functions.functionsDeletedSuccessfully", {
+              count: selectedFunctions.value.length,
+            }),
+          });
+        }
+
+        selectedFunctions.value = [];
+      } catch (error: any) {
+        dismiss();
+        console.error("Error deleting functions:", error);
+
+        // Show error message from response if available
+        const errorMessage =
+          error.response?.data?.message ||
+          error?.message ||
+          t("functions.bulkDeleteFunctionsFailed");
+        if (error.response?.status != 403 || error?.status != 403) {
+          toast({
+            variant: "error",
+            message: errorMessage,
+          });
+        }
+      } finally {
+        bulkDeleteLoading.value = false;
+      }
+
+      confirmBulkDelete.value = false;
+    };
+
+    // ── Keyboard shortcuts ────────────────────────────────────────────────
+    useShortcuts([
+      {
+        id: "functionsAdd",
+        handler: () => {
+          if (!isInputFocused()) showAddUpdateFn({});
+        },
+      },
+      {
+        id: "functionsRefresh",
+        handler: () => {
+          if (!isInputFocused()) refreshJSTransforms();
+        },
+      },
+      {
+        id: "functionsFocusSearch",
+        handler: () => {
+          focusSearchInput("functions-list-search-input");
+        },
+      },
+    ]);
+    return {
+      t,
+      raw,
+      store,
+      router,
+      jsTransforms,
+      columns,
+      formData,
+      hideForm,
+      confirmDelete,
+      selectedDelete,
+      loading,
+      fetching,
+      lastUpdatedAt,
+      refreshJSTransforms,
+      forbidden,
+      resultTotal,
+      refreshList,
+      pageSize,
+      pageSizeOptions,
+      addTransform,
+      deleteFn,
+      isUpdated,
+      showAddUpdateFn,
+      showDeleteDialogFn,
+      showAddJSTransformDialog,
+      forceDeleteFn,
+      confirmForceDelete,
+      pipelineList,
+      selectedPipeline,
+      closeDialog,
+      onPipelineSelect,
+      transformedPipelineList,
+      getAssociatedPipelines,
+      filterQuery,
+      filterData,
+      getImageURL,
+      verifyOrganizationStatus,
+      sendToAiChat,
+      visibleRows,
+      hasVisibleRows,
+      openBulkDeleteDialog,
+      bulkDeleteFunctions,
+      bulkDeleteLoading,
+      confirmBulkDelete,
+      selectedFunctions,
+      selectedFunctionIds,
+      currentPage,
+      onPageChange,
+      oTableRef,
+      restorePageIndex,
+    };
+  },
+  computed: {
+    // selectedOrg() {
+    //   return this.store.state.selectedOrganization.identifier;
+    // },
+  },
+  watch: {
+    // selectedOrg(newVal: any, oldVal: any) {
+    //   this.verifyOrganizationStatus(
+    //     this.store.state.organizations,
+    //     this.router
+    //   );
+    //   if (
+    //     (newVal != oldVal || this.jsTransforms.value == undefined) &&
+    //     this.router.currentRoute.value.name == "AppFunctions"
+    //   ) {
+    //     this.resultTotal = 0;
+    //     this.jsTransforms = [];
+    //     this.getJSTransforms();
+    //   }
+    // },
+  },
+});
+</script>
+
+<style scoped>
+/* keep(scrollbar): custom webkit scrollbar for the function list */
+.scrollable-list::-webkit-scrollbar {
+  width: 0.5rem;
+}
+
+.scrollable-list::-webkit-scrollbar-thumb {
+  background-color: var(--color-border-strong);
+  border-radius: 0.25rem;
+}
+
+.scrollable-list::-webkit-scrollbar-thumb:hover {
+  background-color: var(--color-text-muted);
+}
+
+.scrollable-list::-webkit-scrollbar-track {
+  background-color: transparent;
+}
+</style>

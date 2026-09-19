@@ -1,0 +1,53 @@
+# Dependencies
+node_modules
+**/node_modules
+
+# Build outputs
+dist
+.next
+**/.next
+**/.next-pw
+.turbo
+**/.turbo
+target
+**/target
+**/*.node
+archestra-rs/sandbox-rs/index.js
+**/playwright-report
+**/tsconfig.tsbuildinfo
+
+# Local dotnet build outputs of the M-Files VAF Add On — the image build
+# compiles the add-on from source in its own stage and must never pick up a
+# stale locally-built package.
+integrations/m-files-vaf-add-on/bin
+integrations/m-files-vaf-add-on/obj
+
+# Development
+.tilt
+.env.local
+.env.*.local
+
+# Tests
+coverage
+# E2E suites run from the checkout and are never copied into the runtime image.
+e2e-tests
+**/*.test.ts
+**/*.test.tsx
+
+# Misc
+.DS_Store
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Git
+.git
+.gitignore

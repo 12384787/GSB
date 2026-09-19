@@ -1,0 +1,68 @@
+{-# LANGUAGE ApplicativeDo #-}
+{-# OPTIONS_GHC -Wno-unused-imports #-}
+
+module Lib.Types.GateInfo where
+
+import qualified Data.Map.Strict
+import qualified Data.OpenApi
+import qualified Kernel.Beam.Lib.UtilsTH
+import qualified Kernel.External.Maps
+import Kernel.Prelude
+import qualified Kernel.Types.Common
+import qualified Kernel.Types.Id
+import qualified Lib.Types.SpecialLocation
+import qualified Tools.Beam.UtilsTH
+
+data GateInfo = GateInfo
+  { address :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    canQueueUpOnGate :: Kernel.Prelude.Bool,
+    createdAt :: Kernel.Prelude.UTCTime,
+    defaultDemandThreshold :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    defaultDriverExtra :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    defaultMaxDriverThreshold :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    defaultMinDriverThreshold :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    demandThresholds :: Kernel.Prelude.Maybe (Data.Map.Strict.Map Kernel.Prelude.Text Kernel.Prelude.Int),
+    enableQueueFilter :: Kernel.Prelude.Maybe (Data.Map.Strict.Map Kernel.Prelude.Text Kernel.Prelude.Bool),
+    entryFeeAmount :: Kernel.Prelude.Maybe Kernel.Prelude.Double,
+    entryFeeDisabledServiceTiers :: Kernel.Prelude.Maybe [Kernel.Prelude.Text],
+    feeItems :: Kernel.Prelude.Maybe [Lib.Types.GateInfo.GateFeeItem],
+    gateConfig :: Kernel.Prelude.Maybe Lib.Types.GateInfo.GateConfig,
+    gateTags :: Kernel.Prelude.Maybe [Kernel.Prelude.Text],
+    gateType :: Lib.Types.GateInfo.GateType,
+    geomGeoJson :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    id :: Kernel.Types.Id.Id Lib.Types.GateInfo.GateInfo,
+    maxDriverThresholds :: Kernel.Prelude.Maybe (Data.Map.Strict.Map Kernel.Prelude.Text Kernel.Prelude.Int),
+    maxRideSkipsBeforeQueueRemoval :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    merchantId :: Kernel.Prelude.Maybe (Kernel.Types.Id.Id Lib.Types.SpecialLocation.Merchant),
+    merchantOperatingCityId :: Kernel.Prelude.Maybe (Kernel.Types.Id.Id Lib.Types.SpecialLocation.MerchantOperatingCity),
+    minBalanceRequired :: Kernel.Prelude.Maybe Kernel.Types.Common.HighPrecMoney,
+    minDriverThresholds :: Kernel.Prelude.Maybe (Data.Map.Strict.Map Kernel.Prelude.Text Kernel.Prelude.Int),
+    name :: Kernel.Prelude.Text,
+    navigationInstructions :: Kernel.Prelude.Maybe (Data.Map.Strict.Map Kernel.Prelude.Text Kernel.Prelude.Text),
+    notificationActiveTillInSec :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    notificationCooldownInSec :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    pickupRequestResponseTimeoutInSec :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    pickupZoneArrivalTimeoutInSec :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    point :: Kernel.External.Maps.LatLong,
+    specialLocationId :: Kernel.Types.Id.Id Lib.Types.SpecialLocation.SpecialLocation,
+    updatedAt :: Kernel.Prelude.UTCTime,
+    walkDescription :: Kernel.Prelude.Maybe Kernel.Prelude.Text
+  }
+  deriving (Generic, Show, Eq, FromJSON, ToJSON, ToSchema)
+
+data GateConfig = GateConfig {enableIsDemandHigh :: Kernel.Prelude.Maybe Kernel.Prelude.Bool, enablePerKmFare :: Kernel.Prelude.Maybe Kernel.Prelude.Bool}
+  deriving (Generic, Show, Eq, ToJSON, FromJSON, Data.OpenApi.ToSchema)
+
+data GateFeeCollectionType = CustomerFeeItem | DriverFeeItem deriving (Eq, Ord, Show, Read, Generic, ToJSON, FromJSON, ToSchema)
+
+data GateFeeItem = GateFeeItem {amountWithCurrency :: Kernel.Types.Common.PriceAPIEntity, collectionType :: Lib.Types.GateInfo.GateFeeCollectionType, itemName :: Lib.Types.GateInfo.GateFeeItemName}
+  deriving (Generic, Show, Eq, ToJSON, FromJSON, Data.OpenApi.ToSchema)
+
+data GateFeeItemName = GateFeeItemName {customer :: Kernel.Prelude.Maybe Kernel.Prelude.Text, driver :: Kernel.Prelude.Maybe Kernel.Prelude.Text}
+  deriving (Generic, Show, Eq, ToJSON, FromJSON, Data.OpenApi.ToSchema)
+
+data GateType = Pickup | Drop | Parking deriving (Eq, Ord, Show, Read, Generic, ToJSON, FromJSON, ToSchema)
+
+$(Tools.Beam.UtilsTH.mkBeamInstancesForEnumAndList ''GateFeeCollectionType)
+
+$(Tools.Beam.UtilsTH.mkBeamInstancesForEnumAndList ''GateType)

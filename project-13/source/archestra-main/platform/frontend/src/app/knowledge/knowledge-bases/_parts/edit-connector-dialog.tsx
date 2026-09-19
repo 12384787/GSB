@@ -1,0 +1,516 @@
+"use client";
+
+import {
+  type archestraApiTypes,
+  getConnectorNamePlaceholder,
+  type TextSearchLanguage,
+} from "@archestra/shared";
+import { useEffect, useRef, useState } from "react";
+import { type Path, useForm } from "react-hook-form";
+import { KnowledgeSourceVisibilitySelector } from "@/app/knowledge/_parts/knowledge-source-visibility-selector";
+import {
+  type ProfileLabel,
+  ProfileLabels,
+  type ProfileLabelsRef,
+} from "@/components/agent-labels";
+import { EnvironmentSelector } from "@/components/environment-selector";
+import { ExternalDocsLink } from "@/components/external-docs-link";
+import { TabbedDialogShell } from "@/components/tabbed-dialog-shell";
+import { Button } from "@/components/ui/button";
+import {
+  Form,
+  FormControl,
+  FormDescription,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form";
+import { Input } from "@/components/ui/input";
+import { SecretInput, SecretTextarea } from "@/components/ui/secret-input";
+import { Switch } from "@/components/ui/switch";
+import { useFeature } from "@/lib/config/config.query";
+import { useUpdateConnector } from "@/lib/knowledge/connector.query";
+import {
+  AdminApiKeyDescription,
+  AutoSyncCredentialRequirement,
+  autoSyncRequirementSlot,
+  ConnectorAdvancedConfigFields,
+  ConnectorInlineConfigFields,
+  connectorNeedsEmail,
+  connectorSupportsAdminApiKey,
+  connectorSupportsAutoSync,
+  getConnectorCredentialConfig,
+  getConnectorDocsUrl,
+  getConnectorTypeLabel,
+  getConnectorUrlConfig,
+  NotionAutoSyncPermissionsNote,
+} from "./connector-dialog-config";
+import { ConnectorTypeIcon } from "./connector-icons";
+import { PerforcePermissionSyncFields } from "./perforce-config-fields";
+import { PermissionSyncIntervalPicker } from "./permission-sync-interval-picker";
+import { SchedulePicker } from "./schedule-picker";
+import { TextSearchLanguagePicker } from "./text-search-language-picker";
+import { transformConfigArrayFields } from "./transform-config-array-fields";
+
+type ConnectorItem = Pick<
+  archestraApiTypes.GetConnectorsResponses["200"]["data"][number],
+  | "id"
+  | "name"
+  | "description"
+  | "visibility"
+  | "teamIds"
+  | "connectorType"
+  | "config"
+  | "schedule"
+  | "ftsLanguage"
+  | "permissionSyncIntervalSeconds"
+  | "enabled"
+  | "environmentId"
+> & {
+  labels?: archestraApiTypes.GetConnectorsResponses["200"]["data"][number]["labels"];
+};
+
+type EditConnectorFormValues = {
+  name: string;
+  description: string;
+  enabled: boolean;
+  config: Record<string, unknown>;
+  email: string;
+  apiToken: string;
+  adminApiKey: string;
+  schedule: string;
+  ftsLanguage: TextSearchLanguage;
+  permissionSyncIntervalSeconds: number;
+  environmentId: string | null;
+};
+
+function editableConnectorConfig(connector: ConnectorItem) {
+  if (
+    connector.connectorType === "mfiles" &&
+    typeof (connector.config as Record<string, unknown>).authMethod !== "string"
+  ) {
+    // Connectors created before OAuth support used password-derived MFWS
+    // tokens. Preserve that meaning when opening/saving the upgraded form.
+    return { ...connector.config, authMethod: "mfiles_password_token" };
+  }
+  return connector.config;
+}
+
+export function EditConnectorDialog({
+  connector,
+  open,
+  onOpenChange,
+}: {
+  connector: ConnectorItem;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const updateConnector = useUpdateConnector();
+  // Perforce permission sync needs the K8s orchestrator (in-cluster p4 pod).
+  const orchestratorK8sRuntime = useFeature("orchestratorK8sRuntime") ?? false;
+  const [visibility, setVisibility] = useState(connector.visibility);
+  const [teamIds, setTeamIds] = useState<string[]>(connector.teamIds);
+  const [labels, setLabels] = useState<ProfileLabel[]>(connector.labels ?? []);
+  const labelsRef = useRef<ProfileLabelsRef>(null);
+  const [activeSection, setActiveSection] = useState<"general" | "advanced">(
+    "general",
+  );
+
+  const form = useForm<EditConnectorFormValues>({
+    defaultValues: {
+      name: connector.name,
+      description: connector.description ?? "",
+      enabled: connector.enabled,
+      config: editableConnectorConfig(connector),
+      email: "",
+      apiToken: "",
+      adminApiKey: "",
+      schedule: connector.schedule,
+      ftsLanguage: connector.ftsLanguage,
+      permissionSyncIntervalSeconds: connector.permissionSyncIntervalSeconds,
+      environmentId: connector.environmentId ?? null,
+    },
+  });
+
+  useEffect(() => {
+    if (open) {
+      setActiveSection("general");
+      setVisibility(connector.visibility);
+      setTeamIds(connector.teamIds);
+      setLabels(connector.labels ?? []);
+      form.reset({
+        name: connector.name,
+        description: connector.description ?? "",
+        enabled: connector.enabled,
+        config: editableConnectorConfig(connector),
+        email: "",
+        apiToken: "",
+        adminApiKey: "",
+        schedule: connector.schedule,
+        ftsLanguage: connector.ftsLanguage,
+        permissionSyncIntervalSeconds: connector.permissionSyncIntervalSeconds,
+        environmentId: connector.environmentId ?? null,
+      });
+    }
+  }, [open, connector, form]);
+
+  const connectorType = connector.connectorType;
+  // Uploads-backed connectors have no credentials, schedule or config to edit,
+  // and the connectors list excludes them, so nothing can open this dialog for
+  // one. Bailing keeps that guarantee enforced rather than assumed — every
+  // config lookup below is keyed by a type this one has no entry for.
+  if (connectorType === "file_upload") {
+    return null;
+  }
+
+  const typeLabel = getConnectorTypeLabel(connectorType);
+  const connectorDocsUrl = getConnectorDocsUrl(connectorType);
+
+  const needsEmail = connectorNeedsEmail(connectorType);
+  const isCloud = form.watch("config.isCloud") as boolean | undefined;
+  const authMethod = form.watch("config.authMethod") as string | undefined;
+  const authMode = form.watch("config.authMode") as string | undefined;
+  // App-auth GitHub connectors inherit their host from the App config, so the
+  // connector's own URL field is hidden to avoid a misleading second host
+  const usesGithubApp =
+    connectorType === "github" &&
+    authMethod !== "pat" &&
+    authMethod !== undefined;
+  const urlConfig = usesGithubApp ? null : getConnectorUrlConfig(connectorType);
+  const emailRequired = needsEmail && isCloud !== false;
+  // Only the auto-sync visibility mirrors the source's access control, so the
+  // upstream-permission requirement is noise on any other visibility.
+  const autoSyncRequirement =
+    visibility === "auto-sync-permissions" ? (
+      <AutoSyncCredentialRequirement type={connectorType} />
+    ) : undefined;
+  // Sources whose credential is minted inside the customer's own workspace
+  // link to that workspace, taken from the URL field above.
+  const connectorInstanceUrl = form.watch("config.outlineUrl") as
+    | string
+    | undefined;
+  const requirementSlot = autoSyncRequirementSlot({
+    type: connectorType,
+    authMethod,
+    authMode,
+  });
+  const credentialRequirement =
+    requirementSlot === "credential" ? autoSyncRequirement : undefined;
+  const connectorFieldsRequirement =
+    requirementSlot === "connector-fields" ? autoSyncRequirement : undefined;
+  const permissionSyncRequirement =
+    requirementSlot === "permission-sync-fields"
+      ? autoSyncRequirement
+      : undefined;
+  const {
+    apiTokenHelpText,
+    apiTokenLabel,
+    apiTokenMultiline,
+    apiTokenPlaceholder,
+  } = getConnectorCredentialConfig({
+    type: connectorType,
+    emailRequired,
+    mode: "edit",
+    authMethod,
+    authMode,
+    autoSyncRequirementShown: Boolean(credentialRequirement),
+    instanceUrl: connectorInstanceUrl,
+  });
+
+  const handleSubmit = async (values: EditConnectorFormValues) => {
+    const finalLabels = labelsRef.current?.saveUnsavedLabel() ?? labels;
+    // Any single credential field can be updated alone — the backend merges
+    // the submitted fields over the stored secret, so pasting only the admin
+    // API key (or correcting only the email) must not be dropped just because
+    // the token field is left empty to keep the existing token.
+    const hasCredentials =
+      values.email.length > 0 ||
+      values.apiToken.length > 0 ||
+      values.adminApiKey.length > 0;
+    const result = await updateConnector.mutateAsync({
+      id: connector.id,
+      body: {
+        name: values.name,
+        description: values.description || null,
+        visibility,
+        teamIds: visibility === "team-scoped" ? teamIds : [],
+        enabled: values.enabled,
+        config: transformConfigArrayFields(
+          values.config,
+        ) as archestraApiTypes.CreateConnectorData["body"]["config"],
+        environmentId: values.environmentId,
+        schedule: values.schedule,
+        ftsLanguage: values.ftsLanguage,
+        ...(visibility === "auto-sync-permissions" && {
+          permissionSyncIntervalSeconds: values.permissionSyncIntervalSeconds,
+        }),
+        ...(hasCredentials && {
+          credentials: {
+            ...(values.email && { email: values.email }),
+            ...(values.apiToken && { apiToken: values.apiToken }),
+            ...(values.adminApiKey && { adminApiKey: values.adminApiKey }),
+          },
+        }),
+        labels: finalLabels,
+      },
+    });
+    if (result) {
+      onOpenChange(false);
+    }
+  };
+
+  return (
+    <TabbedDialogShell
+      open={open}
+      onOpenChange={onOpenChange}
+      title={`Edit ${typeLabel} Connector`}
+      description="Update the settings for this connector."
+      sidebarLabel={typeLabel}
+      sidebarDescription="Knowledge Connector"
+      sidebarIcon={
+        <ConnectorTypeIcon type={connectorType} className="h-4 w-4" />
+      }
+      activeSection={activeSection}
+      navItems={[
+        { id: "general", label: "General" },
+        { id: "advanced", label: "Advanced" },
+      ]}
+      onActiveSectionChange={setActiveSection}
+      onSubmit={form.handleSubmit(handleSubmit, () =>
+        setActiveSection("general"),
+      )}
+      wrapForm={(children) => <Form {...form}>{children}</Form>}
+      sidebarFooter={
+        <ExternalDocsLink href={connectorDocsUrl}>Learn more</ExternalDocsLink>
+      }
+      footer={
+        <>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+          >
+            Cancel
+          </Button>
+          <Button type="submit" disabled={updateConnector.isPending}>
+            {updateConnector.isPending ? "Saving..." : "Save Changes"}
+          </Button>
+        </>
+      }
+    >
+      <div hidden={activeSection !== "general"} className="space-y-4">
+        <FormField
+          control={form.control}
+          name="enabled"
+          render={({ field }) => (
+            <FormItem className="flex items-center justify-between rounded-lg border p-3">
+              <div>
+                <FormLabel className="text-sm font-medium">Enabled</FormLabel>
+                <FormDescription className="text-xs">
+                  When disabled, scheduled syncs will not run.
+                </FormDescription>
+              </div>
+              <FormControl>
+                <Switch
+                  checked={field.value}
+                  onCheckedChange={field.onChange}
+                />
+              </FormControl>
+            </FormItem>
+          )}
+        />
+
+        <FormField
+          control={form.control}
+          name="name"
+          rules={{ required: "Name is required" }}
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>Name</FormLabel>
+              <FormControl>
+                <Input
+                  placeholder={getConnectorNamePlaceholder(connectorType)}
+                  {...field}
+                />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+
+        <FormField
+          control={form.control}
+          name="description"
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>
+                Description{" "}
+                <span className="text-muted-foreground font-normal">
+                  (optional)
+                </span>
+              </FormLabel>
+              <FormControl>
+                <Input
+                  placeholder="A short description of this connector"
+                  {...field}
+                />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+
+        <FormField
+          control={form.control}
+          name="environmentId"
+          render={({ field }) => (
+            <EnvironmentSelector
+              value={field.value ?? null}
+              onChange={field.onChange}
+              resource="knowledgeSource"
+              helpText="The environment this connector belongs to, controlling which gateways and agents can use its knowledge."
+            />
+          )}
+        />
+
+        <KnowledgeSourceVisibilitySelector
+          visibility={visibility}
+          onVisibilityChange={setVisibility}
+          teamIds={teamIds}
+          onTeamIdsChange={setTeamIds}
+          showTeamRequired
+          supportsAutoSync={connectorSupportsAutoSync(
+            connectorType,
+            orchestratorK8sRuntime,
+          )}
+          autoSyncPermissionAction="update"
+        />
+
+        {visibility === "auto-sync-permissions" &&
+          connectorType === "notion" && <NotionAutoSyncPermissionsNote />}
+
+        <div className="border-t" />
+
+        {urlConfig && (
+          <FormField
+            control={form.control}
+            name={urlConfig.fieldName as Path<EditConnectorFormValues>}
+            rules={{ required: `${urlConfig.label} is required` }}
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{urlConfig.label}</FormLabel>
+                <FormDescription>{urlConfig.description}</FormDescription>
+                <FormControl>
+                  <Input
+                    placeholder={urlConfig.placeholder}
+                    {...field}
+                    value={(field.value as string) ?? ""}
+                  />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+        )}
+
+        <ConnectorInlineConfigFields
+          connectorType={connectorType}
+          form={form}
+          mode="edit"
+          emailRequired={emailRequired}
+          autoSyncRequirement={connectorFieldsRequirement}
+        />
+
+        {Boolean(apiTokenLabel) && (
+          <FormField
+            control={form.control}
+            name="apiToken"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{apiTokenLabel}</FormLabel>
+                <FormDescription>
+                  <span>
+                    Leave empty to keep existing credentials unchanged.
+                  </span>{" "}
+                  {apiTokenHelpText ? <span>{apiTokenHelpText}</span> : null}{" "}
+                  {credentialRequirement}
+                </FormDescription>
+                <FormControl>
+                  {apiTokenMultiline ? (
+                    <SecretTextarea
+                      placeholder={apiTokenPlaceholder}
+                      rows={5}
+                      {...field}
+                    />
+                  ) : (
+                    <SecretInput placeholder={apiTokenPlaceholder} {...field} />
+                  )}
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+        )}
+
+        {visibility === "auto-sync-permissions" &&
+          connectorSupportsAdminApiKey(connectorType) && (
+            <FormField
+              control={form.control}
+              name="adminApiKey"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Organization admin API key (optional)</FormLabel>
+                  <FormDescription>
+                    <AdminApiKeyDescription type={connectorType} /> Leave empty
+                    to keep the existing key.
+                  </FormDescription>
+                  <FormControl>
+                    <SecretInput
+                      placeholder="Atlassian organization admin API key"
+                      {...field}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          )}
+
+        {visibility === "auto-sync-permissions" &&
+          connectorType === "perforce" && (
+            <PerforcePermissionSyncFields
+              form={form}
+              mode="edit"
+              adminCredentialDescription={permissionSyncRequirement}
+            />
+          )}
+      </div>
+      <div hidden={activeSection !== "advanced"} className="space-y-4">
+        <SchedulePicker
+          form={form}
+          name="schedule"
+          connectorTypeLabel={typeLabel}
+        />
+        {visibility === "auto-sync-permissions" && (
+          <PermissionSyncIntervalPicker
+            form={form}
+            name="permissionSyncIntervalSeconds"
+            connectorTypeLabel={typeLabel}
+          />
+        )}
+        <TextSearchLanguagePicker form={form} name="ftsLanguage" />
+        <ConnectorAdvancedConfigFields
+          connectorType={connectorType}
+          form={form}
+          mode="edit"
+        />
+        <ProfileLabels
+          ref={labelsRef}
+          labels={labels}
+          onLabelsChange={setLabels}
+        />
+      </div>
+    </TabbedDialogShell>
+  );
+}

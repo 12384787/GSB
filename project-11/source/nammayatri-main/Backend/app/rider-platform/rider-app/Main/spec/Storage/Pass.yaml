@@ -1,0 +1,100 @@
+imports:
+  Merchant: Domain.Types.Merchant
+  MerchantOperatingCity: Domain.Types.MerchantOperatingCity
+  PassType: Domain.Types.PassType
+  HighPrecMoney: Kernel.Types.Common
+  FRFSVehicleServiceTier: Domain.Types.FRFSVehicleServiceTier
+  Value: Data.Aeson
+  ServiceTierType: BecknV2.FRFS.Enums
+  VehicleCategory: BecknV2.FRFS.Enums
+
+Pass:
+  tableName: pass
+
+  types:
+    PassDocumentType:
+      enum: "ProfilePicture,Aadhaar"
+      derive': "Show, Eq, Ord, Read, Generic, ToJSON, FromJSON, ToSchema, ToParamSchema"
+
+    PassConfig:
+      maxSwitchCount: Int
+      derive': "Show, Eq, Ord, Read, Generic, ToJSON, FromJSON, ToSchema"
+
+    Benefit:
+      enum: "FullSaving,FixedSaving HighPrecMoney,PercentageSaving HighPrecMoney"
+      derive': "Show, Eq, Ord, Read, Generic, ToJSON, FromJSON, ToSchema"
+
+  domainInstance:
+    - Custom Kernel.Beam.Lib.UtilsTH.mkBeamInstancesForEnumAndList <PassDocumentType>
+    - Custom Kernel.Utils.TH.mkFromHttpInstanceForEnum <PassDocumentType>
+    - Custom Kernel.Beam.Lib.UtilsTH.mkBeamInstancesForEnumAndList <Benefit>
+    - Custom Kernel.Utils.TH.mkFromHttpInstanceForEnum <Benefit>
+
+  fields:
+    id: Id Pass
+    passTypeId: Id PassType
+    code: Text
+    name: Maybe Text
+    description: Maybe Text
+    amount: HighPrecMoney
+    benefitDescription: Text
+    benefit: Maybe Benefit
+    applicableVehicleServiceTiers: "[ServiceTierType]"
+    vehicleType: VehicleCategory
+    purchaseEligibilityJsonLogic: "[Value]"
+    redeemEligibilityJsonLogic: "[Value]"
+    pricingTiers: Maybe Value
+    maxValidTrips: Maybe Int
+    maxValidDays: Maybe Int
+    verificationValidity: Seconds
+    documentsRequired: "[PassDocumentType]"
+    frfsPriceOverrideApplicable: Maybe Bool
+    frfsCancelLimit: Maybe Int
+    order: Int
+    enable: Bool
+    autoApply: Bool
+    merchantId: Id Merchant
+    merchantOperatingCityId: Id MerchantOperatingCity
+    passConfig: Maybe PassConfig
+    minFare: Maybe HighPrecMoney
+    maxFare: Maybe HighPrecMoney
+    formVerificationConfig: Maybe Value
+    overrideBenefitConfigJson: Maybe Value
+    minTripsAllowingOverlap: Maybe Int
+    minDaysToSuggestRenewal: Maybe Int
+    timeOverlappingFrfsBookingsLimit: Maybe Int
+
+  beamFields:
+    passConfig:
+      maxSwitchCount: Maybe Int
+
+  beamType:
+    vehicleType: Maybe VehicleCategory
+    verificationValidity: Maybe Seconds
+    maxSwitchCount: Maybe Int
+
+  fromTType:
+    vehicleType: Kernel.Prelude.fromMaybe BecknV2.FRFS.Enums.BUS|I
+    verificationValidity: Kernel.Prelude.fromMaybe 9000|I
+    passConfig: (Domain.Types.Pass.PassConfig <$> maxSwitchCount)|E
+
+  toTType:
+    vehicleType: Kernel.Prelude.Just|I
+    verificationValidity: Kernel.Prelude.Just|I
+    maxSwitchCount: ((.maxSwitchCount) <$> passConfig)|E
+
+  constraints:
+    id: PrimaryKey
+    passTypeId: "!SecondaryKey"
+
+  sqlType:
+    applicableVehicleServiceTiers: text[]
+    documentsRequired: text[]
+    purchaseEligibilityJsonLogic: jsonb[]
+    redeemEligibilityJsonLogic: jsonb[]
+    pricingTiers: jsonb
+    formVerificationConfig: jsonb
+    overrideBenefitConfigJson: jsonb
+
+  extraOperations:
+    - EXTRA_QUERY_FILE

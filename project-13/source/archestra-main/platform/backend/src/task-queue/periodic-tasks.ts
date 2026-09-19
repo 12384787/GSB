@@ -1,0 +1,95 @@
+import config from "@/config";
+import type { TaskType } from "@/types";
+
+type PeriodicTaskDefinition = {
+  taskType: TaskType;
+  intervalSeconds: number;
+  payload: Record<string, unknown>;
+};
+
+const PERIODIC_TASK_DEFINITIONS: PeriodicTaskDefinition[] = [
+  // Runs every 30s (not 60): besides enqueuing due syncs, this task drives
+  // connector-run recovery — reaping expired leases, reconciling statuses, and
+  // sweeping stalled embeddings — so its cadence is the quantization on how fast
+  // a crashed or stalled sync is picked back up.
+  { taskType: "check_due_connectors", intervalSeconds: 30, payload: {} },
+  // Drives the runtime-isolated permission-sync family: enqueues due
+  // permission_sync tasks per the global schedule and reaps expired permission
+  // runs. Kept separate from check_due_connectors so content-run recovery is
+  // never overloaded with permission concerns.
+  {
+    taskType: "check_due_permission_syncs",
+    intervalSeconds: 30,
+    payload: {},
+  },
+  {
+    taskType: "check_due_schedule_triggers",
+    intervalSeconds: 60,
+    payload: {},
+  },
+  {
+    taskType: "check_due_openappa_github_syncs",
+    intervalSeconds: 60,
+    payload: {},
+  },
+  // Enqueues skill_github_sync for GitHub-synced skills whose per-skill
+  // interval (15m/1h/1d) has elapsed. 60s tick keeps the finest interval
+  // within a minute of schedule.
+  {
+    taskType: "check_due_skill_github_syncs",
+    intervalSeconds: 60,
+    payload: {},
+  },
+  {
+    taskType: "check_due_plugin_github_syncs",
+    intervalSeconds: 60,
+    payload: {},
+  },
+  // Converges the Perforce permission-sync shims on the connectors that want
+  // one. Every surface that changes that answer already reconciles inside its
+  // own request, so this is the backstop for the calls those lose to a crash
+  // or a network partition — not the mechanism. Hence 5 minutes: a pod nobody
+  // claims is worth removing promptly, not urgently, and the work is one list
+  // call plus a couple per Perforce connector.
+  { taskType: "p4_shim_reconcile", intervalSeconds: 300, payload: {} },
+  { taskType: "audit_log_cleanup", intervalSeconds: 86400, payload: {} },
+  // Rebuilds the portable BM25 corpus statistics (document frequency, chunk
+  // count, mean chunk length) the keyword ranker scores from. A read-only
+  // scan of kb_chunks, and a long interval is safe: stale statistics shift
+  // scores slightly rather than making them wrong. Until the first rebuild
+  // (or for a language first indexed since the last one) keyword search
+  // ranks with ts_rank; Knowledge settings shows where this stands.
+  {
+    taskType: "kb_bm25_stats_refresh",
+    intervalSeconds: config.kb.bm25StatsRefreshIntervalSeconds,
+    payload: {},
+  },
+  // Enterprise data-retention sweep over interactions, mcp_tool_calls, and
+  // conversations. A fast no-op while every retention window is disabled.
+  {
+    taskType: "content_retention_cleanup",
+    intervalSeconds: 86400,
+    payload: {},
+  },
+  // Enterprise content-encryption backfill/rotation sweep. O(1) no-op once
+  // complete (and when the feature is disabled); a 10-minute tick keeps a
+  // large backlog progressing without a long-lived task.
+  {
+    taskType: "content_encryption_backfill",
+    intervalSeconds: 600,
+    payload: {},
+  },
+  // Digests skills and skill files written before migration 0407 so the MCP
+  // gateway can publish them — it withholds an undigested row rather than
+  // serving it unverifiable, and the listing query filters those rows out
+  // entirely, so an undigested row is invisible until this repairs it. A tick
+  // rather than a boot-only run: a failed pass must not leave the catalog
+  // withheld until someone restarts the worker. O(1) no-op once complete.
+  {
+    taskType: "skill_publication_backfill",
+    intervalSeconds: 600,
+    payload: {},
+  },
+];
+
+export default PERIODIC_TASK_DEFINITIONS;

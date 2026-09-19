@@ -1,0 +1,3583 @@
+import {
+  APP_RECORDING_DEFAULT_MAX_FINAL_CUT_MS,
+  isValidK8sCpuQuantity,
+  isValidK8sMemoryQuantity,
+} from "@archestra/shared";
+import { vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  test,
+} from "@/test";
+import config, {
+  betaFeatureEnabled,
+  deriveOllamaNativeBaseUrl,
+  getAnalyticsConfig,
+  getAppAssetBaseOrigin,
+  getCorsOrigins,
+  getDatabaseUrl,
+  getMCPGatewayOauthAllowedPublicHosts,
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  getMcpImagePrepullConfig,
+  // SPDX-SnippetEnd
+  getOtelExporterOtlpEndpoint,
+  getOtelExporterOtlpLogEndpoint,
+  getOtlpAuthHeaders,
+  getRumOtlpAuthHeaders,
+  getTrustedOrigins,
+  isCodeRuntimeEnabled,
+  k8sMemoryQuantityToBytes,
+  parseActiveChatRunPollIntervalMs,
+  parseActiveUsersRefreshIntervalMs,
+  parseAnthropicWifConfig,
+  parseBodyLimit,
+  parseChatMaxOutputTokens,
+  parseChatRateMeteredMaxOutputTokens,
+  parseClampedFloat,
+  parseClampedInt,
+  parseClampedIntOrZero,
+  parseCodeRuntimeDaggerRunnerHost,
+  parseCommaSeparatedList,
+  parseConnectorSyncMaxDuration,
+  parseContentMaxLength,
+  parseDatabasePoolMax,
+  parseDatabaseStatementTimeoutMillis,
+  parseEngineDeniedCidrs,
+  parseFileStorageFilesystemRoot,
+  parseFileStorageProvider,
+  parseFileStorageS3Config,
+  parseFrontendBaseUrl,
+  parseHackathonGalleryRepo,
+  parseHackathonRecorderEnabled,
+  parseHackathonRecorderMaxFinalCutMs,
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  parseHelmReleaseName,
+  // SPDX-SnippetEnd
+  parseK8sResourceQuantity,
+  parseKeepAliveTimeoutMs,
+  parseLlmProxyPlugins,
+  parseLogFormat,
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  parseMcpIdleHibernationSeconds,
+  // SPDX-SnippetEnd
+  parseMetricsPort,
+  parseNonNegativeInt,
+  parseOpenAppaConfig,
+  parseOptionalPort,
+  parseOtelCaptureContent,
+  parseProcessType,
+  parseRefreshTokenReuseGraceSeconds,
+  parseRetentionDays,
+  parseSampleRate,
+  parseSandboxMemoryMaxBytes,
+  parseTrustProxy,
+  parseVirtualKeyDefaultExpiration,
+  resolveRenderBaseUrl,
+} from "./config";
+
+// Mock the logger
+vi.mock("./logging", () => ({
+  __esModule: true,
+  default: {
+    warn: vi.fn(),
+    info: vi.fn(),
+    error: vi.fn(),
+  },
+}));
+
+import logger from "./logging";
+
+describe("getAnalyticsConfig", () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    delete process.env.ARCHESTRA_ANALYTICS;
+    delete process.env.ARCHESTRA_ANALYTICS_POSTHOG_KEY;
+    delete process.env.ARCHESTRA_ANALYTICS_POSTHOG_HOST;
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  test("uses the default PostHog analytics config, enabled in production", () => {
+    process.env.NODE_ENV = "production";
+
+    expect(getAnalyticsConfig()).toEqual({
+      enabled: true,
+      posthog: {
+        key: expect.stringMatching(/^phc_/),
+        host: "https://eu.i.posthog.com",
+      },
+    });
+  });
+
+  test("defaults to disabled outside production", () => {
+    process.env.NODE_ENV = "development";
+
+    expect(getAnalyticsConfig().enabled).toBe(false);
+  });
+
+  test("explicit ARCHESTRA_ANALYTICS=enabled wins outside production", () => {
+    process.env.NODE_ENV = "development";
+    process.env.ARCHESTRA_ANALYTICS = "enabled";
+
+    expect(getAnalyticsConfig().enabled).toBe(true);
+  });
+
+  test("explicit ARCHESTRA_ANALYTICS=disabled wins in production", () => {
+    process.env.NODE_ENV = "production";
+    process.env.ARCHESTRA_ANALYTICS = "disabled";
+
+    expect(getAnalyticsConfig().enabled).toBe(false);
+  });
+
+  test("uses custom PostHog analytics env vars", () => {
+    process.env.ARCHESTRA_ANALYTICS = "disabled";
+    process.env.ARCHESTRA_ANALYTICS_POSTHOG_KEY = " ph_custom ";
+    process.env.ARCHESTRA_ANALYTICS_POSTHOG_HOST =
+      " https://posthog.example.com ";
+
+    expect(getAnalyticsConfig()).toEqual({
+      enabled: false,
+      posthog: {
+        key: "ph_custom",
+        host: "https://posthog.example.com",
+      },
+    });
+  });
+});
+
+describe("getDatabaseUrl", () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    // Create a fresh copy of process.env for each test
+    process.env = { ...originalEnv };
+  });
+
+  afterEach(() => {
+    // Restore the original environment
+    process.env = originalEnv;
+  });
+
+  test("should use ARCHESTRA_DATABASE_URL when both ARCHESTRA_DATABASE_URL and DATABASE_URL are set", () => {
+    process.env.ARCHESTRA_DATABASE_URL =
+      "postgresql://archestra:pass@host:5432/archestra_db";
+    process.env.DATABASE_URL = "postgresql://other:pass@host:5432/other_db";
+
+    const result = getDatabaseUrl();
+
+    expect(result).toBe("postgresql://archestra:pass@host:5432/archestra_db");
+  });
+
+  test("should use DATABASE_URL when only DATABASE_URL is set", () => {
+    delete process.env.ARCHESTRA_DATABASE_URL;
+    process.env.DATABASE_URL = "postgresql://other:pass@host:5432/other_db";
+
+    const result = getDatabaseUrl();
+
+    expect(result).toBe("postgresql://other:pass@host:5432/other_db");
+  });
+
+  test("should use ARCHESTRA_DATABASE_URL when only ARCHESTRA_DATABASE_URL is set", () => {
+    process.env.ARCHESTRA_DATABASE_URL =
+      "postgresql://archestra:pass@host:5432/archestra_db";
+    delete process.env.DATABASE_URL;
+
+    const result = getDatabaseUrl();
+
+    expect(result).toBe("postgresql://archestra:pass@host:5432/archestra_db");
+  });
+
+  test("should throw an error when neither ARCHESTRA_DATABASE_URL nor DATABASE_URL is set", () => {
+    delete process.env.ARCHESTRA_DATABASE_URL;
+    delete process.env.DATABASE_URL;
+
+    expect(() => getDatabaseUrl()).toThrow(
+      "Database URL is not set. Please set ARCHESTRA_DATABASE_URL or DATABASE_URL",
+    );
+  });
+
+  test("should throw an error when both are empty strings", () => {
+    process.env.ARCHESTRA_DATABASE_URL = "";
+    process.env.DATABASE_URL = "";
+
+    expect(() => getDatabaseUrl()).toThrow(
+      "Database URL is not set. Please set ARCHESTRA_DATABASE_URL or DATABASE_URL",
+    );
+  });
+
+  test("should use DATABASE_URL when ARCHESTRA_DATABASE_URL is empty string", () => {
+    process.env.ARCHESTRA_DATABASE_URL = "";
+    process.env.DATABASE_URL = "postgresql://other:pass@host:5432/other_db";
+
+    const result = getDatabaseUrl();
+
+    expect(result).toBe("postgresql://other:pass@host:5432/other_db");
+  });
+});
+
+describe("getOtlpAuthHeaders", () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    // Create a fresh copy of process.env for each test
+    process.env = { ...originalEnv };
+    // Clear mock calls
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    // Restore the original environment
+    process.env = originalEnv;
+  });
+
+  describe("Bearer token authentication", () => {
+    test("should return Bearer authorization header when bearer token is provided", () => {
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_BEARER = "my-bearer-token";
+
+      const result = getOtlpAuthHeaders();
+
+      expect(result).toEqual({
+        Authorization: "Bearer my-bearer-token",
+      });
+    });
+
+    test("should prioritize bearer token over basic auth when both are provided", () => {
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_BEARER = "my-bearer-token";
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_USERNAME = "user";
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_PASSWORD = "pass";
+
+      const result = getOtlpAuthHeaders();
+
+      expect(result).toEqual({
+        Authorization: "Bearer my-bearer-token",
+      });
+    });
+
+    test("should trim whitespace from bearer token", () => {
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_BEARER =
+        "  my-bearer-token  ";
+
+      const result = getOtlpAuthHeaders();
+
+      expect(result).toEqual({
+        Authorization: "Bearer my-bearer-token",
+      });
+    });
+  });
+
+  describe("Basic authentication", () => {
+    test("should return Basic authorization header when both username and password are provided", () => {
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_USERNAME = "testuser";
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_PASSWORD = "testpass";
+
+      const result = getOtlpAuthHeaders();
+
+      // testuser:testpass in base64 is dGVzdHVzZXI6dGVzdHBhc3M=
+      expect(result).toEqual({
+        Authorization: "Basic dGVzdHVzZXI6dGVzdHBhc3M=",
+      });
+    });
+
+    test("should trim whitespace from username and password", () => {
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_USERNAME = "  testuser  ";
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_PASSWORD = "  testpass  ";
+
+      const result = getOtlpAuthHeaders();
+
+      expect(result).toEqual({
+        Authorization: "Basic dGVzdHVzZXI6dGVzdHBhc3M=",
+      });
+    });
+
+    test("should return undefined and warn when only username is provided", () => {
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_USERNAME = "testuser";
+      delete process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_PASSWORD;
+
+      const result = getOtlpAuthHeaders();
+
+      expect(result).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        "OTEL authentication misconfigured: both ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_USERNAME and ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_PASSWORD must be provided for basic auth",
+      );
+    });
+
+    test("should return undefined and warn when only password is provided", () => {
+      delete process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_USERNAME;
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_PASSWORD = "testpass";
+
+      const result = getOtlpAuthHeaders();
+
+      expect(result).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        "OTEL authentication misconfigured: both ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_USERNAME and ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_PASSWORD must be provided for basic auth",
+      );
+    });
+
+    test("should return undefined and warn when username is empty string", () => {
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_USERNAME = "";
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_PASSWORD = "testpass";
+
+      const result = getOtlpAuthHeaders();
+
+      expect(result).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        "OTEL authentication misconfigured: both ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_USERNAME and ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_PASSWORD must be provided for basic auth",
+      );
+    });
+
+    test("should return undefined and warn when password is empty string", () => {
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_USERNAME = "testuser";
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_PASSWORD = "";
+
+      const result = getOtlpAuthHeaders();
+
+      expect(result).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        "OTEL authentication misconfigured: both ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_USERNAME and ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_PASSWORD must be provided for basic auth",
+      );
+    });
+  });
+
+  describe("No authentication", () => {
+    test("should return undefined when no authentication environment variables are set", () => {
+      delete process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_BEARER;
+      delete process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_USERNAME;
+      delete process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_PASSWORD;
+
+      const result = getOtlpAuthHeaders();
+
+      expect(result).toBeUndefined();
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+
+    test("should return undefined when all authentication variables are empty strings", () => {
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_BEARER = "";
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_USERNAME = "";
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_PASSWORD = "";
+
+      const result = getOtlpAuthHeaders();
+
+      expect(result).toBeUndefined();
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe("getRumOtlpAuthHeaders", () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  test("reads the RUM-prefixed variables, not the OTEL ones", () => {
+    process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_AUTH_BEARER = "otel-token";
+    delete process.env.ARCHESTRA_RUM_EXPORTER_OTLP_AUTH_BEARER;
+
+    expect(getRumOtlpAuthHeaders()).toBeUndefined();
+
+    process.env.ARCHESTRA_RUM_EXPORTER_OTLP_AUTH_BEARER = "rum-token";
+
+    expect(getRumOtlpAuthHeaders()).toEqual({
+      Authorization: "Bearer rum-token",
+    });
+  });
+
+  test("supports basic auth and warns on a partial pair", () => {
+    process.env.ARCHESTRA_RUM_EXPORTER_OTLP_AUTH_USERNAME = "testuser";
+    process.env.ARCHESTRA_RUM_EXPORTER_OTLP_AUTH_PASSWORD = "testpass";
+
+    expect(getRumOtlpAuthHeaders()).toEqual({
+      Authorization: "Basic dGVzdHVzZXI6dGVzdHBhc3M=",
+    });
+
+    delete process.env.ARCHESTRA_RUM_EXPORTER_OTLP_AUTH_PASSWORD;
+
+    expect(getRumOtlpAuthHeaders()).toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(
+      "OTEL authentication misconfigured: both ARCHESTRA_RUM_EXPORTER_OTLP_AUTH_USERNAME and ARCHESTRA_RUM_EXPORTER_OTLP_AUTH_PASSWORD must be provided for basic auth",
+    );
+  });
+});
+
+describe("parseFrontendBaseUrl", () => {
+  test("defaults to localhost when unset or blank", () => {
+    expect(parseFrontendBaseUrl(undefined)).toBe("http://localhost:3000");
+    expect(parseFrontendBaseUrl("   ")).toBe("http://localhost:3000");
+  });
+
+  test("returns a clean URL unchanged", () => {
+    expect(parseFrontendBaseUrl("https://app.example.com")).toBe(
+      "https://app.example.com",
+    );
+  });
+
+  test("strips trailing slashes so the OAuth issuer identifier stays slash-free", () => {
+    // A slashed value would disagree with the RFC 9207 `iss` parameter
+    // (better-auth strips the slash) and break URL-building call sites that
+    // append their own paths.
+    expect(parseFrontendBaseUrl("https://app.example.com/")).toBe(
+      "https://app.example.com",
+    );
+    expect(parseFrontendBaseUrl(" https://app.example.com// ")).toBe(
+      "https://app.example.com",
+    );
+  });
+});
+
+describe("getConfiguredOrigins (tested via getCorsOrigins/getTrustedOrigins)", () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    // A local .env may set ARCHESTRA_NGROK_DOMAIN (a tunnel domain), which
+    // getConfiguredOrigins folds into the trusted/CORS origins. Pin it empty so
+    // these tests are independent of the developer's .env. Set to "" rather than
+    // deleted: the re-import tests below reload config (and thus dotenv, which
+    // defaults to override:false), so a deleted var would be repopulated from
+    // .env while an already-set empty value is left untouched.
+    process.env.ARCHESTRA_NGROK_DOMAIN = "";
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  test("should accept all origins when no env vars are set", () => {
+    delete process.env.ARCHESTRA_FRONTEND_URL;
+    delete process.env.ARCHESTRA_AUTH_ADDITIONAL_TRUSTED_ORIGINS;
+
+    const cors = getCorsOrigins();
+    expect(cors).toHaveLength(1);
+    expect(cors[0]).toBeInstanceOf(RegExp);
+
+    const trusted = getTrustedOrigins();
+    expect(trusted).toEqual([
+      "http://*:*",
+      "https://*:*",
+      "http://*",
+      "https://*",
+    ]);
+  });
+
+  test("should parse ARCHESTRA_AUTH_ADDITIONAL_TRUSTED_ORIGINS with trimming and filtering", () => {
+    process.env.ARCHESTRA_AUTH_ADDITIONAL_TRUSTED_ORIGINS =
+      "  http://keycloak:8080 , , https://auth.example.com  ";
+    delete process.env.ARCHESTRA_FRONTEND_URL;
+
+    const result = getTrustedOrigins();
+
+    expect(result).toContain("http://keycloak:8080");
+    expect(result).toContain("https://auth.example.com");
+    expect(result).toHaveLength(2);
+  });
+});
+
+describe("getTrustedOrigins", () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    // See note in getConfiguredOrigins: keep these origin tests independent of
+    // a local .env that sets a tunnel domain.
+    process.env.ARCHESTRA_NGROK_DOMAIN = "";
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  describe("no origin env vars (accept all)", () => {
+    test("should return catch-all wildcards when no env vars are set", () => {
+      delete process.env.ARCHESTRA_FRONTEND_URL;
+      delete process.env.ARCHESTRA_AUTH_ADDITIONAL_TRUSTED_ORIGINS;
+
+      const result = getTrustedOrigins();
+
+      expect(result).toEqual([
+        "http://*:*",
+        "https://*:*",
+        "http://*",
+        "https://*",
+      ]);
+    });
+  });
+
+  describe("configured origins (enforce)", () => {
+    test("should return frontend URL when set", () => {
+      process.env.ARCHESTRA_FRONTEND_URL = "https://app.example.com";
+      delete process.env.ARCHESTRA_AUTH_ADDITIONAL_TRUSTED_ORIGINS;
+
+      expect(getTrustedOrigins()).toEqual(["https://app.example.com"]);
+    });
+
+    test("should combine frontend URL and additional origins", () => {
+      process.env.ARCHESTRA_FRONTEND_URL = "https://app.example.com";
+      process.env.ARCHESTRA_AUTH_ADDITIONAL_TRUSTED_ORIGINS =
+        "http://idp.example.com:8080";
+
+      expect(getTrustedOrigins()).toEqual([
+        "https://app.example.com",
+        "http://idp.example.com:8080",
+      ]);
+    });
+
+    test("should add 127.0.0.1 equivalent for localhost origins", () => {
+      process.env.ARCHESTRA_FRONTEND_URL = "http://localhost:3000";
+      delete process.env.ARCHESTRA_AUTH_ADDITIONAL_TRUSTED_ORIGINS;
+
+      const result = getTrustedOrigins();
+      expect(result).toContain("http://localhost:3000");
+      expect(result).toContain("http://127.0.0.1:3000");
+    });
+
+    test("should add localhost equivalent for 127.0.0.1 origins", () => {
+      process.env.ARCHESTRA_FRONTEND_URL = "http://127.0.0.1:3000";
+      delete process.env.ARCHESTRA_AUTH_ADDITIONAL_TRUSTED_ORIGINS;
+
+      const result = getTrustedOrigins();
+      expect(result).toContain("http://127.0.0.1:3000");
+      expect(result).toContain("http://localhost:3000");
+    });
+
+    test("should enforce only additional origins when frontend URL is not set", () => {
+      delete process.env.ARCHESTRA_FRONTEND_URL;
+      process.env.ARCHESTRA_AUTH_ADDITIONAL_TRUSTED_ORIGINS =
+        "https://auth.example.com";
+
+      expect(getTrustedOrigins()).toEqual(["https://auth.example.com"]);
+    });
+  });
+});
+
+describe("parseBodyLimit", () => {
+  const DEFAULT_VALUE = 1024; // 1KB default for testing
+
+  describe("undefined or empty input", () => {
+    test("should return default value when input is undefined", () => {
+      expect(parseBodyLimit(undefined, DEFAULT_VALUE)).toBe(DEFAULT_VALUE);
+    });
+
+    test("should return default value when input is empty string", () => {
+      expect(parseBodyLimit("", DEFAULT_VALUE)).toBe(DEFAULT_VALUE);
+    });
+  });
+
+  describe("numeric bytes input", () => {
+    test("should parse plain numeric value as bytes", () => {
+      expect(parseBodyLimit("52428800", DEFAULT_VALUE)).toBe(52428800);
+    });
+
+    test("should parse small numeric value", () => {
+      expect(parseBodyLimit("1024", DEFAULT_VALUE)).toBe(1024);
+    });
+
+    test("should parse zero", () => {
+      expect(parseBodyLimit("0", DEFAULT_VALUE)).toBe(0);
+    });
+  });
+
+  describe("human-readable format (KB)", () => {
+    test("should parse KB lowercase", () => {
+      expect(parseBodyLimit("100kb", DEFAULT_VALUE)).toBe(100 * 1024);
+    });
+
+    test("should parse KB uppercase", () => {
+      expect(parseBodyLimit("100KB", DEFAULT_VALUE)).toBe(100 * 1024);
+    });
+
+    test("should parse KB mixed case", () => {
+      expect(parseBodyLimit("100Kb", DEFAULT_VALUE)).toBe(100 * 1024);
+    });
+  });
+
+  describe("human-readable format (MB)", () => {
+    test("should parse MB lowercase", () => {
+      expect(parseBodyLimit("50mb", DEFAULT_VALUE)).toBe(50 * 1024 * 1024);
+    });
+
+    test("should parse MB uppercase", () => {
+      expect(parseBodyLimit("50MB", DEFAULT_VALUE)).toBe(50 * 1024 * 1024);
+    });
+
+    test("should parse MB mixed case", () => {
+      expect(parseBodyLimit("50Mb", DEFAULT_VALUE)).toBe(50 * 1024 * 1024);
+    });
+
+    test("should parse 100MB correctly", () => {
+      expect(parseBodyLimit("100MB", DEFAULT_VALUE)).toBe(100 * 1024 * 1024);
+    });
+  });
+
+  describe("human-readable format (GB)", () => {
+    test("should parse GB lowercase", () => {
+      expect(parseBodyLimit("1gb", DEFAULT_VALUE)).toBe(1 * 1024 * 1024 * 1024);
+    });
+
+    test("should parse GB uppercase", () => {
+      expect(parseBodyLimit("1GB", DEFAULT_VALUE)).toBe(1 * 1024 * 1024 * 1024);
+    });
+
+    test("should parse GB mixed case", () => {
+      expect(parseBodyLimit("2Gb", DEFAULT_VALUE)).toBe(2 * 1024 * 1024 * 1024);
+    });
+  });
+
+  describe("whitespace handling", () => {
+    test("should handle leading whitespace", () => {
+      expect(parseBodyLimit("  50MB", DEFAULT_VALUE)).toBe(50 * 1024 * 1024);
+    });
+
+    test("should handle trailing whitespace", () => {
+      expect(parseBodyLimit("50MB  ", DEFAULT_VALUE)).toBe(50 * 1024 * 1024);
+    });
+
+    test("should handle surrounding whitespace", () => {
+      expect(parseBodyLimit("  50MB  ", DEFAULT_VALUE)).toBe(50 * 1024 * 1024);
+    });
+  });
+
+  describe("invalid input", () => {
+    test("should return default value for invalid unit", () => {
+      expect(parseBodyLimit("50TB", DEFAULT_VALUE)).toBe(DEFAULT_VALUE);
+    });
+
+    test("should return default value for text without numbers", () => {
+      expect(parseBodyLimit("MB", DEFAULT_VALUE)).toBe(DEFAULT_VALUE);
+    });
+
+    test("should return default value for random text", () => {
+      expect(parseBodyLimit("invalid", DEFAULT_VALUE)).toBe(DEFAULT_VALUE);
+    });
+
+    test("should return default value for negative with unit", () => {
+      expect(parseBodyLimit("-50MB", DEFAULT_VALUE)).toBe(DEFAULT_VALUE);
+    });
+
+    test("should return default value for decimal with unit", () => {
+      expect(parseBodyLimit("1.5MB", DEFAULT_VALUE)).toBe(DEFAULT_VALUE);
+    });
+
+    test("should return default value for space between number and unit", () => {
+      expect(parseBodyLimit("50 MB", DEFAULT_VALUE)).toBe(DEFAULT_VALUE);
+    });
+  });
+});
+
+describe("parseKeepAliveTimeoutMs", () => {
+  const DEFAULT_VALUE = 620_000;
+
+  test("uses the default when unset or empty", () => {
+    expect(parseKeepAliveTimeoutMs(undefined, DEFAULT_VALUE)).toBe(
+      DEFAULT_VALUE,
+    );
+    expect(parseKeepAliveTimeoutMs("", DEFAULT_VALUE)).toBe(DEFAULT_VALUE);
+  });
+
+  test("honours a positive millisecond value", () => {
+    expect(parseKeepAliveTimeoutMs("900000", DEFAULT_VALUE)).toBe(900_000);
+  });
+
+  test("tolerates surrounding whitespace", () => {
+    expect(parseKeepAliveTimeoutMs("  900000  ", DEFAULT_VALUE)).toBe(900_000);
+  });
+
+  // Zero cannot express "never close" downstream — Fastify coerces a falsy
+  // keepAliveTimeout back to its own 72s default and the Next.js standalone
+  // server ignores it — so honouring 0 would quietly apply a timeout the
+  // operator did not ask for. Fall back to the documented default instead.
+  test.each([
+    ["0"],
+    ["-1"],
+    ["-620000"],
+  ])("falls back to the default for non-positive input %s", (value) => {
+    expect(parseKeepAliveTimeoutMs(value, DEFAULT_VALUE)).toBe(DEFAULT_VALUE);
+  });
+
+  test.each([
+    ["abc"],
+    ["null"],
+    ["  "],
+  ])("falls back to the default for unparsable input %s", (value) => {
+    expect(parseKeepAliveTimeoutMs(value, DEFAULT_VALUE)).toBe(DEFAULT_VALUE);
+  });
+
+  // parseInt would stop at the first non-digit and hand back the leading
+  // prefix: "620_000" -> 620ms, "620s" -> 620ms, "1.5" -> 1ms. A sub-second
+  // keep-alive is two orders of magnitude BELOW Node's own 5s default, so a
+  // typo would silently make the dropped-request failure this setting exists
+  // to prevent far worse than doing nothing at all.
+  //
+  // Asserted against a sentinel rather than DEFAULT_VALUE: several of these
+  // inputs evaluate to exactly 620000 ("6.2e5"), so against the real default a
+  // parser that ACCEPTED them would return the same number a rejecting one
+  // does, and the assertion could never fail.
+  const REJECTED = 777_777;
+
+  test.each([
+    ["620_000"],
+    ["620s"],
+    ["1.5"],
+    ["620000abc"],
+    // Evaluates to 620000. Number() alone reads it as a valid integer and
+    // accepts it; only the digits-only screen rejects it.
+    ["6.2e5"],
+    // Number("1e6") is 1000000, an integer the entrypoint's digits-only screen
+    // rejects — accepting it here would put the two servers on different
+    // windows, the split normalizing in the entrypoint exists to prevent.
+    ["1e6"],
+    // Number("0x1") is 1: a 1ms keep-alive, the exact sub-second window this
+    // guard exists to reject, slipping through as a "valid" positive integer.
+    ["0x1"],
+  ])("refuses to truncate malformed input %s to a sub-second timeout", (value) => {
+    expect(parseKeepAliveTimeoutMs(value, REJECTED)).toBe(REJECTED);
+  });
+});
+
+describe("getOtelExporterOtlpEndpoint", () => {
+  describe("default value", () => {
+    test("should return default endpoint when no value provided", () => {
+      const result = getOtelExporterOtlpEndpoint(undefined);
+      expect(result).toBe("http://localhost:4318/v1/traces");
+    });
+
+    test("should return default endpoint when empty string provided", () => {
+      const result = getOtelExporterOtlpEndpoint("");
+      expect(result).toBe("http://localhost:4318/v1/traces");
+    });
+
+    test("should return default endpoint when only whitespace provided", () => {
+      const result = getOtelExporterOtlpEndpoint("   ");
+      expect(result).toBe("http://localhost:4318/v1/traces");
+    });
+  });
+
+  describe("URL already ends with /v1/traces", () => {
+    test("should return URL as-is when it ends with /v1/traces", () => {
+      const result = getOtelExporterOtlpEndpoint(
+        "http://otel-collector:4318/v1/traces",
+      );
+      expect(result).toBe("http://otel-collector:4318/v1/traces");
+    });
+
+    test("should normalize trailing slashes and return URL with /v1/traces", () => {
+      const result = getOtelExporterOtlpEndpoint(
+        "http://otel-collector:4318/v1/traces/",
+      );
+      expect(result).toBe("http://otel-collector:4318/v1/traces");
+    });
+
+    test("should handle multiple trailing slashes", () => {
+      const result = getOtelExporterOtlpEndpoint(
+        "http://otel-collector:4318/v1/traces///",
+      );
+      expect(result).toBe("http://otel-collector:4318/v1/traces");
+    });
+  });
+
+  describe("URL ends with /v1", () => {
+    test("should append /traces when URL ends with /v1", () => {
+      const result = getOtelExporterOtlpEndpoint(
+        "http://otel-collector:4318/v1",
+      );
+      expect(result).toBe("http://otel-collector:4318/v1/traces");
+    });
+
+    test("should handle /v1 with trailing slash", () => {
+      const result = getOtelExporterOtlpEndpoint(
+        "http://otel-collector:4318/v1/",
+      );
+      expect(result).toBe("http://otel-collector:4318/v1/traces");
+    });
+  });
+
+  describe("URL without /v1/traces suffix", () => {
+    test("should append /v1/traces to base URL", () => {
+      const result = getOtelExporterOtlpEndpoint("http://otel-collector:4318");
+      expect(result).toBe("http://otel-collector:4318/v1/traces");
+    });
+
+    test("should append /v1/traces to URL with trailing slash", () => {
+      const result = getOtelExporterOtlpEndpoint("http://otel-collector:4318/");
+      expect(result).toBe("http://otel-collector:4318/v1/traces");
+    });
+
+    test("should append /v1/traces to URL with custom path", () => {
+      const result = getOtelExporterOtlpEndpoint(
+        "http://otel-collector:4318/custom",
+      );
+      expect(result).toBe("http://otel-collector:4318/custom/v1/traces");
+    });
+
+    test("should handle $(NODE_IP) variable expansion syntax", () => {
+      const result = getOtelExporterOtlpEndpoint("http://$(NODE_IP):4317");
+      expect(result).toBe("http://$(NODE_IP):4317/v1/traces");
+    });
+
+    test("should preserve $(NODE_IP) and append /v1/traces", () => {
+      const result = getOtelExporterOtlpEndpoint(
+        "http://$(NODE_IP):4317/custom/path",
+      );
+      expect(result).toBe("http://$(NODE_IP):4317/custom/path/v1/traces");
+    });
+  });
+
+  describe("HTTPS URLs", () => {
+    test("should work with HTTPS URLs", () => {
+      const result = getOtelExporterOtlpEndpoint("https://otel.example.com");
+      expect(result).toBe("https://otel.example.com/v1/traces");
+    });
+
+    test("should work with HTTPS URLs that already have /v1/traces", () => {
+      const result = getOtelExporterOtlpEndpoint(
+        "https://otel.example.com/v1/traces",
+      );
+      expect(result).toBe("https://otel.example.com/v1/traces");
+    });
+  });
+
+  describe("edge cases", () => {
+    test("should handle URL with port but no path", () => {
+      const result = getOtelExporterOtlpEndpoint("http://localhost:4317");
+      expect(result).toBe("http://localhost:4317/v1/traces");
+    });
+
+    test("should handle URL without port", () => {
+      const result = getOtelExporterOtlpEndpoint("http://otel-collector");
+      expect(result).toBe("http://otel-collector/v1/traces");
+    });
+
+    test("should fix common typo /v1/trace (missing s) to /v1/traces", () => {
+      // URL ending in /v1/trace (missing s) should be normalized to /v1/traces
+      const result = getOtelExporterOtlpEndpoint(
+        "http://otel-collector:4318/v1/trace",
+      );
+      expect(result).toBe("http://otel-collector:4318/v1/traces");
+    });
+  });
+});
+
+describe("getOtelExporterOtlpLogEndpoint", () => {
+  const savedEnv = process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_ENDPOINT;
+
+  afterAll(() => {
+    if (savedEnv !== undefined) {
+      process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_ENDPOINT = savedEnv;
+    } else {
+      delete process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_ENDPOINT;
+    }
+  });
+
+  describe("default value", () => {
+    test("should return default endpoint when no value provided", () => {
+      delete process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_ENDPOINT;
+      const result = getOtelExporterOtlpLogEndpoint(undefined);
+      expect(result).toBe("http://localhost:4318/v1/logs");
+    });
+
+    test("should return default endpoint when empty string provided", () => {
+      const result = getOtelExporterOtlpLogEndpoint("");
+      expect(result).toBe("http://localhost:4318/v1/logs");
+    });
+
+    test("should return default endpoint when only whitespace provided", () => {
+      const result = getOtelExporterOtlpLogEndpoint("   ");
+      expect(result).toBe("http://localhost:4318/v1/logs");
+    });
+  });
+
+  describe("URL already ends with /v1/logs", () => {
+    test("should return URL as-is when it ends with /v1/logs", () => {
+      const result = getOtelExporterOtlpLogEndpoint(
+        "http://otel-collector:4318/v1/logs",
+      );
+      expect(result).toBe("http://otel-collector:4318/v1/logs");
+    });
+
+    test("should normalize trailing slashes and return URL with /v1/logs", () => {
+      const result = getOtelExporterOtlpLogEndpoint(
+        "http://otel-collector:4318/v1/logs/",
+      );
+      expect(result).toBe("http://otel-collector:4318/v1/logs");
+    });
+  });
+
+  describe("URL ends with /v1", () => {
+    test("should append /logs when URL ends with /v1", () => {
+      const result = getOtelExporterOtlpLogEndpoint(
+        "http://otel-collector:4318/v1",
+      );
+      expect(result).toBe("http://otel-collector:4318/v1/logs");
+    });
+
+    test("should handle /v1 with trailing slash", () => {
+      const result = getOtelExporterOtlpLogEndpoint(
+        "http://otel-collector:4318/v1/",
+      );
+      expect(result).toBe("http://otel-collector:4318/v1/logs");
+    });
+  });
+
+  describe("URL without /v1/logs suffix", () => {
+    test("should append /v1/logs to base URL", () => {
+      const result = getOtelExporterOtlpLogEndpoint(
+        "http://otel-collector:4318",
+      );
+      expect(result).toBe("http://otel-collector:4318/v1/logs");
+    });
+
+    test("should append /v1/logs to URL with trailing slash", () => {
+      const result = getOtelExporterOtlpLogEndpoint(
+        "http://otel-collector:4318/",
+      );
+      expect(result).toBe("http://otel-collector:4318/v1/logs");
+    });
+  });
+
+  describe("HTTPS URLs", () => {
+    test("should work with HTTPS URLs", () => {
+      const result = getOtelExporterOtlpLogEndpoint("https://otel.example.com");
+      expect(result).toBe("https://otel.example.com/v1/logs");
+    });
+
+    test("should work with HTTPS URLs that already have /v1/logs", () => {
+      const result = getOtelExporterOtlpLogEndpoint(
+        "https://otel.example.com/v1/logs",
+      );
+      expect(result).toBe("https://otel.example.com/v1/logs");
+    });
+  });
+});
+
+describe("parseRefreshTokenReuseGraceSeconds", () => {
+  test("defaults to 60 when unset, empty, or whitespace", () => {
+    expect(parseRefreshTokenReuseGraceSeconds(undefined)).toBe(60);
+    expect(parseRefreshTokenReuseGraceSeconds("")).toBe(60);
+    expect(parseRefreshTokenReuseGraceSeconds("   ")).toBe(60);
+  });
+
+  test("parses a valid value and trims whitespace", () => {
+    expect(parseRefreshTokenReuseGraceSeconds("120")).toBe(120);
+    expect(parseRefreshTokenReuseGraceSeconds("  30  ")).toBe(30);
+  });
+
+  test("accepts 0 to disable the grace window", () => {
+    expect(parseRefreshTokenReuseGraceSeconds("0")).toBe(0);
+  });
+
+  test("returns default and warns for non-numeric or negative values", () => {
+    expect(parseRefreshTokenReuseGraceSeconds("abc")).toBe(60);
+    expect(parseRefreshTokenReuseGraceSeconds("-5")).toBe(60);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_AUTH_REFRESH_TOKEN_REUSE_GRACE_SECONDS value "-5", using default 60',
+    );
+  });
+});
+
+describe("parseContentMaxLength", () => {
+  test("should return default 10000 when no value provided", () => {
+    expect(parseContentMaxLength(undefined)).toBe(10_000);
+  });
+
+  test("should return default when empty string provided", () => {
+    expect(parseContentMaxLength("")).toBe(10_000);
+  });
+
+  test("should return default when whitespace-only string provided", () => {
+    expect(parseContentMaxLength("   ")).toBe(10_000);
+  });
+
+  test("should parse valid integer value", () => {
+    expect(parseContentMaxLength("5000")).toBe(5000);
+  });
+
+  test("should parse large value", () => {
+    expect(parseContentMaxLength("100000")).toBe(100_000);
+  });
+
+  test("should trim whitespace and parse value", () => {
+    expect(parseContentMaxLength("  8000  ")).toBe(8000);
+  });
+
+  test("should return default and warn for non-numeric value", () => {
+    expect(parseContentMaxLength("abc")).toBe(10_000);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_OTEL_CONTENT_MAX_LENGTH value "abc", using default 10000',
+    );
+  });
+
+  test("should return default and warn for zero", () => {
+    expect(parseContentMaxLength("0")).toBe(10_000);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_OTEL_CONTENT_MAX_LENGTH value "0", using default 10000',
+    );
+  });
+
+  test("should return default and warn for negative value", () => {
+    expect(parseContentMaxLength("-100")).toBe(10_000);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_OTEL_CONTENT_MAX_LENGTH value "-100", using default 10000',
+    );
+  });
+});
+
+describe("parseChatMaxOutputTokens", () => {
+  test("should return default 32768 when no value provided", () => {
+    expect(parseChatMaxOutputTokens(undefined)).toBe(32768);
+  });
+
+  test("should return default when empty/whitespace string provided", () => {
+    expect(parseChatMaxOutputTokens("")).toBe(32768);
+    expect(parseChatMaxOutputTokens("   ")).toBe(32768);
+  });
+
+  test("should parse and trim a valid value", () => {
+    expect(parseChatMaxOutputTokens("  16000  ")).toBe(16000);
+  });
+
+  test("should accept boundary values", () => {
+    expect(parseChatMaxOutputTokens("1")).toBe(1);
+    expect(parseChatMaxOutputTokens("1000000")).toBe(1000000);
+  });
+
+  test("should return default and warn for non-numeric value", () => {
+    expect(parseChatMaxOutputTokens("abc")).toBe(32768);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_CHAT_MAX_OUTPUT_TOKENS value "abc", using default 32768',
+    );
+  });
+
+  test("should reject fractional and trailing-garbage values instead of truncating", () => {
+    expect(parseChatMaxOutputTokens("1.5")).toBe(32768);
+    expect(parseChatMaxOutputTokens("32768abc")).toBe(32768);
+    expect(parseChatMaxOutputTokens("Infinity")).toBe(32768);
+  });
+
+  test("should accept scientific notation for an integer value", () => {
+    expect(parseChatMaxOutputTokens("1e6")).toBe(1000000);
+  });
+
+  test("should return default and warn for zero and out-of-range", () => {
+    expect(parseChatMaxOutputTokens("0")).toBe(32768);
+    expect(parseChatMaxOutputTokens("1000001")).toBe(32768);
+  });
+});
+
+describe("parseChatRateMeteredMaxOutputTokens", () => {
+  test("should return default 4096 when no value provided", () => {
+    expect(parseChatRateMeteredMaxOutputTokens(undefined)).toBe(4096);
+  });
+
+  test("should parse and trim a valid value", () => {
+    expect(parseChatRateMeteredMaxOutputTokens("  16000  ")).toBe(16000);
+  });
+
+  test("should return default and warn naming its own env var", () => {
+    expect(parseChatRateMeteredMaxOutputTokens("abc")).toBe(4096);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_CHAT_RATE_METERED_MAX_OUTPUT_TOKENS value "abc", using default 4096',
+    );
+  });
+
+  test("should reject fractional, out-of-range and trailing-garbage values", () => {
+    expect(parseChatRateMeteredMaxOutputTokens("1.5")).toBe(4096);
+    expect(parseChatRateMeteredMaxOutputTokens("4096abc")).toBe(4096);
+    expect(parseChatRateMeteredMaxOutputTokens("0")).toBe(4096);
+    expect(parseChatRateMeteredMaxOutputTokens("1000001")).toBe(4096);
+  });
+});
+
+describe("parseDatabasePoolMax", () => {
+  test("should return default 50 when no value provided", () => {
+    expect(parseDatabasePoolMax(undefined)).toBe(50);
+  });
+
+  test("should return default when empty string provided", () => {
+    expect(parseDatabasePoolMax("")).toBe(50);
+  });
+
+  test("should return default when whitespace-only string provided", () => {
+    expect(parseDatabasePoolMax("   ")).toBe(50);
+  });
+
+  test("should parse valid value", () => {
+    expect(parseDatabasePoolMax("100")).toBe(100);
+  });
+
+  test("should accept boundary values", () => {
+    expect(parseDatabasePoolMax("1")).toBe(1);
+    expect(parseDatabasePoolMax("500")).toBe(500);
+  });
+
+  test("should trim whitespace and parse value", () => {
+    expect(parseDatabasePoolMax("  75  ")).toBe(75);
+  });
+
+  test("should return default and warn for non-numeric value", () => {
+    expect(parseDatabasePoolMax("abc")).toBe(50);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_DATABASE_POOL_MAX value "abc", using default 50',
+    );
+  });
+
+  test("should return default and warn for zero", () => {
+    expect(parseDatabasePoolMax("0")).toBe(50);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_DATABASE_POOL_MAX value "0", using default 50',
+    );
+  });
+
+  test("should return default and warn for negative value", () => {
+    expect(parseDatabasePoolMax("-1")).toBe(50);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_DATABASE_POOL_MAX value "-1", using default 50',
+    );
+  });
+
+  test("should return default and warn for value above cap", () => {
+    expect(parseDatabasePoolMax("501")).toBe(50);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_DATABASE_POOL_MAX value "501", using default 50',
+    );
+  });
+});
+
+describe("parseDatabaseStatementTimeoutMillis", () => {
+  test("should return default 30000 when no value provided", () => {
+    expect(parseDatabaseStatementTimeoutMillis(undefined)).toBe(30000);
+  });
+
+  test("should return default when empty string provided", () => {
+    expect(parseDatabaseStatementTimeoutMillis("")).toBe(30000);
+  });
+
+  test("should return default when whitespace-only string provided", () => {
+    expect(parseDatabaseStatementTimeoutMillis("   ")).toBe(30000);
+  });
+
+  test("should parse valid value", () => {
+    expect(parseDatabaseStatementTimeoutMillis("60000")).toBe(60000);
+  });
+
+  test("should trim whitespace and parse value", () => {
+    expect(parseDatabaseStatementTimeoutMillis("  45000  ")).toBe(45000);
+  });
+
+  test("should allow 0 to disable the timeout", () => {
+    expect(parseDatabaseStatementTimeoutMillis("0")).toBe(0);
+  });
+
+  test("should return default and warn for non-numeric value", () => {
+    expect(parseDatabaseStatementTimeoutMillis("abc")).toBe(30000);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_DATABASE_STATEMENT_TIMEOUT_MILLIS value "abc", using default 30000',
+    );
+  });
+
+  test("should return default and warn for negative value", () => {
+    expect(parseDatabaseStatementTimeoutMillis("-1")).toBe(30000);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_DATABASE_STATEMENT_TIMEOUT_MILLIS value "-1", using default 30000',
+    );
+  });
+});
+
+describe("parseActiveUsersRefreshIntervalMs", () => {
+  const DEFAULT = 5 * 60 * 1000;
+  const FLOOR = 30 * 1000;
+
+  test("returns the default when no value provided", () => {
+    expect(parseActiveUsersRefreshIntervalMs(undefined)).toBe(DEFAULT);
+    expect(parseActiveUsersRefreshIntervalMs("")).toBe(DEFAULT);
+    expect(parseActiveUsersRefreshIntervalMs("   ")).toBe(DEFAULT);
+  });
+
+  test("parses a valid interval", () => {
+    expect(parseActiveUsersRefreshIntervalMs("600000")).toBe(600000);
+    expect(parseActiveUsersRefreshIntervalMs("  120000  ")).toBe(120000);
+  });
+
+  test("treats 0 as explicitly disabled rather than falling back to the default", () => {
+    expect(parseActiveUsersRefreshIntervalMs("0")).toBe(0);
+  });
+
+  test("raises sub-floor intervals to the floor so the DISTINCT count is not run continuously", () => {
+    expect(parseActiveUsersRefreshIntervalMs("1000")).toBe(FLOOR);
+    expect(logger.warn).toHaveBeenCalledWith(
+      `ARCHESTRA_METRICS_ACTIVE_USERS_REFRESH_INTERVAL_MS value "1000" is below the ${FLOOR}ms floor, using the floor`,
+    );
+  });
+
+  test("returns the default and warns for non-numeric or negative values", () => {
+    expect(parseActiveUsersRefreshIntervalMs("abc")).toBe(DEFAULT);
+    expect(parseActiveUsersRefreshIntervalMs("-1")).toBe(DEFAULT);
+    expect(logger.warn).toHaveBeenCalledWith(
+      `Invalid ARCHESTRA_METRICS_ACTIVE_USERS_REFRESH_INTERVAL_MS value "-1", using default ${DEFAULT}`,
+    );
+  });
+});
+
+describe("parseMetricsPort", () => {
+  test("should return default 9050 when no value provided", () => {
+    expect(parseMetricsPort(undefined)).toBe(9050);
+  });
+
+  test("should return default when empty string provided", () => {
+    expect(parseMetricsPort("")).toBe(9050);
+  });
+
+  test("should return default when whitespace-only string provided", () => {
+    expect(parseMetricsPort("   ")).toBe(9050);
+  });
+
+  test("should parse valid port value", () => {
+    expect(parseMetricsPort("9051")).toBe(9051);
+  });
+
+  test("should accept boundary ports", () => {
+    expect(parseMetricsPort("1")).toBe(1);
+    expect(parseMetricsPort("65535")).toBe(65535);
+  });
+
+  test("should trim whitespace and parse value", () => {
+    expect(parseMetricsPort("  9100  ")).toBe(9100);
+  });
+
+  test("should return default and warn for non-numeric value", () => {
+    expect(parseMetricsPort("abc")).toBe(9050);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_METRICS_PORT value "abc", using default 9050',
+    );
+  });
+
+  test("should return default and warn for zero", () => {
+    expect(parseMetricsPort("0")).toBe(9050);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_METRICS_PORT value "0", using default 9050',
+    );
+  });
+
+  test("should return default and warn for out-of-range port", () => {
+    expect(parseMetricsPort("65536")).toBe(9050);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_METRICS_PORT value "65536", using default 9050',
+    );
+  });
+
+  test("should return default and warn for negative value", () => {
+    expect(parseMetricsPort("-1")).toBe(9050);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_METRICS_PORT value "-1", using default 9050',
+    );
+  });
+});
+
+describe("parseOptionalPort", () => {
+  test("returns undefined (disabled) when no value provided", () => {
+    expect(
+      parseOptionalPort({
+        envVarName: "ARCHESTRA_PUBLIC_ENDPOINTS_PORT",
+        envValue: undefined,
+      }),
+    ).toBeUndefined();
+  });
+
+  test("returns undefined when empty or whitespace-only string provided", () => {
+    expect(
+      parseOptionalPort({
+        envVarName: "ARCHESTRA_PUBLIC_ENDPOINTS_PORT",
+        envValue: "",
+      }),
+    ).toBeUndefined();
+    expect(
+      parseOptionalPort({
+        envVarName: "ARCHESTRA_PUBLIC_ENDPOINTS_PORT",
+        envValue: "   ",
+      }),
+    ).toBeUndefined();
+  });
+
+  test("parses valid port value", () => {
+    expect(
+      parseOptionalPort({
+        envVarName: "ARCHESTRA_PUBLIC_ENDPOINTS_PORT",
+        envValue: "9010",
+      }),
+    ).toBe(9010);
+  });
+
+  test("accepts boundary ports and trims whitespace", () => {
+    expect(
+      parseOptionalPort({
+        envVarName: "ARCHESTRA_PUBLIC_ENDPOINTS_PORT",
+        envValue: "1",
+      }),
+    ).toBe(1);
+    expect(
+      parseOptionalPort({
+        envVarName: "ARCHESTRA_PUBLIC_ENDPOINTS_PORT",
+        envValue: "65535",
+      }),
+    ).toBe(65535);
+    expect(
+      parseOptionalPort({
+        envVarName: "ARCHESTRA_PUBLIC_ENDPOINTS_PORT",
+        envValue: "  9010  ",
+      }),
+    ).toBe(9010);
+  });
+
+  test("returns undefined and warns for invalid values", () => {
+    for (const envValue of ["abc", "0", "65536", "-1"]) {
+      expect(
+        parseOptionalPort({
+          envVarName: "ARCHESTRA_PUBLIC_ENDPOINTS_PORT",
+          envValue,
+        }),
+      ).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        `Invalid ARCHESTRA_PUBLIC_ENDPOINTS_PORT value "${envValue}", the dedicated listener will not be started`,
+      );
+    }
+  });
+});
+
+describe("parseActiveChatRunPollIntervalMs", () => {
+  test("returns default when value is missing", () => {
+    expect(
+      parseActiveChatRunPollIntervalMs({
+        value: undefined,
+        defaultValue: 500,
+        envName: "ARCHESTRA_CHAT_ACTIVE_RUN_REPLAY_POLL_INTERVAL_MS",
+      }),
+    ).toBe(500);
+  });
+
+  test("returns default when value is empty", () => {
+    expect(
+      parseActiveChatRunPollIntervalMs({
+        value: "   ",
+        defaultValue: 500,
+        envName: "ARCHESTRA_CHAT_ACTIVE_RUN_REPLAY_POLL_INTERVAL_MS",
+      }),
+    ).toBe(500);
+  });
+
+  test("parses a positive integer", () => {
+    expect(
+      parseActiveChatRunPollIntervalMs({
+        value: "1000",
+        defaultValue: 500,
+        envName: "ARCHESTRA_CHAT_ACTIVE_RUN_REPLAY_POLL_INTERVAL_MS",
+      }),
+    ).toBe(1000);
+  });
+
+  test("returns default and warns for zero", () => {
+    expect(
+      parseActiveChatRunPollIntervalMs({
+        value: "0",
+        defaultValue: 500,
+        envName: "ARCHESTRA_CHAT_ACTIVE_RUN_REPLAY_POLL_INTERVAL_MS",
+      }),
+    ).toBe(500);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_CHAT_ACTIVE_RUN_REPLAY_POLL_INTERVAL_MS value "0", using default 500',
+    );
+  });
+
+  test("returns default and warns for negative values", () => {
+    expect(
+      parseActiveChatRunPollIntervalMs({
+        value: "-1",
+        defaultValue: 500,
+        envName: "ARCHESTRA_CHAT_ACTIVE_RUN_STOP_POLL_INTERVAL_MS",
+      }),
+    ).toBe(500);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_CHAT_ACTIVE_RUN_STOP_POLL_INTERVAL_MS value "-1", using default 500',
+    );
+  });
+
+  test("returns default and warns for non-numeric values", () => {
+    expect(
+      parseActiveChatRunPollIntervalMs({
+        value: "abc",
+        defaultValue: 500,
+        envName: "ARCHESTRA_CHAT_ACTIVE_RUN_REPLAY_POLL_INTERVAL_MS",
+      }),
+    ).toBe(500);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_CHAT_ACTIVE_RUN_REPLAY_POLL_INTERVAL_MS value "abc", using default 500',
+    );
+  });
+});
+
+describe("Anthropic Vertex AI config", () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  test.each([
+    { project: "", legacyEnabled: "", enabled: false, expectedProject: "" },
+    {
+      project: "   ",
+      legacyEnabled: "true",
+      enabled: false,
+      expectedProject: "",
+    },
+    { project: "", legacyEnabled: "true", enabled: false, expectedProject: "" },
+    {
+      project: "test-project",
+      legacyEnabled: "",
+      enabled: true,
+      expectedProject: "test-project",
+    },
+    {
+      project: "test-project",
+      legacyEnabled: "false",
+      enabled: true,
+      expectedProject: "test-project",
+    },
+    {
+      project: "  test-project  ",
+      legacyEnabled: "true",
+      enabled: true,
+      expectedProject: "test-project",
+    },
+  ])("project '$project' enables Vertex AI: $enabled (legacy flag '$legacyEnabled')", async ({
+    project,
+    legacyEnabled,
+    enabled,
+    expectedProject,
+  }) => {
+    vi.stubEnv("ARCHESTRA_ANTHROPIC_VERTEX_AI_PROJECT", project);
+    vi.stubEnv("ARCHESTRA_ANTHROPIC_VERTEX_AI_ENABLED", legacyEnabled);
+
+    const { default: cfg } = await import("./config");
+
+    expect(cfg.llm.anthropic.vertexAi).toMatchObject({
+      enabled,
+      project: expectedProject,
+    });
+  });
+});
+
+describe("chat active run config", () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    vi.resetModules();
+    process.env = { ...originalEnv };
+    process.env.ARCHESTRA_DATABASE_URL =
+      "postgresql://archestra:pass@localhost:5432/archestra";
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  test("uses listen/notify by default", async () => {
+    delete process.env.ARCHESTRA_CHAT_ACTIVE_RUN_REPLAY_POLL_INTERVAL_MS;
+    delete process.env.ARCHESTRA_CHAT_ACTIVE_RUN_STOP_POLL_INTERVAL_MS;
+    delete process.env.ARCHESTRA_CHAT_ACTIVE_RUN_POLLING_COMPATIBILITY_ENABLED;
+    delete process.env.ARCHESTRA_CHAT_ACTIVE_RUN_NOTIFY_DATABASE_URL;
+
+    const { default: cfg } = await import("./config");
+
+    expect(cfg.chat.activeRun).toMatchObject({
+      replayPollIntervalMs: 500,
+      stopPollIntervalMs: 30_000,
+      pollingCompatibilityEnabled: false,
+      notifyDatabaseUrl: "",
+    });
+  });
+
+  test("reads active run polling compatibility env vars", async () => {
+    process.env.ARCHESTRA_CHAT_ACTIVE_RUN_REPLAY_POLL_INTERVAL_MS = "750";
+    process.env.ARCHESTRA_CHAT_ACTIVE_RUN_STOP_POLL_INTERVAL_MS = "1250";
+    process.env.ARCHESTRA_CHAT_ACTIVE_RUN_POLLING_COMPATIBILITY_ENABLED =
+      "true";
+    process.env.ARCHESTRA_CHAT_ACTIVE_RUN_NOTIFY_DATABASE_URL =
+      " postgresql://notify:pass@localhost:5432/archestra ";
+
+    const { default: cfg } = await import("./config");
+
+    expect(cfg.chat.activeRun).toMatchObject({
+      replayPollIntervalMs: 750,
+      stopPollIntervalMs: 1250,
+      pollingCompatibilityEnabled: true,
+      notifyDatabaseUrl: "postgresql://notify:pass@localhost:5432/archestra",
+    });
+  });
+
+  test("keeps polling compatibility disabled for non-true values", async () => {
+    process.env.ARCHESTRA_CHAT_ACTIVE_RUN_POLLING_COMPATIBILITY_ENABLED =
+      "false";
+
+    const { default: cfg } = await import("./config");
+
+    expect(cfg.chat.activeRun.pollingCompatibilityEnabled).toBe(false);
+  });
+
+  test("keeps one stop polling default regardless of compatibility mode", async () => {
+    // The interval no longer encodes whether notifications work. It is the
+    // fallback a stream wants when they do; the notify hub tightens its own
+    // fallback when they do not, so an operator does not tune this to match
+    // their database endpoint.
+    delete process.env.ARCHESTRA_CHAT_ACTIVE_RUN_STOP_POLL_INTERVAL_MS;
+    process.env.ARCHESTRA_CHAT_ACTIVE_RUN_POLLING_COMPATIBILITY_ENABLED =
+      "true";
+
+    const { default: cfg } = await import("./config");
+
+    expect(cfg.chat.activeRun.stopPollIntervalMs).toBe(30_000);
+  });
+});
+
+describe("Agent Runtime image version", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.stubEnv("ARCHESTRA_AGENT_RUNTIME_BASE_IMAGE", "");
+    vi.stubEnv(
+      "ARCHESTRA_DATABASE_URL",
+      "postgresql://archestra:pass@localhost:5432/archestra",
+    );
+  });
+
+  test.each([
+    "1.3.52",
+    "1.4.0-beta.2",
+  ])("matches platform version %s instead of the stable latest alias", async (version) => {
+    vi.stubEnv("ARCHESTRA_VERSION", version);
+    const { default: cfg } = await import("./config");
+
+    expect(cfg.agentRuntime.defaultImage).toBe(
+      `europe-west1-docker.pkg.dev/friendly-path-465518-r6/archestra-public/agent-archestra:${version}`,
+    );
+  });
+
+  test("preserves an explicit image override on a beta platform", async () => {
+    vi.stubEnv("ARCHESTRA_VERSION", "1.4.0-beta.2");
+    const image = `registry.example.com/custom-agent@sha256:${"a".repeat(64)}`;
+    vi.stubEnv("ARCHESTRA_AGENT_RUNTIME_BASE_IMAGE", ` ${image} `);
+    const { default: cfg } = await import("./config");
+
+    expect(cfg.agentRuntime.defaultImage).toBe(image);
+  });
+});
+
+describe("mcp gateway config", () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    vi.resetModules();
+    process.env = { ...originalEnv };
+    process.env.ARCHESTRA_DATABASE_URL =
+      "postgresql://archestra:pass@localhost:5432/archestra";
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  test("defaults the tool call timeout to 60s", async () => {
+    delete process.env.ARCHESTRA_MCP_GATEWAY_TOOL_CALL_TIMEOUT_MS;
+
+    const { default: cfg } = await import("./config");
+
+    expect(cfg.mcpGateway.toolCallTimeoutMs).toBe(60000);
+  });
+
+  test("reads the tool call timeout from the env var", async () => {
+    process.env.ARCHESTRA_MCP_GATEWAY_TOOL_CALL_TIMEOUT_MS = "300000";
+
+    const { default: cfg } = await import("./config");
+
+    expect(cfg.mcpGateway.toolCallTimeoutMs).toBe(300000);
+  });
+
+  test("falls back to the default for invalid values", async () => {
+    process.env.ARCHESTRA_MCP_GATEWAY_TOOL_CALL_TIMEOUT_MS = "-1";
+
+    const { default: cfg } = await import("./config");
+
+    expect(cfg.mcpGateway.toolCallTimeoutMs).toBe(60000);
+  });
+});
+
+describe("rum export config", () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    vi.resetModules();
+    process.env = { ...originalEnv };
+    process.env.ARCHESTRA_DATABASE_URL =
+      "postgresql://archestra:pass@localhost:5432/archestra";
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  test("stays disabled with an empty exporter url when no RUM endpoint is set", async () => {
+    delete process.env.ARCHESTRA_RUM_EXPORTER_OTLP_ENDPOINT;
+
+    const { default: cfg } = await import("./config");
+
+    expect(cfg.observability.rum).toMatchObject({
+      enabled: false,
+      logExporter: { url: "" },
+    });
+  });
+
+  test("enables the pipeline and normalizes the endpoint to /v1/logs", async () => {
+    process.env.ARCHESTRA_RUM_EXPORTER_OTLP_ENDPOINT =
+      "https://collector.example";
+
+    const { default: cfg } = await import("./config");
+
+    expect(cfg.observability.rum).toMatchObject({
+      enabled: true,
+      logExporter: { url: "https://collector.example/v1/logs" },
+    });
+  });
+
+  test("never falls back to the backend OTEL exporter endpoint", async () => {
+    // RUM export targets a customer-controlled collector; the backend's own
+    // OTEL endpoint must never become an accidental default for it.
+    delete process.env.ARCHESTRA_RUM_EXPORTER_OTLP_ENDPOINT;
+    process.env.ARCHESTRA_OTEL_EXPORTER_OTLP_ENDPOINT = "https://otel.example";
+
+    const { default: cfg } = await import("./config");
+
+    expect(cfg.observability.rum).toMatchObject({
+      enabled: false,
+      logExporter: { url: "" },
+    });
+  });
+});
+
+describe("getCorsOrigins", () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    // See note in getConfiguredOrigins: keep these origin tests independent of
+    // a local .env that sets a tunnel domain.
+    process.env.ARCHESTRA_NGROK_DOMAIN = "";
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  describe("no origin env vars (accept all)", () => {
+    test("should return catch-all regex when no env vars are set", () => {
+      delete process.env.ARCHESTRA_FRONTEND_URL;
+      delete process.env.ARCHESTRA_AUTH_ADDITIONAL_TRUSTED_ORIGINS;
+
+      const result = getCorsOrigins();
+
+      expect(result).toHaveLength(1);
+      expect(result[0]).toBeInstanceOf(RegExp);
+      expect((result[0] as RegExp).test("http://anything.example.com")).toBe(
+        true,
+      );
+    });
+  });
+
+  describe("configured origins (enforce)", () => {
+    beforeEach(() => {
+      vi.resetModules();
+    });
+
+    test("should return frontend URL when set", async () => {
+      process.env.NODE_ENV = "production";
+      process.env.ARCHESTRA_FRONTEND_URL = "https://app.example.com";
+      process.env.ARCHESTRA_AUTH_ADDITIONAL_TRUSTED_ORIGINS = "";
+
+      const { getCorsOrigins: fn } = await import("./config");
+      expect(fn()).toEqual(["https://app.example.com"]);
+    });
+
+    test("should combine frontend URL and additional origins", async () => {
+      process.env.NODE_ENV = "production";
+      process.env.ARCHESTRA_FRONTEND_URL = "https://app.example.com";
+      process.env.ARCHESTRA_AUTH_ADDITIONAL_TRUSTED_ORIGINS =
+        "http://idp.example.com:8080";
+
+      const { getCorsOrigins: fn } = await import("./config");
+      expect(fn()).toEqual([
+        "https://app.example.com",
+        "http://idp.example.com:8080",
+      ]);
+    });
+
+    test("should add loopback equivalents for localhost origins", async () => {
+      process.env.NODE_ENV = "production";
+      process.env.ARCHESTRA_FRONTEND_URL = "http://localhost:3000";
+      process.env.ARCHESTRA_AUTH_ADDITIONAL_TRUSTED_ORIGINS = "";
+
+      const { getCorsOrigins: fn } = await import("./config");
+      const result = fn();
+      expect(result).toContain("http://localhost:3000");
+      expect(result).toContain("http://127.0.0.1:3000");
+    });
+  });
+});
+
+describe("parseVirtualKeyDefaultExpiration", () => {
+  test("should return default 2592000 when undefined", () => {
+    expect(parseVirtualKeyDefaultExpiration(undefined)).toBe(2592000);
+  });
+
+  test("should return default when empty string", () => {
+    expect(parseVirtualKeyDefaultExpiration("")).toBe(2592000);
+  });
+
+  test("should return default when whitespace-only", () => {
+    expect(parseVirtualKeyDefaultExpiration("   ")).toBe(2592000);
+  });
+
+  test("should parse valid positive integer", () => {
+    expect(parseVirtualKeyDefaultExpiration("86400")).toBe(86400);
+  });
+
+  test("should return 0 for zero (never expires)", () => {
+    expect(parseVirtualKeyDefaultExpiration("0")).toBe(0);
+  });
+
+  test("should return default and warn for negative value", () => {
+    expect(parseVirtualKeyDefaultExpiration("-100")).toBe(2592000);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_LLM_PROXY_VIRTUAL_KEYS_DEFAULT_EXPIRATION_SECONDS value "-100", using default 2592000',
+    );
+  });
+
+  test("should return default and warn for non-numeric value", () => {
+    expect(parseVirtualKeyDefaultExpiration("abc")).toBe(2592000);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'Invalid ARCHESTRA_LLM_PROXY_VIRTUAL_KEYS_DEFAULT_EXPIRATION_SECONDS value "abc", using default 2592000',
+    );
+  });
+
+  test("should trim whitespace and parse", () => {
+    expect(parseVirtualKeyDefaultExpiration("  3600  ")).toBe(3600);
+  });
+
+  test("should cap values exceeding 1 year to 31536000", () => {
+    expect(parseVirtualKeyDefaultExpiration("100000000")).toBe(31_536_000);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'ARCHESTRA_LLM_PROXY_VIRTUAL_KEYS_DEFAULT_EXPIRATION_SECONDS value "100000000" exceeds maximum (31536000s / 1 year), capping to 31536000',
+    );
+  });
+
+  test("should allow exactly 1 year (31536000)", () => {
+    expect(parseVirtualKeyDefaultExpiration("31536000")).toBe(31_536_000);
+  });
+
+  test("should cap value just over 1 year", () => {
+    expect(parseVirtualKeyDefaultExpiration("31536001")).toBe(31_536_000);
+  });
+});
+
+describe("parseConnectorSyncMaxDuration", () => {
+  test("should return default 3300 when undefined", () => {
+    expect(parseConnectorSyncMaxDuration(undefined)).toBe(3300);
+  });
+
+  test("should return default 3300 when empty string", () => {
+    expect(parseConnectorSyncMaxDuration("")).toBe(3300);
+  });
+
+  test("should parse valid positive integer", () => {
+    expect(parseConnectorSyncMaxDuration("1800")).toBe(1800);
+  });
+
+  test("should return undefined for zero (disables time-bounded runs)", () => {
+    expect(parseConnectorSyncMaxDuration("0")).toBeUndefined();
+  });
+
+  test("should return undefined for negative value", () => {
+    expect(parseConnectorSyncMaxDuration("-100")).toBeUndefined();
+  });
+
+  test("should return undefined for non-numeric value", () => {
+    expect(parseConnectorSyncMaxDuration("abc")).toBeUndefined();
+  });
+
+  test("should parse large value", () => {
+    expect(parseConnectorSyncMaxDuration("7200")).toBe(7200);
+  });
+});
+
+describe("parseFileStorageProvider", () => {
+  test("defaults to db when unset", () => {
+    expect(parseFileStorageProvider(undefined)).toBe("db");
+  });
+
+  test("returns filesystem (case/space-insensitive)", () => {
+    expect(parseFileStorageProvider(" FileSystem ")).toBe("filesystem");
+  });
+
+  test("falls back to db for any unknown value", () => {
+    expect(parseFileStorageProvider("nope")).toBe("db");
+  });
+});
+
+describe("parseFileStorageProvider (s3)", () => {
+  test("recognizes s3 (case-insensitive)", () => {
+    expect(parseFileStorageProvider("s3")).toBe("s3");
+    expect(parseFileStorageProvider("S3")).toBe("s3");
+  });
+  test("keeps filesystem and defaults unknown to db", () => {
+    expect(parseFileStorageProvider("filesystem")).toBe("filesystem");
+    expect(parseFileStorageProvider(undefined)).toBe("db");
+    expect(parseFileStorageProvider("nope")).toBe("db");
+  });
+});
+
+describe("parseFileStorageS3Config", () => {
+  const env = {
+    bucket: "my-bucket",
+    region: "eu-west-1",
+    endpoint: "https://minio.local:9000",
+    forcePathStyle: "true",
+    accessKeyId: "AKIA",
+    secretAccessKey: "secret",
+    keyPrefix: "/inst-a/",
+  };
+  test("parses a full s3 config", () => {
+    const cfg = parseFileStorageS3Config({ provider: "s3", env });
+    expect(cfg).toEqual({
+      bucket: "my-bucket",
+      region: "eu-west-1",
+      endpoint: "https://minio.local:9000",
+      forcePathStyle: true,
+      accessKeyId: "AKIA",
+      secretAccessKey: "secret",
+      keyPrefix: "inst-a",
+    });
+  });
+  test("defaults region, forcePathStyle, and keyPrefix", () => {
+    const cfg = parseFileStorageS3Config({
+      provider: "s3",
+      env: {
+        ...env,
+        region: undefined,
+        forcePathStyle: undefined,
+        keyPrefix: undefined,
+      },
+    });
+    expect(cfg.region).toBe("us-east-1");
+    expect(cfg.forcePathStyle).toBe(false);
+    expect(cfg.keyPrefix).toBe("");
+  });
+  test("throws when bucket is missing under the s3 provider", () => {
+    expect(() =>
+      parseFileStorageS3Config({
+        provider: "s3",
+        env: { ...env, bucket: undefined },
+      }),
+    ).toThrow(/ARCHESTRA_FILE_STORAGE_S3_BUCKET/);
+  });
+  test("does not validate when the provider is not s3", () => {
+    expect(
+      parseFileStorageS3Config({
+        provider: "db",
+        env: { ...env, bucket: undefined },
+      }).bucket,
+    ).toBe("");
+  });
+  test("throws when only one of the credential pair is set under s3", () => {
+    expect(() =>
+      parseFileStorageS3Config({
+        provider: "s3",
+        env: { ...env, secretAccessKey: undefined },
+      }),
+    ).toThrow(/must be set together/);
+    expect(() =>
+      parseFileStorageS3Config({
+        provider: "s3",
+        env: { ...env, accessKeyId: undefined },
+      }),
+    ).toThrow(/must be set together/);
+  });
+  test("treats a whitespace-only credential as unset under s3", () => {
+    expect(() =>
+      parseFileStorageS3Config({
+        provider: "s3",
+        env: { ...env, secretAccessKey: "   " },
+      }),
+    ).toThrow(/must be set together/);
+  });
+  test("allows both credentials omitted under s3 (AWS default chain)", () => {
+    const cfg = parseFileStorageS3Config({
+      provider: "s3",
+      env: { ...env, accessKeyId: undefined, secretAccessKey: undefined },
+    });
+    expect(cfg.accessKeyId).toBeUndefined();
+    expect(cfg.secretAccessKey).toBeUndefined();
+  });
+  test("does not reject a partial credential pair when the provider is not s3", () => {
+    expect(
+      parseFileStorageS3Config({
+        provider: "db",
+        env: { ...env, secretAccessKey: undefined },
+      }).accessKeyId,
+    ).toBe("AKIA");
+  });
+});
+
+describe("parseFileStorageFilesystemRoot", () => {
+  test("ignores the root when provider is db", () => {
+    expect(parseFileStorageFilesystemRoot({ provider: "db", value: "" })).toBe(
+      "",
+    );
+  });
+
+  test("trims a configured absolute root for the filesystem provider", () => {
+    expect(
+      parseFileStorageFilesystemRoot({
+        provider: "filesystem",
+        value: "  /data/archestra_results  ",
+      }),
+    ).toBe("/data/archestra_results");
+  });
+
+  test("requires a root when provider is filesystem", () => {
+    expect(() =>
+      parseFileStorageFilesystemRoot({ provider: "filesystem", value: " " }),
+    ).toThrow(
+      "ARCHESTRA_FILE_STORAGE_FILESYSTEM_ROOT is required when ARCHESTRA_FILE_STORAGE_PROVIDER=filesystem",
+    );
+  });
+
+  test("rejects a relative root for the filesystem provider", () => {
+    expect(() =>
+      parseFileStorageFilesystemRoot({
+        provider: "filesystem",
+        value: "relative/dir",
+      }),
+    ).toThrow(
+      "ARCHESTRA_FILE_STORAGE_FILESYSTEM_ROOT must be an absolute path",
+    );
+  });
+});
+describe("parseProcessType", () => {
+  test("should return 'all' when undefined", () => {
+    expect(parseProcessType(undefined)).toBe("all");
+  });
+
+  test("should return 'all' when empty string", () => {
+    expect(parseProcessType("")).toBe("all");
+  });
+
+  test("should return 'web' for 'web'", () => {
+    expect(parseProcessType("web")).toBe("web");
+  });
+
+  test("should return 'worker' for 'worker'", () => {
+    expect(parseProcessType("worker")).toBe("worker");
+  });
+
+  test("should return 'renderer' for 'renderer'", () => {
+    expect(parseProcessType("renderer")).toBe("renderer");
+  });
+
+  test("should be case insensitive", () => {
+    expect(parseProcessType("WEB")).toBe("web");
+    expect(parseProcessType("WORKER")).toBe("worker");
+    expect(parseProcessType("RENDERER")).toBe("renderer");
+    expect(parseProcessType("Web")).toBe("web");
+    expect(parseProcessType("Worker")).toBe("worker");
+    expect(parseProcessType("Renderer")).toBe("renderer");
+  });
+
+  test("should return 'all' for unknown values", () => {
+    expect(parseProcessType("unknown")).toBe("all");
+    expect(parseProcessType("both")).toBe("all");
+    expect(parseProcessType("api")).toBe("all");
+  });
+
+  test.each([
+    { input: undefined, type: "all", web: true, worker: true, renderer: false },
+    { input: "", type: "all", web: true, worker: true, renderer: false },
+    { input: "all", type: "all", web: true, worker: true, renderer: false },
+    { input: "web", type: "web", web: true, worker: false, renderer: false },
+    { input: "WEB", type: "web", web: true, worker: false, renderer: false },
+    {
+      input: "worker",
+      type: "worker",
+      web: false,
+      worker: true,
+      renderer: false,
+    },
+    {
+      input: "WORKER",
+      type: "worker",
+      web: false,
+      worker: true,
+      renderer: false,
+    },
+    {
+      input: "renderer",
+      type: "renderer",
+      web: false,
+      worker: false,
+      renderer: true,
+    },
+    {
+      input: "RENDERER",
+      type: "renderer",
+      web: false,
+      worker: false,
+      renderer: true,
+    },
+    { input: "unknown", type: "all", web: true, worker: true, renderer: false },
+  ])("input=$input → web=$web worker=$worker renderer=$renderer", ({
+    input,
+    type,
+    web,
+    worker,
+    renderer,
+  }) => {
+    const result = parseProcessType(input);
+    expect(result).toBe(type);
+    // Mirror the derivations in config.ts: only "web"/"all" run the web
+    // server, only "worker"/"all" run the worker, and "renderer" is neither —
+    // it runs only the isolated app-recording render service.
+    expect(result === "web" || result === "all").toBe(web);
+    expect(result === "worker" || result === "all").toBe(worker);
+    expect(result === "renderer").toBe(renderer);
+  });
+});
+
+describe("parseSampleRate", () => {
+  test("should return default when undefined", () => {
+    expect(parseSampleRate(undefined, 0.2)).toBe(0.2);
+  });
+
+  test("should return default when empty string", () => {
+    expect(parseSampleRate("", 0.05)).toBe(0.05);
+  });
+
+  test("should parse valid rate", () => {
+    expect(parseSampleRate("0.5", 0.2)).toBe(0.5);
+  });
+
+  test("should parse 0", () => {
+    expect(parseSampleRate("0", 0.2)).toBe(0);
+  });
+
+  test("should parse 1", () => {
+    expect(parseSampleRate("1", 0.2)).toBe(1);
+  });
+
+  test("should return default for value above 1", () => {
+    expect(parseSampleRate("1.5", 0.2)).toBe(0.2);
+  });
+
+  test("should return default for negative value", () => {
+    expect(parseSampleRate("-0.1", 0.3)).toBe(0.3);
+  });
+
+  test("should return default for non-numeric value", () => {
+    expect(parseSampleRate("abc", 0.1)).toBe(0.1);
+  });
+});
+
+describe("parseCodeRuntimeDaggerRunnerHost", () => {
+  test("should return undefined when host is unset", () => {
+    expect(parseCodeRuntimeDaggerRunnerHost(undefined)).toBeUndefined();
+  });
+
+  test("should trim and return kube-pod runner host", () => {
+    expect(
+      parseCodeRuntimeDaggerRunnerHost(
+        " kube-pod://dagger-runtime-engine-0?namespace=dagger&container=dagger-engine ",
+      ),
+    ).toBe(
+      "kube-pod://dagger-runtime-engine-0?namespace=dagger&container=dagger-engine",
+    );
+  });
+
+  test("should trim and return TCP runner host", () => {
+    expect(
+      parseCodeRuntimeDaggerRunnerHost(
+        " tcp://dagger-runtime.dagger.svc.cluster.local:1234 ",
+      ),
+    ).toBe("tcp://dagger-runtime.dagger.svc.cluster.local:1234");
+  });
+
+  // A blank host is the normal "no sandbox here" case, not a misconfiguration:
+  // it must stay silent. A malformed one is logged. The gate relies on exactly
+  // this distinction to decide whether to fail closed.
+  test("treats a whitespace-only host as unset, without logging an error", () => {
+    vi.mocked(logger.error).mockClear();
+    expect(parseCodeRuntimeDaggerRunnerHost("   ")).toBeUndefined();
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  test("rejects a supported scheme in the wrong case, and says so", () => {
+    vi.mocked(logger.error).mockClear();
+    expect(
+      parseCodeRuntimeDaggerRunnerHost("TCP://dagger:1234"),
+    ).toBeUndefined();
+    expect(logger.error).toHaveBeenCalled();
+  });
+
+  test("should return undefined for unsupported runner hosts", () => {
+    expect(
+      parseCodeRuntimeDaggerRunnerHost("unix:///run/dagger/engine.sock"),
+    ).toBeUndefined();
+  });
+});
+
+describe("isCodeRuntimeEnabled", () => {
+  const base = {
+    runnerHost: undefined,
+    runnerHostEnv: undefined,
+    codeRuntimeEnabledEnv: undefined,
+    kubeconfig: undefined,
+    loadKubeconfigFromCurrentCluster: undefined,
+  };
+
+  test("enabled when an explicit runner host is configured, even without k8s", () => {
+    expect(
+      isCodeRuntimeEnabled({
+        ...base,
+        runnerHost: "tcp://dagger.dagger.svc.cluster.local:1234",
+        runnerHostEnv: "tcp://dagger.dagger.svc.cluster.local:1234",
+      }),
+    ).toBe(true);
+  });
+
+  test("an explicit runner host wins even when the flag is unset", () => {
+    expect(
+      isCodeRuntimeEnabled({
+        ...base,
+        runnerHost: "kube-pod://engine?namespace=dagger",
+        codeRuntimeEnabledEnv: undefined,
+      }),
+    ).toBe(true);
+  });
+
+  // The documented kill switch: "To turn it off, set ARCHESTRA_CODE_RUNTIME_ENABLED
+  // =false". It must beat a runner host, or an operator cannot disable the sandbox
+  // on a deployment (quickstart, BYO) that supplies one.
+  // A host that is set but malformed parses to `undefined`, which is otherwise
+  // indistinguishable from "unset". Falling through to the k8s path would
+  // provision code-managed engines for an operator who asked for a BYO runner,
+  // while the parser logs "code runtime disabled".
+  test("a malformed runner host disables, it does not fall through to k8s", () => {
+    expect(
+      isCodeRuntimeEnabled({
+        ...base,
+        runnerHost: undefined,
+        runnerHostEnv: "http://not-a-dagger-scheme:1234",
+        codeRuntimeEnabledEnv: "true",
+        loadKubeconfigFromCurrentCluster: "true",
+      }),
+    ).toBe(false);
+  });
+
+  test("a blank runner host is 'unset', not malformed", () => {
+    expect(
+      isCodeRuntimeEnabled({
+        ...base,
+        runnerHost: undefined,
+        runnerHostEnv: "   ",
+        codeRuntimeEnabledEnv: "true",
+        loadKubeconfigFromCurrentCluster: "true",
+      }),
+    ).toBe(true);
+  });
+
+  // The contract that matters is the parser and the gate together: the parser is
+  // what turns a malformed host into `undefined` in production.
+  test("parser + gate: a malformed host fails closed end to end", () => {
+    const envValue = "https://dagger.example.com";
+    expect(
+      isCodeRuntimeEnabled({
+        ...base,
+        runnerHost: parseCodeRuntimeDaggerRunnerHost(envValue),
+        runnerHostEnv: envValue,
+        codeRuntimeEnabledEnv: "true",
+        loadKubeconfigFromCurrentCluster: "true",
+      }),
+    ).toBe(false);
+  });
+
+  test("parser + gate: a supported host enables", () => {
+    const envValue = "kube-pod://engine?namespace=dagger";
+    expect(
+      isCodeRuntimeEnabled({
+        ...base,
+        runnerHost: parseCodeRuntimeDaggerRunnerHost(envValue),
+        runnerHostEnv: envValue,
+      }),
+    ).toBe(true);
+  });
+
+  test('"false" disables even when an explicit runner host is set', () => {
+    expect(
+      isCodeRuntimeEnabled({
+        ...base,
+        codeRuntimeEnabledEnv: "false",
+        runnerHost: "tcp://dagger:1234",
+        runnerHostEnv: "tcp://dagger:1234",
+      }),
+    ).toBe(false);
+  });
+
+  test('"false" disables even with the orchestrator configured', () => {
+    expect(
+      isCodeRuntimeEnabled({
+        ...base,
+        codeRuntimeEnabledEnv: "false",
+        loadKubeconfigFromCurrentCluster: "true",
+      }),
+    ).toBe(false);
+  });
+
+  test("enabled by the flag when the orchestrator loads the current cluster", () => {
+    expect(
+      isCodeRuntimeEnabled({
+        ...base,
+        codeRuntimeEnabledEnv: "true",
+        loadKubeconfigFromCurrentCluster: "true",
+      }),
+    ).toBe(true);
+  });
+
+  test("enabled by the flag when a kubeconfig path is set", () => {
+    expect(
+      isCodeRuntimeEnabled({
+        ...base,
+        codeRuntimeEnabledEnv: "true",
+        kubeconfig: "/home/app/.kube/config",
+      }),
+    ).toBe(true);
+  });
+
+  test("the flag alone (no orchestrator) does not enable", () => {
+    expect(
+      isCodeRuntimeEnabled({ ...base, codeRuntimeEnabledEnv: "true" }),
+    ).toBe(false);
+  });
+
+  test("the orchestrator alone (no flag) does not enable", () => {
+    expect(
+      isCodeRuntimeEnabled({
+        ...base,
+        loadKubeconfigFromCurrentCluster: "true",
+      }),
+    ).toBe(false);
+  });
+
+  test("a whitespace-only kubeconfig is not configured", () => {
+    expect(
+      isCodeRuntimeEnabled({
+        ...base,
+        codeRuntimeEnabledEnv: "true",
+        kubeconfig: "   ",
+      }),
+    ).toBe(false);
+  });
+
+  test('a non-"true" flag value does not enable', () => {
+    expect(
+      isCodeRuntimeEnabled({
+        ...base,
+        codeRuntimeEnabledEnv: "1",
+        loadKubeconfigFromCurrentCluster: "true",
+      }),
+    ).toBe(false);
+  });
+
+  // config.ts derives orchestrator.loadKubeconfigFromCurrentCluster with
+  // `env === "true"`, and k8s/shared.ts's isK8sConfigured() consumes that
+  // boolean. This gate recomputes the predicate from raw env (importing
+  // k8s/shared would be a circular dependency), so it must agree: any value
+  // other than the exact string "true" is NOT the orchestrator being configured.
+  test.each([
+    "TRUE",
+    "1",
+    "yes",
+    "True",
+    " true ",
+  ])("loadKubeconfigFromCurrentCluster=%s does not count as configured", (value) => {
+    expect(
+      isCodeRuntimeEnabled({
+        ...base,
+        codeRuntimeEnabledEnv: "true",
+        loadKubeconfigFromCurrentCluster: value,
+      }),
+    ).toBe(false);
+  });
+
+  test("nothing configured stays off", () => {
+    expect(isCodeRuntimeEnabled(base)).toBe(false);
+  });
+});
+
+describe("k8sMemoryQuantityToBytes", () => {
+  test("converts binary and decimal suffixes", () => {
+    expect(k8sMemoryQuantityToBytes("4Gi")).toBe(4 * 1024 ** 3);
+    expect(k8sMemoryQuantityToBytes("512Mi")).toBe(512 * 1024 ** 2);
+    expect(k8sMemoryQuantityToBytes("1536Mi")).toBe(1536 * 1024 ** 2);
+    // Decimal suffixes are a different size from their binary namesakes, so
+    // treating `G` as `Gi` would compare the ceiling against the wrong number.
+    expect(k8sMemoryQuantityToBytes("1G")).toBe(1000 ** 3);
+    expect(k8sMemoryQuantityToBytes("1048576")).toBe(1048576);
+  });
+
+  test("returns undefined for anything that is not a quantity", () => {
+    expect(k8sMemoryQuantityToBytes("4GB")).toBeUndefined();
+    expect(k8sMemoryQuantityToBytes("lots")).toBeUndefined();
+    expect(k8sMemoryQuantityToBytes("")).toBeUndefined();
+  });
+});
+
+describe("parseSandboxMemoryMaxBytes", () => {
+  test("defaults to 5Gi and resolves a quantity to bytes", () => {
+    expect(parseSandboxMemoryMaxBytes(undefined, "6Gi")).toBe(5 * 1024 ** 3);
+    expect(parseSandboxMemoryMaxBytes("1Gi", "6Gi")).toBe(1024 ** 3);
+    expect(parseSandboxMemoryMaxBytes("512Mi", "6Gi")).toBe(512 * 1024 ** 2);
+  });
+
+  // The value lands in a cgroup's memory.max. Read as a bare number, "5Gi"
+  // would become a 5-byte ceiling and kill every run that allocated anything,
+  // so an unparseable value has to fall back rather than be honoured.
+  test("falls back and reports a value that is not a quantity", () => {
+    const logged = vi.mocked(logger.error);
+    logged.mockClear();
+    expect(parseSandboxMemoryMaxBytes("5 gigabytes", "6Gi")).toBe(
+      5 * 1024 ** 3,
+    );
+    expect(logged).toHaveBeenCalledTimes(1);
+
+    logged.mockClear();
+    expect(parseSandboxMemoryMaxBytes("0", "6Gi")).toBe(5 * 1024 ** 3);
+    expect(logged).toHaveBeenCalledTimes(1);
+  });
+
+  // The ceiling bounds a cgroup the scheduler cannot see, so the request is the
+  // only thing reserving node capacity for it. At or above the request the
+  // engine can hold more than it reserved, and the shortfall is charged to
+  // whatever else the node runs — the value still applies, but it is flagged.
+  test("flags a ceiling that is not below the engine's memory request", () => {
+    const logged = vi.mocked(logger.error);
+    logged.mockClear();
+    expect(parseSandboxMemoryMaxBytes("4Gi", "4Gi")).toBe(4 * 1024 ** 3);
+    expect(logged).toHaveBeenCalledTimes(1);
+
+    logged.mockClear();
+    parseSandboxMemoryMaxBytes("1Gi", "512Mi");
+    expect(logged).toHaveBeenCalledTimes(1);
+
+    logged.mockClear();
+    parseSandboxMemoryMaxBytes("1Gi", "4Gi");
+    expect(logged).not.toHaveBeenCalled();
+  });
+
+  test("does not flag when the request is not a parseable quantity", () => {
+    const logged = vi.mocked(logger.error);
+    logged.mockClear();
+    expect(parseSandboxMemoryMaxBytes("4Gi", "not-a-quantity")).toBe(
+      4 * 1024 ** 3,
+    );
+    expect(logged).not.toHaveBeenCalled();
+  });
+});
+
+describe("parseEngineDeniedCidrs", () => {
+  test("returns an empty list when unset or empty", () => {
+    expect(parseEngineDeniedCidrs(undefined)).toEqual([]);
+    expect(parseEngineDeniedCidrs("")).toEqual([]);
+  });
+
+  test("keeps valid IPv4 CIDRs", () => {
+    expect(parseEngineDeniedCidrs("100.68.0.0/16,34.118.224.0/20")).toEqual([
+      "100.68.0.0/16",
+      "34.118.224.0/20",
+    ]);
+    expect(parseEngineDeniedCidrs("0.0.0.0/0,255.255.255.255/32")).toEqual([
+      "0.0.0.0/0",
+      "255.255.255.255/32",
+    ]);
+  });
+
+  // A malformed entry would make the Kubernetes API reject the whole egress
+  // NetworkPolicy. The engine StatefulSet is created before its policy, so that
+  // leaves a privileged engine running with no egress policy at all. Dropping
+  // the bad entry keeps the built-in denials in force.
+  test("trims whitespace around entries", () => {
+    expect(parseEngineDeniedCidrs(" 10.1.0.0/16 , 192.0.2.0/24 ")).toEqual([
+      "10.1.0.0/16",
+      "192.0.2.0/24",
+    ]);
+  });
+
+  test("drops every entry when none is valid, and logs them", () => {
+    vi.mocked(logger.error).mockClear();
+    expect(parseEngineDeniedCidrs("nonsense,also-bad")).toEqual([]);
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining("nonsense"),
+    );
+  });
+
+  // A leading zero makes an octet octal-ambiguous across parsers, so the whole
+  // entry is rejected rather than silently denying a different range.
+  test("rejects an octet with a leading zero", () => {
+    expect(parseEngineDeniedCidrs("010.0.0.0/8")).toEqual([]);
+  });
+
+  test.each([
+    "not-a-cidr",
+    "10.0.0.0", // no prefix
+    "10.0.0.0/33", // prefix out of range
+    "256.0.0.0/8", // octet out of range
+    "10.0.0.0/8/8",
+    "fc00::/7", // IPv6 goes on the v6 rule, not this list
+  ])("drops the invalid entry %s", (bad) => {
+    expect(parseEngineDeniedCidrs(`10.1.0.0/16,${bad},192.0.2.0/24`)).toEqual([
+      "10.1.0.0/16",
+      "192.0.2.0/24",
+    ]);
+  });
+});
+
+describe("parseCommaSeparatedList", () => {
+  test("should parse comma-separated values", () => {
+    expect(parseCommaSeparatedList("anthropic,amazon")).toEqual([
+      "anthropic",
+      "amazon",
+    ]);
+  });
+
+  test("should trim whitespace from values", () => {
+    expect(parseCommaSeparatedList(" anthropic , amazon ")).toEqual([
+      "anthropic",
+      "amazon",
+    ]);
+  });
+
+  test("should return empty array for empty string", () => {
+    expect(parseCommaSeparatedList("")).toEqual([]);
+  });
+
+  test("should filter out empty entries from extra commas", () => {
+    expect(parseCommaSeparatedList("anthropic,,amazon,")).toEqual([
+      "anthropic",
+      "amazon",
+    ]);
+  });
+
+  test("should handle single value", () => {
+    expect(parseCommaSeparatedList("anthropic")).toEqual(["anthropic"]);
+  });
+});
+
+describe("parseK8sResourceQuantity", () => {
+  const memoryParams = {
+    envName: "ARCHESTRA_ORCHESTRATOR_MCP_SERVER_MEMORY_LIMIT",
+    validator: isValidK8sMemoryQuantity,
+    defaultValue: "512Mi",
+  };
+
+  test("returns default when unset", () => {
+    expect(
+      parseK8sResourceQuantity({ ...memoryParams, value: undefined }),
+    ).toBe("512Mi");
+  });
+
+  test("returns default when empty or whitespace-only", () => {
+    expect(parseK8sResourceQuantity({ ...memoryParams, value: "" })).toBe(
+      "512Mi",
+    );
+    expect(parseK8sResourceQuantity({ ...memoryParams, value: "   " })).toBe(
+      "512Mi",
+    );
+  });
+
+  test("returns trimmed valid value", () => {
+    expect(parseK8sResourceQuantity({ ...memoryParams, value: " 1Gi " })).toBe(
+      "1Gi",
+    );
+    expect(parseK8sResourceQuantity({ ...memoryParams, value: "2048Mi" })).toBe(
+      "2048Mi",
+    );
+  });
+
+  test("returns default for invalid quantity", () => {
+    expect(
+      parseK8sResourceQuantity({ ...memoryParams, value: "lots-of-ram" }),
+    ).toBe("512Mi");
+    expect(parseK8sResourceQuantity({ ...memoryParams, value: "-1Gi" })).toBe(
+      "512Mi",
+    );
+  });
+
+  test("validates CPU quantities with the CPU validator", () => {
+    const cpuParams = {
+      envName: "ARCHESTRA_ORCHESTRATOR_MCP_SERVER_CPU_REQUEST",
+      validator: isValidK8sCpuQuantity,
+      defaultValue: "50m",
+    };
+    expect(parseK8sResourceQuantity({ ...cpuParams, value: "250m" })).toBe(
+      "250m",
+    );
+    expect(parseK8sResourceQuantity({ ...cpuParams, value: "0.5" })).toBe(
+      "0.5",
+    );
+    expect(parseK8sResourceQuantity({ ...cpuParams, value: "fast" })).toBe(
+      "50m",
+    );
+  });
+});
+
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+describe("parseMcpIdleHibernationSeconds", () => {
+  test("unset means the default window, NOT disabled", () => {
+    // The env var stopped being the on/off switch when hibernation became an
+    // organization setting: leaving it unset must not silently veto a toggle
+    // an administrator turned on.
+    expect(parseMcpIdleHibernationSeconds(undefined)).toEqual({
+      windowSeconds: 1800,
+      hardDisabled: false,
+    });
+    expect(parseMcpIdleHibernationSeconds("")).toEqual({
+      windowSeconds: 1800,
+      hardDisabled: false,
+    });
+  });
+
+  test('an explicit "0" is the operator kill switch', () => {
+    // The one value that overrides the organization: a deployment that must
+    // never see a scaled-to-zero MCP pod.
+    expect(parseMcpIdleHibernationSeconds("0")).toEqual({
+      windowSeconds: 1800,
+      hardDisabled: true,
+    });
+    expect(parseMcpIdleHibernationSeconds(" 0 ")).toEqual({
+      windowSeconds: 1800,
+      hardDisabled: true,
+    });
+  });
+
+  test("every numerically-zero spelling kills, none of them arm", () => {
+    // The failure mode this pins: "00" used to miss the literal-"0" test AND
+    // the positive-int parse, silently arming hibernation with the default
+    // window — the exact opposite of what the operator wrote.
+    for (const spelling of ["00", "0.0", "+0", "000 "]) {
+      expect(parseMcpIdleHibernationSeconds(spelling)).toEqual({
+        windowSeconds: 1800,
+        hardDisabled: true,
+      });
+    }
+  });
+
+  test("values below the floor are clamped to 120", () => {
+    expect(parseMcpIdleHibernationSeconds("60")).toEqual({
+      windowSeconds: 120,
+      hardDisabled: false,
+    });
+    expect(parseMcpIdleHibernationSeconds("1")).toEqual({
+      windowSeconds: 120,
+      hardDisabled: false,
+    });
+  });
+
+  test("an explicit test minimum accelerates E2E without changing the kill switch", () => {
+    expect(parseMcpIdleHibernationSeconds("1", 8)).toEqual({
+      windowSeconds: 8,
+      hardDisabled: false,
+    });
+    expect(parseMcpIdleHibernationSeconds("0", 8)).toEqual({
+      windowSeconds: 1800,
+      hardDisabled: true,
+    });
+  });
+
+  test("values at or above the floor pass through", () => {
+    expect(parseMcpIdleHibernationSeconds("120")).toEqual({
+      windowSeconds: 120,
+      hardDisabled: false,
+    });
+    expect(parseMcpIdleHibernationSeconds("600")).toEqual({
+      windowSeconds: 600,
+      hardDisabled: false,
+    });
+  });
+
+  test("garbage and negative values fall back to the default window", () => {
+    // Unparseable configuration is an operator mistake, not a kill switch —
+    // only the literal "0" turns the feature off.
+    expect(parseMcpIdleHibernationSeconds("soon")).toEqual({
+      windowSeconds: 1800,
+      hardDisabled: false,
+    });
+    expect(parseMcpIdleHibernationSeconds("-300")).toEqual({
+      windowSeconds: 1800,
+      hardDisabled: false,
+    });
+  });
+});
+// SPDX-SnippetEnd
+
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+describe("parseHelmReleaseName", () => {
+  test("takes the release name the chart injected", () => {
+    expect(parseHelmReleaseName("my-release")).toBe("my-release");
+    expect(parseHelmReleaseName("  my-release  ")).toBe("my-release");
+    expect(parseHelmReleaseName("archestra1")).toBe("archestra1");
+  });
+
+  test("an absent release name stays absent — it is never approximated", () => {
+    // Callers name a cluster object with this. A stand-in value would have
+    // them create an object under a name nothing else looks for, so "unknown"
+    // has to survive all the way to them.
+    expect(parseHelmReleaseName(undefined)).toBeUndefined();
+    expect(parseHelmReleaseName("")).toBeUndefined();
+    expect(parseHelmReleaseName("   ")).toBeUndefined();
+  });
+
+  test("a value Helm could not have produced is rejected, not repaired", () => {
+    // Repairing it would invent a name: "My_Release" and "my-release" would
+    // both resolve to the same object, which is exactly the collision the
+    // release name exists to prevent.
+    expect(parseHelmReleaseName("My-Release")).toBeUndefined();
+    expect(parseHelmReleaseName("my_release")).toBeUndefined();
+    expect(parseHelmReleaseName("-my-release")).toBeUndefined();
+    expect(parseHelmReleaseName("my-release-")).toBeUndefined();
+    expect(parseHelmReleaseName("my release")).toBeUndefined();
+    expect(parseHelmReleaseName("a".repeat(54))).toBeUndefined();
+    expect(parseHelmReleaseName("a".repeat(53))).toBe("a".repeat(53));
+  });
+});
+// SPDX-SnippetEnd
+
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+describe("getMcpImagePrepullConfig", () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    delete process.env.ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_ENABLED;
+    delete process.env
+      .ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_PRIORITY_CLASS_NAME;
+    delete process.env.ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_CPU_REQUEST;
+    delete process.env.ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_MEMORY_REQUEST;
+    delete process.env.ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_MEMORY_LIMIT;
+    delete process.env.ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_BOOTSTRAP_IMAGE;
+    delete process.env
+      .ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_BOOTSTRAP_IMAGE_PULL_SECRETS;
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  test("unset means on: pre-pulling follows idle hibernation", () => {
+    // The opposite default from the hibernation flag, and deliberately so:
+    // this is not a feature gate but a kill switch for the extra per-node pod,
+    // and hibernation's own gates already decide whether anything runs.
+    expect(getMcpImagePrepullConfig().enabled).toBe(true);
+
+    process.env.ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_ENABLED = "";
+    expect(getMcpImagePrepullConfig().enabled).toBe(true);
+    process.env.ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_ENABLED = "true";
+    expect(getMcpImagePrepullConfig().enabled).toBe(true);
+  });
+
+  test("the bootstrap image defaults to static busybox and honors an override", () => {
+    // Never the MCP server base image: that one is an operator's choice, and
+    // assuming anything about its contents wedges every pre-pull pod in init.
+    // Static linking also lets the copied noop run in images using another libc.
+    expect(getMcpImagePrepullConfig().bootstrapImage).toBe(
+      "docker.io/library/busybox:1.36-musl",
+    );
+
+    process.env.ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_BOOTSTRAP_IMAGE =
+      "  registry.internal.example.com/busybox:1.36  ";
+    expect(getMcpImagePrepullConfig().bootstrapImage).toBe(
+      "registry.internal.example.com/busybox:1.36",
+    );
+
+    process.env.ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_BOOTSTRAP_IMAGE = "";
+    expect(getMcpImagePrepullConfig().bootstrapImage).toBe(
+      "docker.io/library/busybox:1.36-musl",
+    );
+  });
+
+  test("bootstrap image pull secrets are trimmed and deduplicated", () => {
+    process.env.ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_BOOTSTRAP_IMAGE_PULL_SECRETS =
+      " mirror-auth, shared-auth,mirror-auth ";
+    expect(getMcpImagePrepullConfig().bootstrapImagePullSecrets).toEqual([
+      "mirror-auth",
+      "shared-auth",
+    ]);
+  });
+
+  test('only an explicit "false" turns pre-pulling off', () => {
+    process.env.ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_ENABLED = "false";
+    expect(getMcpImagePrepullConfig().enabled).toBe(false);
+    process.env.ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_ENABLED = " false ";
+    expect(getMcpImagePrepullConfig().enabled).toBe(false);
+
+    // A typo must not silently disable it — the operator asked for nothing
+    // recognizable, and the safe reading of that is "leave the cache warm".
+    process.env.ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_ENABLED = "no";
+    expect(getMcpImagePrepullConfig().enabled).toBe(true);
+  });
+
+  test("no priority class unless one is configured", () => {
+    expect(getMcpImagePrepullConfig().priorityClassName).toBeUndefined();
+
+    process.env.ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_PRIORITY_CLASS_NAME =
+      "  best-effort ";
+    expect(getMcpImagePrepullConfig().priorityClassName).toBe("best-effort");
+  });
+
+  test("footprint defaults are tiny, and an invalid quantity keeps them", () => {
+    // Paid on every node in the cluster.
+    expect(getMcpImagePrepullConfig().resources).toEqual({
+      requests: { cpu: "10m", memory: "16Mi" },
+      limits: { memory: "64Mi" },
+    });
+
+    process.env.ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_CPU_REQUEST = "25m";
+    process.env.ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_MEMORY_REQUEST =
+      "not-a-quantity";
+    process.env.ARCHESTRA_ORCHESTRATOR_MCP_IMAGE_PREPULL_MEMORY_LIMIT = "128Mi";
+
+    expect(getMcpImagePrepullConfig().resources).toEqual({
+      requests: { cpu: "25m", memory: "16Mi" },
+      limits: { memory: "128Mi" },
+    });
+  });
+});
+// SPDX-SnippetEnd
+
+describe("parseTrustProxy", () => {
+  test("should return false when undefined", () => {
+    expect(parseTrustProxy(undefined)).toBe(false);
+  });
+
+  test("should return false when empty string", () => {
+    expect(parseTrustProxy("")).toBe(false);
+  });
+
+  test("should return false when whitespace-only", () => {
+    expect(parseTrustProxy("   ")).toBe(false);
+  });
+
+  test('should return false for "false"', () => {
+    expect(parseTrustProxy("false")).toBe(false);
+  });
+
+  test('should return true for "true"', () => {
+    expect(parseTrustProxy("true")).toBe(true);
+  });
+
+  test("should trim whitespace and return true", () => {
+    expect(parseTrustProxy("  true  ")).toBe(true);
+  });
+
+  test("should return string for a single IP", () => {
+    expect(parseTrustProxy("127.0.0.1")).toBe("127.0.0.1");
+  });
+
+  test("should return string for a single CIDR", () => {
+    expect(parseTrustProxy("192.168.1.0/24")).toBe("192.168.1.0/24");
+  });
+
+  test("should return normalised string for comma-separated IPs", () => {
+    expect(parseTrustProxy("127.0.0.1,10.0.0.1")).toBe("127.0.0.1,10.0.0.1");
+  });
+
+  test("should return normalised string for comma-separated CIDRs", () => {
+    expect(parseTrustProxy("10.0.0.0/8,172.16.0.0/12,192.168.0.0/16")).toBe(
+      "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16",
+    );
+  });
+
+  test("should trim whitespace around each IP in a comma-separated list", () => {
+    expect(parseTrustProxy("  127.0.0.1 , 10.0.0.1  ")).toBe(
+      "127.0.0.1,10.0.0.1",
+    );
+  });
+
+  test("should filter empty entries from extra commas", () => {
+    expect(parseTrustProxy("127.0.0.1,,10.0.0.1")).toBe("127.0.0.1,10.0.0.1");
+  });
+});
+
+describe("getMCPGatewayOauthAllowedPublicHosts", () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    delete process.env.ARCHESTRA_API_BASE_URL;
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  // ARCHESTRA_FRONTEND_URL is captured at module load (config.frontendBaseUrl),
+  // so it can't be mutated per-test. We assert the function pulls that captured
+  // value through, and exercise the ARCHESTRA_API_BASE_URL path
+  // (which is read fresh on every call) for the rest of the behavior.
+
+  test("always includes the frontendBaseUrl host", () => {
+    const hosts = getMCPGatewayOauthAllowedPublicHosts();
+    expect(hosts.size).toBeGreaterThan(0);
+    expect(hosts.has(new URL(config.frontendBaseUrl).host.toLowerCase())).toBe(
+      true,
+    );
+  });
+
+  test("includes the frontend host plus local dev origins when ARCHESTRA_API_BASE_URL is unset", () => {
+    const expected = new URL(config.frontendBaseUrl).host.toLowerCase();
+    const hosts = getMCPGatewayOauthAllowedPublicHosts();
+    expect(hosts.has(expected)).toBe(true);
+    // Local dev origins are always allow-listed in development so a configured
+    // tunnel (ARCHESTRA_FRONTEND_URL) can't break localhost MCP connections.
+    expect(hosts.has("localhost:3000")).toBe(true);
+    expect(hosts.has("127.0.0.1:3000")).toBe(true);
+  });
+
+  test("includes a single ARCHESTRA_API_BASE_URL host", () => {
+    process.env.ARCHESTRA_API_BASE_URL = "https://api.example.com";
+    expect(getMCPGatewayOauthAllowedPublicHosts().has("api.example.com")).toBe(
+      true,
+    );
+  });
+
+  test("splits comma-separated ARCHESTRA_API_BASE_URL", () => {
+    process.env.ARCHESTRA_API_BASE_URL =
+      "https://api.example.com,https://internal.svc:9000";
+    const hosts = getMCPGatewayOauthAllowedPublicHosts();
+    expect(hosts.has("api.example.com")).toBe(true);
+    expect(hosts.has("internal.svc:9000")).toBe(true);
+  });
+
+  test("strips default ports (80 for http, 443 for https)", () => {
+    process.env.ARCHESTRA_API_BASE_URL =
+      "https://api.example.com:443,http://other.example.com:80";
+    const hosts = getMCPGatewayOauthAllowedPublicHosts();
+    expect(hosts.has("api.example.com")).toBe(true);
+    expect(hosts.has("other.example.com")).toBe(true);
+  });
+
+  test("keeps explicit non-default ports", () => {
+    process.env.ARCHESTRA_API_BASE_URL =
+      "http://something.example:9000,https://api.example.com:8443";
+    const hosts = getMCPGatewayOauthAllowedPublicHosts();
+    expect(hosts.has("something.example:9000")).toBe(true);
+    expect(hosts.has("api.example.com:8443")).toBe(true);
+  });
+
+  test("lowercases hostnames", () => {
+    process.env.ARCHESTRA_API_BASE_URL = "https://Api.Example.COM";
+    expect(getMCPGatewayOauthAllowedPublicHosts().has("api.example.com")).toBe(
+      true,
+    );
+  });
+
+  test("trims whitespace around comma-separated URLs", () => {
+    process.env.ARCHESTRA_API_BASE_URL =
+      "  https://api.example.com , https://internal.svc:9000  ";
+    const hosts = getMCPGatewayOauthAllowedPublicHosts();
+    expect(hosts.has("api.example.com")).toBe(true);
+    expect(hosts.has("internal.svc:9000")).toBe(true);
+  });
+
+  test("ignores empty entries from extra commas", () => {
+    process.env.ARCHESTRA_API_BASE_URL =
+      "https://api.example.com,,https://internal.svc:9000";
+    const hosts = getMCPGatewayOauthAllowedPublicHosts();
+    expect(hosts.has("api.example.com")).toBe(true);
+    expect(hosts.has("internal.svc:9000")).toBe(true);
+  });
+
+  test("ignores malformed URLs without failing", () => {
+    process.env.ARCHESTRA_API_BASE_URL = "not-a-url,https://api.example.com";
+    expect(getMCPGatewayOauthAllowedPublicHosts().has("api.example.com")).toBe(
+      true,
+    );
+  });
+});
+
+describe("getAppAssetBaseOrigin", () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    delete process.env.ARCHESTRA_API_BASE_URL;
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  test("prefers a public https entry over a cluster-internal one", () => {
+    process.env.ARCHESTRA_API_BASE_URL =
+      "http://archestra.default.svc:9000,https://api.example.com";
+    expect(getAppAssetBaseOrigin()).toBe("https://api.example.com");
+  });
+
+  test("uses a non-https entry when no https entry is present", () => {
+    process.env.ARCHESTRA_API_BASE_URL = "http://api.example.com:9000/base";
+    expect(getAppAssetBaseOrigin()).toBe("http://api.example.com:9000");
+  });
+
+  test("skips a malformed entry and uses the next candidate", () => {
+    process.env.ARCHESTRA_API_BASE_URL = "not-a-url,https://api.example.com";
+    expect(getAppAssetBaseOrigin()).toBe("https://api.example.com");
+  });
+
+  test("falls back to the frontend origin (never a loopback API origin) when ARCHESTRA_API_BASE_URL is unset", () => {
+    // The old fallback was http://127.0.0.1:<backend port>, which a public page
+    // (a tunnel, the shared catalog) cannot load — Private Network Access blocks
+    // it, taking the injected recorder/replay SDK down with it. The frontend
+    // origin is same-origin with the page, so the assets always load.
+    const origin = getAppAssetBaseOrigin();
+    expect(origin).toBe(new URL(config.frontendBaseUrl).origin);
+    expect(origin).not.toContain("127.0.0.1:9000");
+  });
+});
+
+describe("parseRetentionDays", () => {
+  const parse = (value: string | undefined) =>
+    parseRetentionDays("ARCHESTRA_AUDIT_LOG_RETENTION_DAYS", value);
+
+  test("returns 0 (disabled) when env var is not set", () => {
+    expect(parse(undefined)).toBe(0);
+  });
+
+  test("returns 0 (disabled) when env var is empty string", () => {
+    expect(parse("")).toBe(0);
+  });
+
+  test("returns 0 to keep the sweep disabled", () => {
+    expect(parse("0")).toBe(0);
+  });
+
+  test("returns a valid positive integer (opt-in)", () => {
+    expect(parse("90")).toBe(90);
+    expect(parse("365")).toBe(365);
+  });
+
+  test("trims whitespace before parsing", () => {
+    expect(parse("  30  ")).toBe(30);
+  });
+
+  test("returns default and warns on non-numeric value, naming the env var", () => {
+    expect(parse("abc")).toBe(0);
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("abc"));
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("ARCHESTRA_AUDIT_LOG_RETENTION_DAYS"),
+    );
+  });
+
+  test("returns default and warns on negative value", () => {
+    expect(parse("-1")).toBe(0);
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("-1"));
+  });
+
+  test("rejects partially numeric values instead of truncating them", () => {
+    // parseInt would read "30days" as 30 and "1.5" as 1 — for a value that
+    // drives deletion, a typo must disable the sweep, not shrink the window.
+    expect(parse("30days")).toBe(0);
+    expect(parse("1.5")).toBe(0);
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("parseHackathonRecorderEnabled", () => {
+  const parse = (
+    enterpriseLicenseActivated: boolean,
+    enterpriseOverride?: string,
+  ) =>
+    parseHackathonRecorderEnabled({
+      enterpriseLicenseActivated,
+      enterpriseOverride,
+    });
+
+  test("on for every community deployment — there is no opt-out flag", () => {
+    // The date window and the org toggle already decide when and whether it
+    // shows, so a community deployment has no switch of its own.
+    expect(parse(false)).toBe(true);
+    expect(parse(false, "true")).toBe(true);
+  });
+
+  test("stays off when the enterprise license is activated", () => {
+    expect(parse(true)).toBe(false);
+  });
+
+  test("the undocumented override is the only enterprise way in", () => {
+    expect(parse(true, "true")).toBe(true);
+  });
+
+  test("the override does nothing unless it is exactly true", () => {
+    expect(parse(true, "yes")).toBe(false);
+    expect(parse(true, "")).toBe(false);
+  });
+});
+
+describe("parseHackathonGalleryRepo", () => {
+  test("unset means sharing is not offered", () => {
+    expect(parseHackathonGalleryRepo(undefined)).toBeUndefined();
+    expect(parseHackathonGalleryRepo("")).toBeUndefined();
+    expect(parseHackathonGalleryRepo("   ")).toBeUndefined();
+  });
+
+  test("splits owner/name, tolerating surrounding whitespace", () => {
+    expect(parseHackathonGalleryRepo("archestra-ai/app-gallery")).toEqual({
+      owner: "archestra-ai",
+      name: "app-gallery",
+    });
+    expect(parseHackathonGalleryRepo(" archestra-ai/app-gallery ")).toEqual({
+      owner: "archestra-ai",
+      name: "app-gallery",
+    });
+  });
+
+  test("refuses anything that is not exactly owner/name", () => {
+    // Fail at boot, not with a broken share button: a URL, a bare owner, or a
+    // nested path are all misconfigurations.
+    expect(() =>
+      parseHackathonGalleryRepo("https://github.com/archestra-ai/app-gallery"),
+    ).toThrow(/owner\/name/);
+    expect(() => parseHackathonGalleryRepo("archestra-ai")).toThrow(
+      /owner\/name/,
+    );
+    expect(() =>
+      parseHackathonGalleryRepo("archestra-ai/app-gallery/main"),
+    ).toThrow(/owner\/name/);
+  });
+});
+
+describe("resolveRenderBaseUrl", () => {
+  test("films the deployment's own first configured origin", () => {
+    // The renderer must reach the frontend at an origin the app sandbox trusts
+    // to be framed by. Reaching it at loopback instead is refused by the
+    // sandbox's frame-ancestors policy, and the export films an empty app pane
+    // rather than failing — so the default has to come from the same set CORS
+    // and auth are built from.
+    expect(
+      resolveRenderBaseUrl({
+        explicit: undefined,
+        configuredOrigins: ["https://apps.example.com", "https://tunnel.test"],
+      }),
+    ).toBe("https://apps.example.com");
+  });
+
+  test("an explicit base URL wins, for a renderer pointed somewhere internal", () => {
+    expect(
+      resolveRenderBaseUrl({
+        explicit: "http://frontend.svc:3000",
+        configuredOrigins: ["https://apps.example.com"],
+      }),
+    ).toBe("http://frontend.svc:3000");
+  });
+
+  test("falls back to loopback only when nothing is configured", () => {
+    expect(
+      resolveRenderBaseUrl({ explicit: "  ", configuredOrigins: [] }),
+    ).toBe("http://localhost:3000");
+  });
+});
+
+describe("betaFeatureEnabled", () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    delete process.env.ARCHESTRA_BETA;
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  describe("with ARCHESTRA_BETA unset", () => {
+    test("an unset flag stays off", () => {
+      expect(betaFeatureEnabled(undefined)).toBe(false);
+    });
+
+    test("a blank flag stays off", () => {
+      expect(betaFeatureEnabled("")).toBe(false);
+    });
+
+    test('an explicit "true" enables the flag', () => {
+      expect(betaFeatureEnabled("true")).toBe(true);
+    });
+
+    test('an explicit "false" disables the flag', () => {
+      expect(betaFeatureEnabled("false")).toBe(false);
+    });
+  });
+
+  describe("with ARCHESTRA_BETA=true", () => {
+    beforeEach(() => {
+      process.env.ARCHESTRA_BETA = "true";
+    });
+
+    test("an unset flag falls back to beta (on)", () => {
+      expect(betaFeatureEnabled(undefined)).toBe(true);
+    });
+
+    test("a blank flag falls back to beta (on)", () => {
+      expect(betaFeatureEnabled("")).toBe(true);
+    });
+
+    test('an explicit "false" still wins over beta', () => {
+      expect(betaFeatureEnabled("false")).toBe(false);
+    });
+
+    test('an explicit "true" stays on', () => {
+      expect(betaFeatureEnabled("true")).toBe(true);
+    });
+  });
+
+  describe("with ARCHESTRA_BETA set to a non-true value", () => {
+    test('"false" does not trigger the fallback', () => {
+      process.env.ARCHESTRA_BETA = "false";
+      expect(betaFeatureEnabled(undefined)).toBe(false);
+    });
+
+    test("any other value is treated as off", () => {
+      process.env.ARCHESTRA_BETA = "1";
+      expect(betaFeatureEnabled(undefined)).toBe(false);
+    });
+  });
+
+  test('only the exact string "true" enables a flag', () => {
+    expect(betaFeatureEnabled("TRUE")).toBe(false);
+    expect(betaFeatureEnabled("yes")).toBe(false);
+    expect(betaFeatureEnabled("1")).toBe(false);
+  });
+});
+
+describe("parseLogFormat", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  test('accepts "pretty"', () => {
+    expect(parseLogFormat("pretty")).toBe("pretty");
+  });
+
+  test('accepts "json"', () => {
+    expect(parseLogFormat("json")).toBe("json");
+  });
+
+  test("is case-insensitive and trims whitespace", () => {
+    expect(parseLogFormat("  PRETTY  ")).toBe("pretty");
+    expect(parseLogFormat("Json")).toBe("json");
+  });
+
+  test('defaults to "json" when undefined or empty without warning', () => {
+    expect(parseLogFormat(undefined)).toBe("json");
+    expect(parseLogFormat("")).toBe("json");
+    expect(parseLogFormat("   ")).toBe("json");
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  test('warns and falls back to "json" on unknown values', () => {
+    expect(parseLogFormat("xml")).toBe("json");
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('Invalid ARCHESTRA_LOGGING_FORMAT value "xml"'),
+    );
+  });
+});
+
+describe("parseAnthropicWifConfig", () => {
+  const completeEnv = {
+    federationRuleId: "fdrl_test",
+    organizationId: "00000000-0000-0000-0000-000000000000",
+    serviceAccountId: "svac_test",
+    identityTokenFile: "/var/run/secrets/anthropic.com/token",
+  };
+
+  test("returns null when nothing is set", () => {
+    expect(parseAnthropicWifConfig({})).toBeNull();
+  });
+
+  test("parses a complete configuration with a token file", () => {
+    expect(parseAnthropicWifConfig(completeEnv)).toEqual({
+      federationRuleId: "fdrl_test",
+      organizationId: "00000000-0000-0000-0000-000000000000",
+      serviceAccountId: "svac_test",
+      identityTokenFile: "/var/run/secrets/anthropic.com/token",
+    });
+  });
+
+  test("accepts an inline identity token as the token source", () => {
+    expect(
+      parseAnthropicWifConfig({
+        ...completeEnv,
+        identityTokenFile: undefined,
+        identityToken: "jwt-inline",
+      }),
+    ).toMatchObject({ identityToken: "jwt-inline" });
+  });
+
+  test("includes the optional workspace ID when set", () => {
+    expect(
+      parseAnthropicWifConfig({ ...completeEnv, workspaceId: "wrkspc_test" }),
+    ).toMatchObject({ workspaceId: "wrkspc_test" });
+  });
+
+  test.each([
+    ["federationRuleId", { ...completeEnv, federationRuleId: undefined }],
+    ["organizationId", { ...completeEnv, organizationId: undefined }],
+    ["serviceAccountId", { ...completeEnv, serviceAccountId: undefined }],
+    ["token source", { ...completeEnv, identityTokenFile: undefined }],
+  ])("disables WIF when %s is missing", (_label, env) => {
+    expect(parseAnthropicWifConfig(env)).toBeNull();
+  });
+
+  test("treats whitespace-only values as unset", () => {
+    expect(
+      parseAnthropicWifConfig({ ...completeEnv, federationRuleId: "  " }),
+    ).toBeNull();
+  });
+});
+
+describe("deriveOllamaNativeBaseUrl", () => {
+  test("strips a /v1 suffix from the OpenAI-compatible URL", () => {
+    // The native API is served from the server root, so a deployment can set
+    // ARCHESTRA_OLLAMA_BASE_URL alone and get both providers.
+    expect(
+      deriveOllamaNativeBaseUrl({
+        nativeBaseUrl: undefined,
+        ollamaBaseUrl: "http://ollama.internal:11434/v1",
+      }),
+    ).toBe("http://ollama.internal:11434");
+  });
+
+  test("prefers an explicit native URL", () => {
+    expect(
+      deriveOllamaNativeBaseUrl({
+        nativeBaseUrl: "http://native.internal:11434",
+        ollamaBaseUrl: "http://other.internal:11434/v1",
+      }),
+    ).toBe("http://native.internal:11434");
+  });
+
+  test("strips a /v1 suffix from an explicit native URL too", () => {
+    // Setting the native variable to a /v1 URL is the likeliest misconfiguration,
+    // and it points at the OpenAI-compatible API rather than the native one.
+    expect(
+      deriveOllamaNativeBaseUrl({
+        nativeBaseUrl: "http://native.internal:11434/v1",
+        ollamaBaseUrl: undefined,
+      }),
+    ).toBe("http://native.internal:11434");
+  });
+
+  test("strips trailing slashes", () => {
+    expect(
+      deriveOllamaNativeBaseUrl({
+        nativeBaseUrl: "http://native.internal:11434/v1///",
+        ollamaBaseUrl: undefined,
+      }),
+    ).toBe("http://native.internal:11434");
+    expect(
+      deriveOllamaNativeBaseUrl({
+        nativeBaseUrl: "http://native.internal:11434/",
+        ollamaBaseUrl: undefined,
+      }),
+    ).toBe("http://native.internal:11434");
+  });
+
+  test("falls back to localhost when neither is set", () => {
+    expect(
+      deriveOllamaNativeBaseUrl({
+        nativeBaseUrl: undefined,
+        ollamaBaseUrl: undefined,
+      }),
+    ).toBe("http://localhost:11434");
+  });
+
+  test("leaves a path that merely contains v1 alone", () => {
+    expect(
+      deriveOllamaNativeBaseUrl({
+        nativeBaseUrl: "http://proxy.internal/v1/ollama",
+        ollamaBaseUrl: undefined,
+      }),
+    ).toBe("http://proxy.internal/v1/ollama");
+  });
+});
+
+describe("parseHackathonRecorderMaxFinalCutMs", () => {
+  test("defaults to the shared limit when unset", () => {
+    expect(parseHackathonRecorderMaxFinalCutMs(undefined)).toBe(60_000);
+    expect(parseHackathonRecorderMaxFinalCutMs("")).toBe(
+      APP_RECORDING_DEFAULT_MAX_FINAL_CUT_MS,
+    );
+    expect(parseHackathonRecorderMaxFinalCutMs("   ")).toBe(
+      APP_RECORDING_DEFAULT_MAX_FINAL_CUT_MS,
+    );
+  });
+
+  test("takes a deployment's own limit", () => {
+    expect(parseHackathonRecorderMaxFinalCutMs("30000")).toBe(30_000);
+    expect(parseHackathonRecorderMaxFinalCutMs(" 600000 ")).toBe(600_000);
+  });
+
+  test("refuses a value it cannot honour rather than silently defaulting", () => {
+    // Falling back would read as the platform ignoring the operator's limit —
+    // the one failure mode a length cap must not have.
+    expect(() => parseHackathonRecorderMaxFinalCutMs("abc")).toThrow(
+      /whole number of milliseconds/,
+    );
+    expect(() => parseHackathonRecorderMaxFinalCutMs("60.5")).toThrow();
+    expect(() => parseHackathonRecorderMaxFinalCutMs("-1000")).toThrow();
+  });
+
+  test("refuses a limit so small nothing could ever be submitted", () => {
+    expect(() => parseHackathonRecorderMaxFinalCutMs("10")).toThrow();
+    expect(parseHackathonRecorderMaxFinalCutMs("5000")).toBe(5_000);
+  });
+});
+
+describe("parseNonNegativeInt", () => {
+  test("falls back when unset or unparseable", () => {
+    expect(parseNonNegativeInt(undefined, 90)).toBe(90);
+    expect(parseNonNegativeInt("", 90)).toBe(90);
+    expect(parseNonNegativeInt("not-a-number", 90)).toBe(90);
+  });
+
+  test("accepts zero, which parsePositiveInt would reject", () => {
+    // 0 is a real setting here — a retention window of zero means "keep
+    // forever" — so it must not collapse to the default.
+    expect(parseNonNegativeInt("0", 90)).toBe(0);
+  });
+
+  test("accepts positive values and rejects negative ones", () => {
+    expect(parseNonNegativeInt("30", 90)).toBe(30);
+    expect(parseNonNegativeInt("-5", 90)).toBe(90);
+  });
+});
+
+describe("parseClampedInt", () => {
+  test("falls back when unset or unparseable", () => {
+    expect(parseClampedInt(undefined, 512, 128, 2048)).toBe(512);
+    expect(parseClampedInt("", 512, 128, 2048)).toBe(512);
+    expect(parseClampedInt("not-a-number", 512, 128, 2048)).toBe(512);
+  });
+
+  test("passes through a value inside the range", () => {
+    expect(parseClampedInt("256", 512, 128, 2048)).toBe(256);
+  });
+
+  test("clamps out-of-range values to the nearest bound", () => {
+    // Deliberately NOT the default: an operator who wrote 8 wanted "smaller",
+    // and silently restoring 512 would look like the setting was ignored.
+    expect(parseClampedInt("8", 512, 128, 2048)).toBe(128);
+    expect(parseClampedInt("999999", 512, 128, 2048)).toBe(2048);
+    expect(parseClampedInt("-5", 512, 128, 2048)).toBe(128);
+  });
+
+  test("allows zero when the range permits it", () => {
+    expect(parseClampedInt("0", 1, 0, 4)).toBe(0);
+  });
+});
+
+describe("parseClampedIntOrZero", () => {
+  test("falls back when unset or unparseable", () => {
+    expect(parseClampedIntOrZero(undefined, 0, 32, 2048)).toBe(0);
+    expect(parseClampedIntOrZero("", 0, 32, 2048)).toBe(0);
+    expect(parseClampedIntOrZero("not-a-number", 0, 32, 2048)).toBe(0);
+  });
+
+  test("passes through a value inside the range", () => {
+    expect(parseClampedIntOrZero("128", 0, 32, 2048)).toBe(128);
+  });
+
+  test("honours an explicit zero instead of clamping it up to the floor", () => {
+    // The whole point of this parser: 0 means "off", which sits outside the
+    // valid range. A plain clamp would turn it into 32 and switch the feature
+    // ON for an operator who wrote 0 to switch it off.
+    expect(parseClampedIntOrZero("0", 0, 32, 2048)).toBe(0);
+  });
+
+  test("corrects a too-small non-zero value upward rather than disabling", () => {
+    // An operator who wrote 8 wanted "smaller", not "off".
+    expect(parseClampedIntOrZero("8", 0, 32, 2048)).toBe(32);
+  });
+
+  test("treats a negative value as off", () => {
+    expect(parseClampedIntOrZero("-5", 0, 32, 2048)).toBe(0);
+  });
+
+  test("clamps above the ceiling", () => {
+    expect(parseClampedIntOrZero("999999", 0, 32, 2048)).toBe(2048);
+  });
+});
+
+describe("parseClampedFloat", () => {
+  test("falls back when unset or unparseable", () => {
+    expect(parseClampedFloat(undefined, 1.2, 0, 10)).toBe(1.2);
+    expect(parseClampedFloat("", 1.2, 0, 10)).toBe(1.2);
+    expect(parseClampedFloat("not-a-number", 1.2, 0, 10)).toBe(1.2);
+  });
+
+  test("keeps the fractional part", () => {
+    // The whole reason this exists: parseClampedInt would read 0.75 as 0,
+    // silently turning BM25's length normalization off.
+    expect(parseClampedFloat("0.75", 1.2, 0, 10)).toBe(0.75);
+  });
+
+  test("clamps out-of-range values to the nearest bound", () => {
+    expect(parseClampedFloat("-3", 0.75, 0, 1)).toBe(0);
+    expect(parseClampedFloat("42", 0.75, 0, 1)).toBe(1);
+  });
+
+  test("falls back rather than clamping non-finite input", () => {
+    // Clamping NaN yields NaN, which would poison every score derived from it.
+    expect(parseClampedFloat("NaN", 1.2, 0, 10)).toBe(1.2);
+    expect(parseClampedFloat("Infinity", 1.2, 0, 10)).toBe(1.2);
+  });
+
+  test("allows zero when the range permits it", () => {
+    expect(parseClampedFloat("0", 0.75, 0, 1)).toBe(0);
+  });
+});
+
+describe("parseOtelCaptureContent", () => {
+  test("defaults on without content encryption, off with it", () => {
+    expect(
+      parseOtelCaptureContent({
+        envValue: undefined,
+        contentEncryptionConfigured: false,
+      }),
+    ).toBe(true);
+    expect(
+      parseOtelCaptureContent({
+        envValue: undefined,
+        contentEncryptionConfigured: true,
+      }),
+    ).toBe(false);
+  });
+
+  test("an explicit value always wins over the encryption default", () => {
+    expect(
+      parseOtelCaptureContent({
+        envValue: "true",
+        contentEncryptionConfigured: true,
+      }),
+    ).toBe(true);
+    expect(
+      parseOtelCaptureContent({
+        envValue: "false",
+        contentEncryptionConfigured: false,
+      }),
+    ).toBe(false);
+  });
+
+  test("junk values take the default path, not the explicit one", () => {
+    expect(
+      parseOtelCaptureContent({
+        envValue: "yes",
+        contentEncryptionConfigured: true,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("OpenAPPA feature configuration", () => {
+  test("reporting defaults on for OpenAPPA and supports an explicit opt-out", () => {
+    expect(parseOpenAppaConfig("true").yellEnabled).toBe(true);
+    expect(parseOpenAppaConfig("true", "true").yellEnabled).toBe(true);
+    for (const [enabled, reporting] of [
+      [undefined, "true"],
+      ["false", "true"],
+      ["true", "false"],
+      ["true", ""],
+      ["true", "TRUE"],
+    ]) {
+      expect(parseOpenAppaConfig(enabled, reporting).yellEnabled).toBe(false);
+    }
+  });
+  test("gates APPA registration on its feature flag, regardless of the explicit plugin list", () => {
+    expect(parseLlmProxyPlugins(undefined)).toEqual([]);
+    expect(parseLlmProxyPlugins(" appa ")).toEqual([]);
+    expect(parseLlmProxyPlugins(undefined, true)).toEqual(["appa"]);
+    expect(parseLlmProxyPlugins("", true)).toEqual(["appa"]);
+    expect(parseLlmProxyPlugins(" appa ", true)).toEqual(["appa"]);
+  });
+
+  test.each([
+    false,
+    true,
+  ])("rejects invalid plugin configuration (APPA enabled=%s)", (enabled) => {
+    expect(() => parseLlmProxyPlugins("unknown", enabled)).toThrow(
+      "ARCHESTRA_LLM_PROXY_PLUGINS contains unsupported plugin names",
+    );
+    expect(() => parseLlmProxyPlugins("appa,appa", enabled)).toThrow(
+      "ARCHESTRA_LLM_PROXY_PLUGINS must not contain duplicates",
+    );
+  });
+
+  test.each([
+    undefined,
+    "false",
+    "TRUE",
+    "1",
+  ])("requires explicit true to enable APPA (flag=%s)", (enabled) => {
+    vi.stubEnv("ARCHESTRA_BETA", "true");
+    expect(parseOpenAppaConfig(enabled)).toEqual({
+      enabled: false,
+      yellEnabled: false,
+      offerSigningSecret: "",
+    });
+  });
+  test("enables database policies without a container path", () => {
+    expect(parseOpenAppaConfig("true")).toEqual({
+      enabled: true,
+      yellEnabled: true,
+      offerSigningSecret: "",
+    });
+    expect(
+      parseOpenAppaConfig("true", "true", "offer-signing-secret-at-least-32ch")
+        .offerSigningSecret,
+    ).toBe("offer-signing-secret-at-least-32ch");
+    expect(() => parseOpenAppaConfig("true", "true", "short")).toThrow(
+      "ARCHESTRA_OPENAPPA_OFFER_SIGNING_SECRET must be at least 32 characters",
+    );
+  });
+});

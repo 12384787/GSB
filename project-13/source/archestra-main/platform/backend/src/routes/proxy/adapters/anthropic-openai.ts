@@ -1,0 +1,364 @@
+import type {
+  Anthropic,
+  CommonToolCall,
+  LLMProvider,
+  LLMResponseAdapter,
+  LLMStreamAdapter,
+  OpenAi,
+  StreamAccumulatorState,
+  UsageView,
+} from "@/types";
+import { anthropicAdapterFactory } from "./anthropic";
+import {
+  type AnthropicOpenaiContext,
+  anthropicResponseToOpenai,
+  anthropicUsageViewToOpenai,
+  mapStopReason,
+} from "./anthropic-openai-translator";
+import {
+  formatOpenAiChunkSse,
+  type OpenAiStreamUsage,
+} from "./openai-sse-chunk";
+
+type AnthropicRequest = Anthropic.Types.MessagesRequest;
+type AnthropicResponse = Anthropic.Types.MessagesResponse;
+type AnthropicMessages = Anthropic.Types.MessagesRequest["messages"];
+type AnthropicHeaders = Anthropic.Types.MessagesHeaders;
+type AnthropicStreamChunk = Parameters<
+  ReturnType<typeof anthropicAdapterFactory.createStreamAdapter>["processChunk"]
+>[0];
+
+class AnthropicOpenaiResponseAdapter
+  implements LLMResponseAdapter<AnthropicResponse>
+{
+  readonly provider = "anthropic" as const;
+  private inner: LLMResponseAdapter<AnthropicResponse>;
+  // The inner (logged-shape) response after a dispatch-mode repair, so
+  // getLoggedResponse persists the rewritten turn rather than the original.
+  private rewrittenInner: AnthropicResponse | null = null;
+  private ctx: AnthropicOpenaiContext;
+
+  constructor(response: AnthropicResponse, ctx: AnthropicOpenaiContext) {
+    this.inner = anthropicAdapterFactory.createResponseAdapter(response);
+    this.ctx = ctx;
+  }
+
+  getId(): string {
+    return this.inner.getId();
+  }
+
+  getModel(): string {
+    return this.ctx.requestedModel;
+  }
+
+  getText(): string {
+    return this.inner.getText();
+  }
+
+  getToolCalls(): CommonToolCall[] {
+    return this.inner.getToolCalls();
+  }
+
+  hasToolCalls(): boolean {
+    return this.inner.hasToolCalls();
+  }
+
+  getUsage(): UsageView {
+    return this.inner.getUsage();
+  }
+
+  getOriginalResponse(): AnthropicResponse {
+    // The model router's external wire format is OpenAI, so the handler should
+    // send the translated response even though this adapter wraps Anthropic.
+    return anthropicResponseToOpenai(
+      this.inner.getOriginalResponse(),
+      this.ctx,
+    ) as unknown as AnthropicResponse;
+  }
+
+  getLoggedResponse(): AnthropicResponse {
+    return this.rewrittenInner ?? this.inner.getOriginalResponse();
+  }
+
+  getFinishReasons(): string[] {
+    return this.inner.getFinishReasons();
+  }
+
+  withRewrittenToolCalls(
+    toolCalls: Array<{ id: string; name: string; arguments: string }>,
+  ): AnthropicResponse {
+    // Rewrite in the inner wire shape (which is what gets logged), then
+    // translate for the client exactly as getOriginalResponse does. If the
+    // inner adapter cannot rewrite, hand back the untouched translation — the
+    // handler only reaches here when the planner produced a rewrite, and a
+    // silent no-op would strand the client with a call it cannot execute; but
+    // every inner adapter this wraps does implement it.
+    const inner =
+      this.inner.withRewrittenToolCalls?.(toolCalls) ??
+      this.inner.getOriginalResponse();
+    this.rewrittenInner = inner;
+    return anthropicResponseToOpenai(
+      inner,
+      this.ctx,
+    ) as unknown as AnthropicResponse;
+  }
+
+  toRefusalResponse(
+    _refusalMessage: string,
+    contentMessage: string,
+  ): AnthropicResponse {
+    const usage = this.inner.getUsage();
+    const response: OpenAi.Types.ChatCompletionsResponse = {
+      id: this.ctx.chatcmplId,
+      object: "chat.completion",
+      created: this.ctx.createdUnix,
+      model: this.ctx.requestedModel,
+      choices: [
+        {
+          index: 0,
+          logprobs: null,
+          finish_reason: "stop",
+          message: {
+            role: "assistant",
+            content: contentMessage,
+          },
+        },
+      ],
+      usage: anthropicUsageViewToOpenai(usage),
+    };
+
+    return response as unknown as AnthropicResponse;
+  }
+}
+
+class AnthropicOpenaiStreamAdapter
+  implements LLMStreamAdapter<AnthropicStreamChunk, AnthropicResponse>
+{
+  readonly provider = "anthropic" as const;
+  private inner: LLMStreamAdapter<AnthropicStreamChunk, AnthropicResponse>;
+  private ctx: AnthropicOpenaiContext;
+  private pendingToolCallEvents: string[] = [];
+
+  constructor(ctx: AnthropicOpenaiContext) {
+    this.inner = anthropicAdapterFactory.createStreamAdapter();
+    this.ctx = ctx;
+  }
+
+  get state(): StreamAccumulatorState {
+    return this.inner.state;
+  }
+
+  processChunk(chunk: AnthropicStreamChunk) {
+    const innerResult = this.inner.processChunk(chunk);
+    const sseData = this.toOpenaiSse(chunk, innerResult.isToolCallChunk);
+
+    if (innerResult.isToolCallChunk && sseData) {
+      this.pendingToolCallEvents.push(sseData);
+      return {
+        ...innerResult,
+        sseData: null,
+      };
+    }
+
+    return {
+      ...innerResult,
+      sseData,
+    };
+  }
+
+  getSSEHeaders(): Record<string, string> {
+    return {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    };
+  }
+
+  formatTextDeltaSSE(text: string): string {
+    return this.formatChunk({
+      delta: { content: text },
+      finishReason: null,
+    });
+  }
+
+  getRawToolCallEvents(): string[] {
+    // Snapshot, never drain (the base anthropic adapter behaves the same way).
+    // Draining re-based later tool calls to index 0, so with parallel tool
+    // calls the second call's start chunk lost its id and name and the client
+    // received a dangling tool call.
+    //
+    // The inner read is for its side effect only — the events themselves are
+    // the OpenAI-shaped ones below. toProviderResponse() delegates to that
+    // inner adapter, which names tool calls in the reconstructed turn only
+    // once it has handed them over, and this is that moment.
+    this.inner.getRawToolCallEvents();
+    return [...this.pendingToolCallEvents];
+  }
+
+  formatToolCallsSSE(toolCalls: StreamAccumulatorState["toolCalls"]): string[] {
+    // The inner (Anthropic-shaped) read is for its side effect only — it marks
+    // the calls as handed over so inner.toProviderResponse() names them — while
+    // the wire events below are the OpenAI-shaped ones this surface speaks.
+    // Mirrors getRawToolCallEvents above; the buffered OpenAI events are
+    // dropped rather than replayed, because they name the tool the model called
+    // directly and that is the call being repaired.
+    this.inner.formatToolCallsSSE?.(toolCalls);
+    this.pendingToolCallEvents = [];
+    return [
+      this.formatChunk({
+        delta: {
+          tool_calls: toolCalls.map((toolCall, index) => ({
+            index,
+            id: toolCall.id,
+            type: "function" as const,
+            function: { name: toolCall.name, arguments: toolCall.arguments },
+          })),
+        },
+        finishReason: null,
+      }),
+    ];
+  }
+
+  formatCompleteTextSSE(text: string): string[] {
+    // Mark the inner adapter as refusal-replaced (side effect only; its
+    // Anthropic-format events are unused here). This makes inner.stop_reason
+    // resolve to end_turn below and inner.toProviderResponse() persist the
+    // refusal rather than the blocked tool calls. The finish reason is emitted
+    // once, by formatEndSSE — this chunk must not also carry one.
+    this.inner.formatCompleteTextSSE(text);
+    return [
+      this.formatChunk({
+        delta: { role: "assistant", content: text },
+        finishReason: null,
+      }),
+    ];
+  }
+
+  formatEndSSE(): string {
+    const finishReason = mapStopReason(
+      this.inner.toProviderResponse().stop_reason,
+    );
+    return `${this.formatChunk({
+      delta: {},
+      finishReason,
+      usage: anthropicUsageViewToOpenai(this.state.usage),
+    })}data: [DONE]\n\n`;
+  }
+
+  toProviderResponse(): AnthropicResponse {
+    return this.inner.toProviderResponse();
+  }
+
+  private toOpenaiSse(
+    chunk: AnthropicStreamChunk,
+    isToolCallChunk: boolean,
+  ): string | null {
+    if (chunk.type === "message_start") {
+      return this.formatChunk({
+        delta: { role: "assistant" },
+        finishReason: null,
+      });
+    }
+
+    if (
+      chunk.type === "content_block_delta" &&
+      chunk.delta.type === "text_delta"
+    ) {
+      return this.formatChunk({
+        delta: { content: chunk.delta.text },
+        finishReason: null,
+      });
+    }
+
+    if (!isToolCallChunk) {
+      return null;
+    }
+
+    const toolIndex = Math.max(this.state.toolCalls.length - 1, 0);
+    if (
+      chunk.type === "content_block_start" &&
+      chunk.content_block.type === "tool_use"
+    ) {
+      return this.formatChunk({
+        delta: {
+          tool_calls: [
+            {
+              index: toolIndex,
+              id: chunk.content_block.id,
+              type: "function",
+              function: {
+                name: chunk.content_block.name,
+                arguments: "",
+              },
+            },
+          ],
+        },
+        finishReason: null,
+      });
+    }
+
+    if (
+      chunk.type === "content_block_delta" &&
+      chunk.delta.type === "input_json_delta"
+    ) {
+      return this.formatChunk({
+        delta: {
+          tool_calls: [
+            {
+              index: toolIndex,
+              function: {
+                arguments: chunk.delta.partial_json,
+              },
+            },
+          ],
+        },
+        finishReason: null,
+      });
+    }
+
+    return null;
+  }
+
+  private formatChunk(params: {
+    delta: Record<string, unknown>;
+    finishReason: string | null;
+    /** Only the final chunk passes this; delta chunks must stay usage-free. */
+    usage?: OpenAiStreamUsage;
+  }): string {
+    return formatOpenAiChunkSse({
+      id: this.ctx.chatcmplId,
+      created: this.ctx.createdUnix,
+      model: this.ctx.requestedModel,
+      delta: params.delta,
+      finishReason: params.finishReason,
+      usage: params.usage,
+    });
+  }
+}
+
+export function makeAnthropicOpenaiAdapterFactory(
+  ctx: AnthropicOpenaiContext,
+): LLMProvider<
+  AnthropicRequest,
+  AnthropicResponse,
+  AnthropicMessages,
+  AnthropicStreamChunk,
+  AnthropicHeaders
+> {
+  return {
+    ...anthropicAdapterFactory,
+    extractApiKey(headers) {
+      const authorization = (headers as Record<string, unknown>).authorization;
+      if (typeof authorization !== "string") {
+        return undefined;
+      }
+      return authorization.replace(/^Bearer\s+/i, "");
+    },
+    createResponseAdapter(response) {
+      return new AnthropicOpenaiResponseAdapter(response, ctx);
+    },
+    createStreamAdapter() {
+      return new AnthropicOpenaiStreamAdapter(ctx);
+    },
+  };
+}

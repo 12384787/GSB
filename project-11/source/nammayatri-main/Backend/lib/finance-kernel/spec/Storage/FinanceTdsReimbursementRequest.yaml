@@ -1,0 +1,107 @@
+# Finance Kernel - TDS Reimbursement Request Table
+# Namma-DSL YAML specification
+
+imports:
+  UTCTime: Kernel.Prelude
+  HighPrecMoney: Kernel.Types.Common
+  Image: Lib.Finance.Core.Types
+
+FinanceTdsReimbursementRequest:
+  tableName: finance_tds_reimbursement_request
+  derives: "Generic"
+
+  types:
+    AssessmentYear:
+      recordType: NewType
+      enum: AssessmentYear Text
+
+    Quarter:
+      enum: "Q1, Q2, Q3, Q4"
+      derive: "ToParamSchema"
+
+    FinanceTdsReimbursementRequestStatus:
+      enum: "PENDING, APPROVED, REJECTED"
+      derive: "ToParamSchema"
+
+  fields:
+    id: Id FinanceTdsReimbursementRequest
+    merchantId: Text
+    merchantOperatingCityId: Text
+    fleetOwnerId: Text
+    tanNumber: Text
+    certNumber: Text
+    quarter: Quarter
+    assessmentYear: AssessmentYear
+    tdsSection: Maybe Text
+    certAmount: HighPrecMoney
+    tdsRate: Double
+    documentId: Id Image
+    status: FinanceTdsReimbursementRequestStatus
+    rejectionReason: Maybe Text
+    # Set once wired into WS3 (ledger adjustment integration)
+    # ledgerAdjustmentRequestId: Maybe (Id LedgerAdjustmentRequest)
+    # Denormalized from the associated LedgerAdjustmentRequest maker/checker, kept in sync at
+    # submit (maker) / approve+reject (checker) time so the list API can filter/display without a join.
+    adminMakerId: Maybe Text
+    adminMakerName: Maybe Text
+    adminCheckerId: Maybe Text
+    adminCheckerName: Maybe Text
+    createdAt: UTCTime
+    updatedAt: UTCTime
+
+  constraints:
+    id: PrimaryKey
+    fleetOwnerId: "!SecondaryKey"
+
+  sqlType:
+    tanNumber: character varying(20)
+    certNumber: character varying(64)
+    quarter: character varying(10)
+    status: character varying(20)
+
+  queries:
+    findAllByFleetOwnerIdQuarterAndAssessmentYear:
+      kvFunction: findAllWithKV
+      where:
+        and: [fleetOwnerId, quarter, assessmentYear, merchantOperatingCityId]
+
+    findAllByIds:
+      kvFunction: findAllWithKV
+      where:
+        in: [id]
+
+    updateStatusAndRejectionReason:
+      kvFunction: updateOneWithKV
+      params: [status, rejectionReason]
+      where: id
+
+    updateAdminMaker:
+      kvFunction: updateOneWithKV
+      params: [adminMakerId, adminMakerName]
+      where: id
+
+    updateStatusRejectionReasonAndAdminMaker:
+      kvFunction: updateOneWithKV
+      params: [status, rejectionReason, adminMakerId, adminMakerName]
+      where: id
+
+    updateAdminChecker:
+      kvFunction: updateOneWithKV
+      params: [adminCheckerId, adminCheckerName]
+      where: id
+
+    updateStatusRejectionReasonAndAdminChecker:
+      kvFunction: updateOneWithKV
+      params: [status, rejectionReason, adminCheckerId, adminCheckerName]
+      where: id
+
+    # updateLedgerAdjustmentRequestId:
+    #   kvFunction: updateOneWithKV
+    #   params: [ledgerAdjustmentRequestId]
+    #   where: id
+
+  defaultQueryTypeConstraint: "(Lib.Finance.Storage.Beam.BeamFlow.BeamFlow m r)"
+  beamInstance: MakeTableInstancesGenericSchema
+
+  extraOperations:
+    - EXTRA_QUERY_FILE

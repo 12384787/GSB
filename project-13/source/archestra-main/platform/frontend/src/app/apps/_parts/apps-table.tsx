@@ -1,0 +1,393 @@
+"use client";
+
+import type { archestraApiTypes } from "@archestra/shared";
+import type {
+  ColumnDef,
+  OnChangeFn,
+  RowSelectionState,
+} from "@tanstack/react-table";
+import {
+  AppWindow,
+  History,
+  Loader2,
+  Pin,
+  PinOff,
+  Server,
+  Settings,
+  SquareArrowOutUpRight,
+  Trash2,
+} from "lucide-react";
+import { useRouter } from "next/navigation";
+import { useState } from "react";
+import { LabelTags } from "@/components/label-tags";
+import { AppVersionHistoryDialog } from "@/components/mcp-app/app-version-history-dialog";
+import { ScopeBadge } from "@/components/scope-badge";
+import {
+  type TableRowAction,
+  TableRowActions,
+} from "@/components/table-row-actions";
+import { Badge } from "@/components/ui/badge";
+import { createSelectColumn } from "@/components/ui/bulk-select-column";
+import { DataTable } from "@/components/ui/data-table";
+import { useResourceOwnershipTransfer } from "@/components/use-resource-ownership-transfer";
+import {
+  useOpenAppInChat,
+  useOpenExternalAppInChat,
+  usePinApp,
+} from "@/lib/app.query";
+import {
+  appActionDisabledReason,
+  computeAppAccess,
+  useAppAccessContext,
+} from "@/lib/apps/use-app-access";
+import type { BulkRangeSelectionController } from "@/lib/bulk-range-selection";
+import { setPendingProjectChatHandoff } from "@/lib/chat/pending-project-chat-handoff";
+import { AppTypeIcon } from "./app-card";
+import { AppDeleteDialog } from "./app-delete-dialog";
+
+type AppListItem = archestraApiTypes.GetAppsResponses["200"]["data"][number];
+type OwnedApp = Extract<AppListItem, { source: "owned" }>;
+
+// Table variant of one apps section. Its parent owns selection and bulk actions
+// so this view and the equivalent card grid act on the same selected apps.
+export function AppsTable({
+  apps,
+  onOpenSettings,
+  rowSelection,
+  setRowSelection,
+  onPageRowIdsChange,
+  rangeSelection,
+}: {
+  apps: AppListItem[];
+  onOpenSettings: (app: { id: string }) => void;
+  rowSelection: RowSelectionState;
+  setRowSelection: OnChangeFn<RowSelectionState>;
+  onPageRowIdsChange: (ids: string[]) => void;
+  rangeSelection: BulkRangeSelectionController;
+}) {
+  const router = useRouter();
+  const openOwnedApp = useOpenAppInChat();
+  const openExternalApp = useOpenExternalAppInChat();
+  const pinApp = usePinApp();
+  const accessContext = useAppAccessContext();
+  // Row-scoped "Opening…" indicator; mirrors the card overlay. Stays set
+  // through the redirect (the table unmounts on success); only a failure
+  // resets it.
+  const [openingKey, setOpeningKey] = useState<string | null>(null);
+  const [deletingApp, setDeletingApp] = useState<OwnedApp | null>(null);
+  const [historyApp, setHistoryApp] = useState<OwnedApp | null>(null);
+
+  const handleOpen = async (app: AppListItem) => {
+    if (openingKey) return;
+    setOpeningKey(getAppRowKey(app));
+    if (app.source === "owned") {
+      const result = await openOwnedApp.mutateAsync(app.id);
+      if (result?.conversationId) {
+        router.push(`/chat/${result.conversationId}`);
+        return;
+      }
+    } else {
+      const result = await openExternalApp.mutateAsync({
+        mcpServerId: app.mcpServerId,
+        resourceUri: app.resourceUri,
+      });
+      if (result?.conversationId) {
+        if (result.mode === "prompt" && result.prompt) {
+          setPendingProjectChatHandoff({
+            conversationId: result.conversationId,
+            prompt: result.prompt,
+          });
+        }
+        router.push(`/chat/${result.conversationId}`);
+        return;
+      }
+    }
+    setOpeningKey(null);
+  };
+
+  const togglePin = (app: AppListItem) =>
+    pinApp.mutate({
+      pinned: !app.pinnedAt,
+      target:
+        app.source === "owned"
+          ? { source: "owned", appId: app.id }
+          : {
+              source: "external",
+              mcpServerId: app.mcpServerId,
+              resourceUri: app.resourceUri,
+              toolName: app.toolName,
+            },
+    });
+
+  const columns: ColumnDef<AppListItem>[] = [
+    createSelectColumn<AppListItem>({
+      rowLabel: (app) => `Select ${app.name}`,
+      allLabel: "Select all apps on this page",
+      canSelect: (app) =>
+        app.source === "owned" && computeAppAccess(app, accessContext).canEdit,
+      disabledReason: (app) =>
+        app.source === "owned"
+          ? (appActionDisabledReason({
+              app,
+              access: computeAppAccess(app, accessContext),
+              action: "update",
+            }) ?? "You do not have permission to modify this app")
+          : "Installed apps are managed through their MCP server",
+    }),
+    {
+      id: "name",
+      accessorKey: "name",
+      header: "App",
+      size: 600,
+      cell: ({ row }) => {
+        const app = row.original;
+        const isOpening = openingKey === getAppRowKey(app);
+        return (
+          <div className="min-w-0">
+            <div className="flex min-w-0 items-center gap-2">
+              <AppTypeIcon owned={app.source === "owned"} icon={app.icon} />
+              <span className="truncate font-medium">{app.name}</span>
+              <LabelTags labels={app.labels} />
+              {isOpening && (
+                <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground" />
+              )}
+            </div>
+            {app.description && (
+              <div className="truncate text-xs text-muted-foreground">
+                {app.description}
+              </div>
+            )}
+          </div>
+        );
+      },
+    },
+    {
+      id: "sharing",
+      size: 160,
+      header: "Sharing",
+      cell: ({ row }) => {
+        const app = row.original;
+        // Same admin-oversight badge as the card: someone else's personal app.
+        const isForeignPersonalApp =
+          app.source === "owned" &&
+          app.scope === "personal" &&
+          app.viewerRole === "admin";
+        return (
+          <span className="flex flex-wrap items-center gap-1">
+            <ScopeBadge
+              scope={app.scope}
+              teamNames={
+                app.source === "owned"
+                  ? app.teams?.map((team) => team.name)
+                  : undefined
+              }
+              userNames={
+                app.source === "owned"
+                  ? app.users?.map((user) => user.name)
+                  : undefined
+              }
+            />
+            {isForeignPersonalApp && (
+              <Badge variant="secondary">
+                {app.authorName ? `Owned by ${app.authorName}` : "Other user"}
+              </Badge>
+            )}
+          </span>
+        );
+      },
+    },
+    {
+      id: "actions",
+      size: 170,
+      header: () => <div className="text-right">Actions</div>,
+      cell: ({ row }) => {
+        const app = row.original;
+        const actions: TableRowAction[] = [
+          {
+            icon: app.pinnedAt ? (
+              <PinOff className="h-4 w-4" />
+            ) : (
+              <Pin className="h-4 w-4" />
+            ),
+            label: app.pinnedAt ? "Unpin" : "Pin",
+            onClick: () => togglePin(app),
+          },
+          ...(app.source === "owned"
+            ? ownedAppActions(app)
+            : externalAppActions(app)),
+        ];
+        const isPrimaryAction = (action: TableRowAction) =>
+          action.label === "Settings" || action.label === "Open in new tab";
+        const primaryActions = actions.filter(isPrimaryAction);
+        const dropdownActions = actions.filter(
+          (action) => !isPrimaryAction(action),
+        );
+        return (
+          <div className="flex justify-end">
+            {app.source === "owned" ? (
+              <OwnedAppActions
+                app={app}
+                actions={primaryActions}
+                dropdownActions={dropdownActions}
+              />
+            ) : (
+              <TableRowActions
+                actions={primaryActions}
+                dropdownActions={dropdownActions}
+                itemName={app.name}
+              />
+            )}
+          </div>
+        );
+      },
+    },
+  ];
+
+  const ownedAppActions = (app: OwnedApp): TableRowAction[] => {
+    const access = computeAppAccess(app, accessContext);
+    const settingsDisabledReason = appActionDisabledReason({
+      app,
+      access,
+      action: "update",
+    });
+    const deleteDisabledReason = appActionDisabledReason({
+      app,
+      access,
+      action: "delete",
+    });
+    return [
+      {
+        icon: <Settings className="h-4 w-4" />,
+        label: "Settings",
+        permissions: { app: ["update"] },
+        disabled: !!settingsDisabledReason,
+        disabledTooltip: settingsDisabledReason,
+        onClick: () => onOpenSettings({ id: app.id }),
+      },
+      {
+        icon: <History className="h-4 w-4" />,
+        label: "Version history",
+        permissions: { app: ["update"] },
+        disabled: !!settingsDisabledReason,
+        disabledTooltip: settingsDisabledReason,
+        onClick: () => setHistoryApp(app),
+      },
+      {
+        icon: <SquareArrowOutUpRight className="h-4 w-4" />,
+        label: "Open in new tab",
+        onClick: () => window.open(`/a/${app.id}`, "_blank", "noreferrer"),
+      },
+      {
+        icon: <Trash2 className="h-4 w-4" />,
+        label: "Delete",
+        permissions: { app: ["delete"] },
+        disabled: !!deleteDisabledReason,
+        disabledTooltip: deleteDisabledReason,
+        variant: "destructive" as const,
+        onClick: () => setDeletingApp(app),
+      },
+    ];
+  };
+
+  const externalAppActions = (
+    app: Extract<AppListItem, { source: "external" }>,
+  ): TableRowAction[] => [
+    // A tool with required inputs only opens via the chat prompt flow — its
+    // standalone page can't render anything useful, so don't offer it.
+    ...(app.requiresInput
+      ? []
+      : [
+          {
+            icon: <SquareArrowOutUpRight className="h-4 w-4" />,
+            label: "Open in new tab",
+            onClick: () =>
+              window.open(
+                `/a/catalog/${app.catalogId}?install=${encodeURIComponent(app.mcpServerId)}&resource=${encodeURIComponent(app.resourceUri)}`,
+                "_blank",
+                "noreferrer",
+              ),
+          } satisfies TableRowAction,
+        ]),
+    {
+      icon: <Server className="h-4 w-4" />,
+      label: "Manage MCP server",
+      href: `/mcp/registry/${app.catalogId}`,
+    },
+  ];
+
+  return (
+    <>
+      <DataTable
+        columns={columns}
+        data={apps}
+        getRowId={getAppRowKey}
+        rowSelection={rowSelection}
+        onRowSelectionChange={setRowSelection}
+        onPageRowIdsChange={onPageRowIdsChange}
+        rangeSelection={rangeSelection}
+        hideSelectedCount
+        onRowClick={(app) => void handleOpen(app)}
+        emptyIcon={AppWindow}
+        emptyMessage="No apps here yet"
+        hidePaginationWhenSinglePage
+        fixedWidthColumnIds={["sharing"]}
+        flexibleColumnIds={["name"]}
+      />
+
+      {deletingApp && (
+        <AppDeleteDialog
+          app={{ id: deletingApp.id, name: deletingApp.name }}
+          open
+          onOpenChange={(open) => {
+            if (!open) setDeletingApp(null);
+          }}
+        />
+      )}
+      {historyApp ? (
+        <AppVersionHistoryDialog
+          app={historyApp}
+          open
+          onOpenChange={(open) => {
+            if (!open) setHistoryApp(null);
+          }}
+        />
+      ) : null}
+    </>
+  );
+}
+
+// === shared helpers ===
+
+// Several tools of one server can share a widget resource, so the tool-scoped
+// name disambiguates external cards and rows.
+export function getAppRowKey(app: AppListItem): string {
+  return app.source === "owned"
+    ? app.id
+    : `${app.mcpServerId}:${app.resourceUri}:${app.name}`;
+}
+
+function OwnedAppActions({
+  app,
+  actions,
+  dropdownActions,
+}: {
+  app: OwnedApp;
+  actions: TableRowAction[];
+  dropdownActions: TableRowAction[];
+}) {
+  const ownership = useResourceOwnershipTransfer({
+    kind: "app",
+    resource: app,
+  });
+  return (
+    <>
+      <TableRowActions
+        actions={actions}
+        dropdownActions={dropdownActions}
+        dropdownContent={ownership.menuItem}
+        itemName={app.name}
+      />
+      {ownership.dialog}
+    </>
+  );
+}

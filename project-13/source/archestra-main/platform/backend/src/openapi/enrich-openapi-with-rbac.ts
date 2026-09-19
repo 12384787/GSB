@@ -1,0 +1,345 @@
+import { RouteId } from "@archestra/shared";
+import {
+  permissionDescriptions,
+  requiredEndpointPermissionsMap,
+} from "@archestra/shared/access-control";
+import { archestraMcpBranding } from "@/archestra-mcp-server/branding";
+
+// === Exports ===
+
+export function enrichOpenApiWithRbac<T extends OpenApiDocument>(spec: T): T {
+  const clonedSpec = structuredClone(spec);
+
+  for (const [path, pathItem] of Object.entries(clonedSpec.paths ?? {})) {
+    if (!pathItem) {
+      continue;
+    }
+
+    for (const operation of getOperations(pathItem)) {
+      if (hasTag(operation, "LLM Proxy")) {
+        operation.description = appendDescriptionSection(
+          operation.description,
+          createLlmProxyAuthenticationSection(),
+        );
+      }
+
+      if (!operation.operationId) {
+        continue;
+      }
+
+      if (!path.startsWith("/api/")) {
+        continue;
+      }
+
+      const rbacMetadata = getRbacMetadata(operation.operationId);
+      operation["x-required-permissions"] = rbacMetadata;
+
+      operation.description = appendDescriptionSection(
+        operation.description,
+        createAuthenticationSection(operation.operationId),
+      );
+      operation.description = appendDescriptionSection(
+        operation.description,
+        createPermissionSection(rbacMetadata),
+      );
+    }
+  }
+
+  brandSpecTextInPlace(clonedSpec);
+  return clonedSpec;
+}
+
+// === Internal helpers ===
+
+/**
+ * Rebrand the prose fields of the served spec.
+ *
+ * Route schemas are registered while the server is being built, which happens
+ * *before* the branding singleton is synced from the organization — so a route's
+ * `description` cannot resolve the app name where it is written. The spec is
+ * assembled per request, though, which makes this the one place that can.
+ *
+ * Only `description`/`summary` are rewritten, never arbitrary strings: schema
+ * ids, `$ref` targets, operationIds and enum values are wire identifiers, and
+ * rewriting a `$ref` value while its schema key stays put would produce a spec
+ * that no longer resolves. `brandBuiltInText` is a no-op for non-white-labeled
+ * deployments.
+ *
+ * Mutates the given node in place — the caller hands it the fresh
+ * `structuredClone` it is about to serve, so nothing shared is touched and a
+ * copying transform would only churn allocations on every /openapi.json hit.
+ */
+const BRANDABLE_SPEC_KEYS = new Set(["description", "summary"]);
+
+function brandSpecTextInPlace(node: unknown): void {
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      brandSpecTextInPlace(item);
+    }
+    return;
+  }
+  if (node && typeof node === "object") {
+    for (const [key, child] of Object.entries(node)) {
+      if (typeof child === "string" && BRANDABLE_SPEC_KEYS.has(key)) {
+        (node as Record<string, unknown>)[key] =
+          archestraMcpBranding.brandBuiltInText(child);
+      } else {
+        brandSpecTextInPlace(child);
+      }
+    }
+  }
+}
+
+// === Types ===
+
+type OpenApiDocument = {
+  info?: {
+    title?: string;
+    version?: string;
+  };
+  paths?: Record<string, OpenApiPathItem | undefined>;
+};
+
+type OpenApiPathItem = Partial<
+  Record<HttpMethod, OpenApiOperation | undefined>
+>;
+
+type OpenApiOperation = {
+  operationId?: string;
+  description?: string;
+  tags?: string[];
+  "x-required-permissions"?: RequiredPermissionsExtension;
+};
+
+type HttpMethod =
+  | "delete"
+  | "get"
+  | "head"
+  | "options"
+  | "patch"
+  | "post"
+  | "put"
+  | "trace";
+
+type RequiredPermissionsExtension = {
+  kind: "dynamic" | "none" | "static";
+  note?: string;
+  permissions: string[];
+};
+
+// === Internal helpers ===
+
+function getOperations(pathItem: OpenApiPathItem): OpenApiOperation[] {
+  return Object.entries(pathItem)
+    .filter(([method]) => HTTP_METHODS.has(method as HttpMethod))
+    .map(([, operation]) => operation)
+    .filter(
+      (operation): operation is OpenApiOperation =>
+        operation !== undefined && operation !== null,
+    );
+}
+
+function hasTag(operation: OpenApiOperation, tag: string): boolean {
+  return operation.tags?.includes(tag) ?? false;
+}
+
+function getRbacMetadata(operationId: string): RequiredPermissionsExtension {
+  const dynamicNote =
+    DYNAMIC_ROUTE_PERMISSION_NOTES[
+      operationId as keyof typeof DYNAMIC_ROUTE_PERMISSION_NOTES
+    ];
+  if (dynamicNote) {
+    return {
+      kind: "dynamic",
+      note: dynamicNote,
+      permissions: [],
+    };
+  }
+
+  const permissions = flattenPermissions(
+    requiredEndpointPermissionsMap[
+      operationId as keyof typeof requiredEndpointPermissionsMap
+    ],
+  );
+  if (permissions.length === 0) {
+    return {
+      kind: "none",
+      note: "None (no additional RBAC permission required)",
+      permissions: [],
+    };
+  }
+
+  const note =
+    STATIC_ROUTE_PERMISSION_NOTES[
+      operationId as keyof typeof STATIC_ROUTE_PERMISSION_NOTES
+    ];
+
+  return {
+    kind: "static",
+    ...(note ? { note } : {}),
+    permissions,
+  };
+}
+
+function flattenPermissions(
+  permissions: Record<string, string[]> | undefined,
+): string[] {
+  if (!permissions) {
+    return [];
+  }
+
+  return Object.entries(permissions)
+    .flatMap(([resource, actions]) =>
+      [...actions].sort().map((action) => `${resource}:${action}`),
+    )
+    .sort();
+}
+
+function appendDescriptionSection(
+  description: string | undefined,
+  section: string,
+): string {
+  if (!description) {
+    return section;
+  }
+
+  return `${description}\n\n${section}`;
+}
+
+function createAuthenticationSection(operationId: string): string {
+  if (
+    PUBLIC_UNAUTHENTICATED_ROUTE_IDS.has(
+      operationId as typeof PUBLIC_UNAUTHENTICATED_ROUTE_IDS extends Set<
+        infer T
+      >
+        ? T
+        : never,
+    )
+  ) {
+    return ["Authentication:", "", "Not required."].join("\n");
+  }
+
+  return [
+    "Authentication:",
+    "",
+    // white-label-ok: OpenAPI prose; this section is appended to the operation's
+    // description, which brandSpecTextInPlace rebrands with everything else —
+    // branding it inline too would just be the same swap twice.
+    "Required. Use an authenticated browser session or send your Archestra API key in the `Authorization` header.",
+  ].join("\n");
+}
+
+function createLlmProxyAuthenticationSection(): string {
+  return [
+    "Authentication:",
+    "",
+    "This route accepts either an LLM provider API key or a Virtual API Key. See [LLM Proxy Authentication](/docs/platform-llm-proxy-authentication).",
+  ].join("\n");
+}
+
+function createPermissionSection(
+  metadata: RequiredPermissionsExtension,
+): string {
+  if (metadata.kind === "static") {
+    return [
+      "Authorization:",
+      "",
+      ...metadata.permissions.map(
+        (permission) =>
+          `\`${permission}\`: ${permissionDescriptions[permission] ?? "No description available"}`,
+      ),
+      ...(metadata.note ? ["", metadata.note] : []),
+    ].join("\n");
+  }
+
+  return [
+    "Authorization:",
+    "",
+    metadata.note ?? "None (no additional RBAC permission required)",
+  ].join("\n");
+}
+
+const HTTP_METHODS = new Set<HttpMethod>([
+  "delete",
+  "get",
+  "head",
+  "options",
+  "patch",
+  "post",
+  "put",
+  "trace",
+]);
+
+const DYNAMIC_ROUTE_PERMISSION_NOTES = {
+  [RouteId.GetAgentCatalog]:
+    "Requires `agent:read`; when `status=deleted`, requires `agent:delete`. External A2A rows are limited to agents visible to the caller unless they have `agentSettings:update`; when `selectableOnly=true`, external rows are omitted unless the caller has that permission.",
+  [RouteId.GetAgents]:
+    "Checked dynamically based on agent type. `profile` and `agent` require `agent:read`; `mcp_gateway` requires `mcpGateway:read`. If no type filter is provided, the user must have read access to at least one agent type.",
+  [RouteId.GetAllAgents]:
+    "Checked dynamically based on agent type. `profile` and `agent` require `agent:read`; `mcp_gateway` requires `mcpGateway:read`. If no type filter is provided, the user must have read access to at least one agent type.",
+  [RouteId.GetAgent]:
+    "Checked dynamically based on the target agent's type. `profile` and `agent` require `agent:read`; `mcp_gateway` requires `mcpGateway:read`.",
+  [RouteId.PinAgent]:
+    "Checked dynamically based on the target agent's type and the caller's visibility. `profile` and `agent` require `agent:read`; `mcp_gateway` requires `mcpGateway:read`.",
+  [RouteId.CreateAgent]:
+    "Checked dynamically based on the agent type being created. `profile` and `agent` require `agent:create`; `mcp_gateway` requires `mcpGateway:create`. Additional scope and team-admin checks may apply.",
+  [RouteId.UpdateAgent]:
+    "Checked dynamically based on the target agent's type. `profile` and `agent` require `agent:update`; `mcp_gateway` requires `mcpGateway:update`. Additional scope and team-admin checks may apply.",
+  [RouteId.DeleteAgent]:
+    "Checked dynamically based on the target agent's type. `profile` and `agent` require `agent:delete`; `mcp_gateway` requires `mcpGateway:delete`. Additional scope checks may apply.",
+  [RouteId.RestoreAgent]:
+    "Checked dynamically based on the target agent's type. `profile` and `agent` require `agent:delete`; `mcp_gateway` requires `mcpGateway:delete`. Additional scope checks may apply.",
+  // The three purge routes are gated by role, not by permission: the caller
+  // must hold a built-in admin role. Recorded here because the static
+  // permission alone would advertise `delete` as sufficient, and the handler's
+  // refusal is a 404 — so a caller acting on that would see "not found" rather
+  // than anything pointing at the missing access.
+  [RouteId.PermanentlyDeleteAgent]:
+    "Restricted to the built-in Admin and Platform Admin roles. No permission grants it: `agent:delete` and even `agent:admin` reach the trash, not past it, and a service account never qualifies. A caller without it gets 404, not 403, so the endpoint never confirms the agent exists.",
+  [RouteId.PermanentlyDeleteSkill]:
+    "Restricted to the built-in Admin and Platform Admin roles. No permission grants it: `skill:delete` and even `skill:admin` reach the trash, not past it, and a service account never qualifies. A caller without it gets 404, not 403, so the endpoint never confirms the skill exists.",
+  [RouteId.PermanentlyDeleteProject]:
+    "Restricted to the built-in Admin and Platform Admin roles. No permission grants it: `project:delete`, `project:admin`, and ownership of the project all reach the trash, not past it, and a service account never qualifies. A caller without it gets 404, not 403, so the endpoint never confirms the project exists.",
+} satisfies Partial<Record<RouteId, string>>;
+
+const STATIC_ROUTE_PERMISSION_NOTES = {
+  [RouteId.GetInteractions]:
+    "`log:read` returns rows attributed to the caller. `log:admin` includes every row in the active organization.",
+  [RouteId.GetInteractionSummaries]:
+    "`log:read` returns rows attributed to the caller. `log:admin` includes every row in the active organization.",
+  [RouteId.GetInteractionSessions]:
+    "`log:read` returns rows attributed to the caller. `log:admin` includes every row in the active organization.",
+  [RouteId.GetUniqueExternalAgentIds]:
+    "`log:read` returns identifiers from rows attributed to the caller. `log:admin` includes identifiers from every row in the active organization.",
+  [RouteId.GetUniqueUserIds]:
+    "`log:read` returns the caller's identity. `log:admin` includes every represented user in the active organization.",
+  [RouteId.GetInteraction]:
+    "`log:read` permits a row attributed to the caller. `log:admin` permits any row in the active organization.",
+  [RouteId.GetMcpToolCalls]:
+    "`log:read` returns rows attributed to the caller. `log:admin` includes every row in the active organization.",
+  [RouteId.GetMcpToolCall]:
+    "`log:read` permits a row attributed to the caller. `log:admin` permits any row in the active organization.",
+  [RouteId.GetTeamStatistics]:
+    "Returns aggregate team usage for the active organization.",
+  [RouteId.GetAgentStatistics]:
+    "Returns aggregate usage for every agent in the active organization.",
+  [RouteId.GetModelStatistics]:
+    "Returns aggregate model usage for the active organization.",
+  [RouteId.GetOverviewStatistics]:
+    "Returns aggregate usage for the active organization.",
+  [RouteId.GetCostSavingsStatistics]:
+    "Returns aggregate cost savings for the active organization.",
+  [RouteId.GetUserStatistics]:
+    "Returns the caller's usage. `member:read` includes identified users across the active organization.",
+  [RouteId.GetAppStatistics]:
+    "App details are limited to apps visible to the caller; `app:admin` includes every app in the active organization.",
+  [RouteId.GetSkillStatistics]:
+    "Skill details are limited to skills visible to the caller; `skill:admin` includes every skill in the active organization.",
+} satisfies Partial<Record<RouteId, string>>;
+
+const PUBLIC_UNAUTHENTICATED_ROUTE_IDS = new Set<RouteId>([
+  RouteId.GetPublicConfig,
+  RouteId.GetPublicIdentityProviders,
+  RouteId.GetAppearanceSettings,
+  RouteId.GetConnectionHealth,
+]);

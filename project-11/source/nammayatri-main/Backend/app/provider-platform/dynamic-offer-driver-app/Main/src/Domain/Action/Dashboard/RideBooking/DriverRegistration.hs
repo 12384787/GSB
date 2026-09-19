@@ -1,0 +1,111 @@
+module Domain.Action.Dashboard.RideBooking.DriverRegistration
+  ( postDriverRegistrationAuth,
+    postDriverRegistrationVerify,
+    auth,
+    verify,
+  )
+where
+
+import qualified "dashboard-helper-api" API.Types.ProviderPlatform.Management.DriverRegistration as Common
+import qualified Domain.Action.Internal.DriverMode as DDriverMode
+import qualified Domain.Action.UI.FleetDriverAssociation as FDV
+import qualified Domain.Action.UI.Registration as DReg
+import qualified Domain.Types.Merchant as DM
+import qualified Domain.Types.Person as SP
+import qualified Domain.Types.RegistrationToken as SR
+import Domain.Types.TransporterConfig
+import Environment
+import Kernel.Beam.Functions as B
+import Kernel.Prelude
+import Kernel.Types.APISuccess (APISuccess (Success))
+import Kernel.Types.Beckn.Context as Context
+import Kernel.Types.Id
+import Kernel.Utils.Common
+import Lib.ConfigPilot.Interface.Types (getOneConfig)
+import SharedLogic.Analytics as Analytics
+import qualified SharedLogic.DriverOnboarding as DomainRC
+import qualified SharedLogic.DriverOnboarding.Common as SOnbCommon
+import SharedLogic.Merchant (findMerchantByShortId)
+import qualified Storage.CachedQueries.Merchant.MerchantOperatingCity as CQMOC
+import Storage.ConfigPilot.Config.TransporterConfig (TransporterConfigDimensions (..))
+import qualified Storage.Queries.DriverBankAccount as QDBA
+import qualified Storage.Queries.FleetDriverAssociation as QFDV
+import qualified Storage.Queries.Person as QP
+import qualified Storage.Queries.RideExtra as QRideExtra
+import Tools.Error
+
+postDriverRegistrationAuth, auth :: ShortId DM.Merchant -> Context.City -> Common.AuthReq -> Flow Common.AuthRes
+postDriverRegistrationAuth = auth
+auth merchantShortId opCity req = do
+  merchant <- findMerchantByShortId merchantShortId
+  res <-
+    DReg.auth
+      True
+      DReg.AuthReq
+        { mobileNumber = Just req.mobileNumber,
+          mobileCountryCode = Just req.mobileCountryCode,
+          merchantId = merchant.id.getId,
+          merchantOperatingCity = Just opCity,
+          registrationLat = Nothing,
+          registrationLon = Nothing,
+          name = req.name,
+          email = Nothing,
+          identifierType = Just SP.MOBILENUMBER,
+          otpChannel = Nothing,
+          password = Nothing,
+          employeeId = Nothing
+        }
+      Nothing
+      Nothing
+      Nothing
+      Nothing
+      Nothing
+      Nothing
+      Nothing
+      Nothing
+  pure $ Common.AuthRes {authId = res.authId.getId, attempts = res.attempts}
+
+postDriverRegistrationVerify :: ShortId DM.Merchant -> Context.City -> Text -> Bool -> Text -> Common.AuthVerifyReq -> Flow APISuccess
+postDriverRegistrationVerify merchantShortId opCity authId mbFleet fleetOwnerId req = do
+  merchant <- findMerchantByShortId merchantShortId
+  merchantOpCityId <- CQMOC.getMerchantOpCityId Nothing merchant (Just opCity)
+  transporterConfig <- getOneConfig (TransporterConfigDimensions {merchantOperatingCityId = merchantOpCityId.getId}) Nothing >>= fromMaybeM (TransporterConfigNotFound merchantOpCityId.getId)
+  verify authId mbFleet fleetOwnerId Nothing transporterConfig req
+
+verify :: Text -> Bool -> Text -> Maybe (Id SP.Person) -> TransporterConfig -> Common.AuthVerifyReq -> Flow APISuccess
+verify authId mbFleet fleetOwnerId mbOperatorId transporterConfig req = do
+  let regId = Id authId :: Id SR.RegistrationToken
+  res <-
+    DReg.verify
+      regId
+      DReg.AuthVerifyReq
+        { otp = req.otp,
+          deviceToken = req.deviceToken,
+          whatsappNotificationEnroll = Nothing
+        }
+      Nothing
+  when (not mbFleet && req.isOnboardingFlow == Just True) $
+    fork "Sending onboarding link SMS to Driver" $ do
+      driver <- QP.findById res.person.id >>= fromMaybeM (PersonNotFound res.person.id.getId)
+      merchantOpCity <- CQMOC.findById transporterConfig.merchantOperatingCityId >>= fromMaybeM (MerchantOperatingCityNotFound transporterConfig.merchantOperatingCityId.getId)
+      SOnbCommon.sendOnboardingLinkSms merchantOpCity transporterConfig driver Nothing
+  when mbFleet $ do
+    checkAssoc <- runInReplica $ QFDV.findByDriverIdAndFleetOwnerId res.person.id fleetOwnerId True
+    when (isJust checkAssoc) $ throwError (InvalidRequest "Driver already associated with fleet")
+    -- Check if driver has any active rides (not completed or cancelled)
+    mbActiveRide <- B.runInReplica $ QRideExtra.getUpcomingOrActiveByDriverId res.person.id
+    when (isJust mbActiveRide) $ throwError (InvalidRequest "Driver has active rides. Please complete or cancel all rides before adding to fleet")
+    assoc <- FDV.makeFleetDriverAssociation res.person.id fleetOwnerId mbOperatorId DomainRC.defaultAssociationEnd (Just transporterConfig.merchantId) (Just transporterConfig.merchantOperatingCityId)
+    QFDV.create assoc
+    when (transporterConfig.deleteDriverBankAccountWhenLinkToFleet == Just True) $ QDBA.deleteById res.person.id
+    Analytics.handleDriverAnalyticsAndFlowStatus
+      transporterConfig
+      res.person.id
+      Nothing
+      ( \_ -> do
+          Analytics.incrementFleetOwnerAnalyticsActiveDriverCount transporterConfig (Just fleetOwnerId) res.person.id
+      )
+      ( \driverInfo -> do
+          DDriverMode.incrementFleetOperatorStatusKeyForDriver SP.FLEET_OWNER fleetOwnerId driverInfo.driverFlowStatus
+      )
+  pure Success

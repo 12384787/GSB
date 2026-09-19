@@ -1,0 +1,481 @@
+module Storage.Queries.Person.GetNearestDrivers
+  ( getNearestDrivers,
+    fetchSortedLTSCandidates,
+    processCandidatesChunk,
+    buildDriverResult,
+    isTierEligibleForDriver,
+    scheduledTierEligibleForDriver,
+    isDriverModeEligibleHelper,
+    SortedLTSCandidate (..),
+    NearestDriversResult (..),
+    NearestDriversReq (..),
+    estimateDeductionsFromConfig,
+  )
+where
+
+import Control.Applicative ((<|>))
+import qualified Data.Aeson as A
+import qualified Data.HashMap.Strict as HashMap
+import qualified Data.List as DL
+import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
+import qualified Database.Redis as Hedis
+import Domain.Types
+import qualified Domain.Types.Common as DriverInfo
+import qualified Domain.Types.DriverInformation as DI
+import Domain.Types.DriverLocation (DriverLocation)
+import qualified Domain.Types.Extra.MerchantPaymentMethod as MP
+import Domain.Types.Merchant
+import Domain.Types.Person as Person
+import qualified Domain.Types.SubscriptionPurchase as DSP
+import qualified Domain.Types.TransporterConfig as DTC
+import Domain.Types.VehicleServiceTier as DVST
+import Domain.Types.VehicleVariant as DV
+import Domain.Utils
+import Kernel.External.Maps as Maps
+import qualified Kernel.External.Notification.FCM.Types as FCM
+import Kernel.Prelude
+import qualified Kernel.Storage.Hedis as Redis
+import Kernel.Tools.Metrics.CoreMetrics (CoreMetrics)
+import Kernel.Types.Id
+import Kernel.Types.Version
+import Kernel.Utils.CalculateDistance (distanceBetweenInMeters)
+import Kernel.Utils.Common hiding (Value)
+import Lib.Finance.Storage.Beam.BeamFlow (BeamFlow)
+import qualified Lib.Yudhishthira.Tools.Utils as Yudhishthira
+import qualified Lib.Yudhishthira.Types as LYT
+import qualified SharedLogic.DriverPool.DriverPoolData as DPD
+import qualified SharedLogic.External.LocationTrackingService.Types as LT
+import SharedLogic.Finance.Prepaid
+import SharedLogic.Finance.WalletAccount
+import Storage.Beam.Finance ()
+import qualified Storage.CachedQueries.Merchant as CQM
+import qualified Storage.Queries.DriverLocation.Internal as Int
+import Tools.Error
+
+data NearestDriversResult = NearestDriversResult
+  { driverId :: Id Driver,
+    driverDeviceToken :: Maybe FCM.FCMRecipientToken,
+    language :: Maybe Maps.Language,
+    onRide :: Bool,
+    distanceToDriver :: Meters,
+    variant :: DV.VehicleVariant,
+    serviceTier :: ServiceTierType,
+    serviceTierDowngradeLevel :: Int,
+    isAirConditioned :: Maybe Bool,
+    lat :: Double,
+    lon :: Double,
+    mode :: Maybe DriverInfo.DriverMode,
+    clientSdkVersion :: Maybe Version,
+    clientBundleVersion :: Maybe Version,
+    clientConfigVersion :: Maybe Version,
+    clientDevice :: Maybe Device,
+    vehicleAge :: Maybe Months,
+    latestScheduledBooking :: Maybe UTCTime,
+    latestScheduledPickup :: Maybe Maps.LatLong,
+    driverTags :: A.Value,
+    selectedAutoAcceptTiers :: [ServiceTierType],
+    score :: Maybe A.Value,
+    tripDistanceMinThreshold :: Maybe Meters,
+    tripDistanceMaxThreshold :: Maybe Meters,
+    maxPickupDistance :: Maybe Meters,
+    isPetModeEnabled :: Bool,
+    isTollRouteEligible :: Bool, -- True if tollRouteBlockedTill is Nothing or < now
+    driverGender :: Person.Gender,
+    vehicleNumber :: Maybe Text,
+    fleetOwnerId :: Maybe Text,
+    -- On-ride forward batching fields (Nothing for non-on-ride drivers)
+    previousRideDropLat :: Maybe Double,
+    previousRideDropLon :: Maybe Double,
+    distanceFromDriverToDestination :: Maybe Meters
+  }
+  deriving (Generic, Show, HasCoordinates)
+
+data NearestDriversReq = NearestDriversReq
+  { cityServiceTiers :: [DVST.VehicleServiceTier],
+    serviceTiers :: [ServiceTierType],
+    fromLocLatLong :: LatLong,
+    nearestRadius :: Meters,
+    merchantId :: Id Merchant,
+    driverPositionInfoExpiry :: Maybe Seconds,
+    isRental :: Bool,
+    isInterCity :: Bool,
+    isScheduled :: Bool,
+    scheduledOpenToAll :: Bool,
+    scheduledPickupTime :: Maybe UTCTime,
+    currentRideTripCategoryValidForForwardBatching :: [Text],
+    prepaidSubscriptionThreshold :: Maybe HighPrecMoney,
+    fleetPrepaidSubscriptionThreshold :: Maybe HighPrecMoney,
+    rideFare :: Maybe HighPrecMoney,
+    govtCharges :: Maybe HighPrecMoney,
+    tollCharges :: Maybe HighPrecMoney,
+    parkingCharge :: Maybe HighPrecMoney,
+    minWalletAmountForCashRides :: Maybe HighPrecMoney,
+    minWalletAmountForScheduledRides :: Maybe HighPrecMoney,
+    paymentInstrument :: Maybe MP.PaymentInstrument,
+    taxConfig :: DTC.TaxConfig,
+    isValueAddNP :: Bool,
+    onlinePayment :: Bool,
+    now :: UTCTime,
+    paymentMode :: Maybe MP.PaymentMode,
+    vehicleCategoryScopedPrepaidEnabled :: Bool,
+    excludeDriverIds :: [Id Person.Driver],
+    prevAttemptedDriverIds :: [Id Person.Driver],
+    applyParallelRequestFilter :: Bool,
+    maxParallelSearchRequests :: Int,
+    airportEntryFee :: Maybe HighPrecMoney,
+    isAirportRequest :: Bool,
+    searchTryId :: Maybe Text
+  }
+
+-- | A driver location candidate sorted by straight-line distance, with the
+-- previously-attempted flag preserved so that downstream chunking can keep
+-- prev-attempted drivers at the tail (process them only when fresh drivers run out).
+data SortedLTSCandidate = SortedLTSCandidate
+  { driverLoc :: DriverLocation,
+    straightLineDistanceMeters :: Double,
+    isPrevAttempted :: Bool
+  }
+  deriving (Generic, Show)
+
+-- | LTS fetch + exclude blocklisted + compute straight-line distance + sort.
+-- Output: sorted candidates with NON-prev-attempted drivers first (by distance ASC),
+-- then prev-attempted drivers (by distance ASC). This lets chunked callers process
+-- fresh drivers first and only touch prev-attempted ones when fresh ones run out
+-- (replaces the old fillBatch backfill mechanism).
+fetchSortedLTSCandidates ::
+  (MonadFlow m, MonadTime m, LT.HasLocationService m r, CoreMetrics m, EsqDBFlow m r, CacheFlow m r, Redis.HedisFlow m r, HasShortDurationRetryCfg r c) =>
+  NearestDriversReq ->
+  m [SortedLTSCandidate]
+fetchSortedLTSCandidates NearestDriversReq {..} = do
+  let allowedCityServiceTiers = filter (\cvst -> cvst.serviceTierType `elem` serviceTiers) cityServiceTiers
+      allowedVehicleVariant = DL.nub (concatMap (.allowedVehicleVariant) allowedCityServiceTiers)
+  driverLocsRaw <- Int.getDriverLocsWithCond merchantId driverPositionInfoExpiry fromLocLatLong nearestRadius (bool (Just allowedVehicleVariant) Nothing (null allowedVehicleVariant)) searchTryId
+  let afterExclude = if null excludeDriverIds then driverLocsRaw else filter (\dl -> dl.driverId `notElem` excludeDriverIds) driverLocsRaw
+      prevSet = prevAttemptedDriverIds
+      mkCandidate dl =
+        let dist = (realToFrac $ distanceBetweenInMeters fromLocLatLong (LatLong dl.lat dl.lon)) :: Double
+            isPrev = dl.driverId `elem` prevSet
+         in SortedLTSCandidate dl dist isPrev
+      withDist = map mkCandidate afterExclude
+      (notPrev, prev) = DL.partition (not . isPrevAttempted) withDist
+      sortedNotPrev = DL.sortOn straightLineDistanceMeters notPrev
+      sortedPrev = DL.sortOn straightLineDistanceMeters prev
+      sorted = sortedNotPrev <> sortedPrev
+  logDebug $
+    "DriverPool[1-LTS] " <> show (length sorted) <> " drivers within " <> show nearestRadius
+      <> "m (excluded="
+      <> show (length driverLocsRaw - length afterExclude)
+      <> ", notPrev="
+      <> show (length sortedNotPrev)
+      <> ", prevAtTail="
+      <> show (length sortedPrev)
+      <> ")"
+  pure sorted
+
+-- | Process one chunk of sorted candidates: parallel-cap filter, pool-data fetch,
+-- eligibility chain, service-tier expansion, wallet balance check.
+-- Returns NearestDriversResult per (driver, matchingServiceTier) pair.
+processCandidatesChunk ::
+  (BeamFlow m r, MonadFlow m, MonadTime m, CoreMetrics m, EsqDBFlow m r, CacheFlow m r, Redis.HedisFlow m r) =>
+  NearestDriversReq ->
+  (Bool -> Bool -> [Id Person.Driver] -> m [DPD.DriverPoolData]) ->
+  [SortedLTSCandidate] ->
+  m [NearestDriversResult]
+processCandidatesChunk req@NearestDriversReq {..} fetchPoolData chunk = do
+  merchant <- CQM.findById merchantId >>= fromMaybeM (MerchantNotFound merchantId.getId)
+  let isPrepaidEnabled = fromMaybe False merchant.prepaidSubscriptionAndWalletEnabled
+  -- Parallel-cap filter (one pipelined Redis ZCOUNT per driver in the chunk).
+  filteredChunk <-
+    if applyParallelRequestFilter
+      then filterByParallelRequestCap req chunk
+      else pure chunk
+  -- Pool-data MGET for chunk survivors only.
+  let chunkDriverIds = (.driverId) . driverLoc <$> filteredChunk
+  poolDataList <- fetchPoolData onlinePayment isPrepaidEnabled chunkDriverIds
+  let poolDataMap = HashMap.fromList $ (\dpd -> (dpd.driverId, dpd)) <$> poolDataList
+      cityServiceTiersHashMap = HashMap.fromList $ (\vst -> (vst.serviceTierType, vst)) <$> cityServiceTiers
+      results = concat $ mapMaybe (buildDriverResult req isPrepaidEnabled poolDataMap cityServiceTiersHashMap . driverLoc) filteredChunk
+  filterByWalletBalance req isPrepaidEnabled results
+
+-- | Wrapper for non-chunked callers (Estimate stage): fetch then process all as one chunk.
+getNearestDrivers ::
+  (BeamFlow m r, MonadFlow m, MonadTime m, LT.HasLocationService m r, CoreMetrics m, EsqDBFlow m r, CacheFlow m r, Redis.HedisFlow m r, HasShortDurationRetryCfg r c) =>
+  NearestDriversReq ->
+  (Bool -> Bool -> [Id Person.Driver] -> m [DPD.DriverPoolData]) ->
+  m [NearestDriversResult]
+getNearestDrivers req fetchPoolData = do
+  candidates <- fetchSortedLTSCandidates req
+  processCandidatesChunk req fetchPoolData candidates
+
+-- | True if `tier` is either not cohort-gated at all, or the driver currently holds a valid,
+-- unexpired tag for the cohort it's gated on. Also imported by SharedLogic.VehicleServiceTier's
+-- candidate-selection/display logic, so this is the single shared definition -- defined here
+-- (not there) to avoid a module cycle, since VehicleServiceTier needs Storage.Queries.Person for
+-- an internal Person.driverTag fetch, and Storage.Queries.Person's submodule graph already routes
+-- through this file. This is the layer that actually gates dispatch, so it must never trust
+-- `selectedServiceTiers` alone for a cohort-gated tier. The cohort tag itself is always
+-- ops-assigned (via the dashboard); no tier-selection change ever writes it.
+--
+-- The cohort tag's value is the tier name itself -- "Cohort#<tier>", or "Cohort#<tierA>&<tierB>"
+-- for a driver in several cohorts -- not a separately configured short code, so no Redis-backed
+-- short-code-to-tier mapping is needed anywhere (Haskell or location-tracking-service) to answer
+-- "which tier does this cohort gate." elemTagValue matches the tier within that "&"-separated set.
+isTierEligibleForDriver :: UTCTime -> Maybe [LYT.TagNameValueExpiry] -> HashMap.HashMap ServiceTierType DVST.VehicleServiceTier -> ServiceTierType -> Bool
+isTierEligibleForDriver now driverTag tierConfigs tier =
+  case HashMap.lookup tier tierConfigs >>= (.availabilityCheckConfig) of
+    Nothing -> True
+    Just _ -> Yudhishthira.elemTagValue (LYT.TagName "Cohort") (show tier) (Yudhishthira.filterExpiredTags' now (fromMaybe [] driverTag))
+
+-- | Whether the driver is eligible for a scheduled booking of the given tier: not a scheduled ride
+-- at all, within the R4 open-to-all threshold, or the tier's configured eligibility tags intersect
+-- the driver's (already expiry-filtered) tags. A tier with no configured eligibility tags is open.
+scheduledTierEligibleForDriver :: Bool -> Bool -> [Text] -> HashMap.HashMap ServiceTierType DVST.VehicleServiceTier -> ServiceTierType -> Bool
+scheduledTierEligibleForDriver isScheduled scheduledOpenToAll driverTagTexts cityServiceTiersHashMap tier =
+  not isScheduled
+    || scheduledOpenToAll -- R4: within open-to-all threshold, eligibility is dropped
+    || case HashMap.lookup tier cityServiceTiersHashMap >>= (.scheduleBookingListEligibilityTags) of
+      Just reqTags@(_ : _) -> not . null $ DL.intersect driverTagTexts reqTags
+      _ -> True
+
+buildDriverResult ::
+  NearestDriversReq ->
+  Bool ->
+  HashMap.HashMap (Id Person.Driver) DPD.DriverPoolData ->
+  HashMap.HashMap ServiceTierType DVST.VehicleServiceTier ->
+  DriverLocation ->
+  Maybe [NearestDriversResult]
+buildDriverResult NearestDriversReq {..} isPrepaidEnabled poolDataMap cityServiceTiersHashMap location = do
+  dpd <- HashMap.lookup location.driverId poolDataMap
+  guard $ not dpd.blocked
+  guard $ dpd.enabled
+  guard $ not (fromMaybe False dpd.isDisabledReasonFlag)
+  -- Fleet drivers under prepaid billing are settled at the fleet-owner level (the wallet
+  -- filter below redirects dues to `fleetOwnerId` via `resolveOwnerAndThreshold`), so the
+  -- per-driver `subscribed` flag is not the authority on their eligibility -- nothing in the
+  -- fleet flow ever sets it. `fleetOwnerId` is only populated from an association that is
+  -- already `isActive = True` and unexpired (`associatedTill > now`, see
+  -- FleetDriverAssociationExtra.findAllByDriverIds), so its presence IS the active-association
+  -- check. Solo drivers, and fleet drivers on non-prepaid merchants, still gate on `subscribed`.
+  guard $ dpd.subscribed || (isPrepaidEnabled && isJust dpd.fleetOwnerId)
+  guard $ isDriverModeEligibleHelper dpd.mode dpd.active
+  guard $ isTripTypeEligibleHelper isRental isInterCity dpd
+  when isAirportRequest $ guard $ dpd.enableForAirport == Just DI.ENABLED
+  guard $ not (shouldCheckCashWallet paymentInstrument) || fromMaybe True dpd.enableCashRide
+  when dpd.onRide $ do
+    guard dpd.forwardBatchingEnabled
+    guard $ dpd.hasRideStarted == Just True
+    guard $ isJust dpd.driverTripEndLocation
+    guard $ maybe False (\tc -> tc `elem` currentRideTripCategoryValidForForwardBatching) dpd.onRideTripCategory
+  when onlinePayment $ do
+    guard dpd.chargesEnabled
+    let effectiveMode = fromMaybe MP.LIVE dpd.bankAccountPaymentMode
+        requestedMode = fromMaybe MP.LIVE paymentMode
+    guard $ effectiveMode == requestedMode
+  let driverPoint = LatLong {lat = location.lat, lon = location.lon}
+  let (dist, mbPrevDropLat, mbPrevDropLon, mbDistToDestination) =
+        if dpd.onRide
+          then case dpd.driverTripEndLocation of
+            Just dropLoc ->
+              let distDriverToDrop = (realToFrac $ distanceBetweenInMeters driverPoint dropLoc) :: Double
+                  distDropToPickup = (realToFrac $ distanceBetweenInMeters fromLocLatLong dropLoc) :: Double
+               in (distDriverToDrop + distDropToPickup, Just dropLoc.lat, Just dropLoc.lon, Just $ roundToIntegral distDriverToDrop)
+            Nothing -> ((realToFrac $ distanceBetweenInMeters fromLocLatLong driverPoint) :: Double, Nothing, Nothing, Nothing)
+          else ((realToFrac $ distanceBetweenInMeters fromLocLatLong driverPoint) :: Double, Nothing, Nothing, Nothing)
+  when dpd.onRide $ guard $ roundToIntegral dist <= nearestRadius
+  let mbDefaultServiceTierForDriver = find (\vst -> dpd.variant `elem` vst.defaultForVehicleVariant) cityServiceTiers
+  let softBlockedTiers = fromMaybe [] dpd.softBlockStiers
+  let removeSoftBlockedTiers = filter (\stier -> stier `notElem` softBlockedTiers)
+  let availableCityTiers = (.serviceTierType) <$> filter (\vst -> dpd.variant `elem` vst.allowedVehicleVariant) cityServiceTiers
+  let selectedDriverServiceTiers = removeSoftBlockedTiers $ DL.intersect dpd.selectedServiceTiers availableCityTiers
+  let selectedDriverServiceTiers' = filter (isTierEligibleForDriver now dpd.driverTag cityServiceTiersHashMap) selectedDriverServiceTiers
+  -- Filter expired tags before matching so a stale (expired) tag can't grant scheduled eligibility,
+  -- consistent with isTierEligibleForDriver above.
+  let driverTagTexts = LYT.getTagNameValue . Yudhishthira.removeTagExpiry <$> Yudhishthira.filterExpiredTags' now (fromMaybe [] dpd.driverTag)
+  let matchingTiers =
+        filter (scheduledTierEligibleForDriver isScheduled scheduledOpenToAll driverTagTexts cityServiceTiersHashMap) $
+          if null serviceTiers
+            then selectedDriverServiceTiers'
+            else filter (`elem` selectedDriverServiceTiers') serviceTiers
+  guard $ not $ null matchingTiers
+  Just $ mapMaybe (mkResultHelper now dpd location dist mbDefaultServiceTierForDriver cityServiceTiersHashMap mbPrevDropLat mbPrevDropLon mbDistToDestination) matchingTiers
+
+mkResultHelper ::
+  UTCTime ->
+  DPD.DriverPoolData ->
+  DriverLocation ->
+  Double ->
+  Maybe DVST.VehicleServiceTier ->
+  HashMap.HashMap ServiceTierType DVST.VehicleServiceTier ->
+  Maybe Double ->
+  Maybe Double ->
+  Maybe Meters ->
+  ServiceTierType ->
+  Maybe NearestDriversResult
+mkResultHelper now dpd location dist mbDefaultServiceTierForDriver cityServiceTiersHashMap mbPrevDropLat mbPrevDropLon mbDistToDestination serviceTier = do
+  serviceTierInfo <- HashMap.lookup serviceTier cityServiceTiersHashMap
+  let tollRouteEligible = case dpd.tollRouteBlockedTill of
+        Nothing -> True
+        Just blockTill -> blockTill < now
+  let driverTagPrefix = if dpd.onRide then "OnRideDriver#true" else "NormalDriver#true"
+  Just $
+    NearestDriversResult
+      { driverId = dpd.driverId,
+        driverDeviceToken = dpd.deviceToken,
+        language = dpd.language,
+        onRide = dpd.onRide,
+        distanceToDriver = roundToIntegral dist,
+        variant = dpd.variant,
+        serviceTier,
+        serviceTierDowngradeLevel = maybe 0 (\d -> d.priority - serviceTierInfo.priority) mbDefaultServiceTierForDriver,
+        isAirConditioned = serviceTierInfo.isAirConditioned,
+        lat = location.lat,
+        lon = location.lon,
+        mode = dpd.mode,
+        clientSdkVersion = dpd.clientSdkVersion,
+        clientBundleVersion = dpd.clientBundleVersion,
+        clientConfigVersion = dpd.clientConfigVersion,
+        clientDevice = dpd.clientDevice,
+        vehicleAge = getVehicleAge dpd.mYManufacturing now,
+        latestScheduledBooking = dpd.latestScheduledBooking,
+        latestScheduledPickup = dpd.latestScheduledPickup,
+        selectedAutoAcceptTiers = fromMaybe [] dpd.selectedAutoAcceptTiers,
+        -- Expiry-filtered, like the cohort and scheduled-eligibility checks above: the pool
+        -- data is a long-lived Redis cache, so a tag that has already run out of time is
+        -- still sitting in `dpd.driverTag` until the driver's next tag write.
+        driverTags = Yudhishthira.convertTags $ LYT.TagNameValueExpiry driverTagPrefix : (map LYT.TagNameValueExpiry (fromMaybe [] dpd.vehicleTags) ++ Yudhishthira.filterExpiredTags' now (fromMaybe [] dpd.driverTag)),
+        score = Nothing,
+        tripDistanceMinThreshold = dpd.tripDistanceMinThreshold,
+        tripDistanceMaxThreshold = dpd.tripDistanceMaxThreshold,
+        maxPickupDistance = dpd.maxPickupRadius,
+        isPetModeEnabled = dpd.isPetModeEnabled,
+        isTollRouteEligible = tollRouteEligible,
+        driverGender = dpd.gender,
+        previousRideDropLat = mbPrevDropLat,
+        previousRideDropLon = mbPrevDropLon,
+        vehicleNumber = Just dpd.registrationNo,
+        fleetOwnerId = dpd.fleetOwnerId,
+        distanceFromDriverToDestination = mbDistToDestination
+      }
+
+filterByParallelRequestCap :: (Redis.HedisFlow m r, MonadFlow m) => NearestDriversReq -> [SortedLTSCandidate] -> m [SortedLTSCandidate]
+filterByParallelRequestCap NearestDriversReq {..} chunk = do
+  let toScore = realToFrac . utcTimeToPOSIXSeconds :: UTCTime -> Double
+      parallelKeys = DPD.mkParallelSearchRequestKey merchantId . (.driverId) . driverLoc <$> chunk
+  activeCounts <-
+    Redis.withMasterRedis . Redis.withCrossAppRedis $
+      Redis.runPipelinedByKey "zCountPipelined" (\key -> Hedis.zcount key (toScore now) (toScore (addUTCTime 5000 now))) parallelKeys
+  pure [candidate | (candidate, activeCount) <- zip chunk activeCounts, maybe True ((< maxParallelSearchRequests) . fromIntegral) activeCount]
+
+isDriverModeEligibleHelper :: Maybe DriverInfo.DriverMode -> Bool -> Bool
+isDriverModeEligibleHelper Nothing active = active
+isDriverModeEligibleHelper (Just DriverInfo.SILENT) _ = True
+isDriverModeEligibleHelper (Just DriverInfo.ONLINE) _ = True
+isDriverModeEligibleHelper _ _ = False
+
+isTripTypeEligibleHelper :: Bool -> Bool -> DPD.DriverPoolData -> Bool
+isTripTypeEligibleHelper isRental isInterCity dpd
+  | isRental = dpd.canSwitchToRental
+  | isInterCity = dpd.canSwitchToInterCity
+  | otherwise = dpd.canSwitchToIntraCity
+
+filterByWalletBalance ::
+  (BeamFlow m r, MonadFlow m, CacheFlow m r, EsqDBFlow m r, Redis.HedisFlow m r) =>
+  NearestDriversReq ->
+  Bool ->
+  [NearestDriversResult] ->
+  m [NearestDriversResult]
+filterByWalletBalance NearestDriversReq {..} isPrepaidEnabled results = do
+  afterPrepaid <-
+    if isPrepaidEnabled
+      then do
+        let mbFareRequirement = case (rideFare, prepaidSubscriptionThreshold <|> fleetPrepaidSubscriptionThreshold) of
+              (Just fare, Just _) -> Just fare
+              _ -> Nothing
+            mbCreditsValidAt = if isScheduled then scheduledPickupTime else Nothing
+        if isNothing mbFareRequirement && isNothing mbCreditsValidAt
+          then pure results
+          else do
+            purchasesByOwner <- case mbCreditsValidAt of
+              Just _ -> fetchActivePrepaidPurchasesByOwners (map candidateOwnerId results)
+              Nothing -> pure mempty
+            filterM (passesPrepaidGates mbFareRequirement mbCreditsValidAt purchasesByOwner) results
+      else pure results
+  let cashRequirement =
+        case minWalletAmountForCashRides of
+          Just minAmt
+            | isPrepaidEnabled && shouldCheckCashWallet paymentInstrument ->
+              Just (minAmt + estimateDeductionsFromConfig taxConfig rideFare govtCharges tollCharges parkingCharge)
+          _ -> Nothing
+      airportRequirement = case airportEntryFee of
+        Just fee | fee > 0 -> Just fee
+        _ -> Nothing
+      -- Scheduled-ride minimum wallet balance, folded into this pass so the candidate list is
+      -- filtered once (combined with the cash/airport gates) rather than in a second traversal.
+      applyScheduledGate = isScheduled && not scheduledOpenToAll
+  if isNothing cashRequirement && isNothing airportRequirement && not applyScheduledGate
+    then pure afterPrepaid
+    else filterM (passesLiabilityGates cashRequirement airportRequirement applyScheduledGate) afterPrepaid
+  where
+    resolveOwnerAndThreshold r = case r.fleetOwnerId of
+      Just fleetOwnerId -> (counterpartyFleetOwner, fleetOwnerId, fromMaybe 0 fleetPrepaidSubscriptionThreshold)
+      Nothing -> (counterpartyDriver, r.driverId.getId, fromMaybe 0 prepaidSubscriptionThreshold)
+
+    candidateOwnerId r = let (_, ownerId, _) = resolveOwnerAndThreshold r in ownerId
+    passesPrepaidGates mbFareRequirement mbCreditsValidAt purchasesByOwner r = do
+      let mbVehicleCategory = if vehicleCategoryScopedPrepaidEnabled then Just (DV.castServiceTierToVehicleCategory r.serviceTier) else Nothing
+          (counterpartyType, ownerId, threshold) = resolveOwnerAndThreshold r
+          ownerType = maybe DSP.DRIVER (const DSP.FLEET_OWNER) r.fleetOwnerId
+      balanceOk <- case mbFareRequirement of
+        Nothing -> pure True
+        Just fare -> do
+          mbBalance <- getPrepaidAvailableBalanceByOwner counterpartyType ownerId mbVehicleCategory
+          pure $ maybe False (>= (fare + threshold)) mbBalance
+      if not balanceOk
+        then pure False
+        else pure $ maybe True (prepaidCreditsValidAtIn purchasesByOwner ownerId ownerType mbVehicleCategory) mbCreditsValidAt
+
+    checkBalance (counterpartyType, ownerId) required = do
+      mbBalance <- getWalletBalanceByOwner counterpartyType ownerId
+      pure $ maybe False (>= required) mbBalance
+
+    passesLiabilityGates cashReq airportReq applyScheduledGate r = do
+      -- Scheduled-ride wallet gate first (short-circuits the cash/airport balance fetches on failure).
+      scheduledOk <-
+        if applyScheduledGate
+          then hasMinWalletBalance counterpartyDriver minWalletAmountForScheduledRides r.driverId.getId
+          else pure True
+      if not scheduledOk
+        then pure False
+        else do
+          let (cashCp, cashOwner, _) = resolveOwnerAndThreshold r
+              cashAccount = (cashCp, cashOwner)
+              airportAccount = (counterpartyDriver, r.driverId.getId)
+          case (cashReq, airportReq) of
+            (Nothing, Nothing) -> pure True
+            (Just c, Nothing) -> checkBalance cashAccount c
+            (Nothing, Just a) -> checkBalance airportAccount a
+            (Just c, Just a)
+              | cashAccount == airportAccount -> checkBalance cashAccount (max c a)
+              | otherwise -> do
+                cashOk <- checkBalance cashAccount c
+                if cashOk then checkBalance airportAccount a else pure False
+
+shouldCheckCashWallet :: Maybe MP.PaymentInstrument -> Bool
+shouldCheckCashWallet = \case
+  Nothing -> True
+  Just MP.Cash -> True
+  Just MP.BoothOnline -> True
+  _ -> False
+
+-- | Estimate deductions (govtCharges + TDS) from fare components.
+estimateDeductionsFromConfig :: DTC.TaxConfig -> Maybe HighPrecMoney -> Maybe HighPrecMoney -> Maybe HighPrecMoney -> Maybe HighPrecMoney -> HighPrecMoney
+estimateDeductionsFromConfig taxConfig rideFare govtCharges_ tollCharges_ parkingCharge_ =
+  case rideFare of
+    Nothing -> 0
+    Just totalFare ->
+      let gstAmount = fromMaybe 0 govtCharges_
+          tollAmount = fromMaybe 0 tollCharges_
+          parkingAmount = fromMaybe 0 parkingCharge_
+          baseFare = totalFare - gstAmount - tollAmount - parkingAmount
+          tdsRate = Just taxConfig.invalidPanTdsRate.rate
+       in gstAmount + estimateWalletDeductions tdsRate baseFare

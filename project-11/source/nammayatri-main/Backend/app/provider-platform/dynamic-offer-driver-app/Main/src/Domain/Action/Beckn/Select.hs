@@ -1,0 +1,284 @@
+{-
+ Copyright 2022-23, Juspay India Pvt Ltd
+
+ This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License
+
+ as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. This program
+
+ is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+
+ or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details. You should have received a copy of
+
+ the GNU Affero General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+-}
+module Domain.Action.Beckn.Select
+  ( DSelectReq (..),
+    validateRequest,
+    handler,
+    validateQuoteSelect,
+    handleQuoteSelect,
+  )
+where
+
+import qualified Beckn.OnDemand.Transformer.MSIL.OnSelect as MSILOnSelect
+import qualified BecknV2.OnDemand.Utils.Common as BUtils
+import Control.Applicative ((<|>))
+import Data.Either.Extra (eitherToMaybe)
+import Data.Text as Text hiding (find)
+import qualified Domain.Action.UI.SearchRequestForDriver as USRD
+import qualified Domain.Types.ConditionalCharges as DAC
+import qualified Domain.Types.Estimate as DEst
+import qualified Domain.Types.Extra.MerchantPaymentMethod as DMPM
+import qualified Domain.Types.FareParameters as DFareParams
+import qualified Domain.Types.FarePolicy as DFP
+import qualified Domain.Types.Merchant as DM
+import qualified Domain.Types.MerchantOperatingCity as DMOC
+import qualified Domain.Types.ParcelType as DParcel
+import qualified Domain.Types.Quote as DQuote
+import qualified Domain.Types.RiderDetails as DRD
+import qualified Domain.Types.SearchRequest as DSR
+import qualified Domain.Types.Yudhishthira as Y
+import Environment
+import Kernel.Prelude
+import qualified Kernel.Tools.Metrics.AppMetrics as Metrics
+import Kernel.Types.Error
+import Kernel.Types.Id
+import Kernel.Utils.Common
+import Lib.ConfigPilot.Interface.Types (getOneConfig)
+-- import qualified Lib.Yudhishthira.Event as Yudhishthira
+import qualified Lib.Types.SpecialLocation as SL
+import qualified Lib.Yudhishthira.Tools.DebugLog as LYDL
+import qualified Lib.Yudhishthira.Types as Yudhishthira
+import SharedLogic.Allocator.Jobs.SendSearchRequestToDrivers (sendSearchRequestToDrivers')
+import qualified SharedLogic.CallBAP as CallBAP
+import SharedLogic.DriverPool
+import qualified SharedLogic.FarePolicy as SFP
+import qualified SharedLogic.MetricsLabels as SML
+import qualified SharedLogic.RiderDetails as SRD
+import SharedLogic.SearchTry
+import qualified SharedLogic.Type as SLT
+import qualified Storage.CachedQueries.BecknConfig as QBC
+import qualified Storage.CachedQueries.Merchant as QMerch
+import qualified Storage.CachedQueries.ValueAddNP as CQVAN
+import qualified Storage.CachedQueries.VehicleServiceTier as CQVST
+import Storage.ConfigPilot.Config.TransporterConfig (TransporterConfigDimensions (..))
+import qualified Storage.Queries.DriverQuote as QDQ
+import qualified Storage.Queries.Estimate as QEst
+import qualified Storage.Queries.FareParameters as QFareParams
+import qualified Storage.Queries.Quote as QQuote
+import qualified Storage.Queries.RiderDetails as QRD
+import qualified Storage.Queries.SearchRequest as QSR
+import Tools.Error
+import qualified Tools.Metrics.ARDUBPPMetrics as BPPMetrics
+
+data DSelectReq = DSelectReq
+  { messageId :: Text,
+    transactionId :: Text,
+    estimateIds :: [Id DEst.Estimate],
+    bapId :: Text,
+    bapUri :: BaseUrl,
+    pickupTime :: UTCTime,
+    autoAssignEnabled :: Bool,
+    customerExtraFee :: Maybe HighPrecMoney,
+    -- | BAP-proposed total fare for the Quote-based /select negotiation flow
+    -- (ONDC v2.1.0 Pre-Order Bid). Layer 1 (Beckn.ACL.Select) always sets this
+    -- to Nothing; only Beckn.OnDemand.Transformer.MSIL.Select.msilParser fills
+    -- it in, from item.price.value, for enableOndcScheduledRideSupport cities
+    -- pilot merchants. Deliberately a separate field from customerExtraFee,
+    -- which is an additive tip/extra-fee delta used by the Estimate-based
+    -- dynamic-offer flow -- this one is the bid's absolute proposed total.
+    negotiatedFare :: Maybe HighPrecMoney,
+    negativeFareAdjustment :: Maybe HighPrecMoney,
+    isPetRide :: Bool,
+    customerPhoneNum :: Maybe Text,
+    -- | Customer display name from fulfillment.customer.person (value-add-NP BAPs
+    -- send it for the one-shot assignment flow); stored on SearchRequest.riderName.
+    customerName :: Maybe Text,
+    isAdvancedBookingEnabled :: Bool,
+    isMultipleOrNoDeviceIdExist :: Maybe Bool,
+    toUpdateDeviceIdInfo :: Bool,
+    disabilityDisable :: Maybe Bool,
+    parcelDetails :: (Maybe Text, Maybe Int),
+    preferSafetyPlus :: Bool,
+    driverPreference :: Maybe [Text],
+    billingCategory :: SLT.BillingCategory,
+    paymentMethodInfo :: Maybe DMPM.PaymentMethodInfo,
+    emailDomain :: Maybe Text,
+    businessEmailDomain :: Maybe Text
+  }
+
+-- user can select array of estimate because of book any option, in most of the cases it will be a single estimate
+handler :: DM.Merchant -> DSelectReq -> DSR.SearchRequest -> [DEst.Estimate] -> Flow ()
+handler merchant sReq searchReq estimates = do
+  logDebug $ "DSelectReq: select request billingCategory: " <> show sReq.billingCategory <> "transactionId: " <> sReq.transactionId
+  whenJust (listToMaybe estimates) $ \primaryEstimate -> do
+    cityLabel <- SML.getCityLabel searchReq.merchantOperatingCityId
+    distanceEdges <- SML.getDistanceBucketEdges searchReq.merchantOperatingCityId
+    let (pickupZone, dropZone) = SML.specialZoneLabels searchReq.area
+    BPPMetrics.incrementRiderAcceptanceCount
+      merchant.shortId.getShortId
+      cityLabel
+      (show primaryEstimate.vehicleServiceTier)
+      "normal"
+      (SML.distanceBucketLabel distanceEdges primaryEstimate.estimatedDistance)
+      pickupZone
+      dropZone
+  now <- getCurrentTime
+  riderId <- case sReq.customerPhoneNum of
+    Just number -> do
+      let mbMerchantOperatingCityId = Just searchReq.merchantOperatingCityId
+      -- consent tag is only emitted at confirm, not select, so no consent to record yet here
+      (riderDetails, isNewRider) <- SRD.getRiderDetails searchReq.currency merchant.id mbMerchantOperatingCityId (fromMaybe "+91" merchant.mobileCountryCode) number searchReq.bapId False Nothing
+      when isNewRider $ QRD.create riderDetails
+      when sReq.toUpdateDeviceIdInfo do
+        let mbFlag = mbGetPayoutFlag sReq.isMultipleOrNoDeviceIdExist
+        when (riderDetails.payoutFlagReason /= mbFlag) $ QRD.updateFlagReasonAndIsDeviceIdExists mbFlag (Just $ isJust sReq.isMultipleOrNoDeviceIdExist) riderDetails.id
+      return (Just riderDetails.id)
+    Nothing -> do
+      logWarning "Failed to get rider details as BAP Phone Number is NULL"
+      return Nothing
+  when sReq.isPetRide $ do
+    let tagData =
+          Y.SelectTagData
+            { isPetRide = sReq.isPetRide
+            -- ,estimates = estimates uncomment this line if you want to use estimates in select tag data
+            }
+    addNammaTags tagData searchReq
+  tripQuoteDetails <-
+    estimates `forM` \estimate -> do
+      QDQ.setInactiveAllDQByEstId estimate.id now
+      let mbDriverExtraFeeBounds = ((,) <$> estimate.estimatedDistance <*> (join $ (.driverExtraFeeBounds) <$> estimate.farePolicy)) <&> \(dist, driverExtraFeeBounds) -> DFP.findDriverExtraFeeBoundsByDistance dist driverExtraFeeBounds
+          driverPickUpCharge = join $ USRD.extractDriverPickupCharges <$> ((.farePolicyDetails) <$> estimate.farePolicy)
+          driverParkingCharge = join $ (.parkingCharge) <$> estimate.farePolicy
+          driverAdditionalCharges = filterChargesByApplicability $ fromMaybe [] ((.conditionalCharges) <$> estimate.farePolicy)
+          petCharges' = if sReq.isPetRide then (.petCharges) =<< estimate.farePolicy else Nothing
+          businessDiscount = if sReq.billingCategory == SLT.BUSINESS then fromMaybe 0.0 estimate.businessDiscount else 0.0
+          personalDiscount = if sReq.billingCategory == SLT.PERSONAL then fromMaybe 0.0 estimate.personalDiscount else 0.0
+      buildTripQuoteDetail searchReq estimate.tripCategory estimate.vehicleServiceTier estimate.vehicleServiceTierName (estimate.minFare + fromMaybe 0 sReq.customerExtraFee + fromMaybe 0 sReq.negativeFareAdjustment + fromMaybe 0 petCharges' - businessDiscount - personalDiscount) Nothing (mbDriverExtraFeeBounds <&> (.minFee)) (mbDriverExtraFeeBounds <&> (.maxFee)) (mbDriverExtraFeeBounds <&> (.stepFee)) (mbDriverExtraFeeBounds <&> (.defaultStepFee)) driverPickUpCharge driverParkingCharge estimate.id.getId driverAdditionalCharges False ((.congestionCharge) =<< estimate.fareParams) petCharges' (estimate.fareParams >>= (.priorityCharges)) estimate.commissionCharges (estimate.fareParams >>= (.tollCharges)) (estimate.fareParams >>= (.govtCharges)) (estimate.fareParams >>= (.driverCancellationNotAllowed))
+  let parcelType = (fst sReq.parcelDetails) >>= \rpt -> readMaybe @DParcel.ParcelType $ unpack rpt
+      -- Quotes-first airport flow: the picked estimate carries its own gate area (e.g.
+      -- Pickup_<slId>_Gate_<gateId>). Refine the SearchRequest.area/pickupGateId from
+      -- that so per-gate driver-queue routing (Redis DriverDemand:Gate:<gateId>:<variant>)
+      -- dispatches to the right pool.
+      mbEstimateArea = listToMaybe estimates >>= (.area) >>= (readMaybe . Text.unpack)
+      mbEstimateGateId = mbEstimateArea >>= SL.pickupGateIdFromArea
+      updatedSearchRequest =
+        searchReq
+          { DSR.disabilityTag = if sReq.disabilityDisable == Just True then Nothing else searchReq.disabilityTag,
+            DSR.isAdvanceBookingEnabled = sReq.isAdvancedBookingEnabled || searchReq.isAdvanceBookingEnabled,
+            DSR.autoAssignEnabled = if sReq.autoAssignEnabled then Just sReq.autoAssignEnabled else searchReq.autoAssignEnabled,
+            DSR.riderId = riderId,
+            DSR.riderName = sReq.customerName <|> searchReq.riderName,
+            DSR.parcelType = if isJust parcelType then parcelType else searchReq.parcelType,
+            DSR.parcelQuantity = if isJust parcelType then snd sReq.parcelDetails else searchReq.parcelQuantity,
+            DSR.preferSafetyPlus = sReq.preferSafetyPlus,
+            DSR.isPetRide = sReq.isPetRide,
+            DSR.area = mbEstimateArea <|> searchReq.area,
+            DSR.pickupGateId = mbEstimateGateId <|> searchReq.pickupGateId
+          }
+  QSR.updateMultipleByRequestId updatedSearchRequest searchReq.isScheduled
+  QSR.updateByPrimaryKey updatedSearchRequest
+  let driverSearchBatchInput =
+        DriverSearchBatchInput
+          { sendSearchRequestToDrivers = sendSearchRequestToDrivers',
+            merchant,
+            searchReq = updatedSearchRequest,
+            tripQuoteDetails,
+            customerExtraFee = sReq.customerExtraFee,
+            negativeFareAdjustment = sReq.negativeFareAdjustment,
+            messageId = sReq.messageId,
+            isRepeatSearch = False,
+            billingCategory = sReq.billingCategory,
+            isAllocatorBatch = False,
+            paymentMethodInfo = sReq.paymentMethodInfo,
+            emailDomain = sReq.emailDomain,
+            businessEmailDomain = sReq.businessEmailDomain,
+            driverPreference = sReq.driverPreference
+          }
+  void $ initiateDriverSearchBatch driverSearchBatchInput
+  -- NOTE: Special zone demand pipeline has been moved to Init handler (Domain.Action.Beckn.Init)
+  -- so that it fires for both estimate-based (Select → Init) and quote-based (direct Init)
+  -- flows. Special zone OTP rides skip Select entirely, so demand was never incrementing.
+  Metrics.finishGenericLatencyMetrics Metrics.SELECT_TO_SEND_REQUEST searchReq.transactionId
+  where
+    mbGetPayoutFlag isMultipleOrNoDeviceIdExist = maybe Nothing (\val -> if val then Just DRD.MultipleDeviceIdExists else Nothing) isMultipleOrNoDeviceIdExist
+    filterChargesByApplicability conditionalCharges = do
+      let safetyCharges = if sReq.preferSafetyPlus then find (\ac -> (ac.chargeCategory) == DAC.SAFETY_PLUS_CHARGES) conditionalCharges else Nothing
+          nyregularCharges = if fromMaybe False searchReq.isReserveRide then find (\ac -> (ac.chargeCategory) == DAC.NYREGULAR_SUBSCRIPTION_CHARGE) conditionalCharges else Nothing
+      catMaybes $ [safetyCharges, nyregularCharges]
+
+validateRequest :: Id DM.Merchant -> DSelectReq -> Flow (DM.Merchant, DSR.SearchRequest, [DEst.Estimate])
+validateRequest merchantId sReq = do
+  merchant <- QMerch.findById merchantId >>= fromMaybeM (MerchantNotFound merchantId.getId)
+  mbEstimates <- mapM QEst.findById sReq.estimateIds
+  let estimates = catMaybes mbEstimates
+  case estimates of
+    [] -> throwError $ InvalidRequest "User need to select at least one estimate"
+    (estimate : xs) -> do
+      searchReq <- QSR.findById estimate.requestId >>= fromMaybeM (SearchRequestNotFound estimate.requestId.getId)
+      return (merchant, searchReq, [estimate] <> xs)
+
+addNammaTags :: Y.SelectTagData -> DSR.SearchRequest -> Flow ()
+addNammaTags tagData sReq = do
+  newSearchTags <- withTryCatch "computeNammaTags:Select" (LYDL.computeNammaTagsWithDebugLog LYDL.Driver (cast sReq.merchantOperatingCityId) Yudhishthira.Select (Just sReq.transactionId) tagData)
+  let tags = sReq.searchTags <> eitherToMaybe newSearchTags
+  QSR.updateSearchTags tags sReq.id
+
+-- MSIL pilot: /select for the new Quote-based (static/scheduled) capability --
+-- Dispatched only for cities with enableOndcScheduledRideSupport,
+-- at the API layer (API.Beckn.Select), when the wire item.id resolves to a Quote
+-- instead of an Estimate.
+
+-- | Validate a Quote-based /select. Pure read -- no DB writes, no driver-search
+-- trigger (unlike 'handler' above, which is the Estimate-based/dynamic-offer path).
+-- Driver search for this flow already starts later, at /confirm
+-- (Domain.Action.Beckn.Confirm.handleStaticOfferFlow).
+validateQuoteSelect :: Id DM.Merchant -> Id DQuote.Quote -> Text -> Maybe HighPrecMoney -> Flow (DM.Merchant, DSR.SearchRequest, DQuote.Quote)
+validateQuoteSelect merchantId quoteId transactionId mbNegotiatedFare = do
+  merchant <- QMerch.findById merchantId >>= fromMaybeM (MerchantNotFound merchantId.getId)
+  quote <- QQuote.findById quoteId >>= fromMaybeM (QuoteNotFound quoteId.getId)
+  now <- getCurrentTime
+  unless (quote.validTill > now) $
+    throwError $ QuoteExpired quoteId.getId
+  searchReq <- QSR.findById quote.searchRequestId >>= fromMaybeM (SearchRequestNotFound quote.searchRequestId.getId)
+  unless (searchReq.transactionId == transactionId) $
+    throwError $ InvalidRequest "select transaction_id does not match the search context this quote belongs to"
+  quote' <- case mbNegotiatedFare of
+    Nothing -> return quote
+    Just negotiatedFare -> applyNegotiatedFare searchReq.merchantOperatingCityId quoteId quote negotiatedFare
+  return (merchant, searchReq, quote')
+
+-- Validate the negotiated fare and update fare policy and quotes according to that
+applyNegotiatedFare :: Id DMOC.MerchantOperatingCity -> Id DQuote.Quote -> DQuote.Quote -> HighPrecMoney -> Flow DQuote.Quote
+applyNegotiatedFare merchantOpCityId quoteId quote negotiatedFare = do
+  transporterConfig <- getOneConfig (TransporterConfigDimensions {merchantOperatingCityId = merchantOpCityId.getId}) Nothing >>= fromMaybeM (TransporterConfigDoesNotExist merchantOpCityId.getId)
+  let negotiationFareMinTolerancePct = fromMaybe 0.1 transporterConfig.negotiationFareMinTolerancePct
+      negotiationFareMaxTolerancePct = fromMaybe 0.1 transporterConfig.negotiationFareMaxTolerancePct
+      currentFare = quote.estimatedFare
+      minAcceptable = currentFare * (1 - realToFrac negotiationFareMinTolerancePct)
+      maxAcceptable = currentFare * (1 + realToFrac negotiationFareMaxTolerancePct)
+  unless (negotiatedFare >= minAcceptable && negotiatedFare <= maxAcceptable) $ -- We can discuss on this comparisation logic
+    throwError $ NegotiatedFareNotAcceptable quoteId.getId
+  let negotiationDelta = negotiatedFare - currentFare
+      updatedFareParams = quote.fareParams {DFareParams.negotiatedFareDelta = Just negotiationDelta}
+  QFareParams.updateFareParameters updatedFareParams quote.fareParams.id
+  QQuote.updateEstimatedFare quoteId negotiatedFare
+  return quote {DQuote.estimatedFare = negotiatedFare, DQuote.fareParams = updatedFareParams}
+
+-- | Build and send /on_select for a validated Quote (see
+-- Beckn.OnDemand.Transformer.MSIL.OnSelect for the builder). Called from a fork,
+-- same as 'handler' above, using the inbound /select's own messageId -- unlike
+-- the dynamic-offer flow's callOnSelectV2, there's no driver bid to wait for, so
+-- this is synchronous within the same request, not deferred to a later event.
+handleQuoteSelect :: Text -> DM.Merchant -> DSR.SearchRequest -> DQuote.Quote -> Flow ()
+handleQuoteSelect msgId merchant searchReq quote = do
+  now <- getCurrentTime
+  let vehicleCategory = BUtils.mapServiceTierToCategory quote.vehicleServiceTier
+  bppConfig <- QBC.findByMerchantIdDomainAndVehicle merchant.id "MOBILITY" vehicleCategory >>= fromMaybeM (InternalError "Beckn Config not found")
+  vehicleServiceTierItem <-
+    CQVST.findByServiceTierTypeAndCityIdInRideFlow quote.vehicleServiceTier searchReq.merchantOperatingCityId (searchReq.area >>= SL.pickupSpecialZoneIdFromArea)
+      >>= fromMaybeM (VehicleServiceTierNotFound (show quote.vehicleServiceTier))
+  mbFarePolicy <- SFP.getFarePolicyByEstOrQuoteIdWithoutFallback quote.id.getId
+  isValueAddNP <- CQVAN.isValueAddNP searchReq.bapId
+  onSelectMsg <- MSILOnSelect.mkOnSelectMessageV2FromQuote isValueAddNP bppConfig merchant searchReq quote vehicleServiceTierItem mbFarePolicy now
+  CallBAP.callOnSelectV2ForQuote merchant searchReq msgId quote onSelectMsg

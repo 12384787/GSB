@@ -1,0 +1,930 @@
+"use client";
+
+import {
+  ADMIN_ROLE_NAME,
+  type archestraApiTypes,
+  DocsPage,
+  E2eTestId,
+  formatSecretStorageType,
+  getDocsUrl,
+  isPlaywrightCatalogItem,
+  MCP_CATALOG_REAUTH_QUERY_PARAM,
+  MCP_CATALOG_SERVER_QUERY_PARAM,
+  type McpDeploymentStatusEntry,
+} from "@archestra/shared";
+import { format } from "date-fns";
+import { KeyRound, Plus, RefreshCw, Trash, User, Zap } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { useEffect, useState } from "react";
+import { ExternalDocsLink } from "@/components/external-docs-link";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogStickyFooter,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { useHasPermissions, useSession } from "@/lib/auth/auth.query";
+import { useFeature } from "@/lib/config/config.query";
+import {
+  useInternalMcpCatalog,
+  useUpdateInternalMcpCatalogItem,
+} from "@/lib/mcp/internal-mcp-catalog.query";
+import { useDeleteMcpServer, useMcpServers } from "@/lib/mcp/mcp-server.query";
+import { useCanReauthenticate } from "@/lib/mcp/use-can-reauthenticate";
+import { useMyTeams } from "@/lib/teams/team.query";
+import { AddServiceAccountDialog } from "./add-service-account-dialog";
+import { useCanModifyCatalogItem } from "./catalog-edit-access";
+import {
+  type DeploymentState,
+  DeploymentStatusDot,
+  getDeploymentLabel,
+  STATE_PRIORITY,
+} from "./deployment-status";
+
+type InstalledServer = archestraApiTypes.GetMcpServersResponses["200"][number];
+
+interface ManageUsersDialogProps {
+  isOpen: boolean;
+  onClose: () => void;
+  label?: string;
+  catalogId: string;
+  /** Called when user wants to add a personal connection. */
+  onAddPersonalConnection?: () => void;
+  /** Called when user wants to add a team connection for a specific team */
+  onAddSharedConnection?: (teamId: string) => void;
+  /** Called when user wants to add an organization-wide connection */
+  onAddOrgConnection?: () => void;
+  /** Deployment statuses keyed by server ID */
+  deploymentStatuses?: Record<string, McpDeploymentStatusEntry>;
+  /** Called when user clicks a pod name to open the debug dialog */
+  onOpenPodLogs?: (serverId: string) => void;
+}
+
+export function ManageUsersDialog({
+  isOpen,
+  onClose,
+  label,
+  catalogId,
+  onAddPersonalConnection,
+  onAddSharedConnection,
+  onAddOrgConnection,
+  deploymentStatuses = {},
+  onOpenPodLogs,
+}: ManageUsersDialogProps) {
+  return (
+    <Dialog open={isOpen} onOpenChange={onClose}>
+      <DialogContent
+        className="max-w-5xl h-[85vh] flex flex-col overflow-y-auto"
+        data-testid={E2eTestId.ManageCredentialsDialog}
+      >
+        <ManageUsersContent
+          isActive={isOpen}
+          onClose={onClose}
+          label={label}
+          catalogId={catalogId}
+          onAddPersonalConnection={onAddPersonalConnection}
+          onAddSharedConnection={onAddSharedConnection}
+          onAddOrgConnection={onAddOrgConnection}
+          deploymentStatuses={deploymentStatuses}
+          onOpenPodLogs={onOpenPodLogs}
+        />
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+interface ManageUsersContentProps {
+  isActive: boolean;
+  onClose: () => void;
+  label?: string;
+  catalogId: string;
+  onAddPersonalConnection?: () => void;
+  onAddSharedConnection?: (teamId: string) => void;
+  onAddOrgConnection?: () => void;
+  deploymentStatuses?: Record<string, McpDeploymentStatusEntry>;
+  onOpenPodLogs?: (serverId: string) => void;
+  hideHeader?: boolean;
+  bodyTestId?: string;
+  /** Whether this catalog is currently being installed. */
+  isInstalling?: boolean;
+  onReauthenticate?: (server: InstalledServer) => void;
+}
+
+export function ManageUsersContent({
+  isActive,
+  onClose,
+  label,
+  catalogId,
+  onAddPersonalConnection,
+  onAddSharedConnection,
+  onAddOrgConnection,
+  deploymentStatuses = {},
+  onOpenPodLogs,
+  hideHeader = false,
+  bodyTestId,
+  isInstalling = false,
+  onReauthenticate,
+}: ManageUsersContentProps) {
+  const router = useRouter();
+  // Subscribe to live mcp-servers query to get fresh data. We fetch all
+  // servers (no catalogId filter) and keep those installed from this catalog.
+  const { data: allServersUnfiltered = [], isFetched: serversFetched } =
+    useMcpServers();
+  const { data: catalogItems } = useInternalMcpCatalog({});
+  const { data: session } = useSession();
+  const currentUserId = session?.user?.id;
+
+  // Get user's teams and permissions for re-authentication checks
+  const { data: userTeams } = useMyTeams();
+  const { data: hasMcpServerCreatePermission } = useHasPermissions({
+    mcpServerInstallation: ["create"],
+  });
+  const { data: hasMcpServerUpdatePermission } = useHasPermissions({
+    mcpServerInstallation: ["update"],
+  });
+  const { data: hasMcpServerAdminPermission } = useHasPermissions({
+    mcpServerInstallation: ["admin"],
+  });
+
+  const allServers = allServersUnfiltered.filter(
+    (s) => s.catalogId === catalogId,
+  );
+
+  const [serviceAccountDialogOpen, setServiceAccountDialogOpen] =
+    useState(false);
+
+  // Use the first server for display purposes
+  const firstServer = allServers?.[0];
+
+  // Find the catalog item for connection labels and add-connection behavior.
+  const catalogItem = catalogItems?.find((item) => item.id === catalogId);
+
+  const canReauthenticate = useCanReauthenticate();
+
+  // Get tooltip message for disabled re-authenticate button
+  const getReauthTooltip = (mcpServer: (typeof allServers)[number]): string => {
+    if (!hasMcpServerCreatePermission) {
+      return "You need MCP server create permission to re-authenticate";
+    }
+    const scope = resolveServerScope(mcpServer);
+    if (scope === "org") {
+      return "Only an organization admin can re-authenticate an organization connection";
+    }
+    if (scope === "personal") {
+      return "Only the connection owner can re-authenticate";
+    }
+    // WHY: Different messages for different failure reasons
+    if (!hasMcpServerUpdatePermission) {
+      return "You don't have permission to re-authenticate team connections";
+    }
+    return "You can only re-authenticate connections for teams you are a member of";
+  };
+
+  // Check if user can revoke (delete) a credential
+  // Personal: owner OR mcpServer:update. Team: team admin role OR (mcpServer:update AND membership).
+  // Org: mcpServerInstallation:admin.
+  const canRevoke = (mcpServer: (typeof allServers)[number]) => {
+    const scope = resolveServerScope(mcpServer);
+    if (scope === "org") return !!hasMcpServerAdminPermission;
+    if (scope === "personal") {
+      return (
+        mcpServer.ownerId === currentUserId || !!hasMcpServerUpdatePermission
+      );
+    }
+    if (isCurrentUserTeamAdmin(mcpServer.teamId)) return true;
+    if (!hasMcpServerUpdatePermission) return false;
+    return userTeams?.some((team) => team.id === mcpServer.teamId) ?? false;
+  };
+
+  const isCurrentUserTeamAdmin = (teamId: string | null | undefined) => {
+    if (!teamId || !currentUserId) return false;
+    const team = userTeams?.find((team) => team.id === teamId);
+    return (
+      team?.members?.some(
+        (member) =>
+          member.userId === currentUserId && member.role === ADMIN_ROLE_NAME,
+      ) ?? false
+    );
+  };
+
+  // Get tooltip message for disabled revoke button
+  const getRevokeTooltip = (mcpServer: (typeof allServers)[number]): string => {
+    const scope = resolveServerScope(mcpServer);
+    if (scope === "org") {
+      return "Only an organization admin can revoke an organization connection";
+    }
+    if (scope === "personal") {
+      return "Only the connection owner or an editor/admin can revoke";
+    }
+    if (!hasMcpServerUpdatePermission) {
+      return "You don't have permission to revoke team connections";
+    }
+    return "You can only revoke connections for teams you are a member of";
+  };
+
+  const deleteMcpServerMutation = useDeleteMcpServer();
+
+  const handleRevoke = async (mcpServer: (typeof allServers)[number]) => {
+    await deleteMcpServerMutation.mutateAsync({
+      id: mcpServer.id,
+      name: mcpServer.name,
+    });
+  };
+
+  const handleReauthenticate = (mcpServer: (typeof allServers)[number]) => {
+    if (onReauthenticate) {
+      onReauthenticate(mcpServer);
+      return;
+    }
+    const params = new URLSearchParams({
+      [MCP_CATALOG_REAUTH_QUERY_PARAM]: catalogId,
+      [MCP_CATALOG_SERVER_QUERY_PARAM]: mcpServer.id,
+    });
+    // The registry owns the complete reauth flow. It handles pure OAuth,
+    // OAuth plus setup fields, and non-OAuth credentials without this table
+    // guessing from catalog metadata.
+    router.push(`/mcp/registry?${params.toString()}`);
+  };
+
+  // Close dialog when all credentials are revoked (only after data has loaded),
+  // but keep it open if add callbacks are available.
+  const hasAddCallbacks =
+    !!onAddPersonalConnection ||
+    !!onAddSharedConnection ||
+    !!onAddOrgConnection;
+  useEffect(() => {
+    if (isActive && serversFetched && !firstServer && !hasAddCallbacks) {
+      onClose();
+    }
+  }, [isActive, serversFetched, firstServer, onClose, hasAddCallbacks]);
+
+  if (!firstServer && !hasAddCallbacks) {
+    return null;
+  }
+
+  type Server = (typeof allServers)[number];
+  function splitByScope(servers: Server[]) {
+    const teamServers = servers.filter(
+      (s) => resolveServerScope(s) === "team" && !!s.teamId,
+    );
+    const orgServers = servers.filter((s) => resolveServerScope(s) === "org");
+    const teamsWithConnection = new Set(teamServers.map((s) => s.teamId));
+    const myPersonalServer =
+      servers.find(
+        (s) =>
+          resolveServerScope(s) === "personal" && s.ownerId === currentUserId,
+      ) ?? null;
+    const otherPersonalServers = servers.filter(
+      (s) =>
+        resolveServerScope(s) === "personal" && s.ownerId !== currentUserId,
+    );
+    const availableTeamsForShared =
+      userTeams?.filter((t) => !teamsWithConnection.has(t.id)) ?? [];
+    const hasOrgConnection = orgServers.length > 0;
+    return {
+      teamServers,
+      orgServers,
+      myPersonalServer,
+      otherPersonalServers,
+      availableTeamsForShared,
+      hasOrgConnection,
+    };
+  }
+
+  const getCredentialOwnerName = (mcpServer: Server): string => {
+    const scope = resolveServerScope(mcpServer);
+    if (scope === "org") return "Organization";
+    if (scope === "team") return mcpServer.teamDetails?.name || "Team";
+    return mcpServer.ownerEmail || "Deleted user";
+  };
+
+  const split = splitByScope(allServers);
+  const canonicalStateByPod = computeCanonicalStateByPod(
+    allServers,
+    deploymentStatuses,
+  );
+
+  const personalRows: ConnectionRow[] = [
+    ...(split.myPersonalServer
+      ? [{ server: split.myPersonalServer, isYou: true } as const]
+      : []),
+    ...split.otherPersonalServers.map((s) => ({ server: s, isYou: false })),
+  ];
+  const serviceAccountRows: ConnectionRow[] = [
+    ...split.teamServers.map((s) => ({ server: s, isYou: false })),
+    ...split.orgServers.map((s) => ({ server: s, isYou: false })),
+  ];
+
+  const canAddPersonal =
+    hasAddCallbacks && !!onAddPersonalConnection && !split.myPersonalServer;
+  const canAddTeam =
+    hasAddCallbacks &&
+    !!onAddSharedConnection &&
+    split.availableTeamsForShared.length > 0;
+  const canAddOrg =
+    hasAddCallbacks &&
+    !!onAddOrgConnection &&
+    !split.hasOrgConnection &&
+    !!hasMcpServerAdminPermission;
+  const isLocalServer = catalogItem?.serverType === "local";
+  const isPersonalOnly =
+    catalogItem != null && isPlaywrightCatalogItem(catalogItem.id);
+  const canAddServiceAccount = !isPersonalOnly && (canAddTeam || canAddOrg);
+
+  const rowProps: RowRenderProps = {
+    deploymentStatuses,
+    canonicalStateByPod,
+    getCredentialOwnerName,
+    canReauthenticate,
+    getReauthTooltip,
+    canRevoke,
+    getRevokeTooltip,
+    handleReauthenticate,
+    handleRevoke,
+    isDeleting: deleteMcpServerMutation.isPending,
+    onOpenPodLogs,
+  };
+
+  return (
+    <>
+      {!hideHeader && (
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <User className="h-5 w-5" />
+            Connections
+            <span className="text-muted-foreground font-normal">
+              {label || firstServer?.name}
+            </span>
+          </DialogTitle>
+          <DialogDescription className="sr-only">Connections</DialogDescription>
+        </DialogHeader>
+      )}
+
+      <div
+        className={hideHeader ? "space-y-6" : "space-y-6 pb-4"}
+        data-testid={bodyTestId}
+      >
+        {catalogItem?.serverType === "remote" && (
+          <AgentConnectionsSection
+            item={catalogItem}
+            connections={allServers}
+          />
+        )}
+
+        {(personalRows.length > 0 || canAddPersonal) && (
+          <ConnectionsSection
+            title={
+              isLocalServer ? "Personal installations" : "Personal connections"
+            }
+            description={
+              isLocalServer
+                ? "A private hosted instance available only to its owner."
+                : "Private to its owner — only that person can use it."
+            }
+            emptyText={
+              isLocalServer
+                ? "No personal installations yet."
+                : "No personal connections yet."
+            }
+            rows={personalRows}
+            tableTestId={E2eTestId.ManageCredentialsDialogTable}
+            action={
+              canAddPersonal ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  disabled={isInstalling}
+                  onClick={() => {
+                    onClose();
+                    onAddPersonalConnection?.();
+                  }}
+                >
+                  <Plus className="mr-1 h-3 w-3" />
+                  {isInstalling
+                    ? "Installing..."
+                    : isLocalServer
+                      ? "Install for me"
+                      : "Connect my account"}
+                </Button>
+              ) : null
+            }
+            {...rowProps}
+          />
+        )}
+
+        {(serviceAccountRows.length > 0 || canAddServiceAccount) && (
+          <ConnectionsSection
+            title={isLocalServer ? "Shared installations" : "Service accounts"}
+            description={
+              isLocalServer
+                ? "Hosted instances shared with a team or organization."
+                : "Static credentials intentionally shared with a team or organization."
+            }
+            emptyText={
+              isLocalServer
+                ? "No shared installations yet."
+                : "No service accounts yet."
+            }
+            rows={serviceAccountRows}
+            tableTestId={E2eTestId.ManageServiceAccountsTable}
+            action={
+              canAddServiceAccount ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  disabled={isInstalling}
+                  data-testid={
+                    E2eTestId.ManageCredentialsAddServiceAccountButton
+                  }
+                  onClick={() => setServiceAccountDialogOpen(true)}
+                >
+                  <Plus className="mr-1 h-3 w-3" />
+                  {isLocalServer
+                    ? "Add shared installation"
+                    : "Add service account"}
+                </Button>
+              ) : null
+            }
+            {...rowProps}
+          />
+        )}
+      </div>
+
+      <AddServiceAccountDialog
+        open={serviceAccountDialogOpen}
+        onOpenChange={setServiceAccountDialogOpen}
+        availableTeams={canAddTeam ? split.availableTeamsForShared : []}
+        canAddOrg={canAddOrg}
+        resourceKind={isLocalServer ? "installation" : "service-account"}
+        onConfirm={(target) => {
+          onClose();
+          if (target.type === "org") {
+            onAddOrgConnection?.();
+          } else {
+            onAddSharedConnection?.(target.teamId);
+          }
+        }}
+      />
+
+      {!hideHeader && (
+        <DialogStickyFooter>
+          <Button variant="outline" onClick={onClose}>
+            Close
+          </Button>
+        </DialogStickyFooter>
+      )}
+    </>
+  );
+}
+
+type ServerEntry = NonNullable<
+  ReturnType<typeof useMcpServers>["data"]
+>[number];
+
+type ConnectionRow = { server: ServerEntry; isYou: boolean };
+
+interface RowRenderProps {
+  deploymentStatuses: Record<string, McpDeploymentStatusEntry>;
+  canonicalStateByPod: Map<string, string>;
+  getCredentialOwnerName: (s: ServerEntry) => string;
+  canReauthenticate: (s: ServerEntry) => boolean;
+  getReauthTooltip: (s: ServerEntry) => string;
+  canRevoke: (s: ServerEntry) => boolean;
+  getRevokeTooltip: (s: ServerEntry) => string;
+  handleReauthenticate: (s: ServerEntry) => void;
+  handleRevoke: (s: ServerEntry) => void;
+  isDeleting: boolean;
+  onOpenPodLogs?: (serverId: string) => void;
+}
+
+function ConnectionsSection({
+  title,
+  description,
+  action,
+  rows,
+  emptyText,
+  tableTestId,
+  ...rowProps
+}: {
+  title: string;
+  description: string;
+  action: React.ReactNode;
+  rows: ConnectionRow[];
+  emptyText: string;
+  tableTestId: string;
+} & RowRenderProps) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-start justify-between gap-4">
+        <div className="space-y-0.5">
+          <h4 className="text-sm font-medium">{title}</h4>
+          <p className="text-sm text-muted-foreground">{description}</p>
+        </div>
+        {action}
+      </div>
+      <div className="overflow-hidden rounded-lg border">
+        {rows.length > 0 ? (
+          <ConnectionsTable rows={rows} testId={tableTestId} {...rowProps} />
+        ) : (
+          <p className="text-sm text-muted-foreground px-4 py-3">{emptyText}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ConnectionsTable({
+  rows,
+  testId,
+  deploymentStatuses,
+  canonicalStateByPod,
+  getCredentialOwnerName,
+  canReauthenticate,
+  getReauthTooltip,
+  canRevoke,
+  getRevokeTooltip,
+  handleReauthenticate,
+  handleRevoke,
+  isDeleting,
+  onOpenPodLogs,
+}: {
+  rows: ConnectionRow[];
+  testId: string;
+} & RowRenderProps) {
+  const alertingEnabled = useFeature("mcpServerAlertingEnabled") === true;
+  const hasDeploymentStatuses = rows.some(
+    (r) => deploymentStatuses[r.server.id],
+  );
+
+  return (
+    <Table data-testid={testId}>
+      <TableHeader>
+        <TableRow>
+          <TableHead className="w-[200px] whitespace-nowrap">Owner</TableHead>
+          {hasDeploymentStatuses && (
+            <TableHead className="whitespace-nowrap">Pod</TableHead>
+          )}
+          <TableHead className="whitespace-nowrap">Secret Storage</TableHead>
+          <TableHead className="whitespace-nowrap">Created At</TableHead>
+          <TableHead className="w-[280px] whitespace-nowrap text-right">
+            Action
+          </TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {rows.map(({ server, isYou }) => (
+          <TableRow
+            key={server.id}
+            data-testid={E2eTestId.CredentialRow}
+            data-server-id={server.id}
+          >
+            <TableCell className="w-[200px] max-w-[220px] font-medium">
+              <div className="flex items-center gap-2">
+                <span
+                  className="truncate"
+                  data-testid={E2eTestId.CredentialOwner}
+                >
+                  {getCredentialOwnerName(server)}
+                </span>
+                {isYou && (
+                  <Badge variant="secondary" className="text-[10px]">
+                    You
+                  </Badge>
+                )}
+              </div>
+              {(server.teamId || server.scope === "org") &&
+                server.ownerEmail && (
+                  <span
+                    className="block truncate text-xs font-normal text-muted-foreground"
+                    title={`Created by ${server.ownerEmail}`}
+                  >
+                    {server.ownerEmail}
+                  </span>
+                )}
+            </TableCell>
+            {hasDeploymentStatuses && (
+              <TableCell className="max-w-[260px]">
+                {(() => {
+                  const status = deploymentStatuses[server.id];
+                  if (!status) {
+                    return <span className="text-muted-foreground">—</span>;
+                  }
+                  const podName = status.podName;
+                  const effectiveState =
+                    (podName && canonicalStateByPod.get(podName)) ||
+                    status.state;
+                  const dot = (
+                    <DeploymentStatusDot
+                      state={
+                        (effectiveState === "not_created" ||
+                        effectiveState === "succeeded"
+                          ? "running"
+                          : effectiveState) as DeploymentState
+                      }
+                    />
+                  );
+                  if (!podName) {
+                    // SPDX-SnippetBegin
+                    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+                    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+                    // An idle-scaled deployment has no pod BY DESIGN — naming
+                    // its state beats a placeholder that reads like telemetry
+                    // went missing.
+                    // SPDX-SnippetEnd
+                    return (
+                      <div className="flex items-center gap-1.5 text-sm text-muted-foreground italic">
+                        {dot}
+                        <span>
+                          {
+                            /* SPDX-SnippetBegin */
+                            /* SPDX-SnippetCopyrightText: 2026 Archestra Inc. */
+                            /* SPDX-License-Identifier: LicenseRef-Archestra-Enterprise */
+                            effectiveState === "hibernated" ||
+                            effectiveState === "waking"
+                              ? getDeploymentLabel(effectiveState)
+                              : /* SPDX-SnippetEnd */ "Pod not reported yet"
+                          }
+                        </span>
+                      </div>
+                    );
+                  }
+                  return (
+                    <button
+                      type="button"
+                      onClick={() => onOpenPodLogs?.(server.id)}
+                      className="flex w-full items-center gap-1.5 text-sm hover:underline cursor-pointer font-mono min-w-0"
+                    >
+                      {dot}
+                      <span className="truncate min-w-0 flex-1 text-left">
+                        {podName}
+                      </span>
+                    </button>
+                  );
+                })()}
+              </TableCell>
+            )}
+            <TableCell className="text-muted-foreground">
+              {formatSecretStorageType(server.secretStorageType)}
+            </TableCell>
+            <TableCell
+              className="whitespace-nowrap text-muted-foreground"
+              title={format(new Date(server.createdAt), "PPpp")}
+            >
+              {format(new Date(server.createdAt), "PP")}
+            </TableCell>
+            <TableCell className="w-[280px]">
+              <div className="flex items-center justify-end gap-2 whitespace-nowrap">
+                {alertingEnabled && server.oauthRefreshError && (
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span>
+                          <Button
+                            onClick={() => handleReauthenticate(server)}
+                            disabled={!canReauthenticate(server)}
+                            size="sm"
+                            variant="outline"
+                            className="h-7 text-xs"
+                          >
+                            <RefreshCw className="mr-1 h-3 w-3" />
+                            Re-authenticate
+                          </Button>
+                        </span>
+                      </TooltipTrigger>
+                      {!canReauthenticate(server) && (
+                        <TooltipContent>
+                          {getReauthTooltip(server)}
+                        </TooltipContent>
+                      )}
+                    </Tooltip>
+                  </TooltipProvider>
+                )}
+                <TooltipProvider>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span>
+                        <Button
+                          onClick={() => handleRevoke(server)}
+                          disabled={isDeleting || !canRevoke(server)}
+                          size="sm"
+                          variant="ghost"
+                          className="h-7 text-xs text-muted-foreground hover:text-foreground"
+                          data-testid={
+                            isYou
+                              ? `${E2eTestId.RevokeCredentialButton}-personal`
+                              : `${E2eTestId.RevokeCredentialButton}-${getCredentialOwnerName(server)}`
+                          }
+                        >
+                          <Trash className="mr-1 h-3 w-3" />
+                          Revoke
+                        </Button>
+                      </span>
+                    </TooltipTrigger>
+                    {!canRevoke(server) && (
+                      <TooltipContent>
+                        {getRevokeTooltip(server)}
+                      </TooltipContent>
+                    )}
+                  </Tooltip>
+                </TooltipProvider>
+              </div>
+            </TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  );
+}
+
+// `scope` is nullable on rows created before it existed; a team id implies a
+// team connection, and everything else without a scope is personal.
+function resolveServerScope(server: ServerEntry): "personal" | "team" | "org" {
+  return server.scope ?? (server.teamId ? "team" : "personal");
+}
+
+// Multi-tenant catalogs alias one pod across N caller rows. Each row's
+// K8sDeployment instance tracks its own state independently, so the row that
+// didn't observe the pod first stays "pending" while the other goes "failed".
+// Pick a canonical state per podName (across every connection for the catalog,
+// so the personal and service-account tables agree) so all rows match.
+function computeCanonicalStateByPod(
+  servers: ServerEntry[],
+  deploymentStatuses: Record<string, McpDeploymentStatusEntry>,
+): Map<string, string> {
+  const canonicalStateByPod = new Map<string, string>();
+  for (const server of servers) {
+    const entry = deploymentStatuses[server.id];
+    if (!entry?.podName) continue;
+    const current = canonicalStateByPod.get(entry.podName);
+    if (
+      !current ||
+      (STATE_PRIORITY[entry.state] ?? 0) > (STATE_PRIORITY[current] ?? 0)
+    ) {
+      canonicalStateByPod.set(entry.podName, entry.state);
+    }
+  }
+  return canonicalStateByPod;
+}
+
+// The catalog-level "default credential" setting as a standard settings row:
+// title, a plain-language description that names the current choice, and a
+// dedicated select whose options are self-explanatory. It governs every tool
+// assignment that resolves credentials at call time — Auto mode always, and
+// Custom-mode assignments unless a specific connection is pinned on the
+// assignment itself. NULL (default) = agents act on behalf of whoever is
+// calling, using that person's own connection; an mcp_servers.id = agents
+// always use that one connection. Saves on change; gated by the same
+// authorization as editing the catalog item.
+const ON_BEHALF_OF_VALUE = "__on_behalf_of__";
+
+function AgentConnectionsSection({
+  item,
+  connections,
+}: {
+  item: NonNullable<Parameters<typeof useCanModifyCatalogItem>[0]>;
+  connections: NonNullable<ReturnType<typeof useMcpServers>["data"]>;
+}) {
+  const { canModify } = useCanModifyCatalogItem(item);
+  const updateMutation = useUpdateInternalMcpCatalogItem();
+  const serviceAccountConnections = connections.filter(
+    (connection) => resolveServerScope(connection) !== "personal",
+  );
+  const pinnedId = item.dynamicConnectionMcpServerId ?? null;
+  const pinnedConnection = pinnedId
+    ? serviceAccountConnections.find((connection) => connection.id === pinnedId)
+    : undefined;
+  const pinUnresolved = Boolean(pinnedId) && !pinnedConnection;
+
+  const applyDefault = (value: string | null) =>
+    updateMutation.mutate({
+      id: item.id,
+      data: { dynamicConnectionMcpServerId: value },
+    });
+
+  const handleSelectDefault = (value: string) => {
+    if (value === ON_BEHALF_OF_VALUE) {
+      applyDefault(null);
+      return;
+    }
+    applyDefault(value);
+  };
+
+  const connectionLabel = (connection: (typeof connections)[number]) => {
+    const scope = resolveServerScope(connection);
+    if (scope === "org") return "Organization account";
+    if (scope === "team")
+      return `Team — ${connection.teamDetails?.name ?? "Unknown team"}`;
+    return "Service account";
+  };
+
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-2">
+      <div className="max-w-xl space-y-1">
+        <h4 className="text-sm font-medium">Default credential</h4>
+        <p className="text-sm text-muted-foreground">
+          {!pinnedId ? (
+            <>
+              Agents connect on behalf of whoever is calling — each person uses
+              their own connection if they have one, otherwise a team or
+              organization connection they can access. Applies in Auto mode and
+              to Custom tool assignments that resolve at call time.
+            </>
+          ) : pinUnresolved ? (
+            <>
+              The selected connection is unavailable. Agents connect on behalf
+              of whoever is calling until you choose another one.
+            </>
+          ) : (
+            <>
+              Agents connect as{" "}
+              <span className="font-medium text-foreground">
+                {pinnedConnection ? (
+                  <span>{connectionLabel(pinnedConnection)}</span>
+                ) : null}
+              </span>
+              , no matter who is calling. Applies in Auto mode and to Custom
+              tool assignments that resolve at call time.
+            </>
+          )}{" "}
+          <ExternalDocsLink
+            href={getDocsUrl(
+              DocsPage.McpAuthentication,
+              "resolve-at-call-time",
+            )}
+            className="underline"
+            showIcon={false}
+          >
+            Learn more
+          </ExternalDocsLink>
+        </p>
+      </div>
+      <Select
+        value={pinUnresolved ? "" : (pinnedId ?? ON_BEHALF_OF_VALUE)}
+        disabled={!canModify || updateMutation.isPending}
+        onValueChange={handleSelectDefault}
+      >
+        <SelectTrigger className="w-[320px]">
+          <SelectValue placeholder="Connection unavailable" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem
+            value={ON_BEHALF_OF_VALUE}
+            className="cursor-pointer"
+            description="Everyone connects their own account."
+          >
+            <div className="flex items-center gap-1.5">
+              <Zap className="h-3.5! w-3.5! text-amber-500" />
+              <span>On behalf of the user (Recommended)</span>
+            </div>
+          </SelectItem>
+          {serviceAccountConnections.length > 0 && (
+            <>
+              <div className="px-2 pt-2 pb-1 text-xs text-muted-foreground">
+                Always use one service account
+              </div>
+              {serviceAccountConnections.map((connection) => (
+                <SelectItem
+                  key={connection.id}
+                  value={connection.id}
+                  className="cursor-pointer"
+                >
+                  <div className="flex items-center gap-1.5">
+                    <KeyRound className="h-3.5! w-3.5! text-muted-foreground" />
+                    <span>{connectionLabel(connection)}</span>
+                  </div>
+                </SelectItem>
+              ))}
+            </>
+          )}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}

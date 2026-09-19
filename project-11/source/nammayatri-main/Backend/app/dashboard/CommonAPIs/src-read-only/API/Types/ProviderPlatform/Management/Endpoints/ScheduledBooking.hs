@@ -1,0 +1,253 @@
+{-# LANGUAGE StandaloneKindSignatures #-}
+{-# OPTIONS_GHC -Wno-unused-imports #-}
+
+module API.Types.ProviderPlatform.Management.Endpoints.ScheduledBooking where
+
+import qualified Dashboard.Common
+import Data.Aeson
+import Data.OpenApi (ToSchema)
+import qualified Data.Singletons.TH
+import qualified Domain.Types
+import qualified Domain.Types.RideStatus
+import EulerHS.Prelude hiding (id, state)
+import qualified EulerHS.Types
+import qualified Kernel.External.Maps.Types
+import qualified Kernel.Prelude
+import qualified Kernel.Types.APISuccess
+import Kernel.Types.Common
+import qualified Kernel.Types.Common
+import qualified Kernel.Types.HideSecrets
+import qualified Kernel.Types.Id
+import Kernel.Utils.TH
+import Servant
+import Servant.Client
+
+data AssignDriverReq = AssignDriverReq {driverId :: Kernel.Types.Id.Id Dashboard.Common.Driver, clientId :: Kernel.Prelude.Maybe Kernel.Prelude.Text}
+  deriving stock (Generic)
+  deriving anyclass (ToJSON, FromJSON, ToSchema)
+
+instance Kernel.Types.HideSecrets.HideSecrets AssignDriverReq where
+  hideSecrets = Kernel.Prelude.identity
+
+data AssignmentStatus
+  = ASSIGNED
+  | UNASSIGNED
+  deriving stock (Eq, Show, Generic)
+  deriving anyclass (ToJSON, FromJSON, ToSchema, Kernel.Prelude.ToParamSchema)
+
+data BookingStatus
+  = NEW
+  | TRIP_ASSIGNED
+  | COMPLETED
+  | CANCELLED
+  | REALLOCATED
+  deriving stock (Eq, Show, Generic, Read)
+  deriving anyclass (ToJSON, FromJSON, ToSchema, Kernel.Prelude.ToParamSchema)
+
+data CancellationSource
+  = ByUser
+  | ByDriver
+  | ByMerchant
+  | ByAllocator
+  | ByApplication
+  | ByFleetOwner
+  deriving stock (Eq, Show, Generic, Read)
+  deriving anyclass (ToJSON, FromJSON, ToSchema, Kernel.Prelude.ToParamSchema)
+
+data DriverDistanceRes = DriverDistanceRes
+  { assigned :: Kernel.Prelude.Bool,
+    driverId :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    driverCurrentLocation :: Kernel.Prelude.Maybe Kernel.External.Maps.Types.LatLong,
+    distanceToPickupMeters :: Kernel.Prelude.Maybe Kernel.Types.Common.Meters,
+    etaToPickupSeconds :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    computedAt :: Kernel.Prelude.UTCTime
+  }
+  deriving stock (Generic)
+  deriving anyclass (ToJSON, FromJSON, ToSchema)
+
+data LocationAPIEntity = LocationAPIEntity
+  { lat :: Kernel.Prelude.Double,
+    lon :: Kernel.Prelude.Double,
+    street :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    city :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    state :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    country :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    building :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    areaCode :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    area :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    fullAddress :: Kernel.Prelude.Maybe Kernel.Prelude.Text
+  }
+  deriving stock (Generic)
+  deriving anyclass (ToJSON, FromJSON, ToSchema)
+
+data NearbyDriverItem = NearbyDriverItem
+  { driverId :: Kernel.Prelude.Text,
+    driverName :: Kernel.Prelude.Text,
+    driverPhoneNo :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    serviceTiers :: [Dashboard.Common.ServiceTierType],
+    straightLineDistanceMeters :: Kernel.Types.Common.Meters
+  }
+  deriving stock (Generic)
+  deriving anyclass (ToJSON, FromJSON, ToSchema)
+
+data NearbyDriversRes = NearbyDriversRes {radiusKm :: Kernel.Prelude.Double, searchedAt :: Kernel.Prelude.UTCTime, drivers :: [NearbyDriverItem]}
+  deriving stock (Generic)
+  deriving anyclass (ToJSON, FromJSON, ToSchema)
+
+data OpsNote = OpsNote {id :: Kernel.Prelude.Text, authorId :: Kernel.Prelude.Text, authorName :: Kernel.Prelude.Maybe Kernel.Prelude.Text, content :: Kernel.Prelude.Text, createdAt :: Kernel.Prelude.UTCTime}
+  deriving stock (Generic)
+  deriving anyclass (ToJSON, FromJSON, ToSchema)
+
+data OpsNoteReq = OpsNoteReq {content :: Kernel.Prelude.Text}
+  deriving stock (Generic)
+  deriving anyclass (ToJSON, FromJSON, ToSchema)
+
+instance Kernel.Types.HideSecrets.HideSecrets OpsNoteReq where
+  hideSecrets = Kernel.Prelude.identity
+
+data ReallocationEventItem = ReallocationEventItem
+  { bookingId :: Kernel.Prelude.Text,
+    driverName :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    driverPhoneNo :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    driverId :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    rideStatus :: Kernel.Prelude.Maybe Domain.Types.RideStatus.RideStatus,
+    bookingStatus :: BookingStatus,
+    becameCurrentAt :: Kernel.Prelude.UTCTime,
+    cancelledAt :: Kernel.Prelude.Maybe Kernel.Prelude.UTCTime,
+    cancellationSource :: Kernel.Prelude.Maybe CancellationSource,
+    driverDistToPickupAtCancel :: Kernel.Prelude.Maybe Kernel.Types.Common.Meters
+  }
+  deriving stock (Generic)
+  deriving anyclass (ToJSON, FromJSON, ToSchema)
+
+data ScheduledBookingInfoRes = ScheduledBookingInfoRes
+  { transactionId :: Kernel.Prelude.Text,
+    bookingId :: Kernel.Prelude.Text,
+    tripCategory :: Domain.Types.TripCategory,
+    scheduledAt :: Kernel.Prelude.UTCTime,
+    roundTrip :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    returnTime :: Kernel.Prelude.Maybe Kernel.Prelude.UTCTime,
+    fromLocation :: LocationAPIEntity,
+    toLocation :: Kernel.Prelude.Maybe LocationAPIEntity,
+    riderName :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    riderPhoneNo :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    driverName :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    driverPhoneNo :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    driverId :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    bookingStatus :: BookingStatus,
+    rideStatus :: Kernel.Prelude.Maybe Domain.Types.RideStatus.RideStatus,
+    driverCurrentLocation :: Kernel.Prelude.Maybe Kernel.External.Maps.Types.LatLong,
+    driverDistanceToPickup :: Kernel.Prelude.Maybe Kernel.Types.Common.Meters,
+    driverEtaToPickupSeconds :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    estimatedDistance :: Kernel.Prelude.Maybe Kernel.Types.Common.Meters,
+    estimatedDurationSeconds :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    estimatedFare :: Kernel.Types.Common.HighPrecMoney,
+    currency :: Kernel.Types.Common.Currency,
+    vehicleServiceTier :: Dashboard.Common.ServiceTierType,
+    vehicleServiceTierName :: Kernel.Prelude.Text,
+    reallocationHistory :: [ReallocationEventItem],
+    opsNotes :: [OpsNote]
+  }
+  deriving stock (Generic)
+  deriving anyclass (ToJSON, FromJSON, ToSchema)
+
+data ScheduledBookingListItem = ScheduledBookingListItem
+  { transactionId :: Kernel.Prelude.Text,
+    bookingId :: Kernel.Prelude.Text,
+    tripCategory :: Domain.Types.TripCategory,
+    scheduledAt :: Kernel.Prelude.UTCTime,
+    fromLocation :: LocationAPIEntity,
+    toLocation :: Kernel.Prelude.Maybe LocationAPIEntity,
+    riderName :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    riderPhoneNo :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    driverName :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    driverPhoneNo :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    driverId :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    bookingStatus :: BookingStatus,
+    rideStatus :: Kernel.Prelude.Maybe Domain.Types.RideStatus.RideStatus,
+    reallocationCount :: Kernel.Prelude.Int,
+    estimatedFare :: Kernel.Types.Common.HighPrecMoney,
+    currency :: Kernel.Types.Common.Currency,
+    vehicleServiceTier :: Dashboard.Common.ServiceTierType,
+    vehicleServiceTierName :: Kernel.Prelude.Text
+  }
+  deriving stock (Generic)
+  deriving anyclass (ToJSON, FromJSON, ToSchema)
+
+data ScheduledBookingListRes = ScheduledBookingListRes {totalItems :: Kernel.Prelude.Int, bookings :: [ScheduledBookingListItem]}
+  deriving stock (Generic)
+  deriving anyclass (ToJSON, FromJSON, ToSchema)
+
+type API = ("scheduledBooking" :> (GetScheduledBookingList :<|> GetScheduledBookingInfo :<|> GetScheduledBookingDriverDistance :<|> GetScheduledBookingNearbyDrivers :<|> PostScheduledBookingAssignHelper :<|> PostScheduledBookingUnassignHelper :<|> PostScheduledBookingOpsNoteHelper))
+
+type GetScheduledBookingList =
+  ( "list" :> QueryParam "assignmentStatus" AssignmentStatus :> QueryParam "from" Kernel.Prelude.UTCTime :> QueryParam "limit" Kernel.Prelude.Int
+      :> QueryParam
+           "offset"
+           Kernel.Prelude.Int
+      :> QueryParam "to" Kernel.Prelude.UTCTime
+      :> Get '[JSON] ScheduledBookingListRes
+  )
+
+type GetScheduledBookingInfo = (Capture "transactionId" Kernel.Prelude.Text :> "info" :> Get '[JSON] ScheduledBookingInfoRes)
+
+type GetScheduledBookingDriverDistance = (Capture "transactionId" Kernel.Prelude.Text :> "driverDistance" :> Get '[JSON] DriverDistanceRes)
+
+type GetScheduledBookingNearbyDrivers = (Capture "transactionId" Kernel.Prelude.Text :> "nearbyDrivers" :> QueryParam "radiusKm" Kernel.Prelude.Double :> Get '[JSON] NearbyDriversRes)
+
+type PostScheduledBookingAssign = (Capture "transactionId" Kernel.Prelude.Text :> "assign" :> ReqBody '[JSON] AssignDriverReq :> Post '[JSON] Kernel.Types.APISuccess.APISuccess)
+
+type PostScheduledBookingAssignHelper =
+  ( Capture "transactionId" Kernel.Prelude.Text :> "assign" :> QueryParam "requestorId" Kernel.Prelude.Text :> ReqBody '[JSON] AssignDriverReq
+      :> Post
+           '[JSON]
+           Kernel.Types.APISuccess.APISuccess
+  )
+
+type PostScheduledBookingUnassign = (Capture "transactionId" Kernel.Prelude.Text :> "unassign" :> Post '[JSON] Kernel.Types.APISuccess.APISuccess)
+
+type PostScheduledBookingUnassignHelper =
+  ( Capture "transactionId" Kernel.Prelude.Text :> "unassign" :> QueryParam "requestorId" Kernel.Prelude.Text
+      :> Post
+           '[JSON]
+           Kernel.Types.APISuccess.APISuccess
+  )
+
+type PostScheduledBookingOpsNote = (Capture "transactionId" Kernel.Prelude.Text :> "opsNote" :> ReqBody '[JSON] OpsNoteReq :> Post '[JSON] Kernel.Types.APISuccess.APISuccess)
+
+type PostScheduledBookingOpsNoteHelper =
+  ( Capture "transactionId" Kernel.Prelude.Text :> "opsNote" :> QueryParam "requestorId" Kernel.Prelude.Text :> ReqBody '[JSON] OpsNoteReq
+      :> Post
+           '[JSON]
+           Kernel.Types.APISuccess.APISuccess
+  )
+
+data ScheduledBookingAPIs = ScheduledBookingAPIs
+  { getScheduledBookingList :: Kernel.Prelude.Maybe AssignmentStatus -> Kernel.Prelude.Maybe Kernel.Prelude.UTCTime -> Kernel.Prelude.Maybe Kernel.Prelude.Int -> Kernel.Prelude.Maybe Kernel.Prelude.Int -> Kernel.Prelude.Maybe Kernel.Prelude.UTCTime -> EulerHS.Types.EulerClient ScheduledBookingListRes,
+    getScheduledBookingInfo :: Kernel.Prelude.Text -> EulerHS.Types.EulerClient ScheduledBookingInfoRes,
+    getScheduledBookingDriverDistance :: Kernel.Prelude.Text -> EulerHS.Types.EulerClient DriverDistanceRes,
+    getScheduledBookingNearbyDrivers :: Kernel.Prelude.Text -> Kernel.Prelude.Maybe Kernel.Prelude.Double -> EulerHS.Types.EulerClient NearbyDriversRes,
+    postScheduledBookingAssign :: Kernel.Prelude.Text -> Kernel.Prelude.Maybe Kernel.Prelude.Text -> AssignDriverReq -> EulerHS.Types.EulerClient Kernel.Types.APISuccess.APISuccess,
+    postScheduledBookingUnassign :: Kernel.Prelude.Text -> Kernel.Prelude.Maybe Kernel.Prelude.Text -> EulerHS.Types.EulerClient Kernel.Types.APISuccess.APISuccess,
+    postScheduledBookingOpsNote :: Kernel.Prelude.Text -> Kernel.Prelude.Maybe Kernel.Prelude.Text -> OpsNoteReq -> EulerHS.Types.EulerClient Kernel.Types.APISuccess.APISuccess
+  }
+
+mkScheduledBookingAPIs :: (Client EulerHS.Types.EulerClient API -> ScheduledBookingAPIs)
+mkScheduledBookingAPIs scheduledBookingClient = (ScheduledBookingAPIs {..})
+  where
+    getScheduledBookingList :<|> getScheduledBookingInfo :<|> getScheduledBookingDriverDistance :<|> getScheduledBookingNearbyDrivers :<|> postScheduledBookingAssign :<|> postScheduledBookingUnassign :<|> postScheduledBookingOpsNote = scheduledBookingClient
+
+data ScheduledBookingUserActionType
+  = GET_SCHEDULED_BOOKING_LIST
+  | GET_SCHEDULED_BOOKING_INFO
+  | GET_SCHEDULED_BOOKING_DRIVER_DISTANCE
+  | GET_SCHEDULED_BOOKING_NEARBY_DRIVERS
+  | POST_SCHEDULED_BOOKING_ASSIGN
+  | POST_SCHEDULED_BOOKING_UNASSIGN
+  | POST_SCHEDULED_BOOKING_OPS_NOTE
+  deriving stock (Show, Read, Generic, Eq, Ord)
+  deriving anyclass (ToJSON, FromJSON, ToSchema)
+
+$(mkHttpInstancesForEnum ''AssignmentStatus)
+
+$(Data.Singletons.TH.genSingletons [''ScheduledBookingUserActionType])

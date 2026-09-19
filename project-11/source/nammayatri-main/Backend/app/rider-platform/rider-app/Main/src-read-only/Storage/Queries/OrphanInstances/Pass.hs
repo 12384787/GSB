@@ -1,0 +1,95 @@
+{-# OPTIONS_GHC -Wno-orphans #-}
+{-# OPTIONS_GHC -Wno-unused-imports #-}
+
+module Storage.Queries.OrphanInstances.Pass where
+
+import qualified BecknV2.FRFS.Enums
+import qualified Domain.Types.Pass
+import Kernel.Beam.Functions
+import Kernel.External.Encryption
+import Kernel.Prelude
+import qualified Kernel.Prelude
+import Kernel.Types.Error
+import qualified Kernel.Types.Id
+import Kernel.Utils.Common (CacheFlow, EsqDBFlow, MonadFlow, fromMaybeM, getCurrentTime)
+import qualified Storage.Beam.Pass as Beam
+
+instance FromTType' Beam.Pass Domain.Types.Pass.Pass where
+  fromTType' (Beam.PassT {..}) = do
+    pure $
+      Just
+        Domain.Types.Pass.Pass
+          { amount = amount,
+            applicableVehicleServiceTiers = applicableVehicleServiceTiers,
+            autoApply = autoApply,
+            benefit = benefit,
+            benefitDescription = benefitDescription,
+            code = code,
+            description = description,
+            documentsRequired = documentsRequired,
+            enable = enable,
+            formVerificationConfig = formVerificationConfig,
+            frfsCancelLimit = frfsCancelLimit,
+            frfsPriceOverrideApplicable = frfsPriceOverrideApplicable,
+            id = Kernel.Types.Id.Id id,
+            maxFare = maxFare,
+            maxValidDays = maxValidDays,
+            maxValidTrips = maxValidTrips,
+            merchantId = Kernel.Types.Id.Id merchantId,
+            merchantOperatingCityId = Kernel.Types.Id.Id merchantOperatingCityId,
+            minDaysToSuggestRenewal = minDaysToSuggestRenewal,
+            minFare = minFare,
+            minTripsAllowingOverlap = minTripsAllowingOverlap,
+            name = name,
+            order = order,
+            overrideBenefitConfigJson = overrideBenefitConfigJson,
+            passConfig = Domain.Types.Pass.PassConfig <$> maxSwitchCount,
+            passTypeId = Kernel.Types.Id.Id passTypeId,
+            pricingTiers = pricingTiers,
+            purchaseEligibilityJsonLogic = purchaseEligibilityJsonLogic,
+            redeemEligibilityJsonLogic = redeemEligibilityJsonLogic,
+            timeOverlappingFrfsBookingsLimit = timeOverlappingFrfsBookingsLimit,
+            vehicleType = Kernel.Prelude.fromMaybe BecknV2.FRFS.Enums.BUS vehicleType,
+            verificationValidity = Kernel.Prelude.fromMaybe 9000 verificationValidity,
+            createdAt = createdAt,
+            updatedAt = updatedAt
+          }
+
+instance ToTType' Beam.Pass Domain.Types.Pass.Pass where
+  toTType' (Domain.Types.Pass.Pass {..}) = do
+    Beam.PassT
+      { Beam.amount = amount,
+        Beam.applicableVehicleServiceTiers = applicableVehicleServiceTiers,
+        Beam.autoApply = autoApply,
+        Beam.benefit = benefit,
+        Beam.benefitDescription = benefitDescription,
+        Beam.code = code,
+        Beam.description = description,
+        Beam.documentsRequired = documentsRequired,
+        Beam.enable = enable,
+        Beam.formVerificationConfig = formVerificationConfig,
+        Beam.frfsCancelLimit = frfsCancelLimit,
+        Beam.frfsPriceOverrideApplicable = frfsPriceOverrideApplicable,
+        Beam.id = Kernel.Types.Id.getId id,
+        Beam.maxFare = maxFare,
+        Beam.maxValidDays = maxValidDays,
+        Beam.maxValidTrips = maxValidTrips,
+        Beam.merchantId = Kernel.Types.Id.getId merchantId,
+        Beam.merchantOperatingCityId = Kernel.Types.Id.getId merchantOperatingCityId,
+        Beam.minDaysToSuggestRenewal = minDaysToSuggestRenewal,
+        Beam.minFare = minFare,
+        Beam.minTripsAllowingOverlap = minTripsAllowingOverlap,
+        Beam.name = name,
+        Beam.order = order,
+        Beam.overrideBenefitConfigJson = overrideBenefitConfigJson,
+        Beam.maxSwitchCount = (.maxSwitchCount) <$> passConfig,
+        Beam.passTypeId = Kernel.Types.Id.getId passTypeId,
+        Beam.pricingTiers = pricingTiers,
+        Beam.purchaseEligibilityJsonLogic = purchaseEligibilityJsonLogic,
+        Beam.redeemEligibilityJsonLogic = redeemEligibilityJsonLogic,
+        Beam.timeOverlappingFrfsBookingsLimit = timeOverlappingFrfsBookingsLimit,
+        Beam.vehicleType = Kernel.Prelude.Just vehicleType,
+        Beam.verificationValidity = Kernel.Prelude.Just verificationValidity,
+        Beam.createdAt = createdAt,
+        Beam.updatedAt = updatedAt
+      }

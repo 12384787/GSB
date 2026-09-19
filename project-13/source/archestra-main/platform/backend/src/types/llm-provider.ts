@@ -1,0 +1,613 @@
+/**
+ * LLM Proxy Common Types
+ *
+ * These types define adapter interfaces for working with provider-specific
+ * requests and responses in a uniform way. The original provider data is
+ * preserved and can be reconstructed after modifications.
+ *
+ * Usage flow:
+ * ```
+ * Provider Request
+ *       ↓
+ * RequestAdapter (wraps original, provides uniform read/modify API)
+ *       ↓
+ * [Business Logic operates via adapter methods]
+ *       ↓
+ * adapter.toProviderRequest() → Modified Provider Request
+ *       ↓
+ * LLM Provider
+ *       ↓
+ * Provider Response
+ *       ↓
+ * ResponseAdapter (wraps original, provides uniform read API)
+ *       ↓
+ * [Business Logic operates via adapter methods]
+ *       ↓
+ * adapter.toProviderResponse() or adapter.toRefusalResponse()
+ * ```
+
+ */
+
+import type {
+  ArchestraInternalErrorCode,
+  InteractionSource,
+  SupportedProvider,
+  SupportedProviderDiscriminator,
+} from "@archestra/shared";
+
+import type { GatewayAgent } from "./agent";
+
+/**
+ * GenAI operation names for tracing span names.
+ * Follows OTEL GenAI Semantic Conventions.
+ * Span names are constructed as `{operationName} {model}`.
+ */
+export type GenAiOperationName = "chat" | "generate_content" | "embedding";
+
+import type {
+  CommonMcpToolDefinition,
+  CommonMessage,
+  CommonToolCall,
+  CommonToolResult,
+} from "./common-llm-format";
+
+/**
+ * A call the provider ran inside the inference call. It is never the client's
+ * to execute, so it stays out of {@link LLMResponseAdapter.getToolCalls}.
+ */
+export type HostedToolCall = {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+  /** What the run brought into the turn, as the wire carries it. */
+  output: string;
+};
+
+/**
+ * Options for creating an LLM provider client
+ */
+export interface CreateClientOptions {
+  /** Base URL override for the provider API */
+  baseUrl?: string;
+  /** Agent for observability metrics (request duration, tokens) */
+  agent?: GatewayAgent;
+  /** Default headers to include with every request */
+  defaultHeaders?: Record<string, string>;
+  /** Interaction source for observability metrics (e.g. "api", "chat", "knowledge:embedding") */
+  source: InteractionSource;
+  /**
+   * Id of the llm_provider_api_keys row the request's credential resolved
+   * from, when known. Adapters whose upstream rotates the stored credential
+   * (Microsoft 365 Copilot's Entra refresh tokens) use it to persist the rotated
+   * secret back to the key; other adapters ignore it.
+   */
+  llmProviderApiKeyId?: string;
+  /**
+   * Aborted when the downstream HTTP client disconnects before its response
+   * finishes. Provider clients may forward it to their upstream requests.
+   */
+  abortSignal?: AbortSignal;
+  /**
+   * Model the client is being built for. Only providers whose endpoint depends
+   * on the model read it — Gemini in Vertex AI mode, where the location that
+   * serves a model varies by generation and is fixed at client construction.
+   */
+  model?: string;
+  /**
+   * Observe successful upstream response headers before the provider SDK
+   * consumes the body. Used for billing signals at the HTTP boundary.
+   */
+  onResponseHeaders?: (headers: Headers) => void;
+}
+
+/**
+ * Adapter interface for LLM requests
+ *
+ * Wraps provider-specific request and provides uniform API for business logic.
+ * Original data is preserved and can be reconstructed after modifications.
+ *
+ * @typeParam TRequest - Provider-specific request type
+ * @typeParam TMessages - Provider-specific messages type
+ */
+export interface LLMRequestAdapter<TRequest, TMessages = unknown> {
+  /** Provider name */
+  readonly provider: SupportedProvider;
+
+  // ---------------------------------------------------------------------------
+  // Read Access
+  // ---------------------------------------------------------------------------
+
+  /** Get model name */
+  getModel(): string;
+
+  /** Check if streaming is requested */
+  isStreaming(): boolean;
+
+  /** Get messages in common format (for trusted data evaluation) */
+  getMessages(): CommonMessage[];
+
+  /** Get tool results from messages (for trusted data evaluation) */
+  getToolResults(): CommonToolResult[];
+
+  /**
+   * Get tool definitions (for persistence, hasTools check).
+   *
+   * Lossy on purpose: it keeps only the schema-carrying function tools this
+   * provider can describe. Do not use it to decide which tool calls the caller
+   * made available — that comes from `collectDeclaredToolNames`, which reads
+   * the request body and so counts built-ins and other schema-less tools too.
+   */
+  getTools(): CommonMcpToolDefinition[];
+
+  /** Check if request has tools */
+  hasTools(): boolean;
+
+  /** Get provider-specific messages (for token counting) */
+  getProviderMessages(): TMessages;
+
+  /** Get original unmodified request */
+  getOriginalRequest(): TRequest;
+
+  // ---------------------------------------------------------------------------
+  // Modify Access
+  // ---------------------------------------------------------------------------
+
+  /** Set model (for cost optimization) */
+  setModel(model: string): void;
+
+  /**
+   * Update a tool result's content (for trusted data updates)
+   * @param toolCallId - The tool call ID to update
+   * @param newContent - New content string
+   */
+  updateToolResult(toolCallId: string, newContent: string): void;
+
+  /**
+   * Apply multiple tool result updates at once
+   * @param updates - Map of tool call ID to new content
+   */
+  applyToolResultUpdates(updates: Record<string, string>): void;
+
+  /**
+   * Convert tool result content to provider-specific format (e.g., MCP image blocks)
+   * @param messages - Provider-specific messages to convert
+   */
+  convertToolResultContent(messages: TMessages): TMessages;
+
+  // ---------------------------------------------------------------------------
+  // Build Modified Request
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Build the modified provider-specific request
+   * Incorporates all modifications (model, tool results)
+   */
+  toProviderRequest(): TRequest;
+}
+
+// =============================================================================
+// RESPONSE ADAPTER INTERFACE
+// =============================================================================
+
+/**
+ * Adapter interface for LLM responses
+ *
+ * Wraps provider-specific response and provides uniform API for business logic.
+ *
+ * @typeParam TResponse - Provider-specific response type
+ */
+export interface LLMResponseAdapter<TResponse> {
+  /** Provider name */
+  readonly provider: SupportedProvider;
+
+  // ---------------------------------------------------------------------------
+  // Read Access
+  // ---------------------------------------------------------------------------
+
+  /** Get response ID */
+  getId(): string;
+
+  /** Get model name */
+  getModel(): string;
+
+  /** Get text content from response */
+  getText(): string;
+
+  /** Get tool calls from response (for tool invocation policies) */
+  getToolCalls(): CommonToolCall[];
+
+  /** Check if response has tool calls */
+  hasToolCalls(): boolean;
+
+  /** Get token usage */
+  getUsage(): UsageView;
+
+  /** Get original response */
+  getOriginalResponse(): TResponse;
+
+  /**
+   * Optional hook for adapters whose wire response shape differs from the
+   * shape we want to persist in the interaction log. When present, the proxy
+   * handler stores this value instead of `getOriginalResponse()`. Default
+   * (unimplemented) means log == wire, which is correct for every native
+   * adapter.
+   */
+  getLoggedResponse?(): TResponse;
+
+  /**
+   * Return this response with its tool calls replaced, for the non-streaming
+   * counterpart of {@link LLMStreamAdapter.formatToolCallsSSE}: the proxy
+   * repairs a dispatch-mode agent's direct tool call by re-addressing it to
+   * `run_tool` (see `planDispatchModeToolCallRewrites`).
+   *
+   * `toolCalls` is positional — one entry per call this response already
+   * carries, in order — so an adapter rewrites in place and preserves each
+   * call's id, which is what the client correlates its tool result by.
+   *
+   * Optional, on the same terms as `formatToolCallsSSE`: an adapter that does
+   * not implement it keeps the pre-existing refusal-with-steer behavior for its
+   * provider, so no response shape is ever rewritten speculatively.
+   */
+  withRewrittenToolCalls?(
+    toolCalls: Array<{ id: string; name: string; arguments: string }>,
+  ): TResponse;
+
+  /**
+   * Calls the provider ran inside the inference call, each with what it
+   * produced. Optional: a wire that does not surface them has none to rule on.
+   */
+  getHostedToolCalls?(): HostedToolCall[];
+
+  /**
+   * Return this response with its provider-run part withheld and `notices`
+   * standing in its place, for a client that must not see what those calls
+   * brought in.
+   */
+  withHeldHostedToolCalls?(
+    notices: Array<{ id: string; name: string; arguments: string }>,
+  ): TResponse;
+
+  /** Get finish reasons array for OTEL tracing (e.g., ["stop"], ["tool_calls"]) */
+  getFinishReasons(): string[];
+
+  // ---------------------------------------------------------------------------
+  // Build Responses
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Build a refusal response (when tool invocation is blocked)
+   * @param refusalMessage - Full message with metadata
+   * @param contentMessage - Human-readable message
+   */
+  toRefusalResponse(refusalMessage: string, contentMessage: string): TResponse;
+}
+
+// =============================================================================
+// STREAMING ADAPTER INTERFACE
+// =============================================================================
+
+/**
+ * Accumulated state during streaming
+ */
+export interface StreamAccumulatorState {
+  responseId: string;
+  model: string;
+  text: string;
+  toolCalls: Array<{
+    id: string;
+    name: string;
+    arguments: string;
+  }>;
+  /** Raw tool call events stored for replay after policy approval */
+  rawToolCallEvents: unknown[];
+  usage: UsageView | null;
+  stopReason: string | null;
+  // timing for metrics
+  timing: {
+    startTime: number;
+    firstChunkTime: number | null;
+  };
+}
+
+/**
+ * Result of processing a stream chunk
+ */
+export interface ChunkProcessingResult {
+  /** SSE data to send to client immediately (null if should be held) */
+  sseData: string | Uint8Array | null;
+  /** Whether this chunk contains tool call data (held for policy evaluation) */
+  isToolCallChunk: boolean;
+  /** Whether this is the final chunk */
+  isFinal: boolean;
+  /** Error information if this chunk represents an error event */
+  error?: {
+    type: string;
+    message: string;
+  };
+}
+
+/**
+ * Keep-alive frame written while a dual LLM analysis holds a stream idle
+ * before the upstream call. A `:`-prefixed line is defined by the event-stream
+ * spec as a comment, so every compliant SSE parser drops it without touching
+ * message content — which also means it is only safe on `text/event-stream`
+ * transports, not on the NDJSON or binary event streams some providers speak.
+ */
+export const DUAL_LLM_KEEPALIVE_SSE_COMMENT =
+  ": archestra dual-llm analysis in progress\n\n";
+
+/**
+ * Adapter interface for streaming LLM responses
+ *
+ * Handles parsing provider-specific chunks, accumulating state,
+ * and formatting SSE events.
+ *
+ * @typeParam TChunk - Provider-specific stream chunk type
+ * @typeParam TResponse - Provider-specific response type
+ */
+export interface LLMStreamAdapter<TChunk, TResponse> {
+  /** Provider name */
+  readonly provider: SupportedProvider;
+
+  /** Current accumulated state */
+  readonly state: StreamAccumulatorState;
+
+  // ---------------------------------------------------------------------------
+  // Chunk Processing
+  // ---------------------------------------------------------------------------
+
+  /**
+   * processChunk process straming chunkgs one-by-one to:
+   * 1. Tell LLMProxy how to handle current streaming chunk, depending on it's type (stream immediately, buffer for tool result inspection, etc.)
+   * 2. Updates concrete StreamAdapter's internal StreamingAccumulatorState. This state is also used by the LLMProxy
+   *    to build final response and other business logic.
+   */
+  processChunk(chunk: TChunk): ChunkProcessingResult;
+
+  // ---------------------------------------------------------------------------
+  // SSE Formatting
+  // ---------------------------------------------------------------------------
+
+  /** Format SSE headers for response */
+  getSSEHeaders(): Record<string, string>;
+
+  /**
+   * Format a text fragment as SSE to inject into an ongoing stream.
+   * Used to surface a terminal dual LLM sanitization failure before the
+   * request fails closed. Never used for mid-stream progress: injected text
+   * is indistinguishable from model output and fuses into the answer.
+   */
+  formatTextDeltaSSE(text: string): string | Uint8Array;
+
+  /** Get raw tool call events as SSE strings (for replay after policy approval) */
+  getRawToolCallEvents(): (string | Uint8Array)[];
+
+  /**
+   * Format a complete, self-contained text response as SSE events.
+   * Used when replacing the response entirely (e.g., policy refusal).
+   * Returns provider-specific events that form a valid complete response.
+   */
+  formatCompleteTextSSE(text: string): (string | Uint8Array)[];
+
+  /**
+   * Re-emit this turn's tool calls as SSE, replacing the buffered raw events.
+   *
+   * Used when the proxy repairs a dispatch-mode agent's *direct* tool call by
+   * re-addressing it to `run_tool` (see `planDispatchModeToolCallRewrites`).
+   * The buffered events cannot simply be edited: they are provider-native
+   * fragments, with the name and the argument JSON split across chunks.
+   *
+   * Emits ONLY the tool-call portion of the message. Any text the model
+   * produced in the same turn has already been streamed to the client, so this
+   * must continue that message rather than open a new one — unlike
+   * {@link formatCompleteTextSSE}, which replaces the response wholesale.
+   *
+   * Optional: an adapter that does not implement it keeps the pre-existing
+   * behavior for its provider (the calls are refused with the
+   * "cannot be called directly" steer), so coverage can grow one wire format at
+   * a time without any provider silently emitting a malformed stream.
+   */
+  formatToolCallsSSE?(
+    toolCalls: StreamAccumulatorState["toolCalls"],
+  ): (string | Uint8Array)[];
+
+  /**
+   * Asks the adapter to withhold every chunk from the first hosted call on, so
+   * the verdict is in before any of that reaches the client. Called before the
+   * first chunk, and only when something will rule on those calls: withholding
+   * costs the turn its token streaming.
+   */
+  withholdHostedToolCalls?(): void;
+
+  /** Streaming counterpart of {@link LLMResponseAdapter.getHostedToolCalls}. */
+  getHostedToolCalls?(): HostedToolCall[];
+
+  /**
+   * Discards the withheld chunks and emits `notices` in their place, ending
+   * with the terminal frame the client keeps.
+   */
+  formatHeldHostedToolCallsSSE?(
+    notices: StreamAccumulatorState["toolCalls"],
+  ): (string | Uint8Array)[];
+
+  /** Format the stream end marker */
+  formatEndSSE(): string | Uint8Array;
+
+  // ---------------------------------------------------------------------------
+  // Build Response
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Reconstructs a complete provider-native response from accumulated streaming chunks.
+   *
+   * During streaming, responses arrive as many small chunks (text deltas, tool call fragments, etc.).
+   * This method combines all accumulated state into a single complete response object,
+   * which is needed for saving the interaction to the database.
+   */
+  toProviderResponse(): TResponse;
+}
+
+// =============================================================================
+// ADAPTER FACTORY INTERFACE
+// =============================================================================
+
+/**
+ * Factory for creating adapters for a specific provider
+ *
+ * Each provider implements this interface to create adapters for their
+ * request/response types.
+ *
+ * @typeParam TRequest - Provider-specific request type
+ * @typeParam TResponse - Provider-specific response type
+ * @typeParam TMessages - Provider-specific messages type
+ * @typeParam TChunk - Provider-specific stream chunk type
+ * @typeParam THeaders - Provider-specific headers type
+ */
+export interface LLMProvider<TRequest, TResponse, TMessages, TChunk, THeaders> {
+  /** Provider name */
+  readonly provider: SupportedProvider;
+
+  /** Interaction type for database storage */
+  readonly interactionType: SupportedProviderDiscriminator;
+
+  /**
+   * When true, the LLM proxy handler records the `llm_request_duration_seconds`
+   * metric for this provider. Leave unset for providers whose transport already
+   * self-instruments duration (fetch-based providers via getObservableFetch,
+   * Gemini via getObservableGenAI) to avoid double-counting. Bedrock sets this
+   * because its custom SigV4 client has no access to the profile/source labels
+   * the metric needs, so the handler records duration on its behalf.
+   */
+  readonly recordRequestDurationInHandler?: boolean;
+
+  /**
+   * Render a mid-stream error into this provider's own stream framing.
+   *
+   * Once headers are committed the HTTP status can no longer change, so the
+   * failure has to travel inside the stream — which means it has to be shaped
+   * like the stream. Leave unset for the SSE majority and the shared default
+   * (`event: error\ndata: …`) applies. Implement it for providers on a
+   * different transport: an SSE frame injected into an NDJSON stream is a parse
+   * error at the client, which reports the framing problem instead of the real
+   * upstream cause.
+   */
+  readonly formatStreamErrorFrame?: (event: unknown) => string;
+
+  // ---------------------------------------------------------------------------
+  // Adapter Creation
+  // ---------------------------------------------------------------------------
+
+  /** Create a request adapter */
+  createRequestAdapter(
+    request: TRequest,
+  ): LLMRequestAdapter<TRequest, TMessages>;
+
+  /** Create a response adapter */
+  createResponseAdapter(response: TResponse): LLMResponseAdapter<TResponse>;
+
+  /** Create a stream adapter. Request is optional and used by some providers (e.g., Bedrock for tool name mapping) */
+  createStreamAdapter(request?: TRequest): LLMStreamAdapter<TChunk, TResponse>;
+
+  // ---------------------------------------------------------------------------
+  // Client & Headers
+  // ---------------------------------------------------------------------------
+
+  /** Extract API key from headers */
+  extractApiKey(headers: THeaders): string | undefined;
+
+  /**
+   * Whether the resolved upstream credential is a flat-rate subscription token
+   * rather than a metered API key, judged purely by the credential's format.
+   * Used for billing-mode classification (see resolveInteractionBillingMode).
+   * Implement ONLY for providers whose subscription tokens are format-
+   * distinguishable from metered keys: Anthropic OAuth access tokens (Claude
+   * Pro/Max, what Claude Code forwards) are `sk-ant-oat…` while metered API
+   * keys are `sk-ant-api…`. Providers without such a marker must leave this
+   * unset so their traffic stays metered.
+   */
+  isSubscriptionCredential?(apiKey: string | undefined): boolean;
+
+  /** Get base URL for the provider (from config), undefined means use SDK default */
+  getBaseUrl(): string | undefined;
+
+  /** GenAI operation name for tracing (e.g., "chat", "generate_content"). The span name is constructed as `{operationName} {model}` by startActiveLlmSpan. */
+  readonly spanName: GenAiOperationName;
+
+  /**
+   * Create provider client with observability.
+   * Each provider is responsible for setting up its own metrics tracking:
+   */
+  createClient(
+    apiKey: string | undefined,
+    options: CreateClientOptions,
+  ): unknown;
+
+  // ---------------------------------------------------------------------------
+  // Execution
+  // ---------------------------------------------------------------------------
+
+  /** Execute non-streaming request */
+  execute(client: unknown, request: TRequest): Promise<TResponse>;
+
+  /** Execute streaming request */
+  executeStream(
+    client: unknown,
+    request: TRequest,
+  ): Promise<AsyncIterable<TChunk>>;
+
+  /**
+   * Extract error message from provider-specific SDK error.
+   * Each provider SDK wraps errors differently (e.g., Anthropic uses nested
+   * error.error.message structure), so this normalizes them to a string.
+   */
+  extractErrorMessage(error: unknown): string;
+
+  /**
+   * Classify a provider-specific SDK error into an Archestra-normalized
+   * internal code. Used by the proxy to emit a uniform `internal_code`
+   * field on the error response body, which downstream consumers (notably
+   * the chat-error mapper) can read without provider-specific knowledge.
+   *
+   * Returns `undefined` when the error doesn't match any known normalized
+   * category, in which case no `internal_code` is added to the envelope.
+   */
+  extractInternalCode(error: unknown): ArchestraInternalErrorCode | undefined;
+}
+
+/**
+ * Token usage from response
+ */
+export interface UsageView {
+  /** Uncached input tokens only (normalized across providers). */
+  inputTokens: number;
+  outputTokens: number;
+  /** Tokens served from the prompt cache (billed at the provider's reduced read rate). Absent = no cache reporting. */
+  cacheReadTokens?: number;
+  /** Tokens written to the prompt cache (0/absent for providers that auto-cache without a write surcharge). */
+  cacheWriteTokens?: number;
+  /** Portion of cacheWriteTokens written at the 1-hour TTL (billed higher than 5m). Anthropic-only; absent elsewhere. */
+  cacheWrite1hTokens?: number;
+  /** Output tokens spent on reasoning/extended thinking. Reported by OpenAI (reasoning_tokens) and Gemini (thoughtsTokenCount); absent elsewhere. */
+  reasoningTokens?: number;
+  /** True when inputTokens is a locally-computed estimate, not a provider-reported count (see applyInputTokenFallback). Absent/false = provider-measured. */
+  inputTokensEstimated?: boolean;
+}
+
+/**
+ * Create initial stream accumulator state
+ */
+export function createStreamAccumulatorState(): StreamAccumulatorState {
+  return {
+    responseId: "",
+    model: "",
+    text: "",
+    toolCalls: [],
+    rawToolCallEvents: [],
+    usage: null,
+    stopReason: null,
+    timing: {
+      startTime: Date.now(),
+      firstChunkTime: null,
+    },
+  };
+}

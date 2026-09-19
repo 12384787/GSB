@@ -1,0 +1,856 @@
+{-
+ Copyright 2022-23, Juspay India Pvt Ltd
+
+ This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License
+
+ as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. This program
+
+ is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+
+ or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details. You should have received a copy of
+
+ the GNU Affero General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+-}
+
+module Domain.Action.Beckn.FRFS.OnConfirm where
+
+import qualified Beckn.ACL.FRFS.Utils as Utils
+import qualified BecknV2.FRFS.Enums as Spec
+import BecknV2.FRFS.Utils
+import Data.Aeson
+import qualified Data.ByteString.Base64 as B64
+import qualified Data.ByteString.Lazy as BL
+import Data.HashMap.Strict
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
+import Data.Time.Clock.POSIX hiding (getCurrentTime)
+import Domain.Action.Beckn.FRFS.Common
+import qualified Domain.Action.Beckn.FRFS.GWLink as GWSA
+import Domain.Types.BecknConfig
+import qualified Domain.Types.Extra.MerchantServiceConfig as DEMSC
+import qualified Domain.Types.FRFSQuote as FQ
+import qualified Domain.Types.FRFSQuoteCategory as DFRFSQuoteCategory
+import qualified Domain.Types.FRFSRecon as Recon
+import qualified Domain.Types.FRFSTicket as Ticket
+import qualified Domain.Types.FRFSTicketBooking as Booking
+import qualified Domain.Types.FRFSTicketBookingStatus as Booking
+import qualified Domain.Types.FRFSTicketStatus as DFRFSTicketStatus
+import qualified Domain.Types.IntegratedBPPConfig as DIBC
+import Domain.Types.Merchant as Merchant
+import qualified Domain.Types.PartnerOrgConfig as DPOC
+import Domain.Types.PartnerOrganization
+import qualified Domain.Types.Person as Person
+import qualified Domain.Types.PersonPTStats as DPUS
+import EulerHS.Prelude ((+||), (<|>), (||+))
+import ExternalBPP.CallAPI.Cancel
+import Kernel.Beam.Functions
+import Kernel.External.Encryption as ENC
+import Kernel.External.MasterCloudForward (HasMasterCloudForwarder)
+import Kernel.External.Types (SchedulerFlow)
+import Kernel.Prelude as Prelude hiding (lookup)
+import Kernel.Sms.Config (SmsConfig)
+import Kernel.Storage.Esqueleto.Config (EsqDBReplicaFlow)
+import qualified Kernel.Storage.Hedis as Redis
+import Kernel.Streaming.Kafka.Producer.Types (HasKafkaProducer)
+import Kernel.Types.Error
+import Kernel.Types.Id
+import Kernel.Types.Version (CloudType)
+import Kernel.Utils.Common
+import Lib.ConfigPilot.Interface.Types (getConfig, getOneConfig)
+import qualified Lib.Finance.Core.Types as Finance
+import qualified Lib.Payment.Storage.HistoryQueries.PaymentTransaction as HQPaymentTransaction
+import qualified SharedLogic.CallFRFSBPP as CallFRFSBPP
+import qualified SharedLogic.FRFSCancel as FRFSCancel
+import qualified SharedLogic.FRFSPassOverride as FRFSPassOverride
+import qualified SharedLogic.FRFSSeatBooking as SeatBooking
+import SharedLogic.FRFSUtils as FRFSUtils
+import qualified SharedLogic.IntegratedBPPConfig as SIBC
+import qualified SharedLogic.MessageBuilder as MessageBuilder
+import qualified SharedLogic.Payment as SPayment
+import qualified SharedLogic.PersonPTStats as SPUS
+import Storage.Beam.Payment ()
+import qualified Storage.CachedQueries.BecknConfig as CQBC
+import qualified Storage.CachedQueries.Merchant as QMerch
+import qualified Storage.CachedQueries.Merchant.MerchantOperatingCity as QMerchOpCity
+import qualified Storage.CachedQueries.OTPRest.OTPRest as OTPRest
+import qualified Storage.CachedQueries.PartnerOrgConfig as CQPOC
+import qualified Storage.CachedQueries.PartnerOrgStation as CQPOS
+import qualified Storage.CachedQueries.Person as CQP
+import Storage.ConfigPilot.Config.BecknConfig (BecknConfigDimensions (..))
+import Storage.ConfigPilot.Config.FRFSConfig (FRFSConfigDimensions (..))
+import qualified Storage.Queries.FRFSQuoteCategory as QFRFSQuoteCategory
+import qualified Storage.Queries.FRFSRecon as QRecon
+import qualified Storage.Queries.FRFSSearch as QSearch
+import qualified Storage.Queries.FRFSTicket as QTicket
+import qualified Storage.Queries.FRFSTicketBooking as QTBooking
+import qualified Storage.Queries.FRFSTicketBookingPayment as QFRFSTicketBookingPayment
+import qualified Storage.Queries.Journey as QJourney
+import qualified Storage.Queries.JourneyExtra as QJourneyExtra
+import qualified Storage.Queries.Person as QPerson
+import qualified Storage.Queries.PersonStats as QPS
+import qualified Storage.Queries.PurchasedPassPayment as QPurchasedPassPayment
+import qualified Text.Regex as TR
+import Tools.Error
+import qualified Tools.Metrics.BAPMetrics as Metrics
+import qualified Tools.SMS as Sms
+import qualified UrlShortner.Common as UrlShortner
+import qualified Utils.Common.JWT.Config as GW
+import qualified Utils.Common.JWT.TransitClaim as TC
+import qualified Utils.QRCode.Scanner as QRScanner
+import Web.JWT hiding (claims)
+
+validateRequest ::
+  ( CacheFlow m r,
+    EsqDBFlow m r,
+    Finance.HasActorInfo m r,
+    EncFlow m r,
+    SchedulerFlow r,
+    EsqDBReplicaFlow m r,
+    HasLongDurationRetryCfg r c,
+    HasShortDurationRetryCfg r c,
+    HasKafkaProducer r,
+    CallFRFSBPP.BecknAPICallFlow m r,
+    Metrics.HasBAPMetrics m r,
+    HasField "ltsHedisEnv" r Redis.HedisEnv,
+    HasFlowEnv m r '["smsCfg" ::: SmsConfig],
+    HasFlowEnv m r '["googleSAPrivateKey" ::: String],
+    HasFlowEnv m r '["urlShortnerConfig" ::: UrlShortner.UrlShortnerConfig],
+    HasField "isMetroTestTransaction" r Bool,
+    HasField "blackListedJobs" r [Text],
+    HasMasterCloudForwarder r
+  ) =>
+  DOrder ->
+  m (Merchant, Booking.FRFSTicketBooking, [DFRFSQuoteCategory.FRFSQuoteCategory])
+validateRequest DOrder {..} = do
+  _ <- runInReplica $ QSearch.findById (Id transactionId) >>= fromMaybeM (SearchRequestDoesNotExist transactionId)
+  booking <- runInReplica $ QTBooking.findById (Id messageId) >>= fromMaybeM (BookingDoesNotExist messageId)
+  quoteCategories <- QFRFSQuoteCategory.findAllByQuoteId booking.quoteId
+  let merchantId = booking.merchantId
+  merchant <- QMerch.findById merchantId >>= fromMaybeM (MerchantNotFound merchantId.getId)
+  mbBookingPayment <- QFRFSTicketBookingPayment.findTicketBookingPayment booking
+  unless (isJust mbBookingPayment || FRFSPassOverride.isFullyPassCovered booking.overriddenAmount) $
+    throwError (FRFSTicketBookingPaymentNotFound booking.id.getId)
+  now <- getCurrentTime
+  if booking.validTill < now
+    then do
+      -- Booking is expired
+      logInfo $ "booking is expired: " <> show booking
+      merchantOperatingCity <- QMerchOpCity.findById booking.merchantOperatingCityId >>= fromMaybeM (MerchantOperatingCityNotFound booking.merchantOperatingCityId.getId)
+      bapConfig <- getOneConfig (BecknConfigDimensions {merchantOperatingCityId = merchantOperatingCity.id.getId, merchantId = merchantId.getId, domain = Just (show Spec.FRFS), vehicleCategory = Just (frfsVehicleCategoryToBecknVehicleCategory booking.vehicleType), becknProtocol = Nothing}) (Just (maybeToList <$> CQBC.findByMerchantIdDomainVehicleAndMerchantOperatingCityIdWithFallback merchantOperatingCity.id merchantId (show Spec.FRFS) (frfsVehicleCategoryToBecknVehicleCategory booking.vehicleType))) >>= fromMaybeM (InternalError $ "Beckn Config not found for merchantId:- " <> merchantId.getId)
+      -- Kept, and it is not dead: validateRequest has no status guard at all, so a replayed
+      -- on_confirm for a booking that already reached CONFIRMED -- and therefore already debited --
+      -- lands here once validTill has passed and gets marked FAILED. The release is guarded on
+      -- CONFIRMED internally, so it is a no-op on the ordinary pre-confirm expiry.
+      void $ QTBooking.updateBPPOrderIdAndStatusById (Just bppOrderId) Booking.FAILED booking.id
+      -- Guarded like markFRFSBookingStatus: this path has no status guard, so a replayed on_confirm
+      -- on an already-FAILED booking re-runs it and would count the same failure twice.
+      unless (booking.status == Booking.FAILED) $
+        Metrics.incrementFRFSBookingCount booking.merchantId.getId booking.merchantOperatingCityId.getId (show booking.vehicleType) (show Booking.FAILED) "expired_on_confirm_validate"
+      void $ withTryCatch "onConfirmValidate:releaseTrip" (FRFSPassOverride.releasePassOverrideTripOnFailure booking)
+      when (isNothing booking.parentBookingId) $
+        whenJust mbBookingPayment $ \bookingPayment ->
+          void $ SPayment.markRefundPendingAndSyncOrderStatus merchantId booking.riderId bookingPayment.paymentOrderId
+      let updatedBooking = booking {Booking.bppOrderId = Just bppOrderId}
+      void $ cancel merchant merchantOperatingCity bapConfig Spec.CONFIRM_CANCEL Technical False updatedBooking
+      throwM $ InvalidRequest "Booking expired, initated cancel request"
+    else return (merchant, booking, quoteCategories)
+
+onConfirmFailure ::
+  ( CacheFlow m r,
+    EsqDBFlow m r,
+    Finance.HasActorInfo m r,
+    EncFlow m r,
+    SchedulerFlow r,
+    EsqDBReplicaFlow m r,
+    HasLongDurationRetryCfg r c,
+    HasShortDurationRetryCfg r c,
+    HasKafkaProducer r,
+    CallFRFSBPP.BecknAPICallFlow m r,
+    Metrics.HasBAPMetrics m r,
+    HasField "ltsHedisEnv" r Redis.HedisEnv,
+    HasFlowEnv m r '["smsCfg" ::: SmsConfig],
+    HasFlowEnv m r '["googleSAPrivateKey" ::: String],
+    HasFlowEnv m r '["urlShortnerConfig" ::: UrlShortner.UrlShortnerConfig],
+    HasField "isMetroTestTransaction" r Bool,
+    HasField "blackListedJobs" r [Text],
+    HasMasterCloudForwarder r
+  ) =>
+  BecknConfig ->
+  Booking.FRFSTicketBooking ->
+  m ()
+onConfirmFailure bapConfig ticketBooking = do
+  logInfo $ "onConfirmFailure: " <> show ticketBooking
+  merchant <- QMerch.findById ticketBooking.merchantId >>= fromMaybeM (MerchantNotFound ticketBooking.merchantId.getId)
+  merchantOperatingCity <- QMerchOpCity.findById ticketBooking.merchantOperatingCityId >>= fromMaybeM (MerchantOperatingCityNotFound ticketBooking.merchantOperatingCityId.getId)
+  mbBookingPayment <- QFRFSTicketBookingPayment.findTicketBookingPayment ticketBooking
+  unless (isJust mbBookingPayment || FRFSPassOverride.isFullyPassCovered ticketBooking.overriddenAmount) $
+    throwError (FRFSTicketBookingPaymentNotFound ticketBooking.id.getId)
+  void $ FRFSUtils.markFRFSBookingStatus Booking.FAILED "on_confirm_failure" ticketBooking
+  -- The only release left in the codebase, and it is guarded on CONFIRMED for a reason: this is
+  -- the one path where a failure can arrive AFTER a successful on_confirm already debited the
+  -- pass. Everywhere else is pre-CONFIRMED, where nothing has been spent. ticketBooking still
+  -- holds the pre-FAILED status read above, so the guard sees the status that matters.
+  void $ withTryCatch "onConfirmFailure:releaseTrip" (FRFSPassOverride.releasePassOverrideTripOnFailure ticketBooking)
+  case ticketBooking.parentBookingId of
+    Just parentId ->
+      logInfo $
+        "onConfirmFailure: staging booking of " <> parentId.getId
+          <> " failed; leaving the parent's payment alone for rollbackFailedReschedule bookingId="
+          <> ticketBooking.id.getId
+    Nothing ->
+      whenJust mbBookingPayment $ \bookingPayment -> void $ SPayment.markRefundPendingAndSyncOrderStatus merchant.id ticketBooking.riderId bookingPayment.paymentOrderId
+  -- enforceCap=False: this is a Technical cancellation, so it must not consume the rider's
+  -- cancellation allowance (see ExternalBPP.CallAPI.Cancel).
+  void $ cancel merchant merchantOperatingCity bapConfig Spec.CONFIRM_CANCEL Technical False ticketBooking
+
+onConfirm ::
+  ( CacheFlow m r,
+    EsqDBFlow m r,
+    MonadFlow m,
+    EncFlow m r,
+    SchedulerFlow r,
+    EsqDBReplicaFlow m r,
+    HasLongDurationRetryCfg r c,
+    HasShortDurationRetryCfg r c,
+    HasKafkaProducer r,
+    CallFRFSBPP.BecknAPICallFlow m r,
+    Metrics.HasBAPMetrics m r,
+    HasFlowEnv m r '["googleSAPrivateKey" ::: String],
+    HasFlowEnv m r '["smsCfg" ::: SmsConfig],
+    HasFlowEnv m r '["urlShortnerConfig" ::: UrlShortner.UrlShortnerConfig],
+    HasField "cloudType" r (Maybe CloudType),
+    Finance.HasActorInfo m r,
+    HasField "ltsHedisEnv" r Redis.HedisEnv,
+    HasField "isMetroTestTransaction" r Bool,
+    HasField "blackListedJobs" r [Text],
+    HasMasterCloudForwarder r,
+    MonadMask m
+  ) =>
+  Merchant ->
+  Booking.FRFSTicketBooking ->
+  [DFRFSQuoteCategory.FRFSQuoteCategory] ->
+  DOrder ->
+  m ()
+onConfirm merchant booking' quoteCategories dOrder = do
+  Metrics.finishMetrics Metrics.CONFIRM_FRFS merchant.name dOrder.transactionId booking'.merchantOperatingCityId.getId
+  let booking = booking' {Booking.bppOrderId = Just dOrder.bppOrderId}
+  let discountedTickets = fromMaybe 0 booking.discountedTickets
+  tickets <- createTickets booking dOrder.tickets discountedTickets
+  let mbPaymentHoldId = listToMaybe quoteCategories >>= (.holdId)
+  let effectiveHoldId = mbPaymentHoldId <|> booking'.holdId
+  whenJust effectiveHoldId $ \holdId -> do
+    whenJust booking'.tripId $ \tripId -> do
+      logInfo $ "OnConfirm:onConfirm finalizing seat hold bookingId=" <> booking.id.getId <> " holdId=" <> holdId <> " tripId=" <> tripId
+      SeatBooking.confirmBooking tripId holdId
+      SeatBooking.releaseAbandonedHolds tripId booking.id.getId holdId
+  void $ QTicket.createMany tickets
+  mbJourneyId <- FRFSUtils.getJourneyIdFromBooking booking
+  person <- runInReplica $ QPerson.findById booking.riderId >>= fromMaybeM (PersonNotFound booking.riderId.getId)
+  let fareParameters = mkFareParameters (mkCategoryPriceItemFromQuoteCategories quoteCategories)
+  void $ QTBooking.updateBPPOrderIdAndStatusById (Just dOrder.bppOrderId) Booking.CONFIRMED booking.id
+  -- Count the transition, not the callback. validateRequest has no status guard, so a replayed
+  -- on_confirm re-runs this handler; booking.status is still the pre-update status here, which is
+  -- the same reason the pass debit below is guarded on it.
+  unless (booking.status == Booking.CONFIRMED) $
+    Metrics.incrementFRFSBookingCount booking.merchantId.getId booking.merchantOperatingCityId.getId (show booking.vehicleType) (show Booking.CONFIRMED) ""
+  -- Debit the pass here, once the ticket exists. Everything between a debit and the ticket -- a
+  -- thrown BPP call, a pod restart, a journey the rider abandons -- used to strand the trip with
+  -- nothing left to release it. Swallowed so a metering failure can never undo a confirmed ticket.
+  --
+  -- Guarded on the PRE-update status: validateRequest does not reject an already-CONFIRMED
+  -- booking, so a replayed on_confirm re-runs this handler, and the TripConsumed marker only
+  -- dedupes for passMarkerTtl. Debit strictly on the transition into CONFIRMED.
+  integratedBPPConfig <- SIBC.findIntegratedBPPConfigFromEntity booking
+  passCouldNotCover <-
+    if booking.status == Booking.CONFIRMED || isJust booking.parentBookingId
+      then pure False
+      else
+        withTryCatch "onConfirm:spendTripForBooking" (FRFSPassOverride.spendTripForBooking person booking {Booking.status = Booking.CONFIRMED}) >>= \case
+          Right FRFSPassOverride.TripPassExhausted -> pure True
+          Right other -> do
+            case other of
+              FRFSPassOverride.TripPassUnusable why ->
+                logError $ "FRFSPassOverride: not reversing on an ambiguous debit failure (" <> why <> ") bookingId=" <> booking.id.getId
+              _ -> pure ()
+            pure False
+          Left err -> do
+            logError $ "FRFSPassOverride: trip debit threw, leaving the booking alone bookingId=" <> booking.id.getId <> " error=" <> show err
+            pure False
+  overCap <-
+    if booking.status == Booking.CONFIRMED
+      then pure False
+      else
+        withTryCatch
+          "onConfirm:recordBookedTrip"
+          ( do
+              mbApplied <- FRFSPassOverride.passForOverrideAppliedEntity booking.overrideAppliedEntityId
+              case (,) <$> booking.overrideAppliedEntityId <*> mbApplied of
+                Nothing -> pure False
+                Just (_, (_, appliedPass)) | isNothing (mfilter (> 0) appliedPass.timeOverlappingFrfsBookingsLimit) -> pure False
+                Just (entityId, (_, appliedPass)) -> do
+                  mbEnd <- case (booking.tripId, booking.routeCode) of
+                    (Just tripId, Just routeCode) -> snd <$> FRFSUtils.getScheduledTripWindow tripId routeCode booking.fromStationCode booking.toStationCode integratedBPPConfig
+                    _ -> pure Nothing
+                  case ((,) <$> booking.startTime <*> mbEnd) of
+                    Nothing -> do
+                      logInfo $ "FRFSPassOverride: no resolvable trip window, overlapping-booking cap not claimed bookingId=" <> booking.id.getId
+                      pure False
+                    Just tripWindow ->
+                      FRFSPassOverride.recordAndDetectOverLimit person appliedPass (Id entityId) booking.id.getId ((.getId) <$> booking.parentBookingId) tripWindow
+          )
+          >>= \case
+            Right over -> pure over
+            Left err -> do
+              logError $ "FRFSPassOverride: could not record the booked window, cap not enforced for this booking bookingId=" <> booking.id.getId <> " error=" <> show err
+              pure False
+  if overCap || passCouldNotCover
+    then do
+      logError $
+        "FRFSPassOverride: reversing at on_confirm (" <> (if overCap then "over-cap" else "pass could not cover")
+          <> ") bookingId="
+          <> booking.id.getId
+      void $ withTryCatch "onConfirm:teardownCancelTickets" (QTicket.updateAllStatusByBookingId DFRFSTicketStatus.CANCELLED booking.id)
+      void $ withTryCatch "onConfirm:teardownReleaseSeats" (FRFSCancel.releaseSeatsIfHeld booking quoteCategories)
+      teardownResult <-
+        withTryCatch
+          "onConfirm:overCapTeardown"
+          ( do
+              merchantOperatingCity <-
+                QMerchOpCity.findById booking.merchantOperatingCityId
+                  >>= fromMaybeM (MerchantOperatingCityNotFound booking.merchantOperatingCityId.getId)
+              -- Bound to a name rather than written inline: nested one level deeper inside the teardown's
+              -- `do`, GHC parsed the inline `BecknConfigDimensions {...}` as a pattern and rejected the
+              -- record-dot fields in it ("Parse error in pattern: merchantOperatingCity.id.getId").
+              let becknDimensions =
+                    BecknConfigDimensions
+                      { merchantOperatingCityId = merchantOperatingCity.id.getId,
+                        merchantId = merchant.id.getId,
+                        domain = Just (show Spec.FRFS),
+                        vehicleCategory = Just (frfsVehicleCategoryToBecknVehicleCategory booking.vehicleType),
+                        becknProtocol = Nothing
+                      }
+              bapConfig <-
+                getOneConfig
+                  becknDimensions
+                  (Just (maybeToList <$> CQBC.findByMerchantIdDomainVehicleAndMerchantOperatingCityIdWithFallback merchantOperatingCity.id merchant.id (show Spec.FRFS) (frfsVehicleCategoryToBecknVehicleCategory booking.vehicleType)))
+                  >>= fromMaybeM (InternalError "Beckn Config not found")
+              -- Bound with `let` rather than written inline, matching the form used elsewhere in this
+              -- module: as a statement of this `do` the record update parses as a construction applied to
+              -- `booking` ("Not a record constructor: booking").
+              let confirmedBooking = booking {Booking.status = Booking.CONFIRMED}
+              onConfirmFailure bapConfig confirmedBooking
+          )
+      case teardownResult of
+        Right () -> pure ()
+        Left err -> do
+          void $ withTryCatch "onConfirm:teardownFailBooking" (FRFSUtils.markFRFSBookingStatus Booking.FAILED "pass_override_teardown_failed" booking)
+          void $ withTryCatch "onConfirm:teardownReleaseTrip" (FRFSPassOverride.releasePassOverrideTripOnFailure booking {Booking.status = Booking.CONFIRMED})
+          logError $ "FRFSPassOverride: teardown did not complete, refund may need reconciling bookingId=" <> booking.id.getId <> " error=" <> show err
+    else do
+      --
+      let postConfirmWork = do
+            -- Update journey expiry time based on maximum ticket validity using the created tickets
+            whenJust mbJourneyId $ \journeyId -> do
+              QJourneyExtra.updateLongestJourneyExpiryTimeWithTickets journeyId tickets
+            recordStatsResult <-
+              withTryCatch "onConfirm:recordPersonPTStats" $ do
+                purchaseEvent <-
+                  SPUS.mkPurchaseEvent
+                    person
+                    (Just booking.vehicleType)
+                    booking.serviceTierType
+                    DPUS.TICKET
+                    Nothing
+                    (Just fareParameters.totalQuantity)
+                    booking.merchantId
+                    booking.merchantOperatingCityId
+                SPUS.recordPurchase purchaseEvent
+            case recordStatsResult of
+              Right () -> pure ()
+              Left err -> logError $ "Failed to record PersonPTStats for booking " <> booking.id.getId <> ": " <> show err
+            mRiderNumber <- mapM ENC.decrypt person.mobileNumber
+            buildReconTable merchant booking fareParameters dOrder tickets mRiderNumber integratedBPPConfig
+            void $ sendTicketBookedSMS mRiderNumber person.mobileCountryCode fareParameters
+            unless (isJust booking.parentBookingId) $
+              void $ QPS.incrementTicketsBookedInEvent booking.riderId fareParameters.totalQuantity
+            void $ CQP.clearPSCache booking.riderId
+            whenJust booking.partnerOrgId $ \pOrgId -> do
+              walletPOCfg <- do
+                pOrgCfg <- CQPOC.findByIdAndCfgType pOrgId DPOC.WALLET_CLASS_NAME >>= fromMaybeM (PartnerOrgConfigNotFound pOrgId.getId $ show DPOC.WALLET_CLASS_NAME)
+                DPOC.getWalletClassNameConfig pOrgCfg.config
+              let mbClassName = lookup booking.providerId walletPOCfg.className
+              whenJust mbClassName $ \className -> do
+                fork ("adding googleJWTUrl" <> " Booking Id: " <> booking.id.getId) $ do
+                  let serviceName = DEMSC.WalletService GW.GoogleWallet
+                  let mId = booking'.merchantId
+                  let mocId' = booking'.merchantOperatingCityId
+                  serviceAccount <- GWSA.getserviceAccount mId mocId' serviceName
+                  transitObjects' <- createTransitObjects pOrgId booking tickets person serviceAccount className integratedBPPConfig
+                  url <- mkGoogleWalletLink serviceAccount transitObjects'
+                  void $ QTBooking.updateGoogleWalletLinkById (Just url) booking.id
+            -- Last, after everything that can throw: a throw above returns Left to the direct confirm flow,
+            -- which marks the booking FAILED, and a journey must not read as paid with a failed leg.
+            when (FRFSPassOverride.fullyCoveredByPass booking) $
+              whenJust mbJourneyId $ \journeyId ->
+                void $
+                  withTryCatch "onConfirm:markJourneyPaid" $ do
+                    (_, _, allCovered) <- FRFSUtils.journeyFullyPassCovered booking
+                    when allCovered $ do
+                      QJourney.updateIsPaymentSuccessIfNoOrder (Just True) journeyId Nothing
+                      mbJourney <- QJourney.findByPrimaryKey journeyId
+                      whenJust mbJourney $ \journey ->
+                        when (isJust journey.paymentOrderShortId && journey.isPaymentSuccess /= Just True) $
+                          QJourney.updatePaymentOrderShortId journey.paymentOrderShortId (Just True) journeyId
+            return ()
+      if isNothing booking.overrideAppliedEntityId
+        then postConfirmWork
+        else
+          withTryCatch "onConfirm:postConfirmWork" postConfirmWork >>= \case
+            Right () -> pure ()
+            Left err -> do
+              logError $
+                "FRFSPassOverride: on_confirm threw after the ticket was issued, undoing tickets, seats, the debit and the claimed window bookingId="
+                  <> booking.id.getId
+                  <> " error="
+                  <> show err
+              void $ withTryCatch "onConfirm:postConfirmCancelTickets" (QTicket.updateAllStatusByBookingId DFRFSTicketStatus.CANCELLED booking.id)
+              void $ withTryCatch "onConfirm:postConfirmReleaseSeats" (FRFSCancel.releaseSeatsIfHeld booking quoteCategories)
+              void $ withTryCatch "onConfirm:postConfirmUndo" (FRFSPassOverride.releasePassOverrideTripOnFailure booking {Booking.status = Booking.CONFIRMED})
+              throwM err
+  where
+    sendTicketBookedSMS mRiderNumber mRiderMobileCountryCode fareParameters =
+      whenJust booking'.partnerOrgId $ \pOrgId -> do
+        fork "send ticket booked sms" $
+          withLogTag ("SMS:FRFSBookingId:" <> booking'.id.getId) $ do
+            mobileNumber <- mRiderNumber & fromMaybeM (PersonFieldNotPresent "mobileNumber")
+            let mocId = booking'.merchantOperatingCityId
+                countryCode = fromMaybe "+91" mRiderMobileCountryCode
+                phoneNumber = countryCode <> mobileNumber
+            mbBuildSmsReq <-
+              MessageBuilder.buildFRFSTicketBookedMessage mocId pOrgId $
+                MessageBuilder.BuildFRFSTicketBookedMessageReq
+                  { countOfTickets = fareParameters.totalQuantity,
+                    bookingId = booking'.id
+                  }
+            maybe
+              (logError $ "SMS not sent, SMS template not found for partnerOrgId:" <> pOrgId.getId)
+              ( \buildSmsReq -> do
+                  let smsReq = buildSmsReq phoneNumber
+                  logDebug $ "SMS Message:" +|| smsReq.smsBody ||+ ""
+                  Sms.sendSMS booking'.merchantId mocId smsReq >>= Sms.checkSmsResult
+              )
+              mbBuildSmsReq
+
+buildReconTable ::
+  ( CacheFlow m r,
+    EsqDBFlow m r,
+    MonadFlow m,
+    EncFlow m r,
+    SchedulerFlow r,
+    EsqDBReplicaFlow m r,
+    HasLongDurationRetryCfg r c,
+    HasShortDurationRetryCfg r c
+  ) =>
+  Merchant ->
+  Booking.FRFSTicketBooking ->
+  FRFSFareParameters ->
+  DOrder ->
+  [Ticket.FRFSTicket] ->
+  Maybe Text ->
+  DIBC.IntegratedBPPConfig ->
+  m ()
+buildReconTable _merchant booking fareParameters _dOrder tickets mRiderNumber integratedBPPConfig = do
+  bapConfig <- getOneConfig (BecknConfigDimensions {merchantOperatingCityId = booking.merchantOperatingCityId.getId, merchantId = booking.merchantId.getId, domain = Just (show Spec.FRFS), vehicleCategory = Just (frfsVehicleCategoryToBecknVehicleCategory booking.vehicleType), becknProtocol = Nothing}) (Just (maybeToList <$> CQBC.findByMerchantIdDomainVehicleAndMerchantOperatingCityIdWithFallback booking.merchantOperatingCityId booking.merchantId (show Spec.FRFS) (frfsVehicleCategoryToBecknVehicleCategory booking.vehicleType))) >>= fromMaybeM (InternalError "Beckn Config not found")
+  fromStation <- OTPRest.getStationByGtfsIdAndStopCode booking.fromStationCode integratedBPPConfig >>= fromMaybeM (InternalError $ "Station not found for stationCode: " <> booking.fromStationCode <> " and integratedBPPConfigId: " <> integratedBPPConfig.id.getId)
+  toStation <- OTPRest.getStationByGtfsIdAndStopCode booking.toStationCode integratedBPPConfig >>= fromMaybeM (InternalError $ "Station not found for stationCode: " <> booking.toStationCode <> " and integratedBPPConfigId: " <> integratedBPPConfig.id.getId)
+  let isPassCovered = FRFSPassOverride.isFullyPassCovered booking.overriddenAmount
+  -- A pass-covered booking took no payment here, but money did move -- when the pass was bought.
+  -- The txn columns point at that purchase's charge, so they keep holding payment transactions
+  -- rather than a purchasedPassPaymentId; which pass was applied is carried by the override
+  -- columns below instead.
+  mbPassPayment <-
+    if isPassCovered
+      then maybe (pure Nothing) (QPurchasedPassPayment.findByPrimaryKey . Id) booking.overrideAppliedEntityId
+      else pure Nothing
+  mbTxn <-
+    if isPassCovered
+      then maybe (pure Nothing) (\passPayment -> runInReplica $ HQPaymentTransaction.findEarliestChargedTransactionByOrderId passPayment.orderId) mbPassPayment
+      else do
+        transactionRefNumber <- booking.paymentTxnId & fromMaybeM (InternalError "Payment Txn Id not found in booking")
+        Just <$> (runInReplica $ HQPaymentTransaction.findById (Id transactionRefNumber) >>= fromMaybeM (InvalidRequest "Payment Transaction not found for approved TicketBookingId"))
+  mbPaymentBooking <- QFRFSTicketBookingPayment.findTicketBookingPayment booking
+  -- Only a pass-covered booking is allowed to have no payment row; for anything else a missing one
+  -- is still a hard error, as it was before the override work.
+  unless (isJust mbPaymentBooking || isPassCovered) $
+    throwError (InvalidRequest "Payment booking not found for approved TicketBookingId")
+  let transactionRefNumber' = if isPassCovered then (.id.getId) <$> mbTxn else booking.paymentTxnId
+  now <- getCurrentTime
+  bppOrderId <- booking.bppOrderId & fromMaybeM (InternalError "BPP Order Id not found in booking")
+  let finderFee :: Price = mkPrice Nothing $ fromMaybe 0 $ (readMaybe . T.unpack) =<< bapConfig.buyerFinderFee -- FIXME
+      finderFeeForEachTicket = modifyPrice finderFee $ \p -> HighPrecMoney $ (p.getHighPrecMoney) / toRational fareParameters.totalQuantity
+  -- A pass-covered booking has no payment row, and settles at FACE FARE on purpose -- not at
+  -- overriddenAmount. The operator is owed the fare for a real ride whatever funded it; the money
+  -- was already collected by the BUS_PASS recon row at pass purchase, and this trip is settled out
+  -- of that prepaid pool. Using overriddenAmount would settle 0 for a ride that actually happened.
+  -- overrideAppliedEntityId on this row is what joins it back to the purchase that paid for it.
+  tOrderPrice <- maybe (pure booking.totalPrice) (\pb -> FRFSUtils.totalOrderValue pb.status booking) mbPaymentBooking
+  let tOrderValue = modifyPrice tOrderPrice $ \p -> HighPrecMoney $ (p.getHighPrecMoney) / toRational (length tickets)
+  settlementAmount <- tOrderValue `subtractPrice` finderFeeForEachTicket
+  let reconEntry =
+        Recon.FRFSRecon
+          { Recon.id = "",
+            Recon.beneficiaryIFSC = booking.bppBankCode,
+            Recon.beneficiaryBankAccount = booking.bppBankAccountNumber,
+            Recon.buyerFinderFee = finderFee,
+            Recon.collectorIFSC = bapConfig.bapIFSC,
+            Recon.collectorSubscriberId = bapConfig.subscriberId,
+            Recon.date = show now,
+            Recon.destinationStationCode = Just toStation.code,
+            Recon.differenceAmount = Nothing,
+            Recon.fare = fareParameters.totalPrice,
+            Recon.frfsTicketBookingId = booking.id,
+            Recon.message = Nothing,
+            Recon.mobileNumber = mRiderNumber,
+            Recon.networkOrderId = bppOrderId,
+            Recon.receiverSubscriberId = booking.bppSubscriberId,
+            Recon.settlementAmount,
+            Recon.settlementDate = Nothing,
+            Recon.settlementReferenceNumber = Nothing,
+            Recon.sourceStationCode = Just fromStation.code,
+            Recon.transactionUUID = mbTxn >>= (.txnUUID),
+            Recon.ticketNumber = Just "",
+            Recon.ticketQty = Just fareParameters.totalQuantity,
+            Recon.time = show now,
+            Recon.txnId = mbTxn >>= (.txnId),
+            Recon.totalOrderValue = tOrderValue,
+            Recon.transactionRefNumber = transactionRefNumber',
+            Recon.merchantId = Just booking.merchantId,
+            Recon.merchantOperatingCityId = Just booking.merchantOperatingCityId,
+            Recon.createdAt = now,
+            Recon.updatedAt = now,
+            Recon.ticketStatus = Nothing,
+            Recon.providerId = booking.providerId,
+            Recon.providerName = booking.providerName,
+            Recon.entityType = Just Recon.FRFS_TICKET_BOOKING,
+            Recon.reconStatus = Just Recon.PENDING,
+            Recon.paymentGateway = Nothing,
+            -- Carried over from the booking so recon can tell a pass-funded trip from a paid one.
+            -- The money columns stay at face fare either way: the operator is settled the fare
+            -- whatever funded it, and overrideAppliedEntityId joins back to the BUS_PASS row that
+            -- collected it up front.
+            Recon.overrideType = booking.overrideType,
+            Recon.overriddenAmount = booking.overriddenAmount,
+            Recon.overrideAppliedEntityId = booking.overrideAppliedEntityId
+          }
+
+  reconEntries <- mapM (buildRecon reconEntry) tickets
+  void $ QRecon.createMany reconEntries
+
+mkTicket ::
+  ( CacheFlow m r,
+    EsqDBFlow m r,
+    MonadFlow m,
+    EncFlow m r,
+    SchedulerFlow r,
+    EsqDBReplicaFlow m r,
+    HasLongDurationRetryCfg r c,
+    HasShortDurationRetryCfg r c,
+    HasField "cloudType" r (Maybe CloudType)
+  ) =>
+  Booking.FRFSTicketBooking ->
+  DTicket ->
+  Bool ->
+  m Ticket.FRFSTicket
+mkTicket booking dTicket isTicketFree = do
+  now <- getCurrentTime
+  ticketId <- generateGUID
+  -- on_confirm should never make status inprogress, except for a bus SPOT_BOOKING: the passenger
+  -- is already boarding at booking time (no separate conductor scan), so the ticket should start
+  -- checked-in. castTicketStatus's existing BUS branch already turns checkInprogress=True into USED.
+  let isSpotBookedBus = booking.vehicleType == Spec.BUS && fromMaybe False booking.isSpotBooking
+  ticketStatus <- Utils.getTicketStatus booking isSpotBookedBus dTicket
+  processedQrData <- processQRData dTicket.qrData
+  cloudType <- asks (.cloudType)
+  return
+    Ticket.FRFSTicket
+      { Ticket.frfsTicketBookingId = booking.id,
+        Ticket.id = ticketId,
+        Ticket.description = dTicket.description,
+        Ticket.qrData = processedQrData,
+        Ticket.qrRefreshAt = dTicket.qrRefreshAt,
+        Ticket.riderId = booking.riderId,
+        Ticket.status = ticketStatus.status,
+        Ticket.scannedByVehicleNumber = ticketStatus.vehicleNumber,
+        Ticket.ticketNumber = dTicket.ticketNumber,
+        Ticket.validTill = dTicket.validTill,
+        Ticket.merchantId = booking.merchantId,
+        Ticket.merchantOperatingCityId = booking.merchantOperatingCityId,
+        Ticket.partnerOrgId = booking.partnerOrgId,
+        Ticket.partnerOrgTransactionId = booking.partnerOrgTransactionId,
+        Ticket.createdAt = now,
+        Ticket.updatedAt = now,
+        Ticket.isTicketFree = Just isTicketFree,
+        Ticket.commencingHours = dTicket.commencingHours,
+        Ticket.isReturnTicket = dTicket.isReturnTicket,
+        Ticket.cloudType = cloudType
+      }
+
+processQRData ::
+  ( CacheFlow m r,
+    EsqDBFlow m r,
+    MonadFlow m,
+    EncFlow m r,
+    SchedulerFlow r,
+    EsqDBReplicaFlow m r,
+    HasLongDurationRetryCfg r c,
+    HasShortDurationRetryCfg r c
+  ) =>
+  Text ->
+  m Text
+processQRData qrData = do
+  if isBase64Image qrData
+    then do
+      scanResult <- liftIO $ scanQRFromBase64 qrData
+      processedQr <-
+        case scanResult of
+          Right extractedText -> pure extractedText
+          Left err -> do
+            logError $ "Failed to process QR image: " <> err
+            pure qrData -- fallback to original qrData if processing fails
+            -- `<QR_DATA> Codabar:A:8A` CMRL sometimes gives this pattern in the QR data, we need to remove it as it is failign verification
+      let removeCMRLCodabarPattern processedQrData = T.pack $ TR.subRegex (TR.mkRegex "[[:space:]]Codabar:.*$") (T.unpack processedQrData) ""
+          finalQrData = removeCMRLCodabarPattern processedQr
+      when (qrData /= finalQrData) $ do
+        logError $ "Original and processed QR data: " <> finalQrData <> " <- " <> processedQr <> " <- " <> qrData
+      return finalQrData
+    else pure qrData
+
+-- | Check if text likely represents a base64 encoded image
+isBase64Image :: Text -> Bool
+isBase64Image txt =
+  let prefix = T.take 50 txt
+   in (T.isPrefixOf "data:image/" prefix && T.isInfixOf ";base64," prefix)
+        || any -- data URI format
+        -- Check for common image format headers in base64
+          (`T.isPrefixOf` prefix)
+          ["iVBORw0", "/9j/", "R0lGOD", "UklGR", "PD94bW"] -- PNG, JPEG, GIF, WEBP, XML SVG headers
+
+scanQRFromBase64 :: Text -> IO (Either Text Text)
+scanQRFromBase64 txt = do
+  let base64Content = case T.splitOn ";base64," txt of
+        [_, content] -> content
+        _ -> txt -- Not a data URI, use as is
+  case B64.decode (TE.encodeUtf8 base64Content) of
+    Left _ -> pure $ Left "Invalid base64 encoding"
+    Right imgBytes -> do
+      result <- QRScanner.scanQRCode (BL.fromStrict imgBytes)
+      case result of
+        Nothing -> pure $ Left "No QR code found in image"
+        Just text -> pure $ Right text
+
+mkTransitObjects ::
+  ( CacheFlow m r,
+    EsqDBFlow m r,
+    MonadFlow m,
+    EncFlow m r,
+    SchedulerFlow r,
+    EsqDBReplicaFlow m r,
+    HasLongDurationRetryCfg r c,
+    HasShortDurationRetryCfg r c
+  ) =>
+  Id PartnerOrganization ->
+  Booking.FRFSTicketBooking ->
+  Ticket.FRFSTicket ->
+  Person.Person ->
+  TC.ServiceAccount ->
+  Text ->
+  Int ->
+  DIBC.IntegratedBPPConfig ->
+  m TC.TransitObject
+mkTransitObjects pOrgId booking ticket person serviceAccount className sortIndex integratedBPPConfig = do
+  toStation <- OTPRest.getStationByGtfsIdAndStopCode booking.toStationCode integratedBPPConfig >>= fromMaybeM (InternalError $ "Station not found for stationCode: " <> booking.toStationCode <> " and integratedBPPConfigId: " <> integratedBPPConfig.id.getId)
+  fromStation <- OTPRest.getStationByGtfsIdAndStopCode booking.fromStationCode integratedBPPConfig >>= fromMaybeM (InternalError $ "Station not found for stationCode: " <> booking.fromStationCode <> " and integratedBPPConfigId: " <> integratedBPPConfig.id.getId)
+  let tripType' = if booking._type == FQ.ReturnJourney then GWSA.ROUND_TRIP else GWSA.ONE_WAY
+  let fromStaionNameLV = TC.LanguageValue {TC.language = "en-US", TC._value = fromStation.name}
+  let toStaionNameLV = TC.LanguageValue {TC.language = "en-US", TC._value = toStation.name}
+  let fromStationName = TC.Name {TC.defaultValue = fromStaionNameLV}
+  let toStationName = TC.Name {TC.defaultValue = toStaionNameLV}
+  let barcode' =
+        TC.Barcode
+          { TC._type = show GWSA.QR_CODE,
+            TC.value = ticket.qrData
+          }
+  walletQRTypeCfg <- do
+    qrCfg <- CQPOC.findByIdAndCfgType pOrgId DPOC.WALLET_QR_TYPE >>= fromMaybeM (PartnerOrgConfigNotFound pOrgId.getId $ show DPOC.WALLET_QR_TYPE)
+    DPOC.getWalletQRTypeConfig qrCfg.config
+  let mbPeriodMillis = lookup booking.merchantOperatingCityId.getId walletQRTypeCfg.qrType
+  let mbRotatingBarcode = mkRotatingBarcode ticket.qrData mbPeriodMillis
+  frfsConfig <- getConfig (FRFSConfigDimensions {merchantOperatingCityId = fromStation.merchantOperatingCityId.getId}) Nothing >>= fromMaybeM (FRFSConfigNotFound fromStation.merchantOperatingCityId.getId)
+  let passengerName' = fromMaybe "-" person.firstName
+  let istTimeText = GWSA.showTimeIst ticket.validTill
+  let textModuleTicketNumber = TC.TextModule {TC._header = "Ticket number", TC.body = ticket.ticketNumber, TC.id = "myfield1"}
+  let textModuleValidUntil = TC.TextModule {TC._header = "Valid until", TC.body = istTimeText, TC.id = "myfield2"}
+  let textModules = [textModuleTicketNumber, textModuleValidUntil]
+  now <- getCurrentTime
+  let nowText = GWSA.utcTimeToText now
+  let validTillText = GWSA.utcTimeToText ticket.validTill
+  let timeInterval = TC.TimeInterval {TC.start = TC.DateTime {TC.date = nowText}, TC.end = TC.DateTime {TC.date = validTillText}}
+  mbFromStationPartnerOrg <- CQPOS.findByStationCodeAndPOrgId fromStation.code pOrgId |<|>| CQPOS.findByStationCodeAndPOrgId fromStation.id.getId pOrgId
+  let fromStationGMMLocationId = maybe (fromStation.id.getId) (\pOrgStation -> pOrgStation.partnerOrgStationId.getId) mbFromStationPartnerOrg
+  mbToStationPartnerOrg <- CQPOS.findByStationCodeAndPOrgId toStation.code pOrgId |<|>| CQPOS.findByStationCodeAndPOrgId toStation.id.getId pOrgId
+  let toStationGMMLocationId = maybe (toStation.id.getId) (\pOrgStation -> pOrgStation.partnerOrgStationId.getId) mbToStationPartnerOrg
+  let groupingInfo = TC.GroupingInfo {TC.groupingId = "Group." <> booking.id.getId, TC.sortIndex = sortIndex}
+  let customCardTitleValue = GWSA.getCustomCardTitleValueByTripType tripType'
+  let customCardTitle = TC.Name {TC.defaultValue = TC.LanguageValue {TC.language = "en-US", TC._value = customCardTitleValue}}
+  linkModuleData <-
+    if frfsConfig.isCancellationAllowed
+      then do
+        smsPOCfg <- do
+          pOrgCfg <- CQPOC.findByIdAndCfgType pOrgId DPOC.TICKET_SMS >>= fromMaybeM (PartnerOrgConfigNotFound pOrgId.getId $ show DPOC.TICKET_SMS)
+          DPOC.getTicketSMSConfig pOrgCfg.config
+        forM smsPOCfg.publicUrl $
+          \baseUrlTemplate -> do
+            let smsUrl = baseUrlTemplate & T.replace (MessageBuilder.templateText "FRFS_BOOKING_ID") booking.id.getId
+            pure $ TC.LinksModuleData {TC.uris = [TC.URI {TC.uri = Just smsUrl, TC.description = "Cancel Ticket"}]}
+      else pure Nothing
+  return
+    TC.TransitObject
+      { TC.id = serviceAccount.saIssuerId <> "." <> ticket.id.getId,
+        TC.classId = serviceAccount.saIssuerId <> "." <> className,
+        TC.tripId = booking.id.getId,
+        TC.state = show GWSA.ACTIVE,
+        TC.tripType = show tripType',
+        TC.customCardTitle = customCardTitle,
+        TC.passengerType = show GWSA.SINGLE_PASSENGER,
+        TC.passengerNames = passengerName',
+        TC.ticketLeg =
+          TC.TicketLeg
+            { TC.originName = fromStationName,
+              TC.destinationName = toStationName,
+              TC.originStationGmmLocationId = fromStationGMMLocationId,
+              TC.destinationStationGmmLocationId = toStationGMMLocationId
+            },
+        TC.barcode = if isJust mbPeriodMillis then Nothing else Just barcode',
+        TC.textModulesData = textModules,
+        TC.groupingInfo = groupingInfo,
+        TC.validTimeInterval = timeInterval,
+        TC.linksModuleData = linkModuleData,
+        TC.rotatingBarcode = mbRotatingBarcode
+      }
+  where
+    mkRotatingBarcode :: Text -> Maybe Text -> Maybe TC.RotatingBarcode
+    mkRotatingBarcode qrData mbPeriodMillis = do
+      let dynamicData = "#{{totp_timestamp_seconds_hex}||0.0|0.0|}"
+      let dynamicQrData = qrData <> dynamicData
+      periodMillis <- mbPeriodMillis
+      let totpDetails = TC.TOTPDetails {TC.algorithm = "TOTP_SHA1", TC.periodMillis = periodMillis}
+      let rotatingBarcode = TC.RotatingBarcode {TC._type = show GWSA.QR_CODE, TC.renderEncoding = "UTF_8", TC.valuePattern = dynamicQrData, TC.totpDetails = totpDetails, TC.alternateText = "Dynamic QR, don't screenshot"}
+      return rotatingBarcode
+
+createTickets ::
+  ( CacheFlow m r,
+    EsqDBFlow m r,
+    MonadFlow m,
+    EncFlow m r,
+    SchedulerFlow r,
+    EsqDBReplicaFlow m r,
+    HasLongDurationRetryCfg r c,
+    HasShortDurationRetryCfg r c,
+    HasField "cloudType" r (Maybe CloudType)
+  ) =>
+  Booking.FRFSTicketBooking ->
+  [DTicket] ->
+  Int ->
+  m [Ticket.FRFSTicket]
+createTickets booking dTickets discountedTickets = go dTickets discountedTickets []
+  where
+    go [] _ acc = return (Prelude.reverse acc)
+    go (d : ds) freeTicketsLeft acc = do
+      let isTicketFree = freeTicketsLeft > 0
+      ticket <- mkTicket booking d isTicketFree
+      let newFreeTickets = if isTicketFree then freeTicketsLeft - 1 else freeTicketsLeft
+      go ds newFreeTickets (ticket : acc)
+
+createTransitObjects ::
+  ( CacheFlow m r,
+    EsqDBFlow m r,
+    MonadFlow m,
+    EncFlow m r,
+    SchedulerFlow r,
+    EsqDBReplicaFlow m r,
+    HasLongDurationRetryCfg r c,
+    HasShortDurationRetryCfg r c
+  ) =>
+  Id PartnerOrganization ->
+  Booking.FRFSTicketBooking ->
+  [Ticket.FRFSTicket] ->
+  Person.Person ->
+  TC.ServiceAccount ->
+  Text ->
+  DIBC.IntegratedBPPConfig ->
+  m [TC.TransitObject]
+createTransitObjects pOrgId booking tickets person serviceAccount className integratedBPPConfig = go tickets 1 []
+  where
+    go [] _ acc = return (Prelude.reverse acc)
+    go (x : xs) sortIndex acc = do
+      transitObject <- mkTransitObjects pOrgId booking x person serviceAccount className sortIndex integratedBPPConfig
+      go xs (sortIndex + 1) (transitObject : acc)
+
+buildRecon ::
+  ( CacheFlow m r,
+    EsqDBFlow m r,
+    MonadFlow m,
+    EncFlow m r,
+    SchedulerFlow r,
+    EsqDBReplicaFlow m r,
+    HasLongDurationRetryCfg r c,
+    HasShortDurationRetryCfg r c
+  ) =>
+  Recon.FRFSRecon ->
+  Ticket.FRFSTicket ->
+  m Recon.FRFSRecon
+buildRecon recon ticket = do
+  now <- getCurrentTime
+  reconId <- generateGUID
+  return
+    recon
+      { Recon.id = reconId,
+        Recon.ticketNumber = Just ticket.ticketNumber,
+        Recon.ticketStatus = Just ticket.status,
+        Recon.createdAt = now,
+        Recon.updatedAt = now
+      }
+
+mkGoogleWalletLink :: (MonadFlow m, HasFlowEnv m r '["googleSAPrivateKey" ::: String]) => TC.ServiceAccount -> [TC.TransitObject] -> m T.Text
+mkGoogleWalletLink serviceAccount tObject = do
+  let payload' =
+        TC.Payload
+          { TC.transitObjects = tObject
+          }
+  privateKey <- asks (.googleSAPrivateKey)
+  let payloadValue = toJSON payload'
+  let origins = ["www.example.com"] :: [String]
+  let originsValue = toJSON origins
+  let additionalClaims = TC.createAdditionalClaims [("payload", payloadValue), ("origins", originsValue), ("typ", String "savetowallet")]
+  let jwtHeader =
+        JOSEHeader
+          { typ = Just "JWT",
+            cty = Nothing,
+            alg = Just RS256,
+            kid = Nothing
+          }
+  let iss = stringOrURI . TC.saClientEmail $ serviceAccount
+  let aud = Left <$> stringOrURI "google"
+  iat <- numericDate <$> liftIO getPOSIXTime
+  let claims =
+        mempty
+          { iat = iat,
+            iss = iss,
+            aud = aud,
+            unregisteredClaims = additionalClaims
+          }
+  token' <- liftIO $ TC.createJWT' jwtHeader claims privateKey
+  token <- fromEitherM (\err -> InternalError $ "Failed to get jwt token" <> show err) token'
+  let textToken = snd token
+  let url = "https://pay.google.com/gp/v/save/" <> textToken
+  return url

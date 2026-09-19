@@ -1,0 +1,1192 @@
+import { BUILT_IN_IDENTITY_PROVIDER_IDS } from "@archestra/shared";
+import { getCookies } from "better-auth/cookies";
+import { makeSignature } from "better-auth/crypto";
+import { vi } from "vitest";
+import { auth } from "@/auth/better-auth";
+import config from "@/config";
+import IdentityProviderModel from "@/models/identity-provider.ee";
+import type { FastifyInstanceWithZod } from "@/server";
+import { createFastifyInstance } from "@/server";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import type { User } from "@/types";
+import { getIdpLogoutUrl } from "./identity-provider.ee";
+
+function createMockIdToken(claims: Record<string, unknown>): string {
+  const header = Buffer.from(
+    JSON.stringify({ alg: "HS256", typ: "JWT" }),
+  ).toString("base64url");
+  const payload = Buffer.from(JSON.stringify(claims)).toString("base64url");
+  const signature = "test-signature";
+  return `${header}.${payload}.${signature}`;
+}
+
+describe("getIdpLogoutUrl", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  test("returns null for non-SSO user (credential-only account)", async ({
+    makeUser,
+  }) => {
+    const user = await makeUser();
+    // The makeUser fixture creates a "credential" provider account by default
+
+    const url = await getIdpLogoutUrl(user.id);
+    expect(url).toBeNull();
+  });
+
+  test("returns null for SAML provider (no oidcConfig)", async ({
+    makeUser,
+    makeAccount,
+    makeOrganization,
+    makeIdentityProvider,
+  }) => {
+    const user = await makeUser();
+    const org = await makeOrganization();
+
+    // Create an SSO provider with SAML config (no OIDC)
+    await makeIdentityProvider(org.id, {
+      providerId: "saml-provider",
+      samlConfig: {
+        entityId: "https://saml.example.com",
+        signOnUrl: "https://saml.example.com/sso",
+        certificate: "test-cert",
+      },
+    });
+
+    // Create an SSO account linked to the SAML provider
+    await makeAccount(user.id, {
+      providerId: "saml-provider",
+    });
+
+    const url = await getIdpLogoutUrl(user.id);
+    expect(url).toBeNull();
+  });
+
+  test("returns constructed URL for OIDC provider with valid discovery doc", async ({
+    makeUser,
+    makeAccount,
+    makeOrganization,
+    makeIdentityProvider,
+  }) => {
+    const user = await makeUser();
+    const org = await makeOrganization();
+
+    await makeIdentityProvider(org.id, {
+      providerId: "oidc-provider",
+      oidcConfig: {
+        clientId: "test-client",
+        clientSecret: "test-secret",
+        issuer: "https://idp.example.com",
+        pkce: false,
+        enableRpInitiatedLogout: true,
+        discoveryEndpoint:
+          "https://idp.example.com/.well-known/openid-configuration",
+      },
+    });
+
+    const testIdToken = "eyJhbGciOiJSUzI1NiJ9.test-id-token";
+    await makeAccount(user.id, {
+      providerId: "oidc-provider",
+      idToken: testIdToken,
+    });
+
+    // Mock fetch to return a discovery doc with end_session_endpoint
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        issuer: "https://idp.example.com",
+        end_session_endpoint:
+          "https://idp.example.com/protocol/openid-connect/logout",
+      }),
+    });
+
+    const url = await getIdpLogoutUrl(user.id);
+
+    expect(url).not.toBeNull();
+    const parsed = new URL(url as string);
+    expect(parsed.origin + parsed.pathname).toBe(
+      "https://idp.example.com/protocol/openid-connect/logout",
+    );
+    expect(parsed.searchParams.get("id_token_hint")).toBe(testIdToken);
+    expect(parsed.searchParams.get("client_id")).toBe("test-client");
+    expect(parsed.searchParams.get("post_logout_redirect_uri")).toContain(
+      "/auth/sign-in",
+    );
+  });
+
+  test("omits post_logout_redirect_uri when provider disables RP-Initiated Logout", async ({
+    makeUser,
+    makeAccount,
+    makeOrganization,
+    makeIdentityProvider,
+  }) => {
+    const user = await makeUser();
+    const org = await makeOrganization();
+
+    await makeIdentityProvider(org.id, {
+      providerId: "oidc-provider-no-redirect",
+      oidcConfig: {
+        clientId: "test-client",
+        clientSecret: "test-secret",
+        issuer: "https://idp.example.com",
+        pkce: false,
+        enableRpInitiatedLogout: false,
+        discoveryEndpoint:
+          "https://idp.example.com/.well-known/openid-configuration",
+      },
+    });
+
+    const testIdToken = "eyJhbGciOiJSUzI1NiJ9.test-id-token";
+    await makeAccount(user.id, {
+      providerId: "oidc-provider-no-redirect",
+      idToken: testIdToken,
+    });
+
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        issuer: "https://idp.example.com",
+        end_session_endpoint:
+          "https://idp.example.com/protocol/openid-connect/logout",
+      }),
+    });
+
+    const url = await getIdpLogoutUrl(user.id);
+
+    expect(url).not.toBeNull();
+    const parsed = new URL(url as string);
+    expect(parsed.searchParams.get("id_token_hint")).toBe(testIdToken);
+    expect(parsed.searchParams.get("client_id")).toBe("test-client");
+    expect(parsed.searchParams.has("post_logout_redirect_uri")).toBe(false);
+  });
+
+  test("includes post_logout_redirect_uri by default when the provider does not set the toggle", async ({
+    makeUser,
+    makeAccount,
+    makeOrganization,
+    makeIdentityProvider,
+  }) => {
+    const user = await makeUser();
+    const org = await makeOrganization();
+
+    await makeIdentityProvider(org.id, {
+      providerId: "oidc-provider-default-no-redirect",
+      oidcConfig: {
+        clientId: "test-client",
+        clientSecret: "test-secret",
+        issuer: "https://idp.example.com",
+        pkce: false,
+        discoveryEndpoint:
+          "https://idp.example.com/.well-known/openid-configuration",
+      },
+    });
+
+    await makeAccount(user.id, {
+      providerId: "oidc-provider-default-no-redirect",
+      idToken: "eyJhbGciOiJSUzI1NiJ9.test-id-token",
+    });
+
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        issuer: "https://idp.example.com",
+        end_session_endpoint:
+          "https://idp.example.com/protocol/openid-connect/logout",
+      }),
+    });
+
+    const url = await getIdpLogoutUrl(user.id);
+
+    expect(url).not.toBeNull();
+    const parsed = new URL(url as string);
+    expect(parsed.searchParams.get("post_logout_redirect_uri")).toContain(
+      "/auth/sign-in",
+    );
+  });
+
+  test("returns null when discovery fetch fails (graceful degradation)", async ({
+    makeUser,
+    makeAccount,
+    makeOrganization,
+    makeIdentityProvider,
+  }) => {
+    const user = await makeUser();
+    const org = await makeOrganization();
+
+    await makeIdentityProvider(org.id, {
+      providerId: "oidc-failing",
+      oidcConfig: {
+        clientId: "test-client",
+        clientSecret: "test-secret",
+        issuer: "https://idp.example.com",
+        pkce: false,
+        discoveryEndpoint:
+          "https://idp.example.com/.well-known/openid-configuration",
+      },
+    });
+
+    await makeAccount(user.id, {
+      providerId: "oidc-failing",
+    });
+
+    // Mock fetch to throw a network error
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error("Network error"));
+
+    const url = await getIdpLogoutUrl(user.id);
+    expect(url).toBeNull();
+  });
+
+  test("returns null when discovery fetch returns non-2xx status", async ({
+    makeUser,
+    makeAccount,
+    makeOrganization,
+    makeIdentityProvider,
+  }) => {
+    const user = await makeUser();
+    const org = await makeOrganization();
+
+    await makeIdentityProvider(org.id, {
+      providerId: "oidc-500",
+      oidcConfig: {
+        clientId: "test-client",
+        clientSecret: "test-secret",
+        issuer: "https://idp.example.com",
+        pkce: false,
+        discoveryEndpoint:
+          "https://idp.example.com/.well-known/openid-configuration",
+      },
+    });
+
+    await makeAccount(user.id, {
+      providerId: "oidc-500",
+    });
+
+    // Mock fetch to return a 500 server error
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+    });
+
+    const url = await getIdpLogoutUrl(user.id);
+    expect(url).toBeNull();
+  });
+
+  test("returns null when discovery doc has no end_session_endpoint", async ({
+    makeUser,
+    makeAccount,
+    makeOrganization,
+    makeIdentityProvider,
+  }) => {
+    const user = await makeUser();
+    const org = await makeOrganization();
+
+    await makeIdentityProvider(org.id, {
+      providerId: "oidc-no-logout",
+      oidcConfig: {
+        clientId: "test-client",
+        clientSecret: "test-secret",
+        issuer: "https://idp.example.com",
+        pkce: false,
+        discoveryEndpoint:
+          "https://idp.example.com/.well-known/openid-configuration",
+      },
+    });
+
+    await makeAccount(user.id, {
+      providerId: "oidc-no-logout",
+    });
+
+    // Mock fetch to return a discovery doc WITHOUT end_session_endpoint
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        issuer: "https://idp.example.com",
+        authorization_endpoint: "https://idp.example.com/authorize",
+        token_endpoint: "https://idp.example.com/token",
+        // no end_session_endpoint
+      }),
+    });
+
+    const url = await getIdpLogoutUrl(user.id);
+    expect(url).toBeNull();
+  });
+});
+
+describe("identity provider routes", () => {
+  let app: FastifyInstanceWithZod;
+  let user: User;
+  let organizationId: string;
+
+  beforeEach(async ({ makeOrganization, makeUser }) => {
+    user = await makeUser();
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (request as typeof request & { user: unknown }).user = user;
+      (
+        request as typeof request & {
+          organizationId: string;
+        }
+      ).organizationId = organizationId;
+    });
+
+    const { default: identityProviderRoutes } = await import(
+      "./identity-provider.ee"
+    );
+    await app.register(identityProviderRoutes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  describe("GET /api/identity-providers", () => {
+    test("returns empty array when no providers exist", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/identity-providers",
+      });
+
+      expect(response.statusCode).toBe(200);
+      const data = response.json();
+      expect(Array.isArray(data)).toBe(true);
+      expect(data).toHaveLength(0);
+    });
+
+    test("returns array of providers", async ({ makeIdentityProvider }) => {
+      await makeIdentityProvider(organizationId, {
+        providerId: "route-test-provider",
+        oidcConfig: {
+          clientId: "test-client",
+          clientSecret: "test-secret",
+          issuer: "https://idp.example.com",
+          pkce: false,
+          discoveryEndpoint:
+            "https://idp.example.com/.well-known/openid-configuration",
+        },
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/identity-providers",
+      });
+
+      expect(response.statusCode).toBe(200);
+      const data = response.json();
+      expect(Array.isArray(data)).toBe(true);
+      expect(data.length).toBeGreaterThanOrEqual(1);
+      expect(data[0]).toHaveProperty("providerId", "route-test-provider");
+    });
+  });
+
+  describe("POST /api/identity-providers", () => {
+    test("creates every built-in provider through Better Auth", async ({
+      makeMember,
+      makeSession,
+    }) => {
+      await makeMember(user.id, organizationId, { role: "admin" });
+      const session = await makeSession(user.id, {
+        activeOrganizationId: organizationId,
+      });
+      const cookie = await createSessionCookie(session.token);
+
+      for (const providerId of BUILT_IN_IDENTITY_PROVIDER_IDS) {
+        const domain = `${providerId.toLowerCase()}.example.com`;
+        const response = await app.inject({
+          method: "POST",
+          url: "/api/identity-providers",
+          headers: { cookie },
+          payload: {
+            providerId,
+            issuer: "https://idp.example.com",
+            domain,
+            oidcConfig: {
+              issuer: "https://idp.example.com",
+              skipDiscovery: true,
+              pkce: true,
+              clientId: "test-client-id",
+              clientSecret: "test-client-secret",
+              discoveryEndpoint:
+                "https://idp.example.com/.well-known/openid-configuration",
+              authorizationEndpoint: "https://idp.example.com/authorize",
+              tokenEndpoint: "https://idp.example.com/token",
+              userInfoEndpoint: "https://idp.example.com/userinfo",
+              jwksEndpoint: "https://idp.example.com/jwks",
+              scopes: ["openid", "email", "profile"],
+              mapping: {
+                id: "sub",
+                email: "email",
+                name: "name",
+              },
+            },
+          },
+        });
+
+        expect(response.statusCode, `failed to create ${providerId}`).toBe(200);
+        expect(response.json()).toMatchObject({
+          providerId,
+          domain,
+          organizationId,
+          userId: user.id,
+        });
+      }
+    });
+  });
+
+  describe("GET /api/identity-providers/team-sync-options", () => {
+    test("returns id, name, and groups expression only — no configuration or secrets", async ({
+      makeIdentityProvider,
+    }) => {
+      await makeIdentityProvider(organizationId, {
+        providerId: "sync-options-provider",
+        oidcConfig: {
+          clientId: "test-client",
+          clientSecret: "test-secret",
+          issuer: "https://idp.example.com",
+          pkce: false,
+          discoveryEndpoint:
+            "https://idp.example.com/.well-known/openid-configuration",
+        },
+        teamSyncConfig: {
+          groupsExpression: "{{#each groups}}{{this}},{{/each}}",
+        },
+      });
+      await makeIdentityProvider(organizationId, {
+        providerId: "sync-options-no-template",
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/identity-providers/team-sync-options",
+      });
+
+      expect(response.statusCode).toBe(200);
+      const data =
+        response.json<
+          Array<{
+            id: string;
+            providerId: string;
+            groupsExpression: string | null;
+          }>
+        >();
+      expect(data).toHaveLength(2);
+      const withTemplate = data.find(
+        (p) => p.providerId === "sync-options-provider",
+      );
+      expect(withTemplate?.groupsExpression).toBe(
+        "{{#each groups}}{{this}},{{/each}}",
+      );
+      const withoutTemplate = data.find(
+        (p) => p.providerId === "sync-options-no-template",
+      );
+      expect(withoutTemplate?.groupsExpression).toBeNull();
+      // The projection must never leak provider configuration.
+      for (const provider of data) {
+        expect(Object.keys(provider).sort()).toEqual([
+          "groupsExpression",
+          "id",
+          "providerId",
+        ]);
+      }
+    });
+
+    test("excludes other organizations' providers", async ({
+      makeIdentityProvider,
+      makeOrganization,
+    }) => {
+      const otherOrg = await makeOrganization();
+      await makeIdentityProvider(otherOrg.id, {
+        providerId: "foreign-provider",
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/identity-providers/team-sync-options",
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual([]);
+    });
+  });
+
+  describe("GET /api/identity-providers/public", () => {
+    test("returns only id and providerId fields", async ({
+      makeIdentityProvider,
+    }) => {
+      await makeIdentityProvider(organizationId, {
+        providerId: "public-test-provider",
+        oidcConfig: {
+          clientId: "test-client",
+          clientSecret: "test-secret",
+          issuer: "https://idp.example.com",
+          pkce: false,
+          discoveryEndpoint:
+            "https://idp.example.com/.well-known/openid-configuration",
+        },
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/identity-providers/public",
+      });
+
+      expect(response.statusCode).toBe(200);
+      const data = response.json();
+      expect(Array.isArray(data)).toBe(true);
+      expect(data.length).toBeGreaterThanOrEqual(1);
+
+      const provider = data.find(
+        (p: { providerId: string }) => p.providerId === "public-test-provider",
+      );
+      expect(provider).toBeDefined();
+      expect(provider).toHaveProperty("id");
+      expect(provider).toHaveProperty("providerId");
+      expect(provider).not.toHaveProperty("oidcConfig");
+      expect(provider).not.toHaveProperty("samlConfig");
+    });
+
+    test("hides providers disabled for SSO login", async ({
+      makeIdentityProvider,
+    }) => {
+      await makeIdentityProvider(organizationId, {
+        providerId: "primary-login-provider",
+        ssoLoginEnabled: true,
+      });
+      await makeIdentityProvider(organizationId, {
+        providerId: "brokered-token-provider",
+        ssoLoginEnabled: false,
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/identity-providers/public",
+      });
+
+      expect(response.statusCode).toBe(200);
+      const data = response.json() as Array<{ providerId: string }>;
+      expect(data.map((provider) => provider.providerId)).toContain(
+        "primary-login-provider",
+      );
+      expect(data.map((provider) => provider.providerId)).not.toContain(
+        "brokered-token-provider",
+      );
+    });
+
+    test("returns empty array when no providers exist", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/identity-providers/public",
+      });
+
+      expect(response.statusCode).toBe(200);
+      const data = response.json();
+      expect(Array.isArray(data)).toBe(true);
+      expect(data).toHaveLength(0);
+    });
+  });
+
+  describe("GET /api/identity-providers/:id", () => {
+    test("returns 404 for non-existent provider", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/identity-providers/non-existent-id",
+      });
+
+      expect(response.statusCode).toBe(404);
+    });
+
+    test("returns provider by id", async ({ makeIdentityProvider }) => {
+      const idp = await makeIdentityProvider(organizationId, {
+        providerId: "get-by-id-provider",
+        oidcConfig: {
+          clientId: "test-client",
+          clientSecret: "test-secret",
+          issuer: "https://idp.example.com",
+          pkce: false,
+          discoveryEndpoint:
+            "https://idp.example.com/.well-known/openid-configuration",
+        },
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/identity-providers/${idp.id}`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      const data = response.json();
+      expect(data).toHaveProperty("id", idp.id);
+      expect(data).toHaveProperty("providerId", "get-by-id-provider");
+    });
+  });
+
+  describe("credential redaction", () => {
+    const OIDC_WITH_SECRETS = {
+      clientId: "test-client",
+      clientSecret: "oidc-client-secret",
+      issuer: "https://idp.example.com",
+      pkce: false,
+      discoveryEndpoint:
+        "https://idp.example.com/.well-known/openid-configuration",
+      enterpriseManagedCredentials: {
+        clientId: "exchange-client",
+        clientSecret: "exchange-client-secret",
+        privateKeyPem: "-----BEGIN PRIVATE KEY-----exchange-pem-----",
+      },
+    };
+
+    test("GET /:id omits stored credentials and reports which are set", async ({
+      makeIdentityProvider,
+    }) => {
+      const idp = await makeIdentityProvider(organizationId, {
+        providerId: "redaction-provider",
+        oidcConfig: OIDC_WITH_SECRETS,
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/identity-providers/${idp.id}`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      // Nowhere in the payload, not just absent from the field we expected.
+      expect(response.body).not.toContain("oidc-client-secret");
+      expect(response.body).not.toContain("exchange-client-secret");
+      expect(response.body).not.toContain("exchange-pem");
+
+      const data = response.json();
+      expect(data.oidcConfig).not.toHaveProperty("clientSecret");
+      expect(data.configuredSecretPaths).toEqual([
+        "oidcConfig.clientSecret",
+        "oidcConfig.enterpriseManagedCredentials.clientSecret",
+        "oidcConfig.enterpriseManagedCredentials.privateKeyPem",
+      ]);
+      // Non-secret config still round-trips, so the form stays editable.
+      expect(data.oidcConfig.clientId).toBe("test-client");
+      expect(data.oidcConfig.enterpriseManagedCredentials.clientId).toBe(
+        "exchange-client",
+      );
+    });
+
+    test("GET / omits stored credentials from the list", async ({
+      makeIdentityProvider,
+    }) => {
+      await makeIdentityProvider(organizationId, {
+        providerId: "redaction-list-provider",
+        oidcConfig: OIDC_WITH_SECRETS,
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/identity-providers",
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).not.toContain("oidc-client-secret");
+      expect(response.body).not.toContain("exchange-client-secret");
+      expect(response.body).not.toContain("exchange-pem");
+    });
+
+    test("GET /:id redacts SAML private keys but keeps the public cert", async ({
+      makeIdentityProvider,
+    }) => {
+      const idp = await makeIdentityProvider(organizationId, {
+        providerId: "redaction-saml-provider",
+        samlConfig: {
+          issuer: "https://saml.example.com",
+          entryPoint: "https://saml.example.com/sso",
+          cert: "public-idp-signing-cert",
+          callbackUrl: "https://app.example.com/callback",
+          privateKey: "saml-top-level-private-key",
+          decryptionPvk: "saml-decryption-key",
+          spMetadata: {
+            entityID: "https://app.example.com",
+            privateKey: "sp-private-key",
+            privateKeyPass: "sp-private-key-pass",
+          },
+        },
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/identity-providers/${idp.id}`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).not.toContain("saml-top-level-private-key");
+      expect(response.body).not.toContain("saml-decryption-key");
+      expect(response.body).not.toContain("sp-private-key");
+      expect(response.body).not.toContain("sp-private-key-pass");
+
+      const data = response.json();
+      // The IdP signing certificate is public and admins need to read it back.
+      expect(data.samlConfig.cert).toBe("public-idp-signing-cert");
+      expect(data.samlConfig.spMetadata.entityID).toBe(
+        "https://app.example.com",
+      );
+      expect(data.configuredSecretPaths).toEqual([
+        "samlConfig.privateKey",
+        "samlConfig.decryptionPvk",
+        "samlConfig.spMetadata.privateKey",
+        "samlConfig.spMetadata.privateKeyPass",
+      ]);
+    });
+
+    test("PUT re-submitting the redacted config keeps the stored credentials", async ({
+      makeIdentityProvider,
+    }) => {
+      const idp = await makeIdentityProvider(organizationId, {
+        providerId: "redaction-put-provider",
+        oidcConfig: OIDC_WITH_SECRETS,
+      });
+
+      // Exactly what the edit dialog does: load the provider, change one
+      // unrelated field, submit the whole (secret-free) config back.
+      const loaded = (
+        await app.inject({
+          method: "GET",
+          url: `/api/identity-providers/${idp.id}`,
+        })
+      ).json();
+
+      const response = await app.inject({
+        method: "PUT",
+        url: `/api/identity-providers/${idp.id}`,
+        payload: {
+          providerId: loaded.providerId,
+          issuer: loaded.issuer,
+          domain: "renamed.example.com",
+          oidcConfig: loaded.oidcConfig,
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().domain).toBe("renamed.example.com");
+
+      const stored = await IdentityProviderModel.findById(
+        idp.id,
+        organizationId,
+      );
+      expect(stored?.oidcConfig?.clientSecret).toBe("oidc-client-secret");
+      expect(
+        stored?.oidcConfig?.enterpriseManagedCredentials?.clientSecret,
+      ).toBe("exchange-client-secret");
+      expect(
+        stored?.oidcConfig?.enterpriseManagedCredentials?.privateKeyPem,
+      ).toBe("-----BEGIN PRIVATE KEY-----exchange-pem-----");
+    });
+
+    test("PUT with a new client secret rotates it", async ({
+      makeIdentityProvider,
+    }) => {
+      const idp = await makeIdentityProvider(organizationId, {
+        providerId: "rotation-provider",
+        oidcConfig: OIDC_WITH_SECRETS,
+      });
+
+      const response = await app.inject({
+        method: "PUT",
+        url: `/api/identity-providers/${idp.id}`,
+        payload: {
+          oidcConfig: {
+            ...OIDC_WITH_SECRETS,
+            clientSecret: "rotated-client-secret",
+            enterpriseManagedCredentials: {},
+          },
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      // The rotated value must not come straight back out either.
+      expect(response.body).not.toContain("rotated-client-secret");
+
+      const stored = await IdentityProviderModel.findById(
+        idp.id,
+        organizationId,
+      );
+      expect(stored?.oidcConfig?.clientSecret).toBe("rotated-client-secret");
+      // A blank nested secret under a surviving parent is still preserved.
+      expect(
+        stored?.oidcConfig?.enterpriseManagedCredentials?.clientSecret,
+      ).toBe("exchange-client-secret");
+    });
+
+    test("PUT dropping a credential block clears the secrets it held", async ({
+      makeIdentityProvider,
+    }) => {
+      const idp = await makeIdentityProvider(organizationId, {
+        providerId: "clearing-provider",
+        oidcConfig: OIDC_WITH_SECRETS,
+      });
+
+      const { enterpriseManagedCredentials: _dropped, ...withoutExchange } =
+        OIDC_WITH_SECRETS;
+
+      const response = await app.inject({
+        method: "PUT",
+        url: `/api/identity-providers/${idp.id}`,
+        payload: { oidcConfig: { ...withoutExchange, clientSecret: "" } },
+      });
+
+      expect(response.statusCode).toBe(200);
+
+      const stored = await IdentityProviderModel.findById(
+        idp.id,
+        organizationId,
+      );
+      // Removing the whole block is how an admin clears those credentials...
+      expect(stored?.oidcConfig?.enterpriseManagedCredentials).toBeUndefined();
+      // ...while a blank top-level secret still means "keep".
+      expect(stored?.oidcConfig?.clientSecret).toBe("oidc-client-secret");
+    });
+  });
+
+  describe("GET /api/identity-providers/:id/link-status", () => {
+    test("returns whether the current user has a usable provider token", async ({
+      makeAccount,
+      makeIdentityProvider,
+    }) => {
+      const idp = await makeIdentityProvider(organizationId, {
+        providerId: "linked-provider",
+        oidcConfig: {
+          clientId: "test-client",
+          clientSecret: "test-secret",
+          issuer: "https://idp.example.com",
+          pkce: false,
+          discoveryEndpoint:
+            "https://idp.example.com/.well-known/openid-configuration",
+        },
+      });
+
+      let response = await app.inject({
+        method: "GET",
+        url: `/api/identity-providers/${idp.id}/link-status`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        providerId: "linked-provider",
+        connected: false,
+      });
+
+      await makeAccount(user.id, {
+        providerId: "linked-provider",
+        idToken: createMockIdToken({
+          sub: "user-subject",
+          email: "admin@example.com",
+          exp: Math.floor(Date.now() / 1000) + 3600,
+        }),
+      });
+
+      response = await app.inject({
+        method: "GET",
+        url: `/api/identity-providers/${idp.id}/link-status`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        providerId: "linked-provider",
+        connected: true,
+      });
+    });
+
+    test("reports an Entra OBO link with a Graph-audience access token as not connected", async ({
+      makeAccount,
+      makeIdentityProvider,
+    }) => {
+      const idp = await makeIdentityProvider(organizationId, {
+        providerId: "entra-graph-audience",
+        oidcConfig: {
+          clientId: "archestra-app-client-id",
+          clientSecret: "test-secret",
+          issuer: "https://login.example.com/tenant/v2.0",
+          pkce: false,
+          enterpriseManagedCredentials: {
+            exchangeStrategy: "entra_obo",
+            subjectTokenType: "urn:ietf:params:oauth:token-type:access_token",
+            tokenEndpoint: "https://login.example.com/tenant/oauth2/v2.0/token",
+            tokenEndpointAuthentication: "client_secret_post",
+          },
+        },
+      });
+
+      // Graph-audience tokens cannot be used as OBO assertions (AADSTS50013),
+      // so the link must be reported unusable to force a reconnect.
+      await makeAccount(user.id, {
+        providerId: "entra-graph-audience",
+        accessToken: createMockIdToken({
+          aud: "00000003-0000-0000-c000-000000000000",
+          scp: "User.Read profile openid email",
+          exp: Math.floor(Date.now() / 1000) + 3600,
+        }),
+        accessTokenExpiresAt: new Date(Date.now() + 3600_000),
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/identity-providers/${idp.id}/link-status`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        providerId: "entra-graph-audience",
+        connected: false,
+      });
+    });
+
+    test("reports an Entra OBO link with an app-audience access token as connected", async ({
+      makeAccount,
+      makeIdentityProvider,
+    }) => {
+      const idp = await makeIdentityProvider(organizationId, {
+        providerId: "entra-app-audience",
+        oidcConfig: {
+          clientId: "archestra-app-client-id",
+          clientSecret: "test-secret",
+          issuer: "https://login.example.com/tenant/v2.0",
+          pkce: false,
+          enterpriseManagedCredentials: {
+            exchangeStrategy: "entra_obo",
+            subjectTokenType: "urn:ietf:params:oauth:token-type:access_token",
+            tokenEndpoint: "https://login.example.com/tenant/oauth2/v2.0/token",
+            tokenEndpointAuthentication: "client_secret_post",
+          },
+        },
+      });
+
+      await makeAccount(user.id, {
+        providerId: "entra-app-audience",
+        accessToken: createMockIdToken({
+          aud: "api://archestra-app-client-id",
+          scp: "access_as_user",
+          exp: Math.floor(Date.now() / 1000) + 3600,
+        }),
+        accessTokenExpiresAt: new Date(Date.now() + 3600_000),
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/identity-providers/${idp.id}/link-status`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        providerId: "entra-app-audience",
+        connected: true,
+      });
+    });
+
+    test("does not apply the Graph-audience check to non-Entra exchange strategies", async ({
+      makeAccount,
+      makeIdentityProvider,
+    }) => {
+      const idp = await makeIdentityProvider(organizationId, {
+        providerId: "rfc8693-graph-audience",
+        oidcConfig: {
+          clientId: "test-client",
+          clientSecret: "test-secret",
+          issuer: "https://idp.example.com",
+          pkce: false,
+          enterpriseManagedCredentials: {
+            exchangeStrategy: "rfc8693",
+            subjectTokenType: "urn:ietf:params:oauth:token-type:access_token",
+          },
+        },
+      });
+
+      await makeAccount(user.id, {
+        providerId: "rfc8693-graph-audience",
+        accessToken: createMockIdToken({
+          aud: "https://graph.microsoft.com",
+          exp: Math.floor(Date.now() / 1000) + 3600,
+        }),
+        accessTokenExpiresAt: new Date(Date.now() + 3600_000),
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/identity-providers/${idp.id}/link-status`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({
+        providerId: "rfc8693-graph-audience",
+        connected: true,
+      });
+    });
+  });
+
+  describe("GET /api/identity-providers/:id/latest-id-token-claims", () => {
+    test("returns decoded claims for the current user's latest account", async ({
+      makeAccount,
+      makeIdentityProvider,
+    }) => {
+      const idp = await makeIdentityProvider(organizationId, {
+        providerId: "claims-provider",
+        oidcConfig: {
+          clientId: "test-client",
+          clientSecret: "test-secret",
+          issuer: "https://idp.example.com",
+          pkce: false,
+          discoveryEndpoint:
+            "https://idp.example.com/.well-known/openid-configuration",
+        },
+      });
+
+      await makeAccount(user.id, {
+        providerId: "claims-provider",
+        idToken: createMockIdToken({
+          sub: "user-subject",
+          email: "admin@example.com",
+          groups: ["engineering"],
+          roles: ["app-admin"],
+        }),
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/identity-providers/${idp.id}/latest-id-token-claims`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        providerId: "claims-provider",
+        claims: {
+          sub: "user-subject",
+          email: "admin@example.com",
+          groups: ["engineering"],
+          roles: ["app-admin"],
+        },
+      });
+      expect(response.json()).not.toHaveProperty("idToken");
+    });
+
+    test("returns decoded access token claims without exposing the raw token", async ({
+      makeAccount,
+      makeIdentityProvider,
+    }) => {
+      const idp = await makeIdentityProvider(organizationId, {
+        providerId: "access-claims-provider",
+        oidcConfig: {
+          clientId: "test-client",
+          clientSecret: "test-secret",
+          issuer: "https://idp.example.com",
+          pkce: false,
+          discoveryEndpoint:
+            "https://idp.example.com/.well-known/openid-configuration",
+        },
+      });
+
+      await makeAccount(user.id, {
+        providerId: "access-claims-provider",
+        accessToken: createMockIdToken({
+          aud: "exchange-client-id",
+          scp: "api.read",
+          oid: "user-object-id",
+        }),
+        accessTokenExpiresAt: new Date("2026-06-04T18:00:00.000Z"),
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/identity-providers/${idp.id}/latest-id-token-claims`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        providerId: "access-claims-provider",
+        claims: null,
+        accessTokenClaims: {
+          aud: "exchange-client-id",
+          scp: "api.read",
+          oid: "user-object-id",
+        },
+      });
+      expect(response.json()).not.toHaveProperty("accessToken");
+    });
+
+    test("does not expose another user's token claims", async ({
+      makeAccount,
+      makeIdentityProvider,
+      makeUser,
+    }) => {
+      const otherUser = await makeUser({ email: "other@example.com" });
+      const idp = await makeIdentityProvider(organizationId, {
+        providerId: "other-user-claims-provider",
+        oidcConfig: {
+          clientId: "test-client",
+          clientSecret: "test-secret",
+          issuer: "https://idp.example.com",
+          pkce: false,
+          discoveryEndpoint:
+            "https://idp.example.com/.well-known/openid-configuration",
+        },
+      });
+
+      await makeAccount(otherUser.id, {
+        providerId: "other-user-claims-provider",
+        idToken: createMockIdToken({
+          sub: "other-user",
+          email: "other@example.com",
+          groups: ["admins"],
+        }),
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/identity-providers/${idp.id}/latest-id-token-claims`,
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        providerId: "other-user-claims-provider",
+        claims: null,
+      });
+    });
+
+    test("returns 404 for a provider outside the current organization", async ({
+      makeIdentityProvider,
+      makeOrganization,
+    }) => {
+      const otherOrg = await makeOrganization();
+      const idp = await makeIdentityProvider(otherOrg.id, {
+        providerId: "other-org-provider",
+      });
+
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/identity-providers/${idp.id}/latest-id-token-claims`,
+      });
+
+      expect(response.statusCode).toBe(404);
+    });
+  });
+
+  describe("GET /api/identity-providers/idp-logout-url", () => {
+    test("returns null url for non-SSO user", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: "/api/identity-providers/idp-logout-url",
+      });
+
+      expect(response.statusCode).toBe(200);
+      const data = response.json();
+      expect(data).toEqual({ url: null });
+    });
+  });
+});
+
+async function createSessionCookie(sessionToken: string): Promise<string> {
+  if (!config.auth.secret) {
+    throw new Error("Auth secret is not configured");
+  }
+
+  const signature = await makeSignature(sessionToken, config.auth.secret);
+  const cookieName = getCookies(auth.options).sessionToken.name;
+  return `${cookieName}=${encodeURIComponent(`${sessionToken}.${signature}`)}`;
+}

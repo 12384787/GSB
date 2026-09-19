@@ -1,0 +1,307 @@
+imports:
+  Text: Data.Text
+  Maybe: Data.Maybe
+  PassCategory: Domain.Types.PassCategory
+  PassType: Domain.Types.PassType
+  PassEnum: Domain.Types.PassType
+  Pass: Domain.Types.Pass
+  PassDocumentType: Domain.Types.Pass
+  PurchasedPass: Domain.Types.PurchasedPass
+  PurchasedPassPayment: Domain.Types.PurchasedPassPayment
+  StatusType: Domain.Types.PurchasedPass
+  HighPrecMoney: Kernel.Types.Common
+  ServiceTierType: BecknV2.FRFS.Enums
+  VehicleCategory: BecknV2.FRFS.Enums
+  CreateOrderResp: Kernel.External.Payment.Juspay.Types.CreateOrder
+  Benefit: Domain.Types.Pass
+  APISuccess: Kernel.Types.APISuccess
+  Day: Data.Time
+  Language: Kernel.External.Types
+  CumulativeOfferResp: SharedLogic.Offer
+  Refunds: Lib.Payment.Domain.Types.Refunds
+  RefundStatus: Kernel.External.Payment.Interface
+  VerificationStatus: Domain.Types.PassDetails
+  Value: Data.Aeson
+  MediaFile: IssueManagement.Domain.Types.MediaFile
+  IssueMediaUploadReq: IssueManagement.Common.UI.Issue
+  IssueMediaUploadRes: IssueManagement.Common.UI.Issue
+
+module: Pass
+types:
+  PassCategoryAPIEntity:
+    id: Id PassCategory
+    name: Text
+    description: Text
+    derive: "Show"
+
+  PassTypeAPIEntity:
+    id: Id PassType
+    name: Maybe Text
+    catchline: Maybe Text
+    title: Text
+    description: Maybe Text
+    passEnum: Maybe PassEnum
+    derive: "Show"
+
+  FrfsOverrideConfigAPIEntity:
+    percentageApplicable: Maybe HighPrecMoney
+    fixedApplicable: Maybe HighPrecMoney
+    maximumTripCount: Maybe Int
+    unlimitedTripCount: Bool
+    maxTicketQuantityPerOverride: Maybe Int
+    derive: "Show"
+
+  PassAPIEntity:
+    id: Id Pass
+    amount: HighPrecMoney
+    originalAmount: HighPrecMoney
+    savings: Maybe HighPrecMoney
+    benefit: Maybe Benefit
+    benefitDescription: Text
+    vehicleServiceTierType: "[ServiceTierType]"
+    vehicleType: VehicleCategory
+    maxTrips: Maybe Int
+    maxDays: Maybe Int
+    frfsOverrideConfig: Maybe FrfsOverrideConfigAPIEntity
+    frfsCancelLimit: Maybe Int
+    documentsRequired: "[PassDocumentType]"
+    eligibility: Bool
+    name: Maybe Text
+    description: Maybe Text
+    code: Text
+    offer: Maybe CumulativeOfferResp
+    autoApply: Bool
+    minFare: Maybe HighPrecMoney
+    maxFare: Maybe HighPrecMoney
+    verificationStatus: Maybe VerificationStatus
+    formVerificationConfig: Maybe Value
+    referenceNumber: Maybe Int
+    minTripsAllowingOverlap: Maybe Int
+    minDaysToSuggestRenewal: Maybe Int
+    timeOverlappingFrfsBookingsLimit: Maybe Int
+    derive: "Show"
+
+  PassInfoAPIEntity:
+    passCategory: PassCategoryAPIEntity
+    passTypes: "[PassTypeAPIEntity]"
+    passes: "[PassAPIEntity]"
+    derive: "Show"
+
+  PassVerifyReq:
+    vehicleNumber: Text
+    currentLat: Maybe Double
+    currentLon: Maybe Double
+    stopId: Maybe Text
+    autoActivated: Maybe Bool
+
+  PassSelectionAPIEntity:
+    purchasedPassId: Id PurchasedPass
+    paymentOrder: Maybe CreateOrderResp
+    derive: "Show"
+
+  PassSelectReq:
+    startDate: Day
+    imeiNumber: Text
+    profilePicture: Maybe Text
+    passPhotoMediaId: Maybe (Id MediaFile)
+
+  PassSwitchDeviceIdReq:
+    deviceId: Maybe Text
+    imeiNumber: Maybe Text
+
+  PurchasedPassAPIEntity:
+    id: Id PurchasedPass
+    passNumber: Text
+    passEntity: PassDetailsAPIEntity
+    tripsLeft: Maybe Int
+    availableTripCount: Maybe Int
+    unlimitedTripCount: Bool
+    purchasedPassPaymentId: Maybe (Id PurchasedPassPayment)
+    lastVerifiedVehicleNumber: Maybe Text
+    isAutoVerified: Bool
+    status: StatusType
+    purchaseDate: Day
+    daysToExpire: Int
+    photoUploadTimeLimit: Maybe UTCTime
+    photoChangedCount: Maybe Int
+    maxPhotoChangeConfigCount: Maybe Int
+    startDate: Day
+    expiryDate: Day
+    deviceMismatch: Bool
+    deviceSwitchAllowed: Bool
+    profilePicture: Maybe Text
+    passPhotoMediaId: Maybe (Id MediaFile)
+    futureRenewals: [PurchasedPassTransactionAPIEntity]
+    overlappingPasses: [PurchasedPassTransactionAPIEntity]
+    isPreferredSourceAndDestinationSet: Bool
+    derive: "Show"
+
+  PassDetailsAPIEntity:
+    category: PassCategoryAPIEntity
+    passType: PassTypeAPIEntity
+    passDetails: PassAPIEntity
+    derive: "Show"
+
+  RefundAPIEntity:
+    id: Id Refunds
+    amount: HighPrecMoney
+    status: RefundStatus
+    arn: Maybe Text
+    completedAt: Maybe UTCTime
+    updatedAt: UTCTime
+    createdAt: UTCTime
+    derive: "Show"
+
+  PurchasedPassTransactionAPIEntity:
+    id: Id PurchasedPassPayment
+    purchasedPassPaymentId: Id PurchasedPassPayment
+    passName: Maybe Text
+    passCode: Text
+    createdAt: UTCTime
+    startDate: Day
+    endDate: Day
+    amount: HighPrecMoney
+    availableTripCount: Maybe Int
+    status: StatusType
+    passType: Maybe PassEnum
+    refunds: "[RefundAPIEntity]"
+    derive: "Show"
+
+  SetPassPrefSrcAndDestReq:
+    prefSrc: Text
+    prefDest: Text
+    derive: "Show"
+
+  PassUploadProfilePictureReq:
+    purchasedPassId: Id PurchasedPass
+    profilePicture: Text
+    imeiNumber: Text
+    derive: "Show"
+
+
+apis:
+  - GET:
+      endpoint: /multimodal/pass/availablePasses
+      auth: TokenAuth
+      query:
+        language: Language
+      response:
+        type: "[PassInfoAPIEntity]"
+
+  - POST:
+      endpoint: /multimodal/pass/{passId}/select
+      auth: TokenAuth
+      params:
+        passId: Id Pass
+      query:
+        startDate: Day
+        deviceId: Text
+        imeiNumber: Text
+        profilePicture: Text
+        passPhotoMediaId: Text
+        isMockPayment: Bool
+      response:
+        type: PassSelectionAPIEntity
+
+  - POST:
+      endpoint: /multimodal/pass/v2/{passId}/select
+      auth: TokenAuth
+      params:
+        passId: Id Pass
+      query:
+        isMockPayment: Bool
+      request:
+        type: PassSelectReq
+      response:
+        type: PassSelectionAPIEntity
+
+  - GET:
+      endpoint: /multimodal/pass/list
+      auth: TokenAuth
+      query:
+        status: StatusType
+        limit: Int
+        offset: Int
+        language: Language
+        deviceId: Text
+        imeiNumber: Text
+      response:
+        type: "[PurchasedPassAPIEntity]"
+
+  - POST:
+      endpoint: /multimodal/pass/{purchasedPassId}/verify
+      auth: TokenAuth
+      params:
+        purchasedPassId: Id PurchasedPass
+      request:
+        type: PassVerifyReq
+      response:
+        type: APISuccess
+
+  - POST:
+      endpoint: /multimodal/pass/switchDeviceId
+      auth: TokenAuth
+      request:
+        type: PassSwitchDeviceIdReq
+      response:
+        type: APISuccess
+
+  - GET:
+      endpoint: /multimodal/pass/transactions
+      auth: TokenAuth
+      query:
+        limit: Int
+        offset: Int
+        status: Text
+      response:
+        type: "[PurchasedPassTransactionAPIEntity]"
+
+  - POST:
+      endpoint: /multimodal/pass/activateToday/{passNumber}
+      auth: TokenAuth
+      params:
+        passNumber: Int
+      query:
+        date: Day
+      response:
+        type: APISuccess
+
+  - POST:
+      endpoint: /multimodal/pass/{purchasedPassId}/uploadProfilePicture
+      auth: TokenAuth
+      params:
+        purchasedPassId: Id PurchasedPass
+      query:
+        imeiNumber: Text
+        reupload: Bool
+      multipart:
+        type: IssueMediaUploadReq
+      response:
+        type: IssueMediaUploadRes
+
+  - POST:
+      endpoint: /multimodal/pass/uploadProfilePicture
+      name: postMultimodalPassUploadProfilePictureV1
+      auth: TokenAuth
+      request:
+        type: PassUploadProfilePictureReq
+      response:
+        type: APISuccess
+
+  - GET:
+      endpoint: /multimodal/pass/photo/{mediaId}
+      auth: TokenAuth
+      params:
+        mediaId: Id MediaFile
+      response:
+        type: Text
+
+  - POST:
+      endpoint: /multimodal/pass/set/prefSrcAndDest/{purchasedPassId}
+      auth: TokenAuth
+      params:
+        purchasedPassId: Id PurchasedPass
+      request:
+        type: SetPassPrefSrcAndDestReq
+      response:
+        type: APISuccess

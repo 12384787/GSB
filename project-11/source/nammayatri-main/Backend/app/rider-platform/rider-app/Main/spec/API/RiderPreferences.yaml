@@ -1,0 +1,139 @@
+# Triggers NammaDSL code generation for:
+#   src-read-only/API/Types/UI/RiderPreferences.hs      -- wire request/response types
+#   src-read-only/API/Action/UI/RiderPreferences.hs     -- Servant route type + handler glue
+# Business logic stub generated at:
+#   src/Domain/Action/UI/RiderPreferences.hs
+
+imports:
+  RiderPreferences: Domain.Types.RiderPreferences
+  PreferenceType: Domain.Types.Extra.RiderPreferences
+  NotificationCategory: Domain.Types.Extra.RiderPreferences
+  APISuccess: Kernel.Types.APISuccess
+
+module: RiderPreferences
+
+types:
+  # ---------- POST request ----------
+  # Frontend sends raw lat/lon; backend computes sourceGeohash from them.
+  # sourceAddress/pickupAddress are optional display strings stored for UI rendering.
+  LocationPickupReqData:
+    sourceLat: Double
+    sourceLon: Double
+    sourceAddress: Maybe Text
+    pickupLat: Double
+    pickupLon: Double
+    pickupAddress: Maybe Text
+    pickupAddressSubtitle: Maybe Text
+
+  # Notification category opt-in, sent once the rider has responded to the in-app
+  # notification-permission popup (or whenever the client re-syncs OS permission state).
+  # enabledCategories is the ONLY field the backend send-path gate reads;
+  # osPermissionGranted is stored for visibility/analytics only.
+  NotificationPreferenceReqData:
+    osPermissionGranted: Bool
+    enabledCategories: "[NotificationCategory]"
+
+  # Top-level POST body — preferenceType tells us which optional data block to read.
+  RiderPreferenceReq:
+    preferenceType: PreferenceType
+    locationData: Maybe LocationPickupReqData
+    notificationPreferenceData: Maybe NotificationPreferenceReqData
+
+  # ---------- GET response ----------
+  # One entry per saved pickup location (one per source geohash).
+  # id is included so the DELETE endpoint can target a specific row.
+  LocationPickupRespData:
+    id: Id RiderPreferences
+    sourceGeohash: Text
+    sourceLat: Double
+    sourceLon: Double
+    sourceAddress: Maybe Text
+    pickupLat: Double
+    pickupLon: Double
+    pickupAddress: Maybe Text
+    pickupAddressSubtitle: Maybe Text
+    createdAt: UTCTime
+    updatedAt: UTCTime
+
+  # Full GET response — grouped by preference type so the frontend can consume
+  # each category independently. locationPickups will have at most one entry per
+  # source geohash (upsert semantics on POST).
+  RiderPreferencesResp:
+    locationPickups: "[LocationPickupRespData]"
+
+  NotificationPreferenceRespData:
+    osPermissionGranted: Bool
+    enabledCategories: "[NotificationCategory]"
+    createdAt: UTCTime
+    updatedAt: UTCTime
+
+  # GET ALL response — all preferences for the rider, grouped by type.
+  # locationPickups contains all saved pickup locations (not filtered by geohash).
+  # notificationPreference is Nothing if the rider has never responded to the popup —
+  # the client should treat that as "not yet decided" and may show the popup.
+  AllRiderPreferencesResp:
+    locationPickups: "[LocationPickupRespData]"
+    notificationPreference: Maybe NotificationPreferenceRespData
+
+  # Response for the notification-only GET below. A bare `Maybe X` doesn't generate
+  # correctly as a top-level API response type (NammaDSL emits an unparenthesized
+  # handler signature that fails to compile), so this wraps it the same way
+  # AllRiderPreferencesResp wraps its optional field.
+  NotificationPreferenceOnlyResp:
+    notificationPreference: Maybe NotificationPreferenceRespData
+
+apis:
+  # Save or update a preference.
+  # For LOCATION_PICKUP: upserts on (riderId, LOCATION_PICKUP, sourceGeohash).
+  # Re-saving at the same source location overwrites the previous pickup point.
+  - POST:
+      endpoint: /riderPreference
+      auth: TokenAuth
+      request:
+        type: RiderPreferenceReq
+      response:
+        type: APISuccess
+
+  # Fetch all preferences for the logged-in rider.
+  # sourceLat + sourceLon are the current source location — always required.
+  # Backend computes the geohash and returns the matching LOCATION_PICKUP entry.
+  # Result is Redis-cached by riderId; cache is invalidated on POST and DELETE.
+  - GET:
+      endpoint: /riderPreference
+      auth: TokenAuth
+      query:
+        - sourceLat: Double
+        - sourceLon: Double
+      response:
+        type: RiderPreferencesResp
+
+  # Fetch all preferences for the logged-in rider regardless of location.
+  # Used for settings/profile screens to show everything the user has saved.
+  # Result is Redis-cached by riderId; cache is invalidated on POST and DELETE.
+  - GET:
+      endpoint: /riderPreference/all
+      auth: TokenAuth
+      response:
+        type: AllRiderPreferencesResp
+
+  # Fetch only the notification preference for the logged-in rider -- skips the
+  # unbounded LOCATION_PICKUP fetch entirely for callers (e.g. the notification-settings
+  # screen) that don't need saved pickup locations. Goes through the same Redis-cached
+  # single-row lookup the send-path gate uses, so it's cheap regardless of how many
+  # LOCATION_PICKUP rows this rider has accumulated. Nothing if the rider has never
+  # responded to the in-app permission popup.
+  - GET:
+      endpoint: /riderPreference/notification
+      auth: TokenAuth
+      response:
+        type: NotificationPreferenceOnlyResp
+
+  # Delete a specific preference by its DB id.
+  # Ownership is verified: the preference's riderId must match the auth token.
+  - DELETE:
+      endpoint: /riderPreference/{preferenceId}
+      auth: TokenAuth
+      params:
+        preferenceId: Id RiderPreferences
+      response:
+        type: APISuccess

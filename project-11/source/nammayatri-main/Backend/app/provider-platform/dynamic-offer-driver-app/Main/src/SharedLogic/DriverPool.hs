@@ -1,0 +1,1665 @@
+{-
+ Copyright 2022-23, Juspay India Pvt Ltd
+
+ This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License
+
+ as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. This program
+
+ is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+
+ or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details. You should have received a copy of
+
+ the GNU Affero General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+-}
+{-# LANGUAGE DerivingVia #-}
+
+module SharedLogic.DriverPool
+  ( calculateDriverPool,
+    isScheduledOpenToAll,
+    calculateDriverPoolWithActualDist,
+    calculateDriverCurrentlyOnRideWithActualDist,
+    filterOnRideDriversFromPool,
+    incrementTotalRidesCount,
+    isThresholdRidesCompleted,
+    incrementCancellationCount,
+    incrementSrdSentCount,
+    decrementSrdSentCount,
+    getSrdStatsCountersBulk,
+    quoteResponseAcceptActionType,
+    quoteResponseRejectActionType,
+    quoteResponseEligibleActionType,
+    recordQuoteResponseCounters,
+    buildQuoteResponseSnapshot,
+    quoteResponseCounterConfig,
+    quoteResponseCooldownTags,
+    rideCancellationActionType,
+    rideCancellationCounterConfig,
+    getLatestCancellationRatio,
+    getCurrentWindowAvailability,
+    getPopupDelay,
+    getTotalRidesCount,
+    getValidSearchRequestCount,
+    removeSearchReqIdFromMap,
+    updateDriverSpeedInRedis,
+    getDriverAverageSpeed,
+    mkAvailableTimeKey,
+    mkBlockListedDriversKey,
+    mkBlockListedDriversForRiderKey,
+    addDriverToSearchCancelledList,
+    addDriverToRiderCancelledList,
+    convertDriverPoolWithActualDistResultToNearestGoHomeDriversResult,
+    filterOutGoHomeDriversAccordingToHomeLocation,
+    PoolCalculationStage (..),
+    CalculateDriverPoolReq (..),
+    module Reexport,
+    getBatchSize,
+    addSearchRequestInfoToCache,
+    isLessThenNParallelRequests,
+    removeExpiredSearchRequestInfoFromCache,
+    SearchTryBatchData (..),
+    SearchTryBatchPoolData (..),
+    FilterStage (..),
+    incrementSearchTryRejectCount,
+    getSearchTryRejectCount,
+    setBatchSentCount,
+    incrementBatchSentCount,
+    getBatchSentCount,
+    incrementBatchRejectCount,
+    getBatchRejectCount,
+    getBatchEpoch,
+    bumpBatchEpoch,
+    getNextBatchScheduleTime,
+    getBatchingMode,
+    isContinuousBatchingEnabled,
+    driverReserveListKey,
+    setDriverReserveList,
+    popDriverFromReserveList,
+    hasDriverReserveList,
+    maxDriverReserveListSize,
+    driverReserveListTtlBufferSeconds,
+  )
+where
+
+import Control.Monad.Extra (mapMaybeM)
+import qualified Data.Aeson as A
+import Data.Fixed
+import qualified Data.Geohash as DG
+import Data.List (length, partition)
+import qualified Data.List.NonEmpty as NE
+import qualified Data.Map.Strict as Map
+import qualified Data.Text as T
+import Data.Time.Clock hiding (getCurrentTime)
+import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
+import qualified Data.Vector as V
+import qualified Database.Redis as Hedis
+import Domain.Types as DVST
+import qualified Domain.Types.Common as SRD
+import qualified Domain.Types.DriverGoHomeRequest as DDGR
+import Domain.Types.DriverIntelligentPoolConfig (IntelligentScores (IntelligentScores))
+import qualified Domain.Types.DriverIntelligentPoolConfig as DIPC
+import Domain.Types.DriverPoolConfig
+import qualified Domain.Types.Extra.MerchantPaymentMethod as MP
+import Domain.Types.GoHomeConfig (GoHomeConfig)
+import qualified Domain.Types.Merchant as DM
+import qualified Domain.Types.MerchantOperatingCity as DMOC
+import qualified Domain.Types.Person as DP
+import Domain.Types.RiderDetails (RiderDetails)
+import Domain.Types.SearchRequest
+import qualified Domain.Types.SearchTry as DSTry
+import qualified Domain.Types.TransporterConfig as DTC
+import Domain.Types.VehicleServiceTier as DVST
+import EulerHS.Prelude hiding (find, id, length)
+import Kernel.Beam.Lib.Utils (pushToKafka)
+import Kernel.External.Types
+import Kernel.Prelude (head, listToMaybe)
+import qualified Kernel.Prelude as KP
+import Kernel.Storage.Esqueleto
+import qualified Kernel.Storage.Esqueleto as Esq
+import qualified Kernel.Storage.Hedis as Redis
+import Kernel.Streaming.Kafka.Producer.Types (HasKafkaProducer)
+import Kernel.Types.Error
+import Kernel.Types.Id
+import qualified Kernel.Types.SlidingWindowCounters as SWC
+import Kernel.Utils.CalculateDistance (distanceBetweenInMeters)
+import qualified Kernel.Utils.CalculateDistance as CD
+import Kernel.Utils.Common
+import Kernel.Utils.DatastoreLatencyCalculator
+import qualified Kernel.Utils.SlidingWindowCounters as SWC
+import qualified Lib.BehaviorTracker.Accumulator as BTAcc
+import qualified Lib.BehaviorTracker.Recorder as BTRecorder
+import qualified Lib.BehaviorTracker.Snapshot as BTSnap
+import qualified Lib.BehaviorTracker.Types as BTT
+import Lib.ConfigPilot.Interface.Types (getOneConfig)
+import Lib.Finance.Storage.Beam.BeamFlow (BeamFlow)
+import qualified Lib.Types.SpecialLocation as SL
+import qualified SharedLogic.Beckn.Common as DST
+import SharedLogic.DriverPool.DriverPoolData (mkParallelSearchRequestKey)
+import qualified SharedLogic.DriverPool.DriverPoolData as DPD
+import qualified SharedLogic.DriverPool.DriverPoolDataBuilder as DPDBuilder
+import qualified SharedLogic.External.LocationTrackingService.Types as LT
+import SharedLogic.QuickRetry (withQuickRetry)
+import qualified SharedLogic.ScheduledBooking.OverlapCheck as SBOC
+import qualified Storage.Cac.DriverIntelligentPoolConfig as CDIP
+import Storage.Cac.DriverPoolConfig as Reexport
+import qualified Storage.CachedQueries.Driver.GoHomeRequest as CQDGR
+import Storage.ConfigPilot.Config.TransporterConfig (TransporterConfigDimensions (..))
+import qualified Storage.Queries.DriverGoHomeRequest as QDGR
+import qualified Storage.Queries.DriverInformation.Internal as Int
+import qualified Storage.Queries.Person as QP
+import qualified Storage.Queries.Person.GetNearestDrivers as QPG
+import qualified Storage.Queries.Transformers.DriverInformation as TDI
+import Tools.Maps as Maps
+import qualified Tools.Maps as TMaps
+import Tools.Metrics
+import Utils.Common.Cac.KeyNameConstants
+
+mkAvailableTimeKey :: Text -> Text
+mkAvailableTimeKey driverId = "driver-offer:DriverPool:Available-Time:DriverId-" <> driverId
+
+-- Per-driver quote-response counters surfaced in the POOLING dynamic-logic data. Stored as
+-- behavior-tracker (bt:) counters so the behavior framework's rules and snapshots read the
+-- same series. ACCEPT/REJECT/PULL each get an ACTION_COUNT under their own action type;
+-- SENT is the shared eligibility (ELIGIBLE_COUNT under QUOTE_RESPONSE); CANCEL is the
+-- RIDE_CANCELLATION series (ACTION = cancels, ELIGIBLE = rides assigned).
+-- The fixed 7-day window lets both "today" (last 1 day-bucket) and "weekly" (last 7 day-buckets)
+-- be derived from the same series via getCurrentWindowValuesUptoLast.
+quoteResponseAcceptActionType, quoteResponseRejectActionType, quoteResponsePullActionType, quoteResponseEligibleActionType :: Text
+quoteResponseAcceptActionType = "QUOTE_RESPONSE_ACCEPT"
+quoteResponseRejectActionType = "QUOTE_RESPONSE_REJECT"
+quoteResponsePullActionType = "QUOTE_RESPONSE_PULL"
+quoteResponseEligibleActionType = "QUOTE_RESPONSE"
+
+-- bt: series written on valid driver cancellation (Lib.DriverScore, OnDriverCancellation)
+rideCancellationActionType :: Text
+rideCancellationActionType = "RIDE_CANCELLATION"
+
+-- Cooldown tags exposed in the quote-response snapshot (e.g. {"var": "cooldowns.QuoteResponseNudge"})
+-- for the future quote-response behavior rulebook, so a nudge/block consequence can be
+-- guarded to fire at most once per cooldown window.
+quoteResponseCooldownTags :: [Text]
+quoteResponseCooldownTags = ["QuoteResponseNudge", "QuoteResponseBlock"]
+
+mkQuoteResponseCounterKey :: Text -> BTT.CounterType -> Text -> Text
+mkQuoteResponseCounterKey actionType counterType driverId = BTAcc.mkCounterKey quoteResponseCounterConfig.hashTagEntityId BTT.DRIVER actionType counterType driverId
+
+srdStatsWindow :: SWC.SlidingWindowOptions
+srdStatsWindow = SWC.SlidingWindowOptions 7 SWC.Days
+
+quoteResponseActionType :: SRD.SearchRequestForDriverResponse -> Text
+quoteResponseActionType = \case
+  SRD.Accept -> quoteResponseAcceptActionType
+  SRD.Reject -> quoteResponseRejectActionType
+  SRD.Pulled -> quoteResponsePullActionType
+
+-- | Record the outcome of one quote response as a bt: ACTION_COUNT under the
+-- outcome's action type. Called at the respond site (Domain.Action.UI.Driver).
+recordQuoteResponseCounters ::
+  (EsqDBFlow m r, CacheFlow m r, Redis.HedisFlow m r) =>
+  Id DMOC.MerchantOperatingCity ->
+  Id DP.Person ->
+  SRD.SearchRequestForDriverResponse ->
+  m ()
+recordQuoteResponseCounters _merchantOpCityId driverId response =
+  BTRecorder.incrementCounterOnly quoteResponseCounterConfig BTT.DRIVER driverId.getId (quoteResponseActionType response) BTT.ACTION_COUNT
+
+-- windowSizeDays fixed at 7 to match srdStatsWindow — getSrdStatsCountersBulk
+-- enumerates exactly these 7 day-buckets.
+quoteResponseCounterConfig :: BTT.CounterConfig
+quoteResponseCounterConfig =
+  BTT.CounterConfig
+    { windowSizeDays = 7,
+      counters = [BTT.ACTION_COUNT, BTT.ELIGIBLE_COUNT],
+      periods = [BTT.mkPeriodConfig "daily" 1, BTT.mkPeriodConfig "weekly" 7],
+      hashTagEntityId = True
+    }
+
+-- | Snapshot for one quote-response outcome. Rates are computed against the shared
+-- QUOTE_RESPONSE eligibility (total requests received), not the outcome's own actionType.
+buildQuoteResponseSnapshot ::
+  (EsqDBFlow m r, CacheFlow m r, Redis.HedisFlow m r, MonadFlow m) =>
+  Id DMOC.MerchantOperatingCity ->
+  Id DP.Person ->
+  SRD.SearchRequestForDriverResponse ->
+  m BTT.BehaviorSnapshot
+buildQuoteResponseSnapshot merchantOpCityId driverId response = do
+  eventTime <- getCurrentTime
+  let actionEvent =
+        BTT.ActionEvent
+          { entityType = BTT.DRIVER,
+            entityId = driverId.getId,
+            actionType = quoteResponseActionType response,
+            merchantOperatingCityId = merchantOpCityId.getId,
+            flowContext = A.object [],
+            eventData = A.object ["response" A..= (show response :: Text)],
+            timestamp = eventTime
+          }
+  BTSnap.buildSnapshotWithSharedEligible quoteResponseCounterConfig actionEvent (A.object []) quoteResponseCooldownTags quoteResponseEligibleActionType
+
+-- Per-search-try dispatch counters. All Redis-only and short-lived (a search try dies within
+-- minutes), they carry the cross-batch feedback a single batch can't see on its own:
+--   * rejects for the whole try  -> surfaced to the POOLING ruleset as `cumulativeRejectCount`
+--   * sent/rejects per batch     -> lets the respond API spot a *fully* rejected batch
+--   * batch epoch                -> generation token keeping exactly one live rescheduling
+--                                   chain when a batch is advanced early
+mkSearchTryRejectCountKey :: Text -> Text
+mkSearchTryRejectCountKey searchTryId = "Driver-Offer:SearchTry:RejectCount:" <> searchTryId
+
+mkBatchSentCountKey :: Text -> Int -> Text
+mkBatchSentCountKey searchTryId batchNum = "Driver-Offer:SearchTry:BatchSentCount:" <> searchTryId <> ":" <> show batchNum
+
+mkBatchRejectCountKey :: Text -> Int -> Text
+mkBatchRejectCountKey searchTryId batchNum = "Driver-Offer:SearchTry:BatchRejectCount:" <> searchTryId <> ":" <> show batchNum
+
+mkBatchEpochKey :: Text -> Text
+mkBatchEpochKey searchTryId = "Driver-Offer:SearchTry:BatchEpoch:" <> searchTryId
+
+-- Matches poolBatchNumKey's TTL: a search try never outlives it.
+searchTryDispatchCounterTtl :: Redis.ExpirationTime
+searchTryDispatchCounterTtl = 600
+
+-- | Cumulative rejects across every batch of this search try. Returns the post-increment
+-- value so the caller can act on it without a second read.
+incrementSearchTryRejectCount :: (Redis.HedisFlow m r) => Id DSTry.SearchTry -> m Int
+incrementSearchTryRejectCount searchTryId = Redis.withCrossAppRedis $ do
+  let key = mkSearchTryRejectCountKey searchTryId.getId
+  rejectCount <- Redis.incr key
+  Redis.expire key searchTryDispatchCounterTtl
+  pure $ fromIntegral rejectCount
+
+getSearchTryRejectCount :: (Redis.HedisFlow m r) => Id DSTry.SearchTry -> m Int
+getSearchTryRejectCount searchTryId =
+  Redis.withCrossAppRedis $ fromMaybe 0 <$> Redis.get (mkSearchTryRejectCountKey searchTryId.getId)
+
+-- | Recorded when a batch goes out, so the respond API can tell a fully rejected batch
+-- (rejects == sent) from a partly answered one without touching Postgres.
+setBatchSentCount :: (Redis.HedisFlow m r) => Id DSTry.SearchTry -> Int -> Int -> m ()
+setBatchSentCount searchTryId batchNum sentCount =
+  Redis.withCrossAppRedis $ Redis.setExp (mkBatchSentCountKey searchTryId.getId batchNum) sentCount searchTryDispatchCounterTtl
+
+getBatchSentCount :: (Redis.HedisFlow m r) => Id DSTry.SearchTry -> Int -> m (Maybe Int)
+getBatchSentCount searchTryId batchNum =
+  Redis.withCrossAppRedis $ Redis.get (mkBatchSentCountKey searchTryId.getId batchNum)
+
+incrementBatchSentCount :: (Redis.HedisFlow m r) => Id DSTry.SearchTry -> Int -> Int -> m ()
+incrementBatchSentCount searchTryId batchNum sentCount =
+  Redis.withCrossAppRedis $ do
+    let key = mkBatchSentCountKey searchTryId.getId batchNum
+    void $ Redis.incrby key (fromIntegral sentCount)
+    Redis.expire key searchTryDispatchCounterTtl
+
+-- | Returns the post-increment count. The INCR is atomic, so of several drivers rejecting at
+-- once exactly one observes `rejects == sent` — that one owns the early advance.
+incrementBatchRejectCount :: (Redis.HedisFlow m r) => Id DSTry.SearchTry -> Int -> m Int
+incrementBatchRejectCount searchTryId batchNum = Redis.withCrossAppRedis $ do
+  let key = mkBatchRejectCountKey searchTryId.getId batchNum
+  rejectCount <- Redis.incr key
+  Redis.expire key searchTryDispatchCounterTtl
+  pure $ fromIntegral rejectCount
+
+getBatchRejectCount :: (Redis.HedisFlow m r) => Id DSTry.SearchTry -> Int -> m Int
+getBatchRejectCount searchTryId batchNum =
+  Redis.withCrossAppRedis $ fromMaybe 0 <$> Redis.get (mkBatchRejectCountKey searchTryId.getId batchNum)
+
+getBatchEpoch :: (Redis.HedisFlow m r) => Id DSTry.SearchTry -> m Int
+getBatchEpoch searchTryId =
+  Redis.withCrossAppRedis $ fromMaybe 0 <$> Redis.get (mkBatchEpochKey searchTryId.getId)
+
+-- | Bumps the generation token and returns the new epoch. The job created with this epoch
+-- becomes the only live chain; a job carrying an older epoch terminates without rescheduling,
+-- which is what stops an early advance from double-sending a batch.
+bumpBatchEpoch :: (Redis.HedisFlow m r) => Id DSTry.SearchTry -> m Int
+bumpBatchEpoch searchTryId = Redis.withCrossAppRedis $ do
+  let key = mkBatchEpochKey searchTryId.getId
+  epoch <- Redis.incr key
+  Redis.expire key searchTryDispatchCounterTtl
+  pure $ fromIntegral epoch
+
+getBatchingMode :: DriverPoolConfig -> BatchingMode
+getBatchingMode driverPoolCfg = fromMaybe OFF driverPoolCfg.batchingMode
+
+getNextBatchScheduleTime :: DriverPoolConfig -> Seconds
+getNextBatchScheduleTime driverPoolCfg =
+  case getBatchingMode driverPoolCfg of
+    STAGGERED -> fromMaybe driverPoolCfg.singleBatchProcessTime driverPoolCfg.nextBatchScheduleTime
+    _ -> driverPoolCfg.singleBatchProcessTime
+
+isContinuousBatchingEnabled :: DriverPoolConfig -> Bool
+isContinuousBatchingEnabled driverPoolCfg = getBatchingMode driverPoolCfg == CONTINUOUS
+
+maxDriverReserveListSize :: Int
+maxDriverReserveListSize = 50
+
+driverReserveListTtlBufferSeconds :: Seconds
+driverReserveListTtlBufferSeconds = 2
+
+driverReserveListKey :: Id DSTry.SearchTry -> Text
+driverReserveListKey searchTryId = "Driver-Offer:SearchTry:ReservePool:" <> searchTryId.getId
+
+setDriverReserveList :: (Redis.HedisFlow m r, Log m) => Id DSTry.SearchTry -> Seconds -> [DriverPoolWithActualDistResult] -> m ()
+setDriverReserveList searchTryId ttl reserve = Redis.withCrossAppRedis $ do
+  let key = driverReserveListKey searchTryId
+      reserve' = take maxDriverReserveListSize reserve
+  Redis.del key
+  unless (null reserve') $ do
+    Redis.rPushExp key (reverse reserve') (fromIntegral ttl)
+    logInfo $
+      "DriverReserveList set: searchTryId=" <> searchTryId.getId
+        <> " size="
+        <> show (length reserve')
+        <> " ttl="
+        <> show ttl
+
+popDriverFromReserveList :: (Redis.HedisFlow m r) => Id DSTry.SearchTry -> m (Maybe DriverPoolWithActualDistResult)
+popDriverFromReserveList searchTryId = Redis.withCrossAppRedis $ Redis.rPop (driverReserveListKey searchTryId)
+
+hasDriverReserveList :: (Redis.HedisFlow m r) => Id DSTry.SearchTry -> m Bool
+hasDriverReserveList searchTryId = Redis.withCrossAppRedis $ (> 0) <$> Redis.lLen (driverReserveListKey searchTryId)
+
+windowFromIntelligentPoolConfig :: (MonadFlow m, EsqDBFlow m r, CacheFlow m r) => Id DMOC.MerchantOperatingCity -> (DIPC.DriverIntelligentPoolConfig -> SWC.SlidingWindowOptions) -> m SWC.SlidingWindowOptions
+windowFromIntelligentPoolConfig _merchantOpCityId _windowKey = pure $ SWC.SlidingWindowOptions 7 SWC.Days
+
+getBatchSize :: V.Vector Int -> Int -> Int -> Int
+getBatchSize dynamicBatchSize index driverBatchSize =
+  let size = min (V.length dynamicBatchSize - 1) (index + 1)
+   in bool (dynamicBatchSize V.! size) driverBatchSize (size <= -1)
+
+withCancellationAndRideFrequencyRatioWindowOption ::
+  ( Redis.HedisFlow m r,
+    EsqDBFlow m r,
+    CacheFlow m r
+  ) =>
+  Id DMOC.MerchantOperatingCity ->
+  (SWC.SlidingWindowOptions -> m a) ->
+  m a
+withCancellationAndRideFrequencyRatioWindowOption merchantOpCityId fn = windowFromIntelligentPoolConfig merchantOpCityId (.cancellationAndRideFrequencyRatioWindowOption) >>= fn
+
+withAvailabilityTimeWindowOption ::
+  ( Redis.HedisFlow m r,
+    EsqDBFlow m r,
+    CacheFlow m r
+  ) =>
+  Id DMOC.MerchantOperatingCity ->
+  (SWC.SlidingWindowOptions -> m a) ->
+  m a
+withAvailabilityTimeWindowOption merchantOpCityId fn = windowFromIntelligentPoolConfig merchantOpCityId (.availabilityTimeWindowOption) >>= fn
+
+isLessThenNParallelRequests ::
+  ( Redis.HedisFlow m r,
+    EsqDBFlow m r,
+    CacheFlow m r
+  ) =>
+  Id SearchRequest ->
+  Id DM.Merchant ->
+  [Id DP.Driver] ->
+  UTCTime ->
+  Int ->
+  UTCTime ->
+  m [Bool]
+isLessThenNParallelRequests searchReqId merchantId driverIds valueToPut maxSize fromScore = do
+  parallelCounts <- Redis.withMasterRedis $ Redis.withCrossAppRedis $ Redis.zAddIfPossibleMany (mkParallelSearchRequestKey merchantId <$> driverIds) (searchReqId.getId, (realToFrac . utcTimeToPOSIXSeconds) valueToPut) maxSize ((realToFrac . utcTimeToPOSIXSeconds) fromScore)
+  pure $ (== 1) <$> parallelCounts
+
+addSearchRequestInfoToCache ::
+  ( Redis.HedisFlow m r,
+    EsqDBFlow m r,
+    CacheFlow m r
+  ) =>
+  Id SearchRequest ->
+  Id DM.Merchant ->
+  Id DP.Driver ->
+  UTCTime ->
+  Redis.ExpirationTime ->
+  m ()
+addSearchRequestInfoToCache _ merchantId driverId _ _ = Redis.withMasterRedis $
+  Redis.withCrossAppRedis $ do
+    let parallelCountKey = mkParallelSearchRequestKey merchantId driverId
+    now <- getCurrentTime
+    void $ Redis.withMasterRedis $ Redis.withCrossAppRedis $ Redis.zRemRangeByScore parallelCountKey 0 ((realToFrac . utcTimeToPOSIXSeconds) $ addUTCTime (-2) now)
+
+removeExpiredSearchRequestInfoFromCache ::
+  ( Redis.HedisFlow m r,
+    EsqDBFlow m r,
+    CacheFlow m r
+  ) =>
+  Id DM.Merchant ->
+  [Id DP.Driver] ->
+  m ()
+removeExpiredSearchRequestInfoFromCache merchantId driverIds = do
+  now <- getCurrentTime
+  let expiredBefore = (realToFrac . utcTimeToPOSIXSeconds) $ addUTCTime (-2) now
+  void $ Redis.withMasterRedis $ Redis.withCrossAppRedis $ Redis.runPipelinedByKey "zRemRangeByScore" (\key -> Hedis.zremrangebyscore key 0 expiredBefore) (mkParallelSearchRequestKey merchantId <$> driverIds)
+
+getValidSearchRequestCount ::
+  Redis.HedisFlow m r =>
+  Id DM.Merchant ->
+  Id DP.Driver ->
+  UTCTime ->
+  m Int
+getValidSearchRequestCount merchantId driverId now = Redis.withMasterRedis $
+  Redis.withCrossAppRedis $ do
+    validCount <- Redis.zCount (mkParallelSearchRequestKey merchantId driverId) ((realToFrac . utcTimeToPOSIXSeconds) $ now) ((realToFrac . utcTimeToPOSIXSeconds) (addUTCTime 5000 now))
+    pure $ fromIntegral validCount
+
+removeSearchReqIdFromMap ::
+  ( Redis.HedisFlow m r,
+    MonadTime m
+  ) =>
+  Id DM.Merchant ->
+  Id DP.Person ->
+  Id SearchRequest ->
+  m ()
+removeSearchReqIdFromMap merchantId driverId searchReqId = do
+  void $ Redis.withMasterRedis $ Redis.withCrossAppRedis $ Redis.zRem (mkParallelSearchRequestKey merchantId driverId) [searchReqId.getId]
+
+-- Ride-lifecycle counters, stored as the bt: RIDE_CANCELLATION series (ELIGIBLE = rides
+-- assigned, ACTION = cancellations) — the same series getSrdStatsCountersBulk feeds to the
+-- POOLING dynamic logic and the behavior framework's snapshots read.
+rideCancellationCounterConfig :: BTT.CounterConfig
+rideCancellationCounterConfig =
+  BTT.CounterConfig
+    { windowSizeDays = 7,
+      counters = [BTT.ACTION_COUNT, BTT.ELIGIBLE_COUNT],
+      periods = [BTT.mkPeriodConfig "daily" 1, BTT.mkPeriodConfig "weekly" 7],
+      hashTagEntityId = True
+    }
+
+incrementTotalRidesCount ::
+  ( Redis.HedisFlow m r,
+    EsqDBFlow m r,
+    CacheFlow m r
+  ) =>
+  Id DMOC.MerchantOperatingCity ->
+  Id DP.Person ->
+  m ()
+incrementTotalRidesCount _merchantOpCityId driverId = BTRecorder.incrementCounterOnly rideCancellationCounterConfig BTT.DRIVER driverId.getId rideCancellationActionType BTT.ELIGIBLE_COUNT
+
+getTotalRidesCount ::
+  ( Redis.HedisFlow m r,
+    EsqDBFlow m r,
+    CacheFlow m r
+  ) =>
+  Id DMOC.MerchantOperatingCity ->
+  Id DP.Driver ->
+  m Int
+getTotalRidesCount _merchantOpCityId driverId = fromIntegral <$> BTAcc.getCountForPeriod rideCancellationCounterConfig.hashTagEntityId BTT.DRIVER rideCancellationActionType BTT.ELIGIBLE_COUNT driverId.getId 7 rideCancellationCounterConfig.windowSizeDays
+
+incrementCancellationCount ::
+  ( Redis.HedisFlow m r,
+    EsqDBFlow m r,
+    CacheFlow m r
+  ) =>
+  Id DMOC.MerchantOperatingCity ->
+  Id DP.Person ->
+  m ()
+incrementCancellationCount _merchantOpCityId driverId = BTRecorder.incrementCounterOnly rideCancellationCounterConfig BTT.DRIVER driverId.getId rideCancellationActionType BTT.ACTION_COUNT
+
+getLatestCancellationRatio' ::
+  ( EsqDBFlow m r,
+    CacheFlow m r,
+    Redis.HedisFlow m r
+  ) =>
+  Id DMOC.MerchantOperatingCity ->
+  Id DP.Driver ->
+  m Double
+getLatestCancellationRatio' merchantOpCityId driverId = Redis.withCrossAppRedis . withCancellationAndRideFrequencyRatioWindowOption merchantOpCityId $ SWC.getLatestRatio driverId.getId (BTAcc.mkCounterKey rideCancellationCounterConfig.hashTagEntityId BTT.DRIVER rideCancellationActionType BTT.ACTION_COUNT) (BTAcc.mkCounterKey rideCancellationCounterConfig.hashTagEntityId BTT.DRIVER rideCancellationActionType BTT.ELIGIBLE_COUNT)
+
+getLatestCancellationRatio ::
+  ( EsqDBFlow m r,
+    CacheFlow m r,
+    Redis.HedisFlow m r
+  ) =>
+  CancellationScoreRelatedConfig ->
+  Id DMOC.MerchantOperatingCity ->
+  Id DP.Driver ->
+  m Double
+getLatestCancellationRatio cancellationScoreRelatedConfig merchantOpCityId driverId = do
+  isThresholdRidesDone <- isThresholdRidesCompleted driverId merchantOpCityId cancellationScoreRelatedConfig
+  if isThresholdRidesDone
+    then getLatestCancellationRatio' merchantOpCityId driverId
+    else pure 0
+
+getCurrentWindowAvailability ::
+  ( Redis.HedisFlow m r,
+    EsqDBFlow m r,
+    CacheFlow m r,
+    FromJSON a,
+    ToJSON a,
+    Num a
+  ) =>
+  Id DMOC.MerchantOperatingCity ->
+  Id DP.Driver ->
+  m [Maybe a]
+getCurrentWindowAvailability merchantOpCityId driverId = Redis.withCrossAppRedis . withAvailabilityTimeWindowOption merchantOpCityId $ SWC.getCurrentWindowValues (mkAvailableTimeKey driverId.getId)
+
+-- | Shared quote-response eligibility (bt: ELIGIBLE_COUNT under QUOTE_RESPONSE): one +1 per
+-- request actually sent to the driver, whether he later accepts, rejects or ignores it.
+-- Multi-cloud so the behavior framework's cross-cloud readers see the same series.
+incrementSrdSentCount ::
+  ( Redis.HedisFlow m r,
+    EsqDBFlow m r,
+    CacheFlow m r
+  ) =>
+  Id DP.Person ->
+  m ()
+incrementSrdSentCount driverId = BTRecorder.incrementCounterOnly quoteResponseCounterConfig BTT.DRIVER driverId.getId quoteResponseEligibleActionType BTT.ELIGIBLE_COUNT
+
+decrementSrdSentCount ::
+  ( Redis.HedisFlow m r,
+    EsqDBFlow m r,
+    CacheFlow m r
+  ) =>
+  UTCTime ->
+  Id DP.Person ->
+  m ()
+decrementSrdSentCount sentAt driverId = BTRecorder.decrementCounterOnly quoteResponseCounterConfig BTT.DRIVER driverId.getId quoteResponseEligibleActionType BTT.ELIGIBLE_COUNT sentAt
+
+-- Fetch all 8 per-driver sliding-window counts (today = last 1 day-bucket, weekly = last 7
+-- day-buckets) for use in the POOLING dynamic-logic data. All four series are behavior-tracker
+-- (bt:) counters — the same ones the behavior framework's rules and snapshots use — so pooling
+-- dynamic logic and behavior rules always judge the same numbers.
+-- Fallback cap on how many drivers' keys go into a single pipelined MGET, so a large pool never
+-- issues one unboundedly large multi-key Redis read in a single I/O. Overridable per pool via
+-- DriverPoolConfig.srdCountersBulkChunkSize.
+defaultBulkDriverChunkSize :: Int
+defaultBulkDriverChunkSize = 50
+
+chunksOfList :: Int -> [a] -> [[a]]
+chunksOfList _ [] = []
+chunksOfList n xs
+  | n <= 0 = [xs]
+  | otherwise = let (a, rest) = splitAt n xs in a : chunksOfList n rest
+
+-- | Bulk per-driver SRD counters for the pool batch, in pipelined cross-slot MGETs of at most
+-- @fromMaybe defaultBulkDriverChunkSize mbChunkSize@ drivers each. Reads each counter's 7 per-day
+-- bucket keys directly (the authoritative integers written by incrementWindowCount, built via the
+-- SWC lib's own key builders so the format matches exactly), so it needs neither the per-key
+-- combined-cache read/lock nor N separate round-trips. today = current day-bucket (index 0),
+-- weekly = sum over the 7 day-buckets.
+getSrdStatsCountersBulk ::
+  ( MonadFlow m,
+    EsqDBFlow m r,
+    CacheFlow m r
+  ) =>
+  Maybe Int ->
+  [Id DP.Person] ->
+  m (Map.Map (Id DP.Person) SearchReqDriverStatsCounters)
+getSrdStatsCountersBulk mbChunkSize driverIds =
+  Map.unions <$> mapM readChunk (chunksOfList (fromMaybe defaultBulkDriverChunkSize mbChunkSize) driverIds)
+  where
+    baseKeysFor did =
+      [ mkQuoteResponseCounterKey quoteResponseAcceptActionType BTT.ACTION_COUNT did,
+        BTAcc.mkCounterKey rideCancellationCounterConfig.hashTagEntityId BTT.DRIVER rideCancellationActionType BTT.ACTION_COUNT did,
+        mkQuoteResponseCounterKey quoteResponseRejectActionType BTT.ACTION_COUNT did,
+        mkQuoteResponseCounterKey quoteResponseEligibleActionType BTT.ELIGIBLE_COUNT did
+      ]
+    readChunk [] = pure Map.empty
+    readChunk chunk = do
+      now <- getCurrentTime
+      let dayKeys bk = SWC.getkeysForLastPeriods srdStatsWindow now (SWC.makeSlidingWindowKey srdStatsWindow.periodType bk)
+          allKeys = concatMap (\d -> concatMap dayKeys (baseKeysFor d.getId)) chunk
+      pairs <- Redis.withCrossAppRedis $ Redis.mGetClusterWithKeys @Integer allKeys
+      let valMap = Map.fromList pairs
+          sumHead ks =
+            let vs = map (\k -> Map.findWithDefault 0 k valMap) ks
+             in (fromIntegral (case vs of (x : _) -> x; _ -> 0 :: Integer), fromIntegral (sum vs))
+          countersFor did =
+            let (accT, accW) = sumHead (dayKeys (mkQuoteResponseCounterKey quoteResponseAcceptActionType BTT.ACTION_COUNT did))
+                (canT, canW) = sumHead (dayKeys (BTAcc.mkCounterKey rideCancellationCounterConfig.hashTagEntityId BTT.DRIVER rideCancellationActionType BTT.ACTION_COUNT did))
+                (rejT, rejW) = sumHead (dayKeys (mkQuoteResponseCounterKey quoteResponseRejectActionType BTT.ACTION_COUNT did))
+                (sentT, sentW) = sumHead (dayKeys (mkQuoteResponseCounterKey quoteResponseEligibleActionType BTT.ELIGIBLE_COUNT did))
+             in SearchReqDriverStatsCounters
+                  { acceptanceCountToday = accT,
+                    acceptanceCountWeekly = accW,
+                    cancelledRidesToday = canT,
+                    cancelledRidesWeekly = canW,
+                    rejectionCountToday = rejT,
+                    rejectionCountWeekly = rejW,
+                    totalRequestsSentToday = sentT,
+                    totalRequestsSentWeekly = sentW
+                  }
+      pure $ Map.fromList [(d, countersFor d.getId) | d <- chunk]
+
+isThresholdRidesCompleted ::
+  ( CacheFlow m r,
+    EsqDBFlow m r
+  ) =>
+  Id DP.Driver ->
+  Id DMOC.MerchantOperatingCity ->
+  CancellationScoreRelatedConfig ->
+  m Bool
+isThresholdRidesCompleted driverId merchantOpCityId cancellationScoreRelatedConfig = do
+  let minRidesForCancellationScore = fromMaybe 5 cancellationScoreRelatedConfig.minRidesForCancellationScore
+  totalRides <- getTotalRidesCount merchantOpCityId driverId
+  pure $ totalRides >= minRidesForCancellationScore
+
+getPopupDelay ::
+  ( CacheFlow m r,
+    EsqDBFlow m r
+  ) =>
+  Id DMOC.MerchantOperatingCity ->
+  Id DP.Driver ->
+  Double ->
+  CancellationScoreRelatedConfig ->
+  Seconds ->
+  m Seconds
+getPopupDelay merchantOpCityId driverId cancellationRatio cancellationScoreRelatedConfig defaultPopupDelay = do
+  let cancellationRatioThreshold = fromIntegral $ fromMaybe 40 cancellationScoreRelatedConfig.thresholdCancellationScore
+  (defaultPopupDelay +)
+    <$> if cancellationRatio * 100 > cancellationRatioThreshold
+      then do
+        isThresholdRidesDone <- isThresholdRidesCompleted driverId merchantOpCityId cancellationScoreRelatedConfig
+        pure $
+          if isThresholdRidesDone
+            then fromMaybe (Seconds 0) cancellationScoreRelatedConfig.popupDelayToAddAsPenalty
+            else Seconds 0
+      else pure $ Seconds 0
+
+mkDriverLocationUpdatesKey :: Id DMOC.MerchantOperatingCity -> Id DP.Person -> Text
+mkDriverLocationUpdatesKey mocId dId = "driver-offer:DriverPool:mocId-" <> mocId.getId <> ":dId:" <> dId.getId
+
+updateDriverSpeedInRedis ::
+  ( CacheFlow m r,
+    EsqDBFlow m r
+  ) =>
+  Id DMOC.MerchantOperatingCity ->
+  Id DP.Person ->
+  LatLong ->
+  UTCTime ->
+  m ()
+updateDriverSpeedInRedis merchantOpCityId driverId points timeStamp = Redis.withCrossAppRedis $ do
+  locationUpdateSampleTime <- maybe 3 (.locationUpdateSampleTime) <$> CDIP.findByMerchantOpCityId merchantOpCityId (Just (DriverId (cast driverId)))
+  now <- getCurrentTime
+  let driverLocationUpdatesKey = mkDriverLocationUpdatesKey merchantOpCityId driverId
+  locationUpdatesList :: [(LatLong, UTCTime)] <-
+    sortOn (Down . snd)
+      . ((points, timeStamp) :)
+      . filter
+        ( \(_, time) ->
+            time > addUTCTime (fromIntegral $ (-60) * locationUpdateSampleTime.getMinutes) now
+        )
+      . concat
+      <$> Redis.safeGet driverLocationUpdatesKey
+  Redis.set driverLocationUpdatesKey locationUpdatesList
+
+getDriverAverageSpeed ::
+  ( CacheFlow m r,
+    EsqDBFlow m r
+  ) =>
+  Id DMOC.MerchantOperatingCity ->
+  Id DP.Person ->
+  m Double
+getDriverAverageSpeed merchantOpCityId driverId = Redis.withCrossAppRedis $ do
+  intelligentPoolConfig <- CDIP.findByMerchantOpCityId merchantOpCityId (Just (DriverId (cast driverId)))
+  let minLocationUpdates = maybe 3 (.minLocationUpdates) intelligentPoolConfig
+      defaultDriverSpeed = maybe 27.0 (.defaultDriverSpeed) intelligentPoolConfig
+  let driverLocationUpdatesKey = mkDriverLocationUpdatesKey merchantOpCityId driverId
+  locationUpdatesList :: [(LatLong, UTCTime)] <- concat <$> Redis.safeGet driverLocationUpdatesKey
+  let locationUpdatesCount = length locationUpdatesList
+  if locationUpdatesCount > minLocationUpdates
+    then do
+      let locationUpdatesPairs = zip (drop 1 locationUpdatesList) (take (locationUpdatesCount - 1) locationUpdatesList)
+          (totalDistanceTravelled, totalTimeTaken) :: (HighPrecMeters, Centi) =
+            foldr
+              ( \((locationA, timeA), (locationB, timeB)) (accDis, accTime) -> do
+                  let distance = CD.distanceBetweenInMeters locationB locationA
+                      timeTaken = fromInteger . floor $ diffUTCTime timeB timeA
+                  (accDis + distance, accTime + timeTaken)
+              )
+              (0, 0)
+              locationUpdatesPairs
+      pure . fromRational . toRational $ totalDistanceTravelled.getHighPrecMeters.getCenti / totalTimeTaken
+    else pure defaultDriverSpeed
+
+mkBlockListedDriversKey :: Id SearchRequest -> Text
+mkBlockListedDriversKey searchReqId = "Block-Listed-Drivers-Key:SearchRequestId-" <> searchReqId.getId
+
+mkBlockListedDriversForRiderKey :: Id RiderDetails -> Text
+mkBlockListedDriversForRiderKey riderId = "Block-Listed-Drivers-Key:RiderId-" <> riderId.getId
+
+addDriverToSearchCancelledList ::
+  ( CacheFlow m r
+  ) =>
+  Seconds ->
+  Id SearchRequest ->
+  Id DP.Person ->
+  m ()
+addDriverToSearchCancelledList blacklistTtl searchReqId driverId = do
+  let keyForDriverCancelledList = mkBlockListedDriversKey searchReqId
+  cacheBlockListedDrivers blacklistTtl keyForDriverCancelledList driverId
+
+addDriverToRiderCancelledList ::
+  ( CacheFlow m r
+  ) =>
+  Seconds ->
+  Id DP.Person ->
+  Id RiderDetails ->
+  m ()
+addDriverToRiderCancelledList blacklistTtl driverId riderId = do
+  let keyForDriverCancelledList = mkBlockListedDriversForRiderKey riderId
+  cacheBlockListedDrivers blacklistTtl keyForDriverCancelledList driverId
+
+cacheBlockListedDrivers ::
+  ( CacheFlow m r
+  ) =>
+  Seconds ->
+  Text ->
+  Id DP.Person ->
+  m ()
+cacheBlockListedDrivers blacklistTtl key driverId = do
+  Redis.withCrossAppRedis $ Redis.rPushExp key [driverId] (fromIntegral blacklistTtl)
+
+convertDriverPoolWithActualDistResultToNearestGoHomeDriversResult :: Bool -> Bool -> DriverPoolWithActualDistResult -> NearestGoHomeDriversResult -- # TODO: Lets merge these two types
+convertDriverPoolWithActualDistResultToNearestGoHomeDriversResult onRide_ isSpecialLocWarrior DriverPoolWithActualDistResult {driverPoolResult = DriverPoolResult {..}} = do
+  NearestGoHomeDriversResult {distanceToDriver = distanceToPickup, tripDistanceMinThreshold = Nothing, tripDistanceMaxThreshold = Nothing, onRide = onRide_, selectedAutoAcceptTiers = Just selectedAutoAcceptTiers, ..}
+
+-- When straight-line pickup is within `thresholdToIgnoreActualDistanceThreshold`, skip Maps
+-- and treat that straight-line distance as `actualDistanceToPickup` for inclusion + ranking.
+mkDriverPoolWithStraightLineAsActualDistance ::
+  Seconds ->
+  DriverPoolResult ->
+  DriverPoolWithActualDistResult
+mkDriverPoolWithStraightLineAsActualDistance defaultPopupDelay dpr =
+  DriverPoolWithActualDistResult
+    { driverPoolResult = dpr,
+      actualDistanceToPickup = dpr.distanceToPickup,
+      actualDurationToPickup = Seconds 60,
+      intelligentScores = IntelligentScores Nothing Nothing Nothing Nothing Nothing Nothing defaultPopupDelay,
+      isPartOfIntelligentPool = False,
+      pickupZone = False,
+      specialZoneExtraTip = Nothing,
+      searchTags = Nothing,
+      tripDistance = Nothing,
+      keepHiddenForSeconds = Seconds 0,
+      goHomeReqId = Nothing,
+      specialLocWarriorPreferredSpecialLocId = Nothing,
+      isForwardRequest = False,
+      previousDropGeoHash = Nothing,
+      score = dpr.score,
+      poolingLogicVersion = Nothing,
+      searchReqDriverStatsCounters = Nothing,
+      idleTimeSeconds = Nothing,
+      preferenceMatchScore = 1.0
+    }
+
+partitionByIgnoreActualDistanceThreshold ::
+  Maybe Meters ->
+  [DriverPoolResult] ->
+  ([DriverPoolResult], [DriverPoolResult]) -- (skipMaps, needMaps)
+partitionByIgnoreActualDistanceThreshold (Just ignoreThresh) =
+  partition (\dpr -> dpr.distanceToPickup <= ignoreThresh)
+partitionByIgnoreActualDistanceThreshold Nothing = \xs -> ([], xs)
+
+-- this is not required in the flow where we convert them
+
+filterOutGoHomeDriversAccordingToHomeLocation ::
+  ( EncFlow m r,
+    CacheFlow m r,
+    EsqDBFlow m r,
+    Esq.EsqDBReplicaFlow m r,
+    CoreMetrics m,
+    MonadIO m,
+    HasCoordinates a,
+    LT.HasLocationService m r,
+    CoreMetrics m,
+    HasShortDurationRetryCfg r c,
+    HasKafkaProducer r,
+    Redis.HedisLTSFlowEnv r
+  ) =>
+  [NearestGoHomeDriversResult] ->
+  CalculateGoHomeDriverPoolReq a ->
+  Id DMOC.MerchantOperatingCity ->
+  m ([DriverPoolWithActualDistResult], [Id DP.Driver])
+filterOutGoHomeDriversAccordingToHomeLocation randomDriverPool CalculateGoHomeDriverPoolReq {..} merchantOpCityId = do
+  logDebug $ "MetroWarriorDebugging randomDriverPool -----" <> show randomDriverPool
+  now <- getCurrentTime
+  goHomeRequests <-
+    mapMaybeM
+      ( \driver -> runMaybeT $ do
+          ghrId <- MaybeT $ CQDGR.getDriverGoHomeRequestInfo driver.driverId merchantOpCityId Nothing <&> (.driverGoHomeRequestId)
+          goHomeReq <- MaybeT $ QDGR.findById ghrId
+          return (goHomeReq, driver, Nothing)
+      )
+      randomDriverPool
+  let specialLocWarriorDrivers = filter (\driver -> driver.isSpecialLocWarrior) randomDriverPool -- specialLocWarriorDriversInfo <- Int.getSpecialLocWarriorDriverInfo specialLocWarriorDrivers
+  logDebug $ "MetroWarriorDebugging specialLocWarriorDrivers -----" <> show specialLocWarriorDrivers
+  specialLocgoHomeRequests <-
+    mapMaybeM
+      ( \specialLocWarriorDriver -> runMaybeT $ do
+          driverInfo <- MaybeT $ Int.getSpecialLocWarriorDriverInfo specialLocWarriorDriver.driverId.getId
+          specialLocWarriorDriverInfo <- MaybeT $ return $ if driverInfo.isSpecialLocWarrior then Just driverInfo else Nothing
+          preferredLocId <- MaybeT $ return specialLocWarriorDriverInfo.preferredPrimarySpecialLocId
+          preferredLoc <- MaybeT $ TDI.getPreferredPrimarySpecialLoc (Just preferredLocId.getId)
+          preferredLocGate <- MaybeT $ return $ listToMaybe preferredLoc.gates
+          let gHR =
+                DDGR.DriverGoHomeRequest
+                  { createdAt = now,
+                    driverId = driverInfo.driverId,
+                    id = Id "specialLocWarriorGoHomeId",
+                    lat = preferredLocGate.point.lat,
+                    lon = preferredLocGate.point.lon,
+                    mbReachedHome = Nothing,
+                    numCancellation = 0,
+                    status = DDGR.ACTIVE,
+                    updatedAt = now,
+                    merchantId = Just merchantId,
+                    merchantOperatingCityId = Just merchantOpCityId
+                  }
+          return (gHR, specialLocWarriorDriver, Just preferredLocId)
+      )
+      specialLocWarriorDrivers
+  logDebug $ "MetroWarriorDebugging specialLocgoHomeRequests -----" <> show specialLocgoHomeRequests
+  let convertedDriverPoolRes = map (\(ghr, driver, mbPreferredSpecialLocId) -> (ghr, driver, mbPreferredSpecialLocId, makeDriverPoolRes driver)) (goHomeRequests <> specialLocgoHomeRequests)
+  driverGoHomePoolWithActualDistance <-
+    case convertedDriverPoolRes of
+      [] -> return []
+      _ -> do
+        let (skipMapsRes, needMapsRes) =
+              case driverPoolCfg.thresholdToIgnoreActualDistanceThreshold of
+                Just ignoreThresh -> partition (\(_, driver, _, _) -> driver.distanceToDriver <= ignoreThresh) convertedDriverPoolRes
+                Nothing -> ([], convertedDriverPoolRes)
+            skippedWithStraightLine =
+              map
+                (\(ghr, driver, mbPreferredSpecialLocId, dpr) -> (ghr, driver, mbPreferredSpecialLocId, mkDriverPoolWithStraightLineAsActualDistance transporterConfig.defaultPopupDelay dpr))
+                skipMapsRes
+        needMapsWithActualDistance <-
+          case needMapsRes of
+            [] -> return []
+            _ -> do
+              computed <-
+                zipWith (curry (\((ghr, driver, mbPreferredSpecialLocId, _), dpwAD) -> (ghr, driver, mbPreferredSpecialLocId, dpwAD))) needMapsRes . NE.toList
+                  <$> computeActualDistance driverPoolCfg.distanceUnit merchantId merchantOpCityId Nothing fromLocation (NE.fromList $ map (\(_, _, _, c) -> c) needMapsRes) currentSearchInfo
+              case driverPoolCfg.actualDistanceThreshold of
+                Nothing -> return computed
+                Just threshold -> do
+                  logDebug $ "Threshold :" <> show threshold
+                  let res = filter (\(_, _, _, dpwAD) -> getMeters dpwAD.actualDistanceToPickup <= fromIntegral threshold) computed
+                  logDebug $ "secondly filtered go home driver pool" <> show (map (\(_, driver, _, _) -> driver) res)
+                  return res
+        return $ skippedWithStraightLine <> needMapsWithActualDistance
+
+  driversRoutes' <- getRoutesForAllDrivers driverGoHomePoolWithActualDistance
+  let driversRoutes = map (refactorRoutesResp goHomeCfg) driversRoutes'
+  let driversOnWayToHome =
+        filter
+          ( \(_, driverRoute, _, _, _) ->
+              any (\wp -> highPrecMetersToMeters (distanceBetweenInMeters (getCoordinates toLocation) wp) <= goHomeCfg.goHomeWayPointRadius) driverRoute.points
+          )
+          driversRoutes
+  let goHomeDriverIdsToDest = map (\(driver, _, _, _, _) -> driver.driverId) driversOnWayToHome
+  let goHomeDriverIdsNotToDest = map (\(_, driver, _, _) -> driver.driverId) $ filter (\(_, driver, _, _) -> driver.driverId `notElem` goHomeDriverIdsToDest) driverGoHomePoolWithActualDistance
+  logDebug $ "MetroWarriorDebugging goHomeDriverIdsToDest -----" <> show goHomeDriverIdsToDest
+  logDebug $ "MetroWarriorDebugging goHomeDriverIdsNotToDest -----" <> show goHomeDriverIdsNotToDest
+  let goHomeDriverPoolWithActualDist = makeDriverPoolWithActualDistResult <$> driversOnWayToHome
+  logDebug $ "MetroWarriorDebugging goHomeDriverPoolWithActualDist -----" <> show goHomeDriverPoolWithActualDist
+  return (take (getBatchSize driverPoolCfg.dynamicBatchSize (-1) driverPoolCfg.driverBatchSize) goHomeDriverPoolWithActualDist, goHomeDriverIdsNotToDest)
+  where
+    makeDriverPoolRes NearestGoHomeDriversResult {..} =
+      DriverPoolResult
+        { distanceToPickup = distanceToDriver,
+          customerTags = Nothing,
+          minRideDistance = Nothing,
+          maxRideDistance = Nothing,
+          maxPickupDistance = Nothing,
+          isPetModeEnabled = False,
+          vehicleNumber = Nothing,
+          onRide = Just onRide,
+          previousRideDropLat = Nothing,
+          previousRideDropLon = Nothing,
+          distanceFromDriverToDestination = Nothing,
+          selectedAutoAcceptTiers = fromMaybe [] selectedAutoAcceptTiers,
+          ..
+        }
+
+    getRoutesForAllDrivers =
+      mapM
+        ( \(ghReq, driver, mbPreferredSpecialLocId, driverGoHomePoolWithActualDistance) -> do
+            routes <-
+              Maps.getTripRoutes merchantId merchantOpCityId Nothing $
+                Maps.GetRoutesReq
+                  { waypoints = getCoordinates driver :| [getCoordinates ghReq],
+                    mode = Just Maps.CAR,
+                    calcPoints = True
+                  }
+            let route = if null routes then defRouteInfo else head routes
+            return (driver, route, ghReq.id, mbPreferredSpecialLocId, driverGoHomePoolWithActualDistance)
+        )
+
+    defRouteInfo =
+      RouteInfo
+        { duration = Nothing,
+          staticDuration = Nothing,
+          distance = Nothing,
+          distanceWithUnit = Nothing,
+          boundingBox = Nothing,
+          snappedWaypoints = [],
+          points = [],
+          routeToken = Nothing,
+          trafficSegments = Nothing
+        }
+
+    makeDriverPoolWithActualDistResult (driverPoolRes, _, ghrId, mbPreferredSpecialLocId, driverGoHomePoolWithActualDistance) = do
+      DriverPoolWithActualDistResult
+        { driverPoolResult = makeDriverPoolResultFromGoHome driverPoolRes,
+          actualDistanceToPickup = driverGoHomePoolWithActualDistance.actualDistanceToPickup, --fromMaybe 0 driverRoute.distance,
+          actualDurationToPickup = driverGoHomePoolWithActualDistance.actualDurationToPickup,
+          intelligentScores = IntelligentScores Nothing Nothing Nothing Nothing Nothing Nothing transporterConfig.defaultPopupDelay,
+          isPartOfIntelligentPool = False,
+          pickupZone = False,
+          specialZoneExtraTip = Nothing,
+          searchTags = Nothing,
+          tripDistance = Nothing,
+          keepHiddenForSeconds = Seconds 0,
+          goHomeReqId = if ghrId.getId == "specialLocWarriorGoHomeId" then Nothing else Just ghrId,
+          isForwardRequest = False,
+          previousDropGeoHash = Nothing,
+          specialLocWarriorPreferredSpecialLocId = mbPreferredSpecialLocId,
+          score = driverGoHomePoolWithActualDistance.score,
+          poolingLogicVersion = driverGoHomePoolWithActualDistance.poolingLogicVersion,
+          searchReqDriverStatsCounters = Nothing,
+          idleTimeSeconds = Nothing,
+          preferenceMatchScore = 1.0
+        }
+
+    makeDriverPoolResultFromGoHome NearestGoHomeDriversResult {serviceTier = serviceTier', ..} =
+      DriverPoolResult
+        { distanceToPickup = distanceToDriver,
+          serviceTier = serviceTier',
+          customerTags = Nothing,
+          minRideDistance = Nothing,
+          maxRideDistance = Nothing,
+          maxPickupDistance = Nothing,
+          isPetModeEnabled = False,
+          vehicleNumber = Nothing,
+          onRide = Just onRide,
+          previousRideDropLat = Nothing,
+          previousRideDropLon = Nothing,
+          distanceFromDriverToDestination = Nothing,
+          selectedAutoAcceptTiers = fromMaybe [] selectedAutoAcceptTiers,
+          ..
+        }
+
+data CalculateDriverPoolReq a = CalculateDriverPoolReq
+  { cityServiceTiers :: [DVST.VehicleServiceTier],
+    poolStage :: PoolCalculationStage,
+    driverPoolCfg :: DriverPoolConfig,
+    serviceTiers :: [DVST.ServiceTierType],
+    pickup :: a,
+    merchantId :: Id DM.Merchant,
+    merchantOperatingCityId :: Id DMOC.MerchantOperatingCity,
+    transporterConfig :: DTC.TransporterConfig,
+    rideFare :: Maybe HighPrecMoney,
+    govtCharges :: Maybe HighPrecMoney,
+    tollCharges :: Maybe HighPrecMoney,
+    parkingCharge :: Maybe HighPrecMoney,
+    airportEntryFee :: Maybe HighPrecMoney,
+    isAirportRequest :: Bool,
+    paymentInstrument :: Maybe MP.PaymentInstrument,
+    isRental :: Bool,
+    isInterCity :: Bool,
+    isScheduled :: Bool,
+    scheduledPickupTime :: Maybe UTCTime,
+    isValueAddNP :: Bool,
+    onlinePayment :: Bool,
+    now :: UTCTime,
+    paymentMode :: Maybe MP.PaymentMode,
+    currentRideTripCategoryValidForForwardBatching :: [Text],
+    excludeDriverIds :: [Id DP.Driver],
+    prevAttemptedDriverIds :: [Id DP.Driver]
+  }
+
+isScheduledOpenToAll :: Maybe Minutes -> UTCTime -> UTCTime -> Bool
+isScheduledOpenToAll mbThresholdMinutes pickupTime now =
+  maybe False (\n -> let remaining = diffUTCTime pickupTime now in remaining >= 0 && remaining <= fromIntegral (n.getMinutes * 60)) mbThresholdMinutes
+
+calculateDriverPool ::
+  ( BeamFlow m r,
+    EncFlow m r,
+    CacheFlow m r,
+    EsqDBFlow m r,
+    Esq.EsqDBReplicaFlow m r,
+    CoreMetrics m,
+    MonadFlow m,
+    HasCoordinates a,
+    LT.HasLocationService m r,
+    HasShortDurationRetryCfg r c,
+    HasKafkaProducer r,
+    Redis.HedisFlow m r,
+    Redis.HedisLTSFlowEnv r,
+    HasField "enableLtsPoolDataForPooling" r Bool
+  ) =>
+  CalculateDriverPoolReq a ->
+  m ([DriverPoolResult], [DriverPoolResult], [QP.NearestDriversResult]) -- (offRide, onRide, rawApproxPool)
+calculateDriverPool CalculateDriverPoolReq {..} = do
+  let radius = driverPoolCfg.maxRadiusOfSearch
+  let coord = getCoordinates pickup
+  enableLtsPoolData <- asks (.enableLtsPoolDataForPooling)
+  let fetchPoolData = if enableLtsPoolData then DPDBuilder.getOrBuildDriverPoolDataBatch else DPDBuilder.buildDriverPoolDataFromDB
+  -- R4: a still-unassigned scheduled ride within the open-to-all threshold drops eligibility (offered to everyone).
+  let scheduledOpenToAll = isScheduled && maybe False (\pt -> isScheduledOpenToAll transporterConfig.scheduledRideOpenToAllThresholdMinutes pt now) scheduledPickupTime
+  approxDriverPool <-
+    measuringDurationToLog INFO "calculateDriverPool" $
+      QPG.getNearestDrivers
+        QPG.NearestDriversReq
+          { fromLocLatLong = coord,
+            nearestRadius = radius,
+            driverPositionInfoExpiry = driverPoolCfg.driverPositionInfoExpiry,
+            prepaidSubscriptionThreshold = transporterConfig.subscriptionConfig.prepaidSubscriptionThreshold,
+            fleetPrepaidSubscriptionThreshold = transporterConfig.subscriptionConfig.fleetPrepaidSubscriptionThreshold,
+            vehicleCategoryScopedPrepaidEnabled = fromMaybe False transporterConfig.subscriptionConfig.vehicleCategoryScopedPrepaidEnabled,
+            minWalletAmountForCashRides = transporterConfig.driverWalletConfig.minWalletAmountForCashRides,
+            minWalletAmountForScheduledRides = transporterConfig.driverWalletConfig.minWalletAmountForScheduledRides,
+            paymentInstrument,
+            rideFare,
+            taxConfig = transporterConfig.taxConfig,
+            excludeDriverIds = excludeDriverIds,
+            prevAttemptedDriverIds = prevAttemptedDriverIds,
+            applyParallelRequestFilter = poolStage == DriverSelection,
+            maxParallelSearchRequests = driverPoolCfg.maxParallelSearchRequests,
+            searchTryId = Nothing,
+            ..
+          }
+        fetchPoolData
+  -- Split: off-ride drivers go into DriverPoolResult, on-ride returned separately
+  let (onRideDrivers, offRideDrivers) = partition (.onRide) approxDriverPool
+  let driverPoolResult = makeDriverPoolResult <$> offRideDrivers
+  let onRidePoolResult = makeDriverPoolResult <$> onRideDrivers
+  logDebug $ "driverPoolResult (off-ride): " <> show (length driverPoolResult) <> " on-ride: " <> show (length onRidePoolResult)
+  pure (driverPoolResult, onRidePoolResult, approxDriverPool)
+
+makeDriverPoolResult :: QP.NearestDriversResult -> DriverPoolResult
+makeDriverPoolResult QP.NearestDriversResult {..} =
+  DriverPoolResult
+    { distanceToPickup = distanceToDriver,
+      customerTags = Nothing,
+      minRideDistance = tripDistanceMinThreshold,
+      maxRideDistance = tripDistanceMaxThreshold,
+      driverGender = Just driverGender,
+      vehicleNumber,
+      reactBundleVersion = Nothing,
+      backendConfigVersion = Nothing,
+      backendAppVersion = Nothing,
+      onRide = Just onRide,
+      ..
+    }
+
+data FilterStage = NearBy | MaxParallelRequests | ActualDistance | TaggedPool
+  deriving (Generic, Show, FromJSON, ToJSON)
+
+data SearchTryBatchData = SearchTryBatchData
+  { searchTryId :: Text,
+    driverIds :: [Text],
+    filterStage :: FilterStage,
+    batchNum :: Int
+  }
+  deriving (Generic, Show, FromJSON, ToJSON)
+
+data SearchTryBatchPoolData = SearchTryBatchPoolData
+  { searchTryId :: Text,
+    driverPoolData :: [DriverPoolWithActualDistResult],
+    filterStage :: FilterStage,
+    batchNum :: Int
+  }
+  deriving (Generic, Show, FromJSON, ToJSON)
+
+calculateDriverPoolWithActualDist ::
+  ( EncFlow m r,
+    CacheFlow m r,
+    EsqDBFlow m r,
+    Esq.EsqDBReplicaFlow m r,
+    CoreMetrics m,
+    HasCoordinates a,
+    LT.HasLocationService m r,
+    HasKafkaProducer r,
+    HasShortDurationRetryCfg r c,
+    HasField "enableAPILatencyLogging" r Bool,
+    HasField "enableAPIPrometheusMetricLogging" r Bool,
+    Redis.HedisLTSFlowEnv r,
+    HasField "enableLtsPoolDataForPooling" r Bool
+  ) =>
+  CalculateDriverPoolReq a ->
+  PoolType ->
+  DST.CurrentSearchInfo ->
+  Int ->
+  m ([DriverPoolWithActualDistResult], [DriverPoolResult]) -- (offRideWithActualDist, onRidePool)
+calculateDriverPoolWithActualDist CalculateDriverPoolReq {..} poolType currentSearchInfo batchNum = do
+  let radius = driverPoolCfg.maxRadiusOfSearch
+  let coord = getCoordinates pickup
+  enableLtsPoolData <- asks (.enableLtsPoolDataForPooling)
+  let fetchPoolData = if enableLtsPoolData then DPDBuilder.getOrBuildDriverPoolDataBatch else DPDBuilder.buildDriverPoolDataFromDB
+  -- R4: a still-unassigned scheduled ride within the open-to-all threshold drops eligibility (offered to everyone).
+  let scheduledOpenToAll = isScheduled && maybe False (\pt -> isScheduledOpenToAll transporterConfig.scheduledRideOpenToAllThresholdMinutes pt now) scheduledPickupTime
+  let ltsReq =
+        QPG.NearestDriversReq
+          { fromLocLatLong = coord,
+            nearestRadius = radius,
+            driverPositionInfoExpiry = driverPoolCfg.driverPositionInfoExpiry,
+            prepaidSubscriptionThreshold = transporterConfig.subscriptionConfig.prepaidSubscriptionThreshold,
+            fleetPrepaidSubscriptionThreshold = transporterConfig.subscriptionConfig.fleetPrepaidSubscriptionThreshold,
+            vehicleCategoryScopedPrepaidEnabled = fromMaybe False transporterConfig.subscriptionConfig.vehicleCategoryScopedPrepaidEnabled,
+            minWalletAmountForCashRides = transporterConfig.driverWalletConfig.minWalletAmountForCashRides,
+            minWalletAmountForScheduledRides = transporterConfig.driverWalletConfig.minWalletAmountForScheduledRides,
+            paymentInstrument,
+            rideFare,
+            taxConfig = transporterConfig.taxConfig,
+            excludeDriverIds = excludeDriverIds,
+            prevAttemptedDriverIds = prevAttemptedDriverIds,
+            applyParallelRequestFilter = True,
+            maxParallelSearchRequests = driverPoolCfg.maxParallelSearchRequests,
+            cityServiceTiers,
+            serviceTiers,
+            merchantId,
+            isRental,
+            isInterCity,
+            isScheduled,
+            scheduledOpenToAll,
+            scheduledPickupTime,
+            currentRideTripCategoryValidForForwardBatching,
+            govtCharges,
+            tollCharges,
+            parkingCharge,
+            airportEntryFee,
+            isAirportRequest,
+            isValueAddNP,
+            onlinePayment,
+            now,
+            paymentMode,
+            searchTryId = Just currentSearchInfo.searchTry.id.getId
+          }
+  sortedCandidates <- withTimeAPI "driverPooling" "fetchSortedLTSCandidates" $ QPG.fetchSortedLTSCandidates ltsReq
+  let totalCandidates = length sortedCandidates
+  (offRideFinal, onRideFinal) <- chunkLoop ltsReq fetchPoolData sortedCandidates [] []
+  fork "Driver Pool Search Try Batch - Analytics" $ do
+    pushToKafka
+      ( SearchTryBatchData
+          { searchTryId = currentSearchInfo.searchTry.id.getId,
+            driverIds = map ((.getId) . (.driverId) . QPG.driverLoc) sortedCandidates,
+            filterStage = NearBy,
+            batchNum = batchNum
+          }
+      )
+      "search-try-batch"
+      currentSearchInfo.searchTry.id.getId
+    pushToKafka
+      ( SearchTryBatchData
+          { searchTryId = currentSearchInfo.searchTry.id.getId,
+            driverIds = map ((.getId) . (.driverId) . (.driverPoolResult)) offRideFinal,
+            filterStage = ActualDistance,
+            batchNum = batchNum
+          }
+      )
+      "search-try-batch"
+      currentSearchInfo.searchTry.id.getId
+  logDebug $
+    "calculateDriverPoolWithActualDist chunked: totalCandidates=" <> show totalCandidates
+      <> " offRideFinal="
+      <> show (length offRideFinal)
+      <> " onRideFinal="
+      <> show (length onRideFinal)
+  return (offRideFinal, onRideFinal)
+  where
+    chunkSize :: Int
+    chunkSize = 50
+    minSurvivors :: Int
+    minSurvivors = 25
+
+    isBookAnyRequest = length serviceTiers > 1
+    searchTryId = currentSearchInfo.searchTry.id
+
+    -- Drops previously-attempted drivers whose per-search re-ask counter (set by
+    -- `incrementDriverRequestCount` at end of each batch) is at the configured limit.
+    -- Newcomers (not in the prev-attempted set) always pass — skips the Redis call entirely.
+    filterPrevAttemptedByRequestCount prevAttemptedIds = filterM $ \r ->
+      if r.driverId `elem` prevAttemptedIds
+        then DPD.checkRequestCount searchTryId isBookAnyRequest r.driverId r.serviceTier r.serviceTierDowngradeLevel driverPoolCfg
+        else pure True
+
+    chunkLoop ltsReq fetchPoolData remaining offRideAcc onRideAcc = do
+      if length offRideAcc >= minSurvivors || null remaining
+        then pure (offRideAcc, onRideAcc)
+        else do
+          let (chunk, rest) = splitAt chunkSize remaining
+              chunkPrevAttemptedIds = map ((.driverId) . QPG.driverLoc) (filter QPG.isPrevAttempted chunk)
+          chunkResults <- withTimeAPI "driverPooling" "processCandidatesChunk" $ QPG.processCandidatesChunk ltsReq fetchPoolData chunk
+          rateLimited <-
+            if null chunkPrevAttemptedIds
+              then pure chunkResults
+              else filterPrevAttemptedByRequestCount chunkPrevAttemptedIds chunkResults
+          let (chunkOnRide, chunkOffRide) = partition (.onRide) rateLimited
+              chunkOnRideAsPool = makeDriverPoolResult <$> chunkOnRide
+          processedOffRide <- runOffRideStages chunkOffRide
+          chunkLoop ltsReq fetchPoolData rest (offRideAcc <> processedOffRide) (onRideAcc <> chunkOnRideAsPool)
+
+    runOffRideStages chunkOffRide = case poolType of
+      SpecialZoneQueuePool -> pure $ map (mkSpecialZoneQueueActualDistanceResult . makeDriverPoolResult) chunkOffRide
+      _ -> case chunkOffRide of
+        [] -> pure []
+        (a : as) -> do
+          let chunkPool = NE.toList $ makeDriverPoolResult <$> (a :| as)
+              (skipMapsPool, needMapsPool) =
+                partitionByIgnoreActualDistanceThreshold driverPoolCfg.thresholdToIgnoreActualDistanceThreshold chunkPool
+              skippedWithStraightLine =
+                map (mkDriverPoolWithStraightLineAsActualDistance transporterConfig.defaultPopupDelay) skipMapsPool
+          mapsThresholded <- case needMapsPool of
+            [] -> pure []
+            (b : bs) -> do
+              drvPoolWithDist <-
+                withTimeAPI "driverPooling" "computeActualDistance" $
+                  computeActualDistance driverPoolCfg.distanceUnit merchantId merchantOperatingCityId Nothing pickup (b :| bs) currentSearchInfo
+              pure $
+                case driverPoolCfg.actualDistanceThreshold of
+                  Nothing -> NE.toList drvPoolWithDist
+                  Just threshold -> filter (\dis -> getMeters dis.actualDistanceToPickup <= fromIntegral threshold) (NE.toList drvPoolWithDist)
+          withTimeAPI "driverPooling" "filterM scheduledRideFilter" $
+            applyScheduledRideFilter currentSearchInfo merchantId merchantOperatingCityId isRental isInterCity transporterConfig (skippedWithStraightLine <> mapsThresholded)
+
+    mkSpecialZoneQueueActualDistanceResult dpr = do
+      DriverPoolWithActualDistResult
+        { driverPoolResult = dpr,
+          actualDistanceToPickup = dpr.distanceToPickup,
+          actualDurationToPickup = Seconds 180,
+          intelligentScores = IntelligentScores Nothing Nothing Nothing Nothing Nothing Nothing 0,
+          isPartOfIntelligentPool = False,
+          pickupZone = False,
+          specialZoneExtraTip = Nothing,
+          searchTags = Nothing,
+          tripDistance = Nothing,
+          keepHiddenForSeconds = Seconds 0,
+          goHomeReqId = Nothing,
+          specialLocWarriorPreferredSpecialLocId = Nothing,
+          isForwardRequest = False,
+          previousDropGeoHash = Nothing,
+          score = dpr.score,
+          poolingLogicVersion = Nothing,
+          searchReqDriverStatsCounters = Nothing,
+          idleTimeSeconds = Nothing,
+          preferenceMatchScore = 1.0
+        }
+
+scheduledRideFilter :: (MonadFlow m, MonadTime m, LT.HasLocationService m r, ServiceFlow m r) => DST.CurrentSearchInfo -> Id DM.Merchant -> Id DMOC.MerchantOperatingCity -> Bool -> Bool -> DTC.TransporterConfig -> DriverPoolWithActualDistResult -> m Bool
+scheduledRideFilter currentSearchInfo merchantId merchantOpCityId isRental isIntercity transporterConfig driverPoolWithActualDistResult = do
+  now <- getCurrentTime
+  let driverInfo = driverPoolWithActualDistResult.driverPoolResult
+  let minimumScheduledBookingLeadTimeInSecs = KP.intToNominalDiffTime (transporterConfig.minmRentalAndScheduledBookingLeadTimeHours.getHours * 3600)
+      scheduledRideFilterExclusionThresholdInSecs = KP.intToNominalDiffTime (transporterConfig.scheduledRideFilterExclusionThresholdHours.getHours * 3600)
+      haveScheduled = isJust driverInfo.latestScheduledBooking
+      avgSpeedKmph = fromMaybe 25.0 transporterConfig.scheduledRideConfig.avgSpeedKmph
+  if
+      -- these arms assume an ad-hoc ride running now; the self-scheduled candidate path is batched upstream in applyScheduledRideFilter
+      | haveScheduled && isIntercity -> return False
+      | haveScheduled && isRental -> return $ canTakeRental driverInfo.latestScheduledBooking now minimumScheduledBookingLeadTimeInSecs
+      | isScheduledRideUnderFilterExclusionThresholdHours driverInfo.latestScheduledBooking now scheduledRideFilterExclusionThresholdInSecs -> do
+        case (currentSearchInfo.dropLocation, driverInfo.latestScheduledPickup, currentSearchInfo.routeDistance) of
+          (Just dropLoc, Just scheduledPickup, Just routeDistance) -> do
+            currentDroptoScheduledPickupDistance <-
+              TMaps.getDistanceForScheduledRides merchantId merchantOpCityId Nothing $
+                TMaps.GetDistanceReq
+                  { origin = dropLoc,
+                    destination = scheduledPickup,
+                    travelMode = Just TMaps.CAR,
+                    sourceDestinationMapping = Nothing,
+                    distanceUnit = Meter
+                  }
+            let destToPickupDistance = currentDroptoScheduledPickupDistance.distance
+                totalDistanceinM = routeDistance + destToPickupDistance + driverPoolWithActualDistResult.actualDistanceToPickup
+                totalDistanceinKM = (fromIntegral (totalDistanceinM.getMeters) :: Double) / 1000
+                totalTimeinDoubleHr = (totalDistanceinKM / avgSpeedKmph) :: Double -- per-city configurable avg speed; defaults to the legacy 25 kmph
+                totalTimeInSeconds = realToFrac (totalTimeinDoubleHr * 3600) :: NominalDiffTime
+                expectedEndTime = addUTCTime totalTimeInSeconds now
+                isRidePossible = case driverInfo.latestScheduledBooking of
+                  Just latestScheduledBooking ->
+                    let timeDifference = diffUTCTime latestScheduledBooking (addUTCTime transporterConfig.scheduleRideBufferTime expectedEndTime)
+                     in timeDifference > 0
+                  Nothing -> False
+            return isRidePossible
+          (_, _, _) -> return False
+      | otherwise -> return True
+  where
+    canTakeRental :: Maybe UTCTime -> UTCTime -> NominalDiffTime -> Bool
+    canTakeRental mbLatestScheduledBooking now minimumScheduledBookingLeadTimeInSecs =
+      case mbLatestScheduledBooking of
+        Nothing -> True
+        Just latestScheduledBooking ->
+          let timeDifference = diffUTCTime latestScheduledBooking now
+           in timeDifference >= minimumScheduledBookingLeadTimeInSecs
+    isScheduledRideUnderFilterExclusionThresholdHours :: Maybe UTCTime -> UTCTime -> NominalDiffTime -> Bool
+    isScheduledRideUnderFilterExclusionThresholdHours mbLatestScheduledBooking now scheduledRideFilterExclusionThresholdInSecs =
+      case mbLatestScheduledBooking of
+        Nothing -> False
+        Just latestScheduledBooking ->
+          let timeDifference = diffUTCTime latestScheduledBooking now
+           in timeDifference < scheduledRideFilterExclusionThresholdInSecs
+
+-- | Pool-level scheduled-ride filter. For a self-scheduled search the candidate is identical for every driver,
+-- so we batch the committed-set feasibility across the whole pool (≤2 OSRM /table calls) instead of per-driver
+-- point-to-point calls. Every other case falls back to the per-driver scheduledRideFilter unchanged.
+applyScheduledRideFilter ::
+  (MonadFlow m, MonadTime m, LT.HasLocationService m r, ServiceFlow m r) =>
+  DST.CurrentSearchInfo ->
+  Id DM.Merchant ->
+  Id DMOC.MerchantOperatingCity ->
+  Bool ->
+  Bool ->
+  DTC.TransporterConfig ->
+  [DriverPoolWithActualDistResult] ->
+  m [DriverPoolWithActualDistResult]
+applyScheduledRideFilter currentSearchInfo merchantId merchantOpCityId isRental isIntercity transporterConfig pool
+  | currentSearchInfo.searchTry.isScheduled = scheduledSearchBatch
+  | otherwise = filterM (scheduledRideFilter currentSearchInfo merchantId merchantOpCityId isRental isIntercity transporterConfig) pool
+  where
+    scheduledSearchBatch = do
+      now <- getCurrentTime
+      let candidate =
+            SBOC.ScheduledCandidate
+              { candidateStart = currentSearchInfo.searchTry.startTime,
+                candidateEnd = addUTCTime (maybe 0 Kernel.Utils.Common.secondsToNominalDiffTime currentSearchInfo.estimatedDuration) currentSearchInfo.searchTry.startTime,
+                candidatePickup = currentSearchInfo.pickupLocation,
+                candidateDrop = currentSearchInfo.dropLocation
+              }
+      -- one batched read of committed rides for all non-fresh drivers (fresh-driver + hold-cap checks stay cheap and pure); only the feasibility distance work is batched
+      committedByDriver <- SBOC.getDriverCommittedRidesForDrivers [cast dp.driverPoolResult.driverId | dp <- pool, not (isFreshDriver dp)]
+      let classified = map (classifyForBatch now transporterConfig committedByDriver) pool
+          needsFeasibility = [(idx, intervals) | (idx, Right intervals) <- zip [0 :: Int ..] classified]
+      verdicts <- SBOC.batchIsCandidateFeasible merchantId merchantOpCityId transporterConfig candidate needsFeasibility
+      let verdictByIdx = Map.fromList verdicts
+          keep idx cls = case cls of
+            Left decided -> decided
+            Right _ -> Map.findWithDefault False idx verdictByIdx
+      pure [dp | (idx, dp, cls) <- zip3 [0 :: Int ..] pool classified, keep idx cls]
+
+-- | Fresh driver = no committed hold and not on-ride; such drivers surface without any DB or feasibility work.
+isFreshDriver :: DriverPoolWithActualDistResult -> Bool
+isFreshDriver dp = not (isJust dp.driverPoolResult.latestScheduledBooking) && dp.driverPoolResult.onRide /= Just True
+
+-- | Pure classification over the pre-fetched committed rides: fresh -> Left True (surface); at hold cap -> Left False; otherwise Right its committed intervals for the batched feasibility check.
+classifyForBatch :: UTCTime -> DTC.TransporterConfig -> SBOC.CommittedRidesByDriver -> DriverPoolWithActualDistResult -> Either Bool [SBOC.CommittedInterval]
+classifyForBatch now transporterConfig committedByDriver dp
+  | isFreshDriver dp = Left True
+  | SBOC.countActiveHolds committed >= transporterConfig.scheduledRideConfig.maxHoldsPerDriver = Left False
+  | otherwise = Right (SBOC.mkCommittedIntervals now Nothing committed)
+  where
+    committed = Map.findWithDefault [] (cast dp.driverPoolResult.driverId) committedByDriver
+
+-- | Extract on-ride drivers from pre-fetched pool results and convert to DriverPoolResultCurrentlyOnRide.
+-- On-ride eligibility (forwardBatchingEnabled, hasRideStarted, tripCategory) is already filtered
+-- by getNearestDrivers. This just extracts drivers with onRide=True and converts the type.
+filterOnRideDriversFromPool ::
+  [DriverPoolResult] ->
+  [DriverPoolResultCurrentlyOnRide]
+filterOnRideDriversFromPool = mapMaybe toOnRideResult
+  where
+    toOnRideResult DriverPoolResult {..} = do
+      guard $ onRide == Just True
+      prevDropLat <- previousRideDropLat
+      prevDropLon <- previousRideDropLon
+      distToDest <- distanceFromDriverToDestination
+      Just
+        DriverPoolResultCurrentlyOnRide
+          { previousRideDropLat = prevDropLat,
+            previousRideDropLon = prevDropLon,
+            distanceFromDriverToDestination = distToDest,
+            distanceToPickup = distanceToPickup,
+            minRideDistance = minRideDistance,
+            maxRideDistance = maxRideDistance,
+            maxPickupDistance = maxPickupDistance,
+            vehicleNumber,
+            selectedAutoAcceptTiers = Just selectedAutoAcceptTiers,
+            ..
+          }
+
+calculateDriverCurrentlyOnRideWithActualDist ::
+  ( EncFlow m r,
+    CacheFlow m r,
+    EsqDBFlow m r,
+    Esq.EsqDBReplicaFlow m r,
+    HasCoordinates a,
+    LT.HasLocationService m r,
+    CoreMetrics m,
+    HasShortDurationRetryCfg r c,
+    HasKafkaProducer r
+  ) =>
+  CalculateDriverPoolReq a ->
+  [DriverPoolResultCurrentlyOnRide] -> -- pre-filtered on-ride drivers from normal pool
+  PoolType ->
+  DST.CurrentSearchInfo ->
+  m [DriverPoolWithActualDistResult]
+calculateDriverCurrentlyOnRideWithActualDist CalculateDriverPoolReq {..} onRideDriverPool poolType currentSearchInfo = do
+  let countDriversToProccess = fromMaybe 10 driverPoolCfg.batchSizeOnRideWithStraightLineDistance
+  let driverPool = take countDriversToProccess $ sortOn (.distanceToPickup) onRideDriverPool
+  logDebug $ "driverPoolcalculateDriverCurrentlyOnRideWithActualDist" <> show driverPool
+  case driverPool of
+    [] -> do
+      logDebug "driverPool is empty"
+      return []
+    (a : pprox) -> do
+      let driverPoolResultsWithDriverLocationAsDestinationLocation = driverResultFromDestinationLocation <$> (a :| pprox)
+          driverToDestinationDistanceThreshold = driverPoolCfg.driverToDestinationDistanceThreshold
+      driverPoolWithActualDistFromDestinationLocation <- computeActualDistance driverPoolCfg.distanceUnit merchantId merchantOperatingCityId Nothing pickup driverPoolResultsWithDriverLocationAsDestinationLocation currentSearchInfo
+      driverPoolWithActualDistFromCurrentLocation <- do
+        case driverPoolCfg.useOneToOneOsrmMapping of
+          Just True -> calculateActualDistanceCurrentlyOneToOneSrcAndDestMapping (a :| pprox)
+          _ -> traverse (calculateActualDistanceCurrently driverToDestinationDistanceThreshold) (a :| pprox)
+      let driverPoolWithActualDist = catMaybes $ zipWith (curry $ combine driverToDestinationDistanceThreshold) (NE.toList driverPoolWithActualDistFromDestinationLocation) (NE.toList driverPoolWithActualDistFromCurrentLocation)
+          thresholdRadius = driverPoolCfg.maxRadiusOfSearch
+          filtDriverPoolWithActualDist' = case (driverPoolCfg.actualDistanceThresholdOnRide, poolType) of
+            (_, SpecialZoneQueuePool) -> driverPoolWithActualDist
+            (Nothing, _) -> filter (filterFunc thresholdRadius) driverPoolWithActualDist
+            (Just threshold, _) -> filter (filterFunc threshold) driverPoolWithActualDist
+      filtDriverPoolWithActualDist <- applyScheduledRideFilter currentSearchInfo merchantId merchantOperatingCityId isRental isInterCity transporterConfig filtDriverPoolWithActualDist'
+      return filtDriverPoolWithActualDist
+  where
+    filterFunc threshold estDist = getMeters estDist.actualDistanceToPickup <= fromIntegral threshold
+
+    driverResultFromDestinationLocation DriverPoolResultCurrentlyOnRide {..} =
+      DriverPoolResult
+        { lat = previousRideDropLat,
+          lon = previousRideDropLon,
+          customerTags = Nothing,
+          onRide = Just True,
+          previousRideDropLat = Just previousRideDropLat,
+          previousRideDropLon = Just previousRideDropLon,
+          distanceFromDriverToDestination = Just distanceFromDriverToDestination,
+          selectedAutoAcceptTiers = fromMaybe [] selectedAutoAcceptTiers,
+          ..
+        }
+
+    calculateActualDistanceCurrently _driverToDestinationDistanceThreshold DriverPoolResultCurrentlyOnRide {..} = do
+      let temp = DriverPoolResult {customerTags = Nothing, onRide = Just True, previousRideDropLat = Just previousRideDropLat, previousRideDropLon = Just previousRideDropLon, distanceFromDriverToDestination = Just distanceFromDriverToDestination, selectedAutoAcceptTiers = fromMaybe [] selectedAutoAcceptTiers, ..}
+      computeActualDistanceOneToOne driverPoolCfg.distanceUnit merchantId merchantOperatingCityId (Just $ LatLong previousRideDropLat previousRideDropLon) (LatLong previousRideDropLat previousRideDropLon) temp currentSearchInfo
+    combine driverToDestinationDistanceThreshold (DriverPoolWithActualDistResult {actualDistanceToPickup = x, actualDurationToPickup = y, previousDropGeoHash = pDGeoHash}, DriverPoolWithActualDistResult {..}) =
+      if actualDistanceToPickup < driverToDestinationDistanceThreshold
+        then
+          Just
+            DriverPoolWithActualDistResult
+              { actualDistanceToPickup = x + actualDistanceToPickup,
+                actualDurationToPickup = y + actualDurationToPickup,
+                isForwardRequest = True,
+                previousDropGeoHash = pDGeoHash <|> previousDropGeoHash,
+                ..
+              }
+        else Nothing
+    calculateActualDistanceCurrentlyOneToOneSrcAndDestMapping driverPoolCurrentlyOnRide = do
+      let driverPoolResultsWithDriverLocationAsCurrentLocation = map (\DriverPoolResultCurrentlyOnRide {..} -> DriverPoolResult {customerTags = Nothing, onRide = Just True, previousRideDropLat = Just previousRideDropLat, previousRideDropLon = Just previousRideDropLon, distanceFromDriverToDestination = Just distanceFromDriverToDestination, selectedAutoAcceptTiers = fromMaybe [] selectedAutoAcceptTiers, ..}) driverPoolCurrentlyOnRide
+      let mbPreviousRideDropLatLn = NE.toList $ map (\DriverPoolResultCurrentlyOnRide {previousRideDropLat = lat, previousRideDropLon = lon} -> Just $ LatLong lat lon) driverPoolCurrentlyOnRide
+      let previousRideDropLatLn = NE.fromList $ catMaybes mbPreviousRideDropLatLn
+      computeActualDistanceOneToOneSrcAndDestMapping driverPoolCfg.distanceUnit merchantId merchantOperatingCityId previousRideDropLatLn mbPreviousRideDropLatLn driverPoolResultsWithDriverLocationAsCurrentLocation currentSearchInfo
+
+computeActualDistanceOneToOne ::
+  ( CacheFlow m r,
+    EsqDBFlow m r,
+    EncFlow m r,
+    HasCoordinates a,
+    HasShortDurationRetryCfg r c,
+    HasKafkaProducer r
+  ) =>
+  DistanceUnit ->
+  Id DM.Merchant ->
+  Id DMOC.MerchantOperatingCity ->
+  Maybe LatLong ->
+  a ->
+  DriverPoolResult ->
+  DST.CurrentSearchInfo ->
+  m DriverPoolWithActualDistResult
+computeActualDistanceOneToOne distanceUnit merchantId merchantOpCityId prevRideDropLatLn pickup driverPoolResult currentSearchInfo = do
+  (ele :| _) <- computeActualDistance distanceUnit merchantId merchantOpCityId prevRideDropLatLn pickup (driverPoolResult :| []) currentSearchInfo
+  pure ele
+
+computeActualDistance ::
+  ( CacheFlow m r,
+    EsqDBFlow m r,
+    EncFlow m r,
+    HasCoordinates a,
+    HasShortDurationRetryCfg r c,
+    HasKafkaProducer r
+  ) =>
+  DistanceUnit ->
+  Id DM.Merchant ->
+  Id DMOC.MerchantOperatingCity ->
+  Maybe LatLong ->
+  a ->
+  NonEmpty DriverPoolResult ->
+  DST.CurrentSearchInfo ->
+  m (NonEmpty DriverPoolWithActualDistResult)
+computeActualDistance distanceUnit orgId merchantOpCityId prevRideDropLatLn pickup driverPoolResults searchInfo = do
+  let pickupLatLong = getCoordinates pickup
+  transporter <- getOneConfig (TransporterConfigDimensions {merchantOperatingCityId = merchantOpCityId.getId}) Nothing >>= fromMaybeM (TransporterConfigDoesNotExist merchantOpCityId.getId)
+  getDistanceResults <-
+    -- Quick ladder (0.5s/1s/2s): this distance-matrix call sits on the per-batch dispatch
+    -- path, where a 4s retry sleep delays every driver ping in the batch; the dominant
+    -- provider (self-hosted OSRM) is intra-VPC, and for external providers only
+    -- connection errors/503 are retried (never 429), so fast retries stay safe.
+    withQuickRetry $
+      Maps.getEstimatedPickupDistances orgId merchantOpCityId (Just $ getId searchInfo.searchTry.id) $
+        Maps.GetDistancesReq
+          { origins = driverPoolResults,
+            destinations = pickupLatLong :| [],
+            travelMode = Just Maps.CAR,
+            sourceDestinationMapping = Nothing,
+            distanceUnit
+          }
+  logDebug $ "get distance results" <> show getDistanceResults
+  prevRideDropGeoHash <- case prevRideDropLatLn of
+    Just (LatLong lat lon) -> pure $ T.pack <$> DG.encode 9 (lat, lon)
+    Nothing -> pure Nothing
+  return $ mkDriverPoolWithActualDistResult transporter.defaultPopupDelay prevRideDropGeoHash <$> getDistanceResults
+  where
+    mkDriverPoolWithActualDistResult defaultPopupDelay prevRideDropGeoHash distDur = do
+      DriverPoolWithActualDistResult
+        { driverPoolResult = distDur.origin,
+          actualDistanceToPickup = distDur.distance,
+          actualDurationToPickup = distDur.duration,
+          intelligentScores = IntelligentScores Nothing Nothing Nothing Nothing Nothing Nothing defaultPopupDelay,
+          isPartOfIntelligentPool = False,
+          pickupZone = False,
+          specialZoneExtraTip = Nothing,
+          searchTags = Nothing,
+          tripDistance = Nothing,
+          keepHiddenForSeconds = Seconds 0,
+          goHomeReqId = Nothing,
+          specialLocWarriorPreferredSpecialLocId = Nothing,
+          isForwardRequest = False,
+          previousDropGeoHash = prevRideDropGeoHash,
+          score = distDur.origin.score,
+          poolingLogicVersion = Nothing,
+          searchReqDriverStatsCounters = Nothing,
+          idleTimeSeconds = Nothing,
+          preferenceMatchScore = 1.0
+        }
+
+computeActualDistanceOneToOneSrcAndDestMapping ::
+  ( CacheFlow m r,
+    EsqDBFlow m r,
+    EncFlow m r,
+    HasShortDurationRetryCfg r c,
+    HasKafkaProducer r
+  ) =>
+  DistanceUnit ->
+  Id DM.Merchant ->
+  Id DMOC.MerchantOperatingCity ->
+  NonEmpty LatLong ->
+  [Maybe LatLong] ->
+  NonEmpty DriverPoolResult ->
+  DST.CurrentSearchInfo ->
+  m (NonEmpty DriverPoolWithActualDistResult)
+computeActualDistanceOneToOneSrcAndDestMapping distanceUnit orgId merchantOpCityId destinationLatLons previousDropPoints driverPoolResults searchInfo = do
+  transporter <- getOneConfig (TransporterConfigDimensions {merchantOperatingCityId = merchantOpCityId.getId}) Nothing >>= fromMaybeM (TransporterConfigDoesNotExist merchantOpCityId.getId)
+  getDistanceResults <-
+    -- Quick ladder (0.5s/1s/2s): this distance-matrix call sits on the per-batch dispatch
+    -- path, where a 4s retry sleep delays every driver ping in the batch; the dominant
+    -- provider (self-hosted OSRM) is intra-VPC, and for external providers only
+    -- connection errors/503 are retried (never 429), so fast retries stay safe.
+    withQuickRetry $
+      Maps.getEstimatedPickupDistances orgId merchantOpCityId (Just $ getId searchInfo.searchTry.id) $
+        Maps.GetDistancesReq
+          { origins = driverPoolResults,
+            destinations = destinationLatLons,
+            travelMode = Just Maps.CAR,
+            sourceDestinationMapping = Just Maps.OneToOne,
+            distanceUnit
+          }
+  logDebug $ "get distance results one to one mapping" <> show getDistanceResults
+  let distanceAndDropPointsZipped = zip previousDropPoints (NE.toList getDistanceResults)
+  driverPoolEntities <-
+    mapM
+      ( \(prevRideDropLatLn, getDistanceResult) -> do
+          prevRideDropGeoHash <- case prevRideDropLatLn of
+            Just (LatLong lat lon) -> pure $ T.pack <$> DG.encode 9 (lat, lon)
+            Nothing -> pure Nothing
+          return $ mkDriverPoolWithActualDistResult transporter.defaultPopupDelay prevRideDropGeoHash getDistanceResult
+      )
+      distanceAndDropPointsZipped
+  return $ NE.fromList driverPoolEntities
+  where
+    mkDriverPoolWithActualDistResult defaultPopupDelay prevRideDropGeoHash distDur = do
+      DriverPoolWithActualDistResult
+        { driverPoolResult = distDur.origin,
+          actualDistanceToPickup = distDur.distance,
+          actualDurationToPickup = distDur.duration,
+          intelligentScores = IntelligentScores Nothing Nothing Nothing Nothing Nothing Nothing defaultPopupDelay,
+          isPartOfIntelligentPool = False,
+          pickupZone = False,
+          specialZoneExtraTip = Nothing,
+          searchTags = Nothing,
+          tripDistance = Nothing,
+          keepHiddenForSeconds = Seconds 0,
+          goHomeReqId = Nothing,
+          specialLocWarriorPreferredSpecialLocId = Nothing,
+          isForwardRequest = False,
+          previousDropGeoHash = prevRideDropGeoHash,
+          score = distDur.origin.score,
+          poolingLogicVersion = Nothing,
+          searchReqDriverStatsCounters = Nothing,
+          idleTimeSeconds = Nothing,
+          preferenceMatchScore = 1.0
+        }
+
+refactorRoutesResp :: GoHomeConfig -> (NearestGoHomeDriversResult, Maps.RouteInfo, Id DDGR.DriverGoHomeRequest, Maybe (Id SL.SpecialLocation), DriverPoolWithActualDistResult) -> (NearestGoHomeDriversResult, Maps.RouteInfo, Id DDGR.DriverGoHomeRequest, Maybe (Id SL.SpecialLocation), DriverPoolWithActualDistResult)
+refactorRoutesResp goHomeCfg (nearestDriverRes, route, ghrId, mbPreferredSpecialLocId, driverGoHomePoolWithActualDistance) = (nearestDriverRes, newRoute route, ghrId, mbPreferredSpecialLocId, driverGoHomePoolWithActualDistance)
+  where
+    newRoute route' =
+      RouteInfo
+        { distance = route'.distance,
+          distanceWithUnit = route'.distanceWithUnit,
+          duration = route'.duration,
+          staticDuration = route'.staticDuration,
+          points = getStartPoint $ filterInitPoints (refactor [] route'.points),
+          snappedWaypoints = route'.snappedWaypoints,
+          boundingBox = route'.boundingBox,
+          routeToken = route'.routeToken,
+          trafficSegments = route'.trafficSegments
+        }
+
+    filterInitPoints (x1 : x2 : xs) = if highPrecMetersToMeters (distanceBetweenInMeters x1 x2) <= goHomeCfg.ignoreWaypointsTill then filterInitPoints (x1 : xs) else x1 : x2 : xs
+    filterInitPoints [x] = [x]
+    filterInitPoints [] = []
+
+    getStartPoint (x1 : x2 : xs) = getPointInBetween x1 x2 (fromIntegral (getMeters goHomeCfg.addStartWaypointAt) / 111000) : x2 : xs -- 1 degree = 111 Km
+    getStartPoint [x] = [x]
+    getStartPoint [] = []
+
+    refactor acc (p1 : p2 : ps) = if highPrecMetersToMeters (distanceBetweenInMeters p1 p2) > goHomeCfg.goHomeWayPointRadius then refactor (p1 : acc) (getPointInBetween p1 p2 (fromIntegral (goHomeCfg.goHomeWayPointRadius.getMeters) / 111000) : p2 : ps) else refactor (p1 : acc) (p2 : ps)
+    refactor acc [p1] = reverse (p1 : acc)
+    refactor _ [] = []
+
+    getPointInBetween p1 p2 dist = LatLong {lat = p1.lat + dist * (p2.lat - p1.lat) / d, lon = p1.lon + dist * (p2.lon - p1.lon) / d}
+      where
+        d = sqrt ((p2.lat - p1.lat) ^ (2 :: Int) + (p2.lon - p1.lon) ^ (2 :: Int))

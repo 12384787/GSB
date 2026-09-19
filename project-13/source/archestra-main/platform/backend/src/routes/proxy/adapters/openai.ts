@@ -1,0 +1,1806 @@
+import {
+  ApiError,
+  ArchestraInternalErrorCode,
+  type SupportedProvider,
+} from "@archestra/shared";
+import { get } from "lodash-es";
+import OpenAIProvider from "openai";
+import type {
+  ChatCompletionCreateParamsNonStreaming,
+  ChatCompletionCreateParamsStreaming,
+} from "openai/resources/chat/completions/completions";
+import config from "@/config";
+import logger from "@/logging";
+import { metrics } from "@/observability";
+import {
+  decodeOpenAiCodexCredential,
+  isOpenAiCodexCredential,
+} from "@/services/openai-codex-credentials";
+import type {
+  ChunkProcessingResult,
+  CommonMcpToolDefinition,
+  CommonMessage,
+  CommonToolCall,
+  CommonToolResult,
+  CreateClientOptions,
+  LLMProvider,
+  LLMRequestAdapter,
+  LLMResponseAdapter,
+  LLMStreamAdapter,
+  OpenAi,
+  StreamAccumulatorState,
+  UsageView,
+} from "@/types";
+import {
+  extractCommonMessageText,
+  extractCommonToolCallArguments,
+} from "@/types";
+import { estimateMessagesSize } from "@/utils/message-size";
+import {
+  estimateToolResultContentLength,
+  previewToolResultContent,
+} from "@/utils/tool-result-preview";
+import {
+  doesModelSupportImages,
+  hasImageContent,
+  isImageTooLarge,
+  isMcpImageBlock,
+} from "../utils/mcp-image";
+import { stripBrowserToolsResults } from "../utils/summarize-tool-results";
+import { createOpenAiCodexClient } from "./openai-codex-client";
+import { toOpenAiStreamUsageWithCache } from "./openai-sse-chunk";
+import { PROXY_SDK_MAX_RETRIES } from "./sdk-retry-policy";
+import { subscriptionAuthRequiredCode } from "./subscription-auth-error";
+
+// =============================================================================
+// TYPE ALIASES
+// =============================================================================
+
+type OpenAiRequest = OpenAi.Types.ChatCompletionsRequest;
+type OpenAiResponse = OpenAi.Types.ChatCompletionsResponse;
+type OpenAiMessages = OpenAi.Types.ChatCompletionsRequest["messages"];
+type OpenAiHeaders = OpenAi.Types.ChatCompletionsHeaders;
+type OpenAiStreamChunk = OpenAi.Types.ChatCompletionChunk;
+type OpenAiEmbeddingRequest = OpenAi.Types.EmbeddingRequest;
+type OpenAiEmbeddingResponse = OpenAi.Types.EmbeddingResponse;
+
+type OpenAiToolResultImageBlock = {
+  type: "image_url";
+  image_url: {
+    url: string;
+    detail?: "auto" | "low" | "high";
+  };
+};
+
+type OpenAiToolResultTextBlock = {
+  type: "text";
+  text: string;
+};
+
+type OpenAiToolResultContentBlock =
+  | OpenAiToolResultImageBlock
+  | OpenAiToolResultTextBlock;
+
+type OpenAiToolResultContent = string | OpenAiToolResultContentBlock[];
+
+// =============================================================================
+// EMBEDDING REQUEST ADAPTER
+// =============================================================================
+
+export class OpenAIEmbeddingRequestAdapter
+  implements LLMRequestAdapter<OpenAiEmbeddingRequest, OpenAiMessages>
+{
+  readonly provider: SupportedProvider;
+  private request: OpenAiEmbeddingRequest;
+  private modifiedModel: string | null = null;
+
+  constructor(
+    request: OpenAiEmbeddingRequest,
+    provider: SupportedProvider = "openai",
+  ) {
+    this.request = request;
+    this.provider = provider;
+  }
+
+  getModel(): string {
+    return this.modifiedModel ?? this.request.model;
+  }
+
+  isStreaming(): boolean {
+    return false;
+  }
+
+  getMessages(): CommonMessage[] {
+    return this.getInputStrings().map((content) => ({
+      role: "user",
+      content,
+    }));
+  }
+
+  getToolResults(): CommonToolResult[] {
+    return [];
+  }
+
+  getTools(): CommonMcpToolDefinition[] {
+    return [];
+  }
+
+  hasTools(): boolean {
+    return false;
+  }
+
+  getProviderMessages(): OpenAiMessages {
+    return this.getInputStrings().map((content) => ({
+      role: "user",
+      content,
+    }));
+  }
+
+  getOriginalRequest(): OpenAiEmbeddingRequest {
+    return this.request;
+  }
+
+  setModel(model: string): void {
+    this.modifiedModel = model;
+  }
+
+  updateToolResult(): void {}
+
+  applyToolResultUpdates(): void {}
+
+  convertToolResultContent(messages: OpenAiMessages): OpenAiMessages {
+    return messages;
+  }
+
+  toProviderRequest(): OpenAiEmbeddingRequest {
+    return {
+      ...this.request,
+      model: this.getModel(),
+    };
+  }
+
+  private getInputStrings(): string[] {
+    return Array.isArray(this.request.input)
+      ? this.request.input
+      : [this.request.input];
+  }
+}
+
+// =============================================================================
+// EMBEDDING RESPONSE ADAPTER
+// =============================================================================
+
+export class OpenAIEmbeddingResponseAdapter
+  implements LLMResponseAdapter<OpenAiEmbeddingResponse>
+{
+  readonly provider: SupportedProvider;
+  private response: OpenAiEmbeddingResponse;
+
+  constructor(
+    response: OpenAiEmbeddingResponse,
+    provider: SupportedProvider = "openai",
+  ) {
+    this.response = response;
+    this.provider = provider;
+  }
+
+  getId(): string {
+    return "";
+  }
+
+  getModel(): string {
+    return this.response.model;
+  }
+
+  getText(): string {
+    return "";
+  }
+
+  getToolCalls(): CommonToolCall[] {
+    return [];
+  }
+
+  hasToolCalls(): boolean {
+    return false;
+  }
+
+  getUsage(): UsageView {
+    return {
+      inputTokens: this.response.usage.prompt_tokens,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+    };
+  }
+
+  getOriginalResponse(): OpenAiEmbeddingResponse {
+    return this.response;
+  }
+
+  getFinishReasons(): string[] {
+    return [];
+  }
+
+  toRefusalResponse(): OpenAiEmbeddingResponse {
+    return this.response;
+  }
+}
+
+export class OpenAIEmbeddingStreamAdapter
+  implements LLMStreamAdapter<never, OpenAiEmbeddingResponse>
+{
+  readonly provider: SupportedProvider;
+  readonly state: StreamAccumulatorState = {
+    responseId: "",
+    model: "",
+    text: "",
+    toolCalls: [],
+    rawToolCallEvents: [],
+    usage: null,
+    stopReason: null,
+    timing: {
+      startTime: Date.now(),
+      firstChunkTime: null,
+    },
+  };
+
+  constructor(provider: SupportedProvider = "openai") {
+    this.provider = provider;
+  }
+
+  processChunk(): ChunkProcessingResult {
+    throw new Error("OpenAI embeddings do not support streaming.");
+  }
+
+  getSSEHeaders(): Record<string, string> {
+    throw new Error("OpenAI embeddings do not support streaming.");
+  }
+
+  formatTextDeltaSSE(): string {
+    throw new Error("OpenAI embeddings do not support streaming.");
+  }
+
+  getRawToolCallEvents(): string[] {
+    return [];
+  }
+
+  formatCompleteTextSSE(): string[] {
+    throw new Error("OpenAI embeddings do not support streaming.");
+  }
+
+  formatEndSSE(): string {
+    throw new Error("OpenAI embeddings do not support streaming.");
+  }
+
+  toProviderResponse(): OpenAiEmbeddingResponse {
+    throw new Error("OpenAI embeddings do not support streaming.");
+  }
+}
+
+// =============================================================================
+// REQUEST ADAPTER
+// =============================================================================
+
+// Exported for reuse by OpenAI-compatible providers (Mistral, etc.)
+export class OpenAIRequestAdapter
+  implements LLMRequestAdapter<OpenAiRequest, OpenAiMessages>
+{
+  readonly provider: SupportedProvider;
+  private request: OpenAiRequest;
+  private modifiedModel: string | null = null;
+  private toolResultUpdates: Record<string, string> = {};
+
+  // `provider` overrides which provider this adapter attributes to (logs,
+  // metrics, interactions). OpenAI-compatible providers (DeepSeek, GitHub
+  // Copilot, …) reuse this adapter via createOpenAiCompatibleAdapterFactory.
+  constructor(request: OpenAiRequest, provider: SupportedProvider = "openai") {
+    this.request = request;
+    this.provider = provider;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Read Access
+  // ---------------------------------------------------------------------------
+
+  getModel(): string {
+    return this.modifiedModel ?? this.request.model;
+  }
+
+  isStreaming(): boolean {
+    return this.request.stream === true;
+  }
+
+  getMessages(): CommonMessage[] {
+    return this.toCommonFormat(this.request.messages);
+  }
+
+  getToolResults(): CommonToolResult[] {
+    const results: CommonToolResult[] = [];
+
+    for (const message of this.request.messages) {
+      if (message.role === "tool") {
+        const toolCall = this.findToolCallInMessages(
+          this.request.messages,
+          message.tool_call_id,
+        );
+
+        let content: unknown;
+        if (typeof message.content === "string") {
+          try {
+            content = JSON.parse(message.content);
+          } catch {
+            content = message.content;
+          }
+        } else {
+          content = message.content;
+        }
+
+        results.push({
+          id: message.tool_call_id,
+          name: toolCall?.name ?? "unknown",
+          arguments: toolCall?.arguments,
+          content,
+          isError: false,
+        });
+      }
+    }
+
+    return results;
+  }
+
+  getTools(): CommonMcpToolDefinition[] {
+    if (!this.request.tools) return [];
+
+    const result: CommonMcpToolDefinition[] = [];
+    for (const tool of this.request.tools) {
+      if (tool.type === "function") {
+        result.push({
+          name: tool.function.name,
+          description: tool.function.description,
+          inputSchema: tool.function.parameters as Record<string, unknown>,
+        });
+      }
+    }
+    return result;
+  }
+
+  hasTools(): boolean {
+    return (this.request.tools?.length ?? 0) > 0;
+  }
+
+  getProviderMessages(): OpenAiMessages {
+    return this.request.messages;
+  }
+
+  getOriginalRequest(): OpenAiRequest {
+    return this.request;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Modify Access
+  // ---------------------------------------------------------------------------
+
+  setModel(model: string): void {
+    this.modifiedModel = model;
+  }
+
+  updateToolResult(toolCallId: string, newContent: string): void {
+    this.toolResultUpdates[toolCallId] = newContent;
+  }
+
+  applyToolResultUpdates(updates: Record<string, string>): void {
+    Object.assign(this.toolResultUpdates, updates);
+  }
+
+  convertToolResultContent(messages: OpenAiMessages): OpenAiMessages {
+    const model = this.getModel();
+    const modelSupportsImages = doesModelSupportImages(model);
+    let toolMessagesWithImages = 0;
+    let strippedImageCount = 0;
+
+    // First, analyze all tool messages to understand what we're dealing with
+    for (const message of messages) {
+      if (message.role === "tool") {
+        const contentLength = estimateToolResultContentLength(message.content);
+        const contentSizeKB = Math.round(contentLength.length / 1024);
+        const contentPatternSample = previewToolResultContent(
+          message.content,
+          2000,
+        );
+        const contentPreview = contentPatternSample.slice(0, 200);
+
+        // Check for base64 patterns in preview to avoid full serialization.
+        const hasBase64 =
+          contentPatternSample.includes("data:image") ||
+          contentPatternSample.includes('"type":"image"') ||
+          contentPatternSample.includes('"data":"');
+
+        // Find tool name from previous assistant message
+        const toolName = this.findToolCallInMessages(
+          messages,
+          message.tool_call_id,
+        )?.name;
+
+        logger.debug(
+          {
+            toolCallId: message.tool_call_id,
+            toolName,
+            contentSizeKB,
+            hasBase64,
+            contentLengthEstimated: contentLength.isEstimated,
+            isArray: Array.isArray(message.content),
+            contentPreview,
+          },
+          "[OpenAIAdapter] Analyzing tool result content",
+        );
+
+        // If it's an array, analyze each item
+        if (Array.isArray(message.content)) {
+          for (const [idx, item] of message.content.entries()) {
+            if (typeof item === "object" && item !== null) {
+              const itemType = (item as Record<string, unknown>).type;
+              const itemLength = estimateToolResultContentLength(item);
+              logger.info(
+                {
+                  toolCallId: message.tool_call_id,
+                  itemIndex: idx,
+                  itemType,
+                  itemSizeKB: Math.round(itemLength.length / 1024),
+                  itemLengthEstimated: itemLength.isEstimated,
+                  isMcpImage: isMcpImageBlock(item),
+                },
+                "[OpenAIAdapter] Tool result array item",
+              );
+            }
+          }
+        }
+      }
+    }
+
+    const result = messages.map((message) => {
+      if (message.role !== "tool") {
+        return message;
+      }
+
+      // Check if this tool message contains images
+      if (!hasImageContent(message.content)) {
+        return message;
+      }
+
+      // If model doesn't support images, strip image blocks from content
+      if (!modelSupportsImages) {
+        strippedImageCount++;
+        const strippedContent = stripImageBlocksFromContent(message.content);
+        return {
+          ...message,
+          content: strippedContent,
+        };
+      }
+
+      // Model supports images - convert MCP image blocks to OpenAI format
+      const convertedContent = convertMcpImageBlocksToOpenAi(message.content);
+      if (!convertedContent) {
+        return message;
+      }
+
+      toolMessagesWithImages++;
+      return {
+        ...message,
+        content: convertedContent,
+      };
+    });
+
+    if (toolMessagesWithImages > 0 || strippedImageCount > 0) {
+      logger.info(
+        {
+          model,
+          modelSupportsImages,
+          totalMessages: messages.length,
+          toolMessagesWithImages,
+          strippedImageCount,
+        },
+        "[OpenAIAdapter] Processed tool messages with image content",
+      );
+    }
+
+    return result;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Build Modified Request
+  // ---------------------------------------------------------------------------
+
+  toProviderRequest(): OpenAiRequest {
+    let messages = this.request.messages;
+
+    if (Object.keys(this.toolResultUpdates).length > 0) {
+      messages = this.applyUpdates(messages, this.toolResultUpdates);
+    }
+
+    messages = this.convertToolResultContent(messages);
+    const sizeBeforeStrip = estimateMessagesSize(messages);
+    messages = stripBrowserToolsResults(messages);
+    const sizeAfterStrip = estimateMessagesSize(messages);
+
+    if (sizeBeforeStrip.length !== sizeAfterStrip.length) {
+      logger.info(
+        {
+          sizeBeforeKB: Math.round(sizeBeforeStrip.length / 1024),
+          sizeAfterKB: Math.round(sizeAfterStrip.length / 1024),
+          savedKB: Math.round(
+            (sizeBeforeStrip.length - sizeAfterStrip.length) / 1024,
+          ),
+          sizeEstimateReliable:
+            !sizeBeforeStrip.isEstimated && !sizeAfterStrip.isEstimated,
+        },
+        "[OpenAIAdapter] Stripped browser tool results",
+      );
+    }
+
+    // Calculate approximate request size for debugging
+    const requestSize = estimateMessagesSize(messages);
+    const requestSizeKB = Math.round(requestSize.length / 1024);
+    const estimatedTokens = Math.round(requestSize.length / 4);
+    let imageCount = 0;
+    let totalImageBase64Length = 0;
+
+    for (const msg of messages) {
+      if (Array.isArray(msg.content)) {
+        for (const part of msg.content) {
+          if (
+            typeof part === "object" &&
+            part !== null &&
+            "type" in part &&
+            part.type === "image_url" &&
+            "image_url" in part &&
+            part.image_url &&
+            typeof part.image_url === "object" &&
+            "url" in part.image_url
+          ) {
+            imageCount++;
+            const imageUrl = part.image_url.url;
+            if (typeof imageUrl === "string" && imageUrl.startsWith("data:")) {
+              const base64Part = imageUrl.split(",")[1];
+              if (base64Part) {
+                totalImageBase64Length += base64Part.length;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    logger.info(
+      {
+        model: this.getModel(),
+        messageCount: messages.length,
+        requestSizeKB,
+        estimatedTokens,
+        sizeEstimateReliable: !requestSize.isEstimated,
+        hasToolResultUpdates: Object.keys(this.toolResultUpdates).length > 0,
+        imageCount,
+        totalImageBase64KB: Math.round((totalImageBase64Length * 3) / 4 / 1024),
+      },
+      "[OpenAIAdapter] Building provider request",
+    );
+
+    return {
+      ...this.request,
+      model: this.getModel(),
+      messages,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private Helpers (copied from utils/adapters/openai.ts)
+  // ---------------------------------------------------------------------------
+
+  private findToolCallInMessages(
+    messages: OpenAiMessages,
+    toolCallId: string,
+  ): { name: string; arguments?: Record<string, unknown> } | null {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+
+      if (message.role === "assistant" && message.tool_calls) {
+        for (const toolCall of message.tool_calls) {
+          if (toolCall.id === toolCallId) {
+            if (toolCall.type === "function") {
+              return {
+                name: toolCall.function.name,
+                arguments: extractCommonToolCallArguments(
+                  toolCall.function.arguments,
+                ),
+              };
+            } else {
+              return { name: toolCall.custom.name };
+            }
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private toCommonFormat(messages: OpenAiMessages): CommonMessage[] {
+    logger.debug(
+      { messageCount: messages.length },
+      "[OpenAIAdapter] toCommonFormat: starting conversion",
+    );
+    const commonMessages: CommonMessage[] = [];
+
+    for (const message of messages) {
+      const commonMessage: CommonMessage = {
+        role: message.role as CommonMessage["role"],
+        content: extractCommonMessageText(message),
+      };
+
+      // Handle tool messages (tool results)
+      if (message.role === "tool") {
+        const toolCall = this.findToolCallInMessages(
+          messages,
+          message.tool_call_id,
+        );
+
+        if (toolCall) {
+          logger.debug(
+            { toolCallId: message.tool_call_id, toolName: toolCall.name },
+            "[OpenAIAdapter] toCommonFormat: found tool message",
+          );
+          let toolResult: unknown;
+          if (typeof message.content === "string") {
+            try {
+              toolResult = JSON.parse(message.content);
+            } catch {
+              toolResult = message.content;
+            }
+          } else {
+            toolResult = message.content;
+          }
+
+          commonMessage.toolCalls = [
+            {
+              id: message.tool_call_id,
+              name: toolCall.name,
+              arguments: toolCall.arguments,
+              content: toolResult,
+              isError: false,
+            },
+          ];
+        }
+      }
+
+      commonMessages.push(commonMessage);
+    }
+
+    logger.debug(
+      { inputCount: messages.length, outputCount: commonMessages.length },
+      "[OpenAIAdapter] toCommonFormat: conversion complete",
+    );
+    return commonMessages;
+  }
+
+  private applyUpdates(
+    messages: OpenAiMessages,
+    updates: Record<string, string>,
+  ): OpenAiMessages {
+    const updateCount = Object.keys(updates).length;
+    logger.debug(
+      { messageCount: messages.length, updateCount },
+      "[OpenAIAdapter] applyUpdates: starting",
+    );
+
+    if (updateCount === 0) {
+      logger.debug("[OpenAIAdapter] applyUpdates: no updates to apply");
+      return messages;
+    }
+
+    let appliedCount = 0;
+    const result = messages.map((message) => {
+      if (message.role === "tool" && updates[message.tool_call_id]) {
+        appliedCount++;
+        logger.debug(
+          { toolCallId: message.tool_call_id },
+          "[OpenAIAdapter] applyUpdates: applying update to tool message",
+        );
+        return {
+          ...message,
+          content: updates[message.tool_call_id],
+        };
+      }
+      return message;
+    });
+
+    logger.debug(
+      { updateCount, appliedCount },
+      "[OpenAIAdapter] applyUpdates: complete",
+    );
+    return result;
+  }
+}
+
+// Exported for reuse by OpenAI-compatible providers (Mistral, etc.)
+export function convertMcpImageBlocksToOpenAi(
+  content: unknown,
+): OpenAiToolResultContent | null {
+  if (!Array.isArray(content)) {
+    return null;
+  }
+
+  if (!hasImageContent(content)) {
+    return null;
+  }
+
+  const openAiContent: OpenAiToolResultContentBlock[] = [];
+  const imageTooLargePlaceholder = "[Image omitted due to size]";
+
+  for (const item of content) {
+    if (typeof item !== "object" || item === null) continue;
+    const candidate = item as Record<string, unknown>;
+
+    if (isMcpImageBlock(item)) {
+      const mimeType = item.mimeType ?? "image/png";
+      const base64Length = typeof item.data === "string" ? item.data.length : 0;
+      const estimatedSizeKB = Math.round((base64Length * 3) / 4 / 1024);
+      const shouldStripImage = isImageTooLarge(item);
+
+      if (shouldStripImage) {
+        logger.info(
+          {
+            mimeType,
+            base64Length,
+            estimatedSizeKB,
+          },
+          "[OpenAIAdapter] Stripping MCP image block due to size limit",
+        );
+        openAiContent.push({
+          type: "text",
+          text: imageTooLargePlaceholder,
+        });
+        continue;
+      }
+
+      logger.info(
+        {
+          mimeType,
+          base64Length,
+          estimatedSizeKB,
+          // Estimate tokens: base64 chars / 4 (rough estimate for text tokens)
+          // But for images, OpenAI uses tile-based calculation
+          estimatedBase64Tokens: Math.round(base64Length / 4),
+        },
+        "[OpenAIAdapter] Converting MCP image block to OpenAI format",
+      );
+
+      openAiContent.push({
+        type: "image_url",
+        image_url: {
+          url: `data:${mimeType};base64,${item.data}`,
+        },
+      });
+    } else if (candidate.type === "text" && "text" in candidate) {
+      openAiContent.push({
+        type: "text",
+        text:
+          typeof candidate.text === "string"
+            ? candidate.text
+            : JSON.stringify(candidate),
+      });
+    }
+  }
+
+  logger.info(
+    {
+      totalBlocks: openAiContent.length,
+      imageBlocks: openAiContent.filter((b) => b.type === "image_url").length,
+      textBlocks: openAiContent.filter((b) => b.type === "text").length,
+    },
+    "[OpenAIAdapter] Converted MCP content to OpenAI format",
+  );
+
+  return openAiContent.length > 0 ? openAiContent : null;
+}
+
+/**
+ * Strip image blocks from MCP content when model doesn't support images.
+ * Keeps text blocks and replaces image blocks with a placeholder message.
+ * Exported for reuse by OpenAI-compatible providers (Mistral, etc.)
+ */
+export function stripImageBlocksFromContent(content: unknown): string {
+  if (!Array.isArray(content)) {
+    return typeof content === "string" ? content : JSON.stringify(content);
+  }
+
+  const textParts: string[] = [];
+  let imageCount = 0;
+
+  for (const item of content) {
+    if (typeof item !== "object" || item === null) continue;
+    const candidate = item as Record<string, unknown>;
+
+    if (isMcpImageBlock(item)) {
+      imageCount++;
+    } else if (candidate.type === "text" && "text" in candidate) {
+      textParts.push(
+        typeof candidate.text === "string"
+          ? candidate.text
+          : JSON.stringify(candidate.text),
+      );
+    }
+  }
+
+  // Add placeholder for stripped images
+  if (imageCount > 0) {
+    textParts.push(
+      `[${imageCount} image(s) removed - model does not support image inputs]`,
+    );
+    logger.info(
+      { imageCount },
+      "[OpenAIAdapter] Stripped images from tool result (model does not support images)",
+    );
+  }
+
+  return textParts.join("\n");
+}
+
+// =============================================================================
+// RESPONSE ADAPTER
+// =============================================================================
+
+// Exported for reuse by OpenAI-compatible providers (Mistral, etc.)
+export class OpenAIResponseAdapter
+  implements LLMResponseAdapter<OpenAiResponse>
+{
+  readonly provider: SupportedProvider;
+  private response: OpenAiResponse;
+
+  constructor(
+    response: OpenAiResponse,
+    provider: SupportedProvider = "openai",
+  ) {
+    assertResponseHasChoices(response, provider);
+    this.response = response;
+    this.provider = provider;
+  }
+
+  getId(): string {
+    return this.response.id;
+  }
+
+  getModel(): string {
+    return this.response.model;
+  }
+
+  getText(): string {
+    const choice = this.response.choices[0];
+    if (!choice) return "";
+    return choice.message.content ?? "";
+  }
+
+  getToolCalls(): CommonToolCall[] {
+    const choice = this.response.choices[0];
+    if (!choice?.message.tool_calls) return [];
+
+    return choice.message.tool_calls.map((toolCall) => {
+      let name: string;
+      let args: Record<string, unknown>;
+
+      if (toolCall.type === "function" && toolCall.function) {
+        name = toolCall.function.name;
+        try {
+          args = JSON.parse(toolCall.function.arguments);
+        } catch {
+          args = {};
+        }
+      } else if (toolCall.type === "custom" && toolCall.custom) {
+        name = toolCall.custom.name;
+        try {
+          args = JSON.parse(toolCall.custom.input);
+        } catch {
+          args = {};
+        }
+      } else {
+        name = "unknown";
+        args = {};
+      }
+
+      return {
+        id: toolCall.id,
+        name,
+        arguments: args,
+      };
+    });
+  }
+
+  hasToolCalls(): boolean {
+    const choice = this.response.choices[0];
+    return (choice?.message.tool_calls?.length ?? 0) > 0;
+  }
+
+  getUsage(): UsageView {
+    if (!this.response.usage) {
+      return {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+      };
+    }
+    const { input, output, cacheRead, cacheWrite, reasoning } = getUsageTokens(
+      this.response.usage,
+    );
+    return {
+      inputTokens: input,
+      outputTokens: output,
+      cacheReadTokens: cacheRead,
+      cacheWriteTokens: cacheWrite,
+      reasoningTokens: reasoning,
+    };
+  }
+
+  getOriginalResponse(): OpenAiResponse {
+    return this.response;
+  }
+
+  getFinishReasons(): string[] {
+    const reason = this.response.choices?.[0]?.finish_reason;
+    return reason ? [reason] : [];
+  }
+
+  withRewrittenToolCalls(
+    toolCalls: Array<{ id: string; name: string; arguments: string }>,
+  ): OpenAiResponse {
+    const choice = this.response.choices[0];
+    return {
+      ...this.response,
+      choices: [
+        {
+          ...choice,
+          message: {
+            ...choice.message,
+            tool_calls: toolCalls.map((toolCall) => ({
+              id: toolCall.id,
+              type: "function" as const,
+              function: {
+                name: toolCall.name,
+                arguments: toolCall.arguments,
+              },
+            })),
+          },
+        },
+      ],
+    };
+  }
+
+  toRefusalResponse(
+    _refusalMessage: string,
+    contentMessage: string,
+  ): OpenAiResponse {
+    return {
+      ...this.response,
+      choices: [
+        {
+          ...this.response.choices[0],
+          message: {
+            role: "assistant",
+            content: contentMessage,
+            refusal: null,
+          },
+          finish_reason: "stop",
+        },
+      ],
+    };
+  }
+}
+
+// =============================================================================
+// STREAM ADAPTER
+// =============================================================================
+
+// Exported for reuse by OpenAI-compatible providers (Mistral, etc.)
+export class OpenAIStreamAdapter
+  implements LLMStreamAdapter<OpenAiStreamChunk, OpenAiResponse>
+{
+  readonly provider: SupportedProvider;
+  readonly state: StreamAccumulatorState;
+  private currentToolCallIndices = new Map<number, number>();
+  // Set to the refusal text when the streamed response was replaced by a policy
+  // refusal. formatEndSSE then finishes the turn as "stop" instead of replaying
+  // the upstream "tool_calls" finish reason (a text-only turn ending in
+  // "tool_calls" with no tool_calls makes agent harnesses retry), and
+  // toProviderResponse persists the refusal rather than the blocked tool calls.
+  /**
+   * The assistant text as the CLIENT received it.
+   *
+   * A refusal does not erase what the model already said: its text was streamed
+   * as it arrived, and the refusal is appended afterwards as one more delta,
+   * which clients concatenate onto the content they are accumulating. So the
+   * reconstructed turn has to carry both, in that order — reporting the refusal
+   * alone loses the model's own answer from the record, and anything that later
+   * reads the turn back (conversation history, a summarizer, a human debugging
+   * it) sees a turn in which the model never spoke.
+   */
+  private contentWithAnyReplacement(): string | null {
+    if (this.replacedText === null) {
+      return this.state.text || null;
+    }
+    return `${this.state.text}${this.replacedText}`;
+  }
+
+  /**
+   * The reasoning the model streamed, accumulated.
+   *
+   * OpenAI-compatible reasoning models (qwen3, DeepSeek-R1, GLM, …) stream
+   * their thinking in `reasoning_content` (or `reasoning`). It was forwarded to
+   * the client but never accumulated, so the reconstructed turn — the one
+   * persisted as the interaction — recorded a reasoning turn as though the
+   * model had gone straight to its answer, which is what makes such a turn
+   * impossible to review afterwards.
+   */
+  private reasoningText = "";
+
+  private replacedText: string | null = null;
+  private get responseReplacedWithText(): boolean {
+    return this.replacedText !== null;
+  }
+
+  constructor(provider: SupportedProvider = "openai") {
+    this.provider = provider;
+    this.state = {
+      responseId: "",
+      model: "",
+      text: "",
+      toolCalls: [],
+      rawToolCallEvents: [],
+      usage: null,
+      stopReason: null,
+      timing: {
+        startTime: Date.now(),
+        firstChunkTime: null,
+      },
+    };
+  }
+
+  processChunk(chunk: OpenAiStreamChunk): ChunkProcessingResult {
+    if (this.state.timing.firstChunkTime === null) {
+      this.state.timing.firstChunkTime = Date.now();
+    }
+
+    let sseData: string | null = null;
+    let isToolCallChunk = false;
+    let isFinal = false;
+
+    this.state.responseId = chunk.id;
+    this.state.model = chunk.model;
+
+    // Handle usage first - OpenAI sends usage in a final chunk with empty choices[]
+    // when stream_options.include_usage is true
+    if (chunk.usage) {
+      const cacheReadTokens =
+        (
+          chunk.usage.prompt_tokens_details as
+            | { cached_tokens?: number }
+            | undefined
+        )?.cached_tokens ?? 0;
+      const reasoningTokens =
+        (
+          chunk.usage.completion_tokens_details as
+            | { reasoning_tokens?: number }
+            | undefined
+        )?.reasoning_tokens ?? 0;
+      this.state.usage = {
+        inputTokens: Math.max(
+          0,
+          (chunk.usage.prompt_tokens ?? 0) - cacheReadTokens,
+        ),
+        outputTokens: chunk.usage.completion_tokens ?? 0,
+        cacheReadTokens,
+        cacheWriteTokens: 0,
+        reasoningTokens,
+      };
+    }
+
+    // `choices` can be entirely absent (not just empty) on some
+    // OpenAI-compatible upstreams' usage-only or error-shaped chunks —
+    // reading [0] off it unguarded is a crash.
+    const choice = chunk.choices?.[0];
+    if (!choice) {
+      // If we have usage, this is the final chunk (OpenAI sends usage in a chunk with empty choices)
+      return {
+        sseData: null,
+        isToolCallChunk: false,
+        isFinal: this.state.usage !== null,
+      };
+    }
+
+    const delta = choice.delta;
+
+    // Forward reasoning ("thinking") deltas. OpenAI-compatible reasoning models
+    // (qwen3, DeepSeek-R1, GLM, ... via Ollama/vLLM/OpenRouter) stream their
+    // thinking in a `reasoning_content` (or `reasoning`) field that isn't part
+    // of the typed delta. A reasoning-only chunk has no `content`, so without
+    // this it would be dropped and the client never sees the thinking. Forward
+    // the raw chunk unchanged so the field reaches the client's reasoning parser.
+    // Skip when the same chunk also carries a tool call: that must go through the
+    // tool-call branch's blocking-policy buffering below (which replays the full
+    // chunk — reasoning included — only once the call is approved), so reasoning
+    // never streams unapproved tool-call data past the gate.
+    const reasoning = (delta as { reasoning_content?: unknown })
+      .reasoning_content;
+    const reasoningAlt = (delta as { reasoning?: unknown }).reasoning;
+    const hasReasoning =
+      (typeof reasoning === "string" && reasoning.length > 0) ||
+      (typeof reasoningAlt === "string" && reasoningAlt.length > 0);
+    if (hasReasoning && !delta.tool_calls) {
+      this.reasoningText +=
+        typeof reasoning === "string" ? reasoning : (reasoningAlt as string);
+      sseData = `data: ${JSON.stringify(chunk)}\n\n`;
+    }
+
+    // Handle text content
+    if (delta.content) {
+      this.state.text += delta.content;
+      sseData = `data: ${JSON.stringify(chunk)}\n\n`;
+    }
+
+    // Handle tool calls
+    if (delta.tool_calls) {
+      for (const toolCallDelta of delta.tool_calls) {
+        const index = toolCallDelta.index;
+
+        if (!this.currentToolCallIndices.has(index)) {
+          this.currentToolCallIndices.set(index, this.state.toolCalls.length);
+          this.state.toolCalls.push({
+            id: toolCallDelta.id ?? "",
+            name: toolCallDelta.function?.name ?? "",
+            arguments: "",
+          });
+        }
+
+        const toolCallIndex = this.currentToolCallIndices.get(index);
+        if (toolCallIndex === undefined) continue;
+        const toolCall = this.state.toolCalls[toolCallIndex];
+
+        if (toolCallDelta.id) {
+          toolCall.id = toolCallDelta.id;
+        }
+        if (toolCallDelta.function?.name) {
+          toolCall.name = toolCallDelta.function.name;
+        }
+        if (toolCallDelta.function?.arguments) {
+          toolCall.arguments += toolCallDelta.function.arguments;
+        }
+      }
+
+      this.state.rawToolCallEvents.push(chunk);
+      isToolCallChunk = true;
+    }
+
+    // Handle finish reason
+    // Note: Don't set isFinal here - OpenAI sends the usage chunk AFTER the finish_reason chunk
+    // when stream_options.include_usage is true (which we always set in executeStream)
+    if (choice.finish_reason) {
+      this.state.stopReason = choice.finish_reason;
+    }
+
+    // Only mark as final after we've received usage data (which comes in a separate chunk
+    // after the finish_reason chunk when include_usage is enabled)
+    if (this.state.usage !== null) {
+      isFinal = true;
+    }
+
+    return { sseData, isToolCallChunk, isFinal };
+  }
+
+  getSSEHeaders(): Record<string, string> {
+    return {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    };
+  }
+
+  formatTextDeltaSSE(text: string): string {
+    const chunk: OpenAiStreamChunk = {
+      id: this.state.responseId,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: this.state.model,
+      choices: [
+        {
+          index: 0,
+          delta: {
+            content: text,
+          },
+          finish_reason: null,
+        },
+      ],
+    };
+    return `data: ${JSON.stringify(chunk)}\n\n`;
+  }
+
+  getRawToolCallEvents(): string[] {
+    return this.state.rawToolCallEvents.map(
+      (event) => `data: ${JSON.stringify(event)}\n\n`,
+    );
+  }
+
+  formatCompleteTextSSE(text: string): string[] {
+    this.replacedText = text;
+    const chunk: OpenAiStreamChunk = {
+      id: this.state.responseId || `chatcmpl-${Date.now()}`,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: this.state.model,
+      choices: [
+        {
+          index: 0,
+          delta: {
+            role: "assistant",
+            content: text,
+          },
+          finish_reason: null,
+        },
+      ],
+    };
+    return [`data: ${JSON.stringify(chunk)}\n\n`];
+  }
+
+  formatToolCallsSSE(toolCalls: StreamAccumulatorState["toolCalls"]): string[] {
+    // One chunk carrying every call, complete: name and the whole argument
+    // string in a single delta. The wire format allows it (arguments are
+    // concatenated across deltas, and one delta is a valid degenerate case),
+    // and it keeps the rewrite from having to reproduce the upstream's
+    // fragmentation. `index` is the call's position, which is what clients
+    // accumulate by.
+    const chunk: OpenAiStreamChunk = {
+      id: this.state.responseId,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: this.state.model,
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: toolCalls.map((toolCall, index) => ({
+              index,
+              id: toolCall.id,
+              type: "function" as const,
+              function: {
+                name: toolCall.name,
+                arguments: toolCall.arguments,
+              },
+            })),
+          },
+          finish_reason: null,
+        },
+      ],
+    };
+    return [`data: ${JSON.stringify(chunk)}\n\n`];
+  }
+
+  formatEndSSE(): string {
+    const finalChunk: OpenAiStreamChunk = {
+      id: this.state.responseId,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: this.state.model,
+      choices: [
+        {
+          index: 0,
+          delta: {},
+          finish_reason: this.responseReplacedWithText
+            ? "stop"
+            : ((this.state.stopReason as "stop" | "tool_calls") ?? "stop"),
+        },
+      ],
+    };
+    // Carry the usage the provider sent in its trailing chunk into the synthesized final chunk;
+    // without it, streaming clients (e.g. the chat route's AI SDK, for OpenRouter and other
+    // OpenAI-compatible models) never see token counts. `state.usage.inputTokens` is net of
+    // cache reads (see processChunk above), so this must recombine them into a gross
+    // `prompt_tokens` with `prompt_tokens_details` — mirrors `toProviderResponse()` below.
+    const usage = toOpenAiStreamUsageWithCache(this.state.usage);
+    if (usage) {
+      finalChunk.usage = usage;
+    }
+    return `data: ${JSON.stringify(finalChunk)}\n\ndata: [DONE]\n\n`;
+  }
+
+  toProviderResponse(): OpenAiResponse {
+    const toolCalls =
+      this.responseReplacedWithText || this.state.toolCalls.length === 0
+        ? undefined
+        : this.state.toolCalls.map((tc) => ({
+            id: tc.id,
+            type: "function" as const,
+            function: {
+              name: tc.name,
+              arguments: tc.arguments,
+            },
+          }));
+
+    return {
+      id: this.state.responseId,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: this.state.model,
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: this.contentWithAnyReplacement(),
+            // Non-standard, and the same field these models emit on the wire —
+            // clients that render reasoning read it back from here.
+            ...(this.reasoningText
+              ? { reasoning_content: this.reasoningText }
+              : {}),
+            refusal: null,
+            tool_calls: toolCalls,
+          },
+          logprobs: null,
+          finish_reason: this.responseReplacedWithText
+            ? "stop"
+            : ((this.state.stopReason as OpenAi.Types.FinishReason) ?? "stop"),
+        },
+      ],
+      usage: toOpenAiStreamUsageWithCache(this.state.usage) ?? {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+      },
+    };
+  }
+}
+
+// =============================================================================
+// ADAPTER FACTORY
+// =============================================================================
+
+// =============================================================================
+// USAGE TOKEN HELPERS
+// =============================================================================
+
+export function getUsageTokens(usage: OpenAi.Types.Usage) {
+  // OpenAI reports cached tokens as a SUBSET already inside prompt_tokens, so
+  // subtract them to get the uncached input and avoid double-counting.
+  const cacheRead =
+    (usage.prompt_tokens_details as { cached_tokens?: number } | undefined)
+      ?.cached_tokens ?? 0;
+  const reasoning =
+    (
+      usage.completion_tokens_details as
+        | { reasoning_tokens?: number }
+        | undefined
+    )?.reasoning_tokens ?? 0;
+  return {
+    input: Math.max(0, usage.prompt_tokens - cacheRead),
+    output: usage.completion_tokens,
+    cacheRead,
+    cacheWrite: 0,
+    reasoning,
+  };
+}
+
+export const openaiAdapterFactory: LLMProvider<
+  OpenAiRequest,
+  OpenAiResponse,
+  OpenAiMessages,
+  OpenAiStreamChunk,
+  OpenAiHeaders
+> = {
+  provider: "openai",
+  interactionType: "openai:chatCompletions",
+
+  createRequestAdapter(
+    request: OpenAiRequest,
+  ): LLMRequestAdapter<OpenAiRequest, OpenAiMessages> {
+    return new OpenAIRequestAdapter(request);
+  },
+
+  createResponseAdapter(
+    response: OpenAiResponse,
+  ): LLMResponseAdapter<OpenAiResponse> {
+    return new OpenAIResponseAdapter(response);
+  },
+
+  createStreamAdapter(): LLMStreamAdapter<OpenAiStreamChunk, OpenAiResponse> {
+    return new OpenAIStreamAdapter();
+  },
+
+  extractApiKey(headers: OpenAiHeaders): string | undefined {
+    // Return the authorization header as-is (legacy behavior)
+    // OpenAI SDK handles both "Bearer sk-xxx" and "sk-xxx" formats
+    return headers.authorization;
+  },
+
+  isSubscriptionCredential(apiKey: string | undefined): boolean {
+    // ChatGPT-subscription (Codex) credentials travel through the proxy as
+    // marker-prefixed encoded strings (`chatgpt-oauth:…`). They are covered by
+    // a flat-rate plan, so they must classify as subscription — the same rule
+    // as Anthropic `sk-ant-oat…` OAuth tokens. `extractApiKey` returns the
+    // authorization header as-is, so strip an optional `Bearer ` prefix before
+    // the format check; plain `sk-…` API keys stay metered.
+    const token = apiKey?.startsWith("Bearer ") ? apiKey.slice(7) : apiKey;
+    return isOpenAiCodexCredential(token);
+  },
+
+  getBaseUrl(): string | undefined {
+    return config.llm.openai.baseUrl;
+  },
+
+  spanName: "chat",
+
+  createClient(
+    apiKey: string | undefined,
+    options: CreateClientOptions,
+  ): OpenAIProvider {
+    // Use observable fetch for request duration metrics if agent is provided
+    const baseFetch = options.agent
+      ? metrics.llm.getObservableFetch("openai", options.agent, options.source)
+      : undefined;
+
+    // "ChatGPT subscription" (Codex) auth mode: the resolved credential is an
+    // encoded ChatGPT OAuth credential, not an `sk-…` key. Route through the
+    // Codex Responses backend instead of api.openai.com.
+    const codexCredential = decodeOpenAiCodexCredential(apiKey);
+    if (codexCredential) {
+      return createOpenAiCodexClient({
+        credential: codexCredential,
+        options,
+        innerFetch: baseFetch,
+      });
+    }
+
+    // Wrap fetch to normalize non-OpenAI error responses (e.g. LiteLLM/vLLM)
+    // into OpenAI-compatible format so the SDK surfaces the real error message
+    // instead of "500 status code (no body)".
+    const customFetch = async (
+      url: string | URL | Request,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const response = await (baseFetch ?? fetch)(url, init);
+
+      if (!response.ok) {
+        const contentType = response.headers.get("content-type") || "";
+        // Only intercept JSON responses — SSE streams are handled differently
+        if (contentType.includes("application/json")) {
+          try {
+            const cloned = response.clone();
+            const rawBody = await cloned.text();
+            if (rawBody) {
+              const parsed = JSON.parse(rawBody);
+              // If the body already has an OpenAI-compatible error.message, leave it
+              if (parsed?.error?.message) {
+                return response;
+              }
+              // Re-wrap non-standard error body into OpenAI format
+              const errorMessage = parsed?.message || rawBody;
+              const formattedBody = JSON.stringify({
+                error: {
+                  message:
+                    typeof errorMessage === "string"
+                      ? errorMessage
+                      : JSON.stringify(errorMessage),
+                  type: "upstream_error",
+                  code: response.status,
+                },
+              });
+              return new Response(formattedBody, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: new Headers({
+                  "content-type": "application/json",
+                }),
+              });
+            }
+          } catch {
+            // Can't parse body — return original response
+          }
+        }
+      }
+
+      return response;
+    };
+
+    return new OpenAIProvider({
+      maxRetries: PROXY_SDK_MAX_RETRIES,
+      apiKey,
+      baseURL: options.baseUrl,
+      fetch: customFetch,
+      defaultHeaders: options.defaultHeaders,
+    });
+  },
+
+  async execute(
+    client: unknown,
+    request: OpenAiRequest,
+  ): Promise<OpenAiResponse> {
+    const openaiClient = client as OpenAIProvider;
+    const openaiRequest = {
+      ...normalizeChatCompletionsQuirks(request),
+      stream: false,
+    } as unknown as ChatCompletionCreateParamsNonStreaming;
+    return openaiClient.chat.completions.create(
+      openaiRequest,
+    ) as Promise<OpenAiResponse>;
+  },
+
+  async executeStream(
+    client: unknown,
+    request: OpenAiRequest,
+  ): Promise<AsyncIterable<OpenAiStreamChunk>> {
+    const openaiClient = client as OpenAIProvider;
+    const openaiRequest = {
+      ...normalizeChatCompletionsQuirks(request),
+      stream: true,
+      stream_options: { include_usage: true },
+    } as unknown as ChatCompletionCreateParamsStreaming;
+    const stream = await openaiClient.chat.completions.create(openaiRequest);
+
+    return {
+      [Symbol.asyncIterator]: async function* () {
+        for await (const chunk of stream) {
+          yield chunk as OpenAiStreamChunk;
+        }
+      },
+    };
+  },
+
+  extractInternalCode(error: unknown): ArchestraInternalErrorCode | undefined {
+    if (get(error, "error.code") === "context_length_exceeded") {
+      return ArchestraInternalErrorCode.ContextLengthExceeded;
+    }
+    return subscriptionAuthRequiredCode(error);
+  },
+
+  extractErrorMessage(error: unknown): string {
+    // OpenAI SDK APIError — has .error.message with the upstream error
+    const openaiMessage = get(error, "error.message");
+    if (typeof openaiMessage === "string") {
+      return openaiMessage;
+    }
+
+    if (error instanceof Error) {
+      // Node.js stream termination produces a bare "terminated" message.
+      // Make it actionable for users (common with LiteLLM/vLLM proxies).
+      if (error.message === "terminated") {
+        const status = get(error, "status");
+        if (typeof status === "number") {
+          return `Upstream provider returned HTTP ${status} and closed the connection`;
+        }
+        return "Upstream provider closed the connection unexpectedly";
+      }
+
+      return error.message;
+    }
+
+    return "Internal server error";
+  },
+};
+
+type OpenAiEmbeddingsProvider = LLMProvider<
+  OpenAiEmbeddingRequest,
+  OpenAiEmbeddingResponse,
+  OpenAiMessages,
+  never,
+  OpenAiHeaders
+>;
+
+/**
+ * Build an embeddings adapter for any provider that exposes an OpenAI-compatible
+ * `/embeddings` endpoint (OpenAI itself, Mistral, Azure, Ollama, vLLM, Zhipu AI, …).
+ *
+ * The wire format is identical to OpenAI's, so all request/response handling is
+ * shared; only the provider name (used for observability, metrics, and cost
+ * attribution) and the default base URL differ per provider. The effective base
+ * URL is still overridable per request via the mapped provider key / auth
+ * override in the LLM proxy handler.
+ */
+export function makeOpenAiCompatibleEmbeddingsAdapterFactory(
+  provider: SupportedProvider,
+  getBaseUrl: () => string | undefined,
+): OpenAiEmbeddingsProvider {
+  return {
+    provider,
+    // OpenAI-compatible embeddings share the OpenAI interaction discriminator,
+    // matching the knowledge-base embedding pipeline (getEmbeddingDiscriminator).
+    interactionType: "openai:embeddings",
+
+    createRequestAdapter(
+      request: OpenAiEmbeddingRequest,
+    ): LLMRequestAdapter<OpenAiEmbeddingRequest, OpenAiMessages> {
+      return new OpenAIEmbeddingRequestAdapter(request, provider);
+    },
+
+    createResponseAdapter(
+      response: OpenAiEmbeddingResponse,
+    ): LLMResponseAdapter<OpenAiEmbeddingResponse> {
+      return new OpenAIEmbeddingResponseAdapter(response, provider);
+    },
+
+    createStreamAdapter(): LLMStreamAdapter<never, OpenAiEmbeddingResponse> {
+      return new OpenAIEmbeddingStreamAdapter(provider);
+    },
+
+    extractApiKey(headers: OpenAiHeaders): string | undefined {
+      return headers.authorization;
+    },
+
+    getBaseUrl(): string | undefined {
+      return getBaseUrl();
+    },
+
+    spanName: "embedding",
+
+    createClient(
+      apiKey: string | undefined,
+      options: CreateClientOptions,
+    ): OpenAIProvider {
+      // A ChatGPT-subscription (Codex) credential has no embeddings support: the
+      // duck-typed Codex client only implements chat.completions.create, so
+      // guard here for a clean 400 instead of an opaque TypeError -> 500 later.
+      if (isOpenAiCodexCredential(apiKey)) {
+        throw new ApiError(
+          400,
+          "ChatGPT subscription (Codex) credentials do not support embeddings — use a standard OpenAI API key.",
+        );
+      }
+      return openaiAdapterFactory.createClient(
+        apiKey,
+        options,
+      ) as OpenAIProvider;
+    },
+
+    async execute(
+      client: unknown,
+      request: OpenAiEmbeddingRequest,
+    ): Promise<OpenAiEmbeddingResponse> {
+      const openaiClient = client as OpenAIProvider;
+      return openaiClient.embeddings.create(
+        request as Parameters<typeof openaiClient.embeddings.create>[0],
+      ) as Promise<OpenAiEmbeddingResponse>;
+    },
+
+    async executeStream(): Promise<AsyncIterable<never>> {
+      throw new Error("OpenAI embeddings do not support streaming.");
+    },
+
+    extractInternalCode(
+      error: unknown,
+    ): ArchestraInternalErrorCode | undefined {
+      return openaiAdapterFactory.extractInternalCode(error);
+    },
+
+    extractErrorMessage(error: unknown): string {
+      return openaiAdapterFactory.extractErrorMessage(error);
+    },
+  };
+}
+
+export const openAiEmbeddingsAdapterFactory: OpenAiEmbeddingsProvider =
+  makeOpenAiCompatibleEmbeddingsAdapterFactory(
+    "openai",
+    () => config.llm.openai.baseUrl,
+  );
+
+// =============================================================================
+// INTERNAL HELPERS
+// =============================================================================
+
+/**
+ * Client request shapes OpenAI's /chat/completions rejects but that known
+ * clients send anyway (their own backends normalize before forwarding, so the
+ * shapes never reach OpenAI on the clients' native paths — the proxy has to do
+ * the same). Both fixes are no-ops for requests that don't carry the quirk.
+ */
+function normalizeChatCompletionsQuirks(request: OpenAiRequest): OpenAiRequest {
+  return normalizeEmptyAssistantContent(
+    normalizeResponsesStyleCustomTools(request),
+  );
+}
+
+/**
+ * Cursor sends assistant tool-call turns with `content: []`; OpenAI rejects
+ * that with "Invalid 'messages[N].content': empty array. Expected an array
+ * with minimum length 1". `null` is the accepted spelling of "no content" on
+ * an assistant message.
+ */
+function normalizeEmptyAssistantContent(request: OpenAiRequest): OpenAiRequest {
+  const needsFix = request.messages.some(
+    (m) =>
+      m.role === "assistant" &&
+      Array.isArray(m.content) &&
+      m.content.length === 0,
+  );
+  if (!needsFix) return request;
+  return {
+    ...request,
+    messages: request.messages.map((m) =>
+      m.role === "assistant" &&
+      Array.isArray(m.content) &&
+      m.content.length === 0
+        ? { ...m, content: null }
+        : m,
+    ),
+  };
+}
+
+/**
+ * Some Responses-API-first clients (Cursor's ApplyPatch tool is the known
+ * case) attach custom tools to /chat/completions requests in the flat
+ * Responses shape — `name`/`format` at the top level with grammar fields
+ * inlined. OpenAI rejects that shape on Chat Completions with
+ * "Missing required parameter: 'tools[N].custom'", so normalize it to the
+ * nested Chat Completions shape before forwarding. Requests without a flat
+ * custom tool pass through untouched.
+ */
+function normalizeResponsesStyleCustomTools(
+  request: OpenAiRequest,
+): OpenAiRequest {
+  const tools = request.tools;
+  if (!tools?.some((t) => t.type === "custom" && !("custom" in t))) {
+    return request;
+  }
+  return {
+    ...request,
+    tools: tools.map((t) => {
+      if (t.type !== "custom" || "custom" in t) return t;
+      return {
+        type: "custom" as const,
+        custom: {
+          name: t.name,
+          ...(t.description !== undefined && { description: t.description }),
+          ...(t.format !== undefined && {
+            format:
+              t.format.type === "grammar"
+                ? {
+                    type: "grammar" as const,
+                    grammar: {
+                      definition: t.format.definition,
+                      syntax: t.format.syntax,
+                    },
+                  }
+                : { type: "text" as const },
+          }),
+        },
+      };
+    }),
+  };
+}
+
+/**
+ * Some OpenAI-compatible upstreams (LiteLLM, OpenRouter, misconfigured
+ * gateways) return HTTP 200 with an error-shaped body — no `choices` array,
+ * usually an `error` object instead. Downstream code (getText, tool-call
+ * policy evaluation, response serialization) assumes `choices` exists, so
+ * surface the upstream failure as a typed error here instead of crashing with
+ * an opaque TypeError.
+ */
+function assertResponseHasChoices(
+  response: OpenAiResponse,
+  provider: SupportedProvider,
+): void {
+  if (Array.isArray(response?.choices)) return;
+
+  const embeddedError = (
+    response as unknown as {
+      error?: { message?: unknown; code?: unknown; status?: unknown };
+    }
+  )?.error;
+
+  const rawStatus = embeddedError?.status ?? embeddedError?.code;
+  const statusCode =
+    typeof rawStatus === "number" && rawStatus >= 400 && rawStatus <= 599
+      ? rawStatus
+      : 502;
+
+  const upstreamMessage =
+    typeof embeddedError?.message === "string" && embeddedError.message
+      ? embeddedError.message
+      : `Upstream ${provider} provider returned a response without choices`;
+
+  throw new ApiError(statusCode, upstreamMessage);
+}

@@ -1,0 +1,776 @@
+import {
+  MAX_PROJECT_UPLOAD_BYTES,
+  PROJECT_DESCRIPTION_MAX_LENGTH,
+  PROJECT_INSTRUCTIONS_MAX_LENGTH,
+  PROJECT_NAME_MAX_LENGTH,
+  parseLabelsParam,
+  RouteId,
+} from "@archestra/shared";
+import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
+import { z } from "zod";
+import { userHasPermission } from "@/auth";
+import { ProjectLabelModel, ProjectModel } from "@/models";
+import { projectService } from "@/services/project";
+import { transferResourceOwnership } from "@/services/resource-ownership";
+import {
+  constructResponseSchema,
+  GetAgentRunResponseSchema,
+  LabelWithDetailsSchema,
+  ProjectConversationItemSchema,
+  ProjectDetailSchema,
+  ProjectLifecycleSchema,
+  ProjectListItemSchema,
+  ProjectListScopeSchema,
+  ProjectShareVisibilitySchema,
+  SandboxFileListItemSchema,
+} from "@/types";
+import {
+  BulkDeleteBodySchema,
+  BulkIdsSchema,
+  BulkOutcomeSchema,
+  runBulk,
+} from "../bulk-route";
+import { registerEntityLabelRoutes } from "../entity-labels";
+
+/** A comma-separated query param parsed into a string[] (mirrors the agents list). */
+const CommaSeparatedIds = z.preprocess(
+  (val) => (typeof val === "string" ? val.split(",").filter(Boolean) : val),
+  z.array(z.string()),
+);
+
+/**
+ * Body limit for a single-file upload: the 25 MB cap as base64 (~4/3) plus the
+ * small JSON envelope (name + mimeType + keys). Tighter than the global body
+ * limit so an oversized body is rejected at parse time, before a ~190 MB
+ * decode, instead of relying only on the handler's decoded-size 413.
+ */
+const PROJECT_UPLOAD_BODY_LIMIT =
+  Math.ceil(MAX_PROJECT_UPLOAD_BYTES / 3) * 4 + 64 * 1024;
+
+/**
+ * Projects: named collections of chats that own a set of files. Read access
+ * follows the project share (org / teams / owner-only); mutations are
+ * owner-only and "not yours" is indistinguishable from 404.
+ */
+const projectRoutes: FastifyPluginAsyncZod = async (fastify) => {
+  fastify.post(
+    "/api/projects/:id/transfer-ownership",
+    {
+      schema: {
+        operationId: RouteId.TransferProjectOwnership,
+        description: "Transfer ownership to another organization member",
+        tags: ["Ownership"],
+        params: z.object({ id: z.string().uuid() }),
+        body: z.object({ ownerId: z.string().min(1) }),
+        response: constructResponseSchema(z.object({ success: z.boolean() })),
+      },
+    },
+    async ({ params, body, user, organizationId }) => {
+      await transferResourceOwnership({
+        kind: "project",
+        id: params.id,
+        ownerId: body.ownerId,
+        userId: user.id,
+        organizationId,
+      });
+      return { success: true };
+    },
+  );
+
+  registerEntityLabelRoutes(fastify, {
+    basePath: "/api/projects",
+    tag: "Projects",
+    entityNamePlural: "projects",
+    model: ProjectLabelModel,
+    keysOperationId: RouteId.GetProjectLabelKeys,
+    valuesOperationId: RouteId.GetProjectLabelValues,
+  });
+
+  fastify.post(
+    "/api/projects",
+    {
+      schema: {
+        operationId: RouteId.CreateProject,
+        description:
+          "Create a project. Files produced in its chats are owned by the " +
+          "project rather than the individual author.",
+        tags: ["Projects"],
+        body: z.object({
+          name: z.string().min(1).max(PROJECT_NAME_MAX_LENGTH),
+          description: z
+            .string()
+            .max(PROJECT_DESCRIPTION_MAX_LENGTH)
+            .nullable()
+            .optional(),
+          icon: z.string().max(1_000_000).nullable().optional(),
+          defaultAgentId: z.string().uuid().nullable().optional(),
+          labels: z.array(LabelWithDetailsSchema).default([]),
+        }),
+        response: constructResponseSchema(ProjectListItemSchema),
+      },
+    },
+    async ({ body, organizationId, user }) => {
+      const project = await projectService.create({
+        organizationId,
+        userId: user.id,
+        name: body.name,
+        description: body.description ?? null,
+        icon: body.icon ?? null,
+        defaultAgentId: body.defaultAgentId ?? null,
+        labels: body.labels,
+      });
+      const labels = await ProjectLabelModel.getLabelsFor(project.id);
+      return {
+        id: project.id,
+        name: project.name,
+        description: project.description,
+        icon: project.icon,
+        viewerRole: "owner" as const,
+        ownerName: user.name ?? null,
+        // The acting user, straight from the session: they just created it.
+        createdBy: {
+          id: user.id,
+          name: user.name || null,
+          email: user.email || null,
+        },
+        labels,
+        conversationCount: 0,
+        visibility: null,
+        shareTeamNames: null,
+        shareUserNames: null,
+        pinnedAt: null,
+        createdAt: project.createdAt,
+        deletedAt: null,
+      };
+    },
+  );
+
+  fastify.post(
+    "/api/projects/from-conversation",
+    {
+      schema: {
+        operationId: RouteId.CreateProjectFromConversation,
+        description:
+          "Turn an existing chat into a project: create the project, move the " +
+          "chat into it, and re-point the chat's files to the project. Only the " +
+          "chat's owner may do this, and only for a user chat not already in a " +
+          "project. `name` defaults to the chat title.",
+        tags: ["Projects"],
+        body: z.object({
+          conversationId: z.string().uuid(),
+          name: z.string().min(1).max(PROJECT_NAME_MAX_LENGTH).optional(),
+          description: z
+            .string()
+            .max(PROJECT_DESCRIPTION_MAX_LENGTH)
+            .nullable()
+            .optional(),
+          icon: z.string().max(1_000_000).nullable().optional(),
+          labels: z.array(LabelWithDetailsSchema).default([]),
+        }),
+        response: constructResponseSchema(ProjectListItemSchema),
+      },
+    },
+    async ({ body, organizationId, user }) => {
+      const { project } = await projectService.createProjectFromConversation({
+        organizationId,
+        userId: user.id,
+        conversationId: body.conversationId,
+        name: body.name ?? null,
+        description: body.description ?? null,
+        icon: body.icon ?? null,
+        labels: body.labels,
+      });
+      const labels = await ProjectLabelModel.getLabelsFor(project.id);
+      return {
+        id: project.id,
+        name: project.name,
+        description: project.description,
+        icon: project.icon,
+        viewerRole: "owner" as const,
+        ownerName: user.name ?? null,
+        // The acting user, straight from the session: they just created it.
+        createdBy: {
+          id: user.id,
+          name: user.name || null,
+          email: user.email || null,
+        },
+        labels,
+        conversationCount: 1,
+        visibility: null,
+        shareTeamNames: null,
+        shareUserNames: null,
+        pinnedAt: null,
+        createdAt: project.createdAt,
+        deletedAt: null,
+      };
+    },
+  );
+
+  fastify.get(
+    "/api/projects",
+    {
+      schema: {
+        operationId: RouteId.GetProjects,
+        description:
+          "List projects the caller can see. `scope` is the project's share " +
+          "visibility: `personal` (private), `team` (shared with teams — narrow " +
+          "with `teamIds`), or `org` (org-wide); omitted = all visible. Admins " +
+          "additionally filter `personal` by owner via `authorIds` / " +
+          "`excludeAuthorIds` (ignored for non-admins). `search` matches name + " +
+          "description. `status=deleted` returns the org-wide soft-deleted " +
+          "projects for a project admin (empty for everyone else); the other " +
+          "filters do not apply to that slice.",
+        tags: ["Projects"],
+        querystring: z.object({
+          scope: ProjectListScopeSchema.optional(),
+          search: z.string().optional(),
+          labels: z
+            .string()
+            .optional()
+            .describe(
+              "Filter by labels. Format: key1:val1|val2;key2:val3. AND across keys, OR within values.",
+            ),
+          teamIds: CommaSeparatedIds.optional().describe(
+            "Team IDs (comma-separated); only used when scope=team.",
+          ),
+          authorIds: CommaSeparatedIds.optional().describe(
+            "Owner user IDs (comma-separated). Admin-only; used with scope=personal.",
+          ),
+          excludeAuthorIds: CommaSeparatedIds.optional().describe(
+            "Exclude owner user IDs (comma-separated). Admin-only; used with scope=personal.",
+          ),
+          status: ProjectLifecycleSchema.optional().describe(
+            "Lifecycle slice: `active` (default) or `deleted` (project admins " +
+              "only; org-wide soft-deleted projects for the restore view).",
+          ),
+        }),
+        response: constructResponseSchema(z.array(ProjectListItemSchema)),
+      },
+    },
+    async ({ query, organizationId, user }) => {
+      const isProjectAdmin = await userHasPermission(
+        user.id,
+        organizationId,
+        "project",
+        "admin",
+      );
+      const parsedLabels = parseLabelsParam(query.labels);
+      const labelFilteredIds = parsedLabels
+        ? await ProjectLabelModel.getIdsMatchingLabels(parsedLabels)
+        : undefined;
+      return projectService.list({
+        organizationId,
+        userId: user.id,
+        isProjectAdmin,
+        scope: query.scope,
+        teamIds: query.teamIds,
+        // The owner sub-filter is admin-only; ignore it for everyone else.
+        authorIds: isProjectAdmin ? query.authorIds : undefined,
+        excludeAuthorIds: isProjectAdmin ? query.excludeAuthorIds : undefined,
+        search: query.search,
+        status: query.status,
+        labelFilteredIds,
+      });
+    },
+  );
+
+  fastify.get(
+    "/api/projects/:id",
+    {
+      schema: {
+        operationId: RouteId.GetProject,
+        description:
+          "Project detail. Share team ids are included for the owner only.",
+        tags: ["Projects"],
+        params: z.object({ id: z.string().uuid() }),
+        response: constructResponseSchema(ProjectDetailSchema),
+      },
+    },
+    async ({ params: { id }, organizationId, user }) =>
+      projectService.get({
+        id,
+        organizationId,
+        userId: user.id,
+        allowAdminOversight: true,
+      }),
+  );
+
+  fastify.patch(
+    "/api/projects/:id",
+    {
+      schema: {
+        operationId: RouteId.UpdateProject,
+        description:
+          "Update a project's name, description, icon, and/or default agent " +
+          "(owner or a project admin). Only the provided fields change. The " +
+          "default agent must be an organization-wide chat agent; null clears " +
+          "it.",
+        tags: ["Projects"],
+        params: z.object({ id: z.string().uuid() }),
+        body: z.object({
+          name: z.string().min(1).max(PROJECT_NAME_MAX_LENGTH).optional(),
+          description: z
+            .string()
+            .max(PROJECT_DESCRIPTION_MAX_LENGTH)
+            .nullable()
+            .optional(),
+          icon: z.string().max(1_000_000).nullable().optional(),
+          defaultAgentId: z.string().uuid().nullable().optional(),
+          labels: z
+            .array(LabelWithDetailsSchema)
+            .optional()
+            .describe(
+              "Key/value labels. Omit to leave existing labels untouched; pass [] to clear them.",
+            ),
+        }),
+        response: constructResponseSchema(z.object({ ok: z.literal(true) })),
+      },
+    },
+    async ({ params: { id }, body, organizationId, user }) => {
+      await projectService.update({
+        id,
+        organizationId,
+        userId: user.id,
+        name: body.name,
+        description: body.description,
+        icon: body.icon,
+        defaultAgentId: body.defaultAgentId,
+        labels: body.labels,
+      });
+      return { ok: true as const };
+    },
+  );
+
+  fastify.put(
+    "/api/projects/:id/share",
+    {
+      schema: {
+        operationId: RouteId.SetProjectShare,
+        description:
+          "Set who can see the project (owner or a project admin): the whole " +
+          'organization, specific teams, or nobody (visibility "none" unshares).',
+        tags: ["Projects"],
+        params: z.object({ id: z.string().uuid() }),
+        body: z.object({
+          // "none" unshares — expressed as a value (not null) because the
+          // generated client cannot represent a nullable enum.
+          visibility: ProjectShareVisibilitySchema.or(z.literal("none")),
+          teamIds: z.array(z.string()).default([]),
+          // People a `user` share names; ignored for other visibilities.
+          userIds: z.array(z.string()).default([]),
+        }),
+        response: constructResponseSchema(z.object({ ok: z.literal(true) })),
+      },
+    },
+    async ({ params: { id }, body, organizationId, user }) => {
+      await projectService.setShare({
+        id,
+        organizationId,
+        userId: user.id,
+        visibility: body.visibility === "none" ? null : body.visibility,
+        teamIds: body.teamIds,
+        userIds: body.userIds,
+      });
+      return { ok: true as const };
+    },
+  );
+
+  fastify.patch(
+    "/api/projects/bulk",
+    {
+      schema: {
+        operationId: RouteId.BulkUpdateProjects,
+        description:
+          "Update several projects in one request. Today the only " +
+          "bulk-editable surface is who can see them — the whole " +
+          'organization, named teams, named people, or nobody ("none" ' +
+          "unshares) — and every project in the batch is moved to the same " +
+          "one. Per-project problems, such as an id the caller neither owns " +
+          "nor administers, are reported in `failed` and leave the rest of " +
+          "the batch applied.",
+        tags: ["Projects"],
+        body: z.object({
+          ids: BulkIdsSchema,
+          // "none" unshares — a value rather than null, because the generated
+          // client cannot represent a nullable enum.
+          visibility: ProjectShareVisibilitySchema.or(z.literal("none")),
+          teamIds: z.array(z.string()).default([]),
+          userIds: z.array(z.string()).default([]),
+        }),
+        response: constructResponseSchema(BulkOutcomeSchema),
+      },
+    },
+    async (request, reply) => {
+      const { organizationId, user, body } = request;
+      const visibility = body.visibility === "none" ? null : body.visibility;
+
+      const outcome = await runBulk({
+        ids: body.ids,
+        logLabel: "projects bulk update",
+        notFoundMessage: "Project not found",
+        unexpectedMessage: "Could not update this project",
+        load: async (ids) =>
+          new Map(
+            (await ProjectModel.findForBulk({ ids, organizationId })).map(
+              (project) => [project.id, project],
+            ),
+          ),
+        describe: (project) => project.name,
+        // The service owns the authorization (owner or project admin) and
+        // throws exactly as the single-project route would, so a batch refuses
+        // what one request refuses — per project, not for the whole batch.
+        applyEach: async (_project, id) => {
+          await projectService.setShare({
+            id,
+            organizationId,
+            userId: user.id,
+            visibility,
+            teamIds: body.teamIds,
+            userIds: body.userIds,
+          });
+        },
+        audit: {
+          target: request,
+          snapshot: async (ids) => ({
+            projects: await ProjectModel.findVisibilityForBulkAudit({
+              ids,
+              organizationId,
+            }),
+          }),
+        },
+      });
+
+      return reply.send(outcome);
+    },
+  );
+
+  fastify.delete(
+    "/api/projects/bulk",
+    {
+      schema: {
+        operationId: RouteId.BulkDeleteProjects,
+        description:
+          "Soft-delete several projects in one request (owner or project " +
+          "admin per project). As with the single-project delete, their chats " +
+          "detach and survive as ordinary conversations, and their files and " +
+          "scheduled tasks are retained but hidden. Nothing is purged, and a " +
+          "project the caller may not delete is reported in `failed` while " +
+          "the rest of the batch still applies.",
+        tags: ["Projects"],
+        body: BulkDeleteBodySchema,
+        response: constructResponseSchema(BulkOutcomeSchema),
+      },
+    },
+    async (request, reply) => {
+      const { organizationId, user } = request;
+
+      const outcome = await runBulk({
+        ids: request.body.ids,
+        logLabel: "projects bulk delete",
+        notFoundMessage: "Project not found",
+        unexpectedMessage: "Could not delete this project",
+        load: async (ids) =>
+          new Map(
+            (await ProjectModel.findForBulk({ ids, organizationId })).map(
+              (project) => [project.id, project],
+            ),
+          ),
+        describe: (project) => project.name,
+        applyEach: async (_project, id) => {
+          await projectService.delete({ id, organizationId, userId: user.id });
+        },
+        audit: {
+          target: request,
+          snapshot: async (ids) => ({
+            projects: await ProjectModel.findVisibilityForBulkAudit({
+              ids,
+              organizationId,
+            }),
+          }),
+        },
+      });
+
+      return reply.send(outcome);
+    },
+  );
+
+  fastify.delete(
+    "/api/projects/:id",
+    {
+      schema: {
+        operationId: RouteId.DeleteProject,
+        description:
+          "Soft-delete a project (owner or a project admin). Its chats detach " +
+          "and survive as ordinary conversations; its files and scheduled tasks " +
+          "are retained but hidden, and a project admin can restore them. " +
+          "Nothing is purged.",
+        tags: ["Projects"],
+        params: z.object({ id: z.string().uuid() }),
+        response: constructResponseSchema(z.object({ ok: z.literal(true) })),
+      },
+    },
+    async ({ params: { id }, organizationId, user }) => {
+      await projectService.delete({ id, organizationId, userId: user.id });
+      return { ok: true as const };
+    },
+  );
+
+  fastify.post(
+    "/api/projects/:id/restore",
+    {
+      schema: {
+        operationId: RouteId.RestoreProject,
+        description:
+          "Restore a soft-deleted project (project admins only). Brings back " +
+          "its retained files and scheduled tasks (schedules resume forward-" +
+          "only, no catch-up runs); chats do NOT re-attach, so the restored " +
+          "project reports zero chats. 404 if there is no soft-deleted project " +
+          "with that id in the org. Deleting frees the display name, so if the " +
+          "owner has since taken it, pass `name` to restore under a different " +
+          "one; restoring into a name that is still taken is a 409.",
+        tags: ["Projects"],
+        params: z.object({ id: z.string().uuid() }),
+        // nullish, not optional: a POST with no payload arrives as `null`, and
+        // restoring without a rename is the common case.
+        body: z
+          .object({
+            name: z
+              .string()
+              .optional()
+              .describe(
+                "Rename the project as it is restored. Use this when its " +
+                  "original name was taken while it was deleted.",
+              ),
+          })
+          .nullish(),
+        response: constructResponseSchema(ProjectDetailSchema),
+      },
+    },
+    async ({ params: { id }, body, organizationId, user }) =>
+      projectService.restore({
+        id,
+        organizationId,
+        userId: user.id,
+        name: body?.name,
+      }),
+  );
+
+  fastify.delete(
+    "/api/projects/:id/permanent",
+    {
+      schema: {
+        operationId: RouteId.PermanentlyDeleteProject,
+        description:
+          "Permanently destroy a soft-deleted project (global admins only). " +
+          "Irreversible, with no grace period: the project, its files (records " +
+          "and stored contents), pins, share configuration, and scheduled " +
+          "tasks are all destroyed. Its chats are unaffected — they detached " +
+          "when it was deleted and survive as ordinary conversations. 404 if " +
+          "there is no soft-deleted project with that id in the org, which is " +
+          "also the answer when the project is still live or the caller is not " +
+          "a global admin. Restore wins a race: if a restore commits first, " +
+          "this returns 404 and the project stays.",
+        tags: ["Projects"],
+        params: z.object({ id: z.string().uuid() }),
+        response: constructResponseSchema(z.object({ ok: z.literal(true) })),
+      },
+    },
+    async ({ params: { id }, organizationId, user }) => {
+      await projectService.purge({ id, organizationId, userId: user.id });
+      return { ok: true as const };
+    },
+  );
+
+  fastify.get(
+    "/api/projects/:id/files",
+    {
+      schema: {
+        operationId: RouteId.GetProjectFiles,
+        description:
+          "Files owned by the project, readable by anyone with project access.",
+        tags: ["Projects"],
+        params: z.object({ id: z.string().uuid() }),
+        response: constructResponseSchema(z.array(SandboxFileListItemSchema)),
+      },
+    },
+    async ({ params: { id }, organizationId, user }) =>
+      projectService.listFiles({
+        id,
+        organizationId,
+        userId: user.id,
+        allowAdminOversight: true,
+      }),
+  );
+
+  fastify.post(
+    "/api/projects/:id/files",
+    {
+      bodyLimit: PROJECT_UPLOAD_BODY_LIMIT,
+      schema: {
+        operationId: RouteId.UploadProjectFiles,
+        description:
+          "Upload one file into the project (drag-and-drop on the Files " +
+          "panel). The bytes are base64-encoded in the body; a colliding name " +
+          "is auto-renamed.",
+        tags: ["Projects"],
+        params: z.object({ id: z.string().uuid() }),
+        body: z.object({
+          name: z.string().min(1),
+          /** MIME type from the browser; may be empty for some OS drops. */
+          mimeType: z.string(),
+          /** Raw base64 (a `data:` URL prefix is tolerated). */
+          dataBase64: z.string().min(1),
+        }),
+        response: constructResponseSchema(
+          z.object({
+            id: z.string().uuid(),
+            filename: z.string(),
+            mimeType: z.string(),
+          }),
+        ),
+      },
+    },
+    async ({ params: { id }, body, organizationId, user }) =>
+      projectService.uploadFile({
+        id,
+        organizationId,
+        userId: user.id,
+        name: body.name,
+        mimeType: body.mimeType,
+        dataBase64: body.dataBase64,
+      }),
+  );
+
+  fastify.get(
+    "/api/projects/:id/instructions",
+    {
+      schema: {
+        operationId: RouteId.GetProjectInstructions,
+        description:
+          "The project's instructions (markdown). Readable by anyone with " +
+          "project access; empty until the owner first saves it. The content " +
+          "is injected into the system prompt of every chat in the project.",
+        tags: ["Projects"],
+        params: z.object({ id: z.string().uuid() }),
+        response: constructResponseSchema(z.object({ content: z.string() })),
+      },
+    },
+    async ({ params: { id }, organizationId, user }) =>
+      projectService.getInstructions({ id, organizationId, userId: user.id }),
+  );
+
+  fastify.put(
+    "/api/projects/:id/instructions",
+    {
+      schema: {
+        operationId: RouteId.SetProjectInstructions,
+        description:
+          "Set the project's instructions (owner only). The first save creates " +
+          "the instructions file; saving empty content keeps it but injects " +
+          "nothing.",
+        tags: ["Projects"],
+        params: z.object({ id: z.string().uuid() }),
+        body: z.object({
+          content: z.string().max(PROJECT_INSTRUCTIONS_MAX_LENGTH),
+        }),
+        response: constructResponseSchema(z.object({ ok: z.literal(true) })),
+      },
+    },
+    async ({ params: { id }, body, organizationId, user }) => {
+      await projectService.setInstructions({
+        id,
+        organizationId,
+        userId: user.id,
+        content: body.content,
+      });
+      return { ok: true as const };
+    },
+  );
+
+  fastify.get(
+    "/api/projects/:id/conversations",
+    {
+      schema: {
+        operationId: RouteId.GetProjectConversations,
+        description:
+          "All chats in a project the caller can read. Chats authored by " +
+          "others require `project:read-all`; without it the caller sees " +
+          "only their own. `readOnly` marks chats authored by someone else " +
+          "(viewable, never writable).",
+        tags: ["Projects"],
+        params: z.object({ id: z.string().uuid() }),
+        response: constructResponseSchema(
+          z.array(ProjectConversationItemSchema),
+        ),
+      },
+    },
+    async ({ params: { id }, organizationId, user }) =>
+      projectService.listConversations({
+        id,
+        organizationId,
+        userId: user.id,
+      }),
+  );
+
+  fastify.get(
+    "/api/projects/:id/runs",
+    {
+      schema: {
+        operationId: RouteId.GetProjectRuns,
+        description:
+          "All run sessions in a project the caller can read. Sessions " +
+          "started by others require `project:read-all`; all non-owner views " +
+          "are read-only.",
+        tags: ["Projects"],
+        params: z.object({ id: z.string().uuid() }),
+        response: constructResponseSchema(z.array(GetAgentRunResponseSchema)),
+      },
+    },
+    async ({ params: { id }, organizationId, user }) =>
+      projectService.listExecutions({
+        id,
+        organizationId,
+        userId: user.id,
+      }),
+  );
+
+  fastify.put(
+    "/api/projects/:id/pin",
+    {
+      schema: {
+        operationId: RouteId.PinProject,
+        description:
+          "Pin a project to the current user's sidebar. Personal — does not " +
+          "affect other members. Any user who can read the project may pin it.",
+        tags: ["Projects"],
+        params: z.object({ id: z.string().uuid() }),
+        response: constructResponseSchema(z.object({ ok: z.literal(true) })),
+      },
+    },
+    async ({ params: { id }, organizationId, user }) => {
+      await projectService.pin({ id, organizationId, userId: user.id });
+      return { ok: true as const };
+    },
+  );
+
+  fastify.delete(
+    "/api/projects/:id/pin",
+    {
+      schema: {
+        operationId: RouteId.UnpinProject,
+        description:
+          "Remove the current user's pin on a project. Idempotent; allowed " +
+          "even if the project was since unshared from the user.",
+        tags: ["Projects"],
+        params: z.object({ id: z.string().uuid() }),
+        response: constructResponseSchema(z.object({ ok: z.literal(true) })),
+      },
+    },
+    async ({ params: { id }, organizationId, user }) => {
+      await projectService.unpin({ id, organizationId, userId: user.id });
+      return { ok: true as const };
+    },
+  );
+};
+
+export default projectRoutes;

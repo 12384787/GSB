@@ -1,0 +1,669 @@
+import { RouteId, SupportedProviders } from "@archestra/shared";
+import {
+  buildForbiddenErrorMessage,
+  requiredEndpointPermissionsMap,
+} from "@archestra/shared/access-control";
+import * as Sentry from "@sentry/node";
+import type { FastifyReply, FastifyRequest } from "fastify";
+import { betterAuth, hasPermission } from "@/auth";
+import config from "@/config";
+import { enterpriseTier } from "@/enterprise-tier";
+import logger from "@/logging";
+import {
+  OrganizationModel,
+  ServiceAccountModel,
+  SessionModel,
+  UserModel,
+} from "@/models";
+import { MODEL_ROUTER_PREFIX } from "@/routes/proxy/common";
+import { getPublicRequestOrigin } from "@/routes/request-origin";
+import {
+  ARCHESTRA_CATALOG_PROXY_PREFIX,
+  AUTH_STATE_PATH,
+  CONNECTION_HEALTH_PATH,
+  CONNECTION_SETUP_SCRIPT_PREFIX,
+  GUARDRAILS_NOOP_ANNOTATOR_PATH,
+  HEALTH_PATH,
+  INCOMING_EMAIL_WEBHOOK_PREFIX,
+  METRICS_PATH,
+  MFILES_VAF_ADD_ON_PACKAGE_PATH,
+  MFILES_VAF_ADD_ON_SCRIPT_PATH,
+  OAUTH_CALLBACK_PATH,
+  ORGANIZATION_APPEARANCE_SETTINGS_PATH,
+  PUBLIC_CONFIG_PATH,
+  READY_PATH,
+  SKILL_MARKETPLACE_PREFIX,
+  SKILL_MARKETPLACE_STATIC_PATH,
+  WELL_KNOWN_ACME_PREFIX,
+  WELL_KNOWN_OAUTH_PREFIX,
+} from "@/routes/route-paths";
+import {
+  appIdFromConnectorPath,
+  connectorWwwAuthenticate,
+} from "@/services/apps/app-connector-resource";
+import { ApiError } from "@/types";
+
+/**
+ * Routes a session without 2FA may still reach while the organization
+ * requires enrollment: just enough for the account page's enrollment card to
+ * render (public/branding config, the caller's own permissions and org
+ * context). Everything else waits until 2FA is set up.
+ */
+const TWO_FACTOR_SETUP_EXEMPT_ROUTES = new Set<RouteId>([
+  RouteId.GetConfig,
+  RouteId.GetUserPermissions,
+  RouteId.GetOrganization,
+  RouteId.GetAppearanceSettings,
+]);
+
+export class Authnz {
+  public handle = async (request: FastifyRequest, reply: FastifyReply) => {
+    const requestId = request.id;
+
+    // custom logic to skip auth check
+    if (await this.shouldSkipAuthCheck(request)) {
+      return;
+    }
+
+    // return 401 if unauthenticated
+    if (!(await this.isAuthenticated(request))) {
+      logger.trace(
+        { requestId, url: request.url },
+        "[Authnz] Authentication failed",
+      );
+      // A credential-less request to an MCP App connector gets the RFC 9728
+      // challenge here (it has no Bearer header, so it was not skipped above and
+      // never reaches the route); an invalid Bearer token is challenged in-route.
+      this.maybeSetConnectorChallenge(request, reply);
+      throw new ApiError(401, "Unauthenticated");
+    }
+
+    logger.trace(
+      { requestId },
+      "[Authnz] Authentication successful, populating user info",
+    );
+
+    // Populate request.user and request.organizationId after successful authentication
+    await this.populateUserInfo(request, reply);
+
+    // Guard: if populateUserInfo silently failed, user info is missing
+    if (!request.user || !request.organizationId) {
+      logger.warn(
+        { requestId, url: request.url },
+        "[Authnz] Authentication succeeded but user info could not be populated",
+      );
+      throw new ApiError(401, "Unauthenticated");
+    }
+
+    // Set Sentry user context after successful authentication
+    this.setSentryUserContext(request.user, request);
+
+    logger.trace(
+      {
+        requestId,
+        userId: request.user?.id,
+        organizationId: request.organizationId,
+      },
+      "[Authnz] User info populated, checking authorization",
+    );
+
+    // Org auth policies (session max age, mandatory 2FA) apply to human
+    // sessions only — API keys and service-account tokens have their own
+    // lifecycles and no TOTP.
+    await this.enforceOrganizationAuthPolicies(request);
+
+    const { success, error } = await this.isAuthorized(request);
+    if (success) {
+      logger.trace(
+        { requestId, userId: request.user?.id },
+        "[Authnz] Authorization successful",
+      );
+      return;
+    }
+
+    // return 403 if unauthorized, saying what was blocked and why
+    logger.trace(
+      {
+        requestId,
+        userId: request.user?.id,
+        routeId: request.routeOptions.schema?.operationId,
+      },
+      "[Authnz] Authorization failed",
+    );
+    throw new ApiError(403, error?.message || buildForbiddenErrorMessage({}));
+  };
+
+  private shouldSkipAuthCheck = async ({
+    url,
+    method,
+    headers,
+  }: FastifyRequest): Promise<boolean> => {
+    // Skip CORS preflight and HEAD requests globally
+    if (method === "OPTIONS" || method === "HEAD") {
+      // marketplace and connection-setup URLs embed a raw token — omit from
+      // trace to avoid leaking it
+      const safeUrl =
+        url.startsWith(`${SKILL_MARKETPLACE_PREFIX}/`) ||
+        url.startsWith(`${CONNECTION_SETUP_SCRIPT_PREFIX}/`)
+          ? undefined
+          : url;
+      logger.trace(
+        { url: safeUrl, method },
+        "[Authnz] Skipping auth for preflight/HEAD request",
+      );
+      return true;
+    }
+    // Check if URL matches any LLM proxy route (e.g., /v1/openai, /v1/anthropic, /v1/vllm)
+    const isLlmProxyRoute = SupportedProviders.some((provider) =>
+      url.startsWith(`/v1/${provider}`),
+    );
+    // Prefer route consts here instead of hardcoding paths; these checks must
+    // stay in sync with route registration.
+    const isModelRouterRoute = url.startsWith(MODEL_ROUTER_PREFIX);
+
+    if (
+      url.startsWith("/api/auth") ||
+      url.startsWith("/api/invitation/") || // Allow invitation check without auth
+      isLlmProxyRoute ||
+      isModelRouterRoute ||
+      url === "/openapi.json" ||
+      url === HEALTH_PATH ||
+      url === READY_PATH ||
+      url === METRICS_PATH ||
+      url === "/test" ||
+      url.startsWith(config.mcpGateway.endpoint) ||
+      // MCP App connector: a Bearer request (a personal token or the native
+      // OAuth flow's audience-bound token) is validated in-route, so it stands
+      // down here. A session request carries no Bearer and falls through to the
+      // normal session auth below (unchanged); a credential-less request also
+      // falls through and is answered with the RFC 9728 challenge in handle().
+      (appIdFromConnectorPath(url) !== null &&
+        typeof headers.authorization === "string" &&
+        /^Bearer\s+/i.test(headers.authorization)) ||
+      // Public skill marketplace git endpoint: token in URL, no session
+      url === config.skillMarketplace.endpoint ||
+      url.startsWith(`${config.skillMarketplace.endpoint}/`) ||
+      // Static skill marketplace git endpoint: the caller's own credential is
+      // validated in-route (HTTP Basic), or the org publishes it anonymously
+      url === SKILL_MARKETPLACE_STATIC_PATH ||
+      url.startsWith(`${SKILL_MARKETPLACE_STATIC_PATH}/`) ||
+      // Public bootstrap endpoints have their own rate limits and polling proof.
+      (method === "GET" && url === "/api/client-connections/installer") ||
+      (method === "POST" &&
+        (url === "/api/client-connections" ||
+          url === "/api/client-connections/poll")) ||
+      // Public connection-setup script endpoint: one-time token in URL, no session
+      (method === "GET" &&
+        url.startsWith(`${CONNECTION_SETUP_SCRIPT_PREFIX}/`)) ||
+      // Public Archestra VAF Add On install bootstrap and package proxy:
+      // parameterless, credential-free, fetched by irm without a session
+      (method === "GET" && url === MFILES_VAF_ADD_ON_SCRIPT_PATH) ||
+      (method === "GET" && url === MFILES_VAF_ADD_ON_PACKAGE_PATH) ||
+      // A2A routes use token auth handled in route, similar to MCP Gateway
+      url.startsWith(config.a2aGateway.endpoint) ||
+      url.startsWith(config.a2aV2Gateway.endpoint) ||
+      // Skip OAuth well-known discovery endpoints (RFC 8414 / RFC 9728)
+      url.startsWith(WELL_KNOWN_OAUTH_PREFIX) ||
+      // Skip OAuth consent page proxy (handled by frontend)
+      url.startsWith("/oauth/") ||
+      // OAuth providers redirect here without a platform session. The one-time
+      // state value is the callback's authentication proof and is validated
+      // by the route before any token exchange.
+      (method === "POST" && url === OAUTH_CALLBACK_PATH) ||
+      // Skip ACME challenge paths for SSL certificate domain validation
+      url.startsWith(WELL_KNOWN_ACME_PREFIX) ||
+      // Sandbox proxy HTML is a static file with no secrets — must load without
+      // cookies because the iframe has an opaque origin and won't send them.
+      url.startsWith("/_sandbox/") ||
+      // Allow fetching public SSO providers list for login page (minimal info, no secrets)
+      (method === "GET" && url === "/api/identity-providers/public") ||
+      // The APPA runtime has no browser session. This exact endpoint only
+      // returns a constant empty annotation; it reads and writes no user data.
+      (method === "POST" && url === GUARDRAILS_NOOP_ANNOTATOR_PATH) ||
+      // Allow fetching public config for login and invitation UI
+      (method === "GET" && url === PUBLIC_CONFIG_PATH) ||
+      // Explicit even though the /api/auth prefix check below already covers
+      // this path — the exemption is intentional here and must survive a
+      // rename of either path.
+      (method === "GET" && url === AUTH_STATE_PATH) ||
+      // Public existence check for connected remotes (Claude Code startup
+      // guard) — the querystring rides along on request.url
+      (method === "GET" &&
+        (url === CONNECTION_HEALTH_PATH ||
+          url.startsWith(`${CONNECTION_HEALTH_PATH}?`))) ||
+      // Allow fetching public appearance settings for login page (theme, logo, font)
+      (method === "GET" && url === ORGANIZATION_APPEARANCE_SETTINGS_PATH) ||
+      // Incoming email webhooks - Microsoft Graph calls these directly
+      // Only allow the exact webhook path (with optional query params), not sub-paths like /setup
+      url === INCOMING_EMAIL_WEBHOOK_PREFIX ||
+      url.startsWith(`${INCOMING_EMAIL_WEBHOOK_PREFIX}?`) ||
+      // Public reverse proxy to the Archestra MCP catalog (upstream is public)
+      url.startsWith(`${ARCHESTRA_CATALOG_PROXY_PREFIX}/`) ||
+      // ChatOps webhooks - Bot Framework calls these directly
+      // JWT validation is handled by the Bot Framework adapter
+      url.startsWith("/api/webhooks/chatops/")
+    ) {
+      return true;
+    }
+    return false;
+  };
+
+  private maybeSetConnectorChallenge = (
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): void => {
+    const appId = appIdFromConnectorPath(request.url);
+    if (!appId) {
+      return;
+    }
+    reply.header(
+      "WWW-Authenticate",
+      connectorWwwAuthenticate(getPublicRequestOrigin(request), appId),
+    );
+  };
+
+  private isAuthenticated = async (request: FastifyRequest) => {
+    const headers = new Headers(request.headers as HeadersInit);
+
+    try {
+      logger.trace("[Authnz] Attempting session-based authentication");
+      // Reads the short-lived cookie cache when present (see session.cookieCache
+      // in better-auth config), falling back to the session table on a miss.
+      const { response: session } = await betterAuth.api.getSession({
+        headers,
+        returnHeaders: true,
+      });
+
+      if (session) {
+        logger.trace(
+          { userId: session.user?.id, sessionId: session.session?.id },
+          "[Authnz] Session authentication successful",
+        );
+        return true;
+      }
+      logger.trace("[Authnz] No session found");
+    } catch (error) {
+      logger.trace(
+        { error: error instanceof Error ? error.message : "unknown" },
+        "[Authnz] Session authentication failed, trying API key",
+      );
+    }
+
+    const authHeader = headers.get("authorization");
+    if (authHeader) {
+      try {
+        logger.trace("[Authnz] Attempting API key authentication");
+        const { valid } = await betterAuth.api.verifyApiKey({
+          body: { key: authHeader },
+        });
+
+        if (valid) {
+          logger.trace({ valid }, "[Authnz] API key verification result");
+          return true;
+        }
+      } catch (_apiKeyError) {
+        logger.trace(
+          "[Authnz] API key verification failed, trying service account token",
+        );
+      }
+
+      try {
+        const serviceAccountResult =
+          await ServiceAccountModel.verifyToken(authHeader);
+        if (serviceAccountResult) {
+          request.serviceAccountAuthResult = serviceAccountResult;
+          logger.trace("[Authnz] Service account token verification succeeded");
+          return true;
+        }
+      } catch (error) {
+        logger.warn(
+          { error: error instanceof Error ? error.message : "unknown" },
+          "[Authnz] Service account token verification errored, treating as unauthenticated",
+        );
+      }
+    }
+
+    logger.trace("[Authnz] No valid authentication method found");
+    return false;
+  };
+
+  /**
+   * Enforce per-organization session policies on session-authenticated
+   * requests:
+   *
+   * - `sessionMaxAgeSeconds`: an ABSOLUTE cap measured from session creation.
+   *   better-auth's sliding refresh keeps active users signed in forever, so
+   *   expiry is enforced here (and the session revoked so every replica
+   *   agrees within the 60s cookie-cache TTL).
+   * - `requireTwoFactor`: members who have not enrolled may only reach the
+   *   handful of routes the enrollment surface needs; everything else is
+   *   refused until they set 2FA up. Enrollment itself happens on better-auth
+   *   routes, which bypass this middleware entirely.
+   */
+  private enforceOrganizationAuthPolicies = async (
+    request: FastifyRequest,
+  ): Promise<void> => {
+    if (request.authMethod !== "session" || !request.organizationId) {
+      return;
+    }
+
+    // Both policies are enterprise features. If the license lapses while
+    // they are configured, they stop being enforced rather than locking
+    // everyone out (enrollment itself is refused without a license, so
+    // enforcing require-2FA then would strand non-enrolled members).
+    if (!enterpriseTier.isCoreActive()) {
+      return;
+    }
+
+    const policies = await OrganizationModel.getAuthEnforcementSettings(
+      request.organizationId,
+    );
+
+    if (policies.sessionMaxAgeSeconds && request.sessionInfo) {
+      // With better-auth's cookie cache the session arrives JSON-deserialized,
+      // so createdAt may be an ISO string rather than a Date.
+      const createdAtMs = new Date(request.sessionInfo.createdAt).getTime();
+      const ageSeconds = (Date.now() - createdAtMs) / 1000;
+      if (ageSeconds > policies.sessionMaxAgeSeconds) {
+        await SessionModel.deleteById(request.sessionInfo.id);
+        logger.info(
+          { userId: request.user?.id, ageSeconds },
+          "[Authnz] Session exceeded the organization's maximum age — revoked",
+        );
+        throw new ApiError(401, "Session expired. Please sign in again.");
+      }
+    }
+
+    // A deployment that turned email/password sign-in off after the
+    // requirement was set would otherwise strand every member: enrollment
+    // needs a password to confirm. Such deployments enforce MFA at the IdP.
+    if (
+      policies.requireTwoFactor &&
+      !config.auth.disableBasicAuth &&
+      !(request.user?.twoFactorEnabled ?? false)
+    ) {
+      const routeId = request.routeOptions.schema?.operationId as
+        | RouteId
+        | undefined;
+      if (!routeId || !TWO_FACTOR_SETUP_EXEMPT_ROUTES.has(routeId)) {
+        throw new ApiError(
+          403,
+          "This organization requires two-factor authentication. Set it up " +
+            "to continue.",
+          "two_factor_setup_required",
+        );
+      }
+    }
+  };
+
+  private isAuthorized = async (
+    request: FastifyRequest,
+  ): Promise<{ success: boolean; error: Error | null }> => {
+    const routeId = request.routeOptions.schema?.operationId as
+      | RouteId
+      | undefined;
+
+    logger.trace({ routeId }, "[Authnz] Checking authorization for route");
+
+    const requiredPermissions = routeId
+      ? requiredEndpointPermissionsMap[routeId]
+      : undefined;
+
+    logger.trace(
+      {
+        routeId,
+        requiredPermissions,
+        hasPermissions: requiredPermissions !== undefined,
+      },
+      "[Authnz] Permissions lookup result",
+    );
+
+    if (requiredPermissions === undefined) {
+      logger.trace(
+        { routeId },
+        "[Authnz] Route not configured in permissions map, denying by default",
+      );
+      return {
+        success: false,
+        error: new Error(
+          "Access denied: this endpoint is not registered for access control, so it is protected by default. This is a server configuration issue — please report it.",
+        ),
+      };
+    }
+
+    // If no specific permissions are required (empty object), allow any authenticated user
+    if (Object.keys(requiredPermissions).length === 0) {
+      logger.trace(
+        { routeId },
+        "[Authnz] No specific permissions required, allowing access",
+      );
+      return { success: true, error: null };
+    }
+
+    logger.trace(
+      {
+        routeId,
+        requiredPermissions,
+        permissionCount: Object.keys(requiredPermissions).length,
+      },
+      "[Authnz] Checking required permissions",
+    );
+    // Pass the DB-fresh identity populateUserInfo already resolved so the
+    // permission check never consults the (possibly stale) session cookie.
+    const result = await hasPermission(
+      requiredPermissions,
+      request.headers,
+      request.serviceAccount,
+      request.user && request.organizationId
+        ? { userId: request.user.id, organizationId: request.organizationId }
+        : undefined,
+    );
+    logger.trace({ routeId, result }, "[Authnz] hasPermission result");
+    if (result.success) {
+      return result;
+    }
+    // Rebuild the message with the route context ("upload project files")
+    // and the permissions that are actually missing — falling back to the
+    // route's full requirement set when the check failed before it could
+    // determine the specific gap (e.g. an invalid API key).
+    return {
+      success: false,
+      error: new Error(
+        buildForbiddenErrorMessage({
+          routeId,
+          missingPermissions: result.missingPermissions ?? requiredPermissions,
+        }),
+      ),
+    };
+  };
+
+  private populateUserInfo = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<void> => {
+    try {
+      const headers = new Headers(request.headers as HeadersInit);
+
+      // Try session-based authentication first
+      try {
+        logger.trace("[Authnz] populateUserInfo: trying session-based lookup");
+        // returnHeaders so we can forward better-auth's refreshed cookie-cache
+        // Set-Cookie back to the client. Without this the cache would only be
+        // rewritten by the dedicated /api/auth/get-session endpoint, so the
+        // short TTL would lapse between those calls and most API requests would
+        // still hit the session table.
+        const { response: session, headers: authHeaders } =
+          await betterAuth.api.getSession({ headers, returnHeaders: true });
+        this.forwardSessionCookies(reply, authHeaders);
+
+        if (session?.user?.id) {
+          logger.trace(
+            { userId: session.user.id },
+            "[Authnz] populateUserInfo: found session user, fetching full user data",
+          );
+          // Get the full user object from database
+          const { organizationId, ...user } = await UserModel.getById(
+            session.user.id,
+          );
+
+          // Populate the request decorators
+          request.user = user;
+          request.organizationId = organizationId;
+          request.authMethod = "session";
+          request.sessionInfo = {
+            id: session.session.id,
+            createdAt: new Date(session.session.createdAt),
+          };
+          // Impersonated sessions act as the target user; keep the real
+          // human's id on the request so audit rows can attribute them.
+          const impersonatedBy = (
+            session.session as { impersonatedBy?: string | null }
+          ).impersonatedBy;
+          if (impersonatedBy) {
+            request.impersonatedBy = impersonatedBy;
+          }
+          logger.trace(
+            { userId: user.id, organizationId },
+            "[Authnz] populateUserInfo: populated from session",
+          );
+          return;
+        }
+      } catch (sessionError) {
+        // Fall through to API key authentication
+        logger.trace(
+          {
+            error:
+              sessionError instanceof Error ? sessionError.message : "unknown",
+          },
+          "[Authnz] populateUserInfo: session lookup failed, trying API key",
+        );
+      }
+
+      // Try API key authentication
+      const authHeader = headers.get("authorization");
+      if (authHeader) {
+        try {
+          logger.trace("[Authnz] populateUserInfo: trying API key lookup");
+          const apiKeyResult = await betterAuth.api.verifyApiKey({
+            body: { key: authHeader },
+          });
+
+          if (apiKeyResult?.valid && apiKeyResult.key?.referenceId) {
+            logger.trace(
+              "[Authnz] populateUserInfo: valid API key, fetching user data",
+            );
+            // User-owned API keys expose the owning user through `referenceId`.
+            const { organizationId, ...user } = await UserModel.getById(
+              apiKeyResult.key.referenceId,
+            );
+
+            // Populate the request decorators
+            request.user = user;
+            request.organizationId = organizationId;
+            request.authMethod = "api_key";
+            logger.trace(
+              { userId: user.id, organizationId },
+              "[Authnz] populateUserInfo: populated from API key",
+            );
+            return;
+          }
+        } catch (_apiKeyError) {
+          logger.trace(
+            "[Authnz] populateUserInfo: API key verification failed, trying service account token",
+          );
+        }
+
+        const serviceAccountResult =
+          request.serviceAccountAuthResult ??
+          (await ServiceAccountModel.verifyToken(authHeader));
+        if (serviceAccountResult) {
+          request.serviceAccountAuthResult = serviceAccountResult;
+          this.populateServiceAccountUserInfo(request, serviceAccountResult);
+          return;
+        }
+      }
+    } catch (error) {
+      // If population fails, leave decorators unpopulated
+      // The route handlers should handle missing user info gracefully
+      logger.trace(
+        { error: error instanceof Error ? error.message : "unknown" },
+        "[Authnz] populateUserInfo: failed to populate user info",
+      );
+    }
+  };
+
+  /**
+   * Forward any Set-Cookie headers better-auth produced (the refreshed
+   * cookie-cache cookie) onto the Fastify reply, so the next request can
+   * validate the session from the cookie instead of the database. Only
+   * Set-Cookie is copied to avoid clobbering other response headers.
+   */
+  private forwardSessionCookies = (
+    reply: FastifyReply,
+    authHeaders: Headers,
+  ): void => {
+    const setCookies = authHeaders.getSetCookie();
+    if (setCookies.length > 0) {
+      reply.header("set-cookie", setCookies);
+    }
+  };
+
+  /**
+   * Sets the Sentry user context for better error tracking and attribution
+   */
+  public setSentryUserContext = (
+    user: { id: string; email?: string; name?: string },
+    request: FastifyRequest,
+  ): void => {
+    try {
+      // Extract IP address from request headers
+      const ipAddress =
+        (request.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
+        (request.headers["x-real-ip"] as string) ||
+        request.ip;
+
+      Sentry.setUser({
+        id: user.id,
+        email: user.email,
+        username: user.name || user.email,
+        ip_address: ipAddress,
+      });
+    } catch (_error) {
+      // Silently fail if Sentry is not configured or there's an error
+      // We don't want authentication to fail due to Sentry issues
+    }
+  };
+
+  private populateServiceAccountUserInfo = (
+    request: FastifyRequest,
+    serviceAccountResult: NonNullable<
+      FastifyRequest["serviceAccountAuthResult"]
+    >,
+  ): void => {
+    const serviceAccount = serviceAccountResult.serviceAccount;
+    request.user = {
+      id: `service-account:${serviceAccount.id}`,
+      name: serviceAccount.name,
+      email: `${serviceAccount.id}@service-account.local`,
+      emailVerified: true,
+      image: null,
+      createdAt: serviceAccount.createdAt,
+      updatedAt: serviceAccount.updatedAt,
+      role: null,
+      banned: false,
+      banReason: null,
+      banExpires: null,
+      twoFactorEnabled: false,
+    };
+    request.organizationId = serviceAccount.organizationId;
+    request.serviceAccount = serviceAccount;
+    request.authMethod = "service_account";
+    logger.trace(
+      {
+        serviceAccountId: serviceAccount.id,
+        organizationId: serviceAccount.organizationId,
+      },
+      "[Authnz] populateUserInfo: populated from service account token",
+    );
+  };
+}

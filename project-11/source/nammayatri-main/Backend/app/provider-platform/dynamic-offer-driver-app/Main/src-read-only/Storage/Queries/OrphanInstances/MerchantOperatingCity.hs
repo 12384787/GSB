@@ -1,0 +1,65 @@
+{-# OPTIONS_GHC -Wno-orphans #-}
+{-# OPTIONS_GHC -Wno-unused-imports #-}
+
+module Storage.Queries.OrphanInstances.MerchantOperatingCity where
+
+import qualified Data.Text
+import qualified Domain.Types.MerchantOperatingCity
+import Kernel.Beam.Functions
+import Kernel.External.Encryption
+import qualified Kernel.External.Maps.Types
+import Kernel.Prelude
+import qualified Kernel.Prelude
+import qualified Kernel.Types.Common
+import Kernel.Types.Error
+import qualified Kernel.Types.Id
+import Kernel.Utils.Common (CacheFlow, EsqDBFlow, MonadFlow, fromMaybeM, getCurrentTime)
+import qualified Storage.Beam.MerchantOperatingCity as Beam
+
+instance FromTType' Beam.MerchantOperatingCity Domain.Types.MerchantOperatingCity.MerchantOperatingCity where
+  fromTType' (Beam.MerchantOperatingCityT {..}) = do
+    cloudBaseUrl' <- (Kernel.Prelude.pure . (Kernel.Prelude.>>= parseBaseUrl)) cloudBaseUrl
+    pure $
+      Just
+        Domain.Types.MerchantOperatingCity.MerchantOperatingCity
+          { city = city,
+            cloudBaseUrl = cloudBaseUrl',
+            cloudType = (Kernel.Prelude.>>= (Kernel.Prelude.readMaybe . Data.Text.unpack)) cloudType,
+            country = country,
+            countryDialCode = countryDialCode,
+            currency = fromMaybe Kernel.Types.Common.INR currency,
+            distanceUnit = Kernel.Prelude.fromMaybe Kernel.Types.Common.Meter distanceUnit,
+            gstin = gstin,
+            id = Kernel.Types.Id.Id id,
+            language = language,
+            location = Kernel.External.Maps.Types.LatLong lat lon,
+            merchantId = Kernel.Types.Id.Id merchantId,
+            merchantShortId = Kernel.Types.Id.ShortId merchantShortId,
+            state = state,
+            stdCode = stdCode,
+            supportEmails = supportEmails,
+            supportNumber = supportNumber
+          }
+
+instance ToTType' Beam.MerchantOperatingCity Domain.Types.MerchantOperatingCity.MerchantOperatingCity where
+  toTType' (Domain.Types.MerchantOperatingCity.MerchantOperatingCity {..}) = do
+    Beam.MerchantOperatingCityT
+      { Beam.city = city,
+        Beam.cloudBaseUrl = Kernel.Prelude.fmap showBaseUrl cloudBaseUrl,
+        Beam.cloudType = Kernel.Prelude.fmap Kernel.Prelude.show cloudType,
+        Beam.country = country,
+        Beam.countryDialCode = countryDialCode,
+        Beam.currency = Just currency,
+        Beam.distanceUnit = Kernel.Prelude.Just distanceUnit,
+        Beam.gstin = gstin,
+        Beam.id = Kernel.Types.Id.getId id,
+        Beam.language = language,
+        Beam.lat = (.lat) location,
+        Beam.lon = (.lon) location,
+        Beam.merchantId = Kernel.Types.Id.getId merchantId,
+        Beam.merchantShortId = Kernel.Types.Id.getShortId merchantShortId,
+        Beam.state = state,
+        Beam.stdCode = stdCode,
+        Beam.supportEmails = supportEmails,
+        Beam.supportNumber = supportNumber
+      }

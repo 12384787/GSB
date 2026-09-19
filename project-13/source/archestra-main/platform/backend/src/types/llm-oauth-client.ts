@@ -1,0 +1,88 @@
+import {
+  CreatedByNullableSchema,
+  ResourceVisibilityScopeSchema,
+  type SupportedProvider,
+  SupportedProvidersSchema,
+} from "@archestra/shared";
+import { z } from "zod";
+import { LabelWithDetailsSchema } from "./label";
+
+export const LLM_OAUTH_CLIENT_METADATA_TYPE = "llm_oauth_client";
+
+/**
+ * Which OAuth grant an LLM OAuth client uses:
+ * - `client_credentials`: a shared application credential with no acting user,
+ *   scoped to the organization. It brings its own provider keys
+ *   (`providerApiKeys`).
+ * - `authorization_code`: a pre-registered client that mints user-bound tokens,
+ *   so the proxy resolves the acting user's own provider keys, cost limits, and
+ *   policies. The client carries no provider keys — the user's identity governs
+ *   access — so it is identified by its `redirectUris` instead.
+ */
+export const LlmOauthClientGrantTypeSchema = z.enum([
+  "client_credentials",
+  "authorization_code",
+]);
+export type LlmOauthClientGrantType = z.infer<
+  typeof LlmOauthClientGrantTypeSchema
+>;
+
+export const LlmOauthClientProviderKeySchema = z.object({
+  provider: SupportedProvidersSchema,
+  providerApiKeyId: z.string().uuid(),
+});
+
+export const LlmOauthClientMetadataSchema = z.object({
+  type: z.literal(LLM_OAUTH_CLIENT_METADATA_TYPE),
+  organizationId: z.string(),
+  providerApiKeys: z.array(LlmOauthClientProviderKeySchema).default([]),
+  // Rows created before authorization_code support have no grantType; treat
+  // them as the original client_credentials clients.
+  grantType: LlmOauthClientGrantTypeSchema.default("client_credentials"),
+  // Rows created before team scoping have no scope/authorId; they were
+  // implicitly visible org-wide, so they parse as org-scoped with no author.
+  scope: ResourceVisibilityScopeSchema.default("org"),
+  authorId: z.string().nullable().default(null),
+});
+
+const LlmOauthClientTeamInfoSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+});
+
+export const LlmOauthClientSchema = z.object({
+  id: z.string(),
+  clientId: z.string(),
+  name: z.string(),
+  organizationId: z.string(),
+  grantType: LlmOauthClientGrantTypeSchema,
+  providerApiKeys: z.array(
+    LlmOauthClientProviderKeySchema.extend({
+      providerApiKeyName: z.string(),
+    }),
+  ),
+  redirectUris: z.array(z.string()),
+  disabled: z.boolean(),
+  scope: ResourceVisibilityScopeSchema,
+  authorId: z.string().nullable(),
+  authorName: z.string().nullable(),
+  /** The author, in the shape shared by every major object. */
+  createdBy: CreatedByNullableSchema,
+  teams: z.array(LlmOauthClientTeamInfoSchema),
+  labels: z.array(LabelWithDetailsSchema),
+  createdAt: z.date(),
+  updatedAt: z.date(),
+});
+
+export const LlmOauthClientWithSecretSchema = LlmOauthClientSchema.extend({
+  clientSecret: z.string(),
+});
+
+export type LlmOauthClientMetadata = z.infer<
+  typeof LlmOauthClientMetadataSchema
+>;
+export type LlmOauthClient = z.infer<typeof LlmOauthClientSchema>;
+export type LlmOauthClientProviderKey = {
+  provider: SupportedProvider;
+  providerApiKeyId: string;
+};

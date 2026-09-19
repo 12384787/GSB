@@ -1,0 +1,174 @@
+import {
+  archestraApiSdk,
+  type archestraApiTypes,
+  type ClientFilter,
+} from "@archestra/shared";
+import { useQuery } from "@tanstack/react-query";
+import { useAllMatching } from "@/lib/hooks/use-all-matching";
+import { throwOnApiError } from "@/lib/utils";
+
+const { getTool, getToolObservers, getToolsWithAssignments } = archestraApiSdk;
+
+/**
+ * Fetch a single tool's policy-editor fields by id, scoped to what the caller
+ * can access. Unlike the assignment-based listing this resolves All-mode tools
+ * that have no agent_tools row. `enabled` gates the request.
+ */
+export function useTool(id: string | undefined, enabled = true) {
+  return useQuery({
+    queryKey: ["tool", id],
+    queryFn: async () => {
+      const { data, error } = await getTool({ path: { id: id as string } });
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? null;
+    },
+    enabled: enabled && !!id,
+  });
+}
+
+type GetToolsWithAssignmentsQueryParams = NonNullable<
+  archestraApiTypes.GetToolsWithAssignmentsData["query"]
+>;
+
+// Exported type for tool with assignments data
+export type ToolWithAssignmentsData =
+  archestraApiTypes.GetToolsWithAssignmentsResponses["200"]["data"][number];
+
+export function useToolsWithAssignments({
+  initialData,
+  pagination,
+  sorting,
+  filters,
+  enabled = true,
+}: {
+  initialData?: archestraApiTypes.GetToolsWithAssignmentsResponses["200"];
+  pagination?: {
+    limit?: number;
+    offset?: number;
+  };
+  sorting?: {
+    sortBy?: NonNullable<GetToolsWithAssignmentsQueryParams["sortBy"]>;
+    sortDirection?: NonNullable<
+      GetToolsWithAssignmentsQueryParams["sortDirection"]
+    >;
+  };
+  filters?: {
+    search?: string;
+    origin?: string;
+    observedByUserId?: string;
+    observedByClient?: ClientFilter;
+    excludeArchestraTools?: boolean;
+    includeKnowledgeSourcesTool?: boolean;
+  };
+  enabled?: boolean;
+}) {
+  return useQuery({
+    queryKey: [
+      "tools-with-assignments",
+      {
+        limit: pagination?.limit,
+        offset: pagination?.offset,
+        sortBy: sorting?.sortBy,
+        sortDirection: sorting?.sortDirection,
+        search: filters?.search,
+        origin: filters?.origin,
+        observedByUserId: filters?.observedByUserId,
+        observedByClient: filters?.observedByClient,
+        excludeArchestraTools: filters?.excludeArchestraTools,
+        includeKnowledgeSourcesTool: filters?.includeKnowledgeSourcesTool,
+      },
+    ],
+    queryFn: async () => {
+      const result = await getToolsWithAssignments({
+        query: {
+          limit: pagination?.limit,
+          offset: pagination?.offset,
+          sortBy: sorting?.sortBy,
+          sortDirection: sorting?.sortDirection,
+          search: filters?.search,
+          origin: filters?.origin,
+          observedByUserId: filters?.observedByUserId,
+          observedByClient: filters?.observedByClient,
+          excludeArchestraTools: filters?.excludeArchestraTools,
+          includeKnowledgeSourcesTool: filters?.includeKnowledgeSourcesTool,
+        },
+      });
+      throwOnApiError(result.error, { toastOnError: false });
+      return (
+        result.data ?? {
+          data: [],
+          pagination: {
+            currentPage: 1,
+            limit: 20,
+            total: 0,
+            totalPages: 0,
+            hasNext: false,
+            hasPrev: false,
+          },
+        }
+      );
+    },
+    initialData,
+    enabled,
+  });
+}
+
+/**
+ * Filter options for observed tools: the users who have observed tools in LLM
+ * proxy traffic, and the client families their observations came from.
+ */
+export function useToolObservers() {
+  return useQuery({
+    queryKey: ["tool-observers"],
+    queryFn: async () => {
+      const { data, error } = await getToolObservers();
+      throwOnApiError(error, { toastOnError: false });
+      return data ?? { users: [], clients: [] };
+    },
+  });
+}
+
+/**
+ * Every tool matching the guardrails filters, not just the page in view —
+ * what backs "select all N tools that match this search query". The bulk
+ * policy routes take an unbounded id array, so this relies on the shared
+ * ceiling rather than a limit of its own.
+ */
+export function useAllMatchingTools({
+  filters,
+  sorting,
+  enabled,
+}: {
+  filters?: ToolFilters;
+  sorting?: ToolSorting;
+  enabled?: boolean;
+}) {
+  return useAllMatching({
+    queryKey: ["tools-with-assignments", "all-matching", { filters, sorting }],
+    enabled,
+    fetchPage: async ({ limit, offset }) => {
+      const result = await getToolsWithAssignments({
+        query: { ...filters, ...sorting, limit, offset },
+      });
+      throwOnApiError(result.error, { toastOnError: false });
+      return result.data?.data ?? [];
+    },
+  });
+}
+
+/** The guardrails table's filter set, shared by the page query and the walk. */
+type ToolFilters = {
+  search?: string;
+  origin?: string;
+  observedByUserId?: string;
+  observedByClient?: ClientFilter;
+  excludeArchestraTools?: boolean;
+  includeKnowledgeSourcesTool?: boolean;
+};
+
+type ToolSorting = {
+  sortBy?: NonNullable<GetToolsWithAssignmentsQueryParams["sortBy"]>;
+  sortDirection?: NonNullable<
+    GetToolsWithAssignmentsQueryParams["sortDirection"]
+  >;
+};

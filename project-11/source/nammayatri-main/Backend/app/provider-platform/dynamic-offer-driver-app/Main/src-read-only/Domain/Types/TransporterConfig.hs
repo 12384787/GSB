@@ -1,0 +1,651 @@
+{-# LANGUAGE ApplicativeDo #-}
+{-# OPTIONS_GHC -Wno-dodgy-exports #-}
+{-# OPTIONS_GHC -Wno-unused-imports #-}
+
+module Domain.Types.TransporterConfig (module Domain.Types.TransporterConfig, module ReExport) where
+
+import Data.Aeson
+import qualified Domain.Types.DriverInformation
+import qualified Domain.Types.Extra.MerchantPaymentMethod
+import Domain.Types.Extra.TransporterConfig as ReExport
+import qualified Domain.Types.Extra.TransporterConfig
+import qualified Domain.Types.Location
+import qualified Domain.Types.Merchant
+import qualified Domain.Types.MerchantOperatingCity
+import qualified Domain.Types.Person
+import qualified Domain.Types.VehicleCategory
+import qualified Domain.Types.VehicleVariant
+import qualified Email.Types
+import qualified Kernel.External.Notification.FCM.Types
+import qualified Kernel.External.Types
+import Kernel.Prelude
+import qualified Kernel.Types.Beckn.City
+import qualified Kernel.Types.Common
+import qualified Kernel.Types.Id
+import qualified Kernel.Types.SlidingWindowCounters
+import qualified Kernel.Types.Version
+import qualified SharedLogic.BehaviourManagement.IssueBreach
+import qualified Tools.Beam.UtilsTH
+
+data TransporterConfig = TransporterConfig
+  { aaEnabledClientSdkVersion :: Kernel.Prelude.Text,
+    aadhaarImageResizeConfig :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.AadhaarImageResizeConfig,
+    aadhaarVerificationRequired :: Kernel.Prelude.Bool,
+    acStatusCheckGap :: Kernel.Prelude.Int,
+    actualRideDistanceDiffThreshold :: Kernel.Types.Common.HighPrecMeters,
+    actualRideDistanceDiffThresholdIfWithinPickupDrop :: Kernel.Types.Common.HighPrecMeters,
+    addDriverCountThreshold :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    addDriverCountWindow :: Kernel.Prelude.Maybe Kernel.Types.SlidingWindowCounters.SlidingWindowOptions,
+    airportEntryFeeCheckAtStartRide :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    airportEntryFeeEnabled :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowAadhaarReupload :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowDashboardToPassVehicleDetails :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowDefaultPlanAllocation :: Kernel.Prelude.Bool,
+    allowDisableDriverToTakeSpecialZoneRide :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowDisableFleetOnRejectionDoc :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowDlReupload :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowDriverToUseFleetRcs :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowDuplicateAadhaar :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowDuplicateGst :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowDuplicatePan :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowDuplicateUdyam :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowFarePolicyUpdateBelowMinBaseFare :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowGstReupload :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowInvalidRcDeletionOnReplacement :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowMultiFleetOperatorLink :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowNonFleetDriverLiveMap :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowPanAadhaarLinkage :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowPanReupload :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowRcUnlinkWhenDriverOffline :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    allowedPaymentInstrumentForPayout :: Kernel.Prelude.Maybe [Domain.Types.Extra.MerchantPaymentMethod.PaymentInstrument],
+    allowedReferralEntities :: [Domain.Types.Person.Role],
+    analyticsConfig :: Domain.Types.TransporterConfig.AnalyticsConfig,
+    approxRideDistanceDiffThreshold :: Kernel.Types.Common.HighPrecMeters,
+    areaPreferenceMinCells :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    arrivalTimeBufferOfVehicle :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.ArrivalTimeBufferOfVehicle,
+    arrivedPickupThreshold :: Kernel.Types.Common.HighPrecMeters,
+    arrivedStopThreshold :: Kernel.Prelude.Maybe Kernel.Types.Common.HighPrecMeters,
+    arrivingPickupThreshold :: Kernel.Types.Common.HighPrecMeters,
+    authIpBlockedUntilInMins :: Kernel.Prelude.Maybe Kernel.Types.Common.Minutes,
+    authPhoneNumberCountThreshold1 :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    authPhoneNumberCountThreshold2 :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    authPhoneNumberCountWindow1 :: Kernel.Prelude.Maybe Kernel.Types.SlidingWindowCounters.SlidingWindowOptions,
+    authPhoneNumberCountWindow2 :: Kernel.Prelude.Maybe Kernel.Types.SlidingWindowCounters.SlidingWindowOptions,
+    automaticRCActivationCutOff :: Kernel.Types.Common.Seconds,
+    availableForRidesDailyLimit :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    availableForRidesMaxSearchRequests :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    availableForRidesTagValidityMinutes :: Kernel.Prelude.Maybe Kernel.Types.Common.Minutes,
+    badDebtBatchSize :: Kernel.Prelude.Int,
+    badDebtRescheduleTime :: Kernel.Prelude.NominalDiffTime,
+    badDebtSchedulerTime :: Kernel.Prelude.NominalDiffTime,
+    badDebtTimeThreshold :: Kernel.Prelude.Int,
+    bankErrorExpiry :: Kernel.Prelude.NominalDiffTime,
+    blockDriverOwnRCForFleetDrivers :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    bookAnyVehicleDowngradeLevel :: Kernel.Prelude.Int,
+    bulkWaiveOffLimit :: Kernel.Prelude.Int,
+    cacheOfferListByDriverId :: Kernel.Prelude.Bool,
+    cachedDevicesOSForSearchRequest :: [Kernel.Types.Version.DeviceType],
+    canAddCancellationFee :: Kernel.Prelude.Bool,
+    canDowngradeToHatchback :: Kernel.Prelude.Bool,
+    canDowngradeToSedan :: Kernel.Prelude.Bool,
+    canDowngradeToTaxi :: Kernel.Prelude.Bool,
+    canSuvDowngradeToHatchback :: Kernel.Prelude.Bool,
+    canSuvDowngradeToTaxi :: Kernel.Prelude.Bool,
+    canSwitchToInterCity :: Kernel.Prelude.Bool,
+    canSwitchToRental :: Kernel.Prelude.Bool,
+    cancellationDistDiff :: Kernel.Prelude.Int,
+    cancellationFee :: Kernel.Types.Common.HighPrecMoney,
+    cancellationFeeCycle :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    cancellationFeeDisputeLimit :: Kernel.Prelude.Int,
+    cancellationFeeDisputeWindow :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    cancellationFeeVendor :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    cancellationRateCalculationThreshold :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    cancellationRateSlabConfig :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.CancellationRateSlabConfig,
+    cancellationRateThresholdDaily :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    cancellationRateThresholdWeekly :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    cancellationRateWindow :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    cancellationTimeDiff :: Kernel.Prelude.NominalDiffTime,
+    checkImageExtractionForDashboard :: Kernel.Prelude.Bool,
+    coinConversionRate :: Kernel.Types.Common.HighPrecMoney,
+    coinExpireTime :: Kernel.Prelude.NominalDiffTime,
+    coinFeature :: Kernel.Prelude.Bool,
+    communicationChannelCharLimits :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.CommunicationChannelCharLimits,
+    considerDriversForSearch :: Kernel.Prelude.Bool,
+    considerSpecialZoneRideChargesInFreeTrial :: Kernel.Prelude.Bool,
+    considerSpecialZoneRidesForPlanCharges :: Kernel.Prelude.Bool,
+    createDocumentRequired :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    createdAt :: Kernel.Prelude.UTCTime,
+    crossTravelCities :: [Kernel.Types.Beckn.City.City],
+    currency :: Kernel.Types.Common.Currency,
+    dailyConditionCooldownTimeHours :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    dailyMinRidesForBlocking :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    dailyMinRidesForNudging :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    dailyOffenceSuspensionTimeHours :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    dashboardMediaFileUrlPattern :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    deactivateRCOnUnlink :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    defaultOnboardingAs :: Kernel.Prelude.Maybe Domain.Types.DriverInformation.OnboardingAs,
+    defaultPopupDelay :: Kernel.Types.Common.Seconds,
+    defaultRefundDeductFromDriver :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    deleteDriverBankAccountWhenLinkToFleet :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    demandHotspotsConfig :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.DemandHotspotsConfig,
+    digilockerEnabled :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    disableDriverWhenUnlinkingVehicle :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    disableListScheduledBookingAPI :: Kernel.Prelude.Bool,
+    distanceUnit :: Kernel.Types.Common.DistanceUnit,
+    distanceWeightage :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    dlNumberVerification :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    dontAutoEnableDriver :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    dpBlackListedGeohash :: Kernel.Prelude.Maybe [Kernel.Prelude.Text],
+    dpGeoHashPercision :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    dpWhiteListedGeohash :: Kernel.Prelude.Maybe [Kernel.Prelude.Text],
+    driverAutoPayExecutionTime :: Kernel.Prelude.NominalDiffTime,
+    driverAutoPayExecutionTimeFallBack :: Kernel.Prelude.NominalDiffTime,
+    driverAutoPayNotificationTime :: Kernel.Prelude.NominalDiffTime,
+    driverCallingOption :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.CallingOption,
+    driverDistanceToPickupThresholdOnCancel :: Kernel.Types.Common.Meters,
+    driverDistanceTravelledOnPickupThresholdOnCancel :: Kernel.Types.Common.Meters,
+    driverDrivenSearchReqExpiry :: Kernel.Prelude.Maybe Kernel.Prelude.NominalDiffTime,
+    driverFeeCalculationTime :: Kernel.Prelude.Maybe Kernel.Prelude.NominalDiffTime,
+    driverFeeCalculatorBatchGap :: Kernel.Prelude.Maybe Kernel.Prelude.NominalDiffTime,
+    driverFeeCalculatorBatchSize :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    driverFeeMandateExecutionBatchSize :: Kernel.Prelude.Int,
+    driverFeeMandateNotificationBatchSize :: Kernel.Prelude.Int,
+    driverFeeOverlaySendingTimeLimitInDays :: Kernel.Prelude.Int,
+    driverFeeRetryThresholdConfig :: Kernel.Prelude.Int,
+    driverLocationAccuracyBuffer :: Kernel.Types.Common.Meters,
+    driverLocationStalenessThresholdSeconds :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    driverOnboardingLinkExpiryHours :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    driverPaymentCycleBuffer :: Kernel.Prelude.NominalDiffTime,
+    driverPaymentCycleDuration :: Kernel.Prelude.NominalDiffTime,
+    driverPaymentCycleStartTime :: Kernel.Prelude.NominalDiffTime,
+    driverPaymentReminderInterval :: Kernel.Prelude.NominalDiffTime,
+    driverSearchBlacklistDurationSeconds :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    driverSmsReceivingLimit :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.DashboardMediaSendingLimit,
+    driverTimeSpentOnPickupThresholdOnCancel :: Kernel.Types.Common.Seconds,
+    driverWalletConfig :: Domain.Types.TransporterConfig.DriverWalletConfig,
+    dropLocThreshold :: Kernel.Types.Common.Meters,
+    dropQarCalRadiusInKm :: Kernel.Prelude.Maybe Kernel.Prelude.Double,
+    dummyFromLocation :: Domain.Types.Location.DummyLocationInfo,
+    dummyShowDriverAdditions :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    dummyToLocation :: Domain.Types.Location.DummyLocationInfo,
+    dynamicReferralCodeEnabled :: Kernel.Prelude.Bool,
+    dynamicReferralCodeValidForMinutes :: Kernel.Prelude.Integer,
+    editLocDriverPermissionNeeded :: Kernel.Prelude.Bool,
+    editLocTimeThreshold :: Kernel.Types.Common.Seconds,
+    emailOtpConfig :: Kernel.Prelude.Maybe Email.Types.EmailOTPConfig,
+    enableBotFlow :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    enableCoinsToDirectPayout :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    enableCourtRecordCheck :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    enableDashboardSms :: Kernel.Prelude.Bool,
+    enableDirectWalletIncentives :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    enableDownwardRecomputeForDifferentDestination :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    enableDriverHealthCheckDebug :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    enableDriverPoolEnrichment :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    enableEstimatedTollFallback :: Kernel.Prelude.Bool,
+    enableExistingVehicleInBulkUpload :: Kernel.Prelude.Bool,
+    enableFaceVerification :: Kernel.Prelude.Bool,
+    enableFareCalculatorV2 :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    enableGpsTollBehavior :: Kernel.Prelude.Bool,
+    enableManualDocumentStatusCheck :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    enableMobileNumberValidation :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    enableMobilityBilling :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    enableOndcScheduledRideSupport :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    enableOverchargingBlocker :: Kernel.Prelude.Bool,
+    enablePullPendingDocVerification :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    enableScheduleReallocation :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    enableSupportForSafety :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    enableTierUpgradeFeature :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    enableTollCrossedNotifications :: Kernel.Prelude.Bool,
+    enableUdfForOffers :: Kernel.Prelude.Bool,
+    enableVendorCheckForCollectingDues :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    enforceUploadFileTypeCheck :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    exotelAppIdMapping :: Kernel.Prelude.Maybe Domain.Types.Extra.TransporterConfig.ExotelMapping,
+    exotelStatusCheckSchedulerDelay :: Kernel.Prelude.Int,
+    fakeOtpEmails :: [Kernel.Prelude.Text],
+    fakeOtpMobileNumbers :: [Kernel.Prelude.Text],
+    fareRecomputeDailyExtraKmsThreshold :: Kernel.Types.Common.HighPrecMeters,
+    fareRecomputeWeeklyExtraKmsThreshold :: Kernel.Types.Common.HighPrecMeters,
+    favouriteDriverDailyCoinRideThreshold :: Kernel.Prelude.Int,
+    fcmConfig :: Kernel.External.Notification.FCM.Types.FCMConfig,
+    feedbackNotificationConfig :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.FeedbackNotificationConfig,
+    fleetAlertThreshold :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    fleetBankPayoutEnabled :: Kernel.Prelude.Bool,
+    fleetUpiPayoutEnabled :: Kernel.Prelude.Bool,
+    forceDirectCalling :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    forceEnabledBypassingDocsUponDisableTakesToOnboarding :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    fraudAuthCountThreshold :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    fraudAuthCountWindow :: Kernel.Prelude.Maybe Kernel.Types.SlidingWindowCounters.SlidingWindowOptions,
+    freeTrialDays :: Kernel.Prelude.Int,
+    generateReferralCodeForFleet :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    generateReferralCodeForOperator :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    gpsTollBehaviorWindowDays :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    graceTimeForScheduledRidePickup :: Kernel.Prelude.NominalDiffTime,
+    includeDriverCurrentlyOnRide :: Kernel.Prelude.Bool,
+    individualPANCheck :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    invoiceConfig :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.InvoiceConfig,
+    isAAEnabledForRecurring :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    isAvoidToll :: Kernel.Prelude.Bool,
+    isDeviceIdChecksRequired :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    isDriverNameMandatoryInBulkUpload :: Kernel.Prelude.Bool,
+    isDropLocQARCalEnabled :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    isDynamicPricingQARCalEnabled :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    isGstPanLinkCheckRequired :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    isMLBasedDynamicPricingEnabled :: Kernel.Prelude.Bool,
+    isPlanMandatory :: Kernel.Prelude.Bool,
+    isStrongNameCheckRequired :: Kernel.Prelude.Bool,
+    issueBreachConfig :: Kernel.Prelude.Maybe [SharedLogic.BehaviourManagement.IssueBreach.IssueBreachConfig],
+    kaptureDisposition :: Kernel.Prelude.Text,
+    kaptureQueue :: Kernel.Prelude.Text,
+    knowledgeCenterSopTypes :: Domain.Types.Extra.TransporterConfig.KnowledgeCenterSopTypesConfig,
+    languagesToBeTranslated :: [Kernel.External.Types.Language],
+    lastNdaysToCheckForPayoutOrderStatus :: Kernel.Prelude.Int,
+    limitsConfig :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.LimitsConfig,
+    linkFleetToUnVerifiedExistingRC :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    liveEKD :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    localAmbulanceNumbers :: Kernel.Prelude.Maybe [Kernel.Prelude.Text],
+    localPoliceNumbers :: Kernel.Prelude.Maybe [Kernel.Prelude.Text],
+    mandateEmailVerification :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    mandateExecutionRescheduleInterval :: Kernel.Prelude.NominalDiffTime,
+    mandateNotificationRescheduleInterval :: Kernel.Prelude.NominalDiffTime,
+    mandateValidity :: Kernel.Prelude.Int,
+    maxAllowedDocSizeInMB :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    maxAllowedVideoDocSizeInMB :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    maxNumberOfLuggages :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    maxPayoutReferralForADay :: Kernel.Prelude.Int,
+    mediaFileSizeUpperLimit :: Kernel.Prelude.Int,
+    mediaFileUrlPattern :: Kernel.Prelude.Text,
+    merchantId :: Kernel.Types.Id.Id Domain.Types.Merchant.Merchant,
+    merchantOperatingCityId :: Kernel.Types.Id.Id Domain.Types.MerchantOperatingCity.MerchantOperatingCity,
+    meterRideBulkLocUpdateBatchSize :: Kernel.Prelude.Integer,
+    metricsDistanceBucketsKm :: Kernel.Prelude.Maybe [Kernel.Prelude.Int],
+    minBaseFare :: Kernel.Prelude.Maybe Kernel.Types.Common.HighPrecMoney,
+    minDistanceForStopFcm :: Kernel.Types.Common.HighPrecMeters,
+    minLocationAccuracy :: Kernel.Prelude.Double,
+    minRidesForCancellationScore :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    minRidesToUnlist :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    minThresholdForPassThroughDestination :: Kernel.Prelude.Maybe Kernel.Types.Common.Meters,
+    minmRentalAndScheduledBookingLeadTimeHours :: Kernel.Types.Common.Hours,
+    missingMappingFallbackVariant :: Kernel.Prelude.Maybe Domain.Types.VehicleVariant.VehicleVariant,
+    negativeFareAdjustmentCongestionThreshold :: Kernel.Prelude.Maybe Kernel.Prelude.Double,
+    negativeFareAdjustmentMaxAmount :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    negativeFareAdjustmentMinDistanceMeters :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    negotiationFareMaxTolerancePct :: Kernel.Prelude.Maybe Kernel.Prelude.Double,
+    negotiationFareMinTolerancePct :: Kernel.Prelude.Maybe Kernel.Prelude.Double,
+    nightSafetyEndTime :: Kernel.Types.Common.Seconds,
+    nightSafetyRouteDeviationThreshold :: Kernel.Types.Common.Meters,
+    nightSafetyStartTime :: Kernel.Types.Common.Seconds,
+    normalRideBulkLocUpdateBatchSize :: Kernel.Prelude.Integer,
+    notificationRetryCountThreshold :: Kernel.Prelude.Int,
+    notificationRetryEligibleErrorCodes :: [Kernel.Prelude.Text],
+    notificationRetryTimeGap :: Kernel.Prelude.NominalDiffTime,
+    numOfCancellationsAllowed :: Kernel.Prelude.Int,
+    onboardingDocsCountLimit :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    onboardingRetryTimeInHours :: Kernel.Prelude.Int,
+    onboardingTryLimit :: Kernel.Prelude.Int,
+    openMarketUnBlocked :: Kernel.Prelude.Bool,
+    orderAndNotificationStatusCheckFallBackTime :: Kernel.Prelude.NominalDiffTime,
+    orderAndNotificationStatusCheckTime :: Kernel.Prelude.NominalDiffTime,
+    orderAndNotificationStatusCheckTimeLimit :: Kernel.Prelude.NominalDiffTime,
+    otpRideStartRestrictionRadius :: Kernel.Prelude.Maybe Kernel.Types.Common.Meters,
+    overlayBatchSize :: Kernel.Prelude.Int,
+    overrideOperatorDriverJoiningWithDeepLink :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    pastDaysRideCounter :: Kernel.Prelude.Int,
+    payoutBatchLimit :: Kernel.Prelude.Int,
+    payoutRideMoneyToDriver :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    payoutRideScheduleTimeBuffer :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    pickupLocThreshold :: Kernel.Types.Common.Meters,
+    pickupStallMonitoringConfig :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.PickupStallMonitoringConfig,
+    placeNameCacheExpiryDays :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    popupDelayToAddAsPenalty :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    preProcessDocumentIdentifiers :: Kernel.Prelude.Bool,
+    preferOndcCancellationReasonId :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    qarCalRadiusInKm :: Kernel.Prelude.Maybe Kernel.Prelude.Double,
+    ratingAsDecimal :: Kernel.Prelude.Bool,
+    rcChangeThresholdDays :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    rcExpiryChecks :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    rcLimit :: Kernel.Prelude.Int,
+    recentScheduledBookingsSafeLimit :: Kernel.Prelude.Int,
+    recomputeCongestionChargeOnEndRide :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    recomputeDistanceThresholds :: Kernel.Prelude.Maybe [Domain.Types.TransporterConfig.DistanceRecomputeConfigs],
+    recomputeIfPickupDropNotOutsideOfThreshold :: Kernel.Prelude.Bool,
+    reconciliationJobsEnabled :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    referralLinkPassword :: Kernel.Prelude.Text,
+    refillVehicleModel :: Kernel.Prelude.Bool,
+    reminderSystemEnabled :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    requireFleetOwnerRegistrationForEnablement :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    requireRouteMappingInVehicle :: Kernel.Prelude.Bool,
+    requiresDriverOnboardingInspection :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    requiresOnboardingInspection :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    restrictMobileUpdateToDashboard :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    rideTimeEstimatedThreshold :: Kernel.Types.Common.Seconds,
+    routeDeviationThreshold :: Kernel.Types.Common.Meters,
+    safetyTeamNumbers :: Kernel.Prelude.Maybe [Kernel.Prelude.Text],
+    sameRiderDriverRideCountLookbackDays :: Kernel.Prelude.Int,
+    sameRiderDriverRideCountThreshold :: Kernel.Prelude.Int,
+    schedulePayoutForDay :: Kernel.Prelude.Maybe Kernel.Prelude.Integer,
+    scheduleRideBufferTime :: Kernel.Prelude.NominalDiffTime,
+    scheduledRideConfig :: Domain.Types.TransporterConfig.ScheduledRideConfig,
+    scheduledRideFilterExclusionThresholdHours :: Kernel.Types.Common.Hours,
+    scheduledRideJobRescheduleTime :: Kernel.Prelude.NominalDiffTime,
+    scheduledRideOpenToAllThresholdMinutes :: Kernel.Prelude.Maybe Kernel.Types.Common.Minutes,
+    scheduledRideSearchRepeatLimit :: Kernel.Prelude.Int,
+    searchRepeatLimit :: Kernel.Prelude.Int,
+    sendMembershipIdInProfile :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    sendSmsOnEnablement :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    separateDriverVehicleEnablement :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    snapToRoadConfidenceThreshold :: Kernel.Prelude.Double,
+    specialDrivers :: [Kernel.Prelude.Text],
+    specialLocationTags :: [Kernel.Prelude.Text],
+    specialZoneBookingOtpExpiry :: Kernel.Prelude.Int,
+    stclConfig :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.StclConfig,
+    stepFunctionToConvertCoins :: Kernel.Prelude.Int,
+    stripeStatusRefreshCountThreshold :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    stripeStatusRefreshCountWindow :: Kernel.Prelude.Maybe Kernel.Types.SlidingWindowCounters.SlidingWindowOptions,
+    subscription :: Kernel.Prelude.Bool,
+    subscriptionConfig :: Domain.Types.TransporterConfig.SubscriptionConfig,
+    subscriptionStartTime :: Kernel.Prelude.UTCTime,
+    supportedMapProviders :: Kernel.Prelude.Maybe [Domain.Types.DriverInformation.MapProvider],
+    taxConfig :: Domain.Types.TransporterConfig.TaxConfig,
+    tdsFromEmail :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    thresholdCancellationPercentageToUnlist :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    thresholdCancellationScore :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    timeDiffFromUtc :: Kernel.Types.Common.Seconds,
+    toNotifyDriverForExtraKmsLimitExceed :: Kernel.Prelude.Bool,
+    trackingShortUrlPattern :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    tripEndGeofenceRadius :: Kernel.Prelude.Maybe Kernel.Types.Common.Meters,
+    tripStartGeofenceRadius :: Kernel.Prelude.Maybe Kernel.Types.Common.Meters,
+    tripStartLeadTime :: Kernel.Prelude.Maybe Kernel.Types.Common.Minutes,
+    unifiedOnboardingFlagsRecompute :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    updateNotificationStatusBatchSize :: Kernel.Prelude.Int,
+    updateOrderStatusBatchSize :: Kernel.Prelude.Int,
+    updatePayoutStatusBatchSize :: Kernel.Prelude.Int,
+    updatedAt :: Kernel.Prelude.UTCTime,
+    upgradeTierDropRetentionTime :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    upwardsRecomputeBuffer :: Kernel.Types.Common.HighPrecMeters,
+    upwardsRecomputeBufferPercentage :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    useCategoryBasedVerificationPriorityList :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    useDBForAnalytics :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    useOfferListCache :: Kernel.Prelude.Bool,
+    useSilentFCMForForwardBatch :: Kernel.Prelude.Bool,
+    useSurgeConfigPricing :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    useWithSnapToRoadFallback :: Kernel.Prelude.Bool,
+    validNameComparePercentage :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    variantsToEnableForSubscription :: [Domain.Types.VehicleVariant.VehicleVariant],
+    vehicleCategoryExcludedFromVerification :: Kernel.Prelude.Maybe [Domain.Types.VehicleCategory.VehicleCategory],
+    videoFileSizeUpperLimit :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    volunteerSmsSendingLimit :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.DashboardMediaSendingLimit,
+    weeklyConditionCooldownTimeHours :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    weeklyMinRidesForBlocking :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    weeklyMinRidesForNudging :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    weeklyOffenceSuspensionTimeHours :: Kernel.Prelude.Maybe Kernel.Prelude.Int
+  }
+  deriving (Generic, Show, Eq, FromJSON, ToJSON)
+
+data AadhaarImageResizeConfig = AadhaarImageResizeConfig {height :: Kernel.Prelude.Int, width :: Kernel.Prelude.Int} deriving (Generic, (Show), (ToJSON), (FromJSON), (Read), Eq)
+
+data AnalyticsConfig = AnalyticsConfig
+  { allowCacheDriverFlowStatus :: Kernel.Prelude.Bool,
+    earningsWindowSize :: Kernel.Prelude.Int,
+    enableFleetOperatorDashboardAnalytics :: Kernel.Prelude.Bool,
+    financialYearStartMonth :: Kernel.Prelude.Int,
+    maxOnlineDurationDays :: Kernel.Prelude.Int,
+    onlineDurationCalculateFrom :: Kernel.Prelude.Maybe Kernel.Prelude.UTCTime,
+    useDbForEarningAndMetrics :: Kernel.Prelude.Bool,
+    weekStartMode :: Kernel.Prelude.Int
+  }
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (Read), (Eq))
+
+data ArrivalTimeBufferOfVehicle = ArrivalTimeBufferOfVehicle
+  { ambulance :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    autorickshaw :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    bike :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    bikeplus :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    black :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    blackxl :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    boat :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    busAc :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    busNonAc :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    deliveryLightGoodsVehicle :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    deliverybike :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    erickshaw :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    evautorickshaw :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    hatchback :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    heritagecab :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    premiumsedan :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    sedan :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    suv :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    suvplus :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    taxi :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    taxiplus :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    vipEscort :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    vipOfficer :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds
+  }
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (Read), Eq)
+
+data CallingOption = AnonymousCall | DirectCall | DualCall deriving (Eq, Ord, Show, Read, Generic, ToJSON, FromJSON, ToSchema)
+
+data CancellationRateBasedNudgingAndBlockingConfig = CancellationRateBasedNudgingAndBlockingConfig
+  { cancellationRateSlabConfig :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.CancellationRateSlabConfig,
+    cancellationRateThresholdDaily :: Kernel.Prelude.Int,
+    cancellationRateThresholdWeekly :: Kernel.Prelude.Int,
+    dailyConditionCooldownTimeHours :: Kernel.Prelude.Int,
+    dailyMinRidesforBlocking :: Kernel.Prelude.Int,
+    dailyMinRidesforNudging :: Kernel.Prelude.Int,
+    dailyOffenceSuspensionTimeHours :: Kernel.Prelude.Int,
+    weeklyConditionCooldownTimeHours :: Kernel.Prelude.Int,
+    weeklyMinRidesforBlocking :: Kernel.Prelude.Int,
+    weeklyMinRidesforNudging :: Kernel.Prelude.Int,
+    weeklyOffenceSuspensionTimeHours :: Kernel.Prelude.Int
+  }
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (ToSchema), Eq)
+
+data CancellationRateSlab = CancellationRateSlab {cancellationPercentageThreshold :: Kernel.Prelude.Int, suspensionTimeInHours :: Kernel.Prelude.Int}
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (ToSchema), Eq)
+
+data CancellationRateSlabConfig = CancellationRateSlabConfig {dailySlabs :: [Domain.Types.TransporterConfig.SlabType], weeklySlabs :: [Domain.Types.TransporterConfig.SlabType]}
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (ToSchema), Eq)
+
+data ChargeFrequency = CHARGE_DAILY | CHARGE_WEEKLY | CHARGE_MONTHLY deriving (Eq, Ord, Show, Read, Generic, ToJSON, FromJSON, ToSchema)
+
+data CommissionAggregationFrequency = DAILY | WEEKLY | MONTHLY deriving (Eq, Ord, Show, Read, Generic, ToJSON, FromJSON, ToSchema)
+
+data CommunicationChannelCharLimits = CommunicationChannelCharLimits
+  { pushBodyLimit :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    pushTitleLimit :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    smsBodyLimit :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    whatsappBodyLimit :: Kernel.Prelude.Maybe Kernel.Prelude.Int
+  }
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (Read), (Eq))
+
+data ConnectChargeBearer = CONNECT_PLATFORM | CONNECT_DRIVER deriving (Eq, Ord, Show, Read, Generic, ToJSON, FromJSON, ToSchema)
+
+data DashboardMediaSendingLimit = DashboardMediaSendingLimit {alert :: Kernel.Prelude.Int, overlay :: Kernel.Prelude.Int, sms :: Kernel.Prelude.Int, whatsapp :: Kernel.Prelude.Int}
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (Read), Eq)
+
+data DemandHotspotsConfig = DemandHotspotsConfig
+  { analysisDurationMinutes :: Kernel.Prelude.Int,
+    enableDemandHotspots :: Kernel.Prelude.Bool,
+    nearbyRadiusMeters :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    nearbySearchStalenessMinutes :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    noOfGeohashesToReturn :: Kernel.Prelude.Int,
+    precisionOfGeohash :: Kernel.Prelude.Int,
+    resultDurationMinutes :: Kernel.Prelude.Int
+  }
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (ToSchema), Eq)
+
+data DistanceRecomputeConfigs = DistanceRecomputeConfigs {estimatedDistanceUpper :: Kernel.Types.Common.Meters, minThresholdDistance :: Kernel.Types.Common.Meters, minThresholdPercentage :: Kernel.Prelude.Int}
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (Read), Eq)
+
+data DriverWalletConfig = DriverWalletConfig
+  { clubProjectFareInEarnings :: Kernel.Prelude.Maybe [Domain.Types.TransporterConfig.ProjectFareParamsComponent],
+    clubProjectFareInPayouts :: Kernel.Prelude.Maybe [Domain.Types.TransporterConfig.ProjectFareParamsComponent],
+    clubProjectFareInRefundsInvoice :: Kernel.Prelude.Maybe [Domain.Types.TransporterConfig.ProjectFareParamsComponent],
+    clubProjectFareInRideInvoice :: Kernel.Prelude.Maybe [Domain.Types.TransporterConfig.ProjectFareParamsComponent],
+    connectAccountCharge :: Kernel.Prelude.Maybe Kernel.Types.Common.HighPrecMoney,
+    connectAccountChargeBearer :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.ConnectChargeBearer,
+    connectAccountChargeDayOfMonth :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    connectAccountChargeDayOfWeek :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    connectAccountChargeFrequency :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.ChargeFrequency,
+    connectAccountChargeTimeOfDay :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    driverWalletPayoutThreshold :: Kernel.Types.Common.HighPrecMoney,
+    enableDriverWallet :: Kernel.Prelude.Bool,
+    enableWalletGatedTierCheck :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    enableWalletPayout :: Kernel.Prelude.Bool,
+    enableWalletTopup :: Kernel.Prelude.Bool,
+    fetchWalletTransactionsFromClickhouse :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    forceOnlineLedger :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    gstPercentage :: Kernel.Prelude.Double,
+    maxWalletPayoutsPerDay :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    minWalletAmountForCashRides :: Kernel.Prelude.Maybe Kernel.Types.Common.HighPrecMoney,
+    minWalletAmountForScheduledRides :: Kernel.Prelude.Maybe Kernel.Types.Common.HighPrecMoney,
+    minimumWalletPayoutAmount :: Kernel.Types.Common.HighPrecMoney,
+    onlineCommissionPaidOutDirectly :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    paymentChargeBearer :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.PaymentChargeBearer,
+    paymentChargeRate :: Kernel.Prelude.Maybe Kernel.Prelude.Double,
+    paymentChargeVat :: Kernel.Prelude.Maybe Kernel.Prelude.Double,
+    payoutCutOffDays :: Kernel.Prelude.Int,
+    payoutFee :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.PayoutFeeConfig
+  }
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (Read), (Eq))
+
+data FeedbackNotificationConfig = FeedbackNotificationConfig {allowNotificationOnEmptyBadge :: Kernel.Prelude.Bool, enableFeedbackNotification :: Kernel.Prelude.Bool, feedbackNotificationDelayInSec :: Kernel.Prelude.Int}
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (Read), Eq)
+
+data GstBreakup = GstBreakup
+  { cgstPercentage :: Kernel.Prelude.Maybe Kernel.Types.Common.HighPrecMoney,
+    igstPercentage :: Kernel.Prelude.Maybe Kernel.Types.Common.HighPrecMoney,
+    sgstPercentage :: Kernel.Prelude.Maybe Kernel.Types.Common.HighPrecMoney
+  }
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (Read), (Eq))
+
+data InvoiceConfig = InvoiceConfig
+  { commissionAggregationBatchSize :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    commissionAggregationEnabled :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    commissionAggregationFrequency :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.CommissionAggregationFrequency,
+    driverInvoiceLineItemsVatInclusive :: Kernel.Prelude.Bool,
+    emitLedgerEntries :: Kernel.Prelude.Bool,
+    invoiceAppName :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    invoiceSellerAddress :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    invoiceSellerName :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    invoiceSellerTradeName :: Kernel.Prelude.Maybe Kernel.Prelude.Text,
+    logoUrl :: Kernel.Prelude.Maybe Kernel.Prelude.BaseUrl,
+    showVatInputLineItem :: Kernel.Prelude.Maybe Kernel.Prelude.Bool
+  }
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (Eq))
+
+data LimitsConfig = LimitsConfig
+  { cashRideSyncBatchSize :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    maxAddDriversCsvRows :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    maxBulkSubscriptionDriverIds :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    maxCashRideTargetIds :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    maxDriverBusRouteMappingRows :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    maxVehiclesCsvRows :: Kernel.Prelude.Maybe Kernel.Prelude.Int
+  }
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (ToSchema), (Eq))
+
+data PaymentChargeBearer = PAYMENT_CUSTOMER | PAYMENT_DRIVER | PAYMENT_PLATFORM deriving (Eq, Ord, Show, Read, Generic, ToJSON, FromJSON, ToSchema)
+
+data PayoutChargeBearer = DRIVER_BEARER | PLATFORM_BEARER deriving (Eq, Ord, Show, Read, Generic, ToJSON, FromJSON, ToSchema)
+
+data PayoutFeeConfig = PayoutFeeConfig
+  { feeBearer :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.PayoutChargeBearer,
+    feeType :: Domain.Types.TransporterConfig.PayoutFeeType,
+    feeValue :: Kernel.Types.Common.HighPrecMoney,
+    fixedFee :: Kernel.Prelude.Maybe Kernel.Types.Common.HighPrecMoney,
+    percentageRate :: Kernel.Prelude.Maybe Kernel.Prelude.Double
+  }
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (ToSchema), (Read), (Eq))
+
+data PayoutFeeType = PERCENTAGE | FIXED deriving (Eq, Ord, Show, Read, Generic, ToJSON, FromJSON, ToSchema)
+
+data PickupDarkStage = PickupDarkStage
+  { afterDarkSec :: Kernel.Prelude.Int,
+    channel :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.PickupNudgeChannel,
+    chatSuggestions :: Kernel.Prelude.Maybe [Kernel.Prelude.Text],
+    overlayKey :: Kernel.Prelude.Text
+  }
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (ToSchema), Eq)
+
+data PickupNudgeChannel = OVERLAY | CHAT_MESSAGE deriving (Generic, (Show), (ToJSON), (FromJSON), (ToSchema), (Eq))
+
+data PickupStallMonitoringConfig = PickupStallMonitoringConfig
+  { darkStages :: [Domain.Types.TransporterConfig.PickupDarkStage],
+    detourCreditSec :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    detourDisplacementMeters :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    deviationAllowanceMeters :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    progressThresholdMeters :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    runBehaviourEngineForScheduled :: Kernel.Prelude.Maybe Kernel.Prelude.Bool,
+    scheduledMonitoringMode :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.ScheduledPickupMonitoringMode,
+    stages :: [Domain.Types.TransporterConfig.PickupStallStage],
+    staleFixAfterSec :: Kernel.Prelude.Maybe Kernel.Prelude.Int,
+    tickIntervalSec :: Kernel.Prelude.Int
+  }
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (ToSchema), Eq)
+
+data PickupStallStage = PickupStallStage
+  { afterFaultSec :: Kernel.Prelude.Int,
+    channel :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.PickupNudgeChannel,
+    chatSuggestions :: Kernel.Prelude.Maybe [Kernel.Prelude.Text],
+    overlayKey :: Kernel.Prelude.Text,
+    terminalAction :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.PickupStallTerminalAction
+  }
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (ToSchema), Eq)
+
+data PickupStallTerminalAction = REALLOCATE_RIDE | RECORD_ONLY | REALLOCATE_SCHEDULED_RIDE deriving (Generic, (Show), (ToJSON), (FromJSON), (ToSchema), (Eq))
+
+data ProjectFareParamsComponent = RIDE_FARE | TOLL_FARE | CANCELLATION_FARE | PARKING_CHARGE | PAYMENT_CHARGE deriving (Eq, Ord, Show, Read, Generic, ToJSON, FromJSON, ToSchema)
+
+data ScheduledPickupMonitoringMode = DISTANCE_BASED | TIME_BASED deriving (Generic, (Show), (ToJSON), (FromJSON), (ToSchema), (Eq))
+
+data ScheduledRideConfig = ScheduledRideConfig
+  { avgSpeedKmph :: Kernel.Prelude.Maybe Kernel.Prelude.Double,
+    maxHoldsPerDriver :: Kernel.Prelude.Int,
+    maxLeadTime :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds,
+    minLeadTime :: Kernel.Prelude.Maybe Kernel.Types.Common.Seconds
+  }
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (Read), (Eq))
+
+data SlabType = SlabType {minBookingsRange :: [Kernel.Prelude.Int], penalityForCancellation :: Domain.Types.TransporterConfig.CancellationRateSlab}
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (ToSchema), Eq)
+
+data StclConfig = StclConfig {maxSharesPerDriver :: Kernel.Prelude.Maybe Kernel.Prelude.Int, pendingStaleMinutes :: Kernel.Prelude.Maybe Kernel.Prelude.Int, pricePerShare :: Kernel.Prelude.Maybe Kernel.Prelude.Int}
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (ToSchema), (Eq))
+
+data SubscriptionConfig = SubscriptionConfig
+  { fleetPrepaidSubscriptionThreshold :: Kernel.Prelude.Maybe Kernel.Types.Common.HighPrecMoney,
+    prepaidSubscriptionThreshold :: Kernel.Prelude.Maybe Kernel.Types.Common.HighPrecMoney,
+    vehicleCategoryScopedPrepaidEnabled :: Kernel.Prelude.Maybe Kernel.Prelude.Bool
+  }
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (Read), (Eq))
+
+data TaxConfig = TaxConfig
+  { airportEntryFeeGst :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.GstBreakup,
+    businessTds :: Kernel.Prelude.Maybe Domain.Types.Extra.TransporterConfig.TdsConfig,
+    commissionVatPercentage :: Kernel.Prelude.Maybe Kernel.Prelude.Double,
+    defaultTdsRate :: Kernel.Prelude.Maybe Domain.Types.Extra.TransporterConfig.TdsConfig,
+    individualLinked :: Kernel.Prelude.Maybe Domain.Types.Extra.TransporterConfig.TdsConfig,
+    individualNotLinked :: Kernel.Prelude.Maybe Domain.Types.Extra.TransporterConfig.TdsConfig,
+    invalidPanTdsRate :: Domain.Types.Extra.TransporterConfig.TdsConfig,
+    rideGst :: Domain.Types.TransporterConfig.GstBreakup,
+    securityDepositGst :: Kernel.Prelude.Maybe Domain.Types.TransporterConfig.GstBreakup,
+    serviceVatPercentage :: Kernel.Prelude.Maybe Kernel.Prelude.Double,
+    subscriptionGst :: Domain.Types.TransporterConfig.GstBreakup,
+    subscriptionTdsRate :: Kernel.Prelude.Maybe Domain.Types.Extra.TransporterConfig.TdsConfig
+  }
+  deriving (Generic, (Show), (ToJSON), (FromJSON), (Read), (Eq))
+
+$(Tools.Beam.UtilsTH.mkBeamInstancesForEnumAndList (''CallingOption))
+
+$(Tools.Beam.UtilsTH.mkBeamInstancesForEnumAndList (''ChargeFrequency))
+
+$(Tools.Beam.UtilsTH.mkBeamInstancesForEnumAndList (''CommissionAggregationFrequency))
+
+$(Tools.Beam.UtilsTH.mkBeamInstancesForEnumAndList (''ConnectChargeBearer))
+
+$(Tools.Beam.UtilsTH.mkBeamInstancesForEnumAndList (''PaymentChargeBearer))
+
+$(Tools.Beam.UtilsTH.mkBeamInstancesForEnumAndList (''PayoutChargeBearer))
+
+$(Tools.Beam.UtilsTH.mkBeamInstancesForEnumAndList (''PayoutFeeType))
+
+$(Tools.Beam.UtilsTH.mkBeamInstancesForEnumAndList (''ProjectFareParamsComponent))

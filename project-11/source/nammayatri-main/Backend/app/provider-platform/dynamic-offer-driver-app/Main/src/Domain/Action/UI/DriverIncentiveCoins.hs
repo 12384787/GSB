@@ -1,0 +1,353 @@
+module Domain.Action.UI.DriverIncentiveCoins
+  ( getCoinsIncentiveConfig,
+    getCoinsIncentiveRideCount,
+  )
+where
+
+import qualified API.Types.UI.DriverIncentiveCoins as API
+import qualified Crypto.Hash as Hash
+import Data.Aeson (encode)
+import qualified Data.ByteString as BS
+import Data.List (nub)
+import Data.Maybe (listToMaybe)
+import qualified Data.Text as T
+import qualified Domain.Types.Coins.CoinsConfig as CoinsConfig
+import qualified Domain.Types.Merchant as DM
+import qualified Domain.Types.MerchantOperatingCity as DMOC
+import qualified Domain.Types.Person as SP
+import qualified Domain.Types.TransporterConfig as DTC
+import qualified Domain.Types.VehicleCategory as DTV
+import qualified Domain.Types.VehicleVariant as VecVariant
+import Environment
+import EulerHS.Prelude hiding (id)
+import qualified Kernel.Beam.Functions as B
+import Kernel.Types.Error
+import Kernel.Types.Id
+import qualified Kernel.Types.TimeBound as TB
+import Kernel.Utils.Common
+import Lib.ConfigPilot.Interface.Types (getConfig, getOneConfig)
+import qualified Lib.DriverCoins.Coins as Coins
+import qualified Lib.DriverCoins.IncentiveMetrics as IncentiveMetrics
+import qualified Lib.DriverCoins.Types as DCT
+import qualified Lib.Types.SpecialLocation as SL
+import qualified Lib.Yudhishthira.Types as LYT
+import Servant (Header, Headers, addHeader)
+import qualified Storage.CachedQueries.CoinsConfig as CQCoinsConfig
+import Storage.ConfigPilot.Config.CoinsConfig (CoinsConfigDimensions (..))
+import Storage.ConfigPilot.Config.TransporterConfig (TransporterConfigDimensions (..))
+import qualified Storage.Queries.Coins.CoinsConfig as SQCC
+import qualified Storage.Queries.Person as Person
+import qualified Storage.Queries.Vehicle as QVeh
+import Tools.Error
+
+data CoinConfigWithTimeBounds = CoinConfigWithTimeBounds
+  { coinsConfig :: CoinsConfig.CoinsConfig,
+    timeBounds :: TB.TimeBound
+  }
+
+data SelectedIncentiveConfig = SelectedIncentiveConfig
+  { selected :: CoinsConfig.CoinsConfig,
+    ridesThreshold :: Int
+  }
+
+getCoinsIncentiveConfig ::
+  ( Maybe (Id SP.Person),
+    Id DM.Merchant,
+    Id DMOC.MerchantOperatingCity
+  ) ->
+  Maybe Text ->
+  Flow (Headers '[Header "ETag" Text] [API.DriverIncentiveCoinConfigItem])
+getCoinsIncentiveConfig (mbPersonId, merchantId, merchantOpCityId) mbIfNoneMatch = do
+  (transporterConfig, driverId, vehCategory, driver) <- loadDriverContext mbPersonId merchantId merchantOpCityId
+  let mocId = merchantOpCityId.getId
+  mbCachedETag <- CQCoinsConfig.getDriverIncentiveConfigHash mocId vehCategory driverId.getId
+  case (mbIfNoneMatch, mbCachedETag) of
+    (Just clientETag, Just cachedETag)
+      | clientETag == cachedETag ->
+        throwError DriverIncentiveCoinConfigNotModified
+    _ -> do
+      (items, eTag, shouldCache) <-
+        buildIncentiveConfigWithStableGeneration mocId vehCategory transporterConfig merchantId merchantOpCityId driver.driverTag 3
+      when shouldCache $
+        CQCoinsConfig.setDriverIncentiveConfigHash vehCategory driverId.getId eTag
+      pure $ addHeader eTag items
+
+-- | Build config items and pair with generation only when gen is unchanged
+-- across the build (avoids caching new-gen + stale content if CoinsConfig
+-- is updated mid-request). Retries a few times if generation moves.
+buildIncentiveConfigWithStableGeneration ::
+  Text ->
+  DTV.VehicleCategory ->
+  DTC.TransporterConfig ->
+  Id DM.Merchant ->
+  Id DMOC.MerchantOperatingCity ->
+  Maybe [LYT.TagNameValueExpiry] ->
+  Int ->
+  Flow ([API.DriverIncentiveCoinConfigItem], Text, Bool)
+buildIncentiveConfigWithStableGeneration mocId vehCategory transporterConfig merchantId merchantOpCityId driverTag attemptsLeft = do
+  genBefore <- CQCoinsConfig.getDriverIncentiveConfigGeneration mocId vehCategory
+  items <- buildConfigItems transporterConfig merchantId merchantOpCityId vehCategory driverTag
+  genAfter <- CQCoinsConfig.getDriverIncentiveConfigGeneration mocId vehCategory
+  let contentHash = computeDriverIncentiveConfigETag items
+      eTag = CQCoinsConfig.mkDriverIncentiveConfigETag genAfter contentHash
+  if genBefore == genAfter
+    then pure (items, eTag, True)
+    else
+      if attemptsLeft > 1
+        then buildIncentiveConfigWithStableGeneration mocId vehCategory transporterConfig merchantId merchantOpCityId driverTag (attemptsLeft - 1)
+        else -- Generation kept moving; return fresh body but do not cache a possibly mismatched ETag.
+          pure (items, eTag, False)
+
+getCoinsIncentiveRideCount ::
+  ( Maybe (Id SP.Person),
+    Id DM.Merchant,
+    Id DMOC.MerchantOperatingCity
+  ) ->
+  Flow API.DriverIncentiveRideCountRes
+getCoinsIncentiveRideCount (mbPersonId, merchantId, merchantOpCityId) = do
+  (transporterConfig, driverId, vehCategory, driver) <- loadDriverContext mbPersonId merchantId merchantOpCityId
+  -- Same selection as incentiveConfig (tagged cohort OR RidesCompleted fallback).
+  selectedConfigs <- selectIncentiveConfigs transporterConfig merchantId merchantOpCityId vehCategory driver.driverTag
+  -- Day key exists for any driver who completed a valid ride; missing Redis → 0.
+  dayValidRideCount <- fromMaybe 0 <$> Coins.getValidRideCountByDriverIdKey driverId
+  localTime <- getLocalCurrentTime transporterConfig.timeDiffFromUtc
+  let metricWindow =
+        case listToMaybe selectedConfigs of
+          Nothing -> IncentiveMetrics.unBoundedWindowKey
+          Just SelectedIncentiveConfig {selected} ->
+            case selected.timeBounds of
+              Just tb | tb /= TB.Unbounded -> IncentiveMetrics.mkIncentiveWindowKey localTime tb
+              _ -> IncentiveMetrics.unBoundedWindowKey
+  timeBoundValidRideCount <-
+    case listToMaybe selectedConfigs of
+      Nothing -> pure Nothing
+      Just SelectedIncentiveConfig {selected} ->
+        case selected.timeBounds of
+          Just tb | tb /= TB.Unbounded ->
+            case IncentiveMetrics.mkIncentiveWindowKey localTime tb of
+              windowKey@(IncentiveMetrics.TimeBoundWindow _) ->
+                Just . fromMaybe 0 <$> Coins.getValidRideCountByDriverIdWindowKey driverId windowKey
+              IncentiveMetrics.DayWindow -> pure Nothing
+          _ -> pure Nothing
+  metrics <- IncentiveMetrics.getIncentiveMetricsData driverId metricWindow
+  -- Per-config progress for self-scoped milestones (variant / special location):
+  -- each reads its own scoped counter rather than the global day count.
+  -- EndRide increments the DynamicOffer- or OTP-based key by the ride's own trip
+  -- category (config-agnostic), and the award query (fetchFunctionsOnEventbasis)
+  -- matches tripCategoryType = Just <ride category>, so a category-pinned config
+  -- only ever awards on — and must be read from — that same category's counter.
+  -- Read that exact key. A NULL-category config is never awarded at EndRide, so
+  -- for the (in practice unreachable) unpinned case fall back to the larger pool.
+  scopedRideCounts <-
+    fmap catMaybes $
+      forM selectedConfigs $ \SelectedIncentiveConfig {selected} ->
+        case scopedSuffixForFunction selected.eventFunction of
+          Nothing -> pure Nothing
+          Just suffix -> do
+            cnt <- case selected.tripCategoryType of
+              Just tripCat -> fromMaybe 0 <$> Coins.getScopedValidRideCount tripCat driverId suffix
+              Nothing -> do
+                dynamicOfferCnt <- fromMaybe 0 <$> Coins.getScopedValidRideCount DCT.DynamicOfferTrip driverId suffix
+                otpCnt <- fromMaybe 0 <$> Coins.getScopedValidRideCount DCT.OTPRideTrip driverId suffix
+                pure (max dynamicOfferCnt otpCnt)
+            pure $ Just API.DriverIncentiveScopedRideCount {id = selected.id, rideCount = cnt}
+  pure $
+    API.DriverIncentiveRideCountRes
+      { dayValidRideCount = dayValidRideCount,
+        timeBoundValidRideCount = timeBoundValidRideCount,
+        progressValidRideCount = fromMaybe dayValidRideCount timeBoundValidRideCount,
+        scopedRideCounts = scopedRideCounts,
+        ridesCompleted = metrics.ridesCompleted,
+        totalEarnings = metrics.totalEarnings,
+        totalTripDistanceMeters = metrics.totalTripDistanceMeters,
+        totalRideTimeSeconds = metrics.totalRideTimeSeconds
+      }
+
+loadDriverContext ::
+  Maybe (Id SP.Person) ->
+  Id DM.Merchant ->
+  Id DMOC.MerchantOperatingCity ->
+  Flow (DTC.TransporterConfig, Id SP.Person, DTV.VehicleCategory, SP.Person)
+loadDriverContext mbPersonId merchantId merchantOpCityId = do
+  driverId <- mbPersonId & fromMaybeM (PersonNotFound "No person id passed")
+  transporterConfig <-
+    getOneConfig
+      (TransporterConfigDimensions {merchantOperatingCityId = merchantOpCityId.getId})
+      Nothing
+      >>= fromMaybeM (TransporterConfigNotFound merchantOpCityId.getId)
+  unless transporterConfig.coinFeature $
+    throwError $ CoinServiceUnavailable merchantId.getId
+  driver <- B.runInReplica $ Person.findById driverId >>= fromMaybeM (PersonNotFound driverId.getId)
+  vehCategory <-
+    QVeh.findById driverId
+      >>= fromMaybeM (DriverWithoutVehicle driverId.getId)
+      <&> (\vehicle -> VecVariant.castVehicleVariantToVehicleCategory vehicle.variant)
+  pure (transporterConfig, driverId, vehCategory, driver)
+
+buildConfigItems ::
+  DTC.TransporterConfig ->
+  Id DM.Merchant ->
+  Id DMOC.MerchantOperatingCity ->
+  DTV.VehicleCategory ->
+  Maybe [LYT.TagNameValueExpiry] ->
+  Flow [API.DriverIncentiveCoinConfigItem]
+buildConfigItems transporterConfig merchantId merchantOpCityId vehCategory driverTag = do
+  selectedConfigs <- selectIncentiveConfigs transporterConfig merchantId merchantOpCityId vehCategory driverTag
+  pure $ map (\SelectedIncentiveConfig {..} -> toConfigItem selected ridesThreshold) selectedConfigs
+
+selectIncentiveConfigs ::
+  DTC.TransporterConfig ->
+  Id DM.Merchant ->
+  Id DMOC.MerchantOperatingCity ->
+  DTV.VehicleCategory ->
+  Maybe [LYT.TagNameValueExpiry] ->
+  Flow [SelectedIncentiveConfig]
+selectIncentiveConfigs transporterConfig merchantId merchantOpCityId vehCategory driverTag = do
+  activeConfigs <- fetchActiveCoinConfigs merchantId merchantOpCityId vehCategory
+  localTime <- getLocalCurrentTime transporterConfig.timeDiffFromUtc
+  let taggedEventFunctions = parseAllIncentiveRidesCompletedThresholds driverTag
+  if not (null taggedEventFunctions)
+    then
+      pure $
+        mapMaybe
+          ( \(eventFunction, ridesThreshold) ->
+              SelectedIncentiveConfig
+                <$> preferConfigForEventFunction localTime activeConfigs eventFunction
+                <*> pure ridesThreshold
+          )
+          taggedEventFunctions
+    else
+      let ridesCompletedConfigs =
+            filter
+              ( \cc ->
+                  cc.active
+                    && cc.eventName == "EndRide"
+                    && isRidesCompletedFunction cc.eventFunction
+              )
+              activeConfigs
+          eventFunctions = nub $ map (.eventFunction) ridesCompletedConfigs
+       in pure $
+            mapMaybe
+              ( \eventFunction -> do
+                  selected <- preferConfigForEventFunction localTime activeConfigs eventFunction
+                  ridesThreshold <- ridesThresholdFromEventFunction eventFunction
+                  pure $ SelectedIncentiveConfig selected ridesThreshold
+              )
+              eventFunctions
+
+fetchActiveCoinConfigs ::
+  Id DM.Merchant ->
+  Id DMOC.MerchantOperatingCity ->
+  DTV.VehicleCategory ->
+  Flow [CoinsConfig.CoinsConfig]
+fetchActiveCoinConfigs merchantId merchantOpCityId vehCategory =
+  getConfig
+    ( CoinsConfigDimensions
+        { merchantOptCityId = merchantOpCityId.getId,
+          merchantId = Just merchantId.getId,
+          active = Just True,
+          vehicleCategory = Just vehCategory,
+          eventFunction = Nothing,
+          serviceTierType = Nothing,
+          eventName = Nothing,
+          tripCategoryType = Nothing,
+          configId = Nothing
+        }
+    )
+    (Just (SQCC.getActiveCoinConfigs merchantId merchantOpCityId vehCategory))
+
+-- | Prefer an in-window timebound row; else any bounded row for that eventFunction;
+-- else unbounded / null. Nothing if no matching EndRide config.
+preferConfigForEventFunction ::
+  UTCTime ->
+  [CoinsConfig.CoinsConfig] ->
+  DCT.DriverCoinsFunctionType ->
+  Maybe CoinsConfig.CoinsConfig
+preferConfigForEventFunction localTime activeConfigs eventFunction =
+  let matchingConfigs =
+        filter
+          ( \cc ->
+              cc.active
+                && cc.eventName == "EndRide"
+                && cc.eventFunction == eventFunction
+          )
+          activeConfigs
+      timeBoundCandidates =
+        [ CoinConfigWithTimeBounds cc tb
+          | cc <- matchingConfigs,
+            Just tb <- [cc.timeBounds],
+            tb /= TB.Unbounded
+        ]
+      matchedTimeBound = TB.findBoundedDomain timeBoundCandidates localTime
+      selectedConfigs =
+        case matchedTimeBound of
+          matched@(_ : _) -> (.coinsConfig) <$> matched
+          [] ->
+            case timeBoundCandidates of
+              candidate : _ -> [candidate.coinsConfig]
+              [] -> filter (\cc -> fromMaybe TB.Unbounded cc.timeBounds == TB.Unbounded) matchingConfigs
+   in listToMaybe selectedConfigs
+
+toConfigItem :: CoinsConfig.CoinsConfig -> Int -> API.DriverIncentiveCoinConfigItem
+toConfigItem selected ridesThreshold =
+  API.DriverIncentiveCoinConfigItem
+    { id = selected.id,
+      eventFunction = selected.eventFunction,
+      eventName = selected.eventName,
+      coins = selected.coins,
+      expirationAt = selected.expirationAt,
+      active = selected.active,
+      vehicleCategory = selected.vehicleCategory,
+      tripCategoryType = selected.tripCategoryType,
+      serviceTierType = selected.serviceTierType,
+      timeBounds = selected.timeBounds,
+      ridesThreshold = ridesThreshold
+    }
+
+computeDriverIncentiveConfigETag :: [API.DriverIncentiveCoinConfigItem] -> Text
+computeDriverIncentiveConfigETag items =
+  T.pack (show (Hash.hashWith Hash.SHA256 (BS.toStrict (encode items))))
+
+isRidesCompletedFunction :: DCT.DriverCoinsFunctionType -> Bool
+isRidesCompletedFunction = \case
+  DCT.RidesCompleted _ -> True
+  DCT.RidesCompletedOnServiceTier _ _ -> True
+  DCT.RidesCompletedInSpecialLocation {} -> True
+  _ -> False
+
+ridesThresholdFromEventFunction :: DCT.DriverCoinsFunctionType -> Maybe Int
+ridesThresholdFromEventFunction = \case
+  DCT.DriverIncentiveCohortRidesCompleted n -> Just n
+  DCT.DriverIncentiveCohortRidesCompletedSlot _ n -> Just n
+  DCT.RidesCompleted n -> Just n
+  DCT.RidesCompletedOnServiceTier _ n -> Just n
+  DCT.RidesCompletedInSpecialLocation _ n -> Just n
+  _ -> Nothing
+
+-- | The scoped valid-ride counter suffix a self-scoped milestone counts against
+-- (mirrors 'Coins.matchesRideScoping'); Nothing for unscoped / cohort functions.
+scopedSuffixForFunction :: DCT.DriverCoinsFunctionType -> Maybe Text
+scopedSuffixForFunction = \case
+  DCT.RidesCompletedOnServiceTier tier _ -> Just (":ServiceTier:" <> T.pack (show tier))
+  DCT.RidesCompletedInSpecialLocation (SL.Pickup slId _) _ -> Just (":PickupSL:" <> slId.getId)
+  DCT.RidesCompletedInSpecialLocation (SL.Drop slId) _ -> Just (":DropSL:" <> slId.getId)
+  DCT.RidesCompletedInSpecialLocation (SL.PickupDrop pickupSlId dropSlId _) _ -> Just (":PickupSL:" <> pickupSlId.getId <> ":DropSL:" <> dropSlId.getId)
+  DCT.RidesCompletedInSpecialLocation SL.Default _ -> Nothing
+  _ -> Nothing
+
+-- | All DriverIncentiveCohortRidesCompleted / Slot segments after Incentive# (split on "&").
+parseAllIncentiveRidesCompletedThresholds :: Maybe [LYT.TagNameValueExpiry] -> [(DCT.DriverCoinsFunctionType, Int)]
+parseAllIncentiveRidesCompletedThresholds =
+  mapMaybe asRidesCompleted . concatMap parseIncentiveSegments . fromMaybe []
+  where
+    parseIncentiveSegments (LYT.TagNameValueExpiry rawTagText) =
+      case T.splitOn "#" rawTagText of
+        ("Incentive" : tagValueText : _) ->
+          mapMaybe (readMaybe . T.unpack) $
+            filter (not . T.null) $
+              map T.strip (T.splitOn "&" tagValueText)
+        _ -> []
+    asRidesCompleted = \case
+      DCT.DriverIncentiveCohortRidesCompleted n -> Just (DCT.DriverIncentiveCohortRidesCompleted n, n)
+      ef@(DCT.DriverIncentiveCohortRidesCompletedSlot _ n) -> Just (ef, n)
+      _ -> Nothing

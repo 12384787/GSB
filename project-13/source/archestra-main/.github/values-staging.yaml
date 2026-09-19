@@ -1,0 +1,318 @@
+archestra:
+  replicaCount: 4
+
+  # Requires Cloud SQL max_connections=600 before deploying this budget.
+  # Four web replicas can reach 10 pods during a rollout (50% surge plus
+  # terminating pods); three workers can reach 7 (25% surge plus terminating).
+  # 550 / 17 leaves 20 query connections plus 10 cache and 2 listeners per
+  # pod: 544 total, with 56 slots left for reserved connections and other users.
+  database:
+    connectionBudget: 550
+
+  # Staging's measured CPU use is below the chart's production-sized requests.
+  # Keep scheduling room for rolling-update surge pods; no CPU limit prevents
+  # these smaller requests from restricting bursts into spare node capacity.
+  resources:
+    requests:
+      cpu: "500m"
+    # The chart's default 3Gi limit is too tight for this container, which runs
+    # two Node processes under supervisord (backend + the Next.js server). A
+    # freshly-booted web pod already sits at ~2.0Gi of the 3Gi limit (backend
+    # ~1.15Gi RSS, next-server ~0.14Gi, plus slab and page cache), so ordinary
+    # traffic walked it into the limit and the kernel OOM-killed the container
+    # every few minutes. Raising the limit restores real headroom; requests are
+    # unchanged, so scheduling and the node-pool budget are unaffected.
+    #
+    # This also fixes the ordering that made the crash undiagnosable. The Node
+    # launcher derives the V8 old-space ceiling as 60% of the container limit,
+    # so this moves it from 1843 MiB to ~2457 MiB while the container gains a
+    # full extra gigabyte. Projected peak (heap + native/external + the Next.js
+    # server + slab) now lands under 4Gi, so V8 reaches its own heap ceiling
+    # before the cgroup does: the process exits with a JS heap OOM and a
+    # fatal-error report instead of being SIGKILLed with no stack. Note the
+    # ceiling is deliberately left to that formula rather than pinned via
+    # ARCHESTRA_NODE_MAX_OLD_SPACE_SIZE_MIB, because that env var would also
+    # apply to the worker, whose limit is 2Gi.
+    limits:
+      memory: "4Gi"
+
+  worker:
+    replicaCount: 3
+    # Same reasoning as archestra.resources above; workers idle even lower.
+    resources:
+      requests:
+        cpu: "250m"
+
+  # The Apps Hackathon video renderer runs as its own single-replica Deployment
+  # (render jobs live in one process's memory) so the 4-replica web tier's polls
+  # and downloads always reach the pod that holds the job. The web tier is
+  # pointed at it via ARCHESTRA_APP_RECORDING_RENDERER_URL below.
+  renderer:
+    enabled: true
+
+  codeRuntime:
+    enabled: true
+
+  # Pod Disruption Budget: ensure at least 3 of 4 pods stay running during
+  # voluntary disruptions (node upgrades, autoscaling, maintenance)
+  podDisruptionBudget:
+    enabled: true
+    maxUnavailable: 1
+    # Unready pods must not strand a draining node when the healthy-pod budget
+    # is exhausted. Healthy pods still require the budget above.
+    unhealthyPodEvictionPolicy: AlwaysAllow
+
+  # Faster rolling updates: allow 2 pods to be created at once
+  deploymentStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: "50%"
+
+  # Vertex AI Gemini configuration
+  # Uses Application Default Credentials (ADC) via GKE Workload Identity
+  # instead of API keys for authentication
+  env:
+    ARCHESTRA_ANALYTICS: disabled
+    ARCHESTRA_BETA: "true"
+    # Enable OpenAPPA policy editing and GitHub sync on staging.
+    # Enforcement requires the deployment-wide switch on /openappa (off by default).
+    ARCHESTRA_OPENAPPA_ENABLED: "true"
+    # HMAC secret for signed offer routing. Set via the staging secret overlay
+    # (ARCHESTRA_OPENAPPA_OFFER_SIGNING_SECRET); replicas must share it.
+    # Keep agent feedback reporting enabled via the shared OpenAPPA receiver.
+    ARCHESTRA_OPENAPPA_YELL_ENABLED: "true"
+    ARCHESTRA_LLM_PROXY_PLUGINS: ""
+    # BETA: MCP registry attention, ownership and dismissal workflows.
+    # Explicit so staging keeps it if the beta master switch is disabled.
+    ARCHESTRA_MCP_SERVER_ALERTING_ENABLED: "true"
+    ARCHESTRA_DYNAMIC_TOOL_ACCESS_ENABLED: "true"
+    ARCHESTRA_MCP_SKILLS_ENABLED: "true"
+    # Agent Runtime is intentionally independent of ARCHESTRA_BETA.
+    # Enable it only on staging while the capability is being rolled out.
+    ARCHESTRA_AGENT_RUNTIME_ENABLED: "true"
+    ARCHESTRA_AGENT_RUNTIME_WARM_POOL_SIZE: "1"
+    ARCHESTRA_AGENT_RUNTIME_WARM_POOL_MAX_POOLS: "4"
+    # Agent Sandbox workspaces run in separate pods, so the API's ordinary loopback URL
+    # cannot reach the platform from a run pod. Use the in-cluster Service that
+    # the Agent Runtime NetworkPolicy already permits on port 9000.
+    ARCHESTRA_AGENT_RUNTIME_PLATFORM_BASE_URL: "http://archestra-platform.archestra.svc.cluster.local:9000"
+    # Nested development stacks require privilege and a dedicated node pool.
+    # Runtime state, home directories, and Docker data share one durable PVC.
+    ARCHESTRA_AGENT_RUNTIME_ALLOW_PRIVILEGED: "true"
+    ARCHESTRA_AGENT_RUNTIME_NODE_SELECTOR: "archestra-agent-runtime=true"
+    ARCHESTRA_AGENT_RUNTIME_WORKSPACE_STORAGE_SIZE: "60Gi"
+    ARCHESTRA_AGENT_RUNTIME_WORKSPACE_STORAGE_CLASS: "standard-rwo"
+    # Scale-from-zero on the Agent Runtime pool plus a cold multi-GB image pull can
+    # take 6+ minutes before the container starts.
+    ARCHESTRA_AGENT_RUNTIME_POD_START_TIMEOUT_SECONDS: "900"
+    # BETA: auto-sync-permissions connectors (off by default everywhere else).
+    # Explicit so staging keeps the feature even if ARCHESTRA_BETA is ever
+    # flipped off.
+    ARCHESTRA_KNOWLEDGE_BASE_AUTO_SYNC_PERMISSIONS_ENABLED: "true"
+    # BETA: the M-Files connector (off by default everywhere else). Explicit
+    # for the same reason as the auto-sync flag above.
+    ARCHESTRA_KNOWLEDGE_BASE_MFILES_CONNECTOR_ENABLED: "true"
+    # Serve the VAF Add On from main's CI build (proxied with the GitHub
+    # token the deploy workflow injects): no release carries the package yet.
+    # Remove both once the first release ships with the .mfappx asset.
+    ARCHESTRA_KNOWLEDGE_BASE_MFILES_VAF_ADD_ON_SOURCE_REF: "main"
+    # BETA: MCP idle hibernation (off by default everywhere else). Explicit so
+    # staging keeps the feature even if ARCHESTRA_BETA is ever flipped off.
+    ARCHESTRA_ORCHESTRATOR_MCP_IDLE_HIBERNATION_ENABLED: "true"
+    ARCHESTRA_ENTERPRISE_LICENSE_ACTIVATED: "true"
+    ARCHESTRA_ENTERPRISE_LICENSE_FULL_WHITE_LABELING: "true"
+    ARCHESTRA_ENTERPRISE_LICENSE_KNOWLEDGE_BASE_ACTIVATED: "true"
+    # Retention stays OFF here on purpose. This deployment is where the
+    # platform gets stress-tested, and a large `interactions` table is the
+    # point — the volume is the test data, not a problem to sweep up. Storage
+    # autoresizes, so it grows with the table.
+    # Apps Hackathon session recording. The documented flag deliberately cannot
+    # open this on a licensed deployment (see parseHackathonRecorderEnabled),
+    # and staging activates the enterprise license above — so it takes the
+    # separate override, which exists for exactly this deployment and is
+    # deliberately absent from .env.example and the deployment docs.
+    ARCHESTRA_HACKATHON_RECORDER_ENTERPRISE_OVERRIDE: "true"
+    # Apps Hackathon gallery share (test phase): the recorder's "Submit to
+    # Archestra for review" flow files PRs against this repository via GitHub
+    # device flow. The client id is a public identifier by design (device flow
+    # is secretless), so neither value is a secret. Swap both for the real
+    # org OAuth app + gallery repository when it exists.
+    ARCHESTRA_HACKATHON_GALLERY_GITHUB_CLIENT_ID: "Ov23liqkaqAROe7B7ZZ4"
+    ARCHESTRA_HACKATHON_GALLERY_GITHUB_REPO: "archestra-ai/apps-gallery"
+    # Offload video rendering to the dedicated single-replica renderer Service
+    # (see renderer.enabled above), so a render's status polls and download land
+    # on the one pod that holds its in-memory job instead of scattering across
+    # the 4 web replicas.
+    ARCHESTRA_APP_RECORDING_RENDERER_URL: "http://archestra-platform-renderer:9000"
+    ARCHESTRA_API_BASE_URL: "https://frontend.archestra.dev,https://backend.archestra.dev"
+    # Dedicated origin for MCP App sandboxes so browser device permissions
+    # (camera/mic/geolocation/clipboard) can be delegated to app iframes. Each
+    # app renders at <hash>.sandbox.archestra.dev (a real cross-origin); without
+    # this, sandboxes fall back to the frontend's opaque origin and browsers
+    # block those features. Wildcard DNS + the cert-manager-issued wildcard TLS
+    # secret come from archestra-ai/infra (gke/dns.tf, gke-apps/cert-manager);
+    # the ingress rule + tls entry below route the sandbox hosts to the frontend.
+    ARCHESTRA_MCP_SANDBOX_DOMAIN: "sandbox.archestra.dev"
+    ARCHESTRA_GEMINI_VERTEX_AI_ENABLED: "true"
+    ARCHESTRA_GEMINI_VERTEX_AI_PROJECT: "friendly-path-465518-r6"
+    ARCHESTRA_GEMINI_VERTEX_AI_LOCATION: "us-central1"
+    # Staging has no data-residency requirement, so it takes the global endpoint
+    # for the Gemini 3+ generations us-central1 does not serve.
+    ARCHESTRA_GEMINI_VERTEX_AI_ALLOW_GLOBAL_ENDPOINT: "true"
+    ARCHESTRA_BEDROCK_BASE_URL: "https://bedrock-runtime.eu-north-1.amazonaws.com"
+    ARCHESTRA_BEDROCK_INFERENCE_PROFILE_PREFIX: "eu"
+    ARCHESTRA_AUTH_COOKIE_DOMAIN: ".archestra.dev"
+    # SSO-only sign-in. Google is the configured identity provider.
+    # Closes the password endpoints (not just the form) and revokes the
+    # sessions of anyone with no federated account, so everyone re-enters
+    # through Google. Also blocks turning on the require-two-factor org policy,
+    # since enrolment needs a password — 2FA comes from Workspace instead.
+    ARCHESTRA_AUTH_DISABLE_BASIC_AUTH: "true"
+    # No new users by invitation: 403s /organization/invite-member and hides the
+    # invite UI on Settings -> Users.
+    # Scope, so this is not read as "no new users at all":
+    #   - It gates *issuing* an invitation, not *redeeming* one. Anything still
+    #     outstanding stays acceptable, and cancel-invitation is 403'd as well,
+    #     so it can no longer be revoked through the API while this is on.
+    #     Checked before enabling: staging has one live auto-provisioned invite
+    #     (ms-teams, expires 2026-08-30); every other row is accepted or expired.
+    #   - ChatOps auto-provisioning is unaffected. It inserts the user, member
+    #     and invitation rows directly instead of calling invite-member, so a
+    #     first-time Slack/Teams sender still lands in the org.
+    ARCHESTRA_AUTH_DISABLE_INVITATIONS: "true"
+    ARCHESTRA_FRONTEND_URL: "https://frontend.archestra.dev"
+    # Trust only the Google Front End ranges that terminate the ingress, so
+    # request.ip is the real caller instead of the load balancer. Per-IP rate
+    # limits and audit sourceIp then stop collapsing onto one shared address.
+    # These two CIDRs are the documented GCLB/health-check ranges, and are the
+    # socket peers this deployment actually sees. NOT "true": that would trust a
+    # client-supplied X-Forwarded-For and let any caller choose its own IP.
+    ARCHESTRA_TRUST_PROXY: "35.191.0.0/16,130.211.0.0/22"
+    ARCHESTRA_SENTRY_ENVIRONMENT: "archestra.dev"
+    ARCHESTRA_AGENTS_INCOMING_EMAIL_PROVIDER: "outlook"
+    ARCHESTRA_AGENTS_INCOMING_EMAIL_OUTLOOK_MAILBOX_ADDRESS: "agents@archestraai.onmicrosoft.com"
+    ARCHESTRA_AGENTS_INCOMING_EMAIL_OUTLOOK_WEBHOOK_URL: "https://backend.archestra.dev/api/webhooks/incoming-email"
+    # Locked chats. Configuring the escrow public key is what ENABLES the
+    # feature (it is off everywhere it is unset), because a locked chat's
+    # audit trail — LLM interactions, MCP tool calls, chat
+    # errors — is stored encrypted under a key that exists only in the
+    # browser that created the chat. Without an escrowed copy those rows
+    # would be recoverable by nobody, which is worse for an auditable
+    # deployment than not offering the feature.
+    #
+    # This is the PUBLIC half of an RSA-4096 keypair, so it is not a secret
+    # and does not belong in a repo secret — publishing it is how escrow is
+    # meant to work. The PRIVATE half is deliberately NOT in this repo or in
+    # the cluster: it lives offline with the security team and is used only
+    # in the documented break-glass procedure.
+    ARCHESTRA_LOCKED_CHAT_ESCROW_PUBLIC_KEY: "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUlJQ0lqQU5CZ2txaGtpRzl3MEJBUUVGQUFPQ0FnOEFNSUlDQ2dLQ0FnRUFvakRQWU5RbjNSYktoamJ5MUVzTgpvYXYwNGUyQnpoOTFWaEs0TlErNDFEcGVwcjg0dGx6R3ZjandYVC9OQ0txODJvem9kUGwyZE5NeWFxdDE0UG5FCnQ0NUsvRXdrTXE0VlFEUWtlTUJJTFh6c1ZlY0YzQmZ3Rko1eGNLdGFCNXRsNXRRRWVPakhPU2xiamN0czVyaDkKN2wzcE5DdURoUXRkajNmSE80NTN2UXN4eDEyK0drZlpQVVNWeFpiNEhhYkdhazMxWTl3UG1pZVV5ajVzSkkwTwp6VzFrVHFiMkFocEVSQnIxUkNFeUgrSzlvdmRCZlZiYUdGTFZIdmtiSkdSbVNzYk85SVZsQUpNUHE5ZnJXam1VCm5oR2h0UVFzeTQ2TG92ZXFSaTMxM2RaeDUweXEvVGd2TFJLSVFDZEtKYmkvVEoyRmtVMk9VSXdpYWFTQjdyNTAKa0YvZDhGUTNsUVdKWlA4YXU1UWQzQjV1bzl1M3NTMWk1WTZOeHRBYWN0TjBEV2k2L3ZjbEtlRjg5YTFtbkZ3TApBTkZteENsbkVxL3UydmpwbWhOQS9JMnVFVXFvQmZ5NkUxVFFyNSsySUhnZGVXT2tPTFJnYXc5QWE3Z3g1SzlqCkdjaHhXUDkzMDhvN01SS1JsdjlPaTl2UUZsMVB3YUZPbEIyUzIvb2RCcTNhNDFzMkhNUU1ZalJZMC9wR0NuWjUKM2xuN1BzZm9qOEZMd1NoZkRHNVhmNTNnREo0UXB4a3N0amdrekx5ZkxHaThUVGdwSjVmeDJWdVZQajdtTk5JMwpoNWxYZnh4N09Gd1daZEJUVFBnZ3h6LzN1MUs5TTNoUnlObUxrOXZEUVhRS2k2TWdMNVF1THRvQTdVL01GSzBXClY2ZVIyTG4zMFhMVDduaDNlcnRNYnNFQ0F3RUFBUT09Ci0tLS0tRU5EIFBVQkxJQyBLRVktLS0tLQo="
+    ARCHESTRA_CHAT_DEFAULT_PROVIDER: "anthropic"
+    ARCHESTRA_CHAT_DEFAULT_MODEL: "claude-opus-4-5-20251101"
+
+  diagnostics:
+    enabled: true
+    storageClassName: "archestra-diagnostics-rwx"
+    accessModes:
+      - ReadWriteMany
+    # Deliberately off (matching the chart default). Writing a heap snapshot as
+    # V8 approaches its limit needs extra memory and stalls the event loop at
+    # exactly the moment memory is tightest, so the container hit its cgroup
+    # limit mid-write: the volume accumulated 783 snapshots and every one was
+    # 0 bytes, i.e. the process was killed before a single byte landed. It also
+    # converted a diagnosable JS heap OOM into an opaque SIGKILL and made the
+    # readiness/liveness probes fail during the stall. Turn this back on only
+    # for a targeted investigation, with headroom to actually write the file.
+    heapSnapshotsNearHeapLimit: 0
+
+  # Orchestrator configuration with Workload Identity for Vertex AI
+  orchestrator:
+    kubernetes:
+      networkPolicy:
+        # Enable SSRF protection for MCP server pods
+        create: true
+
+      rbac:
+        # Namespaces backing deployment environments the platform may deploy
+        # MCP servers into. Each entry gets a namespace-scoped Role + RoleBinding
+        # and is surfaced to the app as ARCHESTRA_ORCHESTRATOR_ENVIRONMENT_NAMESPACES.
+        environmentNamespaces:
+          - env-test
+
+      serviceAccount:
+        # GKE Workload Identity binding to allow Vertex AI access via ADC
+        # The GCP service account (archestra-vertex-ai@friendly-path-465518-r6.iam.gserviceaccount.com)
+        # is created and bound in the archestra-ai/infra repo (gke/main.tf)
+        annotations:
+          iam.gke.io/gcp-service-account: archestra-vertex-ai@friendly-path-465518-r6.iam.gserviceaccount.com
+
+      # Additional RBAC for MCP K8s operator service account
+      # Grants cluster-wide read access and namespace-specific permissions for the Kubernetes MCP server
+      # The ClusterRole and Roles are created in archestra-ai/infra repo (gke/archestra-rbac.tf)
+      mcpServerRbac:
+        additionalClusterRoleBindings:
+          - clusterRoleName: archestra-cluster-reader
+        additionalRoleBindings:
+          # Read-only access to archestra namespace
+          - roleName: archestra-namespace-reader
+            namespace: archestra
+
+  service:
+    annotations:
+      # GKE BackendConfig for custom health checks
+      # Maps backend port (9000) and frontend port (3000) to their respective BackendConfigs
+      # These BackendConfigs are defined in archestra-ai/infra repo (gke/ingress.tf)
+      cloud.google.com/backend-config: '{"ports": {"9000":"archestra-platform-backend-config", "3000":"archestra-platform-frontend-config"}}'
+      cloud.google.com/neg: '{"ingress": true}'
+
+  ingress:
+    enabled: true
+    annotations:
+      # GKE Ingress Controller configuration
+      kubernetes.io/ingress.class: "gce"
+      kubernetes.io/ingress.global-static-ip-name: "archestra-staging-ip"
+      ingress.gcp.cloud.google.com/load-balancer-type: "External"
+      networking.gke.io/managed-certificates: "archestra-platform-staging-ssl"
+      ingress.gcp.cloud.google.com/ssl-redirect: "true"
+
+    hosts:
+      # The chart adds /v1 and /v2 -> 9000 for any host that serves the UI, so
+      # LLM proxy traffic skips the frontend process. Nothing to declare here.
+      - host: frontend.archestra.dev
+        paths:
+          - path: /
+            port: 3000
+            pathType: Prefix
+      - host: backend.archestra.dev
+        paths:
+          - path: /
+            port: 9000
+            pathType: Prefix
+      # MCP App sandbox origins (<hash>.sandbox.archestra.dev) go straight to
+      # the backend, which serves /_sandbox/* itself and validates the Host
+      # header (routing via the frontend rewrites the Host header -> 403).
+      - host: "*.sandbox.archestra.dev"
+        paths:
+          - path: /
+            port: 9000
+            pathType: Prefix
+
+    # Wildcard cert for the sandbox hosts, issued and renewed by cert-manager
+    # (archestra-ai/infra, gke-apps/cert-manager). GKE combines spec.tls
+    # secrets with the ManagedCertificate annotation above. The secret must
+    # exist before this deploys, or ingress-gce fails to sync the Ingress.
+    tls:
+      - hosts:
+          - "*.sandbox.archestra.dev"
+        secretName: archestra-sandbox-wildcard-tls
+
+postgresql:
+  # Staging's database is Cloud SQL for PostgreSQL 18 (private IP, no public
+  # endpoint), not the bundled chart, so the database's durability no longer
+  # depends on the GKE node lifecycle — replacing a node used to take the only
+  # database pod down with it, which is what kept staging dying at random.
+  #
+  # The connection string is injected by the deploy workflow from the
+  # ARCHESTRA_STAGING_DATABASE_URL repo secret, so it is not in this file.
+  # The chart hard-fails if external_database_url is set while this is true.
+  enabled: false

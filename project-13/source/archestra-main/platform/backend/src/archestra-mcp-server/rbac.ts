@@ -1,0 +1,389 @@
+import type { ArchestraToolShortName, Permission } from "@archestra/shared";
+import { userHasPermission } from "@/auth/utils";
+import logger from "@/logging";
+import { UserModel } from "@/models";
+import { archestraMcpBranding } from "./branding";
+import { errorResult } from "./helpers";
+import type { ArchestraContext } from "./types";
+
+// === Exports ===
+
+/**
+ * Permission required to use each Archestra MCP tool.
+ * `null` means the tool is available to all authenticated users (no additional RBAC check).
+ * Typed as `Record<ArchestraToolShortName, ...>` so adding a new tool without
+ * updating this map causes a compile error.
+ */
+export const TOOL_PERMISSIONS: Record<
+  ArchestraToolShortName,
+  Permission | null
+> = {
+  // Identity — available to all
+  whoami: null,
+  execute_remedy_plan: null,
+  yell: null,
+  get_remedy_plans: null,
+  get_guardrails_policy: { resource: "toolPolicy", action: "read" },
+  validate_guardrails_policy: { resource: "toolPolicy", action: "update" },
+  update_guardrails_policy: { resource: "toolPolicy", action: "update" },
+
+  // Agents
+  create_agent: { resource: "agent", action: "create" },
+  get_agent: { resource: "agent", action: "read" },
+  list_agents: { resource: "agent", action: "read" },
+  edit_agent: { resource: "agent", action: "update" },
+
+  // Agent lifecycle hooks — mirror the REST hook routes' permissions
+  list_hooks: { resource: "agent", action: "read" },
+  create_hook: { resource: "agent", action: "update" },
+  update_hook: { resource: "agent", action: "update" },
+  delete_hook: { resource: "agent", action: "update" },
+
+  // MCP Gateways
+  create_mcp_gateway: { resource: "mcpGateway", action: "create" },
+  get_mcp_gateway: { resource: "mcpGateway", action: "read" },
+  edit_mcp_gateway: { resource: "mcpGateway", action: "update" },
+
+  // MCP Servers
+  search_private_mcp_registry: { resource: "mcpRegistry", action: "read" },
+  get_mcp_servers: { resource: "mcpRegistry", action: "read" },
+  get_mcp_server_tools: { resource: "mcpRegistry", action: "read" },
+  edit_mcp_description: { resource: "mcpRegistry", action: "update" },
+  edit_mcp_config: { resource: "mcpRegistry", action: "update" },
+  create_mcp_server: { resource: "mcpRegistry", action: "create" },
+  deploy_mcp_server: { resource: "mcpRegistry", action: "update" },
+  list_mcp_server_deployments: { resource: "mcpRegistry", action: "read" },
+  get_mcp_server_logs: { resource: "mcpRegistry", action: "read" },
+  reload_mcp_server_tools: { resource: "mcpRegistry", action: "update" },
+
+  // Teams
+  create_team: { resource: "team", action: "create" },
+  get_team: { resource: "team", action: "read" },
+  list_teams: { resource: "team", action: "read" },
+  edit_team: { resource: "team", action: "update" },
+  delete_team: { resource: "team", action: "delete" },
+  list_team_members: { resource: "team", action: "read" },
+  // Membership mutations use team:read as the coarse gate and then enforce a
+  // finer check in the handler (org-level team manager OR admin of that
+  // specific team), mirroring the REST route's `assertCanManageTeam`. Gating
+  // these on team:update here would lock out team admins who are only org
+  // members (they hold team:read, not team:update).
+  add_team_member: { resource: "team", action: "read" },
+  update_team_member_role: { resource: "team", action: "read" },
+  remove_team_member: { resource: "team", action: "read" },
+  // External group sync tools follow the same pattern as membership tools:
+  // team:read as the coarse gate (matching the REST routes), with the finer
+  // manage check (org-level team manager OR team admin) and the enterprise
+  // license gate enforced in the handlers.
+  list_team_external_groups: { resource: "team", action: "read" },
+  add_team_external_group: { resource: "team", action: "read" },
+  remove_team_external_group: { resource: "team", action: "read" },
+
+  // Limits
+  create_limit: { resource: "llmLimit", action: "create" },
+  get_limits: { resource: "llmLimit", action: "read" },
+  update_limit: { resource: "llmLimit", action: "update" },
+  delete_limit: { resource: "llmLimit", action: "delete" },
+  get_agent_token_usage: { resource: "llmLimit", action: "read" },
+  get_llm_proxy_token_usage: { resource: "llmLimit", action: "read" },
+
+  // Policies
+  get_autonomy_policy_operators: { resource: "toolPolicy", action: "read" },
+  get_tool_invocation_policies: { resource: "toolPolicy", action: "read" },
+  create_tool_invocation_policy: { resource: "toolPolicy", action: "create" },
+  get_tool_invocation_policy: { resource: "toolPolicy", action: "read" },
+  update_tool_invocation_policy: { resource: "toolPolicy", action: "update" },
+  delete_tool_invocation_policy: { resource: "toolPolicy", action: "delete" },
+  get_trusted_data_policies: { resource: "toolPolicy", action: "read" },
+  create_trusted_data_policy: { resource: "toolPolicy", action: "create" },
+  get_trusted_data_policy: { resource: "toolPolicy", action: "read" },
+  update_trusted_data_policy: { resource: "toolPolicy", action: "update" },
+  delete_trusted_data_policy: { resource: "toolPolicy", action: "delete" },
+
+  // Tool Assignment
+  bulk_assign_tools_to_agents: { resource: "agent", action: "update" },
+  bulk_remove_tools_from_agents: { resource: "agent", action: "update" },
+  bulk_assign_tools_to_mcp_gateways: {
+    resource: "mcpGateway",
+    action: "update",
+  },
+
+  // Knowledge Management
+  query_knowledge_sources: { resource: "knowledgeSource", action: "query" },
+  create_knowledge_base: { resource: "knowledgeSource", action: "create" },
+  get_knowledge_bases: { resource: "knowledgeSource", action: "read" },
+  get_knowledge_base: { resource: "knowledgeSource", action: "read" },
+  update_knowledge_base: { resource: "knowledgeSource", action: "update" },
+  delete_knowledge_base: { resource: "knowledgeSource", action: "delete" },
+  create_knowledge_connector: { resource: "knowledgeSource", action: "create" },
+  get_knowledge_connectors: { resource: "knowledgeSource", action: "read" },
+  get_knowledge_connector: { resource: "knowledgeSource", action: "read" },
+  update_knowledge_connector: { resource: "knowledgeSource", action: "update" },
+  delete_knowledge_connector: { resource: "knowledgeSource", action: "delete" },
+  assign_knowledge_connector_to_knowledge_base: {
+    resource: "knowledgeSource",
+    action: "update",
+  },
+  unassign_knowledge_connector_from_knowledge_base: {
+    resource: "knowledgeSource",
+    action: "update",
+  },
+  assign_knowledge_base_to_agent: {
+    resource: "knowledgeSource",
+    action: "update",
+  },
+  unassign_knowledge_base_from_agent: {
+    resource: "knowledgeSource",
+    action: "update",
+  },
+  assign_knowledge_connector_to_agent: {
+    resource: "knowledgeSource",
+    action: "update",
+  },
+  unassign_knowledge_connector_from_agent: {
+    resource: "knowledgeSource",
+    action: "update",
+  },
+
+  // Chat — available to all (operate within user's own chat session)
+  todo_write: null,
+  create_project_from_conversation: { resource: "project", action: "create" },
+  // Coarse gate matching the SetProjectShare route; the service additionally
+  // restricts to the owner/project-admin and gates org-wide visibility behind
+  // project:share-org.
+  set_project_share: { resource: "project", action: "update" },
+  // Reads mirror the GetProjects/GetProject routes. The permission is only the
+  // floor: both handlers narrow to what the caller can actually reach (owner or
+  // shared-with), so `project:read` never widens visibility past their own set.
+  list_projects: { resource: "project", action: "read" },
+  get_project: { resource: "project", action: "read" },
+
+  // Meta — permission is enforced on the target tool, not on run_tool itself
+  search_tools: null,
+  run_tool: null,
+
+  // skills — require skill:read; handlers further filter by per-skill scope.
+  list_skills: { resource: "skill", action: "read" },
+  load_skill: { resource: "skill", action: "read" },
+  // Skill authoring — writes need skill:create/update; create_skill always
+  // makes a personal skill, update_skill re-checks the target skill's scope.
+  create_skill: { resource: "skill", action: "create" },
+  update_skill: { resource: "skill", action: "update" },
+  edit_skill: { resource: "skill", action: "update" },
+  // Plugins — executable opaque bytes, so only the metadata catalog is
+  // readable without plugin:admin; byte reads and every mutation require
+  // plugin:admin, matching the REST routes (plugin.routes.ts).
+  list_plugins: { resource: "plugin", action: "read" },
+  get_plugin: { resource: "plugin", action: "admin" },
+  create_plugin: { resource: "plugin", action: "admin" },
+  update_plugin: { resource: "plugin", action: "admin" },
+  edit_plugin: { resource: "plugin", action: "admin" },
+  delete_plugin: { resource: "plugin", action: "admin" },
+  // Code execution sandbox — gated by `sandbox:execute` and per-agent tool
+  // assignment. The implicit per-conversation sandbox is created lazily; the
+  // create step is not a tool. load_skill (skill:read) mounts a skill into
+  // the sandbox when the caller also has sandbox:execute.
+  run_command: { resource: "sandbox", action: "execute" },
+  download_file: { resource: "sandbox", action: "execute" },
+  upload_file: { resource: "sandbox", action: "execute" },
+
+  // Runs are an Agent capability, including when an Agent opts into
+  // Agent Runtime. Per-run ownership stays in the handlers.
+  start_run: { resource: "agent", action: "read" },
+  get_run: { resource: "agent", action: "read" },
+  list_runs: { resource: "agent", action: "read" },
+  list_agent_runs: { resource: "agent", action: "read" },
+  steer_run: { resource: "agent", action: "read" },
+  cancel_run: { resource: "agent", action: "read" },
+  post_run_file: { resource: "agent", action: "read" },
+  read_workspace_file: { resource: "agent", action: "read" },
+  write_workspace_file: { resource: "agent", action: "read" },
+  delete_workspace: { resource: "agent", action: "read" },
+  // Persistent file store — these operate on `skill_sandbox_files`, not the
+  // sandbox itself, so they gate on `file:manage`. Per-file authorization
+  // (authorship, project membership) stays in the handlers.
+  search_files: { resource: "file", action: "manage" },
+  read_file: { resource: "file", action: "manage" },
+  // Agent-side exchange with the chat's open app — pure PFS↔PFS, so file
+  // permission, not sandbox execution.
+  copy_file: { resource: "file", action: "manage" },
+  // App-runtime only (never seeded/agent-visible); still viewer-RBAC-checked.
+  read_file_raw: { resource: "file", action: "manage" },
+  save_file: { resource: "file", action: "manage" },
+  edit_file: { resource: "file", action: "manage" },
+  delete_file: { resource: "file", action: "manage" },
+
+  // MCP Apps. The data-store tools gate on app:read/update; the running app's
+  // appId is route-bound (set by the app MCP proxy), so the permission check
+  // plus that binding together confine a caller to apps it may use.
+  scaffold_app: { resource: "app", action: "create" },
+  // refine mutates the app head (persists its spec), mirroring edit_app.
+  refine_app: { resource: "app", action: "update" },
+  list_apps: { resource: "app", action: "read" },
+  list_app_versions: { resource: "app", action: "read" },
+  render_app: { resource: "app", action: "read" },
+  read_app: { resource: "app", action: "read" },
+  restore_app_version: { resource: "app", action: "update" },
+  edit_app: { resource: "app", action: "update" },
+  // set_app_tools replaces an app's assigned tool set; assertCallerMayModifyApp
+  // is the real authority, app:update is the floor (mirrors edit_app).
+  set_app_tools: { resource: "app", action: "update" },
+  set_app_labels: { resource: "app", action: "update" },
+  // set_app_lock flips the app's lock; the per-app authorization (scope +
+  // author + teams) rides the same loadApp modify gate as the other mutations.
+  set_app_lock: { resource: "app", action: "update" },
+  // validate_app only reads the head html and reports static findings.
+  validate_app: { resource: "app", action: "read" },
+  // publish_app changes the app's visibility scope; the scope-promotion gate
+  // (assertCallerMayModifyApp) is the real authority, app:update is the floor.
+  publish_app: { resource: "app", action: "update" },
+  delete_app: { resource: "app", action: "delete" },
+  // Authoring intent: the preview is exercised while building/fixing an app.
+  preview_app_tool: { resource: "app", action: "update" },
+  get_app_diagnostics: { resource: "app", action: "read" },
+  app_data_get: { resource: "app", action: "read" },
+  app_data_set: { resource: "app", action: "update" },
+  app_data_list: { resource: "app", action: "read" },
+  app_data_delete: { resource: "app", action: "update" },
+  // A viewer who can use an app can run its archestra.llm.complete() calls.
+  llm_complete: { resource: "app", action: "read" },
+};
+
+/**
+ * Read-only tools that operate at organization scope and so may be used by
+ * org/team-token MCP sessions, which carry no `userId`. Their handlers
+ * restrict results to org-scoped resources when no user is present.
+ */
+const ORG_CONTEXT_READ_TOOLS: ReadonlySet<ArchestraToolShortName> = new Set([
+  "list_skills",
+  "load_skill",
+]);
+
+/**
+ * Check if a user has permission to execute a specific Archestra tool.
+ * Returns an error result if denied, or null if allowed.
+ */
+export async function checkToolPermission(
+  toolName: string,
+  context: ArchestraContext,
+) {
+  const shortName = archestraMcpBranding.getToolShortName(toolName);
+  if (!shortName) return null; // Not an Archestra tool — allow (handled elsewhere)
+
+  // Cast is safe: unknown-but-prefixed tools return undefined here and are
+  // allowed through — they'll fail in the handler chain with "unknown tool".
+  // Known tools with `null` permission are also allowed (no RBAC needed).
+  const typedShortName = shortName as ArchestraToolShortName;
+  const perm = TOOL_PERMISSIONS[typedShortName];
+  if (!perm) return null;
+
+  if (!context.organizationId) {
+    return errorResult("Organization context not available");
+  }
+
+  // org/team-token sessions have no user; they may still use read-only tools
+  // that operate at organization scope — the handlers restrict the results.
+  if (!context.userId) {
+    if (ORG_CONTEXT_READ_TOOLS.has(typedShortName)) return null;
+    // Name the cause: this is reached whenever the caller authenticated with a
+    // credential that acts for an application rather than a person, and the
+    // previous wording ("User context not available") read as an internal
+    // fault rather than a fixable choice of credential.
+    return errorResult(
+      `${toolName} requires an acting user, but the credential used to authenticate does not identify one. Team tokens, organization tokens, and OAuth client-credentials tokens act for an application, not a person. Re-authenticate with a personal token, a user OAuth token, or an Identity Provider JWT.`,
+    );
+  }
+
+  const allowed = await userHasPermission(
+    context.userId,
+    context.organizationId,
+    perm.resource,
+    perm.action,
+  );
+
+  if (!allowed) {
+    logger.warn(
+      {
+        organizationId: context.organizationId,
+        userId: context.userId,
+        toolName,
+        resource: perm.resource,
+        action: perm.action,
+      },
+      "[ArchestraMCP] rbac denied tool execution",
+    );
+    return errorResult(
+      `You do not have permission to perform this action (requires ${perm.resource}:${perm.action}).`,
+    );
+  }
+
+  return null;
+}
+
+/**
+ * Filter a list of tool names to only those the user has permission to use.
+ * Non-Archestra tools are always included (their auth is handled separately).
+ */
+export async function filterToolNamesByPermission(
+  toolNames: string[],
+  userId: string | undefined,
+  organizationId: string | undefined,
+): Promise<Set<string>> {
+  if (!userId || !organizationId) {
+    // No user context — include tools with no permission requirement, plus
+    // org-context read tools when an organization context is present.
+    return new Set(
+      toolNames.filter((name) => {
+        const shortName = archestraMcpBranding.getToolShortName(name);
+        if (!shortName) return true; // Non-Archestra tool
+        const typed = shortName as ArchestraToolShortName;
+        if (TOOL_PERMISSIONS[typed] === null) return true;
+        return (
+          organizationId !== undefined && ORG_CONTEXT_READ_TOOLS.has(typed)
+        );
+      }),
+    );
+  }
+
+  const permissions = await UserModel.getUserPermissions(
+    userId,
+    organizationId,
+  );
+
+  // Collect unique permissions we need to check
+  const permResults = new Map<string, boolean>();
+  for (const name of toolNames) {
+    const shortName = archestraMcpBranding.getToolShortName(name);
+    if (!shortName) continue;
+    const perm = TOOL_PERMISSIONS[shortName as ArchestraToolShortName];
+    if (perm) {
+      const key = `${perm.resource}:${perm.action}`;
+      if (!permResults.has(key)) {
+        permResults.set(
+          key,
+          permissions[perm.resource]?.includes(perm.action) ?? false,
+        );
+      }
+    }
+  }
+
+  // Filter tools
+  const allowed = new Set<string>();
+  for (const name of toolNames) {
+    const shortName = archestraMcpBranding.getToolShortName(name);
+    if (!shortName) {
+      allowed.add(name); // Non-Archestra tool
+      continue;
+    }
+    const perm = TOOL_PERMISSIONS[shortName as ArchestraToolShortName];
+    if (!perm) {
+      allowed.add(name); // No permission required
+      continue;
+    }
+    if (permResults.get(`${perm.resource}:${perm.action}`)) {
+      allowed.add(name);
+    }
+  }
+
+  return allowed;
+}

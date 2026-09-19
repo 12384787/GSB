@@ -1,0 +1,1 @@
+ALTER table atlas_dashboard.person ADD COLUMN receive_notification boolean;

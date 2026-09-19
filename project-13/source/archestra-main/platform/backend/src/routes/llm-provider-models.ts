@@ -1,0 +1,995 @@
+import {
+  EmbeddingDimensionsSchema,
+  isFreeModel,
+  isProviderApiKeyOptional,
+  LAZY_MODEL_SYNC_STATUS_HEADER,
+  LAZY_MODEL_SYNC_STATUS_PENDING,
+  providerRequiresPerUserCredential,
+  RouteId,
+  type SupportedProvider,
+  SupportedProviders,
+  SupportedProvidersSchema,
+  TimeInMs,
+} from "@archestra/shared";
+import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
+import { z } from "zod";
+import { userHasPermission } from "@/auth";
+import { LRUCacheManager } from "@/cache-manager";
+import { isAnthropicKeylessAuthEnabled } from "@/clients/anthropic-keyless-auth";
+import { isAzureOpenAiEntraIdEnabled } from "@/clients/azure-openai-credentials";
+import { isBedrockIamAuthEnabled } from "@/clients/bedrock-credentials";
+import { isVertexAiEnabled } from "@/clients/gemini-client";
+import { modelsDevClient } from "@/clients/models-dev-client";
+import { getEmbeddingClientInputModalities } from "@/knowledge-base/embedding-clients";
+import logger from "@/logging";
+import {
+  LlmProviderApiKeyModel,
+  LlmProviderApiKeyModelLinkModel,
+  ModelLabelModel,
+  ModelModel,
+  type ModelSyncState,
+  ModelTeamModel,
+  ModelUserModel,
+  OrganizationModel,
+  TeamModel,
+} from "@/models";
+import { getSecretValueForLlmProviderApiKey } from "@/secrets-manager";
+import {
+  modelSyncService,
+  withDistinctDisplayNames,
+} from "@/services/model-sync";
+import { systemKeyManager } from "@/services/system-key-manager";
+import {
+  ApiError,
+  constructResponseSchema,
+  type LabelWithDetails,
+  type LinkedApiKey,
+  type LlmProviderApiKeyWithScopeInfo,
+  type Model,
+  ModelCapabilitiesSchema,
+  type ModelTeamDetail,
+  ModelWithApiKeysSchema,
+  PatchModelBodySchema,
+  SelectModelSchema,
+  UuidIdSchema,
+} from "@/types";
+import { BulkIdsSchema, BulkOutcomeSchema, runBulk } from "./bulk-route";
+import { registerEntityLabelRoutes } from "./entity-labels";
+
+const DEFAULT_LAZY_MODEL_SYNC_TTL_MS = TimeInMs.Day;
+const LAZY_MODEL_SYNC_TTL_BY_PROVIDER: Partial<
+  Record<SupportedProvider, number>
+> = {
+  openrouter: TimeInMs.Hour,
+  ollama: 5 * TimeInMs.Minute,
+  // Same server as `ollama`, so it needs the same TTL: on the default one-day
+  // fallback a freshly `ollama pull`-ed model appeared in one provider within
+  // five minutes and the other a day later, which reads as a failed pull.
+  "ollama-native": 5 * TimeInMs.Minute,
+  vllm: 5 * TimeInMs.Minute,
+};
+
+const lazyModelSyncsByApiKeyId = new Map<string, Promise<void>>();
+
+/**
+ * Negative cache marking API keys whose lazy sync was recently attempted (any
+ * outcome). Keys that legitimately resolve zero models are otherwise classified
+ * stale forever, re-triggering an upstream fetch on every request; this caps
+ * the re-sync rate to the provider's TTL window. Per-pod by design — a fresh
+ * pod re-attempting once per TTL is acceptable.
+ */
+const recentLazyModelSyncAttempts = new LRUCacheManager<true>({
+  maxSize: 5000,
+  defaultTtl: DEFAULT_LAZY_MODEL_SYNC_TTL_MS,
+});
+
+const LlmModelSchema = z.object({
+  id: z.string(),
+  /** The models.id UUID — used as the model_id FK on conversations/agents. */
+  dbId: z.string(),
+  displayName: z.string(),
+  provider: SupportedProvidersSchema,
+  createdAt: z.string().optional(),
+  capabilities: ModelCapabilitiesSchema.optional(),
+  isBest: z.boolean().optional(),
+  /** True when the provider charges nothing for this model (both prices are zero). */
+  isFree: z.boolean(),
+  embeddingDimensions: EmbeddingDimensionsSchema.nullable().optional(),
+  /**
+   * True for models from a per-user provider (e.g. GitHub Copilot), whose
+   * credential each member supplies via their own account. The model is
+   * selectable by anyone, but using it requires the acting user to have
+   * connected — see `isConnected`.
+   */
+  requiresUserConnection: z.boolean().optional(),
+  /**
+   * For `requiresUserConnection` models: whether the requesting user has linked
+   * their own account. When false, the model is offered but the UI should prompt
+   * the user to connect (and a send surfaces the connect flow).
+   */
+  isConnected: z.boolean().optional(),
+});
+
+const ModelSyncFailureSchema = z.object({
+  apiKeyId: z.string(),
+  name: z.string(),
+  provider: SupportedProvidersSchema,
+  requiresReauthentication: z.boolean(),
+});
+
+const llmModelsRoutes: FastifyPluginAsyncZod = async (fastify) => {
+  registerEntityLabelRoutes(fastify, {
+    basePath: "/api/llm-provider-models",
+    tag: "LLM Models",
+    entityNamePlural: "models",
+    model: ModelLabelModel,
+    keysOperationId: RouteId.GetLlmProviderModelLabelKeys,
+    valuesOperationId: RouteId.GetLlmProviderModelLabelValues,
+  });
+
+  fastify.get(
+    "/api/llm-models/available",
+    {
+      schema: {
+        operationId: RouteId.GetLlmModels,
+        description:
+          "Get available LLM models from configured provider API keys. Models are fetched from the provider-backed catalog and include capabilities when available.",
+        tags: ["LLM Models"],
+        querystring: z.object({
+          provider: SupportedProvidersSchema.optional(),
+          apiKeyId: z.string().uuid().optional(),
+          isEmbedding: z
+            .string()
+            .transform((v) => v === "true")
+            .optional(),
+        }),
+        response: constructResponseSchema(z.array(LlmModelSchema)),
+      },
+    },
+    async ({ query, organizationId, user }, reply) => {
+      const { provider, apiKeyId, isEmbedding } = query;
+
+      modelsDevClient.syncIfNeeded();
+
+      const userTeamIds = await TeamModel.getUserTeamIds(user.id);
+      const apiKeys = await LlmProviderApiKeyModel.getAvailableKeysForUser(
+        organizationId,
+        user.id,
+        userTeamIds,
+        provider,
+      );
+
+      logger.info(
+        {
+          organizationId,
+          provider,
+          apiKeyId,
+          apiKeyCount: apiKeys.length,
+          apiKeys: apiKeys.map((key) => ({
+            id: key.id,
+            name: key.name,
+            provider: key.provider,
+            isSystem: key.isSystem,
+          })),
+        },
+        "Available API keys for user",
+      );
+
+      const accessibleKeyIds = apiKeys.map((key) => key.id);
+      if (apiKeyId && !accessibleKeyIds.includes(apiKeyId)) {
+        logger.warn(
+          { apiKeyId, organizationId, userId: user.id },
+          "Requested apiKeyId not found in user's accessible keys, falling back to all keys",
+        );
+      }
+
+      const apiKeyIds =
+        apiKeyId && accessibleKeyIds.includes(apiKeyId)
+          ? [apiKeyId]
+          : accessibleKeyIds;
+      const modelQueryApiKeys = apiKeys.filter((apiKey) =>
+        apiKeyIds.includes(apiKey.id),
+      );
+
+      try {
+        const lazyModelSyncs = await triggerLazyModelSyncForStaleApiKeys({
+          organizationId,
+          apiKeys: modelQueryApiKeys,
+        });
+        if (lazyModelSyncs.length > 0) {
+          reply.header(
+            LAZY_MODEL_SYNC_STATUS_HEADER,
+            LAZY_MODEL_SYNC_STATUS_PENDING,
+          );
+        }
+      } catch (error) {
+        logger.error(
+          {
+            organizationId,
+            errorMessage:
+              error instanceof Error ? error.message : String(error),
+          },
+          "Failed to schedule lazy model sync",
+        );
+      }
+
+      const dbModels =
+        await LlmProviderApiKeyModelLinkModel.getModelsForApiKeyIds(apiKeyIds);
+
+      logger.info(
+        {
+          organizationId,
+          provider,
+          apiKeyIds,
+          modelCount: dbModels.length,
+        },
+        "Models fetched from database",
+      );
+
+      // Per-user providers (e.g. GitHub Copilot) are catalogued org-wide and
+      // resolved per-user at request time, so they're sourced separately below
+      // (visible to everyone, flagged) — keep them out of the per-key path so a
+      // member's own connected copy isn't listed twice or shown unflagged.
+      let filteredModels = dbModels.filter(
+        ({ model }) => !providerRequiresPerUserCredential(model.provider),
+      );
+      if (provider) {
+        filteredModels = filteredModels.filter(
+          ({ model }) => model.provider === provider,
+        );
+      }
+
+      // Filter by embedding status if requested
+      if (isEmbedding !== undefined) {
+        filteredModels = filteredModels.filter(({ model }) =>
+          isEmbedding
+            ? model.embeddingDimensions !== null
+            : model.embeddingDimensions === null,
+        );
+      }
+
+      const keyLinkedModels = filteredModels
+        .filter(({ model }) =>
+          isEmbedding ? true : ModelModel.supportsTextChat(model),
+        )
+        .map(({ model, isBest, recommendedForAgents }) => ({
+          id: model.modelId,
+          dbId: model.id,
+          displayName: model.description || model.modelId,
+          provider: model.provider,
+          capabilities: ModelModel.toCapabilities(model, recommendedForAgents),
+          isBest,
+          isFree: isFreeModel(model),
+          embeddingDimensions: model.embeddingDimensions,
+        }));
+
+      const perUserModels = await getPerUserProviderModels({
+        organizationId,
+        provider,
+        isEmbedding,
+        connectedProviders: new Set(
+          apiKeys
+            .filter((key) => providerRequiresPerUserCredential(key.provider))
+            .map((key) => key.provider),
+        ),
+      });
+
+      const models = [...keyLinkedModels, ...perUserModels];
+
+      // Hide models restricted to teams the caller is not part of. Catalog
+      // managers (llmModel:update) keep full visibility so they can see what
+      // they are restricting.
+      const isModelCatalogAdmin = await userHasPermission(
+        user.id,
+        organizationId,
+        "llmModel",
+        "update",
+      );
+      let visibleModels = models;
+      if (!isModelCatalogAdmin) {
+        const allowedModelIds = await ModelTeamModel.filterAllowedModelIds({
+          modelIds: models.map((model) => model.dbId),
+          principalTeamIds: userTeamIds,
+        });
+        visibleModels = models.filter((model) =>
+          allowedModelIds.has(model.dbId),
+        );
+      }
+
+      logger.info(
+        { organizationId, provider, totalModels: visibleModels.length },
+        "Returning available LLM models from database",
+      );
+
+      // Stored descriptions can still collide at read time — rows synced
+      // before names were disambiguated, or keys whose catalogs each contain
+      // only one member of a colliding pair — so the response gets its own
+      // pass to keep picker rows tellable-apart.
+      return reply.send(withDistinctDisplayNames(visibleModels));
+    },
+  );
+
+  fastify.post(
+    "/api/llm-models/sync",
+    {
+      schema: {
+        operationId: RouteId.SyncLlmModels,
+        description:
+          "Sync models from providers for all visible API keys and store them in the database",
+        tags: ["LLM Models"],
+        response: constructResponseSchema(
+          z.object({
+            success: z.boolean(),
+            failures: z.array(ModelSyncFailureSchema),
+          }),
+        ),
+      },
+    },
+    async ({ organizationId, user }, reply) => {
+      const failures = await syncModelsForVisibleApiKeys({
+        organizationId,
+        userId: user.id,
+      });
+
+      logger.info({ organizationId }, "Completed model sync for all API keys");
+
+      return reply.send({ success: failures.length === 0, failures });
+    },
+  );
+
+  fastify.get(
+    "/api/llm-models",
+    {
+      schema: {
+        operationId: RouteId.GetModelsWithApiKeys,
+        description:
+          "Get all synced LLM models with their linked provider API keys.",
+        tags: ["LLM Models"],
+        response: constructResponseSchema(z.array(ModelWithApiKeysSchema)),
+      },
+    },
+    async ({ organizationId, user }, reply) => {
+      const allModelsWithApiKeys =
+        await LlmProviderApiKeyModelLinkModel.getAllModelsWithApiKeys();
+
+      // The link table spans every org and user (models are global metadata),
+      // so restrict the attached keys to the caller's visibility — the same
+      // rules as the Model Providers page (own personal + team + org keys,
+      // other users' personal keys hidden even from admins). Without this,
+      // per-user providers leak every member's personal key as identical
+      // "Microsoft 365 Copilot" entries. Models keep showing with an empty
+      // key list, like the unlinked llm-proxy models below.
+      const userTeamIds = await TeamModel.getUserTeamIds(user.id);
+      const isLlmProviderApiKeyAdmin = await userHasPermission(
+        user.id,
+        organizationId,
+        "llmProviderApiKey",
+        "admin",
+      );
+      const visibleKeys = await LlmProviderApiKeyModel.getVisibleKeys(
+        organizationId,
+        user.id,
+        userTeamIds,
+        isLlmProviderApiKeyAdmin,
+      );
+      const visibleKeyIds = new Set(visibleKeys.map((key) => key.id));
+      const modelsWithApiKeys = allModelsWithApiKeys.map((item) => ({
+        ...item,
+        apiKeys: item.apiKeys.filter((key) => visibleKeyIds.has(key.id)),
+      }));
+
+      const linkedModelIds = new Set(
+        modelsWithApiKeys.map((item) => item.model.id),
+      );
+      const llmProxyModels = await ModelModel.findLlmProxyModels();
+      const unlinkedLlmProxyModels = llmProxyModels.filter(
+        (model) => !linkedModelIds.has(model.id),
+      );
+
+      const enrichedModelIds = [
+        ...modelsWithApiKeys.map((item) => item.model.id),
+        ...unlinkedLlmProxyModels.map((model) => model.id),
+      ];
+      const [teamsByModelId, usersByModelId, labelsByModelId] =
+        await Promise.all([
+          ModelTeamModel.getTeamDetailsForModels(enrichedModelIds),
+          ModelUserModel.getUserDetailsForModels(enrichedModelIds),
+          ModelLabelModel.getLabelsForMany(enrichedModelIds),
+        ]);
+
+      const response = [
+        ...modelsWithApiKeys.map(({ model, isBest, apiKeys }) =>
+          toModelWithApiKeysResponse({
+            model,
+            isBest,
+            apiKeys,
+            teams: teamsByModelId.get(model.id) ?? [],
+            users: usersByModelId.get(model.id) ?? [],
+            labels: labelsByModelId.get(model.id) ?? [],
+          }),
+        ),
+        ...unlinkedLlmProxyModels.map((model) =>
+          toModelWithApiKeysResponse({
+            model,
+            isBest: false,
+            apiKeys: [],
+            teams: teamsByModelId.get(model.id) ?? [],
+            users: usersByModelId.get(model.id) ?? [],
+            labels: labelsByModelId.get(model.id) ?? [],
+          }),
+        ),
+      ];
+
+      logger.debug(
+        { modelCount: response.length },
+        "Returning models with API keys",
+      );
+
+      return reply.send(response);
+    },
+  );
+
+  fastify.patch(
+    "/api/llm-models/bulk",
+    {
+      schema: {
+        operationId: RouteId.BulkUpdateModels,
+        description:
+          "Update several LLM models in one request. Today the only " +
+          "bulk-editable field is `ignored`, which hides a model from the " +
+          "pickers without deleting anything. Ids that match no model are " +
+          "reported in `failed` and leave the rest of the batch applied.",
+        tags: ["LLM Models"],
+        body: z.object({
+          ids: BulkIdsSchema,
+          ignored: z
+            .boolean()
+            .describe("Whether every model in the batch is hidden."),
+        }),
+        response: constructResponseSchema(BulkOutcomeSchema),
+      },
+    },
+    async (request, reply) => {
+      const { ignored } = request.body;
+
+      const outcome = await runBulk({
+        ids: request.body.ids,
+        logLabel: "models bulk update",
+        notFoundMessage: "Model not found",
+        unexpectedMessage: "Could not update this model",
+        load: async (ids) =>
+          new Map(
+            (await ModelModel.findByIds(ids)).map((model) => [model.id, model]),
+          ),
+        // The row's own name, as the pickers show it.
+        describe: (model) => model.modelId,
+        applyEach: async (model, id) => {
+          if (model.ignored === ignored) return;
+          await ModelModel.update(id, { ignored });
+        },
+        audit: {
+          target: request,
+          snapshot: async (ids) => ({
+            models: await ModelModel.findVisibilityForBulkAudit(ids),
+          }),
+        },
+      });
+
+      return reply.send(outcome);
+    },
+  );
+
+  fastify.patch(
+    "/api/llm-models/:id",
+    {
+      schema: {
+        operationId: RouteId.UpdateModel,
+        description:
+          "Update LLM model details including custom pricing and modalities.",
+        tags: ["LLM Models"],
+        params: z.object({
+          id: UuidIdSchema,
+        }),
+        body: PatchModelBodySchema,
+        response: constructResponseSchema(SelectModelSchema),
+      },
+    },
+    async ({ params: { id }, body }, reply) => {
+      const existing = await ModelModel.findById(id);
+      if (!existing) {
+        throw new ApiError(404, "Model not found");
+      }
+
+      // Validated here rather than in the body schema, which carries neither the
+      // provider nor the context length. The route gate (`llmModel:update`) is
+      // the only permission check: model rows are global, but so are the pricing
+      // and `ignored` fields an editor can already write, so singling out
+      // generation parameters bought a 403 class without a matching guarantee.
+      if (
+        body.configuredParameters !== undefined &&
+        existing.provider !== "ollama-native"
+      ) {
+        throw new ApiError(
+          400,
+          `Generation parameters are only supported for Ollama (Native) models, not "${existing.provider}"`,
+        );
+      }
+
+      // Checked against the post-patch state, and on either field changing:
+      // lowering the custom context window below an already-configured num_ctx
+      // is the same inconsistency as raising num_ctx above the window, and only
+      // one of the two arrives in any given request.
+      const numCtx =
+        body.configuredParameters !== undefined
+          ? body.configuredParameters?.num_ctx
+          : existing.configuredParameters?.num_ctx;
+      const contextCeiling = ModelModel.resolveArchitecturalContextLength({
+        contextLength: existing.contextLength,
+        customContextLength:
+          body.customContextLength !== undefined
+            ? body.customContextLength
+            : existing.customContextLength,
+      });
+      if (
+        (body.configuredParameters !== undefined ||
+          body.customContextLength !== undefined) &&
+        numCtx !== undefined &&
+        contextCeiling !== null &&
+        numCtx > contextCeiling
+      ) {
+        throw new ApiError(
+          400,
+          `num_ctx (${numCtx}) exceeds the model's context length of ${contextCeiling}`,
+        );
+      }
+
+      // The knowledge base reads embedding dimensions from this row at embed
+      // time, so changing them — or clearing them, which turns the model back
+      // into a chat model — while an organization's embedding config points
+      // here would silently corrupt the existing index. Mirror the
+      // knowledge-settings lock: force changes through the drop-embedding flow.
+      const existingInputModalities = new Set(existing.inputModalities ?? []);
+      const requestedInputModalities = new Set(body.inputModalities ?? []);
+      const inputModalitiesChanged =
+        body.inputModalities !== undefined &&
+        ((body.inputModalities === null) !==
+          (existing.inputModalities === null) ||
+          requestedInputModalities.size !== existingInputModalities.size ||
+          [...requestedInputModalities].some(
+            (modality) => !existingInputModalities.has(modality),
+          ));
+      const embeddingConfigurationChanged =
+        (body.embeddingDimensions !== undefined &&
+          body.embeddingDimensions !== existing.embeddingDimensions) ||
+        inputModalitiesChanged;
+      if (
+        embeddingConfigurationChanged &&
+        (await OrganizationModel.isKnowledgeEmbeddingModel({
+          provider: existing.provider,
+          modelId: existing.modelId,
+        }))
+      ) {
+        throw new ApiError(
+          400,
+          "This model is used as the knowledge base embedding model, so its dimensions and input modalities cannot be changed. Drop the embedding configuration in Knowledge settings first — all documents will need to be re-embedded.",
+          "embedding_validation_failed",
+        );
+      }
+
+      // An embedding model can only be marked image-capable when the embedding
+      // client can actually send images to it — otherwise connectors would
+      // ingest images that fail at embed time. Checked on the post-patch state
+      // so setting embedding dimensions on an image-capable chat model is
+      // caught too.
+      const effectiveEmbeddingDimensions =
+        body.embeddingDimensions !== undefined
+          ? body.embeddingDimensions
+          : existing.embeddingDimensions;
+      const effectiveInputModalities =
+        body.inputModalities !== undefined
+          ? body.inputModalities
+          : existing.inputModalities;
+      if (
+        effectiveEmbeddingDimensions !== null &&
+        effectiveInputModalities?.includes("image")
+      ) {
+        const clientModalities = getEmbeddingClientInputModalities(
+          existing.provider,
+          existing.modelId,
+        );
+        if (clientModalities !== null && !clientModalities.includes("image")) {
+          throw new ApiError(
+            400,
+            `Embedding for "${existing.modelId}" is text-only: the ${existing.provider} embedding client cannot send images to this model, so it cannot accept the image input modality while configured as an embedding model.`,
+            "embedding_validation_failed",
+          );
+        }
+      }
+
+      const { teamIds, userIds, labels, ...modelUpdates } = body;
+      const updated = await ModelModel.update(id, modelUpdates);
+      if (!updated) {
+        throw new ApiError(500, "Failed to update model");
+      }
+
+      if (teamIds !== undefined) {
+        await ModelTeamModel.syncModelTeams(id, teamIds);
+      }
+
+      if (userIds !== undefined) {
+        await ModelUserModel.syncModelUsers(id, userIds);
+      }
+
+      // Only touch labels when the caller sent them, so an update that omits
+      // the field leaves existing labels alone.
+      if (labels !== undefined) {
+        await ModelLabelModel.syncLabels(id, labels);
+      }
+
+      return reply.send(updated);
+    },
+  );
+};
+
+export default llmModelsRoutes;
+
+export async function syncModelsForVisibleApiKeys(params: {
+  organizationId: string;
+  userId: string;
+}): Promise<z.infer<typeof ModelSyncFailureSchema>[]> {
+  const { organizationId, userId } = params;
+  const userTeamIds = await TeamModel.getUserTeamIds(userId);
+  const apiKeys = await LlmProviderApiKeyModel.getAvailableKeysForUser(
+    organizationId,
+    userId,
+    userTeamIds,
+  );
+  const systemFailures = apiKeys.some(shouldHandleWithSystemKeySync)
+    ? await systemKeyManager.syncSystemKeys(organizationId)
+    : [];
+  const results = await Promise.all(
+    apiKeys.map(async (apiKey) => {
+      try {
+        if (shouldHandleWithSystemKeySync(apiKey)) {
+          if (systemFailures?.includes(apiKey.provider))
+            throw new ApiError(502, "Provider model refresh failed");
+        } else {
+          await syncVisibleApiKeyModels({ apiKey, organizationId });
+        }
+        return null;
+      } catch {
+        return {
+          apiKeyId: apiKey.id,
+          name: apiKey.name,
+          provider: apiKey.provider,
+        };
+      }
+    }),
+  );
+  const failedKeys = results.filter((result) => result !== null);
+  if (failedKeys.length === 0) return [];
+  const currentKeys = await LlmProviderApiKeyModel.findByIds(
+    failedKeys.map((key) => key.apiKeyId),
+  );
+  const rejectedIds = new Set(
+    currentKeys
+      .filter((key) => key.requiresReauthentication)
+      .map((key) => key.id),
+  );
+  return failedKeys.map((key) => ({
+    ...key,
+    requiresReauthentication: rejectedIds.has(key.apiKeyId),
+  }));
+}
+
+/**
+ * What model syncing actually needs off a key: its credential and provider
+ * config, never its provenance. Spelled without `createdBy` so both the stored
+ * row and the API response — which differ only in whether that field is a raw
+ * user id or the resolved identity — can be passed here unchanged.
+ */
+type ModelSyncApiKey = Omit<LlmProviderApiKeyWithScopeInfo, "createdBy">;
+
+export async function triggerLazyModelSyncForStaleApiKeys(params: {
+  organizationId: string;
+  apiKeys: ModelSyncApiKey[];
+  now?: Date;
+}): Promise<Array<Promise<void>>> {
+  const staleApiKeys = await getStaleModelSyncApiKeys(params);
+  const syncs = staleApiKeys.map((apiKey) =>
+    scheduleLazyModelSyncForApiKey({
+      apiKey,
+      organizationId: params.organizationId,
+    }),
+  );
+
+  if (syncs.length > 0) {
+    logger.info(
+      {
+        organizationId: params.organizationId,
+        apiKeyIds: staleApiKeys.map((apiKey) => apiKey.id),
+      },
+      "Scheduled lazy model sync for stale API keys",
+    );
+  }
+
+  return syncs;
+}
+
+/**
+ * Generic over the row: staleness is decided from `id` and `provider` alone, so
+ * this accepts any key-shaped record and hands back the same type it was given
+ * rather than pinning callers to one response shape.
+ */
+export async function getStaleModelSyncApiKeys<
+  T extends { id: string; provider: SupportedProvider },
+>(params: { apiKeys: T[]; now?: Date }): Promise<T[]> {
+  const { apiKeys, now = new Date() } = params;
+  const syncStates =
+    await LlmProviderApiKeyModelLinkModel.getModelSyncStatesForApiKeys(
+      apiKeys.map((apiKey) => apiKey.id),
+    );
+
+  return apiKeys.filter((apiKey) =>
+    isModelSyncStateStale({
+      provider: apiKey.provider,
+      syncState: syncStates.get(apiKey.id),
+      recentlyAttempted: recentLazyModelSyncAttempts.get(apiKey.id) === true,
+      now,
+    }),
+  );
+}
+
+export function isModelSyncStateStale(params: {
+  provider: SupportedProvider;
+  syncState?: Pick<ModelSyncState, "linkedModelCount" | "oldestLastSyncedAt">;
+  /** Whether a lazy sync was attempted within this provider's TTL window. */
+  recentlyAttempted?: boolean;
+  now?: Date;
+}): boolean {
+  const {
+    provider,
+    syncState,
+    recentlyAttempted = false,
+    now = new Date(),
+  } = params;
+
+  // no usable linked models yet (unlinked key, empty provider, or failed sync):
+  // re-sync unless we already attempted recently, else we'd hammer the provider.
+  if (
+    !syncState ||
+    syncState.linkedModelCount === 0 ||
+    !syncState.oldestLastSyncedAt
+  ) {
+    return !recentlyAttempted;
+  }
+
+  const ttl =
+    LAZY_MODEL_SYNC_TTL_BY_PROVIDER[provider] ?? DEFAULT_LAZY_MODEL_SYNC_TTL_MS;
+  return now.getTime() - syncState.oldestLastSyncedAt.getTime() >= ttl;
+}
+
+async function syncVisibleApiKeyModels(params: {
+  apiKey: ModelSyncApiKey;
+  organizationId: string;
+}): Promise<void> {
+  const { apiKey, organizationId } = params;
+
+  if (shouldHandleWithSystemKeySync(apiKey)) {
+    const failures = await systemKeyManager.syncSystemKeys(organizationId);
+    if (failures?.includes(apiKey.provider))
+      throw new ApiError(502, "Provider model refresh failed");
+    return;
+  }
+
+  let secretValue: string | null = null;
+  if (apiKey.secretId) {
+    secretValue = (await getSecretValueForLlmProviderApiKey(apiKey.secretId)) as
+      | string
+      | null;
+  }
+
+  if (
+    !secretValue &&
+    !isProviderApiKeyOptional({
+      provider: apiKey.provider,
+      azureEntraIdEnabled: isAzureOpenAiEntraIdEnabled(),
+      anthropicKeylessAuthEnabled: isAnthropicKeylessAuthEnabled(),
+    })
+  ) {
+    if (apiKey.secretId) {
+      logger.warn(
+        { apiKeyId: apiKey.id, provider: apiKey.provider },
+        "No secret value for API key, skipping sync",
+      );
+    }
+    throw new ApiError(400, "No credential is configured");
+  }
+
+  try {
+    await modelSyncService.syncModelsForApiKey({
+      apiKeyId: apiKey.id,
+      provider: apiKey.provider,
+      apiKeyValue: secretValue ?? "",
+      baseUrl: apiKey.baseUrl,
+      extraHeaders: apiKey.extraHeaders,
+    });
+  } catch (error) {
+    logger.error(
+      {
+        apiKeyId: apiKey.id,
+        provider: apiKey.provider,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      },
+      "Failed to sync models for API key",
+    );
+    throw error;
+  }
+}
+
+function scheduleLazyModelSyncForApiKey(params: {
+  apiKey: ModelSyncApiKey;
+  organizationId: string;
+}): Promise<void> {
+  const { apiKey } = params;
+  const inFlight = lazyModelSyncsByApiKeyId.get(apiKey.id);
+  if (inFlight) {
+    return inFlight;
+  }
+
+  const sync = syncVisibleApiKeyModels(params)
+    .catch((error) => {
+      logger.error(
+        {
+          apiKeyId: apiKey.id,
+          provider: apiKey.provider,
+          errorMessage: error instanceof Error ? error.message : String(error),
+        },
+        "Failed to lazily sync models for API key",
+      );
+    })
+    .finally(() => {
+      lazyModelSyncsByApiKeyId.delete(apiKey.id);
+      // mark the attempt (success or failure) so a zero-model key isn't
+      // re-synced on every request until the provider's TTL elapses.
+      recentLazyModelSyncAttempts.set(
+        apiKey.id,
+        true,
+        LAZY_MODEL_SYNC_TTL_BY_PROVIDER[apiKey.provider] ??
+          DEFAULT_LAZY_MODEL_SYNC_TTL_MS,
+      );
+    });
+  lazyModelSyncsByApiKeyId.set(apiKey.id, sync);
+  return sync;
+}
+
+function shouldHandleWithSystemKeySync(apiKey: {
+  provider: string;
+  isSystem: boolean;
+}): boolean {
+  if (!apiKey.isSystem) {
+    return false;
+  }
+
+  if (apiKey.provider === "gemini") {
+    return isVertexAiEnabled();
+  }
+
+  if (apiKey.provider === "bedrock") {
+    return isBedrockIamAuthEnabled();
+  }
+
+  return false;
+}
+
+/**
+ * Build the flagged per-user-provider model entries for the available-models
+ * response. Per-user providers (GitHub Copilot) are advertised to every member
+ * — connected or not — because the credential is resolved per-user at request
+ * time; the `requiresUserConnection`/`isConnected` flags let the UI prompt a
+ * member to connect instead of hiding the model or showing it as unavailable.
+ */
+async function getPerUserProviderModels(params: {
+  organizationId: string;
+  provider?: SupportedProvider;
+  isEmbedding?: boolean;
+  connectedProviders: Set<SupportedProvider>;
+}): Promise<Array<z.infer<typeof LlmModelSchema>>> {
+  const { organizationId, provider, isEmbedding, connectedProviders } = params;
+
+  // Per-user providers don't expose embeddings, so never inject for embeddings.
+  if (isEmbedding) {
+    return [];
+  }
+
+  // Per-user providers are org-wide and resolved per-user at request time, so
+  // they're always offered (regardless of any single-key `apiKeyId` scoping) —
+  // the picker should let any member pick a Copilot model and connect on send.
+  const providers = provider
+    ? providerRequiresPerUserCredential(provider)
+      ? [provider]
+      : []
+    : SupportedProviders.filter(providerRequiresPerUserCredential);
+
+  if (providers.length === 0) {
+    return [];
+  }
+
+  const perProvider = await Promise.all(
+    providers.map(async (perUserProvider) => {
+      const orgModels =
+        await LlmProviderApiKeyModelLinkModel.getOrgModelsForPerUserProvider(
+          organizationId,
+          perUserProvider,
+        );
+      const isConnected = connectedProviders.has(perUserProvider);
+      return orgModels
+        .filter(({ model }) => ModelModel.supportsTextChat(model))
+        .map(({ model, isBest }) => ({
+          id: model.modelId,
+          dbId: model.id,
+          displayName: model.description || model.modelId,
+          provider: model.provider,
+          capabilities: ModelModel.toCapabilities(model),
+          isBest,
+          isFree: isFreeModel(model),
+          embeddingDimensions: model.embeddingDimensions,
+          requiresUserConnection: true,
+          isConnected,
+        }));
+    }),
+  );
+
+  return perProvider.flat();
+}
+
+/**
+ * Shape a model row into the models-with-API-keys response, attaching the
+ * computed effective pricing (input/output + cache) and price sources, plus the
+ * context window the model actually enforces.
+ */
+function toModelWithApiKeysResponse(params: {
+  model: Model;
+  isBest: boolean;
+  apiKeys: LinkedApiKey[];
+  teams: ModelTeamDetail[];
+  users: Array<{ id: string; name: string; email: string }>;
+  labels: LabelWithDetails[];
+}) {
+  const { model, isBest, apiKeys, teams, users, labels } = params;
+  const capabilities = ModelModel.toCapabilities(model);
+  return {
+    ...model,
+    isBest,
+    apiKeys,
+    teams,
+    users,
+    labels,
+    // The spread above carries the architectural `contextLength`, which stays
+    // the ceiling for `num_ctx` validation. Displaying it would over-promise
+    // when Ollama enforces a smaller window, so the resolved one rides along.
+    effectiveContextLength: capabilities.contextLength,
+    embeddingClientImageCapable: embeddingClientImageCapable(model),
+    pricePerMillionInput: capabilities.pricePerMillionInput,
+    pricePerMillionOutput: capabilities.pricePerMillionOutput,
+    isCustomPrice: capabilities.isCustomPrice,
+    priceSource: capabilities.priceSource,
+    pricePerMillionCacheRead: capabilities.pricePerMillionCacheRead,
+    pricePerMillionCacheWrite: capabilities.pricePerMillionCacheWrite,
+    cachePriceSource: capabilities.cachePriceSource,
+    isFree: isFreeModel(model),
+  };
+}
+
+/**
+ * Whether the platform's embedding client can send images to this model —
+ * `null` when the client imposes no per-model limit (Gemini). Drives the edit
+ * dialog's image-modality restriction; the PATCH route enforces the same rule.
+ */
+function embeddingClientImageCapable(model: Model): boolean | null {
+  const clientModalities = getEmbeddingClientInputModalities(
+    model.provider,
+    model.modelId,
+  );
+  return clientModalities === null ? null : clientModalities.includes("image");
+}

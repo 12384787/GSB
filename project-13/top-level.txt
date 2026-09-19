@@ -1,0 +1,1 @@
+.agents,.claude .codex,.github .gitignore,AGENTS.md CLAUDE.md,EXTERNAL_CONTRIBUTORS.md LICENSE.md,LICENSE_AGPL LICENSE_ENTERPRISE,README.md ai-labs,docs logo.svg,mcp-catalog migration-kit,platform

@@ -1,0 +1,40 @@
+import AgentLabelModel from "@/models/agent-label";
+import * as metrics from "./metrics";
+import { agentRuntimeHealthMetrics } from "./metrics/agent-runtime-health";
+
+export async function initializeObservabilityMetrics(params?: {
+  includeMcpMetrics?: boolean;
+  includeAgentRunMetrics?: boolean;
+}): Promise<string[]> {
+  const { includeMcpMetrics = true, includeAgentRunMetrics = true } =
+    params ?? {};
+  const labelKeys = await AgentLabelModel.getAllKeys();
+
+  metrics.llm.initializeMetrics(labelKeys);
+
+  if (includeMcpMetrics) {
+    metrics.mcp.initializeMcpMetrics(labelKeys);
+  }
+
+  if (includeAgentRunMetrics) {
+    metrics.agentRun.initializeAgentRunMetrics(labelKeys);
+  }
+
+  metrics.database.initializeDatabaseMetrics();
+  metrics.fileStorage.initializeFileStorageMetrics();
+  metrics.rag.initializeRagMetrics();
+  metrics.sandbox.initializeSandboxMetrics();
+  metrics.scheduleTrigger.initializeScheduleTriggerMetrics();
+  metrics.taskQueue.initializeTaskQueueMetrics();
+  metrics.audit.initializeAuditMetrics();
+  metrics.chat.initializeChatMetrics();
+  metrics.agentRuntime.initializeAgentRuntimeMetrics();
+  agentRuntimeHealthMetrics.initialize();
+  metrics.skill.initializeSkillMetrics();
+  metrics.activeUsers.initializeActiveUsersMetrics();
+
+  return labelKeys;
+}
+
+export { metrics };
+export * as tracing from "./tracing";

@@ -1,0 +1,1271 @@
+import {
+  ALL_ARCHESTRA_TOKEN_PREFIXES,
+  CLAUDE_CODE_CLIENT_ID,
+  CLAUDE_CODE_CUSTOM_HEADERS_ENV_KEY,
+  CLAUDE_CODE_PROXY_ENV_KEYS,
+  CODEX_CLIENT_ID,
+  COPILOT_CLI_CLIENT_ID,
+  COPILOT_PROVIDER_ENV_KEYS,
+  DEFAULT_APP_NAME,
+  DEFAULT_MODELS,
+  EXTERNAL_AGENT_ID_HEADER,
+  isDefaultBrandedAppName,
+  type SupportedProvider,
+  VIRTUAL_KEY_HEADER,
+} from "@archestra/shared";
+import type {
+  ConnectionSetupClientId,
+  ConnectionSetupPlatform,
+  ConnectionSetupProxyAuth,
+} from "@/types";
+import { archestraMarkWithText } from "./archestra-mark";
+import { renderClaudeDesktopSetupScript } from "./connection-setup-script.claude-desktop";
+import { renderWindowsSetupScript } from "./connection-setup-script.windows";
+import { describeMarketplaceContents } from "./marketplace-copy";
+import {
+  buildStartupGuardContext,
+  buildStartupGuardInstallSection,
+  buildStartupGuardUnshadowSection,
+  type StartupGuardClient,
+} from "./startup-guard";
+import {
+  CLAUDE_CODE_GUARD_CLIENT,
+  CODEX_GUARD_CLIENT,
+  COPILOT_GUARD_CLIENT,
+} from "./startup-guard.clients";
+
+/**
+ * Pure renderers for the /connection one-command setup scripts. Everything in
+ * this module is deterministic string building — no DB, no I/O — so the route
+ * can render inside its claim transaction and tests can assert exact output.
+ *
+ * Script contract (see plan):
+ * - idempotent re-runs (remove-then-add for CLI registrations, key-scoped
+ *   JSON/TOML merges with backups for config files);
+ * - secrets are passed via shell variables / env / stdin, never as argv of
+ *   external commands;
+ * - `curl | bash` cannot export env into the parent shell, so env-based
+ *   config (Copilot, Codex login) is either performed inside the script or
+ *   emitted as ready-to-paste export lines;
+ * - every script ends with next steps + revocation guidance.
+ */
+
+export interface SetupScriptMcpSection {
+  /** Logical server name registered in the client (slug). */
+  serverName: string;
+  /** Gateway URL, e.g. https://host/v1/mcp/<gateway-slug>. */
+  url: string;
+}
+
+export interface SetupScriptProxySection {
+  /**
+   * "provider-key" (passthrough): only the base URL is rewired and the user
+   * keeps their own provider credentials — virtualKey/virtualKeyName are
+   * null. "virtual-key": the auto-provisioned key below is injected.
+   */
+  authMode: ConnectionSetupProxyAuth;
+  provider: SupportedProvider;
+  providerLabel: string;
+  /** Proxy URL, e.g. https://host/v1/anthropic/<profile-id>. */
+  url: string;
+  /** Slug of the LLM proxy name — provider id in client configs. */
+  proxyName: string;
+  /** Raw virtual key value injected at render time (virtual-key mode only). */
+  virtualKey: string | null;
+  /** Display name of the virtual key, for revocation guidance. */
+  virtualKeyName: string | null;
+  /**
+   * Raw passthrough virtual key value injected at render time, sent as the
+   * X-Archestra-Virtual-Key header so the proxy attributes the request to the
+   * user. Set only in passthrough (provider-key) mode for the Anthropic
+   * provider (Claude Code subscription passthrough); null otherwise. Orthogonal
+   * to `virtualKey` — it carries no provider credential.
+   */
+  passthroughVirtualKey: string | null;
+  /**
+   * Model the wizard's review step selected for the Copilot CLI (applied as
+   * COPILOT_MODEL — the CLI refuses to launch a BYOK provider without one).
+   * Null: the script falls back to the provider default only when the
+   * machine has no COPILOT_MODEL set.
+   */
+  model: string | null;
+  /**
+   * GitHub OAuth endpoints for the in-script device flow. Required when
+   * provider is "github-copilot" in passthrough mode: Copilot has no static
+   * API keys, so the script obtains the user's GitHub OAuth token locally
+   * (reusing the Copilot CLI's stored token when one works, otherwise running
+   * the device flow) and the token never leaves the machine.
+   */
+  githubCopilot?: {
+    /** Exchange endpoint used to verify a token has an active Copilot seat. */
+    tokenExchangeUrl: string;
+    /** Host serving /login/device/code and /login/oauth/access_token. */
+    deviceAuthBaseUrl: string;
+    /** GitHub App client id for the device flow. */
+    clientId: string;
+  } | null;
+}
+
+export interface SetupScriptSkillsSection {
+  cloneUrl: string;
+  marketplaceName: string;
+  /** Existing skills plugin is present. Defaults true for older callers/tests. */
+  hasSkills?: boolean;
+  /** Opaque hook-bearing plugin entries advertised by the same marketplace. */
+  pluginNames?: string[];
+}
+
+export interface SetupScriptContext {
+  clientId: ConnectionSetupClientId;
+  /** Target OS: "macos"/"linux" render bash, "windows" renders PowerShell. */
+  platform: ConnectionSetupPlatform;
+  /** White-label product name for user-facing messaging. */
+  appName: string;
+  mcp: SetupScriptMcpSection | null;
+  proxy: SetupScriptProxySection | null;
+  skills: SetupScriptSkillsSection | null;
+}
+
+/**
+ * The one-liner shown in the UI. `origin` is the API origin (no /v1). Windows
+ * gets a PowerShell `irm | iex` invocation; macOS/Linux get `curl | bash`.
+ */
+export function buildSetupCommand(params: {
+  origin: string;
+  rawToken: string;
+  platform: ConnectionSetupPlatform;
+}): string {
+  const url = `${params.origin}/api/connection-setups/script/${params.rawToken}`;
+  if (params.platform === "windows") {
+    // single quotes: nothing in the URL may expand in PowerShell.
+    return `irm ${psq(url)} | iex`;
+  }
+  // single quotes: nothing in the URL may expand in the user's shell.
+  return `curl -fsSL ${sh(url)} | bash`;
+}
+
+/** Strips the /v1 suffix the connection base URLs carry. */
+export function proxyBaseUrlToOrigin(baseUrl: string): string {
+  return baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "");
+}
+
+/**
+ * Value of the COPILOT_PROVIDER_HEADERS env var, shared by the bash and
+ * PowerShell renderers: attribution headers the Copilot CLI sends only to its
+ * BYOK provider endpoint (the LLM proxy), never to GitHub's own services.
+ * Entries are joined with a literal `\n` — the CLI's documented separator —
+ * so the value stays a single line in shell profiles and the Windows
+ * registry. Always carries the client id; in passthrough mode also the
+ * personal passthrough key that attributes the request to the user (the
+ * Copilot analog of Claude Code's ANTHROPIC_CUSTOM_HEADERS injection).
+ */
+export function copilotAttributionHeadersValue(
+  proxy: SetupScriptProxySection,
+): string {
+  const lines = [`${EXTERNAL_AGENT_ID_HEADER}: ${COPILOT_CLI_CLIENT_ID}`];
+  if (proxy.passthroughVirtualKey) {
+    lines.push(`${VIRTUAL_KEY_HEADER}: ${proxy.passthroughVirtualKey}`);
+  }
+  return lines.join("\\n");
+}
+
+/**
+ * Claude Code's post-install OAuth step, shared by the bash and PowerShell
+ * renderers. Registering the gateway is not enough: it authorizes each user
+ * individually, so its tools unlock only after a one-time browser sign-in.
+ */
+export function claudeCodeOAuthNextStep(serverName: string): string {
+  return `Run \`claude /mcp\`, select "${serverName}", and sign in via your browser — the gateway grants tool access per user, so its tools unlock after this one-time approval.`;
+}
+
+export function renderSetupScript(rawCtx: SetupScriptContext): string {
+  if (rawCtx.clientId === "claude-desktop") {
+    return renderClaudeDesktopSetupScript(rawCtx);
+  }
+  // appName is white-label, admin-controlled text that lands in script comments
+  // and bare echo strings. Collapse control characters (newlines, NUL, …) to
+  // spaces so it can never break out of a comment line and execute.
+  const ctx: SetupScriptContext = {
+    ...rawCtx,
+    appName: sanitizeAppName(rawCtx.appName),
+  };
+
+  // Windows targets a separate PowerShell renderer; macOS/Linux share bash.
+  if (ctx.platform === "windows") {
+    return renderWindowsSetupScript(ctx);
+  }
+
+  const sections: string[] = [header(ctx)];
+
+  switch (ctx.clientId) {
+    case "claude-code":
+      sections.push(...claudeCodeSections(ctx));
+      break;
+    case "codex":
+      sections.push(...codexSections(ctx));
+      break;
+    case "copilot-cli":
+      sections.push(...copilotSections(ctx));
+      break;
+    case "cursor":
+      sections.push(...cursorSections(ctx));
+      break;
+  }
+
+  sections.push(footer(ctx));
+  return `${sections.join("\n\n")}\n`;
+}
+
+// ===================================================================
+// Internal helpers — shared scaffolding
+// ===================================================================
+
+const CLIENT_LABELS: Record<ConnectionSetupClientId, string> = {
+  "claude-desktop": "Claude Desktop",
+  "claude-code": "Claude Code",
+  codex: "Codex",
+  "copilot-cli": "Copilot CLI",
+  cursor: "Cursor",
+};
+
+const CLIENT_BINARIES: Partial<Record<ConnectionSetupClientId, string>> = {
+  "claude-code": "claude",
+  codex: "codex",
+  "copilot-cli": "copilot",
+};
+
+/** Single-quote a value for bash; safe for arbitrary content. */
+function sh(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Single-quote a value for PowerShell; safe for arbitrary content. */
+function psq(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+/** Collapse control characters so appName is safe in comments and bare echoes. */
+function sanitizeAppName(appName: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping them is the point
+  return appName.replace(/[\x00-\x1f\x7f]+/g, " ").trim() || DEFAULT_APP_NAME;
+}
+
+/**
+ * Color setup + logging helpers shared by every script. Colors are emitted
+ * only when stdout is a TTY and NO_COLOR is unset, so piping the output to a
+ * file or a non-interactive shell keeps it clean ANSI-free text. `say` marks
+ * section headers, `ok` a success, `warn`/`err` advisory and failure lines
+ * (err goes to stderr so `curl -f | bash` surfaces it).
+ *
+ * `cli` runs an external client CLI with its stdout/stderr detached from the
+ * terminal — see the comment it carries into the script. Every
+ * `claude`/`codex`/`copilot` invocation must go through it, except ones already
+ * fed by a pipe (they own their stdin).
+ *
+ * The leading block normalizes the terminal's line discipline: a child that put
+ * the terminal in raw mode on an earlier run can leave it wedged (output no
+ * longer returns to column 0 and every line marches right), so we reset it up
+ * front and restore it on exit — the script both survives a wedged terminal and
+ * never hands one back.
+ */
+const SCRIPT_HELPERS = `# If stdout is a terminal, make sure its line discipline is sane: a CLI that
+# grabbed it (raw mode) on a previous run can leave newline handling off, which
+# staircases every following line to the right. Reset on entry so this run reads
+# cleanly, and on exit so the shell gets a usable terminal back.
+if [ -t 1 ] && command -v stty >/dev/null 2>&1 && { : </dev/tty; } 2>/dev/null; then
+  stty sane </dev/tty 2>/dev/null || true
+  trap 'stty sane </dev/tty 2>/dev/null || true' EXIT
+fi
+if [ -t 1 ] && [ -z "\${NO_COLOR:-}" ]; then
+  ARCH_C_RESET=$'\\033[0m'; ARCH_C_HEAD=$'\\033[1;36m'; ARCH_C_OK=$'\\033[1;32m'
+  ARCH_C_WARN=$'\\033[1;33m'; ARCH_C_ERR=$'\\033[1;31m'
+else
+  ARCH_C_RESET=''; ARCH_C_HEAD=''; ARCH_C_OK=''; ARCH_C_WARN=''; ARCH_C_ERR=''
+fi
+say()  { printf '\\n%s==> %s%s\\n' "$ARCH_C_HEAD" "$1" "$ARCH_C_RESET"; }
+ok()   { printf '%s==>%s %s\\n' "$ARCH_C_OK" "$ARCH_C_RESET" "$1"; }
+warn() { printf '%swarning:%s %s\\n' "$ARCH_C_WARN" "$ARCH_C_RESET" "$1"; }
+err()  { printf '%serror:%s %s\\n' "$ARCH_C_ERR" "$ARCH_C_RESET" "$1" >&2; }
+
+# Run a client CLI (claude/codex/copilot) so it prints plain text instead of
+# driving the terminal. Those CLIs render a full-screen TUI whenever stdout is a
+# tty: they probe the terminal for its theme/capabilities and position output
+# with absolute cursor moves, both of which assume they own the screen. Under
+# "curl | bash" they don't — this script is already writing to it — so the probe
+# replies echo in as stray text ("rgb:1e1e/1e1e/1e1e", "^[[?1;2c") and the
+# cursor moves land at the wrong column, cascading every following line to the
+# right. Piping stdout+stderr through cat makes stdout a pipe, not a tty, so each
+# CLI falls back to linear plain-text output; </dev/null keeps them off this
+# script's own stdin (the download pipe). pipefail preserves their exit status.
+cli() { "$@" </dev/null 2>&1 | cat; }`;
+
+function header(ctx: SetupScriptContext): string {
+  const label = CLIENT_LABELS[ctx.clientId];
+  const binary = CLIENT_BINARIES[ctx.clientId];
+  const requireBinary = binary
+    ? `
+if ! command -v ${binary} >/dev/null 2>&1; then
+  err "the '${binary}' CLI was not found on PATH. Install ${label} first, then re-run this command."
+  exit 1
+fi`
+    : "";
+
+  return `#!/usr/bin/env bash
+# ${ctx.appName} setup for ${label}.
+# Generated by the ${ctx.appName} /connection page. This script contains
+# credentials — do not share or commit it.
+set -euo pipefail
+
+${SCRIPT_HELPERS}
+
+${banner(ctx)}
+
+say ${sh(`${ctx.appName} setup: ${label}`)}${requireBinary}`;
+}
+
+/**
+ * Splash printed at the very top of every script: the Archestra ASCII mark
+ * (only when not white-labeled — printing the Archestra icon under a custom
+ * brand would be wrong) plus a portable, plain-ASCII details block. Printed
+ * through a quoted heredoc so nothing in it is ever expanded by bash.
+ */
+function banner(ctx: SetupScriptContext): string {
+  const label = CLIENT_LABELS[ctx.clientId];
+
+  const configures: string[] = [];
+  if (ctx.mcp) configures.push("MCP gateway (OAuth)");
+  if (ctx.proxy) {
+    configures.push(
+      `${ctx.proxy.providerLabel} via the LLM proxy${
+        ctx.proxy.virtualKey ? " (virtual key)" : ""
+      }`,
+    );
+  }
+  if (ctx.skills) {
+    configures.push(describeMarketplaceContents(ctx.skills).label);
+  }
+
+  // The one canonical Archestra mark (shared with the startup guards), block/
+  // quadrant glyphs that render as solid shapes in any UTF-8 terminal.
+  const logo = isDefaultBrandedAppName(ctx.appName)
+    ? archestraMarkWithText({ appName: ctx.appName }).join("\n")
+    : `   ${ctx.appName}
+   Secure access to your AI tools`;
+
+  const details = [
+    `   Client:     ${label}`,
+    configures.length > 0 ? `   Configures: ${configures.join(", ")}` : null,
+    `   Note:       one-time setup — this link expires after first use.`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  return `cat <<'ARCHESTRA_BANNER'
+
+${logo}
+
+${details}
+ARCHESTRA_BANNER`;
+}
+
+function footer(ctx: SetupScriptContext): string {
+  const lines = [`ok "Done."`];
+
+  const nextSteps = nextStepsFor(ctx);
+  if (nextSteps.length > 0) {
+    lines.push(`cat <<'ARCHESTRA_NEXT'
+
+Next steps:
+${nextSteps.map((step, i) => `  ${i + 1}. ${step}`).join("\n")}
+ARCHESTRA_NEXT`);
+  }
+
+  const revocation: string[] = [];
+  if (ctx.proxy?.virtualKeyName) {
+    revocation.push(
+      `delete the "${ctx.proxy.virtualKeyName}" key on the Virtual API Keys page`,
+    );
+  }
+  if (ctx.skills) {
+    revocation.push(
+      `revoke the "${ctx.skills.marketplaceName}" marketplace share link`,
+    );
+  }
+  if (revocation.length > 0) {
+    lines.push(`cat <<'ARCHESTRA_REVOKE'
+
+To revoke this machine's access later in ${ctx.appName}: ${revocation.join("; ")}.
+ARCHESTRA_REVOKE`);
+  }
+
+  return lines.join("\n");
+}
+
+function nextStepsFor(ctx: SetupScriptContext): string[] {
+  const steps: string[] = [];
+  switch (ctx.clientId) {
+    case "claude-code":
+      if (ctx.mcp) {
+        steps.push(claudeCodeOAuthNextStep(ctx.mcp.serverName));
+      }
+      if (ctx.skills?.hasSkills ?? !!ctx.skills) {
+        steps.push(
+          "The shared skills are installed for Claude Code — start `claude` and they load automatically.",
+        );
+      }
+      if (ctx.skills?.pluginNames?.length) {
+        steps.push(
+          `${ctx.skills.pluginNames.length} plugin${ctx.skills.pluginNames.length === 1 ? " is" : "s are"} installed and will load automatically.`,
+        );
+      }
+      if (ctx.mcp || ctx.proxy || ctx.skills) {
+        steps.push(
+          "Open a new terminal (or `source` your shell profile) so the startup guard wrapper takes effect — it checks these remotes before every `claude` launch.",
+        );
+      }
+      break;
+    case "codex":
+      if (ctx.mcp) {
+        steps.push(
+          `Run \`codex\` — it opens your browser to finish the OAuth handshake for "${ctx.mcp.serverName}".`,
+        );
+      }
+      if (ctx.proxy) {
+        if (!ctx.proxy.virtualKey) {
+          steps.push(
+            "Make sure Codex is signed in with your own OpenAI API key (printenv OPENAI_API_KEY | codex login --with-api-key).",
+          );
+        }
+        steps.push(
+          `Start Codex through the proxy: codex -c model_provider=${ctx.proxy.proxyName}`,
+        );
+      }
+      if (ctx.skills?.hasSkills ?? !!ctx.skills) {
+        steps.push(
+          'Run /plugins inside Codex and pick "Install Plugin" to install the included skills.',
+        );
+      }
+      if (ctx.skills?.pluginNames?.length) {
+        steps.push(
+          "Run `/hooks` inside Codex and approve each delivered hook before it can execute.",
+        );
+      }
+      break;
+    case "copilot-cli":
+      if (ctx.mcp) {
+        steps.push(
+          "Copilot opens your browser to complete OAuth when the gateway asks for it.",
+        );
+      }
+      if (ctx.proxy) {
+        steps.push(
+          'Paste the export lines printed above into your shell profile, set COPILOT_MODEL, then verify with: copilot -p "Reply with exactly: archestra-copilot-cli-ok"',
+        );
+      }
+      if (ctx.skills?.hasSkills ?? !!ctx.skills) {
+        steps.push(
+          `Browse and install the shared skills: copilot plugin marketplace browse ${ctx.skills.marketplaceName}`,
+        );
+      }
+      if (ctx.skills?.pluginNames?.length) {
+        steps.push("The plugins are installed and enabled.");
+      }
+      break;
+    case "cursor":
+      if (ctx.mcp) {
+        steps.push(
+          `Open Cursor settings → MCP and toggle on "${ctx.mcp.serverName}"; Cursor handles the OAuth flow.`,
+        );
+      }
+      if (ctx.proxy) {
+        steps.push(
+          "Apply the Cursor model settings printed above (Settings → Models → OpenAI API Key).",
+        );
+      }
+      if (ctx.skills) {
+        steps.push(
+          "Run /add-plugin in Cursor's command palette and paste the clone URL printed above.",
+        );
+        if (ctx.skills.pluginNames?.length) {
+          steps.push(
+            `Then install these plugins from Customize → Plugins: ${ctx.skills.pluginNames.join(", ")}.`,
+          );
+        }
+      }
+      break;
+  }
+  return steps;
+}
+
+/**
+ * Key-scoped JSON merge via python3 (no jq dependency). Values arrive through
+ * the child process env, never argv. Backs the file up before writing.
+ */
+function mergeJsonFileSnippet(params: {
+  file: string;
+  env: Record<string, string>;
+  python: string;
+  fallbackMessage: string;
+  fallbackSnippet: string;
+}): string {
+  const envAssignments = Object.entries(params.env)
+    .map(([key, value]) => `export ${key}=${sh(value)}`)
+    .join("\n");
+
+  // params.file is an internal constant like $HOME/.claude/settings.json and
+  // MUST render double-quoted: $HOME has to expand. sh()'s single quotes kept
+  // it literal, so mkdir dropped a junk ./'$HOME' dir in the cwd, the backup
+  // cp never matched, and on a machine without the config dir the python merge
+  // crashed and aborted the whole script under set -e.
+  return `if command -v python3 >/dev/null 2>&1; then
+  mkdir -p "$(dirname "${params.file}")"
+  # Back up once: a re-run must not overwrite the pristine pre-Archestra copy
+  # with our already-modified file. The merge below is itself idempotent.
+  if [ -f "${params.file}" ] && [ ! -f "${params.file}.archestra-backup" ]; then
+    cp "${params.file}" "${params.file}.archestra-backup"
+  fi
+${indent(envAssignments, "  ")}
+  python3 - <<'ARCHESTRA_PY'
+${params.python}
+ARCHESTRA_PY
+else
+  warn ${sh(params.fallbackMessage)}
+  cat <<'ARCHESTRA_MANUAL'
+${params.fallbackSnippet}
+ARCHESTRA_MANUAL
+fi`;
+}
+
+function indent(block: string, prefix: string): string {
+  return block
+    .split("\n")
+    .map((line) => (line.length > 0 ? `${prefix}${line}` : line))
+    .join("\n");
+}
+
+// ===================================================================
+// Internal helpers — Claude Code
+// ===================================================================
+
+function claudeCodeSections(ctx: SetupScriptContext): string[] {
+  const sections: string[] = [];
+
+  if (ctx.mcp) {
+    // Register at USER scope so the gateway is visible in every directory for
+    // this user. `claude mcp add` defaults to `local` (per-directory) scope,
+    // which makes the server "disappear" the moment Claude Code is run from a
+    // different folder than the one connect happened to run in. Clear BOTH the
+    // local and user scopes first: a stale local entry from an older connect run
+    // would otherwise shadow the user entry and fail `add` under `set -euo
+    // pipefail`, leaving the gateway removed and not re-added.
+    sections.push(`say ${sh(`Registering MCP gateway "${ctx.mcp.serverName}" (OAuth)`)}
+cli claude mcp remove --scope local ${sh(ctx.mcp.serverName)} >/dev/null 2>&1 || true
+cli claude mcp remove --scope user ${sh(ctx.mcp.serverName)} >/dev/null 2>&1 || true
+cli claude mcp add --scope user --transport http ${sh(ctx.mcp.serverName)} ${sh(ctx.mcp.url)}`);
+  }
+
+  if (ctx.proxy) {
+    sections.push(
+      ctx.proxy.provider === "bedrock"
+        ? claudeBedrockProxySection(ctx.proxy)
+        : claudeAnthropicProxySection(ctx.proxy),
+    );
+  }
+
+  if (ctx.skills) {
+    const hasSkills = ctx.skills.hasSkills ?? true;
+    const pluginNames = ctx.skills.pluginNames ?? [];
+    const pluginRef = `${ctx.skills.marketplaceName}@${ctx.skills.marketplaceName}`;
+    const installs = [
+      ...(hasSkills
+        ? [
+            `if ! cli claude plugin install ${sh(pluginRef)}; then
+  warn ${sh(`Could not install the skills automatically — run 'claude plugin install ${pluginRef}' or open /plugin inside Claude Code.`)}
+fi`,
+          ]
+        : []),
+      ...pluginNames.map((pluginName) => {
+        const ref = `${pluginName}@${ctx.skills?.marketplaceName}`;
+        return `if ! cli claude plugin install ${sh(ref)}; then
+  warn ${sh(`Could not install plugin — run 'claude plugin install ${ref}'.`)}
+fi`;
+      }),
+    ];
+    sections.push(`say ${sh(`Installing the "${ctx.skills.marketplaceName}" marketplace`)}
+${claudeMarketplaceRegistration(ctx.skills.marketplaceName, ctx.skills.cloneUrl)}
+${installs.join("\n")}`);
+  }
+
+  return withStartupGuard(ctx, CLAUDE_CODE_GUARD_CLIENT, sections);
+}
+
+/**
+ * Claude Code declares user marketplaces in settings.json as a structured
+ * source. Re-adding an identical marketplace is not always idempotent when
+ * the declared fetch identity differs. Compare the declaration first so
+ * matching registrations avoid that error and source or credential changes
+ * are reconciled deliberately. Both URL userinfo and an equivalent Basic
+ * Authorization header are supported representations of the same identity.
+ */
+function claudeMarketplaceRegistration(
+  marketplaceName: string,
+  cloneUrl: string,
+): string {
+  const add = `cli claude plugin marketplace add --scope user ${sh(cloneUrl)}`;
+  const remove = `cli claude plugin marketplace remove --scope user ${sh(marketplaceName)}`;
+  const registrationFailure = sh(
+    `Could not register the "${marketplaceName}" marketplace. Shared skills were not installed.`,
+  );
+
+  return `claude_marketplace_state() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s' unknown
+    return
+  fi
+  ARCHESTRA_MARKETPLACE_NAME=${sh(marketplaceName)} \\
+    ARCHESTRA_MARKETPLACE_URL=${sh(cloneUrl)} \\
+    python3 - <<'ARCHESTRA_MARKETPLACE_PY'
+import base64, json, os
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
+
+name = os.environ["ARCHESTRA_MARKETPLACE_NAME"]
+clone_url = os.environ["ARCHESTRA_MARKETPLACE_URL"]
+config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+settings_path = config_dir / "settings.json"
+
+try:
+    settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+except Exception:
+    print("unknown")
+    raise SystemExit
+
+source = settings.get("extraKnownMarketplaces", {}).get(name, {}).get("source")
+if not isinstance(source, dict):
+    print("add")
+    raise SystemExit
+
+def target(url):
+    parsed = urlsplit(url)
+    if not parsed.scheme or not parsed.hostname:
+        return None
+    host = parsed.hostname.lower()
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port = parsed.port
+    authority = host if port is None else f"{host}:{port}"
+    return (parsed.scheme.lower(), authority, parsed.path or "/", parsed.query)
+
+def credentials(url):
+    parsed = urlsplit(url)
+    if parsed.username is None:
+        return None
+    return f"{unquote(parsed.username)}:{unquote(parsed.password or '')}"
+
+def headers(value):
+    if isinstance(value, dict):
+        return {str(key).lower(): str(item) for key, item in value.items()}
+    if isinstance(value, list):
+        result = {}
+        for item in value:
+            if isinstance(item, dict) and isinstance(item.get("name"), str):
+                result[item["name"].lower()] = str(item.get("value", ""))
+        return result
+    return {}
+
+declared_url = source.get("url")
+desired_credentials = credentials(clone_url)
+declared_credentials = credentials(declared_url) if isinstance(declared_url, str) else None
+declared_headers = headers(source.get("headers"))
+source_has_extra_fetch_shape = any(
+    source.get(key) not in (None, "", [], {})
+    for key in ("ref", "path", "sparsePaths")
+)
+matches_url_credentials = declared_credentials == desired_credentials and not declared_headers
+if not declared_credentials and desired_credentials:
+    basic = base64.b64encode(desired_credentials.encode()).decode()
+    matches_url_credentials = declared_headers == {"authorization": f"Basic {basic}"}
+
+if (
+    source.get("source") == "git"
+    and isinstance(declared_url, str)
+    and target(declared_url) == target(clone_url)
+    and matches_url_credentials
+    and not source_has_extra_fetch_shape
+):
+    print("matching")
+else:
+    print("replace")
+ARCHESTRA_MARKETPLACE_PY
+}
+
+marketplace_state="$(claude_marketplace_state)"
+case "$marketplace_state" in
+  matching)
+    ok ${sh(`Marketplace "${marketplaceName}" is already registered with the requested source.`)}
+    ;;
+  replace)
+    say ${sh(`Updating the "${marketplaceName}" marketplace source`)}
+    ${remove}
+    ${add}
+    ;;
+  *)
+    if ! marketplace_add_output="$( ${add} )"; then
+      printf '%s\n' "$marketplace_add_output"
+      if [[ "$marketplace_add_output" == *"network source differs from the one declared for it in settings"* ]]; then
+        say ${sh(`Updating the "${marketplaceName}" marketplace source`)}
+        ${remove}
+        ${add}
+      else
+        err ${registrationFailure}
+        exit 1
+      fi
+    fi
+    ;;
+esac`;
+}
+
+/**
+ * Wrap a CLI client's setup steps with the same startup-guard lifecycle. The
+ * old guard is unshadowed before any client command runs and the refreshed
+ * guard is installed only after setup succeeds.
+ */
+function withStartupGuard(
+  ctx: SetupScriptContext,
+  client: StartupGuardClient,
+  sections: string[],
+): string[] {
+  return ctx.mcp || ctx.proxy || ctx.skills
+    ? [
+        buildStartupGuardUnshadowSection(client),
+        ...sections,
+        buildStartupGuardInstallSection(buildStartupGuardContext(ctx), client),
+      ]
+    : sections;
+}
+
+// One shared source for the proxy env keys connect writes into
+// ~/.claude/settings.json — the Disconnect panel and the startup guard strip
+// exactly the same lists.
+const [ANTHROPIC_BASE_URL_KEY, ANTHROPIC_AUTH_TOKEN_KEY] =
+  CLAUDE_CODE_PROXY_ENV_KEYS.anthropic;
+const [
+  CLAUDE_USE_BEDROCK_KEY,
+  AWS_REGION_KEY,
+  BEDROCK_BASE_URL_KEY,
+  AWS_BEARER_TOKEN_KEY,
+] = CLAUDE_CODE_PROXY_ENV_KEYS.bedrock;
+
+const CLAUDE_SETTINGS_MERGE_PY = `import json, os, pathlib
+path = pathlib.Path(os.path.expanduser("~/.claude/settings.json"))
+settings = {}
+if path.exists():
+    raw = path.read_text().strip()
+    if raw:
+        settings = json.loads(raw)
+env = settings.setdefault("env", {})
+for key in os.environ.get("ARCHESTRA_REMOVE_VIRTUAL_KEY_ENV", "").split(","):
+    value = env.get(key)
+    if isinstance(value, str) and any(value.startswith(prefix) for prefix in ${JSON.stringify(ALL_ARCHESTRA_TOKEN_PREFIXES)}):
+        env.pop(key)
+for key in os.environ:
+    if key.startswith("ARCHESTRA_SET_ENV_"):
+        env[key.removeprefix("ARCHESTRA_SET_ENV_")] = os.environ[key]
+# Replace both attribution headers so switching auth modes also removes a
+# passthrough key that the new configuration no longer uses.
+append_headers = os.environ.get("ARCHESTRA_APPEND_${CLAUDE_CODE_CUSTOM_HEADERS_ENV_KEY}")
+if append_headers:
+    # strip each line: the script's env-assignment block is indented, which
+    # indents the continuation lines of this multi-line value too.
+    new_lines = [ln.strip() for ln in append_headers.splitlines() if ln.strip()]
+    managed_names = {"${EXTERNAL_AGENT_ID_HEADER.toLowerCase()}", "${VIRTUAL_KEY_HEADER.toLowerCase()}"}
+    existing = env.get("${CLAUDE_CODE_CUSTOM_HEADERS_ENV_KEY}", "") or ""
+    lines = [
+        ln for ln in existing.splitlines()
+        if ln.strip() and ln.split(":", 1)[0].strip().lower() not in managed_names
+    ]
+    lines.extend(new_lines)
+    env["${CLAUDE_CODE_CUSTOM_HEADERS_ENV_KEY}"] = "\\n".join(lines)
+path.write_text(json.dumps(settings, indent=2) + "\\n")
+print(f"Updated {path}")`;
+
+/**
+ * Custom headers Claude Code sends on every proxied request (Anthropic and
+ * Bedrock alike — ANTHROPIC_CUSTOM_HEADERS applies to both), one "Name: Value"
+ * per line:
+ *  - X-Archestra-Agent-Id attributes the request to the Claude Code client.
+ *  - X-Archestra-Virtual-Key (passthrough) attributes it to the user.
+ */
+function claudeCustomHeaders(proxy: SetupScriptProxySection): string {
+  const headerLines = [`${EXTERNAL_AGENT_ID_HEADER}: ${CLAUDE_CODE_CLIENT_ID}`];
+  if (proxy.passthroughVirtualKey) {
+    headerLines.push(`${VIRTUAL_KEY_HEADER}: ${proxy.passthroughVirtualKey}`);
+  }
+  return headerLines.join("\n");
+}
+
+function claudeAnthropicProxySection(proxy: SetupScriptProxySection): string {
+  const removeVirtualKeyEnv = proxy.virtualKey
+    ? ["ANTHROPIC_API_KEY"]
+    : [ANTHROPIC_AUTH_TOKEN_KEY, "ANTHROPIC_API_KEY"];
+  const env: Record<string, string> = {
+    [`ARCHESTRA_SET_ENV_${ANTHROPIC_BASE_URL_KEY}`]: proxy.url,
+    ARCHESTRA_REMOVE_VIRTUAL_KEY_ENV: removeVirtualKeyEnv.join(","),
+  };
+  const manualEnv: Record<string, string> = {
+    [ANTHROPIC_BASE_URL_KEY]: proxy.url,
+  };
+  if (proxy.virtualKey) {
+    env[`ARCHESTRA_SET_ENV_${ANTHROPIC_AUTH_TOKEN_KEY}`] = proxy.virtualKey;
+    manualEnv[ANTHROPIC_AUTH_TOKEN_KEY] = proxy.virtualKey;
+  }
+  const customHeaders = claudeCustomHeaders(proxy);
+  env[`ARCHESTRA_APPEND_${CLAUDE_CODE_CUSTOM_HEADERS_ENV_KEY}`] = customHeaders;
+  manualEnv[CLAUDE_CODE_CUSTOM_HEADERS_ENV_KEY] = customHeaders;
+  const passthroughNote = proxy.virtualKey
+    ? ""
+    : `
+echo "Your existing ${proxy.providerLabel} credentials keep working — only the base URL changed."`;
+
+  return `say ${sh(`Routing Claude Code through the ${proxy.providerLabel} proxy`)}
+${mergeJsonFileSnippet({
+  file: "$HOME/.claude/settings.json",
+  env,
+  python: CLAUDE_SETTINGS_MERGE_PY,
+  fallbackMessage: claudeManualMergeMessage(removeVirtualKeyEnv),
+  fallbackSnippet: JSON.stringify({ env: manualEnv }, null, 2),
+})}${passthroughNote}`;
+}
+
+function claudeBedrockProxySection(proxy: SetupScriptProxySection): string {
+  const removeVirtualKeyEnv = proxy.virtualKey ? [] : [AWS_BEARER_TOKEN_KEY];
+  const customHeaders = claudeCustomHeaders(proxy);
+  const env: Record<string, string> = {
+    [`ARCHESTRA_SET_ENV_${CLAUDE_USE_BEDROCK_KEY}`]: "1",
+    [`ARCHESTRA_SET_ENV_${AWS_REGION_KEY}`]: "us-east-1",
+    [`ARCHESTRA_SET_ENV_${BEDROCK_BASE_URL_KEY}`]: proxy.url,
+    ARCHESTRA_REMOVE_VIRTUAL_KEY_ENV: removeVirtualKeyEnv.join(","),
+  };
+  const manualEnv: Record<string, string> = {
+    [CLAUDE_USE_BEDROCK_KEY]: "1",
+    [AWS_REGION_KEY]: "us-east-1",
+    [BEDROCK_BASE_URL_KEY]: proxy.url,
+  };
+  if (proxy.virtualKey) {
+    // The virtual key authenticates against the proxy as a Bedrock bearer
+    // token. Merged into settings.json env exactly like ANTHROPIC_AUTH_TOKEN
+    // on the Anthropic path, so the setup needs no manual paste step.
+    env[`ARCHESTRA_SET_ENV_${AWS_BEARER_TOKEN_KEY}`] = proxy.virtualKey;
+    manualEnv[AWS_BEARER_TOKEN_KEY] = proxy.virtualKey;
+  }
+  env[`ARCHESTRA_APPEND_${CLAUDE_CODE_CUSTOM_HEADERS_ENV_KEY}`] = customHeaders;
+  manualEnv[CLAUDE_CODE_CUSTOM_HEADERS_ENV_KEY] = customHeaders;
+
+  return `say ${sh("Routing Claude Code through the Bedrock proxy")}
+${mergeJsonFileSnippet({
+  file: "$HOME/.claude/settings.json",
+  env,
+  python: CLAUDE_SETTINGS_MERGE_PY,
+  fallbackMessage: claudeManualMergeMessage(removeVirtualKeyEnv),
+  fallbackSnippet: JSON.stringify({ env: manualEnv }, null, 2),
+})}
+echo "Update AWS_REGION in ~/.claude/settings.json if you use a different region."${
+    proxy.virtualKey
+      ? ""
+      : `
+echo "Your existing AWS credentials keep working — only the base URL changed."`
+  }`;
+}
+
+function claudeManualMergeMessage(removeVirtualKeyEnv: string[]): string {
+  const credentialCleanup = removeVirtualKeyEnv.length
+    ? ` Remove ${removeVirtualKeyEnv.join(" and ")} from env if their values start with ${ALL_ARCHESTRA_TOKEN_PREFIXES.join(" or ")}; keep your provider credentials.`
+    : "";
+  return `python3 not found — remove existing ${EXTERNAL_AGENT_ID_HEADER.toLowerCase()} and ${VIRTUAL_KEY_HEADER.toLowerCase()} lines from env.${CLAUDE_CODE_CUSTOM_HEADERS_ENV_KEY}.${credentialCleanup} Then merge this into ~/.claude/settings.json manually:`;
+}
+
+// ===================================================================
+// Internal helpers — Codex
+// ===================================================================
+
+/**
+ * TOML basic-string quoting for a header name/value in ~/.codex/config.toml.
+ * The inputs here (attribution header names and `arch_`-prefixed key values)
+ * never contain control characters or newlines, so escaping the two basic-string
+ * specials — backslash and double-quote — is sufficient and correct.
+ */
+function tomlBasicString(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * Attribution headers Codex sends on every proxied request, emitted as a
+ * `[model_providers.<name>.http_headers]` TOML table (Codex's equivalent of
+ * Claude Code's ANTHROPIC_CUSTOM_HEADERS), one `"Name" = "Value"` per line:
+ *  - X-Archestra-Agent-Id attributes the request to the Codex CLI client.
+ *  - X-Archestra-Virtual-Key (passthrough) attributes it to the user; in
+ *    virtual-key mode the injected key already carries that attribution.
+ */
+export function codexAttributionHeaderLines(
+  proxy: SetupScriptProxySection,
+): string {
+  const lines = [
+    `${tomlBasicString(EXTERNAL_AGENT_ID_HEADER)} = ${tomlBasicString(CODEX_CLIENT_ID)}`,
+  ];
+  if (proxy.passthroughVirtualKey) {
+    lines.push(
+      `${tomlBasicString(VIRTUAL_KEY_HEADER)} = ${tomlBasicString(proxy.passthroughVirtualKey)}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+function codexSections(ctx: SetupScriptContext): string[] {
+  const sections: string[] = [];
+
+  if (ctx.mcp || ctx.proxy || ctx.skills) {
+    // Codex owns config.toml wherever CODEX_HOME points (default ~/.codex),
+    // and every action below edits that file — the mcp/skills registrations
+    // through the codex CLI just as much as the provider block this script
+    // appends itself. The one-time backup must therefore be taken before the
+    // FIRST of them, or "pristine pre-Archestra config" would already contain
+    // the gateway the CLI registered a moment earlier.
+    sections.push(`CONFIG="\${CODEX_HOME:-$HOME/.codex}/config.toml"
+if [ -f "$CONFIG" ] && [ ! -f "$CONFIG.archestra-backup" ]; then
+  cp "$CONFIG" "$CONFIG.archestra-backup"
+fi`);
+  }
+
+  if (ctx.mcp) {
+    sections.push(`say ${sh(`Registering MCP gateway "${ctx.mcp.serverName}" (OAuth)`)}
+cli codex mcp remove ${sh(ctx.mcp.serverName)} >/dev/null 2>&1 || true
+cli codex mcp add ${sh(ctx.mcp.serverName)} --url ${sh(ctx.mcp.url)}`);
+  }
+
+  if (ctx.proxy) {
+    const marker = `archestra:${ctx.proxy.proxyName}`;
+    const block = `# >>> ${marker} >>>
+[model_providers.${ctx.proxy.proxyName}]
+name = "${ctx.proxy.proxyName}"
+base_url = "${ctx.proxy.url}"
+wire_api = "responses"
+requires_openai_auth = true
+
+[model_providers.${ctx.proxy.proxyName}.http_headers]
+${codexAttributionHeaderLines(ctx.proxy)}
+# <<< ${marker} <<<`;
+
+    sections.push(`say ${sh(`Adding the "${ctx.proxy.proxyName}" provider to Codex's config.toml`)}
+CONFIG="\${CODEX_HOME:-$HOME/.codex}/config.toml"
+mkdir -p "$(dirname "$CONFIG")"
+if [ -f "$CONFIG" ]; then
+  # drop any previous archestra-managed block for this provider (idempotent)
+  awk -v start=${sh(`# >>> ${marker} >>>`)} -v end=${sh(`# <<< ${marker} <<<`)} '
+    $0 == start {skip=1; next}
+    $0 == end {skip=0; next}
+    !skip {print}
+  ' "$CONFIG" > "$CONFIG.archestra-tmp" && mv "$CONFIG.archestra-tmp" "$CONFIG"
+fi
+cat >> "$CONFIG" <<'ARCHESTRA_TOML'
+${block}
+ARCHESTRA_TOML
+echo "Updated $CONFIG"${
+      ctx.proxy.virtualKey
+        ? `
+
+say ${sh("Signing Codex in with your virtual key")}
+ARCHESTRA_VIRTUAL_KEY=${sh(ctx.proxy.virtualKey)}
+printf '%s' "$ARCHESTRA_VIRTUAL_KEY" | codex login --with-api-key`
+        : `
+echo "Codex keeps using your own OpenAI API key login."`
+    }`);
+  }
+
+  if (ctx.skills) {
+    const installs = (ctx.skills.pluginNames ?? []).map((pluginName) => {
+      const ref = `${pluginName}@${ctx.skills?.marketplaceName}`;
+      return `if ! cli codex plugin add ${sh(ref)}; then
+  warn ${sh(`Could not deliver plugin — run 'codex plugin add ${ref}'.`)}
+fi`;
+    });
+    sections.push(`say ${sh(`Registering the "${ctx.skills.marketplaceName}" marketplace`)}
+if ! cli codex plugin marketplace add ${sh(ctx.skills.cloneUrl)}; then
+  warn "Marketplace may already be registered — run /plugins inside Codex to inspect."
+fi
+${installs.join("\n")}`);
+  }
+
+  return withStartupGuard(ctx, CODEX_GUARD_CLIENT, sections);
+}
+
+// ===================================================================
+// Internal helpers — Copilot CLI
+// ===================================================================
+
+function copilotSections(ctx: SetupScriptContext): string[] {
+  const sections: string[] = [];
+
+  if (ctx.mcp) {
+    sections.push(`say ${sh(`Registering MCP gateway "${ctx.mcp.serverName}" (OAuth)`)}
+cli copilot mcp remove ${sh(ctx.mcp.serverName)} >/dev/null 2>&1 || true
+cli copilot mcp add --transport http ${sh(ctx.mcp.serverName)} ${sh(ctx.mcp.url)}
+cli copilot mcp get ${sh(ctx.mcp.serverName)}`);
+  }
+
+  if (ctx.proxy) {
+    if (ctx.proxy.provider === "github-copilot" && !ctx.proxy.virtualKey) {
+      sections.push(copilotGithubLinkSection(ctx.proxy));
+    } else {
+      // A piped script cannot export into the caller's shell; print the lines.
+      sections.push(`say ${sh(`Copilot provider settings (${ctx.proxy.providerLabel} via OpenAI-compatible protocol)`)}
+cat <<'ARCHESTRA_COPILOT'
+
+Add these lines to your shell profile (e.g. ~/.zshrc); adjust ${COPILOT_PROVIDER_ENV_KEYS.model} if you use a different model:
+  export ${COPILOT_PROVIDER_ENV_KEYS.type}="openai"
+  export ${COPILOT_PROVIDER_ENV_KEYS.baseUrl}=${sh(ctx.proxy.url)}
+  export ${COPILOT_PROVIDER_ENV_KEYS.apiKey}=${
+    ctx.proxy.virtualKey
+      ? sh(ctx.proxy.virtualKey)
+      : `"<your-${ctx.proxy.provider}-api-key>"`
+  }
+  export ${COPILOT_PROVIDER_ENV_KEYS.model}="${ctx.proxy.model ?? DEFAULT_MODELS[ctx.proxy.provider]}"
+  export ${COPILOT_PROVIDER_ENV_KEYS.headers}="${copilotAttributionHeadersValue(ctx.proxy)}"
+ARCHESTRA_COPILOT`);
+    }
+  }
+
+  if (ctx.skills) {
+    const installs = (ctx.skills.pluginNames ?? []).map((pluginName) => {
+      const ref = `${pluginName}@${ctx.skills?.marketplaceName}`;
+      return `if ! cli copilot plugin install ${sh(ref)}; then
+  warn ${sh(`Could not install plugin — run 'copilot plugin install ${ref}'.`)}
+fi`;
+    });
+    sections.push(`say ${sh(`Registering the "${ctx.skills.marketplaceName}" marketplace`)}
+if ! cli copilot plugin marketplace add ${sh(ctx.skills.cloneUrl)}; then
+  warn "Marketplace may already be registered — run 'copilot plugin marketplace browse' to inspect."
+fi
+${installs.join("\n")}`);
+  }
+
+  return withStartupGuard(ctx, COPILOT_GUARD_CLIENT, sections);
+}
+
+/**
+ * GitHub Copilot in passthrough mode: there is no static API key — the proxy
+ * expects the user's long-lived GitHub OAuth token as the bearer. The script
+ * obtains one locally and prints it in the export lines, so the token never
+ * leaves the machine:
+ *  1. reuse a token the Copilot CLI / VS Code already stored in
+ *     ~/.config/github-copilot/{apps,hosts}.json — but only if Copilot's token
+ *     exchange accepts it (valid + active Copilot seat);
+ *  2. otherwise run the GitHub device flow (RFC 8628): show a code, poll
+ *     until the user authorizes in the browser, honoring interval/slow_down
+ *     with a hard deadline from expires_in.
+ * The token is never passed as argv to external commands (curl reads it via
+ * stdin config / request bodies via stdin).
+ */
+function copilotGithubLinkSection(proxy: SetupScriptProxySection): string {
+  const gh = proxy.githubCopilot;
+  if (!gh) {
+    throw new Error(
+      "github-copilot passthrough proxy section requires githubCopilot device-flow configuration",
+    );
+  }
+
+  const deviceCodeUrl = `${gh.deviceAuthBaseUrl.replace(/\/+$/, "")}/login/device/code`;
+  const accessTokenUrl = `${gh.deviceAuthBaseUrl.replace(/\/+$/, "")}/login/oauth/access_token`;
+  const deviceRequestBody = JSON.stringify({
+    client_id: gh.clientId,
+    scope: "read:user",
+  });
+
+  return `say 'Linking your GitHub Copilot subscription'
+ARCHESTRA_GHCP_TOKEN=""
+
+# Probe the Copilot token exchange: succeeds only for a valid GitHub token on
+# an account with an active Copilot seat. Token goes via stdin, never argv.
+ghcp_validate() {
+  [ -n "$1" ] || return 1
+  printf 'header = "authorization: token %s"\\n' "$1" | curl -fsS -o /dev/null \\
+    --connect-timeout 10 --max-time 30 -K - \\
+    -H 'accept: application/json' \\
+    -H 'editor-version: vscode/1.99.0' \\
+    -H 'copilot-integration-id: vscode-chat' \\
+    ${sh(gh.tokenExchangeUrl)} 2>/dev/null
+}
+
+if ! command -v python3 >/dev/null 2>&1; then
+  cat <<'ARCHESTRA_GHCP_MANUAL'
+python3 not found — skipping the automatic GitHub sign-in.
+Sign in manually instead: run the Copilot CLI once and complete its login,
+then use the "oauth_token" value from ~/.config/github-copilot/apps.json
+as COPILOT_PROVIDER_API_KEY below.
+ARCHESTRA_GHCP_MANUAL
+else
+  # 1. Reuse a GitHub token already stored by the Copilot CLI / VS Code.
+  ghcp_candidates="$(python3 - "$HOME/.config/github-copilot/apps.json" "$HOME/.config/github-copilot/hosts.json" <<'ARCHESTRA_GHCP_PY'
+import json, sys
+seen = []
+for path in sys.argv[1:]:
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception:
+        continue
+    if not isinstance(data, dict):
+        continue
+    for value in data.values():
+        if isinstance(value, dict):
+            token = value.get("oauth_token")
+            if isinstance(token, str) and token and token not in seen:
+                seen.append(token)
+print("\\n".join(seen))
+ARCHESTRA_GHCP_PY
+)" || ghcp_candidates=""
+  for ghcp_candidate in $ghcp_candidates; do
+    if ghcp_validate "$ghcp_candidate"; then
+      ARCHESTRA_GHCP_TOKEN="$ghcp_candidate"
+      echo "Re-using the GitHub token stored by the Copilot CLI on this machine."
+      break
+    fi
+  done
+
+  # 2. No usable stored token: run the GitHub device flow.
+  if [ -z "$ARCHESTRA_GHCP_TOKEN" ]; then
+    ghcp_device="$(printf '%s' ${sh(deviceRequestBody)} | curl -fsS --connect-timeout 10 --max-time 30 \\
+      -X POST -H 'accept: application/json' -H 'content-type: application/json' \\
+      --data @- ${sh(deviceCodeUrl)})" || {
+      err "could not reach GitHub to start the device flow."
+      exit 1
+    }
+    ghcp_field() { printf '%s' "$ghcp_device" | python3 -c "import json,sys; print(json.load(sys.stdin).get('$1',''))"; }
+    ghcp_device_code="$(ghcp_field device_code)"
+    ghcp_user_code="$(ghcp_field user_code)"
+    ghcp_verification_uri="$(ghcp_field verification_uri)"
+    ghcp_interval="$(ghcp_field interval)"
+    ghcp_expires_in="$(ghcp_field expires_in)"
+    [ -n "$ghcp_interval" ] || ghcp_interval=5
+    [ -n "$ghcp_expires_in" ] || ghcp_expires_in=900
+    if [ -z "$ghcp_device_code" ]; then
+      err "GitHub did not return a device code."
+      exit 1
+    fi
+    ghcp_deadline=$(( $(date +%s) + ghcp_expires_in ))
+    echo
+    printf '  Open:        %s\\n' "$ghcp_verification_uri"
+    printf '  Enter code:  %s\\n' "$ghcp_user_code"
+    echo
+    echo 'Waiting for you to authorize in the browser...'
+    while [ -z "$ARCHESTRA_GHCP_TOKEN" ]; do
+      if [ "$(date +%s)" -ge "$ghcp_deadline" ]; then
+        err "timed out waiting for GitHub authorization — re-run this command to try again."
+        exit 1
+      fi
+      sleep "$ghcp_interval"
+      ghcp_poll="$(printf '{"client_id":"%s","device_code":"%s","grant_type":"urn:ietf:params:oauth:grant-type:device_code"}' ${sh(gh.clientId)} "$ghcp_device_code" | \\
+        curl -sS --connect-timeout 10 --max-time 30 \\
+          -X POST -H 'accept: application/json' -H 'content-type: application/json' \\
+          --data @- ${sh(accessTokenUrl)})" || continue
+      ghcp_token="$(printf '%s' "$ghcp_poll" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("access_token","") or "")' 2>/dev/null)" || ghcp_token=""
+      if [ -n "$ghcp_token" ]; then
+        ARCHESTRA_GHCP_TOKEN="$ghcp_token"
+        break
+      fi
+      ghcp_error="$(printf '%s' "$ghcp_poll" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("error",""))' 2>/dev/null)" || ghcp_error=""
+      case "$ghcp_error" in
+        # keep polling on pending and on transient/parse hiccups
+        authorization_pending|"") ;;
+        slow_down) ghcp_interval=$((ghcp_interval + 5)) ;;
+        *) err "GitHub sign-in failed: $ghcp_error"; exit 1 ;;
+      esac
+    done
+    ok "GitHub account linked."
+    if ! ghcp_validate "$ARCHESTRA_GHCP_TOKEN"; then
+      err "this GitHub account does not appear to have an active Copilot subscription."
+      exit 1
+    fi
+  fi
+fi
+
+say 'Copilot provider settings (GitHub Copilot via OpenAI-compatible protocol)'
+echo
+echo 'Add these lines to your shell profile (e.g. ~/.zshrc); adjust ${COPILOT_PROVIDER_ENV_KEYS.model} if you use a different model:'
+printf '  export ${COPILOT_PROVIDER_ENV_KEYS.type}="openai"\\n'
+printf '  export ${COPILOT_PROVIDER_ENV_KEYS.baseUrl}="%s"\\n' ${sh(proxy.url)}
+if [ -n "$ARCHESTRA_GHCP_TOKEN" ]; then
+  printf '  export ${COPILOT_PROVIDER_ENV_KEYS.apiKey}="%s"\\n' "$ARCHESTRA_GHCP_TOKEN"
+else
+  printf '  export ${COPILOT_PROVIDER_ENV_KEYS.apiKey}="%s"\\n' '<your-github-oauth-token>'
+fi
+printf '  export ${COPILOT_PROVIDER_ENV_KEYS.model}="${proxy.model ?? DEFAULT_MODELS["github-copilot"]}"\\n'
+printf '  export ${COPILOT_PROVIDER_ENV_KEYS.headers}="%s"\\n' ${sh(copilotAttributionHeadersValue(proxy))}`;
+}
+
+// ===================================================================
+// Internal helpers — Cursor
+// ===================================================================
+
+const CURSOR_MCP_MERGE_PY = `import json, os, pathlib
+path = pathlib.Path(os.path.expanduser("~/.cursor/mcp.json"))
+config = {}
+if path.exists():
+    raw = path.read_text().strip()
+    if raw:
+        config = json.loads(raw)
+servers = config.setdefault("mcpServers", {})
+servers[os.environ["ARCHESTRA_MCP_SERVER_NAME"]] = {
+    "url": os.environ["ARCHESTRA_MCP_SERVER_URL"],
+}
+path.write_text(json.dumps(config, indent=2) + "\\n")
+print(f"Updated {path}")`;
+
+function cursorSections(ctx: SetupScriptContext): string[] {
+  const sections: string[] = [];
+
+  if (ctx.mcp) {
+    sections.push(`say ${sh(`Adding MCP gateway "${ctx.mcp.serverName}" to ~/.cursor/mcp.json (OAuth)`)}
+${mergeJsonFileSnippet({
+  file: "$HOME/.cursor/mcp.json",
+  env: {
+    ARCHESTRA_MCP_SERVER_NAME: ctx.mcp.serverName,
+    ARCHESTRA_MCP_SERVER_URL: ctx.mcp.url,
+  },
+  python: CURSOR_MCP_MERGE_PY,
+  fallbackMessage:
+    "python3 not found — merge this into ~/.cursor/mcp.json manually:",
+  fallbackSnippet: JSON.stringify(
+    { mcpServers: { [ctx.mcp.serverName]: { url: ctx.mcp.url } } },
+    null,
+    2,
+  ),
+})}`);
+  }
+
+  if (ctx.proxy) {
+    // Cursor's model settings are UI-only; print everything needed for paste.
+    sections.push(`say ${sh("Cursor model settings (manual step)")}
+cat <<'ARCHESTRA_CURSOR'
+
+In Cursor: Settings -> Models -> API Keys -> OpenAI API Key
+  1. Turn on "Override OpenAI Base URL" and paste: ${ctx.proxy.url}
+  2. ${
+    ctx.proxy.virtualKey
+      ? `Paste this key into the API Key field and click Verify:
+     ${ctx.proxy.virtualKey}`
+      : `Paste your own ${ctx.proxy.providerLabel} API key into the API Key field and click Verify.`
+  }
+ARCHESTRA_CURSOR`);
+  }
+
+  if (ctx.skills) {
+    sections.push(`say ${sh(`${describeMarketplaceContents(ctx.skills).label} (manual step)`)}
+cat <<'ARCHESTRA_CURSOR_SKILLS'
+
+In Cursor's command palette run /add-plugin and paste:
+  ${ctx.skills.cloneUrl}
+ARCHESTRA_CURSOR_SKILLS`);
+  }
+
+  return sections;
+}

@@ -1,0 +1,242 @@
+import { vi } from "vitest";
+import type { FastifyInstanceWithZod } from "@/server";
+import { createFastifyInstance } from "@/server";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import type { User } from "@/types";
+
+vi.mock("@/auth");
+
+import { hasPermission } from "@/auth";
+import { OrganizationModel } from "@/models";
+
+vi.mock("@/config", async () =>
+  (await import("@/test/mocks/config")).configModuleMock({
+    enterpriseFeatures: { core: true },
+  }),
+);
+
+describe("PATCH /api/organization/connection-settings", () => {
+  let app: FastifyInstanceWithZod;
+  let adminUser: User;
+  let organizationId: string;
+
+  beforeEach(async ({ makeAdmin, makeMember, makeOrganization }) => {
+    vi.clearAllMocks();
+    vi.mocked(hasPermission).mockResolvedValue({ success: true, error: null });
+
+    adminUser = await makeAdmin();
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+    await makeMember(adminUser.id, organizationId, { role: "admin" });
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (
+        request as typeof request & {
+          user: unknown;
+          organizationId: string;
+        }
+      ).user = adminUser;
+      (
+        request as typeof request & {
+          user: { id: string };
+          organizationId: string;
+        }
+      ).organizationId = organizationId;
+    });
+
+    const { default: organizationRoutes } = await import("./organization");
+    await app.register(organizationRoutes);
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await app.close();
+  });
+
+  test("persists admin defaults and hidden lists", async ({ makeAgent }) => {
+    const gateway = await makeAgent({
+      organizationId,
+      authorId: adminUser.id,
+      agentType: "mcp_gateway",
+      name: "Admin Default Gateway",
+    });
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: {
+        connectionDefaultMcpGatewayId: gateway.id,
+        connectionShownClientIds: ["claude-code"],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.connectionDefaultMcpGatewayId).toBe(gateway.id);
+    expect(body.connectionShownClientIds).toEqual(["claude-code"]);
+  });
+
+  test("refuses the retired connect-page provider list", async () => {
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: { connectionShownProviders: ["openai"] },
+    });
+
+    // Silently stripping it would let a stale tab look like it gated
+    // providers while changing nothing.
+    expect(response.statusCode).toBe(400);
+  });
+
+  test("rejects a gateway that belongs to another organization", async ({
+    makeAgent,
+    makeOrganization,
+    makeUser,
+  }) => {
+    const otherOrg = await makeOrganization();
+    const otherUser = await makeUser();
+    const foreignGateway = await makeAgent({
+      organizationId: otherOrg.id,
+      authorId: otherUser.id,
+      agentType: "mcp_gateway",
+      name: "Foreign Gateway",
+    });
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: {
+        connectionDefaultMcpGatewayId: foreignGateway.id,
+      },
+    });
+
+    expect(response.statusCode).toBe(404);
+  });
+
+  test("rejects a wrong-type agent for the gateway slot", async ({
+    makeAgent,
+  }) => {
+    const proxy = await makeAgent({
+      organizationId,
+      authorId: adminUser.id,
+      agentType: "llm_proxy",
+      name: "Not a gateway",
+    });
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: {
+        connectionDefaultMcpGatewayId: proxy.id,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
+
+  test("ignores a stale connection-default LLM proxy key from older clients", async ({
+    makeAgent,
+  }) => {
+    // The LLM Proxy needs no selection; the request key is simply stripped so
+    // a stale tab's payload keeps working, and the stored column stays as-is.
+    const proxy = await makeAgent({
+      organizationId,
+      authorId: adminUser.id,
+      agentType: "llm_proxy",
+      name: "Stale Client Proxy",
+    });
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: {
+        connectionDefaultLlmProxyId: proxy.id,
+        connectionShownClientIds: ["claude-code"],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().connectionDefaultLlmProxyId).toBeNull();
+  });
+
+  test("persists and clears the default client id", async () => {
+    const setResponse = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: { connectionDefaultClientId: "cursor" },
+    });
+    expect(setResponse.statusCode).toBe(200);
+    expect(setResponse.json().connectionDefaultClientId).toBe("cursor");
+
+    const clearResponse = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: { connectionDefaultClientId: null },
+    });
+    expect(clearResponse.statusCode).toBe(200);
+    expect(clearResponse.json().connectionDefaultClientId).toBeNull();
+  });
+
+  test("persists skills, LLM proxy, and plugin availability on the connect page", async () => {
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: {
+        connectionSkillsEnabled: false,
+        connectionLlmProxyEnabled: false,
+        connectionPluginsEnabled: false,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().connectionSkillsEnabled).toBe(false);
+    expect(response.json().connectionLlmProxyEnabled).toBe(false);
+    expect(response.json().connectionPluginsEnabled).toBe(false);
+    expect(
+      await OrganizationModel.findByIdForAudit(organizationId, organizationId),
+    ).toMatchObject({
+      connectionSkillsEnabled: false,
+      connectionLlmProxyEnabled: false,
+      connectionPluginsEnabled: false,
+    });
+
+    const restored = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: {
+        connectionSkillsEnabled: true,
+        connectionLlmProxyEnabled: true,
+        connectionPluginsEnabled: true,
+      },
+    });
+    expect(restored.statusCode).toBe(200);
+    expect(restored.json().connectionSkillsEnabled).toBe(true);
+    expect(restored.json().connectionLlmProxyEnabled).toBe(true);
+    expect(restored.json().connectionPluginsEnabled).toBe(true);
+  });
+
+  test("allows clearing defaults with null", async ({ makeAgent }) => {
+    const gateway = await makeAgent({
+      organizationId,
+      authorId: adminUser.id,
+      agentType: "mcp_gateway",
+      name: "Temp Gateway",
+    });
+
+    await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: { connectionDefaultMcpGatewayId: gateway.id },
+    });
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: "/api/organization/connection-settings",
+      payload: { connectionDefaultMcpGatewayId: null },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().connectionDefaultMcpGatewayId).toBeNull();
+  });
+});

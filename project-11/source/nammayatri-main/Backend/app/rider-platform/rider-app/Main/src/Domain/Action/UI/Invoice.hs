@@ -1,0 +1,182 @@
+module Domain.Action.UI.Invoice
+  ( getInvoice,
+    getInvoiceList,
+  )
+where
+
+import qualified API.Types.UI.Invoice as DTInvoice
+import qualified BecknV2.OnDemand.Enums as Enums
+import qualified Domain.Types.FareBreakup as DFareBreakup
+import Domain.Types.Invoice (InvoiceType, IssuedToType (..))
+import qualified Domain.Types.Merchant as DM
+import qualified Domain.Types.Person as DP
+import Environment
+import EulerHS.Prelude hiding (id)
+import qualified Data.Text as T
+import Kernel.Prelude
+import Kernel.Types.Id
+import Kernel.Utils.Common
+import qualified Lib.Finance.Domain.Types.Invoice as FinanceInvoice
+import qualified Lib.Finance.Invoice.Service as InvoiceSvc
+import qualified SharedLogic.Finance.RidePayment as RidePaymentFinance
+import Storage.Beam.Payment ()
+import qualified Storage.Clickhouse.Booking as CHB
+import qualified Storage.Clickhouse.FareBreakup as CHFB
+import qualified Storage.Clickhouse.FareBreakupInfo as CHFBI
+import qualified Storage.Clickhouse.Location as CHL
+import qualified Storage.Clickhouse.Ride as CHR
+import Tools.Error
+
+getInvoice :: (Maybe (Id DP.Person), Id DM.Merchant) -> UTCTime -> UTCTime -> Flow [DTInvoice.InvoiceRes]
+getInvoice (mbPersonId, merchantId) from to = do
+  personId <- mbPersonId & fromMaybeM (PersonNotFound "No person found")
+  bookings <- CHB.findAllCompletedRiderBookingsByMerchantInRange merchantId personId from to
+  invoices <- mapM makeInvoiceResponse bookings
+  return $ catMaybes invoices
+  where
+    makeInvoiceResponse booking = do
+      mbRide <- CHR.findRideByBookingId booking.id booking.createdAt
+      case mbRide of
+        Just ride -> do
+          let breakupItems =
+                [ ("BASE_FARE", "Base Fare"),
+                  ("CUSTOMER_SELECTED_FARE", "Customer Selected Fare"),
+                  ("DEAD_KILOMETER_FARE", "Dead Kilometer Fare"),
+                  ("DISTANCE_FARE", "Distance Fare"),
+                  ("DRIVER_SELECTED_FARE", "Driver Selected Fare"),
+                  ("EXTRA_TIME_FARE", "Extra Time Fare"),
+                  ("FIXED_GOVERNMENT_RATE", "Fixed Government Fare"),
+                  ("NIGHT_SHIFT_CHARGE", "Night Shift Charge"),
+                  ("RIDE_DURATION_FARE", "Ride duration Fare"),
+                  ("PLATFORM_FEE", "Platform Fee"),
+                  ("CGST", "CGST"),
+                  ("SGST", "SGST"),
+                  ("SERVICE_CHARGE", "Service Charge"),
+                  ("TIME_BASED_FARE", "Time Based Fare"),
+                  ("DIST_BASED_FARE", "Distance Based Fare"),
+                  ("EXTRA_DISTANCE_FARE", "Extra Distance Fare"),
+                  ("WAITING_OR_PICKUP_CHARGES", "Wating Charge"),
+                  ("PARKING_CHARGE", "Parking Charge"),
+                  ("RIDE_STOP_CHARGES", "Ride Stop Charges"),
+                  ("PER_STOP_CHARGES", "Per Stop Charges"),
+                  ("LUGGAGE_CHARGE", "Luggage Charge"),
+                  ("DRIVER_ALLOWANCE", "Driver Allowance"),
+                  ("AIRPORT_CONVENIENCE_FEE", "Airport Convenience Fee"),
+                  ("RETURN_FEE", "Return Fee"),
+                  ("BOOTH_CHARGE", "Booth Charge"),
+                  ("SCHEDULING_CHARGE", "Scheduling Charge")
+                ]
+          mbInfoItems <- CHFBI.findFareBreakupItemsByEntityIdAndType booking.id.getId DFareBreakup.BOOKING booking.createdAt
+          fareBreakups <- mapM (getFareBreakup booking mbInfoItems) breakupItems
+          gateFeeBreakups <- getGateFeeBreakups booking mbInfoItems
+          mbSource <- case booking.fromLocationId of
+            Just fromLocId -> CHL.findLocationById fromLocId booking.createdAt
+            Nothing -> return Nothing
+          mbDestination <- case booking.toLocationId of
+            Just toLocId -> CHL.findLocationById toLocId booking.createdAt
+            Nothing -> return Nothing
+          return $
+            Just $
+              DTInvoice.InvoiceRes
+                { date = booking.createdAt,
+                  destination = maybe notAvailableText buildAddress mbDestination,
+                  driverName = fromMaybe notAvailableText ride.driverName,
+                  faresList = catMaybes fareBreakups <> gateFeeBreakups,
+                  rideEndTime = fromMaybe ride.updatedAt ride.rideEndTime,
+                  rideStartTime = fromMaybe ride.createdAt ride.rideStartTime,
+                  shortRideId = ride.shortId.getShortId,
+                  source = maybe notAvailableText buildAddress mbSource,
+                  totalAmount = maybe notAvailableText show ride.totalFare,
+                  vehicleNumber = fromMaybe notAvailableText ride.vehicleNumber,
+                  chargeableDistance = ride.chargeableDistance,
+                  chargeableDistanceWithUnit = convertHighPrecMetersToDistance Meter <$> ride.chargeableDistance -- FIXME use proper unit
+                }
+        Nothing -> return Nothing
+    getFareBreakup booking mbInfoItems (tag, title) =
+      case mbInfoItems of
+        Just infoItems ->
+          return $ (\item -> DTInvoice.FareBreakup {price = show item.amount, title}) <$> Kernel.Prelude.find ((== tag) . (.description)) infoItems
+        Nothing -> do
+          fareBreakup <- CHFB.findFareBreakupByBookingIdAndDescription booking.id tag booking.createdAt
+          case fareBreakup of
+            Just breakup -> return . Just $ DTInvoice.FareBreakup {price = maybe notAvailableText show breakup.amount, title}
+            Nothing -> return Nothing
+    -- A gate fee item's title carries an operator-configured name, so it cannot be
+    -- in the fixed list above. Pick them out of the stored breakups by their
+    -- GATE_FEE: prefix and show each under its configured name. Matching on the
+    -- prefix rather than "anything unrecognised" keeps the internal summary tags
+    -- (RIDE_FARE_*, PAYMENT_CHARGE_*, ...) off the invoice.
+    getGateFeeBreakups booking mbInfoItems = do
+      titledAmounts <- case mbInfoItems of
+        Just infoItems -> return [(item.description, show item.amount) | item <- infoItems]
+        Nothing -> do
+          breakups <- CHFB.findFareBreakupsByBookingId booking.id booking.createdAt
+          return [(breakup.description, maybe notAvailableText show breakup.amount) | breakup <- breakups]
+      return
+        [ DTInvoice.FareBreakup {price, title}
+          | (description, price) <- titledAmounts,
+            Just title <- [Enums.gateFeeBreakupItemName description]
+        ]
+    buildAddress loc =
+      case loc.ward of
+        Just w -> w
+        Nothing ->
+          let parts = catMaybes [loc.area, loc.street, loc.building, loc.city]
+           in if Kernel.Prelude.null parts then notAvailableText else T.intercalate ", " parts
+    notAvailableText = "N/A"
+
+-- | List finance-kernel invoices (Ride, RideCancellation) for the authenticated rider.
+--   Optional 'mbReferenceId' narrows results to a specific ride: we look up all
+--   ledger entries with that reference_id and keep only invoices linked to them
+--   via 'finance_invoice_ledger_link'.
+getInvoiceList ::
+  (Maybe (Id DP.Person), Id DM.Merchant) ->
+  Maybe InvoiceType ->
+  Maybe Int ->
+  Maybe Int ->
+  Maybe Text ->
+  Flow DTInvoice.FinanceInvoiceListRes
+getInvoiceList (mbPersonId, _) mbInvoiceType mbLimit mbOffset mbReferenceId = do
+  personId <- mbPersonId & fromMaybeM (PersonNotFound "No person found")
+  let riderIdText = personId.getId
+      limit = min 20 . fromMaybe 10 $ mbLimit
+      offset = fromMaybe 0 mbOffset
+  allInvoices <- InvoiceSvc.findByIssuedTo RIDER riderIdText
+  filteredByRef <- case mbReferenceId of
+    Nothing -> pure allInvoices
+    Just refId -> do
+      entries <- RidePaymentFinance.findRidePaymentEntries refId
+      linkedInvoices <- catMaybes <$> mapM (InvoiceSvc.getInvoiceForEntry . (.id)) entries
+      let linkedIds = [inv.id | inv <- linkedInvoices]
+      pure $ Kernel.Prelude.filter (\i -> i.id `Kernel.Prelude.elem` linkedIds) allInvoices
+  let invoices = Kernel.Prelude.take limit . Kernel.Prelude.drop offset $
+        case mbInvoiceType of
+          Just invType -> Kernel.Prelude.filter (\i -> i.invoiceType == invType) filteredByRef
+          Nothing -> filteredByRef
+  let items = Kernel.Prelude.map buildInvoiceItem invoices
+  pure $
+    DTInvoice.FinanceInvoiceListRes
+      { invoices = items,
+        totalItems = Kernel.Prelude.length items
+      }
+  where
+    buildInvoiceItem :: FinanceInvoice.Invoice -> DTInvoice.FinanceInvoiceItem
+    buildInvoiceItem inv =
+      let taxAmount = inv.totalAmount - inv.subtotal
+       in DTInvoice.FinanceInvoiceItem
+            { invoiceNumber = inv.invoiceNumber,
+              invoiceType = inv.invoiceType,
+              invoiceStatus = inv.status,
+              invoiceDate = inv.issuedAt,
+              totalAmount = inv.totalAmount,
+              subtotal = inv.subtotal,
+              taxAmount = taxAmount,
+              lineItems = Just inv.lineItems,
+              issuedToName = inv.issuedToName,
+              issuedToAddress = inv.issuedToAddress,
+              issuedByName = inv.issuedByName,
+              issuedByAddress = inv.issuedByAddress,
+              taxRate = Nothing,
+              issuedToTaxNo = Nothing,
+              issuedByTaxNo = Nothing
+            }

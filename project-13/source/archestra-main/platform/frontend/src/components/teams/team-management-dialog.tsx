@@ -1,0 +1,1092 @@
+"use client";
+
+import {
+  ADMIN_ROLE_NAME,
+  archestraApiSdk,
+  type archestraApiTypes,
+  DocsPage,
+  getDocsUrl,
+  MEMBER_ROLE_NAME,
+} from "@archestra/shared";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  Check,
+  ChevronDown,
+  Copy,
+  Key,
+  RefreshCw,
+  Trash2,
+  Users,
+} from "lucide-react";
+import Link from "next/link";
+import {
+  type ComponentType,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { toast } from "sonner";
+import { AdvancedLabelsSection } from "@/components/advanced-labels-section";
+import type { ProfileLabel, ProfileLabelsRef } from "@/components/agent-labels";
+import { ExternalDocsLink } from "@/components/external-docs-link";
+import { TabbedDialogShell } from "@/components/tabbed-dialog-shell";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { FieldDescription } from "@/components/ui/field-description";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { RoleSelect } from "@/components/ui/role-select";
+import { SearchableSelect } from "@/components/ui/searchable-select";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Textarea } from "@/components/ui/textarea";
+import { UserSearchableSelect } from "@/components/user-searchable-select";
+import { useHasPermissions } from "@/lib/auth/auth.query";
+import { copyToClipboard } from "@/lib/clipboard";
+import config from "@/lib/config/config";
+import { useFeature } from "@/lib/config/config.query";
+import { useMemberSearch } from "@/lib/member.query";
+import { useActiveOrganization } from "@/lib/organization.query";
+import { useTeams } from "@/lib/teams/team.query";
+import {
+  formatTeamPath,
+  getTeamDescendantIds,
+} from "@/lib/teams/team-hierarchy";
+import { type TeamToken, useTokens } from "@/lib/teams/team-token.query";
+import { cn } from "@/lib/utils";
+import { formatRelativeTimeFromNow } from "@/lib/utils/date-time";
+import { EnterpriseLicenseRequired } from "../enterprise-license-required";
+
+type Team = archestraApiTypes.GetTeamsResponses["200"]["data"][number];
+type TeamDialogSection =
+  | "team"
+  | "members"
+  | "token"
+  | "vault-folder"
+  | "external-groups";
+type TeamMemberRole = typeof ADMIN_ROLE_NAME | typeof MEMBER_ROLE_NAME;
+
+/**
+ * Member edits staged in the dialog, keyed by userId. Nothing is sent to the
+ * server until Save — the members list renders the server state with these
+ * changes applied on top.
+ */
+type StagedMemberChange =
+  | { type: "add"; role: TeamMemberRole; name?: string; email?: string }
+  | { type: "remove" }
+  | { type: "role"; role: TeamMemberRole };
+type StagedMemberChanges = Map<string, StagedMemberChange>;
+type TeamManagementExternalSyncSectionComponent = ComponentType<{
+  open: boolean;
+  team: Team;
+  readOnly?: boolean;
+}>;
+type TeamManagementVaultFolderSectionComponent = ComponentType<{
+  open: boolean;
+  team: Team;
+}>;
+
+type TeamManagementDialogProps =
+  | {
+      mode: "create";
+      open: boolean;
+      onOpenChange: (open: boolean) => void;
+    }
+  | {
+      mode?: "edit";
+      open: boolean;
+      onOpenChange: (open: boolean) => void;
+      team: Team;
+      /**
+       * Section to open on instead of "team" — used by deep links (e.g.
+       * "Manage your team token" on connection instructions).
+       */
+      initialSection?: TeamDialogSection;
+      /**
+       * View-only access for callers who can read identity-provider
+       * configuration but not manage the team: only the External Group Sync
+       * section is shown, without its mutation controls.
+       */
+      readOnly?: boolean;
+    };
+
+const editNavItems = [
+  { id: "team", label: "Team" },
+  { id: "members", label: "Members" },
+  { id: "external-groups", label: "External Group Sync" },
+] satisfies Array<{ id: TeamDialogSection; label: string }>;
+
+const tokenNavItem = {
+  id: "token",
+  label: "MCP/A2A Gateway Token",
+} satisfies { id: TeamDialogSection; label: string };
+
+const vaultFolderNavItem = {
+  id: "vault-folder",
+  label: "Vault Folder",
+} satisfies { id: TeamDialogSection; label: string };
+
+const createNavItems = [{ id: "team", label: "Team" }] satisfies Array<{
+  id: TeamDialogSection;
+  label: string;
+}>;
+
+export function TeamManagementDialog(props: TeamManagementDialogProps) {
+  const { open, onOpenChange } = props;
+  const mode = props.mode ?? "edit";
+  const [createdTeam, setCreatedTeam] = useState<Team | null>(null);
+  const editTeam = "team" in props ? props.team : null;
+  const initialSection =
+    "initialSection" in props ? props.initialSection : undefined;
+  const readOnly = ("readOnly" in props && props.readOnly) || false;
+  const team = editTeam ?? createdTeam;
+  const queryClient = useQueryClient();
+  const [activeSection, setActiveSection] = useState<TeamDialogSection>("team");
+  const [name, setName] = useState(team?.name ?? "");
+  const [roles, setRoles] = useState((team?.roles ?? []).join(","));
+  const [description, setDescription] = useState(team?.description ?? "");
+  const [parentId, setParentId] = useState<string | null>(
+    team?.parentId ?? null,
+  );
+  const [labels, setLabels] = useState<ProfileLabel[]>(team?.labels ?? []);
+  const [memberChanges, setMemberChanges] = useState<StagedMemberChanges>(
+    new Map(),
+  );
+  const labelsRef = useRef<ProfileLabelsRef>(null);
+  const TeamManagementExternalSyncSection =
+    useTeamManagementExternalSyncSection();
+  const TeamManagementVaultFolderSection =
+    useTeamManagementVaultFolderSection();
+  const { data: canUpdateTeams = false } = useHasPermissions({
+    team: ["update"],
+  });
+  const { data: organizationTeams = [] } = useTeams({
+    enabled: open && (mode === "create" || canUpdateTeams),
+  });
+  const { data: tokensData } = useTokens({
+    enabled: open && mode === "edit" && canUpdateTeams,
+  });
+  const byosEnabled = useFeature("byosEnabled");
+  const teamToken = tokensData?.tokens.find(
+    (token) => token.team?.id === team?.id,
+  );
+  const navItems = useMemo(() => {
+    if (mode === "create") {
+      return team ? [editNavItems[0], editNavItems[1]] : createNavItems;
+    }
+
+    if (readOnly) {
+      return [editNavItems[2]];
+    }
+
+    if (!canUpdateTeams) {
+      return editNavItems;
+    }
+
+    if (!byosEnabled) {
+      return [editNavItems[0], editNavItems[1], tokenNavItem, editNavItems[2]];
+    }
+
+    return [
+      editNavItems[0],
+      editNavItems[1],
+      tokenNavItem,
+      vaultFolderNavItem,
+      editNavItems[2],
+    ];
+  }, [byosEnabled, canUpdateTeams, mode, readOnly, team]);
+  const title =
+    mode === "create"
+      ? "Create Team"
+      : readOnly
+        ? "External Group Sync"
+        : "Edit Team";
+  const canEditDetails = mode === "create" || canUpdateTeams;
+
+  useEffect(() => {
+    if (!open) return;
+    setActiveSection(
+      readOnly
+        ? "external-groups"
+        : mode === "edit" && initialSection
+          ? initialSection
+          : "team",
+    );
+    setMemberChanges(new Map());
+    if (mode === "create") {
+      setCreatedTeam(null);
+      setName("");
+      setDescription("");
+      setRoles("");
+      setParentId(null);
+      setLabels([]);
+      return;
+    }
+
+    setName(editTeam?.name ?? "");
+    setDescription(editTeam?.description ?? "");
+    setRoles((editTeam?.roles ?? []).join(","));
+    setParentId(editTeam?.parentId ?? null);
+    setLabels(editTeam?.labels ?? []);
+  }, [editTeam, initialSection, mode, open, readOnly]);
+
+  useEffect(() => {
+    const canShowActiveSection =
+      (activeSection === "team" && !readOnly) ||
+      (activeSection === "members" && !!team && !readOnly) ||
+      activeSection === "external-groups" ||
+      (activeSection === "token" && canUpdateTeams && !readOnly) ||
+      (activeSection === "vault-folder" &&
+        canUpdateTeams &&
+        byosEnabled &&
+        !readOnly);
+
+    if (!canShowActiveSection) {
+      setActiveSection(readOnly ? "external-groups" : "team");
+    }
+  }, [activeSection, byosEnabled, canUpdateTeams, readOnly, team]);
+
+  const saveTeam = useMutation({
+    mutationFn: async () => {
+      let savedTeam = team;
+      // Team details are only editable with org-level team management; a
+      // team admin can still open the dialog to manage members, so skip the
+      // details update they aren't allowed to make.
+      if (canEditDetails && activeSection === "team") {
+        // Flush any label typed into the picker but not yet committed.
+        const finalLabels = labelsRef.current?.saveUnsavedLabel() ?? labels;
+        const body = {
+          name: name.trim(),
+          description: description.trim() || undefined,
+          roles: roles.split(",").filter(Boolean),
+          parentId,
+          labels: finalLabels.map(({ key, value }) => ({ key, value })),
+        };
+        const { data, error } = !team
+          ? await archestraApiSdk.createTeam({ body })
+          : await archestraApiSdk.updateTeam({
+              path: { id: team.id },
+              body,
+            });
+        if (error) throw new Error(error.error.message);
+        savedTeam = data as Team;
+      }
+
+      // Apply staged member changes (members can only be staged once the
+      // team exists). Failed changes stay staged so Save can be retried.
+      const failedChanges: StagedMemberChanges = new Map();
+      const memberErrors: string[] = [];
+      if (savedTeam) {
+        for (const [userId, change] of memberChanges) {
+          try {
+            if (change.type === "add") {
+              const { error } = await archestraApiSdk.addTeamMember({
+                path: { id: savedTeam.id },
+                body: { userId, role: change.role },
+              });
+              if (error) throw new Error(error.error.message);
+            } else if (change.type === "remove") {
+              const { error } = await archestraApiSdk.removeTeamMember({
+                path: { id: savedTeam.id, userId },
+              });
+              if (error) throw new Error(error.error.message);
+            } else {
+              const { error } = await archestraApiSdk.updateTeamMember({
+                path: { id: savedTeam.id, userId },
+                body: { role: change.role },
+              });
+              if (error) throw new Error(error.error.message);
+            }
+          } catch (err) {
+            failedChanges.set(userId, change);
+            memberErrors.push(err instanceof Error ? err.message : `${err}`);
+          }
+        }
+      }
+
+      return {
+        savedTeam,
+        failedChanges,
+        memberErrors,
+        hadMemberChanges: memberChanges.size > 0,
+      };
+    },
+    onSuccess: ({
+      savedTeam,
+      failedChanges,
+      memberErrors,
+      hadMemberChanges,
+    }) => {
+      queryClient.invalidateQueries({ queryKey: ["auth"] });
+      queryClient.invalidateQueries({ queryKey: ["teams"] });
+      queryClient.invalidateQueries({ queryKey: ["tokens"] });
+      if (hadMemberChanges && savedTeam) {
+        queryClient.invalidateQueries({
+          queryKey: ["teamMembers", savedTeam.id],
+        });
+        queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
+        queryClient.invalidateQueries({ queryKey: ["tools"] });
+      }
+      setMemberChanges(failedChanges);
+      if (mode === "create" && !team && savedTeam) {
+        setCreatedTeam(savedTeam);
+      }
+      if (memberErrors.length > 0) {
+        toast.error(
+          `Failed to apply ${memberErrors.length} member change${
+            memberErrors.length === 1 ? "" : "s"
+          }: ${memberErrors[0]}`,
+        );
+        // Keep the dialog open so the remaining staged changes can be retried.
+        return;
+      }
+      if (mode === "create" && !team) {
+        toast.success("Team created");
+        return;
+      }
+      toast.success("Team updated");
+      onOpenChange(false);
+    },
+    onError: (error: Error) => {
+      toast.error(
+        error.message ||
+          (mode === "create"
+            ? "Failed to create team"
+            : "Failed to update team"),
+      );
+    },
+  });
+
+  const handleSubmit = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (canEditDetails && !name.trim()) {
+      toast.error("Team name is required");
+      return;
+    }
+    saveTeam.mutate();
+  };
+
+  return (
+    <TabbedDialogShell
+      open={open}
+      onOpenChange={onOpenChange}
+      title={title}
+      description="Manage team details, members, token access, and external group sync."
+      sidebarLabel={name.trim() || (mode === "create" ? "New team" : "Team")}
+      sidebarDescription="Team"
+      sidebarIcon={<Users className="h-4 w-4 text-muted-foreground" />}
+      activeSection={activeSection}
+      navItems={navItems}
+      onActiveSectionChange={setActiveSection}
+      onSubmit={handleSubmit}
+      className="max-w-5xl"
+      contentClassName="px-5 py-5"
+      sidebarClassName="w-[220px]"
+      footer={
+        <>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+          >
+            Cancel
+          </Button>
+          {(activeSection === "team" && canEditDetails) ||
+          (activeSection === "members" && memberChanges.size > 0) ? (
+            <Button type="submit" disabled={saveTeam.isPending}>
+              {saveTeam.isPending
+                ? mode === "create" && !team
+                  ? "Creating..."
+                  : "Saving..."
+                : mode === "create" && !team
+                  ? "Create Team"
+                  : "Save Changes"}
+            </Button>
+          ) : (
+            <Button type="button" onClick={() => onOpenChange(false)}>
+              Close
+            </Button>
+          )}
+        </>
+      }
+    >
+      {activeSection === "team" && (
+        <TeamSection
+          team={team}
+          name={name}
+          description={description}
+          roles={roles}
+          onRolesChange={setRoles}
+          parentId={parentId}
+          organizationTeams={organizationTeams}
+          canManageAllTeams={canUpdateTeams}
+          labels={labels}
+          labelsRef={labelsRef}
+          onNameChange={setName}
+          onDescriptionChange={setDescription}
+          onParentIdChange={setParentId}
+          onLabelsChange={setLabels}
+          readOnlyDetails={!canEditDetails}
+        />
+      )}
+      {activeSection === "members" && team && (
+        <TeamMembersSection
+          open={open}
+          team={team}
+          memberChanges={memberChanges}
+          onMemberChangesChange={setMemberChanges}
+          onGoToExternalGroups={() => setActiveSection("external-groups")}
+        />
+      )}
+      {activeSection === "token" && mode === "edit" && (
+        <TokenSection token={teamToken} />
+      )}
+      {activeSection === "vault-folder" && mode === "edit" && team && (
+        <TeamManagementVaultFolderSection open={open} team={team} />
+      )}
+      {activeSection === "external-groups" && mode === "edit" && team && (
+        <TeamManagementExternalSyncSection
+          open={open}
+          team={team}
+          readOnly={readOnly}
+        />
+      )}
+    </TabbedDialogShell>
+  );
+}
+
+function TeamSection(props: {
+  team: Team | null;
+  name: string;
+  description: string;
+  roles: string;
+  onRolesChange: (roles: string) => void;
+  parentId: string | null;
+  organizationTeams: Team[];
+  canManageAllTeams: boolean;
+  labels: ProfileLabel[];
+  labelsRef: React.Ref<ProfileLabelsRef>;
+  onNameChange: (value: string) => void;
+  onDescriptionChange: (value: string) => void;
+  onParentIdChange: (value: string | null) => void;
+  onLabelsChange: (labels: ProfileLabel[]) => void;
+  readOnlyDetails: boolean;
+}) {
+  const descendantIds = new Set(
+    props.team
+      ? getTeamDescendantIds(props.organizationTeams, props.team.id)
+      : [],
+  );
+  const parentOptions = props.organizationTeams.filter(
+    (candidate) =>
+      candidate.id !== props.team?.id &&
+      !descendantIds.has(candidate.id) &&
+      (props.canManageAllTeams || candidate.myRole === ADMIN_ROLE_NAME),
+  );
+
+  return (
+    <div className="space-y-6">
+      <div className="grid max-w-3xl gap-4">
+        <div className="space-y-2">
+          <Label htmlFor="team-name">Team Name *</Label>
+          <Input
+            id="team-name"
+            value={props.name}
+            onChange={(event) => props.onNameChange(event.target.value)}
+            disabled={props.readOnlyDetails}
+            maxLength={256}
+          />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="team-description">Description</Label>
+          <Textarea
+            id="team-description"
+            value={props.description}
+            onChange={(event) => props.onDescriptionChange(event.target.value)}
+            disabled={props.readOnlyDetails}
+          />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="team-roles">Organization Roles</Label>
+          <FieldDescription id="team-roles-description">
+            Members of this team and its descendant teams inherit these
+            permissions. Alternatively, assign roles directly to{" "}
+            <Link
+              href="/settings/users"
+              className="underline underline-offset-4"
+            >
+              users
+            </Link>
+            .
+          </FieldDescription>
+          <RoleSelect
+            multiple
+            allowEmpty
+            id="team-roles"
+            ariaLabel="Organization Roles"
+            aria-describedby="team-roles-description"
+            value={props.roles}
+            onValueChange={props.onRolesChange}
+            disabled={props.readOnlyDetails}
+          />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="team-parent">Parent Team</Label>
+          <FieldDescription id="team-parent-description">
+            Nest this team in your organization hierarchy. Resource access is
+            inherited through the hierarchy; team administration is not.{" "}
+            <ExternalDocsLink
+              href={getDocsUrl(
+                DocsPage.PlatformAccessControl,
+                "team-hierarchies",
+              )}
+            >
+              Learn about inherited access
+            </ExternalDocsLink>
+            .
+          </FieldDescription>
+          <SearchableSelect
+            id="team-parent"
+            ariaLabel="Parent Team"
+            aria-describedby="team-parent-description"
+            value={props.parentId ?? "root"}
+            onValueChange={(value) =>
+              props.onParentIdChange(value === "root" ? null : value)
+            }
+            disabled={props.readOnlyDetails}
+            className="w-full"
+            placeholder="No parent team"
+            searchPlaceholder="Search teams..."
+            emptyMessage="No matching teams found."
+            pinnedItems={[{ value: "root", label: "No parent team" }]}
+            items={parentOptions.map((candidate) => ({
+              value: candidate.id,
+              label: formatTeamPath(props.organizationTeams, candidate.id),
+              description: candidate.description ?? undefined,
+            }))}
+          />
+        </div>
+        {props.readOnlyDetails ? (
+          <ReadOnlyAdvancedLabels labels={props.labels} />
+        ) : (
+          <AdvancedLabelsSection
+            ref={props.labelsRef}
+            labels={props.labels}
+            onLabelsChange={props.onLabelsChange}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TeamMembersSection(props: {
+  open: boolean;
+  team: Team;
+  memberChanges: StagedMemberChanges;
+  onMemberChangesChange: (changes: StagedMemberChanges) => void;
+  onGoToExternalGroups: () => void;
+}) {
+  return (
+    <div className="space-y-4">
+      <div className="space-y-2 rounded-lg border bg-muted/30 p-3 text-xs">
+        <p>
+          <span className="font-medium">Optional:</span> add members manually,
+          or use{" "}
+          <button
+            type="button"
+            onClick={props.onGoToExternalGroups}
+            className="text-primary hover:underline"
+          >
+            External Group Sync
+          </button>{" "}
+          to sync membership. Configure roles through{" "}
+          <ExternalDocsLink href={getDocsUrl(DocsPage.PlatformSsoRoleMapping)}>
+            Role Mapping
+          </ExternalDocsLink>
+          .
+        </p>
+        <div className="space-y-1 text-muted-foreground">
+          <p>
+            <span className="font-medium text-foreground">
+              Able to edit team:
+            </span>{" "}
+            manage members and rotate this team&apos;s token.
+          </p>
+          <p>
+            <span className="font-medium text-foreground">
+              Not able to edit team:
+            </span>{" "}
+            use resources available to the team. This is the default role from
+            group sync.
+          </p>
+        </div>
+      </div>
+      <MembersSection
+        open={props.open}
+        team={props.team}
+        changes={props.memberChanges}
+        onChangesChange={props.onMemberChangesChange}
+      />
+    </div>
+  );
+}
+
+function ReadOnlyAdvancedLabels({ labels }: { labels: ProfileLabel[] }) {
+  return (
+    <details className="group border-t pt-3">
+      <summary className="flex cursor-pointer list-none items-center justify-between text-sm font-medium">
+        Advanced
+        <ChevronDown className="h-4 w-4 text-muted-foreground transition-transform group-open:rotate-180" />
+      </summary>
+      <div className="flex flex-wrap gap-2 pt-4">
+        {labels.length === 0 ? (
+          <span className="text-sm text-muted-foreground">No labels</span>
+        ) : (
+          labels.map((label) => (
+            <Badge
+              key={label.key}
+              variant="secondary"
+              className="flex items-center gap-1"
+            >
+              <span className="font-semibold">{label.key}:</span>
+              <span>{label.value}</span>
+            </Badge>
+          ))
+        )}
+      </div>
+    </details>
+  );
+}
+
+function MembersSection({
+  open,
+  team,
+  changes,
+  onChangesChange,
+}: {
+  open: boolean;
+  team: Team;
+  changes: StagedMemberChanges;
+  onChangesChange: (changes: StagedMemberChanges) => void;
+}) {
+  const { data: activeOrg } = useActiveOrganization();
+  const {
+    users: userOptions,
+    isSearching: isMembersPending,
+    onSearchQueryChange: setMemberSearch,
+    emptyMessage: membersEmptyMessage,
+  } = useMemberSearch({ limit: 20, enabled: open });
+
+  const { data: teamMembers = [] } = useQuery({
+    queryKey: ["teamMembers", team.id],
+    queryFn: async () => {
+      const { data } = await archestraApiSdk.getTeamMembers({
+        path: { id: team.id },
+      });
+      return data ?? [];
+    },
+    enabled: open,
+  });
+
+  const orgMembers = activeOrg?.members ?? [];
+
+  const setChange = (userId: string, change: StagedMemberChange | null) => {
+    const next = new Map(changes);
+    if (change) {
+      next.set(userId, change);
+    } else {
+      next.delete(userId);
+    }
+    onChangesChange(next);
+  };
+
+  const stageAdd = (userId: string) => {
+    if (teamMembers.some((member) => member.userId === userId)) {
+      // Re-adding an existing member just cancels a staged removal.
+      setChange(userId, null);
+    } else {
+      const user = userOptions.find((option) => option.userId === userId);
+      setChange(userId, {
+        type: "add",
+        role: MEMBER_ROLE_NAME,
+        name: user?.name ?? undefined,
+        email: user?.email ?? undefined,
+      });
+    }
+    setMemberSearch("");
+  };
+
+  const stageRemove = (userId: string) => {
+    if (changes.get(userId)?.type === "add") {
+      setChange(userId, null);
+    } else {
+      setChange(userId, { type: "remove" });
+    }
+  };
+
+  const stageRole = (userId: string, role: TeamMemberRole) => {
+    const change = changes.get(userId);
+    if (change?.type === "add") {
+      setChange(userId, { ...change, role });
+      return;
+    }
+    const original = teamMembers.find(
+      (member) => member.userId === userId,
+    )?.role;
+    setChange(userId, original === role ? null : { type: "role", role });
+  };
+
+  // Server members with staged removals hidden and staged role changes
+  // applied, followed by staged additions.
+  const memberRows = [
+    ...teamMembers
+      .filter((member) => changes.get(member.userId)?.type !== "remove")
+      .map((member) => {
+        const change = changes.get(member.userId);
+        const orgMember = orgMembers.find(
+          (candidate) => candidate.userId === member.userId,
+        );
+        return {
+          userId: member.userId,
+          displayName:
+            member.name ||
+            orgMember?.user.name ||
+            member.email ||
+            orgMember?.user.email ||
+            member.userId,
+          displayEmail: member.email || orgMember?.user.email || member.userId,
+          role: change?.type === "role" ? change.role : member.role,
+          pending: !!change,
+        };
+      }),
+    ...[...changes.entries()]
+      .filter(
+        (
+          entry,
+        ): entry is [string, Extract<StagedMemberChange, { type: "add" }>] =>
+          entry[1].type === "add",
+      )
+      .map(([userId, change]) => ({
+        userId,
+        displayName: change.name || change.email || userId,
+        displayEmail: change.email || userId,
+        role: change.role as string,
+        pending: true,
+      })),
+  ];
+
+  const listedUserIds = new Set(memberRows.map((row) => row.userId));
+  const canAddAnyMember = userOptions.some(
+    (user) => !listedUserIds.has(user.userId),
+  );
+  const hasStagedChanges = changes.size > 0;
+
+  return (
+    <div className="space-y-6">
+      <div className="space-y-2 max-w-3xl">
+        <Label>Add User</Label>
+        <UserSearchableSelect
+          value=""
+          onValueChange={stageAdd}
+          users={userOptions}
+          disabledUserIds={listedUserIds}
+          placeholder={
+            canAddAnyMember ? "Select a user" : "All listed users already added"
+          }
+          searchPlaceholder="Search users by name or email"
+          className="w-full"
+          onSearchQueryChange={setMemberSearch}
+          emptyMessage={membersEmptyMessage}
+          hint={
+            canAddAnyMember || isMembersPending
+              ? undefined
+              : "All users in the current result set are already members of this team."
+          }
+        />
+      </div>
+
+      <div className="space-y-2">
+        <Label>Current Members ({memberRows.length})</Label>
+        {memberRows.length === 0 ? (
+          <div className="rounded-lg border border-dashed p-4 text-center">
+            <p className="text-sm text-muted-foreground">
+              No members in this team yet
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {memberRows.map((row) => (
+              <div
+                key={row.userId}
+                className="grid grid-cols-[minmax(0,1fr)_210px_40px] items-center gap-3 rounded-lg border p-3"
+              >
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <p className="truncate text-sm font-medium">
+                      {row.displayName}
+                    </p>
+                    {row.pending && (
+                      <Badge variant="outline" className="shrink-0 text-xs">
+                        pending
+                      </Badge>
+                    )}
+                  </div>
+                  <p className="truncate text-xs text-muted-foreground">
+                    {row.displayEmail}
+                  </p>
+                </div>
+                <Select
+                  value={row.role}
+                  onValueChange={(role: TeamMemberRole) =>
+                    stageRole(row.userId, role)
+                  }
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={ADMIN_ROLE_NAME}>
+                      Able to edit team
+                    </SelectItem>
+                    <SelectItem value={MEMBER_ROLE_NAME}>
+                      Not able to edit team
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => stageRemove(row.userId)}
+                >
+                  <Trash2 className="h-4 w-4 text-destructive" />
+                  <span className="sr-only">Remove member</span>
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+        {hasStagedChanges && (
+          <FieldDescription>
+            Member changes are applied when you save.
+          </FieldDescription>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TokenSection({ token }: { token?: TeamToken }) {
+  const queryClient = useQueryClient();
+  const [showValue, setShowValue] = useState(false);
+  const [displayedValue, setDisplayedValue] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [confirmRotate, setConfirmRotate] = useState(false);
+
+  const fetchValue = useMutation({
+    mutationFn: async () => {
+      if (!token) return null;
+      const { data, error } = await archestraApiSdk.getTokenValue({
+        path: { tokenId: token.id },
+      });
+      if (error) throw new Error(error.error.message);
+      return data?.value ?? null;
+    },
+    onSuccess: (value) => {
+      if (!value) return;
+      setDisplayedValue(value);
+      setShowValue(true);
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  const rotate = useMutation({
+    mutationFn: async () => {
+      if (!token) return null;
+      const { data, error } = await archestraApiSdk.rotateToken({
+        path: { tokenId: token.id },
+      });
+      if (error) throw new Error(error.error.message);
+      return data?.value ?? null;
+    },
+    onSuccess: async (value) => {
+      if (!value) return;
+      await copyToClipboard(value);
+      setDisplayedValue(value);
+      setShowValue(true);
+      setConfirmRotate(false);
+      queryClient.invalidateQueries({ queryKey: ["tokens"] });
+      toast.success("Token rotated and copied to clipboard");
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  if (!token) {
+    return (
+      <div className="rounded-lg border border-dashed p-4 text-sm text-muted-foreground">
+        <span>No token found for this team.</span>
+      </div>
+    );
+  }
+
+  const handleShowToken = () => {
+    if (showValue) {
+      setShowValue(false);
+      return;
+    }
+    fetchValue.mutate();
+  };
+
+  const handleCopy = async () => {
+    if (!displayedValue) return;
+    await copyToClipboard(displayedValue);
+    setCopied(true);
+    toast.success("Token copied to clipboard");
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <div className="space-y-4 max-w-3xl">
+      <div className="space-y-2">
+        <Label>Token</Label>
+        <div className="flex gap-2">
+          <Input
+            aria-label="Token"
+            readOnly
+            value={
+              showValue && displayedValue
+                ? displayedValue
+                : `${displayedValue ? displayedValue.substring(0, 14) : token.tokenStart}...`
+            }
+            className="font-mono"
+          />
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            onClick={handleShowToken}
+          >
+            <Key className="h-4 w-4" />
+            <span className="sr-only">
+              {showValue ? "Hide token" : "Show token"}
+            </span>
+          </Button>
+          {showValue && displayedValue && (
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              onClick={handleCopy}
+            >
+              {copied ? (
+                <Check className="h-4 w-4 text-green-500" />
+              ) : (
+                <Copy className="h-4 w-4" />
+              )}
+              <span className="sr-only">Copy token</span>
+            </Button>
+          )}
+        </div>
+      </div>
+      <div className="space-y-1 text-sm text-muted-foreground">
+        <p>
+          <strong>Created:</strong> {formatRelativeTimeFromNow(token.createdAt)}
+        </p>
+        <p>
+          <strong>Last used:</strong>{" "}
+          {formatRelativeTimeFromNow(token.lastUsedAt)}
+        </p>
+      </div>
+      <Button
+        type="button"
+        variant={confirmRotate ? "destructive" : "outline"}
+        onClick={() => {
+          if (!confirmRotate) {
+            setConfirmRotate(true);
+            return;
+          }
+          rotate.mutate();
+        }}
+        disabled={rotate.isPending}
+      >
+        <RefreshCw
+          className={cn("h-4 w-4", rotate.isPending && "animate-spin")}
+        />
+        {confirmRotate ? "Confirm Rotate" : "Rotate Token"}
+      </Button>
+    </div>
+  );
+}
+
+function TeamManagementExternalSyncSectionUnavailable() {
+  return <EnterpriseLicenseRequired featureName="Team Sync" />;
+}
+
+function TeamManagementVaultFolderSectionUnavailable() {
+  return <EnterpriseLicenseRequired featureName="Team Vault Folders" />;
+}
+
+function useTeamManagementExternalSyncSection(): TeamManagementExternalSyncSectionComponent {
+  const [Section, setSection] =
+    useState<TeamManagementExternalSyncSectionComponent>(
+      () => TeamManagementExternalSyncSectionUnavailable,
+    );
+
+  useEffect(() => {
+    if (!config.enterpriseFeatures.core) return;
+
+    let cancelled = false;
+
+    async function loadEnterpriseSection() {
+      // biome-ignore lint/style/noRestrictedImports: conditional ee component with team sync
+      const module = await import("./team-management-external-sync.ee");
+      if (!cancelled) {
+        setSection(() => module.TeamManagementExternalSyncSection);
+      }
+    }
+
+    loadEnterpriseSection();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return Section;
+}
+
+function useTeamManagementVaultFolderSection(): TeamManagementVaultFolderSectionComponent {
+  const [Section, setSection] =
+    useState<TeamManagementVaultFolderSectionComponent>(
+      () => TeamManagementVaultFolderSectionUnavailable,
+    );
+
+  useEffect(() => {
+    if (!config.enterpriseFeatures.core) return;
+
+    let cancelled = false;
+
+    async function loadEnterpriseSection() {
+      // biome-ignore lint/style/noRestrictedImports: conditional ee component with vault folder management
+      const module = await import("./team-management-vault-folder.ee");
+      if (!cancelled) {
+        setSection(() => module.TeamManagementVaultFolderSection);
+      }
+    }
+
+    loadEnterpriseSection();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return Section;
+}

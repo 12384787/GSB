@@ -1,0 +1,317 @@
+import type { archestraApiTypes } from "@archestra/shared";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ColumnDef } from "@tanstack/react-table";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useHasPermissions, useSession } from "@/lib/auth/auth.query";
+import {
+  useTeam,
+  useTeamLabelKeys,
+  useTeamLabelValues,
+  useTeams,
+} from "@/lib/teams/team.query";
+import { TeamsList } from "./teams-list";
+
+type Team = archestraApiTypes.GetTeamsResponses["200"]["data"][number];
+
+const { mockSetSettingsAction, queryParamsHolder } = vi.hoisted(() => ({
+  mockSetSettingsAction: vi.fn(),
+  queryParamsHolder: { current: new URLSearchParams() },
+}));
+
+vi.mock("next/navigation");
+
+vi.mock("@/app/settings/layout", () => ({
+  useSetSettingsAction: () => mockSetSettingsAction,
+}));
+
+vi.mock("@/components/delete-confirm-dialog", () => ({
+  DeleteConfirmDialog: () => null,
+}));
+
+vi.mock("@/components/search-input", () => ({
+  SearchInput: () => null,
+}));
+
+vi.mock("@/components/ui/data-table", () => ({
+  DataTable: ({
+    columns,
+    data,
+  }: {
+    columns: ColumnDef<Team>[];
+    data: Team[];
+  }) => {
+    const actionsColumn = columns.find((column) => column.id === "actions");
+    const parentColumn = columns.find((column) => column.id === "parent");
+    return (
+      <div>
+        {data.map((team) => (
+          <div key={team.id}>
+            {typeof parentColumn?.cell === "function"
+              ? parentColumn.cell({
+                  row: { original: team },
+                } as Parameters<NonNullable<typeof parentColumn.cell>>[0])
+              : null}
+            {typeof actionsColumn?.cell === "function"
+              ? actionsColumn.cell({
+                  row: { original: team },
+                } as Parameters<NonNullable<typeof actionsColumn.cell>>[0])
+              : null}
+          </div>
+        ))}
+      </div>
+    );
+  },
+}));
+
+vi.mock("@/components/ui/permission-button", () => ({
+  PermissionButton: ({
+    children,
+    onClick,
+  }: {
+    children: React.ReactNode;
+    onClick?: React.MouseEventHandler<HTMLButtonElement>;
+  }) => (
+    <button type="button" onClick={onClick}>
+      {children}
+    </button>
+  ),
+}));
+
+vi.mock("@/components/table-row-actions", () => ({
+  TableRowActions: ({
+    actions,
+  }: {
+    actions: Array<{
+      label: string;
+      disabled?: boolean;
+      onClick?: () => void;
+      testId?: string;
+    }>;
+  }) => (
+    <div>
+      {actions.map((action) => (
+        <button
+          key={action.label}
+          type="button"
+          aria-label={action.label}
+          data-testid={action.testId}
+          disabled={action.disabled}
+          onClick={action.onClick}
+        >
+          {action.label}
+        </button>
+      ))}
+    </div>
+  ),
+}));
+
+vi.mock("@/lib/auth/auth.query");
+
+vi.mock("@/lib/hooks/use-data-table-query-params", () => ({
+  useDataTableQueryParams: () => ({
+    searchParams: queryParamsHolder.current,
+    updateQueryParams: vi.fn(),
+  }),
+}));
+
+vi.mock("@/lib/teams/team.query");
+
+vi.mock("./team-management-dialog", () => ({
+  TeamManagementDialog: ({
+    open,
+    team,
+  }: {
+    open: boolean;
+    team?: Team | null;
+  }) => (open ? <div>Edit dialog for {team?.name ?? "new team"}</div> : null),
+}));
+
+describe("TeamsList", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(useRouter).mockReturnValue({
+      replace: vi.fn(),
+      push: vi.fn(),
+    } as unknown as ReturnType<typeof useRouter>);
+    vi.mocked(usePathname).mockReturnValue("/settings/teams");
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams() as unknown as ReturnType<typeof useSearchParams>,
+    );
+    vi.mocked(useSession).mockReturnValue({
+      data: { user: { id: "user-1" } },
+    } as ReturnType<typeof useSession>);
+    vi.mocked(useHasPermissions).mockImplementation(
+      (permissions) =>
+        ({
+          data: !permissions.team?.includes("update"),
+        }) as ReturnType<typeof useHasPermissions>,
+    );
+    vi.mocked(useTeam).mockReturnValue({
+      data: undefined,
+    } as unknown as ReturnType<typeof useTeam>);
+    vi.mocked(useTeamLabelKeys).mockReturnValue({
+      data: [],
+    } as unknown as ReturnType<typeof useTeamLabelKeys>);
+    vi.mocked(useTeamLabelValues).mockReturnValue({
+      data: [],
+    } as unknown as ReturnType<typeof useTeamLabelValues>);
+    vi.mocked(useTeams).mockReturnValue({
+      data: [],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useTeams>);
+    queryParamsHolder.current = new URLSearchParams();
+  });
+
+  it("lets literal team admins edit their team without organization-level team update permission", () => {
+    vi.mocked(useTeams).mockReturnValue({
+      data: [
+        makeTeam({
+          members: [
+            makeTeamMember({
+              userId: "user-1",
+              role: "admin",
+            }),
+          ],
+        }),
+      ],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useTeams>);
+
+    renderTeamsList();
+
+    const editButton = screen.getByRole("button", { name: "Edit" });
+    expect(editButton).toBeEnabled();
+
+    fireEvent.click(editButton);
+
+    expect(screen.getByText("Edit dialog for Team A")).toBeInTheDocument();
+  });
+
+  it("shows the immediate parent in the hierarchy column", () => {
+    const parent = makeTeam({ id: "parent", name: "Product" });
+    const child = makeTeam({
+      id: "child",
+      name: "Platform",
+      parentId: parent.id,
+    });
+    vi.mocked(useTeams).mockReturnValue({
+      data: [parent, child],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useTeams>);
+
+    renderTeamsList();
+
+    expect(screen.getByText("Product")).toBeInTheDocument();
+  });
+
+  it("keeps edit disabled for regular team members without team update or identity-provider read permission", () => {
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: false,
+    } as ReturnType<typeof useHasPermissions>);
+    vi.mocked(useTeams).mockReturnValue({
+      data: [
+        makeTeam({
+          members: [
+            makeTeamMember({
+              userId: "user-1",
+              role: "member",
+            }),
+          ],
+        }),
+      ],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useTeams>);
+
+    renderTeamsList();
+
+    expect(screen.getByRole("button", { name: "Edit" })).toBeDisabled();
+  });
+
+  it("offers identity-provider readers a view-only group sync action instead of edit", () => {
+    // The default useHasPermissions mock grants everything except team:update,
+    // so this member holds identityProvider:read but cannot manage the team.
+    vi.mocked(useTeams).mockReturnValue({
+      data: [
+        makeTeam({
+          members: [
+            makeTeamMember({
+              userId: "user-1",
+              role: "member",
+            }),
+          ],
+        }),
+      ],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useTeams>);
+
+    renderTeamsList();
+
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    const viewButton = screen.getByRole("button", { name: "View group sync" });
+    expect(viewButton).toBeEnabled();
+
+    fireEvent.click(viewButton);
+
+    expect(screen.getByText("Edit dialog for Team A")).toBeInTheDocument();
+  });
+
+  it("passes the name and labels URL params to the teams query (server-side filtering)", () => {
+    queryParamsHolder.current = new URLSearchParams(
+      "search=platform&labels=env:prod",
+    );
+
+    renderTeamsList();
+
+    expect(useTeams).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "platform", labels: "env:prod" }),
+    );
+  });
+});
+
+function renderTeamsList() {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: { retry: false },
+    },
+  });
+
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <TeamsList />
+    </QueryClientProvider>,
+  );
+}
+
+function makeTeam(overrides: Partial<Team> = {}): Team {
+  return {
+    id: "team-a",
+    name: "Team A",
+    description: null,
+    organizationId: "org-1",
+    parentId: null,
+    createdBy: "user-2",
+    createdByServiceAccountId: null,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    roles: [],
+    members: [],
+    ...overrides,
+  };
+}
+
+function makeTeamMember(
+  overrides: Partial<NonNullable<Team["members"]>[number]> = {},
+): NonNullable<Team["members"]>[number] {
+  return {
+    id: "team-member-1",
+    teamId: "team-a",
+    userId: "user-1",
+    role: "member",
+    syncedFromSso: false,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    ...overrides,
+  };
+}

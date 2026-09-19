@@ -1,0 +1,2646 @@
+import {
+  classifyMcpRuntimeAlert,
+  createMcpServerAlertFingerprint,
+  isBuiltInCatalogId,
+  isMetadataOnlyEdit,
+  mcpRuntimeAlertSource,
+  RouteId,
+  SERVER_NAME_PLACEHOLDER,
+} from "@archestra/shared";
+import type { FastifyRequest } from "fastify";
+import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
+import { z } from "zod";
+import { hasPermission } from "@/auth";
+import {
+  assertMcpCatalogTeams,
+  authorizeMcpCatalogScope,
+  type CatalogTeamAccess,
+  getCatalogWriteMembershipTeamIds,
+  getMcpCatalogPermissionChecker,
+  requireMcpCatalogDeletePermission,
+  requireMcpCatalogModifyPermission,
+  withCatalogTeamFkErrorMapped,
+} from "@/auth/mcp-catalog-permissions";
+import config from "@/config";
+// SPDX-SnippetBegin
+// SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+// SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+import {
+  enterpriseTier,
+  MCP_IDLE_HIBERNATION_ENTERPRISE_MESSAGE,
+} from "@/enterprise-tier";
+import { McpServerRuntimeManager } from "@/k8s/mcp-server-runtime";
+// SPDX-SnippetEnd
+import {
+  generateDeploymentYamlTemplate,
+  mergeLocalConfigIntoYaml,
+  validateDeploymentYaml,
+} from "@/k8s/mcp-server-runtime/k8s-yaml-generator";
+import mcpServerRuntimeManager from "@/k8s/mcp-server-runtime/manager";
+import logger from "@/logging";
+import {
+  AppModel,
+  EnvironmentModel,
+  InternalMcpCatalogModel,
+  McpCatalogLabelModel,
+  McpServerAlertMuteModel,
+  McpServerModel,
+  TeamModel,
+  ToolModel,
+} from "@/models";
+import { isByosEnabled, secretManager } from "@/secrets-manager";
+import { propagateAppCatalogChange } from "@/services/apps/app-mcp-backing";
+import {
+  assertCanAssignEnvironment,
+  assertRemoteServerUrlAllowedByNetworkPolicy,
+  assertValuesMatchEnvironmentRegex,
+  resolveDefaultEnvironmentForNewResource,
+} from "@/services/environments/environment";
+import {
+  extractLocalConfigSecrets,
+  getCatalogClientSecretValues,
+  upsertCatalogClientSecretValue,
+} from "@/services/mcp-catalog-secrets";
+import {
+  flagImageApprovalRequired,
+  holdInstallIfImageGated,
+} from "@/services/mcp-install-policy";
+import {
+  autoReinstallServer,
+  manualReinstallReason,
+  multitenantSharedPodChanged,
+  onlyForwardCompatibleEnvDiff,
+  reinstallMultitenantCatalog,
+  requiresNewUserInputForReinstall,
+} from "@/services/mcp-reinstall";
+import { transferResourceOwnership } from "@/services/resource-ownership";
+import {
+  ApiError,
+  type CatalogTeamAssignment,
+  constructResponseSchema,
+  DeleteObjectResponseSchema,
+  ENTERPRISE_MANAGED_CLIENT_SECRET_OVERRIDE_SECRET_KEY,
+  InsertInternalMcpCatalogSchema,
+  type InternalMcpCatalog,
+  ListInternalMcpCatalogSchema,
+  type LocalConfig,
+  type McpServer,
+  type McpServerAlertMute,
+  McpServerAlertMuteSchema,
+  type McpServerDismissibleAlertKind,
+  McpServerDismissibleAlertKindSchema,
+  MuteMcpServerAlertBodySchema,
+  normalizeCatalogTeamInput,
+  PartialUpdateInternalMcpCatalogSchema,
+  SelectInternalMcpCatalogSchema,
+  UnmuteMcpServerAlertQuerySchema,
+  UuidIdSchema,
+} from "@/types";
+import {
+  broadcastMcpInstallationStatus,
+  broadcastMcpServersChanged,
+} from "@/websocket";
+
+// Match the schema from getMcpServerTools endpoint
+const ToolWithAssignedAgentCountSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string().nullable(),
+  parameters: z.record(z.string(), z.any()),
+  createdAt: z.coerce.date(),
+  // Domain group id for built-in Archestra tools (drives the grouped
+  // tool-picker UI); null for external MCP tools.
+  group: z.string().nullable(),
+  assignedAgentCount: z.number(),
+  assignedAgents: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+    }),
+  ),
+});
+
+/**
+ * The minimum a tool picker needs to group tools by server and resolve saved
+ * per-tool selections: no parameters, no descriptions, no assignment fan-out.
+ * Keeping the batched route this lean is the point — the payload it replaces
+ * was one full tool list (with per-tool assigned-agent rows) per catalog item.
+ */
+const CatalogToolReferenceSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  catalogId: z.string(),
+});
+
+const internalMcpCatalogRoutes: FastifyPluginAsyncZod = async (fastify) => {
+  fastify.post(
+    "/api/internal_mcp_catalog/:id/transfer-ownership",
+    {
+      schema: {
+        operationId: RouteId.TransferMcpCatalogOwnership,
+        description: "Transfer ownership to another organization member",
+        tags: ["Ownership"],
+        params: z.object({ id: z.string().uuid() }),
+        body: z.object({ ownerId: z.string().min(1) }),
+        response: constructResponseSchema(z.object({ success: z.boolean() })),
+      },
+    },
+    async ({ params, body, user, organizationId }) => {
+      await transferResourceOwnership({
+        kind: "catalog",
+        id: params.id,
+        ownerId: body.ownerId,
+        userId: user.id,
+        organizationId,
+      });
+      return { success: true };
+    },
+  );
+
+  fastify.get(
+    "/api/internal_mcp_catalog",
+    {
+      schema: {
+        operationId: RouteId.GetInternalMcpCatalog,
+        description: "Get all Internal MCP catalog items",
+        tags: ["MCP Catalog"],
+        querystring: z.object({
+          // Apps are hidden from the registry but assignable to a gateway, so the
+          // capabilities picker opts in to their backing catalogs here.
+          includeApps: z.coerce.boolean().optional(),
+          status: z
+            .enum(["active", "deleted"])
+            .default("active")
+            .describe(
+              "Filter by lifecycle status. `deleted` lists soft-deleted catalog items and requires the manage-deleted permission (granted to admins by default).",
+            ),
+        }),
+        response: constructResponseSchema(
+          z.array(ListInternalMcpCatalogSchema),
+        ),
+      },
+    },
+    async (request, reply) => {
+      // Soft-deleted catalog items are visible only to holders of the dedicated
+      // manage-deleted capability (admins by default) — the ordinary delete
+      // permission must not unlock the org-wide tombstone view. This lists
+      // org-scoped deleted roots (a backend affordance for discovering
+      // restorable ids — no UI toggle this change).
+      if (request.query.status === "deleted") {
+        const { success: canManageDeleted } = await hasPermission(
+          { mcpRegistry: ["manage-deleted"] },
+          request.headers,
+        );
+        if (!canManageDeleted) {
+          throw new ApiError(
+            403,
+            "You do not have permission to list deleted catalog items.",
+          );
+        }
+        const deleted =
+          await InternalMcpCatalogModel.findDeletedForOrganization(
+            request.organizationId,
+          );
+        return reply.send(
+          deleted.map((item) => ({
+            ...item,
+            alertMutes: [],
+            imageApprovalRequired: false,
+          })),
+        );
+      }
+
+      const { success: isAdmin } = await hasPermission(
+        { mcpServerInstallation: ["admin"] },
+        request.headers,
+      );
+      // Don't expand secrets for list view
+      const opts = {
+        expandSecrets: false,
+        userId: request.user.id,
+        isAdmin,
+        organizationId: request.organizationId,
+      };
+      // App backings are gated by `app:read`, not this route's `mcpRegistry:read`,
+      // so only surface them to callers who could see them on the Apps page.
+      const includeApps =
+        request.query.includeApps === true &&
+        (await hasPermission({ app: ["read"] }, request.headers)).success;
+      if (!includeApps) {
+        const list = await InternalMcpCatalogModel.findAll(opts);
+        const [approvalRequired, alertMutes] = await Promise.all([
+          flagImageApprovalRequired(list, request.organizationId),
+          config.mcpServer.alertingEnabled
+            ? McpServerAlertMuteModel.findForViewer({
+                userId: request.user.id,
+                catalogIds: list.map((item) => item.id),
+              })
+            : Promise.resolve(new Map<string, McpServerAlertMute[]>()),
+        ]);
+        return reply.send(
+          list.map((item) => ({
+            ...item,
+            alertMutes: (alertMutes.get(item.id) ?? []).filter(
+              (mute) => mute.mcpServerId === null,
+            ),
+            imageApprovalRequired: approvalRequired.has(item.id),
+          })),
+        );
+      }
+      // App backings carry an `appId` so the registry can link/manage the app.
+      // Only the (few) serverType:"app" rows need the lookup, so the default
+      // path above never pays for it.
+      const items = await InternalMcpCatalogModel.findAllWithApps(opts);
+      const appCatalogIds = items
+        .filter((item) => item.serverType === "app")
+        .map((item) => item.id);
+      const [appIdByCatalog, appEnabledByCatalog, alertMutes] =
+        await Promise.all([
+          AppModel.getAppIdsByCatalogIds(appCatalogIds),
+          AppModel.getAppEnabledByCatalogIds(appCatalogIds),
+          config.mcpServer.alertingEnabled
+            ? McpServerAlertMuteModel.findForViewer({
+                userId: request.user.id,
+                catalogIds: items.map((item) => item.id),
+              })
+            : Promise.resolve(new Map<string, McpServerAlertMute[]>()),
+        ]);
+      const approvalRequired = await flagImageApprovalRequired(
+        items,
+        request.organizationId,
+      );
+      return reply.send(
+        items.map((item) => ({
+          ...item,
+          alertMutes: (alertMutes.get(item.id) ?? []).filter(
+            (mute) => mute.mcpServerId === null,
+          ),
+          imageApprovalRequired: approvalRequired.has(item.id),
+          ...(item.serverType === "app"
+            ? {
+                appId: appIdByCatalog.get(item.id) ?? null,
+                appEnabled: appEnabledByCatalog.get(item.id) ?? null,
+              }
+            : {}),
+        })),
+      );
+    },
+  );
+
+  fastify.put(
+    "/api/internal_mcp_catalog/:id/alert-mutes/:kind",
+    {
+      schema: {
+        operationId: RouteId.MuteMcpCatalogAlert,
+        description:
+          "Dismiss one catalog-level MCP alert for the calling user only. The fingerprint pins it to one failure episode.",
+        tags: ["MCP Catalog"],
+        params: z.object({
+          id: UuidIdSchema,
+          kind: McpServerDismissibleAlertKindSchema,
+        }),
+        body: MuteMcpServerAlertBodySchema,
+        response: constructResponseSchema(McpServerAlertMuteSchema),
+      },
+    },
+    async (request, reply) => {
+      assertMcpServerAlertingEnabled();
+      const {
+        params: { id: catalogId, kind },
+        body: { issueFingerprint, reason },
+      } = request;
+      const catalogItem = await findVisibleCatalogItem({
+        catalogId,
+        request,
+      });
+      await assertCurrentCatalogAlertFingerprint({
+        catalogItem,
+        kind,
+        issueFingerprint,
+      });
+      const muted = await McpServerAlertMuteModel.dismiss({
+        userId: request.user.id,
+        catalogId,
+        mcpServerId: null,
+        issueKind: kind,
+        issueFingerprint,
+        reason,
+      });
+      return reply.send(muted);
+    },
+  );
+
+  fastify.delete(
+    "/api/internal_mcp_catalog/:id/alert-mutes/:kind",
+    {
+      schema: {
+        operationId: RouteId.UnmuteMcpCatalogAlert,
+        description:
+          "Restore one dismissed catalog-level MCP alert to the calling user's view.",
+        tags: ["MCP Catalog"],
+        params: z.object({
+          id: UuidIdSchema,
+          kind: McpServerDismissibleAlertKindSchema,
+        }),
+        querystring: UnmuteMcpServerAlertQuerySchema,
+        response: constructResponseSchema(DeleteObjectResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      assertMcpServerAlertingEnabled();
+      const {
+        params: { id: catalogId, kind },
+        query: { issueFingerprint },
+      } = request;
+      await findVisibleCatalogItem({
+        catalogId,
+        request,
+      });
+      const removed = await McpServerAlertMuteModel.restore({
+        userId: request.user.id,
+        catalogId,
+        mcpServerId: null,
+        issueKind: kind,
+        issueFingerprint,
+      });
+      if (!removed) {
+        throw new ApiError(404, "You have not dismissed this alert.");
+      }
+      return reply.send({ success: true });
+    },
+  );
+
+  fastify.post(
+    "/api/internal_mcp_catalog",
+    {
+      schema: {
+        operationId: RouteId.CreateInternalMcpCatalogItem,
+        description: "Create a new Internal MCP catalog item",
+        tags: ["MCP Catalog"],
+        body: InsertInternalMcpCatalogSchema.extend({
+          // BYOS: External Vault path for OAuth client secret
+          oauthClientSecretVaultPath: z.string().optional(),
+          // BYOS: External Vault key for OAuth client secret
+          oauthClientSecretVaultKey: z.string().optional(),
+          // BYOS: External Vault path for local config secret env vars
+          localConfigVaultPath: z.string().optional(),
+          // BYOS: External Vault key for local config secret env vars
+          localConfigVaultKey: z.string().optional(),
+        }),
+        response: constructResponseSchema(SelectInternalMcpCatalogSchema),
+      },
+    },
+    async (request, reply) => {
+      const { body } = request;
+      const {
+        oauthClientSecretVaultPath,
+        oauthClientSecretVaultKey,
+        localConfigVaultPath,
+        localConfigVaultKey,
+        ...restBodyInput
+      } = body;
+      // Downstream secret extraction removes plaintext values from the payload
+      // before persistence, so work on a cloned object instead of the request body.
+      const restBody = structuredClone(restBodyInput);
+
+      // serverType:"app" catalogs are created and owned by the Apps flow
+      // (their app row, version store, and connector identity live in `apps`).
+      // Reject them here so the generic registry can't mint an orphan app
+      // catalog with no backing app.
+      if (restBody.serverType === "app") {
+        throw new ApiError(
+          400,
+          "App catalog entities are managed via the Apps API.",
+        );
+      }
+
+      // Secret FK columns are server-managed: clients submit secret values, never
+      // ids. Trusting an inbound id would let a caller point the row at another
+      // org's secret (which create()'s clone-secret merge would then read/write).
+      restBody.clientSecretId = undefined;
+      restBody.localConfigSecretId = undefined;
+
+      // Enforce scope restrictions (3-tier model shared with agents/skills):
+      // org → admin only; team → admin of one of the assigned teams, and
+      // membership in all of them; personal → the author.
+      const checker = await getMcpCatalogPermissionChecker({
+        userId: request.user.id,
+        organizationId: request.organizationId,
+      });
+
+      restBody.scope = restBody.scope ?? "personal";
+      const requestedTeams =
+        restBody.scope === "team"
+          ? normalizeCatalogTeamInput(restBody.teams ?? [])
+          : [];
+      const requestedTeamIds = requestedTeams.map((team) => team.id);
+      const [userTeamIds, writeMembershipTeamIds] = checker.isAdmin
+        ? [[], []]
+        : await Promise.all([
+            TeamModel.getUserTeamIds(request.user.id),
+            getCatalogWriteMembershipTeamIds(request.user.id),
+          ]);
+      authorizeMcpCatalogScope({
+        checker,
+        scope: restBody.scope,
+        authorId: request.user.id,
+        requestedTeamIds,
+        userTeamIds,
+        writeMembershipTeamIds,
+        userId: request.user.id,
+      });
+      if (restBody.scope !== "team") {
+        delete restBody.teams;
+      } else {
+        restBody.teams = requestedTeams;
+      }
+      await assertMcpCatalogTeams({
+        scope: restBody.scope,
+        teamIds: requestedTeamIds,
+        organizationId: request.organizationId,
+      });
+
+      const canDeployToRestricted = await callerCanDeployToRestricted(
+        request.headers,
+      );
+
+      // No environment chosen at all (as opposed to an explicit null, which
+      // picks the default environment on purpose) hands the choice to the org's
+      // configured landing environment for new MCP servers.
+      if (restBody.environmentId === undefined) {
+        restBody.environmentId = await resolveDefaultEnvironmentForNewResource({
+          organizationId: request.organizationId,
+          resource: "mcpRegistry",
+          canDeployToRestricted,
+        });
+      }
+
+      // Gate assigning a restricted environment. Requires
+      // mcpRegistry:deploy-to-restricted. Unrestricted and default (null)
+      // environments are open.
+      await assertCanAssignEnvironment({
+        environmentId: restBody.environmentId ?? null,
+        organizationId: request.organizationId,
+        canDeployToRestricted,
+      });
+
+      let clientSecretId: string | undefined;
+      let localConfigSecretId: string | undefined;
+
+      // Handle OAuth client secret - either via BYOS or direct value
+      if (oauthClientSecretVaultPath && oauthClientSecretVaultKey) {
+        // BYOS flow for OAuth client secret
+        if (!isByosEnabled()) {
+          throw new ApiError(
+            400,
+            "Readonly Vault is not enabled. " +
+              "Requires ARCHESTRA_SECRETS_MANAGER=READONLY_VAULT and an enterprise license.",
+          );
+        }
+
+        // Store as { client_secret: "path#key" } format
+        const vaultReference = `${oauthClientSecretVaultPath}#${oauthClientSecretVaultKey}`;
+        const secret = await secretManager().createSecret(
+          { client_secret: vaultReference },
+          `${restBody.name}-oauth-client-secret-vault`,
+        );
+        clientSecretId = secret.id;
+        restBody.clientSecretId = clientSecretId;
+
+        // Remove client_secret from oauthConfig if present
+        if (restBody.oauthConfig && "client_secret" in restBody.oauthConfig) {
+          delete restBody.oauthConfig.client_secret;
+        }
+
+        logger.info(
+          "Created Readonly Vault external vault secret reference for OAuth client secret",
+        );
+      } else if (
+        restBody.oauthConfig &&
+        "client_secret" in restBody.oauthConfig
+      ) {
+        // Direct client_secret value
+        const clientSecret = restBody.oauthConfig.client_secret;
+        if (clientSecret) {
+          // `rotated` is irrelevant here: no installs exist yet on create.
+          const result = await upsertCatalogClientSecretValue({
+            clientSecretId,
+            catalogName: restBody.name,
+            key: "client_secret",
+            value: clientSecret,
+          });
+          clientSecretId = result.id;
+
+          restBody.clientSecretId = clientSecretId;
+        }
+        delete restBody.oauthConfig.client_secret;
+      }
+
+      const enterpriseManagedClientSecretOverride =
+        restBody.enterpriseManagedConfig?.clientSecretOverride;
+      if (enterpriseManagedClientSecretOverride) {
+        const result = await upsertCatalogClientSecretValue({
+          clientSecretId,
+          catalogName: restBody.name,
+          key: ENTERPRISE_MANAGED_CLIENT_SECRET_OVERRIDE_SECRET_KEY,
+          value: enterpriseManagedClientSecretOverride,
+        });
+        clientSecretId = result.id;
+
+        restBody.clientSecretId = clientSecretId;
+        delete restBody.enterpriseManagedConfig?.clientSecretOverride;
+      }
+
+      // Handle local config secrets - either via Readonly Vault or direct values
+      if (localConfigVaultPath && localConfigVaultKey) {
+        // Readonly Vault flow for local config secrets
+        if (!isByosEnabled()) {
+          throw new ApiError(
+            400,
+            "Readonly Vault is not enabled. " +
+              "Requires ARCHESTRA_SECRETS_MANAGER=READONLY_VAULT and an enterprise license.",
+          );
+        }
+
+        // Store as { vaultKey: "path#vaultKey" } format
+        // The vault key becomes both the Archestra key and references itself in the vault
+        const vaultReference = `${localConfigVaultPath}#${localConfigVaultKey}`;
+        const secret = await secretManager().createSecret(
+          { [localConfigVaultKey]: vaultReference },
+          `${restBody.name}-local-config-env-vault`,
+        );
+        localConfigSecretId = secret.id;
+        restBody.localConfigSecretId = localConfigSecretId;
+
+        // Remove values from secret env vars in catalog template
+        if (restBody.localConfig?.environment) {
+          for (const envVar of restBody.localConfig.environment) {
+            if (envVar.type === "secret" && !envVar.promptOnInstallation) {
+              delete envVar.value;
+            }
+          }
+        }
+
+        logger.info(
+          "Created Readonly Vault external vault secret reference for local config secrets",
+        );
+      } else if (
+        restBody.localConfig?.environment ||
+        restBody.localConfig?.imagePullSecrets ||
+        restBody.userConfig
+      ) {
+        const extraction = await extractLocalConfigSecrets({
+          localConfig: restBody.localConfig,
+          existingSecretId: null,
+          catalogName: restBody.name,
+        });
+        if (extraction.localConfig !== undefined) {
+          restBody.localConfig = extraction.localConfig;
+        }
+        if (extraction.secretId) {
+          localConfigSecretId = extraction.secretId;
+          restBody.localConfigSecretId = localConfigSecretId;
+        }
+      }
+
+      // Only merge environment variables into YAML if YAML is explicitly provided
+      // The YAML is only stored when explicitly edited via the "Edit Deployment Yaml" dialog
+      if (restBody.deploymentSpecYaml && restBody.localConfig?.environment) {
+        restBody.deploymentSpecYaml = mergeLocalConfigIntoYaml(
+          restBody.deploymentSpecYaml,
+          restBody.localConfig.environment,
+        );
+      }
+
+      if (restBody.environmentId != null) {
+        const targetEnv = await EnvironmentModel.findByIdForOrganization(
+          restBody.environmentId,
+          request.organizationId,
+        );
+        if (!targetEnv) {
+          throw new ApiError(400, "Environment not found");
+        }
+      }
+      // Enforce the governing environment's allowlist regex against the
+      // admin-entered config values being persisted: static (non-prompted) env
+      // var values and non-secret userConfig defaults (the value a static header
+      // persists, and the suggested value a prompted field shows). Secrets are
+      // exempt; secret env values are extracted above.
+      await assertValuesMatchEnvironmentRegex({
+        environmentId: restBody.environmentId ?? null,
+        organizationId: request.organizationId,
+        valueSets: [
+          collectStaticEnvValues(restBody.localConfig?.environment),
+          collectStaticUserConfigValues(restBody.userConfig),
+        ],
+      });
+      // A remote server is reached over HTTP from the backend; block creating it
+      // in an environment whose egress policy would forbid that outbound hop.
+      await assertRemoteServerUrlAllowedByNetworkPolicy({
+        serverType: restBody.serverType,
+        serverUrl: restBody.serverUrl ?? null,
+        environmentId: restBody.environmentId ?? null,
+        organizationId: request.organizationId,
+      });
+      // Clone source must resolve under the CALLER's own access. `create` copies
+      // the source's tools, guardrail policies, and secret bags (OAuth client
+      // secret, local-config env, presets) onto the new item — which the caller
+      // owns and can therefore read back expanded. Resolving the source with a
+      // hardcoded admin flag would skip the personal/team scope checks and let
+      // any member clone someone else's item to harvest those values, so pass
+      // the caller's real privilege instead.
+      if (restBody.clonedFrom) {
+        const cloneSource = await InternalMcpCatalogModel.findById(
+          restBody.clonedFrom,
+          {
+            expandSecrets: false,
+            userId: request.user.id,
+            isAdmin: checker.isAdmin,
+            organizationId: request.organizationId,
+          },
+        );
+        if (!cloneSource) {
+          throw new ApiError(400, "Clone source catalog item not found");
+        }
+      }
+
+      const catalogItem = await withCatalogTeamFkErrorMapped(() =>
+        InternalMcpCatalogModel.create(restBody, {
+          organizationId: request.organizationId,
+          authorId: request.user.id,
+        }),
+      );
+      return reply.send(catalogItem);
+    },
+  );
+
+  fastify.get(
+    "/api/internal_mcp_catalog/:id",
+    {
+      schema: {
+        operationId: RouteId.GetInternalMcpCatalogItem,
+        description: "Get Internal MCP catalog item by ID",
+        tags: ["MCP Catalog"],
+        params: z.object({
+          id: UuidIdSchema,
+        }),
+        response: constructResponseSchema(SelectInternalMcpCatalogSchema),
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params;
+      const { success: isAdmin } = await hasPermission(
+        { mcpServerInstallation: ["admin"] },
+        request.headers,
+      );
+      const catalogItem = await InternalMcpCatalogModel.findById(id, {
+        userId: request.user.id,
+        isAdmin,
+        organizationId: request.organizationId,
+      });
+
+      if (!catalogItem) {
+        throw new ApiError(404, "Catalog item not found");
+      }
+
+      return reply.send(catalogItem);
+    },
+  );
+
+  fastify.get(
+    "/api/internal_mcp_catalog/tools",
+    {
+      schema: {
+        operationId: RouteId.GetInternalMcpCatalogToolsBatch,
+        description:
+          "Get id/name/catalog for every listable tool across all catalog items the caller can see, in one request. Backs the tool pickers, which previously issued one request per catalog item.",
+        tags: ["MCP Catalog"],
+        response: constructResponseSchema(z.array(CatalogToolReferenceSchema)),
+      },
+    },
+    async (request, reply) => {
+      const { success: isAdmin } = await hasPermission(
+        { mcpServerInstallation: ["admin"] },
+        request.headers,
+      );
+      // Scoped to exactly the catalogs GET /api/internal_mcp_catalog would
+      // list for this caller — app backings included, which stay behind the
+      // `app:read`-gated includeApps path there and are excluded here too.
+      const catalogIds = await InternalMcpCatalogModel.findAccessibleIds({
+        userId: request.user.id,
+        isAdmin,
+        organizationId: request.organizationId,
+      });
+      return reply.send(await ToolModel.findListableByCatalogIds(catalogIds));
+    },
+  );
+
+  fastify.get(
+    "/api/internal_mcp_catalog/:id/tools",
+    {
+      schema: {
+        operationId: RouteId.GetInternalMcpCatalogTools,
+        description:
+          // white-label-ok: OpenAPI prose; branded per request by enrichOpenApiWithRbac (route schemas register before the branding singleton syncs)
+          "Get tools for a catalog item (including builtin Archestra tools)",
+        tags: ["MCP Catalog"],
+        params: z.object({
+          id: UuidIdSchema,
+        }),
+        response: constructResponseSchema(
+          z.array(ToolWithAssignedAgentCountSchema),
+        ),
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params;
+      const { success: isAdmin } = await hasPermission(
+        { mcpServerInstallation: ["admin"] },
+        request.headers,
+      );
+      // The built-in Archestra catalog is virtual; custom/private catalog IDs
+      // still need an access-checked backing row.
+      if (!isBuiltInCatalogId(id)) {
+        const catalogItem = await InternalMcpCatalogModel.findById(id, {
+          userId: request.user.id,
+          isAdmin,
+          organizationId: request.organizationId,
+        });
+
+        if (!catalogItem) {
+          throw new ApiError(404, "Catalog item not found");
+        }
+      }
+
+      const tools = await ToolModel.findByCatalogId(id);
+      return reply.send(tools);
+    },
+  );
+
+  fastify.put(
+    "/api/internal_mcp_catalog/:id",
+    {
+      schema: {
+        operationId: RouteId.UpdateInternalMcpCatalogItem,
+        description: "Update an Internal MCP catalog item",
+        tags: ["MCP Catalog"],
+        params: z.object({
+          id: UuidIdSchema,
+        }),
+        body: PartialUpdateInternalMcpCatalogSchema.extend({
+          // BYOS: External Vault path for OAuth client secret
+          oauthClientSecretVaultPath: z.string().optional(),
+          // BYOS: External Vault key for OAuth client secret
+          oauthClientSecretVaultKey: z.string().optional(),
+          // BYOS: External Vault path for local config secret env vars
+          localConfigVaultPath: z.string().optional(),
+          // BYOS: External Vault key for local config secret env vars
+          localConfigVaultKey: z.string().optional(),
+        }),
+        response: constructResponseSchema(SelectInternalMcpCatalogSchema),
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params;
+      const { body } = request;
+      if (isBuiltInCatalogId(id)) {
+        throw new ApiError(403, "Built-in catalog items cannot be modified");
+      }
+
+      const {
+        oauthClientSecretVaultPath,
+        oauthClientSecretVaultKey,
+        localConfigVaultPath,
+        localConfigVaultKey,
+        // SPDX-SnippetBegin
+        // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+        // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+        // Operational field on the INSTALL rows, not a catalog column: pulled
+        // out here and cascaded onto every live install after the permission
+        // gate, so it never reaches the catalog update.
+        hibernationMode,
+        // SPDX-SnippetEnd
+        ...restBodyInput
+      } = body;
+      // Downstream secret extraction removes plaintext values from the payload
+      // before persistence, so work on a cloned object instead of the request body.
+      const restBody = structuredClone(restBodyInput);
+
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      // Idle hibernation is enterprise-licensed at both ends: the org toggle
+      // and this per-server override. Refuse rather than ignore, so an
+      // unlicensed caller never believes it pinned a server awake.
+      if (hibernationMode !== undefined && !enterpriseTier.isCoreActive()) {
+        throw new ApiError(403, MCP_IDLE_HIBERNATION_ENTERPRISE_MESSAGE);
+      }
+      // SPDX-SnippetEnd
+
+      // Secret FK columns are server-managed (see POST): a client-supplied id
+      // would otherwise be persisted onto the row, repointing it at another
+      // org's secret. Secret handling below sets them from the existing row.
+      restBody.clientSecretId = undefined;
+      restBody.localConfigSecretId = undefined;
+
+      const checker = await getMcpCatalogPermissionChecker({
+        userId: request.user.id,
+        organizationId: request.organizationId,
+      });
+      const isAdmin = checker.isAdmin;
+
+      // Get the original catalog item to check if name or serverUrl changed
+      const originalCatalogItem = await InternalMcpCatalogModel.findById(id, {
+        userId: request.user.id,
+        isAdmin,
+        organizationId: request.organizationId,
+      });
+
+      if (!originalCatalogItem) {
+        throw new ApiError(404, "Catalog item not found");
+      }
+
+      // App backing catalogs are owned by the Apps flow. Through this generic
+      // endpoint, only visibility (scope/teams) and environment may change: lock
+      // the server type to "app" and drop every deploy/credential field so the
+      // catalog can't be flipped to a deployable type or have an install command
+      // injected (then later installed). The normal scope/team/environment
+      // authorization below still applies; the change is propagated to the linked
+      // app + server after the update.
+      const isAppCatalog = originalCatalogItem.serverType === "app";
+      // A non-app catalog cannot be converted into an app (the inverse of the
+      // create guard): an "app" catalog only makes sense when an actual app row
+      // and the `open` launch tool back it, which this path can't create.
+      if (!isAppCatalog && restBody.serverType === "app") {
+        throw new ApiError(400, "Catalog items cannot be converted to apps.");
+      }
+      if (isAppCatalog) {
+        restBody.serverType = "app";
+        // Name is app-owned (edited via /api/apps, which syncs it here) — never
+        // changed through the generic catalog endpoint.
+        restBody.name = undefined;
+        restBody.localConfig = undefined;
+        restBody.installationCommand = undefined;
+        restBody.oauthConfig = undefined;
+        restBody.enterpriseManagedConfig = undefined;
+        restBody.serverUrl = undefined;
+        restBody.userConfig = undefined;
+        restBody.authFields = undefined;
+        restBody.requiresAuth = undefined;
+        restBody.deploymentSpecYaml = undefined;
+      }
+
+      // A second copy of the same row WITHOUT expanded secret values, used
+      // solely for the cascade-reinstall gate's snapshot comparison. The
+      // expanded `originalCatalogItem` above is needed by the route body
+      // downstream (env-vault construction, userConfig diffing). But the
+      // gate compares `original` vs `Model.update`'s return, and
+      // `Model.update` returns the raw row. Without this unexpanded
+      // fetch, every PUT on a bag-bearing catalog would diff on
+      // `localConfig.environment[*].value` (expanded plaintext vs stored
+      // ID-ref) and cascade-reinstall on edits that didn't actually
+      // touch any runtime field — including pure description edits.
+      const originalCatalogItemForGate = await InternalMcpCatalogModel.findById(
+        id,
+        {
+          userId: request.user.id,
+          isAdmin,
+          organizationId: request.organizationId,
+          expandSecrets: false,
+        },
+      );
+      if (!originalCatalogItemForGate) {
+        throw new ApiError(404, "Catalog item not found");
+      }
+
+      const [userTeamIds, writeMembershipTeamIds] = checker.isAdmin
+        ? [[], []]
+        : await Promise.all([
+            TeamModel.getUserTeamIds(request.user.id),
+            getCatalogWriteMembershipTeamIds(request.user.id),
+          ]);
+      const existingTeams = originalCatalogItem.teams;
+
+      // Gate the right to modify this item at its CURRENT scope. This lets an
+      // admin of one of the item's `write` teams edit it, and still blocks
+      // editing someone else's personal item or a `use`-only team's item.
+      requireMcpCatalogModifyPermission({
+        checker,
+        scope: originalCatalogItem.scope,
+        authorId: originalCatalogItem.authorId,
+        catalogTeams: existingTeams,
+        writeMembershipTeamIds,
+        userId: request.user.id,
+      });
+
+      if (restBody.dynamicConnectionMcpServerId) {
+        const pinned = await McpServerModel.findByIdInOrg(
+          restBody.dynamicConnectionMcpServerId,
+          request.organizationId,
+        );
+        if (pinned?.scope === "personal") {
+          throw new ApiError(
+            400,
+            "Personal connections cannot be set as the default credential. Use on-behalf-of-user resolution instead.",
+          );
+        }
+      }
+
+      // Re-authorize and re-sync teams only when scope, team assignments, or
+      // their access levels actually change. A content-only edit that echoes
+      // the existing teams must not 403 a non-admin author/team-admin or
+      // needlessly rewrite rows.
+      const newScope = restBody.scope ?? originalCatalogItem.scope;
+      // Shared items are one-way: demoting team/org back to personal would yank
+      // the item from everyone it was shared with. Mirrors the agent route.
+      if (newScope === "personal" && originalCatalogItem.scope !== "personal") {
+        throw new ApiError(400, "Shared catalog items cannot be made personal");
+      }
+      const newTeams: CatalogTeamAssignment[] =
+        newScope === "team"
+          ? normalizeCatalogTeamInput(restBody.teams ?? existingTeams)
+          : [];
+      const newTeamIds = newTeams.map((team) => team.id);
+      const scopeChanged = newScope !== originalCatalogItem.scope;
+      const teamsChanged =
+        newScope === "team" && !sameTeamAssignments(newTeams, existingTeams);
+      if (scopeChanged || teamsChanged) {
+        authorizeMcpCatalogScope({
+          checker,
+          scope: newScope,
+          authorId: originalCatalogItem.authorId,
+          requestedTeamIds: newTeamIds,
+          userTeamIds,
+          writeMembershipTeamIds,
+          userId: request.user.id,
+        });
+        await assertMcpCatalogTeams({
+          scope: newScope,
+          teamIds: newTeamIds,
+          organizationId: request.organizationId,
+        });
+      }
+
+      // Only rewrite team assignments when scope/teams/levels actually change;
+      // undefined leaves the existing rows untouched.
+      restBody.teams = scopeChanged || teamsChanged ? newTeams : undefined;
+
+      // ── Rename ─────────────────────────────────────────────────────────
+      // A name change never flows into the generic update below: it is
+      // gated (409) and applied atomically by renameCascade — a pure DB
+      // cascade (catalog → install names → tool slugs → limits) with zero
+      // K8s interaction, since deployment identity is frozen. App catalogs
+      // never get here (name is app-owned and stripped above).
+      const newCatalogName = restBody.name;
+      if (
+        newCatalogName !== undefined &&
+        newCatalogName !== originalCatalogItemForGate.name
+      ) {
+        // Tool names embed the catalog name and are unique only per catalog;
+        // tool-call routing resolves the raw name string, so a same-name (or
+        // same-lowercased-slug) sibling would silently receive this server's
+        // calls. App-level check only (no DB constraint — legacy duplicates
+        // must keep working); the check-then-write race is accepted.
+        const conflict = await InternalMcpCatalogModel.findRootByNameInOrg({
+          name: newCatalogName,
+          organizationId: request.organizationId,
+        });
+        if (conflict && conflict.id !== id) {
+          throw new ApiError(
+            409,
+            `An MCP server named "${newCatalogName}" already exists in this organization. Tool names embed the server name, so duplicates would route tool calls to the wrong server.`,
+            "catalog_name_conflict",
+          );
+        }
+
+        // The cascade's freeze-fallback is only safe once the startup adopt
+        // pass has frozen every row that HAS a live deployment. Block a
+        // rename issued during the startup window until the pass completes;
+        // fail it if the pass failed (churn-prevention outranks
+        // availability).
+        const k8sRuntimeConfigured =
+          Boolean(config.orchestrator.kubernetes.kubeconfig) ||
+          config.orchestrator.kubernetes.loadKubeconfigFromCurrentCluster;
+        if (k8sRuntimeConfigured) {
+          await mcpServerRuntimeManager.deploymentNamesAdopted;
+        }
+
+        // The serverName placeholder is the one way the display name can
+        // reach a pod spec — those installs genuinely need a reinstall.
+        const effectiveDeploymentSpecYaml =
+          restBody.deploymentSpecYaml !== undefined
+            ? restBody.deploymentSpecYaml
+            : originalCatalogItemForGate.deploymentSpecYaml;
+        await InternalMcpCatalogModel.renameCascade({
+          id,
+          newName: newCatalogName,
+          flagReinstallRequired:
+            originalCatalogItemForGate.serverType === "local" &&
+            Boolean(
+              effectiveDeploymentSpecYaml?.includes(SERVER_NAME_PLACEHOLDER),
+            ),
+          freezeDeploymentNames: k8sRuntimeConfigured,
+        });
+
+        // Downstream must see NO name diff: the row is already renamed, and
+        // the reinstall gates below would otherwise misread the rename as a
+        // breaking change. A rename combined with a real breaking change
+        // still composes — the remaining diff drives the gates as usual.
+        restBody.name = undefined;
+        originalCatalogItemForGate.name = newCatalogName;
+      }
+
+      let clientSecretId = originalCatalogItem.clientSecretId;
+      let localConfigSecretId = originalCatalogItem.localConfigSecretId;
+
+      // Catalog secret-bag value rotations are invisible to the
+      // unexpanded gate snapshot (the bag content lives outside the
+      // catalog row). Track here as we write to an EXISTING bag so the
+      // cascade can force the auto-restart path on rotation. Covers
+      // direct OAuth client_secret, enterprise-managed client-secret
+      // override, non-prompted secret env-var values, and image-pull-
+      // secret credential passwords. The Readonly-Vault flows always
+      // delete+create the bag — that swaps the `clientSecretId` /
+      // `localConfigSecretId` on the row itself, so the normal gate
+      // already detects them; no override needed there.
+      let catalogSharedSecretValuesRotated = false;
+
+      // Handle OAuth client secret - either via Readonly Vault or direct value
+      if (oauthClientSecretVaultPath && oauthClientSecretVaultKey) {
+        // Readonly Vault flow for OAuth client secret
+        if (!isByosEnabled()) {
+          throw new ApiError(
+            400,
+            "Readonly Vault is not enabled. " +
+              "Requires ARCHESTRA_SECRETS_MANAGER=READONLY_VAULT and an enterprise license.",
+          );
+        }
+
+        const existingSecretValues =
+          await getCatalogClientSecretValues(clientSecretId);
+
+        // Delete existing secret if any
+        if (clientSecretId) {
+          await secretManager().deleteSecret(clientSecretId);
+        }
+
+        // Store as { client_secret: "path#key" } format
+        const vaultReference = `${oauthClientSecretVaultPath}#${oauthClientSecretVaultKey}`;
+        const secret = await secretManager().createSecret(
+          { ...existingSecretValues, client_secret: vaultReference },
+          `${originalCatalogItem.name}-oauth-client-secret-vault`,
+        );
+        clientSecretId = secret.id;
+        restBody.clientSecretId = clientSecretId;
+
+        // Remove client_secret from oauthConfig if present
+        if (restBody.oauthConfig && "client_secret" in restBody.oauthConfig) {
+          delete restBody.oauthConfig.client_secret;
+        }
+
+        logger.info(
+          "Created Readonly Vault external vault secret reference for OAuth client secret",
+        );
+      } else if (
+        restBody.oauthConfig &&
+        "client_secret" in restBody.oauthConfig
+      ) {
+        // Direct client_secret value
+        const clientSecret = restBody.oauthConfig.client_secret;
+        if (clientSecret) {
+          const result = await upsertCatalogClientSecretValue({
+            clientSecretId,
+            catalogName: originalCatalogItem.name,
+            key: "client_secret",
+            value: clientSecret,
+          });
+          clientSecretId = result.id;
+          if (result.rotated) catalogSharedSecretValuesRotated = true;
+
+          restBody.clientSecretId = clientSecretId;
+        }
+        delete restBody.oauthConfig.client_secret;
+      }
+
+      const enterpriseManagedClientSecretOverride =
+        restBody.enterpriseManagedConfig?.clientSecretOverride;
+      if (enterpriseManagedClientSecretOverride) {
+        const result = await upsertCatalogClientSecretValue({
+          clientSecretId,
+          catalogName: originalCatalogItem.name,
+          key: ENTERPRISE_MANAGED_CLIENT_SECRET_OVERRIDE_SECRET_KEY,
+          value: enterpriseManagedClientSecretOverride,
+        });
+        clientSecretId = result.id;
+        if (result.rotated) catalogSharedSecretValuesRotated = true;
+
+        restBody.clientSecretId = clientSecretId;
+        delete restBody.enterpriseManagedConfig?.clientSecretOverride;
+      }
+
+      // Handle local config secrets - either via Readonly Vault or direct values
+      if (localConfigVaultPath && localConfigVaultKey) {
+        // Readonly Vault flow for local config secrets
+        if (!isByosEnabled()) {
+          throw new ApiError(
+            400,
+            "Readonly Vault is not enabled. " +
+              "Requires ARCHESTRA_SECRETS_MANAGER=READONLY_VAULT and an enterprise license.",
+          );
+        }
+
+        // Delete existing secret if any
+        if (localConfigSecretId) {
+          await secretManager().deleteSecret(localConfigSecretId);
+        }
+
+        // Store as { vaultKey: "path#vaultKey" } format
+        const vaultReference = `${localConfigVaultPath}#${localConfigVaultKey}`;
+        const secret = await secretManager().createSecret(
+          { [localConfigVaultKey]: vaultReference },
+          `${originalCatalogItem.name}-local-config-env-vault`,
+        );
+        localConfigSecretId = secret.id;
+        restBody.localConfigSecretId = localConfigSecretId;
+
+        // Remove values from secret env vars in catalog template
+        if (restBody.localConfig?.environment) {
+          for (const envVar of restBody.localConfig.environment) {
+            if (envVar.type === "secret" && !envVar.promptOnInstallation) {
+              delete envVar.value;
+            }
+          }
+        }
+
+        logger.info(
+          "Created Readonly Vault external vault secret reference for local config secrets",
+        );
+      } else if (
+        restBody.localConfig?.environment ||
+        restBody.localConfig?.imagePullSecrets ||
+        restBody.userConfig
+      ) {
+        const extraction = await extractLocalConfigSecrets({
+          localConfig: restBody.localConfig,
+          existingSecretId: localConfigSecretId,
+          catalogName: originalCatalogItem.name,
+        });
+        // A userConfig-only edit reaches here with no localConfig. Assigning
+        // the (undefined) result would still create the key, and `update()`
+        // resets the image approval on `"localConfig" in dbValues` alone —
+        // re-blocking installs behind the trusted-image gate.
+        if (extraction.localConfig !== undefined) {
+          restBody.localConfig = extraction.localConfig;
+        }
+        if (extraction.rotated) catalogSharedSecretValuesRotated = true;
+        if (extraction.secretId) {
+          localConfigSecretId = extraction.secretId;
+          restBody.localConfigSecretId = localConfigSecretId;
+        }
+      }
+
+      // Merge environment variables into YAML in two cases:
+      // 1. YAML is explicitly provided in request (user editing via "Edit Deployment Yaml" dialog)
+      // 2. YAML already exists in database and env vars are being updated (main form edit)
+      const yamlToUpdate =
+        restBody.deploymentSpecYaml ?? originalCatalogItem.deploymentSpecYaml;
+
+      if (yamlToUpdate && restBody.localConfig?.environment) {
+        const environment = restBody.localConfig.environment;
+
+        // Build set of previously managed keys to detect removed env vars
+        const previouslyManagedKeys = new Set<string>(
+          (originalCatalogItem.localConfig?.environment ?? []).map(
+            (env) => env.key,
+          ),
+        );
+
+        // Merge current environment into the YAML
+        restBody.deploymentSpecYaml = mergeLocalConfigIntoYaml(
+          yamlToUpdate,
+          environment,
+          previouslyManagedKeys,
+        );
+      }
+
+      // When the environment assignment changes, gate it the same way create
+      // does — the target must belong to this org, and a restricted environment
+      // (or restricted default) requires mcpRegistry:deploy-to-restricted.
+      const environmentChanged =
+        "environmentId" in restBody &&
+        restBody.environmentId !== originalCatalogItem.environmentId;
+      if (environmentChanged) {
+        await assertCanAssignEnvironment({
+          environmentId: restBody.environmentId ?? null,
+          organizationId: request.organizationId,
+          canDeployToRestricted: await callerCanDeployToRestricted(
+            request.headers,
+          ),
+        });
+      }
+
+      // Enforce the governing environment's allowlist regex. Validate when the
+      // local config / userConfig changes (incoming values) or the environment
+      // changes (re-check the EFFECTIVE persisted values against the new env, so
+      // moving an item into a stricter env catches values stored under the old
+      // one).
+      if (
+        environmentChanged ||
+        restBody.localConfig !== undefined ||
+        restBody.userConfig !== undefined
+      ) {
+        await assertValuesMatchEnvironmentRegex({
+          environmentId: ("environmentId" in restBody
+            ? restBody.environmentId
+            : originalCatalogItem.environmentId) as string | null,
+          organizationId: request.organizationId,
+          valueSets: [
+            collectStaticEnvValues(
+              restBody.localConfig?.environment ??
+                originalCatalogItem.localConfig?.environment,
+            ),
+            collectStaticUserConfigValues(
+              restBody.userConfig ?? originalCatalogItem.userConfig,
+            ),
+          ],
+        });
+      }
+
+      // Re-validate a remote server's URL against its environment's egress
+      // policy when the URL, server type, or environment changes. Unchanged
+      // existing servers are grandfathered (no retroactive block).
+      if (
+        environmentChanged ||
+        restBody.serverUrl !== undefined ||
+        restBody.serverType !== undefined
+      ) {
+        await assertRemoteServerUrlAllowedByNetworkPolicy({
+          serverType: restBody.serverType ?? originalCatalogItem.serverType,
+          serverUrl:
+            (restBody.serverUrl !== undefined
+              ? restBody.serverUrl
+              : originalCatalogItem.serverUrl) ?? null,
+          environmentId: ("environmentId" in restBody
+            ? restBody.environmentId
+            : originalCatalogItem.environmentId) as string | null,
+          organizationId: request.organizationId,
+        });
+      }
+
+      // Detect an environment reassignment of a local catalog — it relocates
+      // the pod to a different namespace.
+      const relocatingLocalDeployment =
+        "environmentId" in restBody &&
+        restBody.environmentId !== originalCatalogItem.environmentId &&
+        originalCatalogItem.serverType === "local" &&
+        mcpServerRuntimeManager.isEnabled;
+
+      // Update the catalog item
+      const catalogItem = await withCatalogTeamFkErrorMapped(() =>
+        InternalMcpCatalogModel.update(id, restBody),
+      );
+
+      if (!catalogItem) {
+        throw new ApiError(404, "Catalog item not found");
+      }
+
+      // SPDX-SnippetBegin
+      // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+      // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+      // Cascade the per-server idle-hibernation override onto every live
+      // install of this catalog. The registry dialog is catalog-scoped, so
+      // this PUT is its write path; the reinstall route remains the
+      // per-install path when a single installation must diverge. Runs after
+      // the permission gate above — whoever may edit the catalog may pin it
+      // awake — and only once every validation gate and the catalog update
+      // itself have passed: a PUT that 409s on a rename conflict (or fails
+      // env-regex / network-policy / team checks) must not silently change
+      // runtime policy on the way out. Idempotent, so a failure later in
+      // this handler is repaired by re-sending the same request.
+      if (hibernationMode !== undefined) {
+        await McpServerModel.setHibernationModeForCatalog(id, hibernationMode);
+      }
+      // SPDX-SnippetEnd
+
+      // Only tear down the old-namespace deployment when it will actually be
+      // recreated. A single-tenant edit that ALSO requires new user input (e.g.
+      // a command or prompted-env-var change in the same PUT) makes the cascade
+      // mark the install reinstall-required WITHOUT recreating the pod — so
+      // tearing it down here would leave the install with no running pod until a
+      // manual reinstall. Multi-tenant always recreates via
+      // reinstallSharedDeployment below, so it's always safe there.
+      const recreatingRelocatedDeployment =
+        relocatingLocalDeployment &&
+        (originalCatalogItem.multitenant === true ||
+          !requiresNewUserInputForReinstall(
+            originalCatalogItemForGate,
+            catalogItem,
+          ));
+      if (recreatingRelocatedDeployment) {
+        // Remove the deployment(s) from the OLD namespace before recreating in
+        // the new one. The old namespace is derived from `originalCatalogItem`
+        // (captured before the update), so the teardown is correct even on a
+        // cache-cold or cache-stale replica — unlike the recreate paths below,
+        // which resolve the namespace from the now-updated row. Without this the
+        // old-namespace pod is orphaned: it keeps running in a namespace the
+        // catalog no longer points at, and the reconciler only scans the default
+        // namespace so it never reclaims it.
+        await mcpServerRuntimeManager.tearDownOldNamespaceDeployments(
+          originalCatalogItem,
+        );
+      }
+
+      // Recreate in the new namespace. A multi-tenant local catalog shares one
+      // K8s Deployment across all installs, and a per-install restart no-ops on
+      // it (the sibling guard in restartServer), so it must be recreated
+      // explicitly via reinstallSharedDeployment — awaited before the cascade so
+      // its per-install tool sync runs against the relocated, ready pod rather
+      // than racing the recreate. Single-tenant installs are recreated by the
+      // cascade's per-install restart below.
+      if (
+        relocatingLocalDeployment &&
+        originalCatalogItem.multitenant === true
+      ) {
+        await mcpServerRuntimeManager.reinstallSharedDeployment(id);
+      }
+
+      // Trusted-image gate: when a non-privileged author swaps the image to an
+      // untrusted one, hold the new image for admin approval instead of rolling
+      // it out. Flip the catalog flag to `pending` and skip the auto-reinstall so
+      // every install keeps running its old, approved image until an admin
+      // approves — rather than auto-reinstalling onto an image that the gate
+      // would reject and marking the install failed.
+      const imageHeldForApproval = catalogItem.organizationId
+        ? await holdInstallIfImageGated({
+            catalogItem,
+            organizationId: catalogItem.organizationId,
+          })
+        : false;
+
+      if (imageHeldForApproval) {
+        logger.info(
+          { catalogId: id },
+          "Catalog image edited to an untrusted image by a non-privileged author - holding for admin approval; skipping auto-reinstall",
+        );
+      } else {
+        // Cascade reinstall for the parent's own installs. Use the
+        // unexpanded snapshot so the gate's diff isn't fooled by
+        // expanded-vs-raw asymmetry on bag-bearing rows (see comment
+        // above on `originalCatalogItemForGate`). Force the auto-restart
+        // path when secret bag values rotated — those changes are
+        // invisible to the row-diff gate, so without the override pods
+        // would keep injecting the stale value until something else
+        // triggered a restart.
+        await cascadeReinstallForCatalog(
+          originalCatalogItemForGate,
+          catalogItem,
+          {
+            forceAutoRestart: catalogSharedSecretValuesRotated,
+          },
+        );
+      }
+
+      // Note: Tools are NOT deleted - they are synced during reinstall to preserve
+      // policies and profile assignments
+
+      // Keep an app's linked row + backing server in sync with the catalog edit.
+      if (isAppCatalog) {
+        await propagateAppCatalogChange(id, {
+          scope: catalogItem.scope,
+          environmentId: catalogItem.environmentId,
+          description: catalogItem.description,
+        });
+      }
+
+      return reply.send(catalogItem);
+    },
+  );
+
+  fastify.post(
+    "/api/internal_mcp_catalog/:id/reinstall",
+    {
+      schema: {
+        operationId: RouteId.ReinstallInternalMcpCatalogItem,
+        description:
+          "Reinstall the shared K8s Deployment for a multi-tenant local catalog and cascade tool sync to every install.",
+        tags: ["MCP Catalog"],
+        params: z.object({
+          id: UuidIdSchema,
+        }),
+        response: constructResponseSchema(DeleteObjectResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params;
+
+      const checker = await getMcpCatalogPermissionChecker({
+        userId: request.user.id,
+        organizationId: request.organizationId,
+      });
+
+      const catalogItem = await InternalMcpCatalogModel.findById(id, {
+        userId: request.user.id,
+        isAdmin: checker.isAdmin,
+        organizationId: request.organizationId,
+        expandSecrets: false,
+      });
+      if (!catalogItem) {
+        throw new ApiError(404, "Catalog item not found");
+      }
+
+      // Endpoint is meaningful only for multi-tenant local catalogs — these
+      // are the only ones whose execution-config edits set
+      // `catalogReinstallRequired`. Single-tenant / remote catalogs use the
+      // per-install `mcp_server.reinstall_required` flag.
+      if (!(catalogItem.multitenant && catalogItem.serverType === "local")) {
+        throw new ApiError(
+          400,
+          "Catalog reinstall is only supported for multi-tenant local catalogs",
+        );
+      }
+
+      if (!catalogItem.catalogReinstallRequired) {
+        throw new ApiError(409, "Catalog has no pending reinstall");
+      }
+
+      // Mirror the catalog-edit ownership check: only users who could have
+      // edited the catalog (admins, the author, or an admin of one of the
+      // item's `write` teams) can trigger the reinstall.
+      requireMcpCatalogModifyPermission({
+        checker,
+        scope: catalogItem.scope,
+        authorId: catalogItem.authorId,
+        catalogTeams: catalogItem.teams,
+        writeMembershipTeamIds: checker.isAdmin
+          ? []
+          : await getCatalogWriteMembershipTeamIds(request.user.id),
+        userId: request.user.id,
+      });
+
+      try {
+        await reinstallMultitenantCatalog(catalogItem);
+      } catch (error) {
+        throw toMcpOperationApiError(error);
+      }
+
+      return reply.send({ success: true });
+    },
+  );
+
+  fastify.post(
+    "/api/internal_mcp_catalog/:id/refresh-image",
+    {
+      schema: {
+        operationId: RouteId.RefreshInternalMcpCatalogImage,
+        description:
+          "Restart all local MCP server pods for a catalog so Kubernetes pulls the current configured image. Fan-out restarts are best effort: the request succeeds when at least one target restarts successfully, while failed installs are marked with their own error status.",
+        tags: ["MCP Catalog"],
+        params: z.object({
+          id: UuidIdSchema,
+        }),
+        response: constructResponseSchema(DeleteObjectResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params;
+
+      const checker = await getMcpCatalogPermissionChecker({
+        userId: request.user.id,
+        organizationId: request.organizationId,
+      });
+
+      const catalogItem = await InternalMcpCatalogModel.findById(id, {
+        userId: request.user.id,
+        isAdmin: checker.isAdmin,
+        organizationId: request.organizationId,
+        expandSecrets: false,
+      });
+      if (!catalogItem) {
+        throw new ApiError(404, "Catalog item not found");
+      }
+
+      requireMcpCatalogModifyPermission({
+        checker,
+        scope: catalogItem.scope,
+        authorId: catalogItem.authorId,
+        catalogTeams: catalogItem.teams,
+        writeMembershipTeamIds: checker.isAdmin
+          ? []
+          : await getCatalogWriteMembershipTeamIds(request.user.id),
+        userId: request.user.id,
+      });
+
+      const targetCatalogItems = [catalogItem].filter(
+        (item) => item.serverType === "local",
+      );
+
+      if (targetCatalogItems.length === 0) {
+        throw new ApiError(
+          400,
+          "Pod restart is only supported for local catalogs",
+        );
+      }
+
+      const restartResults = await Promise.allSettled(
+        targetCatalogItems.map(refreshCatalogImage),
+      );
+      const failures = restartResults.filter(
+        (result): result is PromiseRejectedResult =>
+          result.status === "rejected",
+      );
+      if (failures.length === restartResults.length) {
+        throw toMcpOperationApiError(failures[0].reason);
+      }
+
+      return reply.send({ success: true });
+    },
+  );
+
+  // === Image approval (trusted-image-registry gate) ===
+
+  fastify.get(
+    "/api/internal_mcp_catalog/pending-image-approval",
+    {
+      schema: {
+        operationId: RouteId.ListPendingImageApprovalCatalogItems,
+        description:
+          "List local catalog items in the org whose custom image is awaiting admin approval (blocked by the target environment's trusted image registries).",
+        tags: ["MCP Catalog"],
+        response: constructResponseSchema(
+          z.array(SelectInternalMcpCatalogSchema),
+        ),
+      },
+    },
+    async (request, reply) => {
+      return reply.send(
+        await InternalMcpCatalogModel.listPendingImageApproval(
+          request.organizationId,
+        ),
+      );
+    },
+  );
+
+  fastify.post(
+    "/api/internal_mcp_catalog/:id/approve",
+    {
+      schema: {
+        operationId: RouteId.ApproveCatalogItemImage,
+        description:
+          "Approve a local catalog item's image so its installs proceed. Requires mcpServerInstallation:admin.",
+        tags: ["MCP Catalog"],
+        params: z.object({ id: UuidIdSchema }),
+        response: constructResponseSchema(SelectInternalMcpCatalogSchema),
+      },
+    },
+    async (request, reply) => {
+      const catalogItem = await assertImageApprovable(
+        request.params.id,
+        request.organizationId,
+      );
+      const approved = await InternalMcpCatalogModel.approveImage({
+        id: catalogItem.id,
+        reviewedBy: request.user.id,
+      });
+      if (!approved) {
+        throw new ApiError(404, "Catalog item not found");
+      }
+      logger.info(
+        { catalogId: catalogItem.id, reviewedBy: request.user.id },
+        "Catalog item image approved",
+      );
+      // Release the auto-reinstall the gated edit deferred: roll existing
+      // installs onto the now-approved image (mirrors the un-gated image edit,
+      // which auto-reinstalls). A fresh, never-installed catalog item has no
+      // installs, so this is a no-op for the install-from-scratch flow.
+      await reinstallApprovedImage(approved);
+      return reply.send(approved);
+    },
+  );
+
+  fastify.delete(
+    "/api/internal_mcp_catalog/:id",
+    {
+      schema: {
+        operationId: RouteId.DeleteInternalMcpCatalogItem,
+        description: "Delete an Internal MCP catalog item",
+        tags: ["MCP Catalog"],
+        params: z.object({
+          id: UuidIdSchema,
+        }),
+        response: constructResponseSchema(DeleteObjectResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params;
+      if (isBuiltInCatalogId(id)) {
+        throw new ApiError(403, "Built-in catalog items cannot be deleted");
+      }
+
+      const { success: isAdmin } = await hasPermission(
+        { mcpServerInstallation: ["admin"] },
+        request.headers,
+      );
+
+      // Get the catalog item to check if it has secrets - don't expand secrets, just need IDs
+      const catalogItem = await InternalMcpCatalogModel.findById(id, {
+        userId: request.user.id,
+        isAdmin,
+        organizationId: request.organizationId,
+        expandSecrets: false,
+      });
+
+      if (!catalogItem) {
+        throw new ApiError(404, "Catalog item not found");
+      }
+
+      // App-backed catalogs are created and removed through the Apps lifecycle;
+      // deleting one here would orphan its app. (Mirrors the install/create guards.)
+      if (catalogItem.serverType === "app") {
+        throw new ApiError(
+          400,
+          "App-backed catalog items are managed through the Apps API and cannot be deleted here.",
+        );
+      }
+
+      // Deletion cascades to every install and secret bag: reserved for admins
+      // and a personal item's author, never conferred by a team `write` level.
+      requireMcpCatalogDeletePermission({
+        checker: { isAdmin },
+        scope: catalogItem.scope,
+        authorId: catalogItem.authorId,
+        userId: request.user.id,
+      });
+
+      const affectedSources =
+        await InternalMcpCatalogModel.findDeleteCascadeSourceIds(id);
+      const success = await InternalMcpCatalogModel.delete(id);
+      if (success) {
+        broadcastMcpServersChanged({
+          organizationId: catalogItem.organizationId,
+          catalogIds: affectedSources.catalogIds,
+          serverIds:
+            catalogItem.organizationId === null
+              ? []
+              : affectedSources.serverIds,
+        });
+      }
+      return reply.send({ success });
+    },
+  );
+
+  fastify.delete(
+    "/api/internal_mcp_catalog/by-name/:name",
+    {
+      schema: {
+        operationId: RouteId.DeleteInternalMcpCatalogItemByName,
+        description: "Delete an Internal MCP catalog item by name",
+        tags: ["MCP Catalog"],
+        params: z.object({
+          name: z.string().min(1),
+        }),
+        response: constructResponseSchema(DeleteObjectResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      const { name } = request.params;
+      const catalogItem = await InternalMcpCatalogModel.findByName(name, {
+        organizationId: request.organizationId,
+      });
+
+      if (!catalogItem) {
+        throw new ApiError(404, `Catalog item with name "${name}" not found`);
+      }
+
+      if (isBuiltInCatalogId(catalogItem.id)) {
+        throw new ApiError(403, "Built-in catalog items cannot be deleted");
+      }
+
+      // App-backed catalogs are managed through the Apps lifecycle (see above).
+      if (catalogItem.serverType === "app") {
+        throw new ApiError(
+          400,
+          "App-backed catalog items are managed through the Apps API and cannot be deleted here.",
+        );
+      }
+
+      // Deletion cascades to every install and secret bag: reserved for admins
+      // and a personal item's author, never conferred by a team `write` level.
+      const { success: isAdmin } = await hasPermission(
+        { mcpServerInstallation: ["admin"] },
+        request.headers,
+      );
+      requireMcpCatalogDeletePermission({
+        checker: { isAdmin },
+        scope: catalogItem.scope,
+        authorId: catalogItem.authorId,
+        userId: request.user.id,
+      });
+
+      const affectedSources =
+        await InternalMcpCatalogModel.findDeleteCascadeSourceIds(
+          catalogItem.id,
+        );
+      const success = await InternalMcpCatalogModel.delete(catalogItem.id);
+      if (success) {
+        broadcastMcpServersChanged({
+          organizationId: catalogItem.organizationId,
+          catalogIds: affectedSources.catalogIds,
+          serverIds:
+            catalogItem.organizationId === null
+              ? []
+              : affectedSources.serverIds,
+        });
+      }
+      return reply.send({ success });
+    },
+  );
+
+  fastify.post(
+    "/api/internal_mcp_catalog/:id/restore",
+    {
+      schema: {
+        operationId: RouteId.RestoreInternalMcpCatalogItem,
+        description:
+          "Restore a soft-deleted Internal MCP catalog item and its cascaded installs and tools (flag-only reinstall).",
+        tags: ["MCP Catalog"],
+        params: z.object({
+          id: UuidIdSchema,
+        }),
+        response: constructResponseSchema(DeleteObjectResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params;
+      if (isBuiltInCatalogId(id)) {
+        throw new ApiError(403, "Built-in catalog items cannot be restored");
+      }
+
+      const catalogItem =
+        await InternalMcpCatalogModel.findDeletedByIdForOrganization(
+          id,
+          request.organizationId,
+        );
+      if (!catalogItem) {
+        throw new ApiError(404, "Catalog item not found");
+      }
+
+      // App-backed catalogs are managed through the Apps lifecycle (mirrors delete).
+      if (catalogItem.serverType === "app") {
+        throw new ApiError(
+          400,
+          "App-backed catalog items are managed through the Apps API and cannot be restored here.",
+        );
+      }
+
+      // Authorization is the route-level manage-deleted permission (admin-only
+      // by default): deleted-resource lifecycle is one org-scoped capability,
+      // not derived from authorship of the live resource.
+
+      const conflict =
+        await InternalMcpCatalogModel.getRestoreConflictMessage(catalogItem);
+      if (conflict) {
+        throw new ApiError(409, conflict);
+      }
+
+      return reply.send({
+        success: await InternalMcpCatalogModel.restore(id),
+      });
+    },
+  );
+
+  // Schema for deployment YAML preview response
+  const DeploymentYamlPreviewSchema = z.object({
+    yaml: z.string(),
+  });
+
+  // Schema for deployment YAML validation response
+  const DeploymentYamlValidationSchema = z.object({
+    valid: z.boolean(),
+    errors: z.array(z.string()),
+    warnings: z.array(z.string()),
+  });
+
+  fastify.get(
+    "/api/internal_mcp_catalog/:id/deployment-yaml-preview",
+    {
+      schema: {
+        operationId: RouteId.GetDeploymentYamlPreview,
+        description:
+          "Generate a deployment YAML template preview for a catalog item",
+        tags: ["MCP Catalog"],
+        params: z.object({
+          id: UuidIdSchema,
+        }),
+        response: constructResponseSchema(DeploymentYamlPreviewSchema),
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params;
+      const { success: isAdmin } = await hasPermission(
+        { mcpServerInstallation: ["admin"] },
+        request.headers,
+      );
+      const catalogItem = await InternalMcpCatalogModel.findById(id, {
+        userId: request.user.id,
+        isAdmin,
+        organizationId: request.organizationId,
+      });
+
+      if (!catalogItem) {
+        throw new ApiError(404, "Catalog item not found");
+      }
+
+      if (catalogItem.serverType !== "local") {
+        throw new ApiError(
+          400,
+          "Deployment YAML preview is only available for local MCP servers",
+        );
+      }
+
+      // If the catalog item already has a deploymentSpecYaml, return it
+      if (catalogItem.deploymentSpecYaml) {
+        return reply.send({
+          yaml: catalogItem.deploymentSpecYaml,
+        });
+      }
+
+      // Extract imagePullSecrets names for YAML preview (existing names only,
+      // credentials entries use generated names at deploy time)
+      const imagePullSecretsForYaml = catalogItem.localConfig?.imagePullSecrets
+        ?.filter((s) => s.source === "existing")
+        .map((s) => ({ name: s.name }));
+
+      // Generate a default YAML template
+      const yamlTemplate = generateDeploymentYamlTemplate({
+        serverId: "{server_id}",
+        serverName: catalogItem.name,
+        namespace: config.orchestrator.kubernetes.namespace,
+        dockerImage:
+          catalogItem.localConfig?.dockerImage ||
+          config.orchestrator.mcpServerBaseImage,
+        command: catalogItem.localConfig?.command,
+        arguments: catalogItem.localConfig?.arguments,
+        environment: catalogItem.localConfig?.environment,
+        serviceAccount: catalogItem.localConfig?.serviceAccount,
+        transportType: catalogItem.localConfig?.transportType,
+        httpPort: catalogItem.localConfig?.httpPort,
+        imagePullSecrets: imagePullSecretsForYaml,
+      });
+
+      return reply.send({ yaml: yamlTemplate });
+    },
+  );
+
+  fastify.post(
+    "/api/internal_mcp_catalog/validate-deployment-yaml",
+    {
+      schema: {
+        operationId: RouteId.ValidateDeploymentYaml,
+        description: "Validate a deployment YAML template",
+        tags: ["MCP Catalog"],
+        body: z.object({
+          yaml: z.string().min(1, "YAML content is required"),
+        }),
+        response: constructResponseSchema(DeploymentYamlValidationSchema),
+      },
+    },
+    async ({ body: { yaml } }, reply) => {
+      const result = validateDeploymentYaml(yaml);
+      return reply.send(result);
+    },
+  );
+
+  fastify.post(
+    "/api/internal_mcp_catalog/:id/reset-deployment-yaml",
+    {
+      schema: {
+        operationId: RouteId.ResetDeploymentYaml,
+        description:
+          "Reset the deployment YAML to default by clearing the custom YAML",
+        tags: ["MCP Catalog"],
+        params: z.object({
+          id: UuidIdSchema,
+        }),
+        response: constructResponseSchema(DeploymentYamlPreviewSchema),
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params;
+      const { success: isAdmin } = await hasPermission(
+        { mcpServerInstallation: ["admin"] },
+        request.headers,
+      );
+      const catalogItem = await InternalMcpCatalogModel.findById(id, {
+        userId: request.user.id,
+        isAdmin,
+        organizationId: request.organizationId,
+      });
+
+      if (!catalogItem) {
+        throw new ApiError(404, "Catalog item not found");
+      }
+
+      if (catalogItem.serverType !== "local") {
+        throw new ApiError(
+          400,
+          "Deployment YAML reset is only available for local MCP servers",
+        );
+      }
+
+      // Clear the custom deployment YAML
+      const updated = await InternalMcpCatalogModel.update(id, {
+        deploymentSpecYaml: null,
+      });
+
+      // Cascade-reinstall installed pods so they pick up the
+      // auto-generated manifest. Without this, existing pods would keep
+      // running on the (now-cleared) override until another unrelated
+      // edit or manual reinstall triggered a restart. The standard
+      // gate handles the decision: pods come up with the new template
+      // via the auto path (no user re-prompt needed).
+      if (updated) {
+        await cascadeReinstallForCatalog(catalogItem, updated);
+      }
+
+      // Extract imagePullSecrets names for YAML preview
+      const imagePullSecretsForYaml = catalogItem.localConfig?.imagePullSecrets
+        ?.filter((s) => s.source === "existing")
+        .map((s) => ({ name: s.name }));
+
+      // Generate and return a fresh default YAML template
+      const yamlTemplate = generateDeploymentYamlTemplate({
+        serverId: "{server_id}",
+        serverName: catalogItem.name,
+        namespace: config.orchestrator.kubernetes.namespace,
+        dockerImage:
+          catalogItem.localConfig?.dockerImage ||
+          config.orchestrator.mcpServerBaseImage,
+        command: catalogItem.localConfig?.command,
+        arguments: catalogItem.localConfig?.arguments,
+        environment: catalogItem.localConfig?.environment,
+        serviceAccount: catalogItem.localConfig?.serviceAccount,
+        transportType: catalogItem.localConfig?.transportType,
+        httpPort: catalogItem.localConfig?.httpPort,
+        imagePullSecrets: imagePullSecretsForYaml,
+      });
+
+      return reply.send({ yaml: yamlTemplate });
+    },
+  );
+
+  fastify.get(
+    "/api/k8s/image-pull-secrets",
+    {
+      schema: {
+        operationId: RouteId.GetK8sImagePullSecrets,
+        description:
+          "List Kubernetes docker-registry secrets available for imagePullSecrets",
+        tags: ["MCP Catalog"],
+        response: constructResponseSchema(
+          z.array(
+            z.object({
+              name: z.string(),
+              registryServers: z.array(z.string()),
+            }),
+          ),
+        ),
+      },
+    },
+    async ({ user, headers }, reply) => {
+      const { success: isMcpServerAdmin } = await hasPermission(
+        { mcpServerInstallation: ["admin"] },
+        headers,
+      );
+
+      const secrets = isMcpServerAdmin
+        ? await mcpServerRuntimeManager.listDockerRegistrySecrets({
+            isAdmin: true,
+          })
+        : await mcpServerRuntimeManager.listDockerRegistrySecrets({
+            teamIds: await TeamModel.getUserTeamIds(user.id),
+          });
+
+      return reply.send(secrets);
+    },
+  );
+
+  fastify.get(
+    "/api/internal_mcp_catalog/labels/keys",
+    {
+      schema: {
+        operationId: RouteId.GetInternalMcpCatalogLabelKeys,
+        description: "Get all label keys used by catalog items",
+        tags: ["MCP Catalog"],
+        response: constructResponseSchema(z.array(z.string())),
+      },
+    },
+    async (_request, reply) => {
+      return reply.send(await McpCatalogLabelModel.getAllKeys());
+    },
+  );
+
+  fastify.get(
+    "/api/internal_mcp_catalog/labels/values",
+    {
+      schema: {
+        operationId: RouteId.GetInternalMcpCatalogLabelValues,
+        description: "Get all label values for catalog items",
+        tags: ["MCP Catalog"],
+        querystring: z.object({
+          key: z.string().optional().describe("Filter values by label key"),
+        }),
+        response: constructResponseSchema(z.array(z.string())),
+      },
+    },
+    async ({ query: { key } }, reply) => {
+      return reply.send(
+        key
+          ? await McpCatalogLabelModel.getValuesByKey(key)
+          : await McpCatalogLabelModel.getAllValues(),
+      );
+    },
+  );
+};
+
+/**
+ * Whether the caller may deploy catalog items to restricted environments.
+ * Gated by `mcpRegistry:deploy-to-restricted`.
+ */
+async function callerCanDeployToRestricted(
+  headers: FastifyRequest["headers"],
+): Promise<boolean> {
+  const { success: hasDeploy } = await hasPermission(
+    { mcpRegistry: ["deploy-to-restricted"] },
+    headers,
+  );
+  return hasDeploy;
+}
+
+/**
+ * Whether a requested team list leaves the stored assignments untouched. An
+ * entry carrying no level cannot change one (the sync preserves what is
+ * stored), so only an explicit, differing level counts as a change.
+ */
+function sameTeamAssignments(
+  requested: CatalogTeamAssignment[],
+  current: CatalogTeamAccess[],
+): boolean {
+  if (requested.length !== current.length) return false;
+  const currentLevels = new Map(current.map((team) => [team.id, team.level]));
+  return requested.every((team) => {
+    const currentLevel = currentLevels.get(team.id);
+    if (currentLevel === undefined) return false;
+    return team.level === undefined || team.level === currentLevel;
+  });
+}
+
+/**
+ * Collect the admin-set static config values an environment's validation regex
+ * governs: plain-text, non-prompted env vars with a stored value. Secret,
+ * prompted, boolean, and number entries are excluded — secrets aren't policy
+ * targets, prompted values are validated at install, and the rule is meant for
+ * free-text values.
+ */
+function collectStaticEnvValues(
+  environment: LocalConfig["environment"],
+): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const envVar of environment ?? []) {
+    if (
+      envVar.type === "plain_text" &&
+      !envVar.promptOnInstallation &&
+      typeof envVar.value === "string"
+    ) {
+      values[envVar.key] = envVar.value;
+    }
+  }
+  return values;
+}
+
+/**
+ * Collect the non-secret, free-text userConfig default values an environment's
+ * allowlist regex governs — the value a static header persists and the
+ * suggested value a prompted field carries (both stored in `default`). Secret
+ * and number/boolean fields are excluded; the rule targets free-text values.
+ */
+function collectStaticUserConfigValues(
+  userConfig:
+    | Record<string, { type?: string; sensitive?: boolean; default?: unknown }>
+    | null
+    | undefined,
+): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const [key, def] of Object.entries(userConfig ?? {})) {
+    if (def.sensitive || def.type === "number" || def.type === "boolean") {
+      continue;
+    }
+    if (typeof def.default === "string" && def.default !== "") {
+      values[key] = def.default;
+    }
+  }
+  return values;
+}
+
+async function cascadeReinstallForCatalog(
+  originalCatalogItem: InternalMcpCatalog,
+  catalogItem: InternalMcpCatalog,
+  /**
+   * Force the auto-restart path past the "no restart needed" gates
+   * (metadata-only, forward-compat) — used when the caller has
+   * out-of-band knowledge that pods need to restart even though the
+   * row looks unchanged (primarily catalog secret-bag value rotation:
+   * non-prompted secret env vars, OAuth client_secret, image-pull-
+   * secret passwords). The bag content lives outside the catalog row,
+   * so the unexpanded gate snapshot cannot see a value change.
+   *
+   * Does NOT override `requiresNewUserInputForReinstall`. If the same
+   * PUT both rotates a secret AND adds a re-prompt-requiring change
+   * (e.g. a new required prompted env var), the cascade must still
+   * mark servers for manual reinstall — auto-restarting would bring
+   * pods back without the newly-required input. The two signals are
+   * orthogonal: rotation says "pods need to restart for the value to
+   * propagate"; re-prompt says "no restart can succeed until the user
+   * supplies a value the install doesn't have."
+   */
+  override?: { forceAutoRestart?: boolean },
+): Promise<void> {
+  const installedServers = await McpServerModel.findByCatalogId(catalogItem.id);
+  if (installedServers.length === 0) return;
+
+  // Multi-tenant local catalogs have one shared K8s Deployment across all
+  // installs. Execution-config drift (image, command, args, transport) on
+  // this kind of catalog is a catalog-level event — one rollout serves every
+  // tenant — so it's handled as a single shared-pod recreate rather than by
+  // marking each install reinstall-required. Single-tenant catalogs continue
+  // to use the per-install flag (see `requiresNewUserInputForReinstall`).
+  const catalogScopeChangeOnMultitenant = multitenantSharedPodChanged(
+    originalCatalogItem,
+    catalogItem,
+  );
+
+  // Manual path is authoritative: a re-prompt edit blocks both the
+  // gate-decided auto path AND the forced auto path. Run it before any
+  // override branching. The persisted reason tells the UI whether to
+  // collect new values ("new-input") or offer a plain restart that reuses
+  // the stored secret bag ("restart"); a restart-only edit never downgrades
+  // an install still owing input from an earlier edit.
+  const manualReason = manualReinstallReason(originalCatalogItem, catalogItem);
+  if (manualReason !== null) {
+    // A shared pod can't roll onto a spec whose new prompted fields no
+    // tenant has filled in yet, so the recreate waits for the catalog
+    // Reinstall button rather than firing now.
+    if (catalogScopeChangeOnMultitenant) {
+      await InternalMcpCatalogModel.update(catalogItem.id, {
+        catalogReinstallRequired: true,
+      });
+    }
+    logger.info(
+      {
+        catalogId: catalogItem.id,
+        serverCount: installedServers.length,
+        manualReason,
+      },
+      "Catalog edit requires manual reinstall - marking servers",
+    );
+    for (const server of installedServers) {
+      await McpServerModel.update(server.id, {
+        reinstallRequired: true,
+        reinstallReason:
+          server.reinstallRequired && server.reinstallReason === "new-input"
+            ? "new-input"
+            : manualReason,
+      });
+    }
+    return;
+  }
+
+  // Execution-only drift on a shared deployment. The admin who saved the
+  // edit is the sole owner of that pod and no tenant owes new input, so the
+  // recreate runs now instead of parking behind a second click. Not routed
+  // through `autoReinstallInstallsInBackground`: that reinstalls per install,
+  // which against one shared pod would recreate it N times.
+  if (catalogScopeChangeOnMultitenant) {
+    logger.info(
+      { catalogId: catalogItem.id, serverCount: installedServers.length },
+      "Catalog execution config changed on multi-tenant local catalog - recreating shared deployment",
+    );
+    reinstallMultitenantCatalogInBackground(catalogItem);
+    return;
+  }
+
+  if (override?.forceAutoRestart) {
+    logger.info(
+      { catalogId: catalogItem.id, serverCount: installedServers.length },
+      "Forced auto-restart cascade (caller signaled secret-bag value rotation)",
+    );
+  } else {
+    // Skip the cascade when only metadata fields changed. List in
+    // `shared/catalog-runtime-fields.ts`.
+    //
+    // Tradeoff: `originalCatalogItem` is fetched with `expandSecrets: true`
+    // (the route body needs expanded secrets downstream); `Model.update`
+    // returns the unexpanded row. For catalogs carrying any secret bag
+    // pointer, the expanded vs unexpanded shapes differ even with no real
+    // edit, so the predicate returns false and we cascade. That is the
+    // safe direction (pre-fix baseline) and `hasSecretBag` in
+    // `edit-catalog-dialog.tsx` mirrors it on the UI side. The
+    // optimization applies cleanly to non-bag catalogs.
+    if (isMetadataOnlyEdit(originalCatalogItem, catalogItem)) {
+      logger.info(
+        { catalogId: catalogItem.id, serverCount: installedServers.length },
+        "Catalog edit is metadata-only - skipping reinstall",
+      );
+      return;
+    }
+
+    // Refinement gate: `isMetadataOnlyEdit` is too blunt for env-var
+    // schema evolution. Adding an optional prompted env var, demoting
+    // required → optional, etc. legitimately changes `localConfig.environment`
+    // but doesn't invalidate any install (the existing pod's env-var
+    // bindings are still valid). Without this check, a forward-compatible
+    // edit would fall through to the auto-cascade path and silently restart
+    // every pod. Mirrors the frontend's `envChangeRequiresReinstall` so
+    // bar silence and backend behavior agree.
+    if (onlyForwardCompatibleEnvDiff(originalCatalogItem, catalogItem)) {
+      logger.info(
+        { catalogId: catalogItem.id, serverCount: installedServers.length },
+        "Catalog edit is a forward-compatible env-var change - skipping reinstall",
+      );
+      return;
+    }
+
+    logger.info(
+      { catalogId: catalogItem.id, serverCount: installedServers.length },
+      "Catalog edit does not require new user input - auto-reinstalling servers",
+    );
+  }
+
+  autoReinstallInstallsInBackground(installedServers, catalogItem);
+}
+
+/**
+ * Roll every install of a single-tenant catalog onto its current spec in the
+ * background, broadcasting status per install. Shared by the catalog-edit auto
+ * cascade and image approval (which releases the auto-reinstall a gated edit
+ * deferred).
+ */
+function autoReinstallInstallsInBackground(
+  installedServers: Awaited<ReturnType<typeof McpServerModel.findByCatalogId>>,
+  catalogItem: InternalMcpCatalog,
+): void {
+  setImmediate(async () => {
+    try {
+      for (const server of installedServers) {
+        try {
+          await McpServerModel.update(server.id, {
+            localInstallationStatus: "pending",
+            localInstallationError: null,
+          });
+          broadcastMcpInstallationStatus(server.id, "pending", null);
+          await autoReinstallServer(server, catalogItem);
+          await McpServerModel.update(server.id, {
+            localInstallationStatus: "success",
+            localInstallationError: null,
+          });
+          broadcastMcpInstallationStatus(server.id, "success", null);
+          logger.info(
+            { serverId: server.id, serverName: server.name },
+            "Auto-reinstalled MCP server successfully",
+          );
+        } catch (error) {
+          const errorMessage =
+            error instanceof Error ? error.message : "Unknown error";
+          logger.error(
+            { err: error, serverId: server.id, serverName: server.name },
+            "Failed to auto-reinstall MCP server - marking for manual reinstall",
+          );
+          // Retry of a failed auto-restart — stored credentials are valid,
+          // unless the install already owed input from an earlier edit.
+          await McpServerModel.update(server.id, {
+            reinstallRequired: true,
+            reinstallReason:
+              server.reinstallRequired && server.reinstallReason === "new-input"
+                ? "new-input"
+                : "restart",
+            localInstallationStatus: "error",
+            localInstallationError: errorMessage,
+          });
+          broadcastMcpInstallationStatus(server.id, "error", errorMessage);
+        }
+      }
+    } catch (error) {
+      logger.error(
+        { err: error, catalogId: catalogItem.id },
+        "Unexpected error during auto-reinstall batch - some servers may need manual reinstall",
+      );
+    }
+  });
+}
+
+/**
+ * Recreate a multi-tenant catalog's shared deployment and cascade tool sync to
+ * every install, off the request path.
+ *
+ * A failed recreate leaves the pod on the old spec, so the catalog falls back
+ * to `catalogReinstallRequired` — that surfaces the card's Reinstall button for
+ * a retry. `reinstallMultitenantCatalog` has already marked the installs
+ * themselves `error` by then.
+ */
+function reinstallMultitenantCatalogInBackground(
+  catalogItem: InternalMcpCatalog,
+): void {
+  setImmediate(async () => {
+    try {
+      // Re-read rather than closing over the caller's row: another edit can
+      // land while this sits queued, and the recreate both syncs tools against
+      // whichever row it's handed and clears `catalogReinstallRequired`
+      // unconditionally when it succeeds.
+      const current = await InternalMcpCatalogModel.findById(catalogItem.id, {
+        expandSecrets: false,
+      });
+      if (!current) return;
+      // That later edit deferred its own rollout because it needs values no
+      // tenant has supplied. Recreating now would roll a spec nobody can
+      // satisfy and clear the very flag asking for those values.
+      if (current.catalogReinstallRequired) {
+        logger.info(
+          { catalogId: catalogItem.id },
+          "Newer catalog edit is awaiting manual reinstall - skipping background recreate",
+        );
+        return;
+      }
+      await reinstallMultitenantCatalog(current);
+    } catch (error) {
+      logger.error(
+        { err: error, catalogId: catalogItem.id },
+        "Shared deployment recreate failed - flagging catalog for manual reinstall",
+      );
+      try {
+        await InternalMcpCatalogModel.update(catalogItem.id, {
+          catalogReinstallRequired: true,
+        });
+      } catch (flagError) {
+        logger.error(
+          { err: flagError, catalogId: catalogItem.id },
+          "Failed to flag catalog for manual reinstall after a failed recreate",
+        );
+      }
+    }
+  });
+}
+
+/**
+ * Release the auto-reinstall that a gated catalog edit deferred: once an admin
+ * approves the image, roll every install onto it. Single-tenant catalogs
+ * auto-reinstall each pod; multi-tenant catalogs flag `catalogReinstallRequired`
+ * for the admin's "Reinstall catalog" — the non-gated multi-tenant edit path is
+ * manual by design too.
+ */
+async function reinstallApprovedImage(
+  catalogItem: InternalMcpCatalog,
+): Promise<void> {
+  const installedServers = await McpServerModel.findByCatalogId(catalogItem.id);
+  if (installedServers.length === 0) return;
+  if (catalogItem.multitenant === true && catalogItem.serverType === "local") {
+    await InternalMcpCatalogModel.update(catalogItem.id, {
+      catalogReinstallRequired: true,
+    });
+    return;
+  }
+  autoReinstallInstallsInBackground(installedServers, catalogItem);
+}
+
+async function refreshCatalogImage(catalogItem: InternalMcpCatalog) {
+  if (catalogItem.multitenant === true) {
+    await reinstallMultitenantCatalog(catalogItem, { freshImagePull: true });
+    return;
+  }
+
+  const installs = await McpServerModel.findByCatalogId(catalogItem.id);
+  const restartResults = await Promise.allSettled(
+    installs.map(async (server) => {
+      await McpServerModel.update(server.id, {
+        localInstallationStatus: "pending",
+        localInstallationError: null,
+      });
+      broadcastMcpInstallationStatus(server.id, "pending", null);
+
+      try {
+        await autoReinstallServer(server, catalogItem, {
+          freshImagePull: true,
+        });
+        await McpServerModel.update(server.id, {
+          localInstallationStatus: "success",
+          localInstallationError: null,
+        });
+        broadcastMcpInstallationStatus(server.id, "success", null);
+      } catch (error) {
+        const errorMessage =
+          error instanceof Error ? error.message : "Unknown error";
+        logger.error(
+          { err: error, serverId: server.id, catalogId: catalogItem.id },
+          "Pod restart failed for MCP server install",
+        );
+        await McpServerModel.update(server.id, {
+          localInstallationStatus: "error",
+          localInstallationError: errorMessage,
+        });
+        broadcastMcpInstallationStatus(server.id, "error", errorMessage);
+        throw error;
+      }
+    }),
+  );
+  const failures = restartResults.filter(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  if (failures.length > 0 && failures.length === restartResults.length) {
+    // Rethrow the original reason (not a rewrapped Error) so the route can
+    // classify it by error name in toMcpOperationApiError.
+    throw failures[0].reason;
+  }
+}
+
+/**
+ * Error names thrown by the MCP client/runtime for a user's server being
+ * unreachable, not ready, or failing to deploy. Matched by name so this route
+ * module doesn't import the runtime's error classes.
+ */
+const MCP_RUNTIME_FAILURE_ERROR_NAMES = new Set([
+  "McpServerNotReadyError",
+  "McpServerConnectionTimeoutError",
+  "McpServerUnreachableError",
+  "McpServerDeploymentFailedError",
+]);
+
+/**
+ * Map a failed install/restart operation to the ApiError surfaced to the
+ * caller. MCP-runtime failures (the user's server unreachable, its container
+ * crashing) are upstream faults → 502; Kubernetes control-plane throttling is
+ * transient → retryable 503 with a readable message (instead of the raw
+ * "HTTP-Code: 429" client error); anything else stays a 500.
+ */
+function toMcpOperationApiError(reason: unknown): ApiError {
+  const message = reason instanceof Error ? reason.message : "Unknown error";
+  if (
+    reason instanceof Error &&
+    MCP_RUNTIME_FAILURE_ERROR_NAMES.has(reason.name)
+  ) {
+    return new ApiError(502, message);
+  }
+  if (isK8sApiThrottlingError(reason)) {
+    return new ApiError(
+      503,
+      "The Kubernetes API is temporarily throttling requests. Please retry in a moment.",
+    );
+  }
+  return new ApiError(500, message);
+}
+
+/**
+ * The Kubernetes client reports API-server throttling as an ApiException with
+ * `code: 429` and an "HTTP-Code: 429" message (e.g. while etcd/storage is
+ * re-initializing during control-plane churn).
+ */
+function isK8sApiThrottlingError(reason: unknown): boolean {
+  if (!(reason instanceof Error)) return false;
+  const code = (reason as { code?: unknown }).code;
+  return code === 429 || /^HTTP-Code: 429\b/.test(reason.message);
+}
+
+/**
+ * Resolve a catalog item that is subject to image approval — a local item with a
+ * custom image — in the caller's org, or throw. The approve endpoint is
+ * admin-gated by the route permission map; this adds the org-scope and "actually
+ * gateable" guards.
+ */
+async function assertImageApprovable(
+  id: string,
+  organizationId: string,
+): Promise<InternalMcpCatalog> {
+  const catalogItem = await InternalMcpCatalogModel.findById(id, {
+    expandSecrets: false,
+  });
+  if (!catalogItem || catalogItem.organizationId !== organizationId) {
+    throw new ApiError(404, "Catalog item not found");
+  }
+  if (
+    catalogItem.serverType !== "local" ||
+    !catalogItem.localConfig?.dockerImage
+  ) {
+    throw new ApiError(
+      400,
+      "This catalog item is not subject to image approval.",
+    );
+  }
+  return catalogItem;
+}
+
+async function findVisibleCatalogItem(params: {
+  catalogId: string;
+  request: FastifyRequest;
+}): Promise<InternalMcpCatalog> {
+  const { success: isAdmin } = await hasPermission(
+    { mcpServerInstallation: ["admin"] },
+    params.request.headers,
+  );
+  const item = await InternalMcpCatalogModel.findById(params.catalogId, {
+    userId: params.request.user.id,
+    isAdmin,
+    organizationId: params.request.organizationId,
+    expandSecrets: false,
+  });
+  if (!item) throw new ApiError(404, "Catalog item not found");
+  return item;
+}
+
+async function assertCurrentCatalogAlertFingerprint(params: {
+  catalogItem: InternalMcpCatalog;
+  kind: McpServerDismissibleAlertKind;
+  issueFingerprint: string;
+}): Promise<void> {
+  const fingerprints = await currentCatalogAlertFingerprints(params);
+  if (!fingerprints.includes(params.issueFingerprint)) {
+    throw new ApiError(
+      409,
+      "This alert changed or cleared. Refresh the registry and try again.",
+    );
+  }
+}
+
+async function currentCatalogAlertFingerprints(params: {
+  catalogItem: InternalMcpCatalog;
+  kind: McpServerDismissibleAlertKind;
+}): Promise<string[]> {
+  const { catalogItem, kind } = params;
+  const sources: unknown[] = [];
+  if (
+    catalogItem.multitenant &&
+    (kind === "failed-to-start" || kind === "not-running")
+  ) {
+    const servers = await McpServerModel.findByCatalogId(catalogItem.id);
+    if (kind === "failed-to-start") {
+      const installErrors = servers
+        .filter((server) => server.localInstallationStatus === "error")
+        .map((server) => server.localInstallationError ?? "")
+        .sort();
+      if (installErrors.length > 0) {
+        sources.push(
+          mcpRuntimeAlertSource({
+            serverId: `catalog:${catalogItem.id}`,
+            deploymentName: catalogItem.id,
+            state: "failed",
+            error: JSON.stringify(installErrors),
+          }),
+        );
+      }
+    }
+    for (const server of servers) {
+      const runtime = currentCatalogRuntimeAlert({ server, catalogItem });
+      if (runtime?.kind === kind) sources.push(runtime.source);
+    }
+  }
+  return sources.map((source) =>
+    createMcpServerAlertFingerprint({
+      kind,
+      catalogId: catalogItem.id,
+      source,
+    }),
+  );
+}
+
+function currentCatalogRuntimeAlert(params: {
+  server: McpServer;
+  catalogItem: InternalMcpCatalog;
+}): {
+  kind: "failed-to-start" | "not-running";
+  source: string;
+} | null {
+  const { server, catalogItem } = params;
+  const runtime = McpServerRuntimeManager.statusSummary.mcpServers[server.id];
+  if (!runtime) return null;
+  const kind = classifyMcpRuntimeAlert({
+    runtimeState: runtime.state,
+    runtimeError: runtime.error,
+    installationStatus: server.localInstallationStatus,
+  });
+  if (!kind) return null;
+  return {
+    kind,
+    source: mcpRuntimeAlertSource({
+      serverId: `catalog:${catalogItem.id}`,
+      deploymentName: runtime.deploymentName ?? undefined,
+      podName: runtime.podName,
+      state: runtime.state,
+      error: runtime.error,
+      restartCount: runtime.restartCount,
+    }),
+  };
+}
+
+function assertMcpServerAlertingEnabled(): void {
+  if (!config.mcpServer.alertingEnabled) {
+    throw new ApiError(404, "Not found");
+  }
+}
+
+export default internalMcpCatalogRoutes;

@@ -1,0 +1,409 @@
+"use client";
+
+import {
+  archestraApiSdk,
+  type archestraApiTypes,
+  type ClientFilter,
+  type InteractionSource,
+} from "@archestra/shared";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { toast } from "sonner";
+import { DEFAULT_TABLE_LIMIT } from "@/consts";
+import { handleApiError, throwOnApiError, toApiError } from "@/lib/utils";
+
+const {
+  getInteraction,
+  getInteractionSummaries,
+  getInteractions,
+  getInteractionSessions,
+  getUniqueExternalAgentIds,
+  getUniqueUserIds,
+} = archestraApiSdk;
+
+/**
+ * True when `value` is a full session ID — either a bare `<UUID>` or a
+ * `scheduled-<UUID>`. The logs search box only supports session-ID lookup
+ * (free-text content search was removed), so callers use this to decide
+ * whether a typed term should filter or be ignored.
+ */
+export const isSessionId = (value: string): boolean => {
+  const sessionIdRegex =
+    /^(scheduled-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return sessionIdRegex.test(value);
+};
+
+export function useInteractions({
+  profileId,
+  externalAgentId,
+  userId,
+  sessionId,
+  startDate,
+  endDate,
+  limit = DEFAULT_TABLE_LIMIT,
+  offset = 0,
+  sortBy,
+  sortDirection = "desc",
+  initialData,
+  enabled = true,
+  refetchInterval,
+}: {
+  profileId?: string;
+  externalAgentId?: string;
+  userId?: string;
+  sessionId?: string;
+  startDate?: string;
+  endDate?: string;
+  limit?: number;
+  offset?: number;
+  sortBy?: NonNullable<
+    archestraApiTypes.GetInteractionsData["query"]
+  >["sortBy"];
+  sortDirection?: NonNullable<
+    archestraApiTypes.GetInteractionsData["query"]
+  >["sortDirection"];
+  initialData?: archestraApiTypes.GetInteractionsResponses["200"];
+  enabled?: boolean;
+  refetchInterval?: number | false;
+} = {}) {
+  return useQuery({
+    queryKey: [
+      "interactions",
+      profileId,
+      externalAgentId,
+      userId,
+      sessionId,
+      startDate,
+      endDate,
+      limit,
+      offset,
+      sortBy,
+      sortDirection,
+    ],
+    queryFn: async () => {
+      const response = await getInteractions({
+        query: {
+          ...(profileId ? { profileId } : {}),
+          ...(externalAgentId ? { externalAgentId } : {}),
+          ...(userId ? { userId } : {}),
+          ...(sessionId ? { sessionId } : {}),
+          ...(startDate ? { startDate } : {}),
+          ...(endDate ? { endDate } : {}),
+          limit,
+          offset,
+          ...(sortBy ? { sortBy } : {}),
+          sortDirection,
+        },
+      });
+      const emptyResponse = {
+        data: [],
+        pagination: {
+          currentPage: 1,
+          limit,
+          total: 0,
+          totalPages: 0,
+          hasNext: false,
+          hasPrev: false,
+        },
+      };
+      throwOnApiError(response.error);
+      return response.data ?? emptyResponse;
+    },
+    enabled,
+    // Only use initialData for the first page (offset 0) with default sorting and default limit
+    initialData:
+      offset === 0 &&
+      limit === DEFAULT_TABLE_LIMIT &&
+      sortBy === "createdAt" &&
+      sortDirection === "desc" &&
+      !profileId &&
+      !externalAgentId &&
+      !userId &&
+      !sessionId &&
+      !startDate &&
+      !endDate
+        ? initialData
+        : undefined,
+    ...(refetchInterval ? { refetchInterval } : {}),
+  });
+}
+
+export function useInteractionSummaries({
+  profileId,
+  externalAgentId,
+  userId,
+  sessionId,
+  startDate,
+  endDate,
+  limit = DEFAULT_TABLE_LIMIT,
+  offset = 0,
+  sortBy,
+  sortDirection = "desc",
+  enabled = true,
+}: {
+  profileId?: string;
+  externalAgentId?: string;
+  userId?: string;
+  sessionId?: string;
+  startDate?: string;
+  endDate?: string;
+  limit?: number;
+  offset?: number;
+  sortBy?: NonNullable<
+    archestraApiTypes.GetInteractionSummariesData["query"]
+  >["sortBy"];
+  sortDirection?: NonNullable<
+    archestraApiTypes.GetInteractionSummariesData["query"]
+  >["sortDirection"];
+  enabled?: boolean;
+} = {}) {
+  return useQuery({
+    queryKey: [
+      "interaction-summaries",
+      profileId,
+      externalAgentId,
+      userId,
+      sessionId,
+      startDate,
+      endDate,
+      limit,
+      offset,
+      sortBy,
+      sortDirection,
+    ],
+    queryFn: async () => {
+      const response = await getInteractionSummaries({
+        query: {
+          profileId,
+          externalAgentId,
+          userId,
+          sessionId,
+          startDate,
+          endDate,
+          limit,
+          offset,
+          sortBy,
+          sortDirection,
+        },
+      });
+      throwOnApiError(response.error);
+      return (
+        response.data ?? {
+          data: [],
+          pagination: {
+            currentPage: 1,
+            limit,
+            total: 0,
+            totalPages: 0,
+            hasNext: false,
+            hasPrev: false,
+          },
+        }
+      );
+    },
+    enabled,
+  });
+}
+
+export function useInteraction({
+  interactionId,
+  initialData,
+  refetchInterval = 3_000,
+  enabled = true,
+}: {
+  interactionId?: string;
+  initialData?: archestraApiTypes.GetInteractionResponses["200"];
+  refetchInterval?: number | null;
+  enabled?: boolean;
+}) {
+  return useQuery({
+    queryKey: ["interactions", interactionId],
+    queryFn: async () => {
+      const response = await getInteraction({
+        path: { interactionId: interactionId as string },
+      });
+      throwOnApiError(response.error, { allowNotFound: true });
+      return response.data ?? null;
+    },
+    initialData,
+    enabled: enabled && !!interactionId,
+    ...(refetchInterval ? { refetchInterval } : {}), // later we might want to switch to websockets or sse, polling for now
+  });
+}
+
+export function useUniqueExternalAgentIds() {
+  return useQuery({
+    queryKey: ["interactions", "externalAgentIds"],
+    queryFn: async () => {
+      const response = await getUniqueExternalAgentIds();
+      throwOnApiError(response.error);
+      return response.data ?? [];
+    },
+  });
+}
+
+export function useUniqueUserIds() {
+  return useQuery({
+    queryKey: ["interactions", "userIds"],
+    queryFn: async () => {
+      const response = await getUniqueUserIds();
+      throwOnApiError(response.error);
+      return response.data ?? [];
+    },
+  });
+}
+
+export function useInteractionSessions({
+  profileId,
+  userId,
+  source,
+  client,
+  sessionId,
+  startDate,
+  endDate,
+  limit = DEFAULT_TABLE_LIMIT,
+  cursor,
+  initialData,
+  toastOnError,
+}: {
+  profileId?: string;
+  userId?: string;
+  source?: InteractionSource;
+  client?: ClientFilter;
+  sessionId?: string;
+  startDate?: string;
+  endDate?: string;
+  limit?: number;
+  cursor?: string;
+  initialData?: archestraApiTypes.GetInteractionSessionsResponses["200"];
+  toastOnError?: boolean;
+} = {}) {
+  return useQuery({
+    queryKey: [
+      "interactions",
+      "sessions",
+      profileId,
+      userId,
+      source,
+      client,
+      sessionId,
+      startDate,
+      endDate,
+      limit,
+      cursor,
+    ],
+    queryFn: async () => {
+      const response = await getInteractionSessions({
+        query: {
+          ...(profileId ? { profileId } : {}),
+          ...(userId ? { userId } : {}),
+          ...(source ? { source } : {}),
+          ...(client ? { client } : {}),
+          ...(sessionId ? { sessionId } : {}),
+          ...(startDate ? { startDate } : {}),
+          ...(endDate ? { endDate } : {}),
+          limit,
+          ...(cursor ? { cursor } : {}),
+        },
+      });
+      const emptyResponse = {
+        data: [],
+        pagination: {
+          limit,
+          nextCursor: null,
+          hasNext: false,
+        },
+      };
+
+      throwOnApiError(response.error, { toastOnError });
+      return response.data ?? emptyResponse;
+    },
+    initialData:
+      !cursor &&
+      limit === DEFAULT_TABLE_LIMIT &&
+      !profileId &&
+      !userId &&
+      !source &&
+      !client &&
+      !sessionId &&
+      !startDate &&
+      !endDate
+        ? initialData
+        : undefined,
+  });
+}
+
+/**
+ * Fetch every interaction in a session (paging through the API) and download
+ * them as a single JSON file. A mutation rather than a query: it is an
+ * on-demand action that wants a pending state for its button and a fresh
+ * fetch per click, not a cached result.
+ */
+export function useExportSessionInteractions() {
+  return useMutation({
+    mutationFn: async ({ sessionId }: { sessionId: string }) => {
+      const interactions: archestraApiTypes.GetInteractionsResponses["200"]["data"] =
+        [];
+      let offset = 0;
+      for (;;) {
+        const response = await getInteractions({
+          query: {
+            sessionId,
+            limit: EXPORT_PAGE_SIZE,
+            offset,
+            sortBy: "createdAt",
+            sortDirection: "asc",
+          },
+        });
+        if (response.error) {
+          handleApiError(response.error);
+          throw toApiError(response.error);
+        }
+        interactions.push(...(response.data?.data ?? []));
+        if (!response.data?.pagination.hasNext) {
+          break;
+        }
+        offset += EXPORT_PAGE_SIZE;
+      }
+      downloadSessionInteractionsFile(sessionId, interactions);
+      return interactions.length;
+    },
+    onSuccess: (count) => {
+      toast.success(
+        `Exported ${count} request${count === 1 ? "" : "s"} from this session`,
+      );
+    },
+  });
+}
+
+// === Internal helpers ===
+
+// The API caps page size at 100, so the export pages at that cap.
+const EXPORT_PAGE_SIZE = 100;
+
+function downloadSessionInteractionsFile(
+  sessionId: string,
+  interactions: archestraApiTypes.GetInteractionsResponses["200"]["data"],
+) {
+  const payload = {
+    sessionId,
+    exportedAt: new Date().toISOString(),
+    interactionCount: interactions.length,
+    interactions,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {
+    type: "application/json",
+  });
+  // Revoked on a delay: the browser reads the blob asynchronously after the
+  // click, so revoking immediately can truncate a large export.
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `llm-session-${sessionId}.json`;
+  anchor.style.display = "none";
+  document.body.append(anchor);
+  anchor.click();
+  setTimeout(() => {
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  }, 10_000);
+}

@@ -1,0 +1,432 @@
+{-
+ Copyright 2022-23, Juspay India Pvt Ltd
+
+ This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License
+
+ as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. This program
+
+ is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+
+ or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details. You should have received a copy of
+
+ the GNU Affero General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+-}
+
+module SharedLogic.Allocator.Jobs.SendSearchRequestToDrivers where
+
+import qualified Control.Monad.Catch as C
+import qualified Data.HashMap.Strict as HM
+import qualified Data.HashMap.Strict as HMS
+import qualified Data.Map as M
+import qualified Domain.Action.UI.SearchRequestForDriver as USRD
+import Domain.Types as DTC
+import Domain.Types.Booking (BookingStatus (..))
+import qualified Domain.Types.ConditionalCharges as DAC
+import Domain.Types.DriverPoolConfig
+import qualified Domain.Types.Estimate as DEst
+import qualified Domain.Types.FarePolicy as DFP
+import Domain.Types.GoHomeConfig (GoHomeConfig)
+import qualified Domain.Types.Person as DPerson
+import qualified Domain.Types.SearchRequest as DSR
+import qualified Domain.Types.SearchRequestForDriver as DSRD
+import Domain.Types.SearchTry (SearchTry)
+import qualified Domain.Types.VehicleVariant as DVeh
+import qualified EulerHS.Language as L
+import qualified Kernel.Beam.Functions as B
+import Kernel.Beam.Types (TxnIdKey (..))
+import Kernel.External.Types (ServiceFlow)
+import Kernel.Prelude hiding (handle)
+import Kernel.Storage.Clickhouse.Config as CH
+import qualified Kernel.Storage.ClickhouseV2 as CHV2
+import Kernel.Storage.Esqueleto as Esq
+import qualified Kernel.Storage.Hedis as Redis
+import Kernel.Streaming.Kafka.Producer.Types (KafkaProducerTools)
+import Kernel.Tools.Metrics.CoreMetrics (CoreMetrics, DeploymentVersion)
+import Kernel.Types.Error
+import Kernel.Types.Id
+import Kernel.Utils.Common
+import Lib.ConfigPilot.Interface.Types (getConfig)
+import qualified Lib.Finance.Core.Types as Finance
+import Lib.Finance.Storage.Beam.BeamFlow (BeamFlow)
+import Lib.Scheduler
+import Lib.SessionizerMetrics.Types.Event (EventStreamFlow)
+import qualified Lib.Types.SpecialLocation as SL
+import SharedLogic.Allocator (AllocatorJobType (..), SendSearchRequestToDriverJobData)
+import SharedLogic.Allocator.Jobs.SendSearchRequestToDrivers.Handle (Handle (..), MetricsHandle (..), handler)
+import qualified SharedLogic.Allocator.Jobs.SendSearchRequestToDrivers.Handle.Internal as I
+import qualified SharedLogic.Allocator.Jobs.SendSearchRequestToDrivers.Handle.Internal.DriverPoolUnified as UI
+import qualified SharedLogic.Booking as SBooking
+import SharedLogic.CallBAPInternal
+import SharedLogic.DriverPool hiding (getDriverPoolConfig)
+import qualified SharedLogic.External.LocationTrackingService.Types as LT
+import SharedLogic.GoogleTranslate (TranslateFlow)
+import qualified SharedLogic.SearchTry as SST
+import qualified SharedLogic.Type as SLT
+import Storage.Cac.DriverPoolConfig (getDriverPoolConfig)
+import qualified Storage.CachedQueries.Merchant as CQM
+import Storage.ConfigPilot.Config.GoHomeConfig (GoHomeConfigDimensions (..))
+import qualified Storage.Queries.Booking as QRB
+import qualified Storage.Queries.Estimate as QEst
+import qualified Storage.Queries.Quote as QQuote
+import qualified Storage.Queries.SearchRequest as QSR
+import qualified Storage.Queries.SearchRequestForDriver as QSRD
+import qualified Storage.Queries.SearchTry as QST
+import Tools.Error
+import qualified Tools.Metrics as Metrics
+import Tools.Utils
+import TransactionLogs.Types
+import Utils.Common.Cac.KeyNameConstants
+
+-- | Dummy driverId for the "drivers exhausted" marker row; analytics filter on it.
+driversNotFoundDriverId :: Id DPerson.Person
+driversNotFoundDriverId = Id "drivers-not-found"
+
+-- | Single dummy SRFD marking mid-search pool exhaustion; only analytics-correlation fields carry real values.
+buildDriversExhaustedMarker :: MonadFlow m => DSR.SearchRequest -> SearchTry -> Int -> m DSRD.SearchRequestForDriver
+buildDriversExhaustedMarker searchReq searchTry batchNumber = do
+  now <- getCurrentTime
+  guid <- generateGUID
+  pure
+    DSRD.SearchRequestForDriver
+      { id = guid,
+        batchingMode = searchTry.batchingMode,
+        driverId = driversNotFoundDriverId,
+        searchTryId = searchTry.id,
+        requestId = searchReq.id,
+        merchantId = Nothing,
+        merchantOperatingCityId = searchReq.merchantOperatingCityId,
+        status = DSRD.Inactive,
+        response = Nothing,
+        createdAt = now,
+        updatedAt = Nothing,
+        currency = searchTry.currency,
+        distanceUnit = searchReq.distanceUnit,
+        vehicleServiceTier = searchTry.vehicleServiceTier,
+        vehicleServiceTierName = Nothing,
+        vehicleVariant = DVeh.SEDAN,
+        vehicleCategory = Nothing,
+        vehicleNumber = Nothing,
+        vehicleAge = Nothing,
+        startTime = now,
+        searchRequestValidTill = now,
+        renderedAt = Nothing,
+        respondedAt = Nothing,
+        batchNumber = batchNumber,
+        actualDistanceToPickup = 0,
+        straightLineDistanceToPickup = 0,
+        durationToPickup = 0,
+        keepHiddenForSeconds = 0,
+        rideRequestPopupDelayDuration = 0,
+        totalRides = 0,
+        customerCancellationDues = 0,
+        baseFare = Nothing,
+        commissionCharges = Nothing,
+        driverMinExtraFee = Nothing,
+        driverMaxExtraFee = Nothing,
+        driverStepFee = Nothing,
+        driverDefaultStepFee = Nothing,
+        acceptanceRatio = Nothing,
+        cancellationRatio = Nothing,
+        driverAvailableTime = Nothing,
+        driverSpeed = Nothing,
+        rideFrequencyScore = Nothing,
+        preferenceMatchScore = Nothing,
+        coinsRewardedOnGoldTierRide = Nothing,
+        conditionalCharges = [],
+        isPartOfIntelligentPool = False,
+        isForwardRequest = False,
+        pickupZone = False,
+        isFavourite = Nothing,
+        isSafetyPlus = Nothing,
+        airConditioned = Nothing,
+        upgradeCabRequest = Nothing,
+        lat = Nothing,
+        lon = Nothing,
+        fromLocGeohash = Nothing,
+        previousDropGeoHash = Nothing,
+        mode = Nothing,
+        notificationSource = Nothing,
+        goHomeRequestId = Nothing,
+        fleetOwnerId = Nothing,
+        estimateId = Nothing,
+        driverTags = Nothing,
+        driverTagScore = Nothing,
+        customerTags = Nothing,
+        middleStopCount = Nothing,
+        parcelType = Nothing,
+        parcelQuantity = Nothing,
+        parallelSearchRequestCount = Nothing,
+        poolingLogicVersion = searchReq.poolingLogicVersion,
+        poolingConfigVersion = searchReq.poolingConfigVersion,
+        tripEstimatedDistance = Nothing,
+        tripEstimatedDuration = Nothing,
+        backendAppVersion = Nothing,
+        backendConfigVersion = Nothing,
+        clientSdkVersion = Nothing,
+        clientBundleVersion = Nothing,
+        clientConfigVersion = Nothing,
+        clientDevice = Nothing,
+        reactBundleVersion = Nothing,
+        driverCancellationNotAllowed = Nothing,
+        isAutoAccepted = Nothing,
+        hasAvailableForRidesTag = Nothing
+      }
+
+type SendSearchRequestJobFlow m r c =
+  ( EncFlow m r,
+    TranslateFlow m r,
+    EsqDBReplicaFlow m r,
+    Metrics.HasSendSearchRequestToDriverMetrics m r,
+    Metrics.HasBPPMetrics m r,
+    CacheFlow m r,
+    EsqDBFlow m r,
+    LT.HasLocationService m r,
+    HasFlowEnv m r '["maxNotificationShards" ::: Int],
+    HasField "maxShards" r Int,
+    HasField "schedulerSetName" r Text,
+    HasField "schedulerType" r SchedulerType,
+    HasField "jobInfoMap" r (M.Map Text Bool),
+    HasField "serviceClickhouseCfg" r CH.ClickhouseCfg,
+    HasField "serviceClickhouseEnv" r CH.ClickhouseEnv,
+    CHV2.HasClickhouseEnv CHV2.APP_SERVICE_CLICKHOUSE m,
+    HasFlowEnv m r '["nwAddress" ::: BaseUrl],
+    HasHttpClientOptions r c,
+    HasLongDurationRetryCfg r c,
+    HasField "singleBatchProcessingTempDelay" r NominalDiffTime,
+    HasFlowEnv m r '["internalEndPointHashMap" ::: HM.HashMap BaseUrl BaseUrl],
+    HasFlowEnv m r '["ondcTokenHashMap" ::: HMS.HashMap KeyConfig TokenConfig],
+    HasFlowEnv m r '["kafkaProducerTools" ::: KafkaProducerTools],
+    HasFlowEnv m r '["fabricGatewayBaseUrl" ::: BaseUrl],
+    HasShortDurationRetryCfg r c,
+    HasField "enableAPILatencyLogging" r Bool,
+    HasField "enableAPIPrometheusMetricLogging" r Bool,
+    HasFlowEnv m r '["appBackendBapInternal" ::: AppBackendBapInternal],
+    HasField "blackListedJobs" r [Text],
+    ClickhouseFlow m r,
+    Redis.HedisLTSFlowEnv r,
+    HasField "enableLtsPoolDataForPooling" r Bool,
+    Finance.HasActorInfo m r,
+    Redis.HedisFlow m r,
+    BeamFlow m r,
+    CoreMetrics m,
+    HasField "driverQuoteExpirationSeconds" r NominalDiffTime,
+    HasFlowEnv m r '["version" ::: DeploymentVersion],
+    Metrics.HasDriverSearchRequestResponseMetrics m r,
+    EventStreamFlow m r,
+    HasPrettyLogger m r,
+    ServiceFlow m r,
+    HasField "quoteRespondCoolDown" r Int,
+    HasField "driverUnlockDelay" r Seconds,
+    C.MonadCatch m
+  )
+
+-- Immediate dispatch (Redis-backed). Scheduled dispatch uses the sibling handler below.
+sendSearchRequestToDrivers ::
+  SendSearchRequestJobFlow m r c =>
+  Job 'SendSearchRequestToDriver ->
+  m ExecutionResult
+sendSearchRequestToDrivers Job {id, jobInfo} = processSendSearchRequestJob id.getId jobInfo.jobData
+
+sendScheduledSearchRequestToDrivers ::
+  SendSearchRequestJobFlow m r c =>
+  Job 'SendScheduledSearchRequestToDriver ->
+  m ExecutionResult
+sendScheduledSearchRequestToDrivers Job {id, jobInfo} = processSendSearchRequestJob id.getId jobInfo.jobData
+
+processSendSearchRequestJob ::
+  SendSearchRequestJobFlow m r c =>
+  Text ->
+  SendSearchRequestToDriverJobData ->
+  m ExecutionResult
+processSendSearchRequestJob jobId jobData = withLogTag ("JobId-" <> jobId) $ do
+  let searchTryId = jobData.searchTryId
+  searchTry <- B.runInReplica $ QST.findById searchTryId >>= fromMaybeM (SearchTryNotFound searchTryId.getId)
+  searchReq <- B.runInReplica $ QSR.findById searchTry.requestId >>= fromMaybeM (SearchRequestNotFound searchTry.requestId.getId)
+  L.setOptionLocal TxnIdKey searchReq.transactionId
+  merchant <- CQM.findById searchReq.providerId >>= fromMaybeM (MerchantNotFound (searchReq.providerId.getId))
+  driverPoolConfig <- getDriverPoolConfig searchReq.merchantOperatingCityId searchTry.vehicleServiceTier searchTry.tripCategory (fromMaybe SL.Default searchReq.area) jobData.estimatedRideDistance searchTry.searchRepeatType searchTry.searchRepeatCounter (Just (TransactionId (Id searchReq.transactionId))) searchReq
+  -- An early batch advance orphans the job that was already scheduled. Terminate the orphan here
+  -- (Complete, so it does *not* reschedule) to keep exactly one live batch chain per search try.
+  superseded <- maybe (I.isBatchChainSuperseded driverPoolConfig searchTryId jobData.batchEpoch) (const $ pure False) jobData.topUpSize
+  if superseded
+    then return Complete
+    else do
+      goHomeCfg <- getConfig (GoHomeConfigDimensions {merchantOperatingCityId = searchReq.merchantOperatingCityId.getId}) Nothing >>= fromMaybeM (InvalidRequest $ "GoHome Config not found for MerchantOperatingCity: " <> searchReq.merchantOperatingCityId.getId)
+      tripQuoteDetailsWithoutUpgrades <- do
+        let estimateIds = if length searchTry.estimateIds == 0 then [searchTry.estimateId] else searchTry.estimateIds
+        estimateIds `forM` \estimateId -> do
+          if DTC.isDynamicOfferTrip searchTry.tripCategory
+            then do
+              estimate <- B.runInReplica $ QEst.findById (Id estimateId) >>= fromMaybeM (EstimateNotFound estimateId)
+              buildEstimateTripQuoteDetails searchTry searchReq estimate
+            else do
+              quote <- B.runInReplica $ QQuote.findById (Id estimateId) >>= fromMaybeM (QuoteNotFound estimateId)
+              let mbDriverExtraFeeBounds = ((,) <$> searchReq.estimatedDistance <*> (join $ (.driverExtraFeeBounds) <$> quote.farePolicy)) <&> \(dist, driverExtraFeeBounds) -> DFP.findDriverExtraFeeBoundsByDistance dist driverExtraFeeBounds
+                  driverPickUpCharge = join $ USRD.extractDriverPickupCharges <$> ((.farePolicyDetails) <$> quote.farePolicy)
+                  driverParkingCharge = join $ (.parkingCharge) <$> quote.farePolicy
+                  businessDiscount = if searchTry.billingCategory == SLT.BUSINESS then fromMaybe 0.0 quote.fareParams.businessDiscount else 0.0
+                  personalDiscount = if searchTry.billingCategory == SLT.PERSONAL then fromMaybe 0.0 quote.fareParams.personalDiscount else 0.0
+              SST.buildTripQuoteDetail searchReq quote.tripCategory quote.vehicleServiceTier quote.vehicleServiceTierName (quote.estimatedFare + fromMaybe 0 searchTry.customerExtraFee + fromMaybe 0 searchTry.petCharges - businessDiscount - personalDiscount) Nothing (mbDriverExtraFeeBounds <&> (.minFee)) (mbDriverExtraFeeBounds <&> (.maxFee)) (mbDriverExtraFeeBounds <&> (.stepFee)) (mbDriverExtraFeeBounds <&> (.defaultStepFee)) driverPickUpCharge driverParkingCharge quote.id.getId [] False quote.fareParams.congestionCharge searchTry.petCharges quote.fareParams.priorityCharges Nothing quote.fareParams.tollCharges quote.fareParams.govtCharges quote.fareParams.driverCancellationNotAllowed
+
+      tripQuoteDetails <-
+        case tripQuoteDetailsWithoutUpgrades of
+          [tripQuoteDetail] ->
+            -- allow upgrade for one way regular rides only if Auto is selected and rider is eligible for upgrade
+            case (tripQuoteDetail.tripCategory, tripQuoteDetail.vehicleServiceTier, isRiderEligibleForCabUpgrade searchReq) of
+              (OneWay OneWayOnDemandDynamicOffer, AUTO_RICKSHAW, True) -> do
+                upgradeEstimates <- QEst.findEligibleForCabUpgrade searchReq.id True
+                upgradeTripQuoteDetails <- upgradeEstimates `forM` buildEstimateTripQuoteDetails searchTry searchReq
+                return $ tripQuoteDetailsWithoutUpgrades <> upgradeTripQuoteDetails
+              _ -> return tripQuoteDetailsWithoutUpgrades
+          _ -> return tripQuoteDetailsWithoutUpgrades
+
+      let driverSearchBatchInput =
+            DriverSearchBatchInput
+              { sendSearchRequestToDrivers = sendSearchRequestToDrivers',
+                merchant,
+                searchReq,
+                tripQuoteDetails,
+                customerExtraFee = searchTry.customerExtraFee,
+                negativeFareAdjustment = searchTry.negativeFareAdjustment,
+                messageId = searchTry.messageId,
+                isRepeatSearch = False,
+                isAllocatorBatch = True,
+                billingCategory = searchTry.billingCategory,
+                paymentMethodInfo = Nothing,
+                emailDomain = searchTry.emailDomain,
+                businessEmailDomain = searchTry.businessEmailDomain,
+                driverPreference = searchTry.driverPreference
+              }
+      (res, _, _) <- sendSearchRequestToDriversWithTopUp jobData.topUpSize driverPoolConfig searchTry driverSearchBatchInput goHomeCfg
+      return res
+  where
+    buildEstimateTripQuoteDetails ::
+      ( CacheFlow m r,
+        EsqDBFlow m r,
+        EsqDBReplicaFlow m r,
+        HasFlowEnv m r '["internalEndPointHashMap" ::: HM.HashMap BaseUrl BaseUrl],
+        HasField "serviceClickhouseCfg" r CH.ClickhouseCfg,
+        HasField "serviceClickhouseEnv" r CH.ClickhouseEnv,
+        CHV2.HasClickhouseEnv CHV2.APP_SERVICE_CLICKHOUSE m,
+        ClickhouseFlow m r
+      ) =>
+      SearchTry ->
+      DSR.SearchRequest ->
+      DEst.Estimate ->
+      m TripQuoteDetail
+    buildEstimateTripQuoteDetails searchTry searchReq estimate = do
+      let mbDriverExtraFeeBounds = if isJust estimate.driverExtraFeeBounds then estimate.driverExtraFeeBounds else ((,) <$> estimate.estimatedDistance <*> (join $ (.driverExtraFeeBounds) <$> estimate.farePolicy)) <&> \(dist, driverExtraFeeBounds) -> DFP.findDriverExtraFeeBoundsByDistance dist driverExtraFeeBounds
+          driverPickUpCharge = join $ USRD.extractDriverPickupCharges <$> ((.farePolicyDetails) <$> estimate.farePolicy)
+          driverParkingCharge = join $ (.parkingCharge) <$> estimate.farePolicy
+          driverAdditionalCharges = filterChargesByApplicability (fromMaybe [] $ (.conditionalCharges) <$> estimate.farePolicy) searchReq
+          businessDiscount = if searchTry.billingCategory == SLT.BUSINESS then fromMaybe 0.0 estimate.businessDiscount else 0.0
+          personalDiscount = if searchTry.billingCategory == SLT.PERSONAL then fromMaybe 0.0 estimate.personalDiscount else 0.0
+      SST.buildTripQuoteDetail searchReq estimate.tripCategory estimate.vehicleServiceTier estimate.vehicleServiceTierName (estimate.minFare + fromMaybe 0 searchTry.customerExtraFee + fromMaybe 0 searchTry.petCharges - businessDiscount - personalDiscount) Nothing (mbDriverExtraFeeBounds <&> (.minFee)) (mbDriverExtraFeeBounds <&> (.maxFee)) (mbDriverExtraFeeBounds <&> (.stepFee)) (mbDriverExtraFeeBounds <&> (.defaultStepFee)) driverPickUpCharge driverParkingCharge estimate.id.getId driverAdditionalCharges estimate.eligibleForUpgrade ((.congestionCharge) =<< estimate.fareParams) searchTry.petCharges (estimate.fareParams >>= (.priorityCharges)) estimate.commissionCharges (estimate.fareParams >>= (.tollCharges)) (estimate.fareParams >>= (.govtCharges)) (estimate.fareParams >>= (.driverCancellationNotAllowed))
+    filterChargesByApplicability conditionalCharges sReq = do
+      let safetyCharges = if sReq.preferSafetyPlus then find (\ac -> (ac.chargeCategory) == DAC.SAFETY_PLUS_CHARGES) conditionalCharges else Nothing
+          nyregularCharges = if fromMaybe False sReq.isReserveRide then find (\ac -> (ac.chargeCategory) == DAC.NYREGULAR_SUBSCRIPTION_CHARGE) conditionalCharges else Nothing
+      catMaybes $ [safetyCharges, nyregularCharges]
+
+sendSearchRequestToDrivers' ::
+  ( EncFlow m r,
+    TranslateFlow m r,
+    EsqDBReplicaFlow m r,
+    Metrics.HasSendSearchRequestToDriverMetrics m r,
+    Metrics.HasDriverSearchRequestResponseMetrics m r,
+    Metrics.HasBPPMetrics m r,
+    CacheFlow m r,
+    EsqDBFlow m r,
+    Finance.HasActorInfo m r,
+    LT.HasLocationService m r,
+    HasFlowEnv m r '["maxNotificationShards" ::: Int],
+    HasField "maxShards" r Int,
+    HasField "schedulerSetName" r Text,
+    HasField "schedulerType" r SchedulerType,
+    HasField "jobInfoMap" r (M.Map Text Bool),
+    HasField "serviceClickhouseCfg" r CH.ClickhouseCfg,
+    HasField "serviceClickhouseEnv" r CH.ClickhouseEnv,
+    CHV2.HasClickhouseEnv CHV2.APP_SERVICE_CLICKHOUSE m,
+    HasFlowEnv m r '["nwAddress" ::: BaseUrl],
+    HasHttpClientOptions r c,
+    HasLongDurationRetryCfg r c,
+    HasField "singleBatchProcessingTempDelay" r NominalDiffTime,
+    HasFlowEnv m r '["ondcTokenHashMap" ::: HMS.HashMap KeyConfig TokenConfig],
+    HasFlowEnv m r '["internalEndPointHashMap" ::: HM.HashMap BaseUrl BaseUrl],
+    HasFlowEnv m r '["kafkaProducerTools" ::: KafkaProducerTools],
+    HasFlowEnv m r '["fabricGatewayBaseUrl" ::: BaseUrl],
+    HasShortDurationRetryCfg r c,
+    HasField "enableAPILatencyLogging" r Bool,
+    HasField "enableAPIPrometheusMetricLogging" r Bool,
+    HasFlowEnv m r '["appBackendBapInternal" ::: AppBackendBapInternal],
+    HasField "blackListedJobs" r [Text],
+    ClickhouseFlow m r,
+    Redis.HedisLTSFlowEnv r,
+    HasField "enableLtsPoolDataForPooling" r Bool,
+    Redis.HedisFlow m r,
+    BeamFlow m r,
+    CoreMetrics m,
+    HasField "driverQuoteExpirationSeconds" r NominalDiffTime,
+    HasFlowEnv m r '["version" ::: DeploymentVersion],
+    EventStreamFlow m r,
+    HasPrettyLogger m r,
+    ServiceFlow m r,
+    HasField "quoteRespondCoolDown" r Int,
+    HasField "driverUnlockDelay" r Seconds,
+    C.MonadCatch m
+  ) =>
+  DriverPoolConfig ->
+  SearchTry ->
+  DriverSearchBatchInput m ->
+  GoHomeConfig ->
+  m (ExecutionResult, PoolType, Maybe Seconds)
+sendSearchRequestToDrivers' = sendSearchRequestToDriversWithTopUp Nothing
+
+sendSearchRequestToDriversWithTopUp ::
+  ( SendSearchRequestJobFlow m r c
+  ) =>
+  Maybe Int ->
+  DriverPoolConfig ->
+  SearchTry ->
+  DriverSearchBatchInput m ->
+  GoHomeConfig ->
+  m (ExecutionResult, PoolType, Maybe Seconds)
+sendSearchRequestToDriversWithTopUp mbTopUpSize driverPoolConfig searchTry driverSearchBatchInput' goHomeCfg = do
+  searchReqWithPoolingVersion <- I.ensurePoolingLogicVersion driverSearchBatchInput'.searchReq
+  let driverSearchBatchInput = driverSearchBatchInput' {searchReq = searchReqWithPoolingVersion}
+  -- In case of static offer flow we will have booking created before driver ride request is sent
+  mbBooking <- if DTC.isDynamicOfferTrip searchTry.tripCategory then pure Nothing else QRB.findByQuoteId searchTry.estimateId
+  handler (handle mbBooking driverSearchBatchInput) goHomeCfg searchReqWithPoolingVersion.transactionId
+  where
+    handle mbBooking driverSearchBatchInput =
+      Handle
+        { isBatchNumExceedLimit = I.isDispatchBudgetExhausted driverPoolConfig searchTry.id driverSearchBatchInput.searchReq.transactionId,
+          mbTopUpSize = mbTopUpSize,
+          isReceivedMaxDriverQuotes = I.isReceivedMaxDriverQuotes driverPoolConfig searchTry.id,
+          getNextDriverPoolBatch = UI.getNextDriverPoolBatch driverPoolConfig driverSearchBatchInput.searchReq searchTry driverSearchBatchInput.tripQuoteDetails driverSearchBatchInput.paymentMethodInfo,
+          popTopUpDrivers = I.popTopUpDrivers driverPoolConfig searchTry.requestId searchTry.id,
+          markDriversAttempted = I.markDriversAttempted searchTry.id,
+          sendSearchRequestToDrivers = I.sendSearchRequestToDrivers driverSearchBatchInput.isAllocatorBatch (isJust mbTopUpSize) driverSearchBatchInput.tripQuoteDetails driverSearchBatchInput.searchReq searchTry driverPoolConfig,
+          logDriversExhausted = do
+            logInfo $ "Drivers exhausted mid-search for searchTry: " <> searchTry.id.getId <> "; inserting analytics marker row"
+            batchNumber <- I.getPoolBatchNum searchTry.id -- read post-increment, matching real rows' numbering
+            markerRow <- buildDriversExhaustedMarker driverSearchBatchInput.searchReq searchTry batchNumber
+            QSRD.createWithoutDriverLookup markerRow,
+          getRescheduleTime = I.getRescheduleTime (getNextBatchScheduleTime driverPoolConfig),
+          metrics =
+            MetricsHandle
+              { incrementTaskCounter = Metrics.incrementTaskCounter driverSearchBatchInput.merchant.name,
+                incrementFailedTaskCounter = Metrics.incrementFailedTaskCounter driverSearchBatchInput.merchant.name,
+                putTaskDuration = Metrics.putTaskDuration driverSearchBatchInput.merchant.name
+              },
+          isSearchTryValid = I.isSearchTryValid searchTry.id,
+          initiateDriverSearchBatch = SST.initiateDriverSearchBatch driverSearchBatchInput,
+          isScheduledBooking = searchTry.isScheduled,
+          cancelSearchTry = I.cancelSearchTry searchTry.id,
+          isBookingValid = do
+            case mbBooking of
+              Just booking -> booking.status `notElem` [COMPLETED, CANCELLED]
+              Nothing -> True,
+          cancelBookingIfApplies = do
+            whenJust mbBooking $ \booking -> do
+              SBooking.cancelBooking booking Nothing driverSearchBatchInput.merchant
+        }

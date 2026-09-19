@@ -1,0 +1,336 @@
+"use client";
+
+import { CircleCheck } from "lucide-react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { useEffect, useState } from "react";
+import { useForm } from "react-hook-form";
+import type { AgentRuntimeConfig } from "@/components/agent-runtime-fields";
+import { ClaudeCodeAccount } from "@/components/claude-code-account";
+import { ExternalSecretReferenceDialog } from "@/components/external-secret-reference-dialog";
+import { GitHubConnectButton } from "@/components/github-connect-button";
+import { QueryLoadError } from "@/components/query-load-error";
+import { RuntimeCredentialConnectionDialog } from "@/components/runtime-credential-connection-dialog";
+import { StandardFormDialog } from "@/components/standard-dialog";
+import { Button } from "@/components/ui/button";
+import {
+  Form,
+  FormControl,
+  FormDescription,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form";
+import { SecretInput } from "@/components/ui/secret-input";
+import {
+  useAgentRuntimePreflight,
+  useSetMissingAgentRuntimeCredentials,
+} from "@/lib/agent-runtime.query";
+import { useHasPermissions } from "@/lib/auth/auth.query";
+import { useConfig } from "@/lib/config/config.query";
+import {
+  type RuntimeCredentialDefinition,
+  useRuntimeCredentials,
+} from "@/lib/runtime-credentials.query";
+
+/** Accept both new setup links and credential anchors already sent to users. */
+export function AgentRuntimeCredentialsDeepLink(props: {
+  agentId: string;
+  declarations: NonNullable<AgentRuntimeConfig["credentials"]>;
+  canEditAgent: boolean;
+}) {
+  const searchParams = useSearchParams();
+  const pathname = usePathname();
+  const router = useRouter();
+  const [legacyLink, setLegacyLink] = useState(false);
+  useEffect(() => {
+    const readHash = () =>
+      setLegacyLink(window.location.hash === "#runtime-credentials");
+    readHash();
+    window.addEventListener("hashchange", readHash);
+    return () => window.removeEventListener("hashchange", readHash);
+  }, []);
+
+  if (searchParams.get("setup") !== "credentials" && !legacyLink) return null;
+
+  return (
+    <AgentRuntimeCredentialsDialog
+      {...props}
+      githubConnected={searchParams.get("github") === "connected"}
+      onClose={() => {
+        setLegacyLink(false);
+        const params = new URLSearchParams(searchParams.toString());
+        params.delete("setup");
+        params.delete("github");
+        params.delete("tab");
+        const query = params.toString();
+        router.replace(`${pathname}${query ? `?${query}` : ""}`, {
+          scroll: false,
+        });
+      }}
+    />
+  );
+}
+
+export function AgentRuntimeCredentialsDialog({
+  agentId,
+  declarations,
+  canEditAgent,
+  githubConnected = false,
+  onClose,
+}: {
+  agentId: string;
+  declarations: NonNullable<AgentRuntimeConfig["credentials"]>;
+  canEditAgent: boolean;
+  githubConnected?: boolean;
+  onClose: () => void;
+}) {
+  const preflight = useAgentRuntimePreflight(agentId);
+  const definitions = useRuntimeCredentials();
+  const [connecting, setConnecting] =
+    useState<RuntimeCredentialDefinition | null>(null);
+  const { data: canManageOrganization, isPending: permissionsPending } =
+    useHasPermissions({ agentSettings: ["update"] });
+  const config = useConfig();
+  const byosEnabled = config.data?.features.byosEnabled;
+  const save = useSetMissingAgentRuntimeCredentials(agentId);
+  const form = useForm<{ values: Record<string, string> }>({
+    defaultValues: { values: {} },
+  });
+  const [externalKey, setExternalKey] = useState<string | null>(null);
+  const [failedKeys, setFailedKeys] = useState<string[]>([]);
+  const missingKeys = new Set(
+    [
+      ...(preflight.data?.missing ?? []),
+      ...(preflight.data?.misconfigured ?? []),
+    ].map(({ key }) => key),
+  );
+  const missing = declarations.filter((credential) =>
+    missingKeys.has(credential.key),
+  );
+  const canSet = (credential: (typeof declarations)[number]) =>
+    credential.scope === "per_user" ||
+    (credential.credentialId ? canManageOrganization : canEditAgent);
+  const isGitHubUserConnection = (credential: (typeof declarations)[number]) =>
+    definitions.data?.some(
+      (definition) =>
+        definition.key === credential.credentialId &&
+        definition.kind === "github_app_user",
+    );
+  const editable = missing.filter(
+    (credential) => canSet(credential) && !isGitHubUserConnection(credential),
+  );
+  const loading =
+    preflight.isPending ||
+    definitions.isPending ||
+    config.isPending ||
+    permissionsPending;
+  const loadFailed = preflight.isError || definitions.isError || config.isError;
+  const needsClaudeCodeAccount = missingKeys.has("CLAUDE_CODE_ACCOUNT");
+  const complete =
+    !loading && !loadFailed && missing.length === 0 && !needsClaudeCodeAccount;
+
+  const singleGitHubConnection =
+    !loading &&
+    !loadFailed &&
+    !needsClaudeCodeAccount &&
+    missing.length === 1 &&
+    canSet(missing[0])
+      ? definitions.data?.find(
+          (definition) =>
+            definition.key === missing[0].credentialId &&
+            definition.kind === "github_app_user",
+        )
+      : undefined;
+  const connectionDefinition = connecting ?? singleGitHubConnection;
+  if (connectionDefinition) {
+    return (
+      <RuntimeCredentialConnectionDialog
+        definition={connectionDefinition}
+        scope="personal"
+        onClose={connecting ? () => setConnecting(null) : onClose}
+      />
+    );
+  }
+
+  return (
+    <StandardFormDialog
+      open
+      title="Set up runtime credentials"
+      description="Add the missing credentials for this Agent. Personal credentials belong to your account."
+      size="medium"
+      isDirty={form.formState.isDirty}
+      onOpenChange={(open) => {
+        if (!open && !save.isPending) onClose();
+      }}
+      onSubmit={form.handleSubmit(({ values }) => {
+        save.mutate(
+          editable.map(({ key }) => ({ key, value: values[key].trim() })),
+          {
+            onSuccess: ({ saved, failed }) => {
+              setFailedKeys(failed);
+              for (const key of saved)
+                form.resetField(`values.${key}`, { defaultValue: "" });
+            },
+          },
+        );
+      })}
+      footer={
+        <>
+          <Button
+            type="button"
+            variant="outline"
+            disabled={save.isPending}
+            onClick={onClose}
+          >
+            {complete ? "Done" : "Cancel"}
+          </Button>
+          {!complete && editable.length > 0 && (
+            <Button
+              type="submit"
+              disabled={
+                loading || loadFailed || save.isPending || editable.length === 0
+              }
+            >
+              {save.isPending ? "Saving…" : "Save credentials"}
+            </Button>
+          )}
+        </>
+      }
+    >
+      {githubConnected && (
+        <output className="mb-5 flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-2 text-sm">
+          <CircleCheck
+            className="size-4 shrink-0 text-green-600 dark:text-green-400"
+            aria-hidden="true"
+          />
+          <span>GitHub connected</span>
+        </output>
+      )}
+      {loading ? (
+        <output>Checking missing credentials…</output>
+      ) : loadFailed ? (
+        <QueryLoadError
+          title="Could not load runtime credentials"
+          onRetry={() => {
+            void preflight.refetch();
+            void definitions.refetch();
+            void config.refetch();
+          }}
+        />
+      ) : complete ? (
+        <output>
+          All required credentials are configured. Return to your conversation
+          and retry the request.
+        </output>
+      ) : (
+        <Form {...form}>
+          <div className="space-y-6">
+            {needsClaudeCodeAccount && <ClaudeCodeAccount agentId={agentId} />}
+            {missing.map((credential) => {
+              const definition = definitions.data?.find(
+                ({ key }) => key === credential.credentialId,
+              );
+              const description = definition
+                ? definition.description
+                : credential.description;
+              return (
+                <FormField
+                  key={credential.key}
+                  control={form.control}
+                  name={`values.${credential.key}`}
+                  defaultValue=""
+                  rules={{
+                    validate: (value) =>
+                      !canSet(credential) ||
+                      isGitHubUserConnection(credential) ||
+                      !!value?.trim() ||
+                      "Secret value is required",
+                    maxLength: {
+                      value: 20_000,
+                      message: "Secret value is too long",
+                    },
+                  }}
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{credential.label}</FormLabel>
+                      {description?.trim() && (
+                        <FormDescription className="whitespace-pre-wrap break-words">
+                          {description.trim()}
+                        </FormDescription>
+                      )}
+                      {!canSet(credential) ? (
+                        <p className="text-sm text-muted-foreground">
+                          An administrator must configure this organization
+                          credential.
+                        </p>
+                      ) : definition?.kind === "github_app_user" ? (
+                        <GitHubConnectButton
+                          className="justify-self-start"
+                          disabled={save.isPending}
+                          onClick={() => setConnecting(definition)}
+                        />
+                      ) : byosEnabled ? (
+                        <FormControl>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            disabled={save.isPending}
+                            onClick={() => setExternalKey(credential.key)}
+                          >
+                            {field.value
+                              ? "Change Vault secret"
+                              : "Select Vault secret"}
+                          </Button>
+                        </FormControl>
+                      ) : (
+                        <FormControl>
+                          <SecretInput
+                            {...field}
+                            disabled={save.isPending}
+                            autoFocus={credential.key === editable[0]?.key}
+                            autoComplete="off"
+                            revealable
+                            placeholder="Paste secret"
+                          />
+                        </FormControl>
+                      )}
+                      <FormMessage />
+                      {failedKeys.includes(credential.key) && (
+                        <p role="alert" className="text-sm text-destructive">
+                          Could not save this credential. Try again.
+                        </p>
+                      )}
+                    </FormItem>
+                  )}
+                />
+              );
+            })}
+          </div>
+        </Form>
+      )}
+      {preflight.data?.incompatible && (
+        <p role="alert" className="mt-4 text-sm text-muted-foreground">
+          {preflight.data.incompatible}
+        </p>
+      )}
+      {externalKey && (
+        <ExternalSecretReferenceDialog
+          fieldLabel={
+            declarations.find(({ key }) => key === externalKey)?.label ??
+            externalKey
+          }
+          initialValue={form.getValues(`values.${externalKey}`)}
+          onClose={() => setExternalKey(null)}
+          onConfirm={(reference) => {
+            form.setValue(`values.${externalKey}`, reference, {
+              shouldDirty: true,
+              shouldValidate: true,
+            });
+            setExternalKey(null);
+          }}
+        />
+      )}
+    </StandardFormDialog>
+  );
+}

@@ -1,0 +1,475 @@
+import {
+  and,
+  count,
+  desc,
+  eq,
+  ilike,
+  inArray,
+  isNotNull,
+  ne,
+  notInArray,
+  or,
+  sql,
+} from "drizzle-orm";
+import db, { schema, withDbTransaction } from "@/database";
+import { notDeleted } from "@/database/schemas/soft-deletable-table";
+import { hardDelete, restore, softDelete } from "@/database/soft-delete";
+import type {
+  InsertKnowledgeBase,
+  KnowledgeBase,
+  UpdateKnowledgeBase,
+} from "@/types";
+import CreatedByModel from "./created-by";
+import KnowledgeBaseConnectorModel from "./knowledge-base-connector";
+
+/**
+ * Filters shared by the list and its count, so a page can never show N rows
+ * with a total of N + rows the other filter would have excluded. `status`
+ * picks the lifecycle slice: `deleted` is the trash view, every other read
+ * stays `notDeleted`.
+ */
+function buildOrgFilters(params: {
+  organizationId: string;
+  search?: string;
+  status?: "active" | "deleted";
+  /**
+   * Knowledge base ids matching the caller's `?labels=` filter, resolved once
+   * by the route so the list and count queries agree without resolving twice.
+   */
+  labelFilteredIds?: string[];
+  canReadAll?: boolean;
+  viewerTeamIds?: string[];
+  viewerUserId?: string;
+  scope?: "personal" | "team" | "org";
+  teamIds?: string[];
+  authorIds?: string[];
+  excludeAuthorIds?: string[];
+  excludeOtherPersonal?: boolean;
+}) {
+  const normalizedSearch = params.search?.trim();
+  return [
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    ...(params.canReadAll === false
+      ? [
+          or(
+            eq(schema.knowledgeBasesTable.visibility, "org-wide"),
+            ...(params.viewerUserId
+              ? [
+                  and(
+                    eq(schema.knowledgeBasesTable.visibility, "private"),
+                    eq(
+                      schema.knowledgeBasesTable.createdBy,
+                      params.viewerUserId,
+                    ),
+                  ),
+                ]
+              : []),
+            ...(params.viewerTeamIds ?? []).map((id) =>
+              and(
+                eq(schema.knowledgeBasesTable.visibility, "team-scoped"),
+                sql`${schema.knowledgeBasesTable.teamIds} @> ${JSON.stringify([id])}::jsonb`,
+              ),
+            ),
+          ),
+        ]
+      : []),
+    // SPDX-SnippetEnd
+    ...(params.scope
+      ? [
+          eq(
+            schema.knowledgeBasesTable.visibility,
+            (
+              {
+                personal: "private",
+                team: "team-scoped",
+                org: "org-wide",
+              } as const
+            )[params.scope],
+          ),
+        ]
+      : []),
+    ...(params.teamIds?.length
+      ? [
+          or(
+            ...params.teamIds.map(
+              (id) =>
+                sql`${schema.knowledgeBasesTable.teamIds} @> ${JSON.stringify([id])}::jsonb`,
+            ),
+          ),
+        ]
+      : []),
+    ...(params.authorIds?.length
+      ? [inArray(schema.knowledgeBasesTable.createdBy, params.authorIds)]
+      : []),
+    ...(params.excludeAuthorIds?.length
+      ? [
+          or(
+            sql`${schema.knowledgeBasesTable.createdBy} IS NULL`,
+            notInArray(
+              schema.knowledgeBasesTable.createdBy,
+              params.excludeAuthorIds,
+            ),
+          ),
+        ]
+      : []),
+    ...(params.excludeOtherPersonal
+      ? [
+          or(
+            ne(schema.knowledgeBasesTable.visibility, "private"),
+            params.viewerUserId
+              ? eq(schema.knowledgeBasesTable.createdBy, params.viewerUserId)
+              : sql`false`,
+          ),
+        ]
+      : []),
+    ...(params.labelFilteredIds !== undefined
+      ? [inArray(schema.knowledgeBasesTable.id, params.labelFilteredIds)]
+      : []),
+    params.status === "deleted"
+      ? isNotNull(schema.knowledgeBasesTable.deletedAt)
+      : notDeleted(schema.knowledgeBasesTable),
+    eq(schema.knowledgeBasesTable.organizationId, params.organizationId),
+    ...(normalizedSearch
+      ? [
+          or(
+            ilike(schema.knowledgeBasesTable.name, `%${normalizedSearch}%`),
+            ilike(
+              schema.knowledgeBasesTable.description,
+              `%${normalizedSearch}%`,
+            ),
+          ),
+        ]
+      : []),
+  ];
+}
+
+class KnowledgeBaseModel {
+  static async findByOrganization(params: {
+    organizationId: string;
+    limit?: number;
+    offset?: number;
+    search?: string;
+    status?: "active" | "deleted";
+    /** Knowledge base ids matching a `?labels=` filter; omit when not filtering. */
+    labelFilteredIds?: string[];
+    canReadAll?: boolean;
+    viewerTeamIds?: string[];
+    viewerUserId?: string;
+    scope?: "personal" | "team" | "org";
+    teamIds?: string[];
+    authorIds?: string[];
+    excludeAuthorIds?: string[];
+    excludeOtherPersonal?: boolean;
+  }): Promise<KnowledgeBase[]> {
+    const filters = buildOrgFilters(params);
+
+    let query = db
+      .select()
+      .from(schema.knowledgeBasesTable)
+      .where(and(...filters))
+      // The trash renders `deletedAt` as its only temporal column, so it sorts
+      // by it — ordering by `createdAt` there would scatter the visible column
+      // into arbitrary order. `deletedAt` is non-null across that slice by
+      // construction (buildOrgFilters pins `isNotNull`), so no null ordering.
+      //
+      // `id` breaks ties on both branches: LIMIT/OFFSET needs a total order, or
+      // a tie group straddling a page boundary renders a row twice and drops
+      // another. Ties are the normal case, not the edge one — `createdAt`
+      // defaults to now(), the transaction timestamp, so rows inserted together
+      // are stamped identically, and a cascade hands `softDelete` one shared
+      // `at` deliberately. The uuid is random: a determinism key, not a recency
+      // proxy. This settles the order for a fixed snapshot only — OFFSET paging
+      // still shifts under a concurrent restore/purge, which would take keyset
+      // pagination to close.
+      .orderBy(
+        params.status === "deleted"
+          ? desc(schema.knowledgeBasesTable.deletedAt)
+          : desc(schema.knowledgeBasesTable.createdAt),
+        desc(schema.knowledgeBasesTable.id),
+      )
+      .$dynamic();
+
+    if (params.limit !== undefined) {
+      query = query.limit(params.limit);
+    }
+    if (params.offset !== undefined) {
+      query = query.offset(params.offset);
+    }
+
+    return await query;
+  }
+
+  static async findById(id: string): Promise<KnowledgeBase | null> {
+    const [result] = await db
+      .select()
+      .from(schema.knowledgeBasesTable)
+      .where(
+        and(
+          eq(schema.knowledgeBasesTable.id, id),
+          notDeleted(schema.knowledgeBasesTable),
+        ),
+      );
+
+    return result ?? null;
+  }
+
+  static async findByIds(ids: string[]): Promise<KnowledgeBase[]> {
+    if (ids.length === 0) return [];
+    return await db
+      .select()
+      .from(schema.knowledgeBasesTable)
+      .where(
+        and(
+          inArray(schema.knowledgeBasesTable.id, ids),
+          notDeleted(schema.knowledgeBasesTable),
+        ),
+      );
+  }
+
+  static async create(data: InsertKnowledgeBase): Promise<KnowledgeBase> {
+    const [result] = await db
+      .insert(schema.knowledgeBasesTable)
+      .values(
+        await CreatedByModel.forInsert({
+          data: data,
+          userIdField: "createdBy",
+        }),
+      )
+      .returning();
+
+    return result;
+  }
+
+  /**
+   * `notDeleted`-filtered like every read: a soft-deleted KB is gone, so a
+   * write must not land on it either. Returns null when nothing matched.
+   */
+  static async update(
+    id: string,
+    data: Partial<UpdateKnowledgeBase>,
+  ): Promise<KnowledgeBase | null> {
+    const [result] = await db
+      .update(schema.knowledgeBasesTable)
+      .set(data)
+      .where(
+        and(
+          eq(schema.knowledgeBasesTable.id, id),
+          notDeleted(schema.knowledgeBasesTable),
+        ),
+      )
+      .returning();
+
+    return result ?? null;
+  }
+
+  /**
+   * Soft-delete: stamps `deleted_at` so the row survives for a follow-up
+   * restore/purge but drops out of every `notDeleted()`-filtered read. Returns
+   * false when no active row matched (already deleted / unknown id), which the
+   * delete routes surface as a 404. Cross-model side-effects (queued-sync
+   * cancellation, cache invalidation) live in the knowledge-source-deletion
+   * service, not here.
+   */
+  static async delete(id: string): Promise<boolean> {
+    const count = await softDelete(
+      db,
+      schema.knowledgeBasesTable,
+      eq(schema.knowledgeBasesTable.id, id),
+    );
+
+    return count > 0;
+  }
+
+  /**
+   * Restore: clears `deleted_at`, pure stamp-removal. Junction rows (agent
+   * assignments, connector links) were never stamped, so the KB comes back
+   * with its prior assignments live. Returns false when no soft-deleted row
+   * matched, which the restore route surfaces as a 404.
+   */
+  static async restore(id: string): Promise<boolean> {
+    const count = await restore(
+      db,
+      schema.knowledgeBasesTable,
+      eq(schema.knowledgeBasesTable.id, id),
+    );
+
+    return count > 0;
+  }
+
+  /**
+   * Org-scoped lookup of a SOFT-DELETED knowledge base, for the restore route.
+   * Does NOT filter `notDeleted` — it is the one point read that must see
+   * deleted rows.
+   */
+  static async findDeletedByIdForOrganization(
+    id: string,
+    organizationId: string,
+  ): Promise<KnowledgeBase | null> {
+    const [result] = await db
+      .select()
+      .from(schema.knowledgeBasesTable)
+      .where(
+        and(
+          eq(schema.knowledgeBasesTable.id, id),
+          eq(schema.knowledgeBasesTable.organizationId, organizationId),
+          isNotNull(schema.knowledgeBasesTable.deletedAt),
+        ),
+      );
+
+    return result ?? null;
+  }
+
+  /**
+   * Physical delete, for the permanent-delete route. Locks on `(id,
+   * organization_id, deleted_at IS NOT NULL)` so the purge is
+   * self-authorizing — the route needs no separate existence read — and a
+   * concurrent restore wins the race (it either commits first, leaving no
+   * soft-deleted row to find, or blocks until this transaction commits and
+   * then finds no row at all). Children (agent assignments, connector
+   * assignments) cascade.
+   */
+  static async purge(params: {
+    id: string;
+    organizationId: string;
+  }): Promise<boolean> {
+    return await withDbTransaction(async (tx) => {
+      const [locked] = await tx
+        .select({ id: schema.knowledgeBasesTable.id })
+        .from(schema.knowledgeBasesTable)
+        .where(
+          and(
+            eq(schema.knowledgeBasesTable.id, params.id),
+            eq(
+              schema.knowledgeBasesTable.organizationId,
+              params.organizationId,
+            ),
+            isNotNull(schema.knowledgeBasesTable.deletedAt),
+          ),
+        )
+        .for("update")
+        .limit(1);
+      if (!locked) return false;
+
+      const count = await hardDelete(
+        tx,
+        schema.knowledgeBasesTable,
+        eq(schema.knowledgeBasesTable.id, params.id),
+      );
+      return count > 0;
+    });
+  }
+
+  /** Identity-only audit snapshot for purge audit rows; org-scoped. */
+  static async findIdentityForAudit(
+    id: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const [row] = await db
+      .select({
+        id: schema.knowledgeBasesTable.id,
+        name: schema.knowledgeBasesTable.name,
+        deletedAt: schema.knowledgeBasesTable.deletedAt,
+      })
+      .from(schema.knowledgeBasesTable)
+      .where(
+        and(
+          eq(schema.knowledgeBasesTable.id, id),
+          eq(schema.knowledgeBasesTable.organizationId, organizationId),
+        ),
+      );
+    if (!row) return null;
+    return { ...row, deletedAt: row.deletedAt?.toISOString() ?? null };
+  }
+
+  static async countByOrganization(params: {
+    organizationId: string;
+    search?: string;
+    status?: "active" | "deleted";
+    /** Knowledge base ids matching a `?labels=` filter; omit when not filtering. */
+    labelFilteredIds?: string[];
+    canReadAll?: boolean;
+    viewerTeamIds?: string[];
+    viewerUserId?: string;
+    scope?: "personal" | "team" | "org";
+    teamIds?: string[];
+    authorIds?: string[];
+    excludeAuthorIds?: string[];
+    excludeOtherPersonal?: boolean;
+  }): Promise<number> {
+    const [result] = await db
+      .select({ count: count() })
+      .from(schema.knowledgeBasesTable)
+      .where(and(...buildOrgFilters(params)));
+
+    return result?.count ?? 0;
+  }
+  static async findByName(
+    name: string,
+    organizationId: string,
+  ): Promise<KnowledgeBase | null> {
+    const [result] = await db
+      .select()
+      .from(schema.knowledgeBasesTable)
+      .where(
+        and(
+          eq(schema.knowledgeBasesTable.name, name),
+          eq(schema.knowledgeBasesTable.organizationId, organizationId),
+          // A soft-deleted KB frees its name for reuse.
+          notDeleted(schema.knowledgeBasesTable),
+        ),
+      );
+
+    return result ?? null;
+  }
+
+  /**
+   * Prior/post-state snapshot for the audit hook. `notDeleted`-filtered like
+   * every other read: both the REST hook and the MCP tool dispatch capture
+   * `before` ahead of the handler (the row is still active then) and never
+   * fetch an after-state for a `.deleted` action, so the delete record keeps
+   * its full before-state while a re-delete of an already-deleted KB records no
+   * phantom prior state.
+   */
+  static async findByIdForAudit(
+    id: string,
+    organizationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const [row] = await db
+      .select()
+      .from(schema.knowledgeBasesTable)
+      .where(
+        and(
+          eq(schema.knowledgeBasesTable.id, id),
+          eq(schema.knowledgeBasesTable.organizationId, organizationId),
+          notDeleted(schema.knowledgeBasesTable),
+        ),
+      )
+      .limit(1);
+
+    if (!row) return null;
+
+    // Fetch connectors to include in the audit snapshot. The snapshot is a
+    // system-level record, not a viewer surface, so it bypasses visibility
+    // filtering and lists every assigned connector.
+    const connectors = await KnowledgeBaseConnectorModel.findByKnowledgeBaseId(
+      id,
+      { canReadAll: true },
+    );
+
+    return {
+      id: row.id,
+      name: row.name,
+      description: row.description ?? null,
+      organizationId: row.organizationId,
+      status: row.status,
+      visibility: row.visibility,
+      teamIds: row.teamIds,
+      connectors: connectors.map((c) => c.name).sort(),
+      createdAt: row.createdAt.toISOString(),
+    };
+  }
+}
+
+export default KnowledgeBaseModel;

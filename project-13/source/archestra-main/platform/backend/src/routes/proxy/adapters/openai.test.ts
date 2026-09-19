@@ -1,0 +1,1273 @@
+import { describe, expect, test } from "@/test";
+import type { OpenAi } from "@/types";
+import { openaiAdapterFactory } from "./openai";
+
+function createMockResponse(
+  message: OpenAi.Types.ChatCompletionsResponse["choices"][0]["message"],
+  usage?: Partial<OpenAi.Types.Usage>,
+): OpenAi.Types.ChatCompletionsResponse {
+  return {
+    id: "chatcmpl-test",
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: "gpt-4o",
+    choices: [
+      {
+        index: 0,
+        message: {
+          refusal: null,
+          ...message,
+          content: message.content ?? null,
+        },
+        logprobs: null,
+        finish_reason: message.tool_calls ? "tool_calls" : "stop",
+      },
+    ],
+    usage: {
+      prompt_tokens: usage?.prompt_tokens ?? 100,
+      completion_tokens: usage?.completion_tokens ?? 50,
+      total_tokens:
+        (usage?.prompt_tokens ?? 100) + (usage?.completion_tokens ?? 50),
+      ...(usage?.prompt_tokens_details
+        ? { prompt_tokens_details: usage.prompt_tokens_details }
+        : {}),
+      ...(usage?.completion_tokens_details
+        ? { completion_tokens_details: usage.completion_tokens_details }
+        : {}),
+    },
+  };
+}
+
+function createMockRequest(
+  messages: OpenAi.Types.ChatCompletionsRequest["messages"],
+  options?: Partial<OpenAi.Types.ChatCompletionsRequest>,
+): OpenAi.Types.ChatCompletionsRequest {
+  return {
+    model: "gpt-4o",
+    messages,
+    ...options,
+  };
+}
+
+describe("OpenAIResponseAdapter", () => {
+  describe("getToolCalls", () => {
+    test("converts function tool calls to common format", () => {
+      const response = createMockResponse({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "call_123",
+            type: "function",
+            function: {
+              name: "test_tool",
+              arguments: '{"param1": "value1", "param2": 42}',
+            },
+          },
+        ],
+      });
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+      const result = adapter.getToolCalls();
+
+      expect(result).toEqual([
+        {
+          id: "call_123",
+          name: "test_tool",
+          arguments: { param1: "value1", param2: 42 },
+        },
+      ]);
+    });
+
+    test("converts custom tool calls to common format", () => {
+      const response = createMockResponse({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "call_456",
+            type: "custom",
+            custom: {
+              name: "custom_tool",
+              input: '{"data": "test"}',
+            },
+          },
+        ],
+      });
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+      const result = adapter.getToolCalls();
+
+      expect(result).toEqual([
+        {
+          id: "call_456",
+          name: "custom_tool",
+          arguments: { data: "test" },
+        },
+      ]);
+    });
+
+    test("handles invalid JSON in arguments gracefully", () => {
+      const response = createMockResponse({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "call_789",
+            type: "function",
+            function: {
+              name: "broken_tool",
+              arguments: "invalid json{",
+            },
+          },
+        ],
+      });
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+      const result = adapter.getToolCalls();
+
+      expect(result).toEqual([
+        {
+          id: "call_789",
+          name: "broken_tool",
+          arguments: {},
+        },
+      ]);
+    });
+
+    test("handles multiple tool calls", () => {
+      const response = createMockResponse({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "call_1",
+            type: "function",
+            function: {
+              name: "tool_one",
+              arguments: '{"param": "value1"}',
+            },
+          },
+          {
+            id: "call_2",
+            type: "function",
+            function: {
+              name: "tool_two",
+              arguments: '{"param": "value2"}',
+            },
+          },
+        ],
+      });
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+      const result = adapter.getToolCalls();
+
+      expect(result).toHaveLength(2);
+      expect(result[0]).toEqual({
+        id: "call_1",
+        name: "tool_one",
+        arguments: { param: "value1" },
+      });
+      expect(result[1]).toEqual({
+        id: "call_2",
+        name: "tool_two",
+        arguments: { param: "value2" },
+      });
+    });
+
+    test("handles empty arguments", () => {
+      const response = createMockResponse({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "call_empty",
+            type: "function",
+            function: {
+              name: "empty_tool",
+              arguments: "{}",
+            },
+          },
+        ],
+      });
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+      const result = adapter.getToolCalls();
+
+      expect(result).toEqual([
+        {
+          id: "call_empty",
+          name: "empty_tool",
+          arguments: {},
+        },
+      ]);
+    });
+  });
+
+  describe("getText", () => {
+    test("extracts text content from response", () => {
+      const response = createMockResponse({
+        role: "assistant",
+        content: "Hello, world!",
+      });
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+      expect(adapter.getText()).toBe("Hello, world!");
+    });
+
+    test("returns empty string when content is null", () => {
+      const response = createMockResponse({
+        role: "assistant",
+        content: null,
+      });
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+      expect(adapter.getText()).toBe("");
+    });
+  });
+
+  describe("getFinishReasons", () => {
+    test("extracts the finish reason from the first choice", () => {
+      const response = createMockResponse({
+        role: "assistant",
+        content: "Hello",
+      });
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+      expect(adapter.getFinishReasons()).toEqual(["stop"]);
+    });
+
+    test("returns empty array when choices is empty", () => {
+      const response = {
+        ...createMockResponse({ role: "assistant", content: "x" }),
+        choices: [],
+      };
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+      expect(adapter.getFinishReasons()).toEqual([]);
+      expect(adapter.getText()).toBe("");
+      expect(adapter.getToolCalls()).toEqual([]);
+      expect(adapter.hasToolCalls()).toBe(false);
+    });
+  });
+
+  describe("responses without choices (upstream error bodies)", () => {
+    test("surfaces the embedded upstream error message and status", () => {
+      const response = {
+        error: { message: "Rate limit exceeded", code: 429 },
+      } as unknown as OpenAi.Types.ChatCompletionsResponse;
+
+      expect(() =>
+        openaiAdapterFactory.createResponseAdapter(response),
+      ).toThrow(
+        expect.objectContaining({
+          statusCode: 429,
+          message: "Rate limit exceeded",
+        }),
+      );
+    });
+
+    test("defaults to 502 with a generic message when no error details exist", () => {
+      const response = {} as unknown as OpenAi.Types.ChatCompletionsResponse;
+
+      expect(() =>
+        openaiAdapterFactory.createResponseAdapter(response),
+      ).toThrow(
+        expect.objectContaining({
+          statusCode: 502,
+          message:
+            "Upstream openai provider returned a response without choices",
+        }),
+      );
+    });
+
+    test("ignores non-HTTP error codes when picking the status", () => {
+      const response = {
+        error: { message: "boom", code: "model_not_found" },
+      } as unknown as OpenAi.Types.ChatCompletionsResponse;
+
+      expect(() =>
+        openaiAdapterFactory.createResponseAdapter(response),
+      ).toThrow(expect.objectContaining({ statusCode: 502 }));
+    });
+  });
+
+  describe("getUsage", () => {
+    test("extracts usage tokens from response", () => {
+      const response = createMockResponse(
+        { role: "assistant", content: "Test" },
+        { prompt_tokens: 150, completion_tokens: 75 },
+      );
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+      const usage = adapter.getUsage();
+
+      expect(usage).toEqual({
+        inputTokens: 150,
+        outputTokens: 75,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+      });
+    });
+
+    test("subtracts cached tokens from prompt to avoid double-counting", () => {
+      const response = createMockResponse(
+        { role: "assistant", content: "Test" },
+        {
+          prompt_tokens: 150,
+          completion_tokens: 75,
+          prompt_tokens_details: { cached_tokens: 120 },
+        },
+      );
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+
+      // OpenAI's cached_tokens are a SUBSET of prompt_tokens: uncached = 150-120.
+      expect(adapter.getUsage()).toEqual({
+        inputTokens: 30,
+        outputTokens: 75,
+        cacheReadTokens: 120,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+      });
+    });
+
+    test("extracts reasoning_tokens from completion_tokens_details", () => {
+      const response = createMockResponse(
+        { role: "assistant", content: "Test" },
+        {
+          prompt_tokens: 150,
+          completion_tokens: 75,
+          completion_tokens_details: { reasoning_tokens: 40 },
+        },
+      );
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+
+      // reasoning_tokens are a subset already inside completion_tokens.
+      expect(adapter.getUsage().reasoningTokens).toBe(40);
+    });
+  });
+
+  describe("toRefusalResponse", () => {
+    test("creates refusal response with provided message", () => {
+      const response = createMockResponse({
+        role: "assistant",
+        content: "Original content",
+      });
+
+      const adapter = openaiAdapterFactory.createResponseAdapter(response);
+      const refusal = adapter.toRefusalResponse(
+        "Full refusal",
+        "Tool call blocked by policy",
+      );
+
+      expect(refusal.choices[0].message.content).toBe(
+        "Tool call blocked by policy",
+      );
+      expect(refusal.choices[0].finish_reason).toBe("stop");
+    });
+  });
+});
+
+describe("OpenAIRequestAdapter", () => {
+  describe("getModel", () => {
+    test("returns original model by default", () => {
+      const request = createMockRequest([{ role: "user", content: "Hello" }], {
+        model: "gpt-4o-mini",
+      });
+
+      const adapter = openaiAdapterFactory.createRequestAdapter(request);
+      expect(adapter.getModel()).toBe("gpt-4o-mini");
+    });
+
+    test("returns modified model after setModel", () => {
+      const request = createMockRequest([{ role: "user", content: "Hello" }], {
+        model: "gpt-4o",
+      });
+
+      const adapter = openaiAdapterFactory.createRequestAdapter(request);
+      adapter.setModel("gpt-4o-mini");
+      expect(adapter.getModel()).toBe("gpt-4o-mini");
+    });
+  });
+
+  describe("isStreaming", () => {
+    test("returns true when stream is true", () => {
+      const request = createMockRequest([{ role: "user", content: "Hello" }], {
+        stream: true,
+      });
+
+      const adapter = openaiAdapterFactory.createRequestAdapter(request);
+      expect(adapter.isStreaming()).toBe(true);
+    });
+
+    test("returns false when stream is false", () => {
+      const request = createMockRequest([{ role: "user", content: "Hello" }], {
+        stream: false,
+      });
+
+      const adapter = openaiAdapterFactory.createRequestAdapter(request);
+      expect(adapter.isStreaming()).toBe(false);
+    });
+
+    test("returns false when stream is undefined", () => {
+      const request = createMockRequest([{ role: "user", content: "Hello" }]);
+
+      const adapter = openaiAdapterFactory.createRequestAdapter(request);
+      expect(adapter.isStreaming()).toBe(false);
+    });
+  });
+
+  describe("getTools", () => {
+    test("extracts function tools from request", () => {
+      const request = createMockRequest([{ role: "user", content: "Hello" }], {
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "get_weather",
+              description: "Get weather for a location",
+              parameters: {
+                type: "object",
+                properties: {
+                  location: { type: "string" },
+                },
+              },
+            },
+          },
+        ],
+      });
+
+      const adapter = openaiAdapterFactory.createRequestAdapter(request);
+      const tools = adapter.getTools();
+
+      expect(tools).toEqual([
+        {
+          name: "get_weather",
+          description: "Get weather for a location",
+          inputSchema: {
+            type: "object",
+            properties: {
+              location: { type: "string" },
+            },
+          },
+        },
+      ]);
+    });
+
+    test("returns empty array when no tools", () => {
+      const request = createMockRequest([{ role: "user", content: "Hello" }]);
+
+      const adapter = openaiAdapterFactory.createRequestAdapter(request);
+      expect(adapter.getTools()).toEqual([]);
+    });
+  });
+
+  describe("getMessages", () => {
+    test("converts tool messages to common format", () => {
+      const request = createMockRequest([
+        { role: "user", content: "Get the weather" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call_123",
+              type: "function",
+              function: {
+                name: "get_weather",
+                arguments: '{"location": "NYC"}',
+              },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          tool_call_id: "call_123",
+          content: '{"temperature": 72, "unit": "fahrenheit"}',
+        },
+      ]);
+
+      const adapter = openaiAdapterFactory.createRequestAdapter(request);
+      const messages = adapter.getMessages();
+
+      expect(messages).toHaveLength(3);
+      expect(messages[2].toolCalls).toEqual([
+        {
+          id: "call_123",
+          name: "get_weather",
+          arguments: { location: "NYC" },
+          content: { temperature: 72, unit: "fahrenheit" },
+          isError: false,
+        },
+      ]);
+    });
+  });
+
+  describe("toProviderRequest - tool results handling", () => {
+    test("preserves successful tool results as tool messages", () => {
+      const request = createMockRequest([
+        { role: "user", content: "Get the data" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call_123",
+              type: "function",
+              function: {
+                name: "test_tool",
+                arguments: "{}",
+              },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          tool_call_id: "call_123",
+          content: '{"result":"success","data":[1,2,3]}',
+        },
+      ]);
+
+      const adapter = openaiAdapterFactory.createRequestAdapter(request);
+      const result = adapter.toProviderRequest();
+
+      const toolMessage = result.messages.find((m) => m.role === "tool");
+      expect(toolMessage).toBeDefined();
+      expect(toolMessage?.tool_call_id).toBe("call_123");
+      expect(toolMessage?.content).toBe('{"result":"success","data":[1,2,3]}');
+    });
+
+    test("preserves error tool results as tool messages", () => {
+      const request = createMockRequest([
+        { role: "user", content: "Get the data" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call_456",
+              type: "function",
+              function: {
+                name: "test_tool",
+                arguments: "{}",
+              },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          tool_call_id: "call_456",
+          content: "Error: Tool execution failed",
+        },
+      ]);
+
+      const adapter = openaiAdapterFactory.createRequestAdapter(request);
+      const result = adapter.toProviderRequest();
+
+      const toolMessage = result.messages.find((m) => m.role === "tool");
+      expect(toolMessage).toBeDefined();
+      expect(toolMessage?.tool_call_id).toBe("call_456");
+      expect(toolMessage?.content).toBe("Error: Tool execution failed");
+    });
+
+    test("handles multiple tool results as separate tool messages", () => {
+      const request = createMockRequest([
+        { role: "user", content: "Do multiple things" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call_1",
+              type: "function",
+              function: {
+                name: "tool_one",
+                arguments: "{}",
+              },
+            },
+            {
+              id: "call_2",
+              type: "function",
+              function: {
+                name: "tool_two",
+                arguments: "{}",
+              },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          tool_call_id: "call_1",
+          content: '"simple text"',
+        },
+        {
+          role: "tool",
+          tool_call_id: "call_2",
+          content: "Error: Network timeout",
+        },
+      ]);
+
+      const adapter = openaiAdapterFactory.createRequestAdapter(request);
+      const result = adapter.toProviderRequest();
+
+      const toolMessages = result.messages.filter((m) => m.role === "tool");
+      expect(toolMessages).toHaveLength(2);
+      expect(toolMessages[0].tool_call_id).toBe("call_1");
+      expect(toolMessages[0].content).toBe('"simple text"');
+      expect(toolMessages[1].tool_call_id).toBe("call_2");
+      expect(toolMessages[1].content).toBe("Error: Network timeout");
+    });
+
+    test("handles request with no tool results", () => {
+      const request = createMockRequest([
+        { role: "user", content: "Hello" },
+        { role: "assistant", content: "Hi there!" },
+      ]);
+
+      const adapter = openaiAdapterFactory.createRequestAdapter(request);
+      const result = adapter.toProviderRequest();
+
+      const toolMessages = result.messages.filter((m) => m.role === "tool");
+      expect(toolMessages).toHaveLength(0);
+    });
+  });
+
+  describe("toProviderRequest - general", () => {
+    test("applies model change to request", () => {
+      const request = createMockRequest([{ role: "user", content: "Hello" }], {
+        model: "gpt-4o",
+      });
+
+      const adapter = openaiAdapterFactory.createRequestAdapter(request);
+      adapter.setModel("gpt-4o-mini");
+      const result = adapter.toProviderRequest();
+
+      expect(result.model).toBe("gpt-4o-mini");
+    });
+
+    test("applies tool result updates to request", () => {
+      const request = createMockRequest([
+        { role: "user", content: "Get the weather" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call_123",
+              type: "function",
+              function: {
+                name: "get_weather",
+                arguments: '{"location": "NYC"}',
+              },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          tool_call_id: "call_123",
+          content: '{"temperature": 72}',
+        },
+      ]);
+
+      const adapter = openaiAdapterFactory.createRequestAdapter(request);
+      adapter.updateToolResult(
+        "call_123",
+        '{"temperature": 75, "note": "updated"}',
+      );
+      const result = adapter.toProviderRequest();
+
+      const toolMessage = result.messages.find((m) => m.role === "tool");
+      expect(toolMessage?.content).toBe(
+        '{"temperature": 75, "note": "updated"}',
+      );
+    });
+
+    test("converts MCP image blocks in tool results", () => {
+      const messages = [
+        { role: "user", content: "Capture a screenshot" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call_123",
+              type: "function",
+              function: {
+                name: "browser_take_screenshot",
+                arguments: "{}",
+              },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          tool_call_id: "call_123",
+          content: [
+            { type: "text", text: "Screenshot captured" },
+            {
+              type: "image",
+              data: "abc123",
+              mimeType: "image/png",
+            },
+          ],
+        },
+      ] as unknown as OpenAi.Types.ChatCompletionsRequest["messages"];
+
+      const request = createMockRequest(messages);
+      const adapter = openaiAdapterFactory.createRequestAdapter(request);
+      const result = adapter.toProviderRequest();
+
+      const toolMessage = result.messages.find(
+        (message) => message.role === "tool",
+      );
+      expect(toolMessage?.content).toEqual([
+        { type: "text", text: "Screenshot captured" },
+        {
+          type: "image_url",
+          image_url: {
+            url: "data:image/png;base64,abc123",
+          },
+        },
+      ]);
+    });
+
+    test("strips oversized MCP image blocks in tool results", () => {
+      const largeImageData = "a".repeat(140000);
+      const messages = [
+        { role: "user", content: "Capture a screenshot" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call_123",
+              type: "function",
+              function: {
+                name: "browser_take_screenshot",
+                arguments: "{}",
+              },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          tool_call_id: "call_123",
+          content: [
+            { type: "text", text: "Screenshot captured" },
+            {
+              type: "image",
+              data: largeImageData,
+              mimeType: "image/png",
+            },
+          ],
+        },
+      ] as unknown as OpenAi.Types.ChatCompletionsRequest["messages"];
+
+      const request = createMockRequest(messages);
+      const adapter = openaiAdapterFactory.createRequestAdapter(request);
+      const result = adapter.toProviderRequest();
+
+      const toolMessage = result.messages.find(
+        (message) => message.role === "tool",
+      );
+      expect(toolMessage?.content).toEqual([
+        { type: "text", text: "Screenshot captured" },
+        { type: "text", text: "[Image omitted due to size]" },
+      ]);
+    });
+  });
+});
+
+describe("openaiAdapterFactory", () => {
+  describe("extractApiKey", () => {
+    test("returns authorization header as-is (Bearer token)", () => {
+      const headers = { authorization: "Bearer sk-test-key-123" };
+      const apiKey = openaiAdapterFactory.extractApiKey(headers);
+      // Returns full header - OpenAI SDK handles "Bearer " prefix
+      expect(apiKey).toBe("Bearer sk-test-key-123");
+    });
+
+    test("returns authorization header as-is (non-Bearer)", () => {
+      const headers = { authorization: "sk-test-key-123" };
+      const apiKey = openaiAdapterFactory.extractApiKey(headers);
+      expect(apiKey).toBe("sk-test-key-123");
+    });
+
+    test("returns undefined when no authorization header", () => {
+      const headers = {} as unknown as OpenAi.Types.ChatCompletionsHeaders;
+      const apiKey = openaiAdapterFactory.extractApiKey(headers);
+      expect(apiKey).toBeUndefined();
+    });
+  });
+
+  describe("provider info", () => {
+    test("has correct provider name", () => {
+      expect(openaiAdapterFactory.provider).toBe("openai");
+    });
+
+    test("has correct interaction type", () => {
+      expect(openaiAdapterFactory.interactionType).toBe(
+        "openai:chatCompletions",
+      );
+    });
+  });
+});
+
+describe("OpenAIStreamAdapter", () => {
+  type Chunk = OpenAi.Types.ChatCompletionChunk;
+
+  function usageOf(endSse: string | Uint8Array): unknown {
+    const text =
+      typeof endSse === "string" ? endSse : new TextDecoder().decode(endSse);
+    const firstData = text.split("\n\n")[0].replace(/^data: /, "");
+    return (JSON.parse(firstData) as { usage?: unknown }).usage;
+  }
+
+  // The refusal is emitted as a further delta, which clients concatenate onto
+  // the content they have accumulated — so the client holds the model's text
+  // AND the refusal. Reporting the refusal alone dropped the model's own answer
+  // from the record, leaving later readers a turn in which it never spoke.
+  test("toProviderResponse keeps streamed content and appends the refusal", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    adapter.processChunk({
+      id: "chatcmpl-1",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [
+        { index: 0, delta: { content: "let me check" }, finish_reason: null },
+      ],
+    } as Chunk);
+
+    adapter.formatCompleteTextSSE("blocked message");
+    const response = adapter.toProviderResponse();
+
+    expect(response.choices[0].message.content).toBe(
+      "let me checkblocked message",
+    );
+    expect(response.choices[0].finish_reason).toBe("stop");
+  });
+
+  // Reasoning models stream their thinking in `reasoning_content`. It reached
+  // the client but was never accumulated, so the recorded turn looked as though
+  // the model had gone straight to its answer.
+  test("toProviderResponse records the reasoning the model streamed", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    adapter.processChunk({
+      id: "chatcmpl-1",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [
+        {
+          index: 0,
+          // Not part of the typed delta — the adapter reads it by cast for the
+          // same reason.
+          delta: {
+            reasoning_content: "weighing ",
+          } as Chunk["choices"][number]["delta"],
+          finish_reason: null,
+        },
+      ],
+    } as Chunk);
+    adapter.processChunk({
+      id: "chatcmpl-1",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [
+        {
+          index: 0,
+          // Not part of the typed delta — the adapter reads it by cast for the
+          // same reason.
+          delta: {
+            reasoning_content: "it up",
+          } as Chunk["choices"][number]["delta"],
+          finish_reason: null,
+        },
+      ],
+    } as Chunk);
+    adapter.processChunk({
+      id: "chatcmpl-1",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [
+        { index: 0, delta: { content: "the answer" }, finish_reason: null },
+      ],
+    } as Chunk);
+
+    const message = adapter.toProviderResponse().choices[0].message as {
+      content: string | null;
+      reasoning_content?: string;
+    };
+    expect(message.reasoning_content).toBe("weighing it up");
+    expect(message.content).toBe("the answer");
+  });
+
+  test("carries the trailing usage chunk into the final SSE as gross prompt_tokens with cache detail", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    adapter.processChunk({
+      id: "chatcmpl-1",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [{ index: 0, delta: { content: "hi" }, finish_reason: null }],
+    } as Chunk);
+    adapter.processChunk({
+      id: "chatcmpl-1",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    } as Chunk);
+    // OpenAI/OpenRouter send usage in a separate trailing chunk with empty choices.
+    adapter.processChunk({
+      id: "chatcmpl-1",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [],
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 42,
+        total_tokens: 142,
+        prompt_tokens_details: { cached_tokens: 10 },
+      },
+    } as Chunk);
+
+    // The upstream's own prompt_tokens (100, already gross) is round-tripped as-is,
+    // with the cache-read subset republished via prompt_tokens_details.
+    expect(usageOf(adapter.formatEndSSE())).toEqual({
+      prompt_tokens: 100,
+      completion_tokens: 42,
+      total_tokens: 142,
+      prompt_tokens_details: { cached_tokens: 10 },
+    });
+  });
+
+  test("omits prompt_tokens_details in the final SSE when nothing was cached", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    adapter.processChunk({
+      id: "chatcmpl-4",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [{ index: 0, delta: { content: "hi" }, finish_reason: "stop" }],
+    } as Chunk);
+    adapter.processChunk({
+      id: "chatcmpl-4",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [],
+      usage: { prompt_tokens: 100, completion_tokens: 42, total_tokens: 142 },
+    } as Chunk);
+
+    expect(usageOf(adapter.formatEndSSE())).toEqual({
+      prompt_tokens: 100,
+      completion_tokens: 42,
+      total_tokens: 142,
+    });
+  });
+
+  test("toProviderResponse reports gross prompt_tokens with cache detail (non-streaming path)", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    adapter.processChunk({
+      id: "chatcmpl-5",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [{ index: 0, delta: { content: "hi" }, finish_reason: "stop" }],
+    } as Chunk);
+    adapter.processChunk({
+      id: "chatcmpl-5",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [],
+      usage: {
+        prompt_tokens: 4000,
+        completion_tokens: 100,
+        total_tokens: 4100,
+        prompt_tokens_details: { cached_tokens: 3900 },
+      },
+    } as Chunk);
+
+    expect(adapter.toProviderResponse().usage).toEqual({
+      prompt_tokens: 4000,
+      completion_tokens: 100,
+      total_tokens: 4100,
+      prompt_tokens_details: { cached_tokens: 3900 },
+    });
+  });
+
+  function deltaOf(
+    sseData: string | Uint8Array | null,
+  ): Record<string, unknown> {
+    if (sseData === null) throw new Error("expected sseData, got null");
+    const text =
+      typeof sseData === "string" ? sseData : new TextDecoder().decode(sseData);
+    const json = JSON.parse(text.replace(/^data: /, "").trim()) as {
+      choices: Array<{ delta: Record<string, unknown> }>;
+    };
+    return json.choices[0].delta;
+  }
+
+  test("forwards a reasoning-only chunk (reasoning_content) instead of dropping it", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    const result = adapter.processChunk({
+      id: "chatcmpl-r",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "qwen3",
+      choices: [
+        {
+          index: 0,
+          delta: { reasoning_content: "Let me think..." },
+          finish_reason: null,
+        },
+      ],
+    } as unknown as Chunk);
+
+    expect(result.sseData).not.toBeNull();
+    expect(deltaOf(result.sseData)).toMatchObject({
+      reasoning_content: "Let me think...",
+    });
+  });
+
+  test("forwards a reasoning-only chunk using the `reasoning` field (OpenRouter)", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    const result = adapter.processChunk({
+      id: "chatcmpl-r2",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "glm",
+      choices: [{ index: 0, delta: { reasoning: "hmm" }, finish_reason: null }],
+    } as unknown as Chunk);
+
+    expect(result.sseData).not.toBeNull();
+    expect(deltaOf(result.sseData)).toMatchObject({ reasoning: "hmm" });
+  });
+
+  test("still drops a truly empty delta chunk (no content, no reasoning)", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    const result = adapter.processChunk({
+      id: "chatcmpl-e",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "qwen3",
+      choices: [{ index: 0, delta: {}, finish_reason: null }],
+    } as Chunk);
+
+    expect(result.sseData).toBeNull();
+  });
+
+  test("does not stream a chunk carrying both reasoning and a tool call", () => {
+    // A reasoning+tool_call chunk must route through the tool-call blocking-policy
+    // buffering (sseData null, isToolCallChunk true), not stream immediately — so
+    // reasoning can't carry unapproved tool-call data past the policy gate.
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    const result = adapter.processChunk({
+      id: "chatcmpl-rt",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "qwen3",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            reasoning_content: "thinking",
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_1",
+                type: "function",
+                function: { name: "search", arguments: "{}" },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ],
+    } as unknown as Chunk);
+
+    expect(result.sseData).toBeNull();
+    expect(result.isToolCallChunk).toBe(true);
+  });
+
+  function finishReasonOf(endSse: string | Uint8Array): unknown {
+    const text =
+      typeof endSse === "string" ? endSse : new TextDecoder().decode(endSse);
+    const firstData = text.split("\n\n")[0].replace(/^data: /, "");
+    return (
+      JSON.parse(firstData) as {
+        choices?: Array<{ finish_reason?: unknown }>;
+      }
+    ).choices?.[0]?.finish_reason;
+  }
+
+  test("closes a refused stream as stop, not the upstream tool_calls", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    adapter.processChunk({
+      id: "chatcmpl-3",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_1",
+                type: "function",
+                function: { name: "list", arguments: '{"a":1}' },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+    } as Chunk);
+
+    adapter.formatCompleteTextSSE("blocked");
+
+    expect(finishReasonOf(adapter.formatEndSSE())).toBe("stop");
+
+    const response = adapter.toProviderResponse();
+    expect(response.choices[0].finish_reason).toBe("stop");
+    expect(response.choices[0].message.tool_calls).toBeUndefined();
+    expect(response.choices[0].message.content).toBe("blocked");
+  });
+
+  test("omits usage when the provider sent none", () => {
+    const adapter = openaiAdapterFactory.createStreamAdapter();
+    adapter.processChunk({
+      id: "chatcmpl-2",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "gpt-x",
+      choices: [{ index: 0, delta: { content: "hi" }, finish_reason: "stop" }],
+    } as Chunk);
+
+    expect(usageOf(adapter.formatEndSSE())).toBeUndefined();
+  });
+});
+
+describe("execute custom-tool normalization", () => {
+  // Cursor attaches its ApplyPatch custom tool in the flat Responses-API
+  // shape; OpenAI's /chat/completions rejects that with "Missing required
+  // parameter: 'tools[N].custom'". The adapter must forward the nested Chat
+  // Completions shape instead, leaving other tools untouched.
+  const flatCustomTool = {
+    type: "custom",
+    name: "ApplyPatch",
+    description: "Use this tool to edit files.",
+    format: {
+      type: "grammar",
+      definition: "start: begin_patch hunk end_patch",
+      syntax: "lark",
+    },
+  };
+  const functionTool = {
+    type: "function",
+    function: { name: "Read", parameters: {} },
+  };
+
+  function captureClient() {
+    const captured: { params?: Record<string, unknown> } = {};
+    const client = {
+      chat: {
+        completions: {
+          create: (params: Record<string, unknown>) => {
+            captured.params = params;
+            return createMockResponse({ role: "assistant", content: "ok" });
+          },
+        },
+      },
+    };
+    return { captured, client };
+  }
+
+  test("nests a flat Responses-style custom tool before forwarding", async () => {
+    const { captured, client } = captureClient();
+    const request = createMockRequest([{ role: "user", content: "hi" }], {
+      tools: [
+        functionTool,
+        flatCustomTool,
+      ] as OpenAi.Types.ChatCompletionsRequest["tools"],
+    });
+
+    await openaiAdapterFactory.execute(client, request);
+
+    const tools = captured.params?.tools as Array<Record<string, unknown>>;
+    expect(tools[0]).toEqual(functionTool);
+    expect(tools[1]).toEqual({
+      type: "custom",
+      custom: {
+        name: "ApplyPatch",
+        description: "Use this tool to edit files.",
+        format: {
+          type: "grammar",
+          grammar: {
+            definition: "start: begin_patch hunk end_patch",
+            syntax: "lark",
+          },
+        },
+      },
+    });
+    // The caller's request object must not be mutated.
+    expect(request.tools?.[1]).toEqual(flatCustomTool);
+  });
+
+  test("nulls out empty assistant content arrays before forwarding", async () => {
+    // Cursor sends assistant tool-call turns with content: []; OpenAI rejects
+    // the empty array ("Expected an array with minimum length 1").
+    const { captured, client } = captureClient();
+    const request = createMockRequest([
+      { role: "user", content: "hi" },
+      {
+        role: "assistant",
+        content: [],
+        tool_calls: [
+          {
+            id: "call_1",
+            type: "function",
+            function: { name: "Read", arguments: "{}" },
+          },
+        ],
+      },
+      { role: "tool", tool_call_id: "call_1", content: "file contents" },
+    ] as OpenAi.Types.ChatCompletionsRequest["messages"]);
+
+    await openaiAdapterFactory.execute(client, request);
+
+    const messages = captured.params?.messages as Array<
+      Record<string, unknown>
+    >;
+    expect(messages[1].content).toBeNull();
+    expect(messages[1].tool_calls).toBeDefined();
+    // Non-empty content and other roles stay untouched.
+    expect(messages[0].content).toBe("hi");
+    expect(messages[2].content).toBe("file contents");
+  });
+
+  test("leaves already-nested custom tools and tool-less requests untouched", async () => {
+    const { captured, client } = captureClient();
+    const nested = {
+      type: "custom",
+      custom: { name: "ApplyPatch" },
+    };
+    const request = createMockRequest([{ role: "user", content: "hi" }], {
+      tools: [nested] as OpenAi.Types.ChatCompletionsRequest["tools"],
+    });
+
+    await openaiAdapterFactory.execute(client, request);
+    expect((captured.params?.tools as unknown[])[0]).toEqual(nested);
+  });
+});

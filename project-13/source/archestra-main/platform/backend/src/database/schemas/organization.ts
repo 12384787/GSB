@@ -1,0 +1,554 @@
+import type {
+  ContextualRetrievalMode,
+  KnowledgeConnectorOverrides,
+  MessagingChannelOverrides,
+  ModelProviderOverrides,
+  OrganizationCustomFont,
+  OrganizationTheme,
+  SupportedProvider,
+} from "@archestra/shared";
+import { DEFAULT_OAUTH_ACCESS_TOKEN_LIFETIME_SECONDS } from "@archestra/shared";
+import {
+  boolean,
+  doublePrecision,
+  integer,
+  jsonb,
+  pgTable,
+  text,
+  timestamp,
+  uuid,
+  varchar,
+} from "drizzle-orm/pg-core";
+import type {
+  ConnectionBaseUrl,
+  ConnectionDefaultProviderKeys,
+  LimitCleanupInterval,
+  NetworkPolicy,
+  OnboardingWizard,
+  OrganizationChatLink,
+  ToolInvocation,
+  TrustedData,
+  TrustedImageRegistries,
+} from "@/types";
+import modelsTable from "./model";
+
+const organizationsTable = pgTable("organization", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  slug: text("slug").notNull().unique(),
+  analyticsInstanceId: uuid("analytics_instance_id").notNull().defaultRandom(),
+  analyticsInstanceStartedAt: timestamp("analytics_instance_started_at"),
+  analyticsInstanceLastHeartbeatAt: timestamp(
+    "analytics_instance_last_heartbeat_at",
+  ),
+  logo: text("logo"),
+  logoDark: text("logo_dark"),
+  createdAt: timestamp("created_at").notNull(),
+  metadata: text("metadata"),
+  onboardingComplete: boolean("onboarding_complete").notNull().default(false),
+  /**
+   * When the first-login onboarding survey was submitted (the forward to the
+   * website is best-effort). Null = not yet; the survey keeps reappearing for
+   * admins of an empty, unlicensed instance until submitted once.
+   */
+  onboardingSurveyCompletedAt: timestamp("onboarding_survey_completed_at"),
+  theme: text("theme").$type<OrganizationTheme>().notNull().default("caffeine"),
+  customFont: text("custom_font")
+    .$type<OrganizationCustomFont>()
+    .notNull()
+    .default("lato"),
+  onlineMcpCatalogEnabled: boolean("online_mcp_catalog_enabled")
+    .notNull()
+    .default(true),
+  onlineSkillCatalogEnabled: boolean("online_skill_catalog_enabled")
+    .notNull()
+    .default(true),
+  /**
+   * Whether the static skills marketplace URL serves unauthenticated clones.
+   * Off by default: the marketplace normally identifies the caller by their own
+   * Archestra token and serves the skills that caller may read, while anonymous
+   * access publishes the org-scoped skills to anyone who can reach the
+   * deployment.
+   */
+  skillMarketplaceAnonymousAccess: boolean("skill_marketplace_anonymous_access")
+    .notNull()
+    .default(false),
+  /**
+   * @deprecated The "security engine on/off" toggle (permissive/restrictive) was
+   * removed — the security engine is always enabled now. This column is inert:
+   * no code reads or writes it, and it is omitted from the API schemas. Retained
+   * (not dropped) for rollout safety — dropping a column older app versions may
+   * still read is not deploy-safe. Safe to drop in a future expand/contract
+   * migration once every supported version no longer references it.
+   */
+  globalToolPolicy: varchar("global_tool_policy")
+    .notNull()
+    .default("permissive"),
+  /**
+   * @deprecated Inert leftover column from the reverted PR #6027 (added by
+   * migration 0316). No code reads or writes it; retained for
+   * backward-compatibility and typed as a plain string so the schema stays
+   * consistent without re-introducing the reverted policy type. Safe to drop in
+   * a future migration.
+   */
+  discoveredToolPolicy: varchar("discovered_tool_policy")
+    .notNull()
+    .default("relaxed"),
+  /**
+   * Admin-configurable default invocation policy applied to every tool the LLM
+   * proxy auto-discovers and persists. Defaults to "allow_when_context_is_untrusted"
+   * ("Allow always") so discovered tools are not blocked by default.
+   */
+  defaultDiscoveredToolInvocationPolicy: varchar(
+    "default_discovered_tool_invocation_policy",
+  )
+    .$type<ToolInvocation.ToolInvocationPolicyAction>()
+    .notNull()
+    .default("allow_when_context_is_untrusted"),
+  /**
+   * Admin-configurable default result policy applied to every tool the LLM proxy
+   * auto-discovers and persists. Defaults to "mark_as_untrusted" ("Mark as
+   * sensitive") so discovered-tool output is treated as untrusted by default.
+   */
+  defaultDiscoveredToolResultPolicy: varchar(
+    "default_discovered_tool_result_policy",
+  )
+    .$type<TrustedData.TrustedDataPolicyAction>()
+    .notNull()
+    .default("mark_as_untrusted"),
+  /**
+   * Whether file uploads are allowed in chat.
+   * Defaults to true. Security policies currently only work on text-based content,
+   * so admins may want to disable this until file-based policy support is added.
+   */
+  allowChatFileUploads: boolean("allow_chat_file_uploads")
+    .notNull()
+    .default(true),
+
+  /**
+   * @deprecated No longer consulted. Dynamic tool access is now gated solely
+   * by the per-agent `access_all_tools` setting. The column is retained (not
+   * dropped) to avoid a backwards-incompatible migration and to keep the
+   * existing API field; any stored value is ignored. Safe to drop in a future
+   * migration once no deployment reads it.
+   */
+  allowToolAutoAssignment: boolean("allow_tool_auto_assignment")
+    .notNull()
+    .default(true),
+
+  /** Embedding model for knowledge base RAG — set explicitly when user configures embedding */
+  embeddingModel: text("embedding_model"),
+
+  /**
+   * @deprecated temporary transition field while embedding dimensions move to `models.embeddingDimensions`.
+   *
+   * TODO: Remove references and drop this column in a future release after existing org configs have been migrated.
+   */
+  embeddingDimensions: integer("embedding_dimensions"),
+
+  /**
+   * Chat API key used for generating embeddings.
+   * FK to chat_api_keys(id) ON DELETE SET NULL — enforced by migration only
+   * (Drizzle .references() causes TS circular inference: organization → chat-api-key → team → organization).
+   */
+  embeddingChatApiKeyId: uuid("embedding_chat_api_key_id"),
+
+  /**
+   * Chat API key used for reranking search results.
+   * FK to chat_api_keys(id) ON DELETE SET NULL — enforced by migration only (same circular issue).
+   */
+  rerankerChatApiKeyId: uuid("reranker_chat_api_key_id"),
+
+  /** LLM model used for reranking (e.g. "gpt-4o") */
+  rerankerModel: text("reranker_model"),
+
+  /**
+   * Chat API key used for OCR transcription of scanned PDF pages at ingest.
+   * FK to chat_api_keys(id) ON DELETE SET NULL — enforced by migration only (same circular issue).
+   */
+  ocrChatApiKeyId: uuid("ocr_chat_api_key_id"),
+
+  /**
+   * Vision-capable LLM model used for OCR transcription (e.g. "claude-sonnet-5").
+   * OCR is enabled exactly when both this and `ocrChatApiKeyId` are set.
+   */
+  ocrModel: text("ocr_model"),
+
+  /**
+   * BM25 tuning for the knowledge-base keyword ranker, adjustable from the
+   * Knowledge settings tab on a live installation. `null` means "use the
+   * deployment default" from `ARCHESTRA_KNOWLEDGE_BASE_BM25_K1` / `_B`, so an
+   * organization that never touched these follows whatever the operator set.
+   *
+   * `k1` is term-frequency saturation (0 = a term counts the same whether it
+   * appears once or fifty times); `b` is document-length normalization in
+   * [0, 1] (0 = ignore chunk length, which is what `ts_rank` does). Both take
+   * effect on the next query — no restart, no reindex, no statistics rebuild —
+   * because BM25 scores are computed at query time from stored statistics.
+   */
+  kbBm25K1: doublePrecision("kb_bm25_k1"),
+  kbBm25B: doublePrecision("kb_bm25_b"),
+
+  /**
+   * Organization override for contextual retrieval at ingest. Null preserves
+   * the deployment-level default for installations that configured the legacy
+   * `ARCHESTRA_KNOWLEDGE_BASE_CONTEXTUAL_RETRIEVAL_ENABLED` flag.
+   */
+  kbContextualRetrievalMode: varchar(
+    "kb_contextual_retrieval_mode",
+  ).$type<ContextualRetrievalMode>(),
+
+  /** @deprecated Superseded by `defaultModelId` (FK). Retained, no longer read or written. */
+  defaultLlmModel: text("default_llm_model"),
+  /** @deprecated Superseded by `defaultModelId` (FK). Retained, no longer read or written. */
+  defaultLlmProvider: text("default_llm_provider").$type<SupportedProvider>(),
+
+  /** Organization-wide default model. FK to models(id) ON DELETE SET NULL. */
+  defaultModelId: uuid("default_model_id").references(() => modelsTable.id, {
+    onDelete: "set null",
+  }),
+
+  /**
+   * Chat API key used for the default LLM model.
+   * FK to chat_api_keys(id) ON DELETE SET NULL — enforced by migration only (same circular issue).
+   */
+  defaultLlmApiKeyId: uuid("default_llm_api_key_id"),
+
+  /** Default token-cost limit value applied to every organization member. */
+  defaultUserLimitValue: integer("default_user_limit_value"),
+
+  /** Models covered by the default user limit. Null means all models. */
+  defaultUserLimitModel: jsonb("default_user_limit_model").$type<
+    string[] | null
+  >(),
+
+  /** Cleanup interval used by default user limits. Null falls back to weekly. */
+  defaultUserLimitCleanupInterval: varchar(
+    "default_user_limit_cleanup_interval",
+  ).$type<LimitCleanupInterval>(),
+
+  /**
+   * Default role assigned to newly provisioned members who don't get an
+   * explicit role — email/password self-signup and ChatOps auto-provisioning.
+   * NULL falls back to the built-in "member" role. Org-wide mirror of the
+   * per-IdP SSO `roleMapping.defaultRole`. Stores one or more comma-separated
+   * predefined or custom organization role identifiers, matching member.role.
+   */
+  defaultMemberRole: text("default_member_role"),
+
+  /**
+   * Organization-wide default agent ID (fallback when member has no personal default).
+   * FK to agents(id) ON DELETE SET NULL — enforced by migration only
+   * (Drizzle .references() causes TS circular inference: organization → agent → ... → organization).
+   */
+  defaultAgentId: uuid("default_agent_id"),
+
+  /** Custom favicon (base64 PNG, same validation as logo) */
+  favicon: text("favicon"),
+
+  /** Custom browser tab title */
+  appName: text("app_name"),
+
+  /** OpenGraph description for link previews */
+  ogDescription: text("og_description"),
+
+  /** Custom footer text (replaces version display) */
+  footerText: text("footer_text"),
+
+  /** Optional quick links shown on the new chat page */
+  chatLinks: jsonb("chat_links").$type<OrganizationChatLink[]>(),
+
+  /** Optional multi-step onboarding wizard rendered beside chat links on the new chat page */
+  onboardingWizard: jsonb("onboarding_wizard").$type<OnboardingWizard>(),
+
+  /** Chat input placeholder texts (cycles with typing animation) */
+  chatPlaceholders: text("chat_placeholders").array(),
+
+  /** Whether chat placeholders should use the typing animation */
+  animateChatPlaceholders: boolean("animate_chat_placeholders")
+    .notNull()
+    .default(true),
+
+  /** Square icon logo (28x28px recommended) for collapsed sidebar and chat loading indicator. PNG or SVG. */
+  iconLogo: text("icon_logo"),
+
+  /** Dark-mode variant of the icon logo. Falls back to `iconLogo` when not set. */
+  iconLogoDark: text("icon_logo_dark"),
+
+  /** Support contact message shown in chat error cards */
+  chatErrorSupportMessage: text("chat_error_support_message"),
+
+  /** When enabled, chat shows only support text plus correlation IDs in error cards */
+  slimChatErrorUi: boolean("slim_chat_error_ui").notNull().default(false),
+
+  /**
+   * When true, every member must have two-factor authentication enrolled:
+   * non-enrolled members' sessions are revoked when the flag turns on, and
+   * until they enroll, session-authenticated API access is refused (the
+   * enrollment path itself stays reachable). Enterprise-licensed.
+   */
+  requireTwoFactor: boolean("require_two_factor").notNull().default(false),
+
+  /**
+   * Absolute cap on how long a session may live, measured from session
+   * creation — the sliding 7-day refresh otherwise keeps an active user
+   * signed in forever. Null = no cap (current behavior).
+   */
+  sessionMaxAgeSeconds: integer("session_max_age_seconds"),
+
+  /**
+   * Organization OAuth access token lifetime for user authorization-code flows.
+   * Returned to clients via `expires_in` and used to persist token expiration.
+   */
+  oauthAccessTokenLifetimeSeconds: integer(
+    "oauth_access_token_lifetime_seconds",
+  )
+    .notNull()
+    .default(DEFAULT_OAUTH_ACCESS_TOKEN_LIFETIME_SECONDS),
+
+  /**
+   * Admin-selected MCP gateway pre-filled on /connection.
+   * FK to agents(id) ON DELETE SET NULL — enforced by migration only
+   * (same circular-inference issue as defaultAgentId).
+   */
+  connectionDefaultMcpGatewayId: uuid("connection_default_mcp_gateway_id"),
+
+  /**
+   * No longer read or written at runtime — the LLM Proxy needs no selection.
+   * The column stays for the rolling-deploy window (older pods still select
+   * it) and as migration input.
+   * TODO(phase-2): drop the column once no release reads it.
+   */
+  connectionDefaultLlmProxyId: uuid("connection_default_llm_proxy_id"),
+
+  /**
+   * Admin-selected client pre-selected on /connection. Null falls back to the
+   * system default ("generic" / "Any Client"). Stored as a string because
+   * client IDs are a frontend-owned string enum, not a DB row.
+   */
+  connectionDefaultClientId: text("connection_default_client_id"),
+
+  /**
+   * Client IDs shown on the /connection client grid. Null = show all.
+   * ("generic" is always shown regardless of this list.)
+   */
+  connectionShownClientIds: text("connection_shown_client_ids").array(),
+
+  /** Providers shown in the /connection proxy step. Null = show all. */
+  connectionShownProviders: text("connection_shown_providers")
+    .$type<SupportedProvider[]>()
+    .array(),
+
+  /**
+   * Per-URL metadata (description + default flag) for the externally configured
+   * proxy URLs (NEXT_PUBLIC_ARCHESTRA_API_BASE_URL). The URLs themselves are
+   * still env-driven — this table just augments them with admin context.
+   */
+  connectionBaseUrls: jsonb("connection_base_urls").$type<
+    ConnectionBaseUrl[]
+  >(),
+
+  /**
+   * Admin-chosen provider API key per provider for auto-provisioned
+   * connection virtual keys (provider → llm_provider_api_keys.id). When a
+   * provider has no entry, provisioning falls back to the user's
+   * personal → team → org key resolution.
+   */
+  connectionDefaultProviderKeys: jsonb(
+    "connection_default_provider_keys",
+  ).$type<ConnectionDefaultProviderKeys>(),
+
+  /**
+   * When false, /connection does not offer installing shared skills, and
+   * connection-setup APIs refuse a skills payload. Existing client configs
+   * and the skills product itself are unchanged.
+   */
+  connectionSkillsEnabled: boolean("connection_skills_enabled")
+    .notNull()
+    .default(true),
+
+  /**
+   * When false, /connection does not offer routing through the LLM Proxy,
+   * and connection-setup APIs refuse a provider/proxy payload. Existing
+   * client configs and /llm/proxy stay available.
+   */
+  connectionLlmProxyEnabled: boolean("connection_llm_proxy_enabled")
+    .notNull()
+    .default(true),
+
+  /**
+   * When false, /connection and plugin details do not offer plugin delivery,
+   * and connection-setup APIs refuse explicit plugin selections. Existing
+   * plugin management and installed plugins are unchanged.
+   */
+  connectionPluginsEnabled: boolean("connection_plugins_enabled")
+    .notNull()
+    .default(true),
+
+  /**
+   * Admin overrides of the built-in model-provider catalog, keyed by provider
+   * id. A `hidden` entry is switched off everywhere: the provider disappears
+   * from the pickers and the API refuses to create a key for it. The other
+   * fields only change how the provider reads. NULL / a missing key = the
+   * provider ships as-is, so providers added later default to visible.
+   */
+  modelProviderOverrides: jsonb(
+    "model_provider_overrides",
+  ).$type<ModelProviderOverrides>(),
+
+  /** Same, for the messaging channels on /messaging-channels. */
+  messagingChannelOverrides: jsonb(
+    "messaging_channel_overrides",
+  ).$type<MessagingChannelOverrides>(),
+
+  /** Same, for the knowledge connector types. */
+  knowledgeConnectorOverrides: jsonb(
+    "knowledge_connector_overrides",
+  ).$type<KnowledgeConnectorOverrides>(),
+
+  /**
+   * Legacy preset columns (feature removed) — retained inert (non-destructive,
+   * no migration) and no longer read or written. Held admin-chosen singular/
+   * plural labels that the catalog UI used to override "Preset"/"presets" copy.
+   */
+  presetEntityName: text("preset_entity_name"),
+  presetEntityNamePlural: text("preset_entity_name_plural"),
+
+  /**
+   * Legacy preset column (feature removed) — retained inert. Held the custom
+   * display label for the implicit "default" preset row. No longer read or
+   * written.
+   */
+  presetEntityDefaultLabel: text("preset_entity_default_label"),
+
+  /**
+   * Display name of the implicit "default" environment (the deployment target
+   * referenced by internal_mcp_catalog.environment_id = null). NULL falls back
+   * to "Default" in the UI.
+   */
+  defaultEnvironmentName: text("default_environment_name"),
+
+  /**
+   * Kubernetes namespace MCP server pods of the implicit "default" environment
+   * (internal_mcp_catalog.environment_id = null) are deployed into. NULL falls
+   * back to the orchestrator's own namespace. Mirrors `environment.namespace`
+   * for the default scope.
+   */
+  defaultEnvironmentNamespace: text("default_environment_namespace"),
+
+  /**
+   * Optional human-readable description of the implicit "default" environment,
+   * shown in the environment selector. NULL = unset.
+   */
+  defaultEnvironmentDescription: text("default_environment_description"),
+
+  /**
+   * Optional default network egress policy for the implicit "default"
+   * environment. NULL falls back to built-in unrestricted behavior.
+   */
+  defaultNetworkPolicy: jsonb("default_network_policy").$type<NetworkPolicy>(),
+
+  /**
+   * When true, assigning a catalog item to the implicit "default" environment
+   * (environment_id = null) requires the resource-specific `deploy-to-restricted` permission — i.e.
+   * creating a catalog item without choosing an environment is gated too.
+   * Mirrors the per-environment `environment.restricted` flag for the default.
+   */
+  defaultEnvironmentRestricted: boolean("default_environment_restricted")
+    .notNull()
+    .default(false),
+
+  /**
+   * ALLOWLIST regex (JS source, no delimiters/flags) for the implicit "default"
+   * environment (internal_mcp_catalog.environment_id = null). User-supplied
+   * config values are allowed only if they MATCH. NULL disables. Mirrors
+   * `environment.validation_regex` for the default scope.
+   */
+  defaultEnvironmentValidationRegex: text(
+    "default_environment_validation_regex",
+  ),
+
+  /**
+   * Trusted image registries for the implicit "default" environment
+   * (internal_mcp_catalog.environment_id = null). Mirrors
+   * `environment.trusted_image_registries` for the default scope. NULL/empty
+   * disables the check.
+   */
+  defaultEnvironmentTrustedImageRegistries: jsonb(
+    "default_environment_trusted_image_registries",
+  ).$type<TrustedImageRegistries>(),
+
+  /**
+   * When true, the Agent Skill tools (`list_skills`, `load_skill`) are assigned
+   * to every agent in the org and added to all new agents. Flipped on
+   * by the "Enable and create a new skill" empty-state button on /skills.
+   */
+  skillToolsEnabled: boolean("skill_tools_enabled").notNull().default(false),
+
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  /**
+   * Whether this organization wants idle MCP servers scaled to zero replicas
+   * (enterprise-licensed; the PATCH route refuses the field without a licence).
+   *
+   * The master switch: with it off nothing hibernates, whatever an individual
+   * install's `mcp_server.hibernation_mode` says. Off by default because
+   * hibernation trades a few seconds of first-call latency for the idle
+   * compute, and that is a decision to make deliberately.
+   *
+   * Deliberately only the on/off half: HOW LONG a server must be idle stays
+   * operator configuration (`ARCHESTRA_ORCHESTRATOR_MCP_IDLE_HIBERNATION_SECONDS`),
+   * because the right window depends on the cluster, not on the tenant.
+   */
+  mcpIdleHibernationEnabled: boolean("mcp_idle_hibernation_enabled")
+    .notNull()
+    .default(false),
+  // SPDX-SnippetEnd
+
+  /**
+   * Whether this organization shows the Apps Hackathon recorder. On by
+   * default, and the way an admin who does not want the promotion turns it and
+   * every part of the feature off without touching deployment configuration.
+   *
+   * It is the middle of three gates: the deployment flag decides whether the
+   * feature exists here at all (and never opens it for a licensed enterprise
+   * deployment), this decides whether the organization wants it, and the
+   * hackathon's closing date overrides both. Enterprise deployments never
+   * reach this column — the flag above them is already off — so it can stay a
+   * plain preference rather than encoding licence rules a second time.
+   */
+  appsHackathonRecorderEnabled: boolean("apps_hackathon_recorder_enabled")
+    .notNull()
+    .default(true),
+
+  /**
+   * When true, every newly created app starts disabled (author-only, invisible
+   * to chat and every agent surface) until its author enables it in App
+   * settings. Applies at creation time only — flipping it never touches
+   * existing apps.
+   */
+  newAppsDisabledByDefault: boolean("new_apps_disabled_by_default")
+    .notNull()
+    .default(false),
+
+  /**
+   * When true, every newly created app starts locked: immutable to agents (all
+   * chat-driven modification refused) until a user unlocks it. Applies at
+   * creation time only — flipping it never touches existing apps.
+   */
+  newAppsLockedByDefault: boolean("new_apps_locked_by_default")
+    .notNull()
+    .default(false),
+
+  /**
+   * Legacy preset column (feature removed) — retained inert. Held a validation
+   * regex (no delimiters/flags) applied to default-scoped field values at
+   * install time. No longer read or written.
+   */
+  presetEntityDefaultValidationRegex: text(
+    "preset_entity_default_validation_regex",
+  ),
+});
+
+export default organizationsTable;

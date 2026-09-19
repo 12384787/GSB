@@ -1,0 +1,118 @@
+# regenerate
+imports:
+  City: Kernel.Types.Beckn.Context
+  IndianState: Kernel.Types.Beckn.Context
+  Country: Kernel.Types.Beckn.Context
+  Merchant: Domain.Types.Merchant
+  ShortId: Kernel.Types.Id
+  CloudType: Kernel.Types.Version
+  BaseUrl: Kernel.Prelude
+
+MerchantOperatingCity:
+  tableName: merchant_operating_city
+
+  fields:
+    id: Id MerchantOperatingCity
+    merchantId: Id Merchant
+    merchantShortId: ShortId Merchant
+    driverOfferMerchantOperatingCityId: Maybe Text
+    state: IndianState
+    country: Country
+    city: City
+    lat: Double
+    long: Double
+    distanceUnit: Kernel.Types.Common.DistanceUnit
+    stdCode: Maybe Text
+    cloudType: Maybe CloudType
+    cloudBaseUrl: Maybe BaseUrl
+
+  beamFields:
+    distanceUnit:
+      distanceUnit: Kernel.Prelude.Maybe Kernel.Types.Common.DistanceUnit
+  beamType:
+    cloudType: Maybe Text
+    cloudBaseUrl: Maybe Text
+  toTType:
+    distanceUnit: Kernel.Prelude.Just|I
+    cloudType: (Kernel.Prelude.fmap Kernel.Prelude.show)|I
+    cloudBaseUrl: (Kernel.Prelude.fmap Kernel.Prelude.showBaseUrl)|I
+  fromTType:
+    distanceUnit: Kernel.Prelude.fromMaybe Kernel.Types.Common.Meter |I
+    cloudType: (Kernel.Prelude.>>= (Kernel.Prelude.readMaybe . Data.Text.unpack))|I
+    cloudBaseUrl: (Kernel.Prelude.pure . (Kernel.Prelude.>>= Kernel.Prelude.parseBaseUrl))|MI
+
+  excludedFields: [merchantOperatingCityId]
+
+  default:
+    lat: '0.0'
+    long: '0.0'
+    state: "'Karnataka'"
+    country: "'India'"
+
+  queries:
+    findById:
+      kvFunction: findOneWithKV
+      where: id
+    findByMerchantShortIdAndCity:
+      kvFunction: findOneWithKV
+      where:
+        and: [merchantShortId, city]
+    findByMerchantIdAndCity:
+      kvFunction: findOneWithKV
+      where:
+        and: [merchantId, city]
+    findAllByMerchantIdAndState:
+      kvFunction: findAllWithKV
+      where:
+        and: [merchantId, state]
+    findAllByMerchantId:
+      kvFunction: findAllWithKV
+      where:
+        and: [merchantId]
+
+  extraOperations:
+    - EXTRA_QUERY_FILE
+
+MerchantState:
+  tableName: merchant_state
+
+  fields:
+    merchantId: Id Merchant
+    state: IndianState
+    allowedDestinationStates: "[IndianState]"
+
+  excludedFields: [merchantOperatingCityId]
+
+  sqlType:
+    allowedDestinationStates: text[]
+
+  constraints:
+    merchantId: PrimaryKey
+    state: PrimaryKey
+
+  queries:
+    findByMerchantIdAndState:
+      kvFunction: findOneWithKV
+      where:
+        and: [merchantId, state]
+    findAllByMerchantId:
+      kvFunction: findAllWithKV
+      where:
+        and: [merchantId]
+
+ValueAddNP:
+  tableName: value_add_np
+
+  fields:
+    subscriberId: Text
+    enabled: Bool
+
+  constraints:
+    subscriberId: PrimaryKey
+
+  excludedFields: [merchantId, merchantOperatingCityId]
+
+  queries:
+    findAll:
+      kvFunction: findAllWithKV
+      where: enabled

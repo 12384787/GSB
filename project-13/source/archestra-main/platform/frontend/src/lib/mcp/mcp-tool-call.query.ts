@@ -1,0 +1,136 @@
+"use client";
+
+import { archestraApiSdk, type archestraApiTypes } from "@archestra/shared";
+import { useQuery } from "@tanstack/react-query";
+import type { CallerIdentity } from "@/components/executed-as-badge";
+import { DEFAULT_TABLE_LIMIT } from "@/consts";
+import { throwOnApiError } from "@/lib/utils";
+
+type MCPGatewayAuthMethod =
+  archestraApiTypes.GetMcpToolCallResponses["200"]["authMethod"];
+
+export function formatAuthMethod(authMethod: MCPGatewayAuthMethod): string {
+  switch (authMethod) {
+    case "oauth":
+      return "OAuth";
+    case "user_token":
+      return "User Token";
+    case "org_token":
+      return "Org Token";
+    case "team_token":
+      return "Team Token";
+    case "external_idp":
+      return "External IdP";
+    case "session":
+      return "Session";
+  }
+}
+
+/**
+ * Who a tool call ran on behalf of, for the calls the platform served itself.
+ * A call made with a gateway token carries no user, and an auditor still needs
+ * an identity for it: the token acts for its team or for the organization, so
+ * that is who made the call. The auth method stays visible in its own column.
+ */
+export function formatCallerIdentity(row: {
+  userName: string | null;
+  authMethod: MCPGatewayAuthMethod | null;
+}): CallerIdentity | null {
+  if (row.userName) {
+    return { name: row.userName, scope: "personal" };
+  }
+  switch (row.authMethod) {
+    case "org_token":
+      return { name: null, scope: "org" };
+    case "team_token":
+      return { name: null, scope: "team" };
+    default:
+      // Every other method authenticates a person, so a missing name means the
+      // user is gone — there is nothing to name them by.
+      return null;
+  }
+}
+
+const { getMcpToolCall, getMcpToolCalls } = archestraApiSdk;
+
+export function useMcpToolCalls({
+  agentId,
+  mcpServerName,
+  startDate,
+  endDate,
+  limit = DEFAULT_TABLE_LIMIT,
+  cursor,
+  initialData,
+}: {
+  agentId?: string;
+  mcpServerName?: string;
+  startDate?: string;
+  endDate?: string;
+  limit?: number;
+  cursor?: string;
+  initialData?: archestraApiTypes.GetMcpToolCallsResponses["200"];
+} = {}) {
+  return useQuery({
+    queryKey: [
+      "mcpToolCalls",
+      agentId,
+      mcpServerName,
+      startDate,
+      endDate,
+      limit,
+      cursor,
+    ],
+    queryFn: async () => {
+      const response = await getMcpToolCalls({
+        query: {
+          ...(agentId ? { agentId } : {}),
+          ...(mcpServerName ? { mcpServerName } : {}),
+          ...(startDate ? { startDate } : {}),
+          ...(endDate ? { endDate } : {}),
+          limit,
+          ...(cursor ? { cursor } : {}),
+        },
+      });
+      // Screen renders its own QueryLoadError panel; don't also toast.
+      throwOnApiError(response.error, { toastOnError: false });
+      return (
+        response.data ?? {
+          data: [],
+          pagination: {
+            limit,
+            nextCursor: null,
+            hasNext: false,
+          },
+        }
+      );
+    },
+    // Only use initialData for the newest page with default sorting and limit.
+    initialData:
+      !cursor &&
+      limit === DEFAULT_TABLE_LIMIT &&
+      !agentId &&
+      !mcpServerName &&
+      !startDate &&
+      !endDate
+        ? initialData
+        : undefined,
+  });
+}
+
+export function useMcpToolCall({
+  mcpToolCallId,
+  initialData,
+}: {
+  mcpToolCallId: string;
+  initialData?: archestraApiTypes.GetMcpToolCallResponses["200"];
+}) {
+  return useQuery({
+    queryKey: ["mcpToolCalls", mcpToolCallId],
+    queryFn: async () => {
+      const response = await getMcpToolCall({ path: { mcpToolCallId } });
+      throwOnApiError(response.error, { allowNotFound: true });
+      return response.data ?? null;
+    },
+    initialData,
+  });
+}

@@ -1,0 +1,132 @@
+{-
+ Copyright 2022-23, Juspay India Pvt Ltd
+
+ This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License
+
+ as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. This program
+
+ is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+
+ or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details. You should have received a copy of
+
+ the GNU Affero General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+-}
+{-# LANGUAGE ApplicativeDo #-}
+
+module Domain.Types.Person.Type where
+
+import Data.Aeson
+import qualified Data.Text as T
+import qualified Domain.Types.Merchant as DMerchant
+import qualified Domain.Types.Role as DRole
+import Kernel.Beam.Lib.UtilsTH
+import Kernel.External.Encryption
+import qualified Kernel.External.Types as KET
+import Kernel.Prelude
+import Kernel.Types.Id
+import Kernel.Utils.TH
+
+data PersonE e = Person
+  { id :: Id Person,
+    firstName :: Text,
+    lastName :: Text,
+    roleId :: Id DRole.Role,
+    email :: Maybe (EncryptedHashedField e Text),
+    mobileNumber :: EncryptedHashedField e Text,
+    mobileCountryCode :: Text,
+    passwordHash :: Maybe DbHash,
+    dashboardAccessType :: Maybe DRole.DashboardAccessType,
+    dashboardType :: DashboardType, -- Using enum for type safety
+    createdAt :: UTCTime,
+    receiveNotification :: Maybe Bool,
+    updatedAt :: UTCTime,
+    verified :: Maybe Bool,
+    rejectionReason :: Maybe Text,
+    rejectedAt :: Maybe UTCTime,
+    passwordUpdatedAt :: Maybe UTCTime,
+    -- | Set when an admin assigns a password. While True the credential may only be
+    -- used to set a new password, never to obtain a session.
+    forcePasswordChange :: Maybe Bool,
+    -- | Durable record of the merchant this person was provisioned under. Written once at
+    -- creation and never updated, so it survives access-row changes. Cross-merchant admin
+    -- guards read this rather than counting merchant_access rows, which any admin can delete.
+    -- Nothing on rows that predate the column.
+    merchantId :: Maybe (Id DMerchant.Merchant),
+    approvedBy :: Maybe (Id Person),
+    rejectedBy :: Maybe (Id Person),
+    language :: Maybe KET.Language,
+    secretKey :: Maybe Text,
+    is2faEnabled :: Bool,
+    tokenNo :: Maybe (EncryptedHashedField e Text),
+    vpa :: Maybe (EncryptedHashedField e Text)
+  }
+  deriving (Generic)
+
+type Person = PersonE 'AsEncrypted
+
+type DecryptedPerson = PersonE 'AsUnencrypted
+
+-- Rows written before token_no_encrypted existed carry a hash with no ciphertext; reads
+-- rebuild them with empty ciphertext, which must never be decrypted nor written back over
+-- the NULL. Real tokenNos can't be blank -- bulk input is nonBlank-filtered before encrypt.
+isLegacyTokenNoPlaceholder :: EncryptedHashedField 'AsEncrypted Text -> Bool
+isLegacyTokenNoPlaceholder = T.null . unEncrypted . (.encrypted)
+
+instance EncryptedItem Person where
+  type Unencrypted Person = (DecryptedPerson, HashSalt)
+  encryptItem (Person {..}, salt) = do
+    mobileNumber_ <- encryptItem (mobileNumber, salt)
+    email_ <- encryptItem $ (,salt) <$> email
+    tokenNo_ <- encryptItem $ (,salt) <$> tokenNo
+    vpa_ <- encryptItem $ (,salt) <$> vpa
+    return Person {mobileNumber = mobileNumber_, email = email_, tokenNo = tokenNo_, vpa = vpa_, ..}
+  decryptItem Person {..} = do
+    mobileNumber_ <- fst <$> decryptItem mobileNumber
+    email_ <- fmap fst <$> decryptItem email
+    tokenNo_ <- case tokenNo of
+      Just t
+        | isLegacyTokenNoPlaceholder t -> pure $ Just ""
+        | otherwise -> Just . fst <$> decryptItem t
+      Nothing -> pure Nothing
+    vpa_ <- fmap fst <$> decryptItem vpa
+    return (Person {mobileNumber = mobileNumber_, email = email_, tokenNo = tokenNo_, vpa = vpa_, ..}, "")
+
+instance EncryptedItem' Person where
+  type UnencryptedItem Person = DecryptedPerson
+  toUnencrypted a salt = (a, salt)
+  fromUnencrypted = fst
+
+data DashboardType = DEFAULT_DASHBOARD | TICKET_DASHBOARD
+  deriving (Show, Eq, Ord, Read, Generic, ToJSON, FromJSON, ToSchema, ToParamSchema)
+
+data DashboardTypeTag = DefaultDashboard | TicketDashboard
+
+data SingDashboardType (t :: DashboardTypeTag) where
+  SingDefaultDashboard :: SingDashboardType 'DefaultDashboard
+  SingTicketDashboard :: SingDashboardType 'TicketDashboard
+
+class KnownDashboardType (t :: DashboardTypeTag) where
+  dashboardTypeVal :: proxy t -> DashboardType
+
+instance KnownDashboardType 'DefaultDashboard where
+  dashboardTypeVal _ = DEFAULT_DASHBOARD
+
+instance KnownDashboardType 'TicketDashboard where
+  dashboardTypeVal _ = TICKET_DASHBOARD
+
+withDashboardType :: forall m a. Monad m => Maybe DashboardType -> (forall (t :: DashboardTypeTag). KnownDashboardType t => Proxy t -> m a) -> m a
+withDashboardType (Just TICKET_DASHBOARD) f = f (Proxy @'TicketDashboard)
+withDashboardType _ f = f (Proxy @'DefaultDashboard)
+
+isFleetOwner :: Person -> Bool
+isFleetOwner person = person.dashboardAccessType `elem` [Just DRole.FLEET_OWNER, Just DRole.RENTAL_FLEET_OWNER]
+
+isOperator :: Person -> Bool
+isOperator person = person.dashboardAccessType == Just DRole.DASHBOARD_OPERATOR
+
+isAdmin :: Person -> Bool
+isAdmin person = person.dashboardAccessType == Just DRole.DASHBOARD_ADMIN
+
+$(mkBeamInstancesForEnum ''DashboardType)
+
+$(mkHttpInstancesForEnum ''DashboardType)

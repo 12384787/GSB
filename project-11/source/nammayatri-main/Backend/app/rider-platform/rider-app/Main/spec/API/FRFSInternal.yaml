@@ -1,0 +1,48 @@
+imports:
+  FRFSTripPassengerManifestResp: API.Types.UI.FRFSTicketService
+  APISuccess: Kernel.Types.APISuccess
+
+module: FRFSInternal
+
+types:
+  NotifyBusApproachingReq:
+    gtfsId: Text
+    routeId: Text
+    vehicleNumber: Text
+    etaSeconds: Maybe Int
+    distanceMeters: Double
+    thresholdType: Text
+    crossedStopId: Maybe Text
+
+apis:
+  - GET:
+      endpoint: /frfs/trip/{tripId}/route/{routeId}/manifest
+      auth: NoAuth
+      headers:
+        token: Text
+      params:
+        tripId: Text
+        routeId: Text
+      response:
+        type: "API.Types.UI.FRFSTicketService.FRFSTripPassengerManifestResp"
+  - POST:
+      endpoint: /frfs/trip/{tripId}/notifyTripStarted
+      auth: NoAuth
+      headers:
+        token: Text
+      params:
+        tripId: Text
+      response:
+        type: "Kernel.Types.APISuccess.APISuccess"
+  - POST:
+      endpoint: /frfs/trip/{tripId}/stop/{stopCode}/notifyApproaching
+      auth: NoAuth
+      headers:
+        token: Text
+      params:
+        tripId: Text
+        stopCode: Text
+      request:
+        type: NotifyBusApproachingReq
+      response:
+        type: "Kernel.Types.APISuccess.APISuccess"

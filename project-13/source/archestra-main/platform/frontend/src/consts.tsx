@@ -1,0 +1,75 @@
+import { DocsPage, getDocsUrl } from "@archestra/shared";
+import { ExternalDocsLink } from "@/components/external-docs-link";
+
+export const DEFAULT_TABLE_LIMIT = 10;
+export const DEFAULT_SORT_BY = "createdAt" as const;
+export const DEFAULT_SORT_DIRECTION = "desc" as const;
+export const DEFAULT_FILTER_ALL = "all" as const;
+
+export const SHORTCUT_SEARCH = {
+  key: "k",
+  label: "K",
+} as const;
+
+export const SHORTCUT_NEW_CHAT = {
+  code: "KeyN",
+  label: "N",
+} as const;
+
+export const SHORTCUT_NEW_LOCKED_CHAT = {
+  code: "KeyI",
+  label: "I",
+} as const;
+
+/**
+ * New-chat route that opens the composer with the locked-chat toggle already on
+ * (the chat page reads the query param). Nothing is created until the user
+ * sends a message, so the URL never carries conversation content or a key.
+ */
+export const NEW_LOCKED_CHAT_HREF = "/chat?lockedChat=1";
+
+/**
+ * Cancelable window event the Alt+I handler dispatches before navigating to
+ * {@link NEW_LOCKED_CHAT_HREF}: the new-chat composer, while mounted,
+ * claims it (preventDefault) and toggles its locked-chat draft in place, so the
+ * shortcut arms AND disarms instead of re-pushing an identical URL.
+ */
+export const LOCKED_CHAT_DRAFT_SHORTCUT_EVENT = "locked-chat-draft-shortcut";
+
+// Alt-qualified (matching SHORTCUT_NEW_CHAT) so the palette has no bare
+// character-key shortcuts (WCAG 2.1.4) and the keys still work while a search
+// query is being typed. `code` dodges macOS Option dead-key characters.
+export const SHORTCUT_DELETE = {
+  code: "KeyD",
+  label: "D",
+} as const;
+
+export const SHORTCUT_PIN = {
+  code: "KeyP",
+  label: "P",
+} as const;
+
+export const SHORTCUT_SIDEBAR = {
+  key: "b",
+  label: "B",
+} as const;
+
+export const LOCAL_MCP_DISABLED_MESSAGE = (
+  <>
+    Unable to connect to Kubernetes cluster. Ensure K8s is running and the
+    orchestrator configuration is correct. Try restarting the backend.{" "}
+    <ExternalDocsLink
+      href={getDocsUrl(DocsPage.PlatformOrchestrator)}
+      className="text-primary hover:underline"
+      showIcon={false}
+    >
+      Learn more
+    </ExternalDocsLink>
+  </>
+);
+
+export const LOGS_LAYOUT_CONFIG = {
+  title: "Logs",
+  description:
+    "Monitor LLM proxy requests, MCP tool calls, and administrative activity across your organization.",
+};

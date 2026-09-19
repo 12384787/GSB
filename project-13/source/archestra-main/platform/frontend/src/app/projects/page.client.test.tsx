@@ -1,0 +1,878 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useInternalAgents } from "@/lib/agent.query";
+import { useHasPermissions, useSession } from "@/lib/auth/auth.query";
+import { useIsGlobalAdmin } from "@/lib/organization.query";
+import { useTeams } from "@/lib/teams/team.query";
+
+const mockRouterPush = vi.fn();
+const mockCreateMutateAsync = vi.fn();
+const mockDeleteMutateAsync = vi.fn();
+const mockUpdateMutateAsync = vi.fn();
+const mockSetShareMutateAsync = vi.fn();
+const mockBulkDeleteMutate = vi.fn();
+const mockBulkUpdateVisibilityMutateAsync = vi.fn();
+/** The detail the edit dialog loads; tests override the pin and sharing. */
+let mockEditingProject: Record<string, unknown> = {};
+const mockPinMutate = vi.fn();
+const mockRestoreMutate = vi.fn();
+const mockPermanentlyDeleteMutateAsync = vi.fn();
+const mockUseProjects = vi.fn();
+
+let mockProjects: ProjectFixture[] = [];
+
+type ApiKeyState = {
+  hasAnyApiKey: boolean;
+  isLoading: boolean;
+  isLoadError: boolean;
+  refetch: () => void;
+};
+let mockApiKeyState: ApiKeyState;
+
+type ProjectFixture = {
+  id: string;
+  name: string;
+  description: string | null;
+  icon: string | null;
+  viewerRole: "owner" | "shared" | "admin";
+  ownerName: string | null;
+  conversationCount: number;
+  visibility: "organization" | "team" | null;
+  shareTeamNames?: string[] | null;
+  shareUserNames?: string[] | null;
+  pinnedAt: string | null;
+  createdAt: string;
+  deletedAt: string | null;
+  labels: Array<{ key: string; value: string }>;
+};
+
+vi.mock("next/navigation");
+
+// The edit dialog now hosts the shared user-share control, which reads the
+// session and the org member list. This suite is about the card menus, so the
+// control is stubbed rather than wiring those queries into every case.
+vi.mock("@/components/user-share-field", () => ({
+  useUserShareOption: (value: string) => ({
+    value,
+    label: "Users",
+    description: "Share this with selected people",
+    disabled: false,
+    hasCandidates: true,
+  }),
+  UserShareField: () => null,
+}));
+
+vi.mock("@/components/search-input", () => ({
+  SearchInput: () => <input aria-label="Search projects" />,
+}));
+
+vi.mock("@/components/resource-scope-filter", () => ({
+  ResourceScopeFilter: () => <div>scope filter</div>,
+  ResourceDeletedStatusFilter: () => <div>status filter</div>,
+  useScopeFilterParams: () => ({
+    scope: undefined,
+    teamIds: undefined,
+    authorIds: undefined,
+    excludeAuthorIds: undefined,
+    excludeOtherPersonal: true,
+    hasActiveScopeFilters: false,
+  }),
+}));
+
+vi.mock("@/components/entity-label-filter", () => ({
+  EntityLabelFilter: () => <div>labels filter</div>,
+}));
+
+vi.mock("next/link", () => ({
+  default: ({
+    href,
+    children,
+    className,
+  }: {
+    href: string;
+    children: React.ReactNode;
+    className?: string;
+  }) => (
+    <a href={href} className={className}>
+      {children}
+    </a>
+  ),
+}));
+
+vi.mock("@/app/_parts/error-boundary", () => ({
+  ErrorBoundary: ({ children }: { children: React.ReactNode }) => (
+    <>{children}</>
+  ),
+}));
+
+vi.mock("@/components/page-layout", () => ({
+  PageLayout: ({
+    title,
+    description,
+    actionButton,
+    children,
+  }: {
+    title: React.ReactNode;
+    description?: string;
+    actionButton?: React.ReactNode;
+    children: React.ReactNode;
+  }) => (
+    <main>
+      <h1>{title}</h1>
+      {description ? <p>{description}</p> : null}
+      {actionButton}
+      {children}
+    </main>
+  ),
+}));
+
+vi.mock("@/components/no-api-key-setup", () => ({
+  NoApiKeySetup: () => <div data-testid="no-api-key-setup" />,
+}));
+
+vi.mock("@/components/agent-icon", () => ({
+  AgentIcon: ({ icon }: { icon?: string | null }) => (
+    <span>{icon ?? "project icon"}</span>
+  ),
+}));
+
+vi.mock("@/components/agent-icon-picker", () => ({
+  AgentIconPicker: () => <button type="button">Pick icon</button>,
+}));
+
+vi.mock("@/components/delete-confirm-dialog", () => ({
+  DeleteConfirmDialog: ({
+    open,
+    title,
+    onConfirm,
+  }: {
+    open: boolean;
+    title: string;
+    onConfirm: () => void;
+  }) =>
+    open ? (
+      <div>
+        {title}
+        <button type="button" onClick={onConfirm}>
+          Confirm
+        </button>
+      </div>
+    ) : null,
+}));
+
+vi.mock("@/components/bulk-visibility-dialog", () => ({
+  BulkVisibilityDialog: ({
+    open,
+    onApply,
+  }: {
+    open: boolean;
+    onApply: (change: {
+      scope: "personal";
+      teamIds: string[];
+      userIds: string[];
+    }) => void;
+  }) =>
+    open ? (
+      <button
+        type="button"
+        onClick={() => onApply({ scope: "personal", teamIds: [], userIds: [] })}
+      >
+        Apply sharing
+      </button>
+    ) : null,
+}));
+
+vi.mock("@/components/standard-dialog", () => ({
+  StandardFormDialog: ({
+    open,
+    title,
+    children,
+    footer,
+    onSubmit,
+  }: {
+    open: boolean;
+    title: string;
+    children: React.ReactNode;
+    footer?: React.ReactNode;
+    onSubmit?: (event: React.FormEvent<HTMLFormElement>) => void;
+  }) =>
+    open ? (
+      <form onSubmit={onSubmit}>
+        <h2>{title}</h2>
+        {children}
+        {footer}
+      </form>
+    ) : null,
+}));
+
+vi.mock("@/components/ui/badge", () => ({
+  Badge: ({ children }: { children: React.ReactNode }) => (
+    <span>{children}</span>
+  ),
+}));
+
+vi.mock("@/components/ui/button", () => ({
+  Button: ({
+    children,
+    onClick,
+    type = "button",
+    "aria-label": ariaLabel,
+  }: {
+    children: React.ReactNode;
+    onClick?: () => void;
+    type?: "button" | "submit";
+    "aria-label"?: string;
+  }) => (
+    <button type={type} onClick={onClick} aria-label={ariaLabel}>
+      {children}
+    </button>
+  ),
+}));
+
+vi.mock("@/components/ui/dropdown-menu", () => ({
+  DropdownMenu: ({ children }: { children: React.ReactNode }) => (
+    <>{children}</>
+  ),
+  DropdownMenuTrigger: ({ children }: { children: React.ReactNode }) => (
+    <>{children}</>
+  ),
+  DropdownMenuContent: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
+  DropdownMenuItem: ({
+    children,
+    onSelect,
+  }: {
+    children: React.ReactNode;
+    onSelect?: () => void;
+  }) => (
+    <button type="button" onClick={onSelect}>
+      {children}
+    </button>
+  ),
+}));
+
+vi.mock("@/components/ui/input", () => ({
+  Input: (props: React.InputHTMLAttributes<HTMLInputElement>) => (
+    <input {...props} />
+  ),
+}));
+
+vi.mock("@/components/ui/textarea", () => ({
+  Textarea: (props: React.TextareaHTMLAttributes<HTMLTextAreaElement>) => (
+    <textarea {...props} />
+  ),
+}));
+
+vi.mock("@/lib/llm-provider-api-keys.query", () => ({
+  useHasAnyApiKey: () => mockApiKeyState,
+}));
+
+vi.mock("@/components/api-key-load-error", () => ({
+  ApiKeyLoadError: ({ onRetry }: { onRetry: () => void }) => (
+    <button type="button" data-testid="api-key-load-error" onClick={onRetry}>
+      retry
+    </button>
+  ),
+}));
+
+vi.mock("@/lib/auth/auth.query");
+
+vi.mock("@/lib/organization.query");
+
+vi.mock("@/lib/projects/projects.query", () => ({
+  // Records its filters: which slice the page asks for is the whole difference
+  // between the trash and the active list, so a mock that dropped them would
+  // stay green if the page stopped passing `status: "deleted"` and listed live
+  // projects with Restore and Delete permanently on them.
+  useProjects: (filters?: { status?: string }) => {
+    mockUseProjects(filters);
+    return { data: mockProjects, isPending: false };
+  },
+  useCreateProject: () => ({
+    mutateAsync: mockCreateMutateAsync,
+    isPending: false,
+  }),
+  useDeleteProject: () => ({
+    mutateAsync: mockDeleteMutateAsync,
+    isPending: false,
+  }),
+  useBulkDeleteProjects: () => ({
+    mutate: mockBulkDeleteMutate,
+    isPending: false,
+  }),
+  useBulkUpdateProjectVisibility: () => ({
+    mutateAsync: mockBulkUpdateVisibilityMutateAsync,
+    isPending: false,
+  }),
+  useUpdateProject: () => ({
+    mutateAsync: mockUpdateMutateAsync,
+    isPending: false,
+  }),
+  usePinProject: () => ({ mutate: mockPinMutate }),
+  useRestoreProject: () => ({ mutate: mockRestoreMutate, isPending: false }),
+  usePermanentlyDeleteProject: () => ({
+    mutateAsync: mockPermanentlyDeleteMutateAsync,
+    isPending: false,
+  }),
+  // The edit dialog fetches the project detail by id; return a minimal one.
+  useProject: () => ({ data: mockEditingProject }),
+  useSetProjectShare: () => ({
+    mutateAsync: mockSetShareMutateAsync,
+    isPending: false,
+  }),
+}));
+
+vi.mock("@/lib/agent.query", () => ({
+  useInternalAgents: vi.fn(() => ({ data: [] })),
+}));
+
+vi.mock("@/lib/teams/team.query");
+
+vi.mock("@/lib/schedule-trigger.query", () => ({
+  useScheduleTriggers: () => ({ data: undefined }),
+}));
+
+import ProjectsPageClient from "./page.client";
+
+describe("ProjectsPageClient", () => {
+  beforeEach(() => {
+    vi.mocked(useSession).mockReturnValue({
+      data: { user: { id: "user-1" } },
+    } as ReturnType<typeof useSession>);
+    vi.clearAllMocks();
+    vi.mocked(useRouter).mockReturnValue({
+      push: mockRouterPush,
+      replace: vi.fn(),
+    } as unknown as ReturnType<typeof useRouter>);
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams() as unknown as ReturnType<typeof useSearchParams>,
+    );
+    vi.mocked(usePathname).mockReturnValue("/projects");
+    vi.mocked(useHasPermissions).mockReturnValue({
+      data: false,
+    } as ReturnType<typeof useHasPermissions>);
+    vi.mocked(useTeams).mockReturnValue({
+      data: [],
+    } as unknown as ReturnType<typeof useTeams>);
+    vi.mocked(useIsGlobalAdmin).mockReturnValue({
+      isGlobalAdmin: true,
+      isLoading: false,
+    });
+    mockProjects = [];
+    mockApiKeyState = {
+      hasAnyApiKey: true,
+      isLoading: false,
+      isLoadError: false,
+      refetch: vi.fn(),
+    };
+    mockDeleteMutateAsync.mockResolvedValue(true);
+    mockUpdateMutateAsync.mockResolvedValue(true);
+    mockSetShareMutateAsync.mockResolvedValue(true);
+    mockBulkUpdateVisibilityMutateAsync.mockResolvedValue({
+      succeeded: ["Project"],
+      failed: [],
+    });
+    mockEditingProject = {
+      id: "owner",
+      name: "Owner project",
+      description: null,
+      icon: null,
+      visibility: null,
+      shareTeamIds: null,
+      shareUserIds: null,
+      viewerRole: "owner",
+      defaultAgent: null,
+      labels: [],
+    };
+    mockCreateMutateAsync.mockResolvedValue({ id: "created-project" });
+    window.localStorage.clear();
+  });
+
+  it("shows the pinned section only when pinned projects exist", () => {
+    mockProjects = [
+      makeProject({
+        id: "pinned",
+        name: "Pinned project",
+        pinnedAt: "2026-01-03T00:00:00.000Z",
+      }),
+      makeProject({ id: "plain", name: "Plain project" }),
+    ];
+
+    render(<ProjectsPageClient />);
+
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+    expect(screen.getByText("All projects")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Pinned project")).not.toBeInTheDocument();
+    expect(screen.getByText("Pinned project")).toBeInTheDocument();
+    expect(screen.getByText("Plain project")).toBeInTheDocument();
+  });
+
+  it("omits the pinned section when no projects are pinned", () => {
+    mockProjects = [
+      makeProject({ id: "plain", name: "Plain project" }),
+      makeProject({ id: "other", name: "Other project" }),
+    ];
+
+    render(<ProjectsPageClient />);
+
+    expect(screen.queryByText("Pinned")).not.toBeInTheDocument();
+    expect(screen.queryByText("All projects")).not.toBeInTheDocument();
+    expect(screen.getByText("Plain project")).toBeInTheDocument();
+    expect(screen.getByText("Other project")).toBeInTheDocument();
+  });
+
+  it("shows visibility labels on project cards", () => {
+    mockProjects = [
+      makeProject({ id: "personal", name: "Personal project" }),
+      makeProject({
+        id: "team",
+        name: "Team project",
+        visibility: "team",
+        shareTeamNames: ["Design"],
+      }),
+      makeProject({
+        id: "organization",
+        name: "Organization project",
+        visibility: "organization",
+      }),
+    ];
+
+    render(<ProjectsPageClient />);
+
+    expect(screen.getByText("Personal", { selector: "span" })).toBeVisible();
+    expect(screen.getByText("Team", { selector: "span" })).toBeVisible();
+    expect(
+      screen.getByText("Organization", { selector: "span" }),
+    ).toBeVisible();
+  });
+
+  it("shows pin, edit details, and delete in owner card menus", () => {
+    mockProjects = [makeProject({ id: "owner", name: "Owner project" })];
+
+    render(<ProjectsPageClient />);
+
+    expect(screen.getByText("Pin")).toBeInTheDocument();
+    expect(screen.getByText("Edit details")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Delete" })).toBeInTheDocument();
+    expect(screen.queryByText("Unpin")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("Pin"));
+    expect(mockPinMutate).toHaveBeenCalledWith({
+      id: "owner",
+      pinned: true,
+    });
+
+    fireEvent.click(screen.getByText("Edit details"));
+    expect(
+      screen.getByRole("heading", { name: "Edit project" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(screen.getByText("Delete Owner project?")).toBeInTheDocument();
+  });
+
+  it("creates a project with a label from Advanced", async () => {
+    render(<ProjectsPageClient />);
+    fireEvent.click(screen.getByRole("button", { name: "New project" }));
+    fireEvent.change(screen.getByLabelText("Name *"), {
+      target: { value: "Labelled project" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    fireEvent.change(screen.getByLabelText("Label key"), {
+      target: { value: "stage" },
+    });
+    fireEvent.change(screen.getByLabelText("Label value"), {
+      target: { value: "draft" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    await waitFor(() =>
+      expect(mockCreateMutateAsync).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: "Labelled project",
+          labels: [{ key: "stage", value: "draft" }],
+        }),
+      ),
+    );
+  });
+
+  it("edits project labels from Advanced", async () => {
+    mockProjects = [makeProject({ id: "owner", name: "Owner project" })];
+    render(<ProjectsPageClient />);
+    fireEvent.click(screen.getByText("Edit details"));
+    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    fireEvent.change(screen.getByLabelText("Label key"), {
+      target: { value: "stage" },
+    });
+    fireEvent.change(screen.getByLabelText("Label value"), {
+      target: { value: "ready" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(mockUpdateMutateAsync).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: "owner",
+          labels: [{ key: "stage", value: "ready" }],
+        }),
+      ),
+    );
+  });
+
+  it("hides the default-agent field from an editor without agent:read", () => {
+    mockProjects = [makeProject({ id: "owner", name: "Owner project" })];
+
+    render(<ProjectsPageClient />);
+    fireEvent.click(screen.getByText("Edit details"));
+
+    // An empty picker would read as "this org has no agents" rather than
+    // "not yours to set".
+    expect(screen.queryByText("Default agent")).not.toBeInTheDocument();
+    expect(useInternalAgents).toHaveBeenCalledWith({ enabled: false });
+  });
+
+  it("shows the default-agent field to an editor with agent:read", () => {
+    vi.mocked(useHasPermissions).mockImplementation(
+      (permissions) =>
+        ({
+          data: permissions.agent?.includes("read") === true,
+        }) as ReturnType<typeof useHasPermissions>,
+    );
+    mockProjects = [makeProject({ id: "owner", name: "Owner project" })];
+
+    render(<ProjectsPageClient />);
+    fireEvent.click(screen.getByText("Edit details"));
+
+    expect(screen.getByText("Default agent")).toBeInTheDocument();
+    expect(useInternalAgents).toHaveBeenCalledWith({ enabled: true });
+  });
+
+  describe("default agent, with agent:read granted", () => {
+    const PINNED = { id: "pinned", name: "Pinned Agent", scope: "org" };
+
+    /** Visibility options render label and description in one control. */
+    function clickOptionStartingWith(label: string) {
+      const option = screen
+        .getAllByRole("button")
+        .find((button) => button.textContent?.startsWith(label));
+      if (!option) throw new Error(`no visibility option for "${label}"`);
+      fireEvent.click(option);
+    }
+
+    beforeEach(() => {
+      // share-org too, or the Organization option renders disabled.
+      vi.mocked(useHasPermissions).mockImplementation(
+        (permissions) =>
+          ({
+            data:
+              permissions.agent?.includes("read") === true ||
+              permissions.project?.includes("share-org") === true,
+          }) as ReturnType<typeof useHasPermissions>,
+      );
+      mockProjects = [makeProject({ id: "owner", name: "Owner project" })];
+      mockEditingProject = {
+        ...mockEditingProject,
+        defaultAgent: { id: PINNED.id, name: PINNED.name },
+      };
+    });
+
+    it("keeps the saved pin selected once the agent list arrives", () => {
+      vi.mocked(useInternalAgents).mockReturnValue({
+        data: [PINNED],
+        isPending: false,
+      } as unknown as ReturnType<typeof useInternalAgents>);
+
+      render(<ProjectsPageClient />);
+      fireEvent.click(screen.getByText("Edit details"));
+
+      expect(screen.getByText("Pinned Agent")).toBeInTheDocument();
+    });
+
+    it("does not clear the saved pin while the agent list is still loading", () => {
+      // Every agent looks unreachable against an empty list, so an unguarded
+      // reset wipes the project's pin the moment the dialog opens.
+      vi.mocked(useInternalAgents).mockReturnValue({
+        data: undefined,
+        isPending: true,
+      } as unknown as ReturnType<typeof useInternalAgents>);
+
+      render(<ProjectsPageClient />);
+      fireEvent.click(screen.getByText("Edit details"));
+
+      expect(screen.queryByText("Default")).not.toBeInTheDocument();
+    });
+
+    it("saves the sharing change before the agent, which is judged against it", async () => {
+      vi.mocked(useInternalAgents).mockReturnValue({
+        data: [PINNED],
+        isPending: false,
+      } as unknown as ReturnType<typeof useInternalAgents>);
+
+      render(<ProjectsPageClient />);
+      fireEvent.click(screen.getByText("Edit details"));
+      // The visibility selector shows only the current choice until expanded.
+      clickOptionStartingWith("Personal");
+      clickOptionStartingWith("Organization");
+      fireEvent.click(screen.getByText("Save"));
+
+      await waitFor(() => expect(mockSetShareMutateAsync).toHaveBeenCalled());
+      await waitFor(() => expect(mockUpdateMutateAsync).toHaveBeenCalled());
+      // Sending the agent first would validate it against the old audience.
+      expect(mockSetShareMutateAsync.mock.invocationCallOrder[0]).toBeLessThan(
+        mockUpdateMutateAsync.mock.invocationCallOrder[0],
+      );
+    });
+  });
+
+  it("shows the load-error retry state, not the add-key prompt, when the keys request fails", () => {
+    const refetch = vi.fn();
+    mockApiKeyState = {
+      hasAnyApiKey: false,
+      isLoading: false,
+      isLoadError: true,
+      refetch,
+    };
+
+    render(<ProjectsPageClient />);
+
+    expect(screen.getByTestId("api-key-load-error")).toBeInTheDocument();
+    expect(screen.queryByTestId("no-api-key-setup")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("api-key-load-error"));
+    expect(refetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the add-key prompt when the keys request succeeds with no keys", () => {
+    mockApiKeyState = {
+      hasAnyApiKey: false,
+      isLoading: false,
+      isLoadError: false,
+      refetch: vi.fn(),
+    };
+
+    render(<ProjectsPageClient />);
+
+    expect(screen.getByTestId("no-api-key-setup")).toBeInTheDocument();
+    expect(screen.queryByTestId("api-key-load-error")).not.toBeInTheDocument();
+  });
+
+  it("keeps showing projects when a refetch fails but cached keys remain", () => {
+    // A failed background refetch after a prior success is not a load error,
+    // so the cached keys keep the project list on screen.
+    mockApiKeyState = {
+      hasAnyApiKey: true,
+      isLoading: false,
+      isLoadError: false,
+      refetch: vi.fn(),
+    };
+    mockProjects = [makeProject({ id: "plain", name: "Plain project" })];
+
+    render(<ProjectsPageClient />);
+
+    expect(screen.queryByTestId("api-key-load-error")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("no-api-key-setup")).not.toBeInTheDocument();
+    expect(screen.getByText("Plain project")).toBeInTheDocument();
+  });
+
+  it("switches to a table view and persists the choice", () => {
+    mockProjects = [
+      makeProject({
+        id: "pinned",
+        name: "Pinned project",
+        pinnedAt: "2026-01-03T00:00:00.000Z",
+      }),
+      makeProject({ id: "plain", name: "Plain project" }),
+    ];
+
+    render(<ProjectsPageClient />);
+    expect(screen.queryByRole("table")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("View as table"));
+
+    // The Pinned / All projects sections survive the switch, each rendering
+    // its own table; both projects stay visible.
+    expect(screen.getAllByRole("table")).toHaveLength(2);
+    expect(screen.getByText("Pinned")).toBeInTheDocument();
+    expect(screen.getByText("All projects")).toBeInTheDocument();
+    expect(screen.getByText("Pinned project")).toBeInTheDocument();
+    expect(screen.getByText("Plain project")).toBeInTheDocument();
+    expect(window.localStorage.getItem("archestra-projects-view")).toBe(
+      "table",
+    );
+  });
+
+  it("restores the stored table view preference on mount", () => {
+    window.localStorage.setItem("archestra-projects-view", "table");
+    mockProjects = [makeProject({ id: "plain", name: "Plain project" })];
+
+    render(<ProjectsPageClient />);
+
+    expect(screen.getByRole("table")).toBeInTheDocument();
+    expect(screen.getByText("Plain project")).toBeInTheDocument();
+  });
+
+  it("offers restore and permanent delete in the trash view", () => {
+    // ?status=deleted is the trash. A deleted project has no card view and no
+    // route to navigate to, so it renders as a table of Restore + Delete
+    // permanently and nothing else.
+    // Restore is gated on `project:admin`, the same bar that serves this slice
+    // at all, so the viewer has to hold it for the row to be operable.
+    vi.mocked(useHasPermissions).mockImplementation(
+      (permissions) =>
+        ({
+          data: permissions.project?.includes("admin") === true,
+        }) as ReturnType<typeof useHasPermissions>,
+    );
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("status=deleted") as unknown as ReturnType<
+        typeof useSearchParams
+      >,
+    );
+    mockProjects = [
+      makeProject({
+        id: "trashed",
+        name: "Trashed project",
+        deletedAt: "2026-01-02T00:00:00.000Z",
+      }),
+    ];
+
+    render(<ProjectsPageClient />);
+
+    // The deleted slice is a different request, not a client-side filter of
+    // the active list — without this the rows below would be live projects.
+    expect(mockUseProjects).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "deleted" }),
+    );
+    expect(screen.getByText("Trashed project")).toBeInTheDocument();
+    expect(screen.queryByText("Edit details")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Pin")).not.toBeInTheDocument();
+    // The backend serves the deleted slice whole, ignoring search and scope, so
+    // leaving those controls live would read as filters that do nothing.
+    expect(screen.queryByLabelText("Search projects")).not.toBeInTheDocument();
+    expect(screen.queryByText("scope filter")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText("Restore Trashed project"));
+    expect(mockRestoreMutate).toHaveBeenCalledWith({ id: "trashed" });
+
+    fireEvent.click(
+      screen.getByLabelText("Delete permanently Trashed project"),
+    );
+    expect(screen.getByText("Delete project permanently")).toBeInTheDocument();
+  });
+
+  it("says the trash is empty rather than showing the no-projects prompt", () => {
+    // "No projects yet" would read as an empty deployment; an empty trash is
+    // a different, unalarming fact.
+    vi.mocked(useSearchParams).mockReturnValue(
+      new URLSearchParams("status=deleted") as unknown as ReturnType<
+        typeof useSearchParams
+      >,
+    );
+    mockProjects = [];
+
+    render(<ProjectsPageClient />);
+
+    expect(mockUseProjects).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "deleted" }),
+    );
+    expect(screen.getByText("No deleted projects")).toBeInTheDocument();
+    expect(screen.queryByText("No projects yet")).not.toBeInTheDocument();
+  });
+
+  it("asks for the active slice everywhere but the trash", () => {
+    mockProjects = [makeProject({ id: "plain", name: "Plain project" })];
+
+    render(<ProjectsPageClient />);
+
+    // The counterpart to the trash assertions: `status` left unset is what
+    // makes the default view the live list rather than the deleted one.
+    expect(mockUseProjects).toHaveBeenCalledWith(
+      expect.objectContaining({ status: undefined }),
+    );
+    expect(screen.getByText("Plain project")).toBeInTheDocument();
+  });
+
+  it("shows unpin in pinned project card menus", () => {
+    mockProjects = [
+      makeProject({
+        id: "pinned-owner",
+        name: "Pinned owner project",
+        pinnedAt: "2026-01-03T00:00:00.000Z",
+      }),
+    ];
+
+    render(<ProjectsPageClient />);
+
+    fireEvent.click(screen.getByText("Unpin"));
+    expect(mockPinMutate).toHaveBeenCalledWith({
+      id: "pinned-owner",
+      pinned: false,
+    });
+  });
+
+  it("shows card bulk actions and targets the selected project", async () => {
+    vi.mocked(useHasPermissions).mockImplementation(
+      (permissions) =>
+        ({
+          data:
+            permissions.project?.includes("update") === true ||
+            permissions.project?.includes("delete") === true,
+        }) as ReturnType<typeof useHasPermissions>,
+    );
+    mockProjects = [
+      makeProject({ id: "first", name: "First project" }),
+      makeProject({ id: "second", name: "Second project" }),
+    ];
+
+    render(<ProjectsPageClient />);
+
+    expect(screen.queryByText("1 project selected")).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Select First project" }),
+    );
+
+    expect(screen.getAllByText("1 project selected")).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "Edit sharing" }));
+    fireEvent.click(screen.getByRole("button", { name: "Apply sharing" }));
+
+    await waitFor(() =>
+      expect(mockBulkUpdateVisibilityMutateAsync).toHaveBeenCalledWith({
+        projects: [expect.objectContaining({ id: "first" })],
+        scope: "personal",
+        teamIds: [],
+        userIds: [],
+      }),
+    );
+
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Select Second project" }),
+    );
+    fireEvent.click(screen.getAllByRole("button", { name: "Delete" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+
+    expect(mockBulkDeleteMutate).toHaveBeenCalledWith(
+      [{ id: "second", name: "Second project" }],
+      expect.any(Object),
+    );
+  });
+});
+
+function makeProject(overrides: Partial<ProjectFixture>): ProjectFixture {
+  return {
+    id: "project-id",
+    name: "Project",
+    description: null,
+    icon: null,
+    viewerRole: "owner",
+    ownerName: null,
+    conversationCount: 0,
+    visibility: null,
+    pinnedAt: null,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    deletedAt: null,
+    labels: [],
+    ...overrides,
+  };
+}

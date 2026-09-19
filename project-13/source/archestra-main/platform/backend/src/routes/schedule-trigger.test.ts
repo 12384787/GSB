@@ -1,0 +1,410 @@
+import { type Mock, vi } from "vitest";
+import ConversationModel from "@/models/conversation";
+import MessageModel from "@/models/message";
+import ScheduleTriggerRunModel from "@/models/schedule-trigger-run";
+import type { FastifyInstanceWithZod } from "@/server";
+import { createFastifyInstance } from "@/server";
+import { projectService } from "@/services/project";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
+import type { User } from "@/types";
+
+vi.mock("@/auth");
+
+import { hasAnyAgentTypeAdminPermission, hasPermission } from "@/auth";
+
+const mockHasPermission = hasPermission as Mock;
+
+describe("schedule trigger routes", () => {
+  let app: FastifyInstanceWithZod;
+  let adminUser: User;
+  let organizationId: string;
+
+  beforeEach(async ({ makeMember, makeOrganization, makeUser }) => {
+    mockHasPermission.mockResolvedValue({ success: true, error: null });
+    vi.mocked(hasAnyAgentTypeAdminPermission).mockResolvedValue(false);
+
+    adminUser = await makeUser();
+    const organization = await makeOrganization();
+    organizationId = organization.id;
+    await makeMember(adminUser.id, organizationId, { role: "admin" });
+
+    app = createFastifyInstance();
+    app.addHook("onRequest", async (request) => {
+      (request as typeof request & { user: User }).user = adminUser;
+      (
+        request as typeof request & {
+          organizationId: string;
+        }
+      ).organizationId = organizationId;
+    });
+
+    const { default: scheduleTriggerRoutes } = await import(
+      "./schedule-trigger"
+    );
+    await app.register(scheduleTriggerRoutes);
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  test("returns an existing run conversation for scheduled task admins when it belongs to another user", async ({
+    makeAgent,
+    makeMember,
+    makeScheduleTrigger,
+    makeScheduleTriggerRun,
+    makeUser,
+  }) => {
+    const owner = await makeUser();
+    await makeMember(owner.id, organizationId, { role: "member" });
+    const agent = await makeAgent({
+      organizationId,
+      authorId: owner.id,
+      scope: "org",
+    });
+    const trigger = await makeScheduleTrigger({
+      organizationId,
+      actorUserId: owner.id,
+      agentId: agent.id,
+    });
+    const run = await makeScheduleTriggerRun(trigger.id, {
+      organizationId,
+      runKind: "due",
+    });
+    const conversation = await ConversationModel.create({
+      userId: owner.id,
+      organizationId,
+      agentId: agent.id,
+    });
+    await MessageModel.create({
+      conversationId: conversation.id,
+      role: "assistant",
+      content: {
+        id: "message-1",
+        role: "assistant",
+        parts: [{ type: "text", text: "Scheduled task result" }],
+      },
+    });
+    await ScheduleTriggerRunModel.setChatConversationId(
+      run.id,
+      conversation.id,
+    );
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/schedule-triggers/${trigger.id}/runs/${run.id}/conversation`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      id: conversation.id,
+      userId: owner.id,
+      messages: [
+        expect.objectContaining({
+          id: expect.any(String),
+          parts: [{ type: "text", text: "Scheduled task result" }],
+        }),
+      ],
+    });
+  });
+
+  test("returns 403 when a non-admin opens another user's run conversation", async ({
+    makeAgent,
+    makeMember,
+    makeScheduleTrigger,
+    makeScheduleTriggerRun,
+    makeUser,
+  }) => {
+    mockHasPermission.mockResolvedValue({ success: false, error: null });
+
+    const owner = await makeUser();
+    const member = await makeUser();
+    await makeMember(owner.id, organizationId, { role: "member" });
+    await makeMember(member.id, organizationId, { role: "member" });
+    const agent = await makeAgent({
+      organizationId,
+      authorId: owner.id,
+      scope: "org",
+    });
+    const trigger = await makeScheduleTrigger({
+      organizationId,
+      actorUserId: owner.id,
+      agentId: agent.id,
+    });
+    const run = await makeScheduleTriggerRun(trigger.id, {
+      organizationId,
+      runKind: "due",
+    });
+
+    adminUser = member;
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/schedule-triggers/${trigger.id}/runs/${run.id}/conversation`,
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json().error.message).toContain(
+      "You do not have access to this scheduled task",
+    );
+  });
+
+  test("POST create rejects a payload without a project", async ({
+    makeInternalAgent,
+  }) => {
+    const agent = await makeInternalAgent({
+      organizationId,
+      authorId: adminUser.id,
+      scope: "org",
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/schedule-triggers",
+      payload: {
+        name: "No project",
+        agentId: agent.id,
+        messageTemplate: "go",
+        cronExpression: "* * * * *",
+        timezone: "UTC",
+      },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.message).toContain("projectId");
+  });
+
+  test("POST create associates the trigger with its project", async ({
+    makeInternalAgent,
+  }) => {
+    const agent = await makeInternalAgent({
+      organizationId,
+      authorId: adminUser.id,
+      scope: "org",
+    });
+    const project = await projectService.create({
+      organizationId,
+      userId: adminUser.id,
+      name: "scheduled-project",
+      description: null,
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/schedule-triggers",
+      payload: {
+        name: "With project",
+        agentId: agent.id,
+        projectId: project.id,
+        messageTemplate: "go",
+        cronExpression: "* * * * *",
+        timezone: "UTC",
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().projectId).toBe(project.id);
+  });
+
+  test("run-now and by-id reads 404 once the trigger's project is soft-deleted", async ({
+    makeInternalAgent,
+    makeScheduleTrigger,
+  }) => {
+    const agent = await makeInternalAgent({
+      organizationId,
+      authorId: adminUser.id,
+      scope: "org",
+    });
+    const project = await projectService.create({
+      organizationId,
+      userId: adminUser.id,
+      name: "doomed-scheduled",
+      description: null,
+    });
+    const trigger = await makeScheduleTrigger({
+      organizationId,
+      // The actor normally always has access; the soft-deleted project overrides
+      // even that, so run-now can't execute into a hidden project.
+      actorUserId: adminUser.id,
+      agentId: agent.id,
+      projectId: project.id,
+    });
+
+    await projectService.delete({
+      id: project.id,
+      organizationId,
+      userId: adminUser.id,
+    });
+
+    const runNow = await app.inject({
+      method: "POST",
+      url: `/api/schedule-triggers/${trigger.id}/run-now`,
+    });
+    expect(runNow.statusCode).toBe(404);
+
+    const byId = await app.inject({
+      method: "GET",
+      url: `/api/schedule-triggers/${trigger.id}`,
+    });
+    expect(byId.statusCode).toBe(404);
+  });
+
+  test("POST create without an agentId falls back to the org default agent", async ({
+    makeInternalAgent,
+  }) => {
+    // The "basic user" path: a caller without `agent:read` omits the agent, and
+    // the schedule implicitly runs the org's default agent — no agent-access
+    // check is performed against a picked agent.
+    const defaultAgent = await makeInternalAgent({
+      organizationId,
+      authorId: adminUser.id,
+      scope: "org",
+      isDefault: true,
+    });
+    const project = await projectService.create({
+      organizationId,
+      userId: adminUser.id,
+      name: "default-agent-project",
+      description: null,
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/schedule-triggers",
+      payload: {
+        name: "No agent chosen",
+        projectId: project.id,
+        messageTemplate: "go",
+        cronExpression: "* * * * *",
+        timezone: "UTC",
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().agentId).toBe(defaultAgent.id);
+  });
+
+  test("POST create without an agentId prefers the project's default agent over the org's", async ({
+    makeInternalAgent,
+  }) => {
+    // Same "basic user" path, but the project pins its own agent. Without this
+    // the pin is honored only for callers whose UI can send an agentId.
+    const orgDefault = await makeInternalAgent({
+      organizationId,
+      authorId: adminUser.id,
+      scope: "org",
+      isDefault: true,
+    });
+    const projectAgent = await makeInternalAgent({
+      organizationId,
+      authorId: adminUser.id,
+      scope: "org",
+    });
+    const project = await projectService.create({
+      organizationId,
+      userId: adminUser.id,
+      name: "pinned-agent-project",
+      description: null,
+      defaultAgentId: projectAgent.id,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/schedule-triggers",
+      payload: {
+        name: "Project pin wins",
+        projectId: project.id,
+        messageTemplate: "go",
+        cronExpression: "* * * * *",
+        timezone: "UTC",
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().agentId).toBe(projectAgent.id);
+    expect(response.json().agentId).not.toBe(orgDefault.id);
+  });
+
+  test("POST create with an explicit agentId keeps it over the project's pin", async ({
+    makeInternalAgent,
+  }) => {
+    const projectAgent = await makeInternalAgent({
+      organizationId,
+      authorId: adminUser.id,
+      scope: "org",
+    });
+    const chosenAgent = await makeInternalAgent({
+      organizationId,
+      authorId: adminUser.id,
+      scope: "org",
+    });
+    const project = await projectService.create({
+      organizationId,
+      userId: adminUser.id,
+      name: "explicit-over-pin",
+      description: null,
+      defaultAgentId: projectAgent.id,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/schedule-triggers",
+      payload: {
+        name: "Explicit wins",
+        projectId: project.id,
+        agentId: chosenAgent.id,
+        messageTemplate: "go",
+        cronExpression: "* * * * *",
+        timezone: "UTC",
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().agentId).toBe(chosenAgent.id);
+  });
+
+  test("POST create without an agentId and no default agent returns 400", async () => {
+    const project = await projectService.create({
+      organizationId,
+      userId: adminUser.id,
+      name: "no-default-project",
+      description: null,
+    });
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/schedule-triggers",
+      payload: {
+        name: "No agent, no default",
+        projectId: project.id,
+        messageTemplate: "go",
+        cronExpression: "* * * * *",
+        timezone: "UTC",
+      },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.message).toContain(
+      "No default agent is configured",
+    );
+  });
+
+  test("PUT cannot move a trigger to an inaccessible project", async ({
+    makeInternalAgent,
+    makeScheduleTrigger,
+  }) => {
+    const agent = await makeInternalAgent({
+      organizationId,
+      authorId: adminUser.id,
+      scope: "org",
+    });
+    const project = await projectService.create({
+      organizationId,
+      userId: adminUser.id,
+      name: "owned",
+      description: null,
+    });
+    const trigger = await makeScheduleTrigger({
+      organizationId,
+      actorUserId: adminUser.id,
+      agentId: agent.id,
+      projectId: project.id,
+    });
+    const response = await app.inject({
+      method: "PUT",
+      url: `/api/schedule-triggers/${trigger.id}`,
+      payload: { projectId: "11111111-1111-4111-8111-111111111111" },
+    });
+    expect(response.statusCode).toBe(404);
+  });
+});

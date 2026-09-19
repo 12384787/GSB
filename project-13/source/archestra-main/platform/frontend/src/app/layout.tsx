@@ -1,0 +1,282 @@
+import type { Metadata, Viewport } from "next";
+import localFont from "next/font/local";
+import { PublicEnvScript } from "next-runtime-env";
+import { AppShell } from "./_parts/app-shell";
+import { MswInit } from "./_parts/msw-init";
+import { PostHogProviderWrapper } from "./_parts/posthog-provider";
+import { ArchestraQueryClientProvider } from "./_parts/query-client-provider";
+// biome-ignore lint/style/noRestrictedImports: dual-licensed; renders null unless the deployment enables RUM
+import { RumTracker } from "./_parts/rum-tracker.ee";
+import { ThemeProvider } from "./_parts/theme-provider";
+import { VisualViewportHeight } from "./_parts/visual-viewport-height";
+import "./globals.css";
+import { DEFAULT_APP_DESCRIPTION } from "@archestra/shared";
+import { DynamicHead } from "@/components/dynamic-head";
+import { OrgThemeLoader } from "@/components/org-theme-loader";
+import { ChatProvider } from "@/lib/chat/global-chat.context";
+import { getDeploymentFavicon } from "@/lib/favicon.server";
+import { PageTitleProvider } from "@/lib/hooks/use-page-title";
+import { WebsocketInitializer } from "./_parts/websocket-initializer";
+import { WithAuthCheck } from "./_parts/with-auth-check";
+import { WithPagePermissions } from "./_parts/with-page-permissions";
+
+// Register theme fonts for white-labeling without preloading every file.
+// The active theme decides which CSS variable is used after appearance settings
+// load, so eager preload would fetch every optional font on every page.
+const latoFont = localFont({
+  src: [
+    { path: "../fonts/Lato-Light.woff2", weight: "300" },
+    { path: "../fonts/Lato-Regular.woff2", weight: "400" },
+    { path: "../fonts/Lato-Bold.woff2", weight: "700" },
+    { path: "../fonts/Lato-Black.woff2", weight: "900" },
+  ],
+  variable: "--font-lato",
+  display: "swap",
+  preload: false,
+});
+
+const interFont = localFont({
+  src: "../fonts/Inter-Variable.woff2",
+  variable: "--font-inter",
+  weight: "100 900",
+  display: "swap",
+  preload: false,
+});
+
+const openSansFont = localFont({
+  src: "../fonts/OpenSans-Variable.woff2",
+  variable: "--font-open-sans",
+  weight: "300 800",
+  display: "swap",
+  preload: false,
+});
+
+const robotoFont = localFont({
+  src: "../fonts/Roboto-Variable.woff2",
+  variable: "--font-roboto",
+  weight: "100 900",
+  display: "swap",
+  preload: false,
+});
+
+const sourceSansFont = localFont({
+  src: "../fonts/SourceSans3-Variable.woff2",
+  variable: "--font-source-sans",
+  weight: "200 900",
+  display: "swap",
+  preload: false,
+});
+
+const jetbrainsMonoFont = localFont({
+  src: "../fonts/JetBrainsMono-Variable.woff2",
+  variable: "--font-jetbrains-mono",
+  weight: "100 800",
+  display: "swap",
+  preload: false,
+});
+
+const dmSansFont = localFont({
+  src: "../fonts/DMSans-Variable.woff2",
+  variable: "--font-dm-sans",
+  weight: "100 1000",
+  display: "swap",
+  preload: false,
+});
+
+const poppinsFont = localFont({
+  src: [
+    { path: "../fonts/Poppins-Light.woff2", weight: "300" },
+    { path: "../fonts/Poppins-Regular.woff2", weight: "400" },
+    { path: "../fonts/Poppins-Medium.woff2", weight: "500" },
+    { path: "../fonts/Poppins-SemiBold.woff2", weight: "600" },
+    { path: "../fonts/Poppins-Bold.woff2", weight: "700" },
+  ],
+  variable: "--font-poppins",
+  display: "swap",
+  preload: false,
+});
+
+const oxaniumFont = localFont({
+  src: "../fonts/Oxanium-Variable.woff2",
+  variable: "--font-oxanium",
+  weight: "200 800",
+  display: "swap",
+  preload: false,
+});
+
+const montserratFont = localFont({
+  src: "../fonts/Montserrat-Variable.woff2",
+  variable: "--font-montserrat",
+  weight: "100 900",
+  display: "swap",
+  preload: false,
+});
+
+const sourceCodeProFont = localFont({
+  src: "../fonts/SourceCodePro-Variable.woff2",
+  variable: "--font-source-code-pro",
+  weight: "200 900",
+  display: "swap",
+  preload: false,
+});
+
+const merriweatherFont = localFont({
+  src: "../fonts/Merriweather-Variable.woff2",
+  variable: "--font-merriweather",
+  weight: "300 900",
+  display: "swap",
+  preload: false,
+});
+
+const quicksandFont = localFont({
+  src: "../fonts/Quicksand-Variable.woff2",
+  variable: "--font-quicksand",
+  weight: "300 700",
+  display: "swap",
+  preload: false,
+});
+
+const outfitFont = localFont({
+  src: "../fonts/Outfit-Variable.woff2",
+  variable: "--font-outfit",
+  weight: "100 900",
+  display: "swap",
+  preload: false,
+});
+
+const plusJakartaSansFont = localFont({
+  src: "../fonts/PlusJakartaSans-Variable.woff2",
+  variable: "--font-plus-jakarta-sans",
+  weight: "200 800",
+  display: "swap",
+  preload: false,
+});
+
+const libreBaskervilleFont = localFont({
+  src: "../fonts/LibreBaskerville-Variable.woff2",
+  variable: "--font-libre-baskerville",
+  weight: "400 700",
+  display: "swap",
+  preload: false,
+});
+
+// Disc-glyph font that renders every character as a dot — visual masking for
+// app-secret fields (.secret-masked in globals.css) without type="password",
+// which would summon browser password managers. Source: text-security@3.2.1
+// (https://github.com/noppa/text-security), SIL OFL 1.1 — same license family
+// as the theme fonts above. display "block" + no fallback so the secret is
+// never flashed in a real-glyph font while loading.
+const secretMaskFont = localFont({
+  src: "../fonts/TextSecurityDisc.woff2",
+  variable: "--font-secret-mask",
+  display: "block",
+  fallback: [],
+  adjustFontFallback: false,
+  preload: false,
+});
+
+// A user agent can replay the favicon saved with an exact history URL while a
+// new document is loading. Using only widely supported DOM, image, and canvas
+// APIs, activate the current content-version during head parsing. Unsupported
+// features simply leave the standards-based versioned link in place.
+const ACTIVATE_FAVICON_SCRIPT = `(() => {
+  const link = document.getElementById("app-favicon");
+  if (!link || link.tagName !== "LINK" || typeof Image === "undefined") return;
+  const image = new Image();
+  image.addEventListener("load", () => {
+    const canvas = document.createElement("canvas");
+    const size = 64;
+    canvas.width = size;
+    canvas.height = size;
+    const context = canvas.getContext("2d");
+    if (!context || !image.naturalWidth || !image.naturalHeight) return;
+    const scale = Math.min(size / image.naturalWidth, size / image.naturalHeight);
+    const width = image.naturalWidth * scale;
+    const height = image.naturalHeight * scale;
+    context.drawImage(image, (size - width) / 2, (size - height) / 2, width, height);
+    try {
+      link.href = canvas.toDataURL("image/png");
+    } catch {
+      // Keep the versioned link if this user agent cannot serialize the canvas.
+    }
+  }, { once: true });
+  image.src = link.href;
+})();`;
+
+export const metadata: Metadata = {
+  description: DEFAULT_APP_DESCRIPTION,
+};
+
+// interactive-widget makes the Android on-screen keyboard resize the layout
+// viewport instead of overlaying it, so the viewport-locked shell keeps its
+// input visible. iOS ignores the property; VisualViewportHeight covers it.
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  interactiveWidget: "resizes-content",
+};
+
+export default async function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  const favicon = await getDeploymentFavicon();
+
+  return (
+    <html
+      lang="en"
+      suppressHydrationWarning
+      className={`${latoFont.variable} ${interFont.variable} ${openSansFont.variable} ${robotoFont.variable} ${sourceSansFont.variable} ${jetbrainsMonoFont.variable} ${dmSansFont.variable} ${poppinsFont.variable} ${oxaniumFont.variable} ${montserratFont.variable} ${sourceCodeProFont.variable} ${merriweatherFont.variable} ${quicksandFont.variable} ${outfitFont.variable} ${plusJakartaSansFont.variable} ${libreBaskervilleFont.variable} ${secretMaskFont.variable}`}
+    >
+      <head>
+        <link rel="describedby" href="/llms.txt" type="text/plain" />
+        <PublicEnvScript />
+        {favicon.version && (
+          <link
+            rel="preload"
+            as="image"
+            href={favicon.href}
+            fetchPriority="high"
+          />
+        )}
+        <link
+          id="app-favicon"
+          rel="icon"
+          href={favicon.href}
+          data-favicon-version={favicon.version ?? "default"}
+        />
+        {favicon.version && <script>{ACTIVATE_FAVICON_SCRIPT}</script>}
+      </head>
+      <body className="font-sans antialiased">
+        <VisualViewportHeight />
+        <MswInit>
+          <ArchestraQueryClientProvider>
+            <ChatProvider>
+              <ThemeProvider
+                attribute="class"
+                defaultTheme="system"
+                enableSystem
+                disableTransitionOnChange
+              >
+                <PostHogProviderWrapper>
+                  <PageTitleProvider>
+                    <OrgThemeLoader />
+                    <DynamicHead />
+                    <WithAuthCheck>
+                      <WebsocketInitializer />
+                      <RumTracker />
+                      <AppShell>
+                        <WithPagePermissions>{children}</WithPagePermissions>
+                      </AppShell>
+                    </WithAuthCheck>
+                  </PageTitleProvider>
+                </PostHogProviderWrapper>
+              </ThemeProvider>
+            </ChatProvider>
+          </ArchestraQueryClientProvider>
+        </MswInit>
+      </body>
+    </html>
+  );
+}

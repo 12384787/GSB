@@ -1,0 +1,78 @@
+imports:
+  Text: Data.Text
+  Merchant: DashboardAlert.Domain.Types.Common
+  MerchantOperatingCity: DashboardAlert.Domain.Types.Common
+  Person: DashboardAlert.Domain.Types.Common
+
+DashboardAlert:
+  tableName: approval_request
+
+  types:
+    RequestorType:
+      enum: "SystemGenerated, DriverGenerated"
+      derive': "Show, Eq, Ord, Read, Generic, ToJSON, FromJSON, ToSchema"
+
+    RequesteeType:
+      enum: "FleetOwner, Driver"
+      derive': "Show, Eq, Ord, Read, Generic, ToJSON, FromJSON, ToSchema"
+
+  fields:
+    id: Id DashboardAlert
+    requestorId: Id Person
+    requestorType: RequestorType
+    requesteeId: Id Person
+    requesteeType: RequesteeType
+    requestType: Domain.Types.Alert.AlertRequestType.AlertRequestType
+    requestData: Domain.Types.Alert.AlertRequestData.AlertRequestData
+    entityId: Maybe Text
+    entityType: Maybe Domain.Types.Alert.AlertEntityType.AlertEntityType
+    title: Text
+    body: Text
+    status: Domain.Types.Alert.AlertRequestStatus.AlertRequestStatus
+    reason: Maybe Text
+    createdAt: UTCTime
+    updatedAt: UTCTime
+    merchantId: Id Merchant
+    merchantOperatingCityId: Id MerchantOperatingCity
+
+  beamType:
+    requestorType: Maybe RequestorType
+    requesteeType: Maybe RequesteeType
+    requestType: Maybe Domain.Types.Alert.AlertRequestType.AlertRequestType
+
+  fromTType:
+    requestorType: Kernel.Prelude.fromMaybe DashboardAlert.Domain.Types.DashboardAlert.DriverGenerated|I
+    requesteeType: Kernel.Prelude.fromMaybe DashboardAlert.Domain.Types.DashboardAlert.FleetOwner|I
+    requestType: Kernel.Prelude.fromMaybe Domain.Types.Alert.AlertRequestType.EndRideApproval|I
+
+  toTType:
+    requestorType: Kernel.Prelude.Just|I
+    requesteeType: Kernel.Prelude.Just|I
+    requestType: Kernel.Prelude.Just|I
+
+  defaultQueryTypeConstraint: "(DashboardAlert.Storage.BeamFlow.BeamFlow m r)"
+  beamInstance: MakeTableInstancesGenericSchema
+
+  constraints:
+    id: PrimaryKey
+    requestorId: "!SecondaryKey"
+    requesteeId: "!SecondaryKey"
+
+  queries:
+    updateStatusWithReason:
+      kvFunction: updateOneWithKV
+      params: [status, reason]
+      where: id
+
+    findAllByRequesteeId:
+      kvFunction: findAllWithOptionsKV
+      where: requesteeId
+      orderBy:
+        field: createdAt
+        order: desc
+
+  domainInstance:
+    - Custom Kernel.Beam.Lib.UtilsTH.mkBeamInstancesForEnum <RequestorType>
+    - Custom Kernel.Utils.TH.mkFromHttpInstanceForEnum <RequestorType>
+    - Custom Kernel.Beam.Lib.UtilsTH.mkBeamInstancesForEnum <RequesteeType>
+    - Custom Kernel.Utils.TH.mkFromHttpInstanceForEnum <RequesteeType>

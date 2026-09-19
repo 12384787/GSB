@@ -1,0 +1,388 @@
+{-
+ Copyright 2022-23, Juspay India Pvt Ltd
+
+ This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License
+
+ as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. This program
+
+ is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+
+ or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details. You should have received a copy of
+
+ the GNU Affero General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+-}
+
+module BecknV2.OnDemand.Enums where
+
+import Data.Aeson
+import Data.Aeson.Types (parseFail, typeMismatch)
+import qualified Data.Text as T
+import Kernel.Prelude
+import Kernel.Utils.JSON
+import Kernel.Utils.TH (mkHttpInstancesForEnum)
+import Prelude (show)
+
+-- #################################################################
+-- This section contains type aliases for all Enums as per ONDC Spec
+-- #################################################################
+
+-- ONDC standard enums for ONDC:TRV10 domain
+
+data VehicleCategory
+  = -- ..fulfillments.vehicle.category
+    AUTO_RICKSHAW
+  | CAB
+  | MOTORCYCLE
+  | METRO
+  | SUBWAY
+  | BUS
+  | AMBULANCE
+  | TWO_WHEELER
+  | TRUCK
+  | BOAT
+  | TOTO
+  deriving (Show, Eq, Ord, Generic, ToJSON, FromJSON, Read, ToSchema, ToParamSchema)
+
+$(mkHttpInstancesForEnum ''VehicleCategory)
+
+data FulfillmentType
+  = -- ..fulfillment.type
+    DELIVERY
+  | -- for on-us only
+    RIDE_OTP
+  | RENTAL
+  | INTER_CITY
+  | AMBULANCE_FLOW
+  | METER_RIDE
+  | SCHEDULED_TRIP
+  | SELF_PICKUP -- v2.1.0: ride-OTP flow for off-us
+  deriving (Show, Eq, Generic, ToJSON, FromJSON, Read)
+
+data StopType
+  = -- ..fulfillments.stops.type
+    START
+  | END
+  | INTERMEDIATE_STOP
+  deriving (Show, Eq, Generic, ToJSON, FromJSON)
+
+data AuthorizationType
+  = -- ..fulfillments.stops.authorization.type
+    OTP
+  | QR -- not used in on-us
+  deriving (Show, Eq, Generic, ToJSON, FromJSON)
+
+data FulfillmentState
+  = -- ..fulfillments.state.descriptor.code -- same enums are used in cancellation_terms
+    RIDE_CANCELLED
+  | RIDE_ENDED
+  | RIDE_STARTED
+  | SCHEDULED_RIDE_ASSIGNED
+  | RIDE_ASSIGNED
+  | RIDE_CONFIRMED -- v2.1.0: phased confirmation (no driver details yet)
+  | RIDE_ENROUTE_PICKUP
+  | RIDE_ARRIVED_PICKUP
+  | NEW -- Custom type only used for on-us transaction
+  | PAYMENT_COMPLETED -- Custom type only used for on-us transaction
+  | EDIT_LOCATION -- Custom type only used for on-us transaction
+  | ADD_STOP -- Custom type only used for on-us transaction
+  | EDIT_STOP -- Custom type only used for on-us transaction
+  | CHANGE_SERVICE_TIER -- Custom type only used for on-us transaction
+  | ADD_BAGGAGE -- Custom type only used for on-us transaction
+  | DRIVER_REACHED_DESTINATION
+  deriving (Show, Eq, Generic, ToJSON, FromJSON)
+
+data PaymentStatus
+  = -- ..fulfillments.payment.status
+    PAID
+  | NOT_PAID
+  deriving (Eq, Generic)
+
+instance Read PaymentStatus where
+  readsPrec _ = \case
+    "PAID" -> [(PAID, "")]
+    "NOT-PAID" -> [(NOT_PAID, "")]
+    _ -> []
+
+instance Show PaymentStatus where
+  show PAID = "PAID"
+  show NOT_PAID = "NOT-PAID"
+
+instance FromJSON PaymentStatus where
+  parseJSON (String "PAID") = return PAID
+  parseJSON (String "NOT-PAID") = return NOT_PAID
+  parseJSON wrongVal = typeMismatch "Invalid PaymentStatus" wrongVal
+
+instance ToJSON PaymentStatus where
+  toJSON = genericToJSON constructorsWithHyphens
+
+data PaymentCollectedBy
+  = -- ..fulfillments.payment.collected.by
+    BAP
+  | BPP
+  | SELLER
+  deriving (Show, Eq, Generic, ToJSON, FromJSON)
+
+data PaymentType
+  = -- ..fulfillments.payment.type -- we only support ON_FULFILLMENT for now
+    PRE_ORDER
+  | ON_FULFILLMENT
+  | POST_FULFILLMENT
+  deriving (Eq, Generic)
+
+instance Show PaymentType where
+  show PRE_ORDER = "PRE-ORDER"
+  show ON_FULFILLMENT = "ON-FULFILLMENT"
+  show POST_FULFILLMENT = "POST-FULFILLMENT"
+
+instance ToJSON PaymentType where
+  toJSON = genericToJSON constructorsWithHyphens
+
+instance FromJSON PaymentType where
+  parseJSON (String "PRE-ORDER") = return PRE_ORDER
+  parseJSON (String "ON-FULFILLMENT") = return ON_FULFILLMENT
+  parseJSON (String "POST-FULFILLMENT") = return POST_FULFILLMENT
+  parseJSON wrongVal = typeMismatch "Invalid PaymentType" wrongVal
+
+data OrderStatus
+  = -- ..order.status
+    SOFT_CANCEL
+  | CONFIRM_CANCEL -- v2.0.0 only, maps to CANCELLATION_INITIATED in 2.1.0
+  | ACTIVE
+  | COMPLETE
+  | CANCELLED
+  | SOFT_UPDATE
+  | CONFIRM_UPDATE
+  | -- New in 2.1.0
+    COMPLETED
+  | CANCELLATION_INITIATED
+  | CANCELLATION_REJECTED
+  | UPDATED
+  deriving (Eq, Generic, Read, Show, FromJSON, ToJSON)
+
+data QuoteBreakupTitle
+  = -- ..quote.breakup.title
+    BASE_FARE
+  | DISTANCE_FARE
+  | CANCELLATION_CHARGES
+  | TOLL_CHARGES
+  | PET_CHARGES
+  | BUSINESS_DISCOUNT
+  | PERSONAL_DISCOUNT
+  | BUSINESS_DISCOUNT_PERCENTAGE
+  | PERSONAL_DISCOUNT_PERCENTAGE
+  | PRIORITY_CHARGES
+  | STATE_ENTRY_PERMIT_CHARGES
+  | CONGESTION_CHARGE
+  | -- Custom Titles not in ONDC Spec
+    SERVICE_CHARGE
+  | DEAD_KILOMETER_FARE
+  | DRIVER_SELECTED_FARE
+  | CUSTOMER_SELECTED_FARE
+  | TOTAL_FARE -- removed from init/on_init
+  | WAITING_OR_PICKUP_CHARGES
+  | PARKING_CHARGE
+  | EXTRA_TIME_FARE
+  | NIGHT_SHIFT_CHARGE
+  | FIXED_GOVERNMENT_RATE
+  | SGST
+  | CGST
+  | RIDE_VAT
+  | TOLL_VAT
+  | PLATFORM_FEE -- should this be in quote breakup?
+  | TIME_BASED_FARE
+  | DIST_BASED_FARE
+  | EXTRA_DISTANCE_FARE
+  | RIDE_DURATION_FARE
+  | INSURANCE_CHARGES
+  | CARD_CHARGES_ON_FARE
+  | CARD_CHARGES_FIXED
+  | PAYMENT_CHARGE -- Stripe payment-gateway charge shown as a customer-visible fare line (when the rider bears it)
+  | SAFETY_PLUS_CHARGES
+  | NO_CHARGES
+  | RIDE_STOP_CHARGES
+  | LUGGAGE_CHARGE
+  | DRIVER_ALLOWANCE
+  | AIRPORT_CONVENIENCE_FEE
+  | RETURN_FEE
+  | BOOTH_CHARGE
+  | SCHEDULING_CHARGE
+  | PER_STOP_CHARGES
+  | NYREGULAR_SUBSCRIPTION_CHARGE
+  | COMMISSION
+  | BUYER_ADDITIONAL_AMOUNT -- v2.1.0: mid-ride tolls, tips
+  | REFUND -- v2.1.0: refund amount
+  | TAX -- v2.1.0: combined tax (CGST+SGST)
+  | DRIVER_BATA -- v2.1.0: driver bata/allowance
+  | NIGHT_CHARGES -- v2.1.0: night shift charges (spec name)
+  | WAITING_CHARGES -- v2.1.0: waiting charges (spec name)
+  | PARKING_CHARGES -- v2.1.0: parking charges (spec name)
+  | TOLL_FARE_TAX_EXCLUSIVE
+  | -- Canonical fare-breakup contract: every BPP fare sum partitions into
+    -- categories × {tax-exclusive, tax}. The ride portion is split by whether
+    -- the customer offer discount applies. Ten fare slots, plus the two
+    -- payment-charge slots below; the twelve sum to what the customer pays.
+    RIDE_FARE_DISCOUNT_APPLICABLE_TAX_EXCLUSIVE
+  | RIDE_FARE_DISCOUNT_APPLICABLE_TAX
+  | RIDE_FARE_NON_DISCOUNT_APPLICABLE_TAX_EXCLUSIVE
+  | RIDE_FARE_NON_DISCOUNT_APPLICABLE_TAX
+  | TOLL_FARE_TAX
+  | CANCELLATION_FEE_TAX_EXCLUSIVE
+  | CANCELLATION_TAX
+  | PARKING_CHARGE_TAX_EXCLUSIVE
+  | PARKING_CHARGE_TAX
+  | -- The payment charge completes the partition: it is levied on the post-discount
+    -- total of the ten fare slots, so the twelve together equal what the customer pays.
+    -- Populated only when the rider bears the charge.
+    PAYMENT_CHARGE_TAX_EXCLUSIVE
+  | PAYMENT_CHARGE_TAX
+  | -- The rate the charge was priced at, so the BAP can re-derive it on the
+    -- post-discount base rather than rescaling and rounding differently.
+    PAYMENT_CHARGE_RATE
+  | PAYMENT_CHARGE_VAT_PCT
+  | -- This ride's cancellation charge is distinct from CANCELLATION_CHARGES, which is a previous ride's carry-forward due.
+    RIDE_CANCELLATION_CHARGES
+  | RIDE_CANCELLATION_TAX
+  deriving (Show, Eq, Generic, ToJSON, FromJSON)
+
+data CancellationReasonId
+  = -- message.cancellation_reason_id -- sent by BAP in cancel
+    TECHNICAL_CANCELLATION -- 000 (v2.1.0)
+  | DRIVER_NOT_MOVING --001
+  | DRIVER_NOT_REACHABLE -- 002
+  | DRIVER_ASKED_TO_CANCEL -- 003
+  | INCORRECT_PICKUP_LOCATION -- 004
+  | BOOKED_BY_MISTAKE -- 005 (v2.1.0)
+  | SAFETY_CONCERN_WITH_DRIVER_OR_RIDE -- 006
+  | VEHICLE_UNSAFE_OR_NON_COMPLIANT -- 007
+  deriving (Eq, Generic, ToJSON, FromJSON, Bounded, Enum)
+
+instance Show CancellationReasonId where
+  show TECHNICAL_CANCELLATION = "000"
+  show DRIVER_NOT_MOVING = "001"
+  show DRIVER_NOT_REACHABLE = "002"
+  show DRIVER_ASKED_TO_CANCEL = "003"
+  show INCORRECT_PICKUP_LOCATION = "004"
+  show BOOKED_BY_MISTAKE = "005"
+  show SAFETY_CONCERN_WITH_DRIVER_OR_RIDE = "006"
+  show VEHICLE_UNSAFE_OR_NON_COMPLIANT = "007"
+
+data CancellationReasonCode
+  = -- message.order.cancellation.reason.descriptor.code -- sent by BPP in cancel
+    NO_DRIVERS_AVAILABLE -- 011
+  | COULD_NOT_FIND_CUSTOMER -- 012
+  | RIDE_ACCEPTED_MISTAKENLY -- 013
+  | UNABLE_TO_CONTACT_RIDER -- 014 (v2.1.0)
+  | STOPPED_BY_TRAFFIC_OFFICIALS -- 015
+  | VEHICLE_ISSUE -- 016
+  | CUSTOMER_MISCONDUCT_OR_SAFETY_CONCERN -- 017
+  deriving (Eq, Generic, ToJSON, FromJSON)
+
+instance Show CancellationReasonCode where
+  show NO_DRIVERS_AVAILABLE = "011"
+  show COULD_NOT_FIND_CUSTOMER = "012"
+  show RIDE_ACCEPTED_MISTAKENLY = "013"
+  show UNABLE_TO_CONTACT_RIDER = "014"
+  show STOPPED_BY_TRAFFIC_OFFICIALS = "015"
+  show VEHICLE_ISSUE = "016"
+  show CUSTOMER_MISCONDUCT_OR_SAFETY_CONCERN = "017"
+
+data CancelReqMessageCancellationReasonId
+  = CANCELLED_BY_CUSTOMER -- 001
+  | CANCELLED_BY_DRIVER -- 002
+  deriving (Eq, Generic)
+
+instance Show CancelReqMessageCancellationReasonId where
+  show CANCELLED_BY_CUSTOMER = "001"
+  show CANCELLED_BY_DRIVER = "002"
+
+instance FromJSON CancelReqMessageCancellationReasonId where
+  parseJSON (String "001") = return CANCELLED_BY_CUSTOMER
+  parseJSON (String "002") = return CANCELLED_BY_DRIVER
+  parseJSON wrongVal = typeMismatch "Invalid Cancellation Reason Id" wrongVal
+
+instance ToJSON CancelReqMessageCancellationReasonId where
+  toJSON CANCELLED_BY_CUSTOMER = String "001"
+  toJSON CANCELLED_BY_DRIVER = String "002"
+
+data CancellationSource
+  = CONSUMER
+  | PROVIDER
+  deriving (Show, Eq, Generic, ToJSON, FromJSON, Read)
+
+data SafetyReasonCode
+  = DEVIATION
+  | RIDE_STOPPAGE
+  deriving (Eq, Generic, ToJSON, FromJSON)
+
+instance Show SafetyReasonCode where
+  show DEVIATION = "DEVIATION"
+  show RIDE_STOPPAGE = "RIDE_STOPPAGE"
+
+instance Read SafetyReasonCode where
+  readsPrec _ = \case
+    "DEVIATION" -> [(DEVIATION, "")]
+    "RIDE_STOPPAGE" -> [(RIDE_STOPPAGE, "")]
+    _ -> []
+
+data TLMethod
+  = HttpGet
+  | HttpPost
+  | StripeSdk -- custom method for Stripe SDK
+  deriving (Eq, Generic, Show, ToSchema)
+
+instance FromJSON TLMethod where
+  parseJSON (String "http/get") = pure HttpGet
+  parseJSON (String "http/post") = pure HttpPost
+  parseJSON (String "stripe/sdk") = pure StripeSdk
+  parseJSON (String _) = parseFail "Invalid tl_method"
+  parseJSON e = typeMismatch "tl_method string" e
+
+instance ToJSON TLMethod where
+  toJSON HttpGet = String "http/get"
+  toJSON HttpPost = String "http/post"
+  toJSON StripeSdk = String "stripe/sdk"
+
+-- | ONDC v2.1.0 standard error codes (from protocol drafts)
+data BecknErrorCode
+  = DRIVER_NOT_ASSIGNED -- 90203 (v2.1.0)
+  deriving (Eq, Generic)
+
+instance Show BecknErrorCode where
+  show DRIVER_NOT_ASSIGNED = "90203"
+
+instance FromJSON BecknErrorCode where
+  parseJSON (String "90203") = return DRIVER_NOT_ASSIGNED
+  parseJSON wrongVal = typeMismatch "Invalid BecknErrorCode" wrongVal
+
+instance ToJSON BecknErrorCode where
+  toJSON DRIVER_NOT_ASSIGNED = String "90203"
+
+-- | Vehicle energy type as per ONDC v2.1.0 spec
+data EnergyType
+  = ELECTRIC
+  | PETROL
+  | DIESEL
+  | HYDROGEN
+  | BIOFUELS
+  | CNG
+  | LPG
+  deriving (Show, Eq, Generic, ToJSON, FromJSON, Read)
+
+$(mkHttpInstancesForEnum ''EnergyType)
+
+-- | Namespace for the breakup title of a gate-configured customer fee item.
+--   The item name is operator-supplied free text, so it is never emitted bare:
+--   consumers look breakups up by exact title (TOLL_CHARGES, BUYER_ADDITIONAL_AMOUNT,
+--   the RIDE_FARE_* summary tags), and an unprefixed name could shadow one of those
+--   on a booking where the real component is absent. The prefix is also what lets
+--   the rider invoice tell a gate fee apart from an internal summary tag.
+gateFeeBreakupTitlePrefix :: Text
+gateFeeBreakupTitlePrefix = "GATE_FEE:"
+
+mkGateFeeBreakupTitle :: Text -> Text
+mkGateFeeBreakupTitle itemName = gateFeeBreakupTitlePrefix <> itemName
+
+-- | The configured item name behind a title built by 'mkGateFeeBreakupTitle',
+--   or 'Nothing' when the title is not a gate fee item.
+gateFeeBreakupItemName :: Text -> Maybe Text
+gateFeeBreakupItemName = T.stripPrefix gateFeeBreakupTitlePrefix

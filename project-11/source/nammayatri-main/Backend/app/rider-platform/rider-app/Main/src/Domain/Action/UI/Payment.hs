@@ -1,0 +1,1315 @@
+{-
+ Copyright 2022-23, Juspay India Pvt Ltd
+
+ This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License
+
+ as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. This program
+
+ is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+
+ or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details. You should have received a copy of
+
+ the GNU Affero General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+-}
+
+module Domain.Action.UI.Payment
+  ( DPayment.PaymentStatusResp (..),
+    createOrder,
+    createRideBookingPaymentOrder,
+    createBookingDepositPaymentOrder,
+    isBookingDepositPaymentInFlight,
+    resumeBookingDepositConfirm,
+    syncBookingDepositOrderStatus,
+    BookingDepositOrderResult (..),
+    abortPaytmEdcIfActive,
+    getRideBookingPaymentStatusByBookingId,
+    getStatus,
+    getStatusS2S,
+    getOrder,
+    juspayWebhookHandler,
+    paytmEdcCallbackHandler,
+    PaytmEdcCallbackReq (..),
+    rideBookingOrderStatusHandler,
+    bookingDepositOrderStatusHandler,
+    stripeWebhookHandler,
+    postWalletRecharge,
+    getWalletBalance,
+    stripeTestWebhookHandler,
+  )
+where
+
+import qualified API.Types.UI.Payment as PaymentAPI
+import qualified Beckn.ACL.Cancel as CancelACL
+import qualified Beckn.ACL.Confirm as ACL
+import qualified BecknV2.OnDemand.Enums as Enums
+import Control.Applicative ((<|>))
+-- import Data.Aeson (defaultOptions, withObject, (.:?))
+import Data.Aeson.Types ()
+import Data.OpenApi ()
+import qualified Data.Text
+import qualified Domain.Action.Beckn.OnInit as DOnInit
+import qualified Domain.Action.UI.BBPS as BBPS
+import qualified Domain.Action.UI.Cancel as DCancel
+import qualified Domain.Action.UI.FRFSTicketService as FRFSTicketService
+import qualified Domain.Action.UI.ParkingBooking as ParkingBooking
+import qualified Domain.Action.UI.Pass as Pass
+import qualified Domain.Action.UI.RidePayment as DRidePayment
+import qualified Domain.SharedLogic.RideDiscount as RD
+import qualified Domain.Types.Booking as DRB
+import qualified Domain.Types.BookingCancellationReason as SBCR
+import qualified Domain.Types.BookingPayment as DBP
+import qualified Domain.Types.BookingStatus as SRB
+import Domain.Types.CancellationReason (CancellationReasonCode (..), CancellationStage (..))
+-- TODO: Uncomment when PaytmEDC module is available in shared-kernel
+-- import qualified Kernel.External.Payment.PaytmEDC.Checksum as PaytmEDCChecksum
+
+import Domain.Types.Extra.MerchantPaymentMethod ()
+import qualified Domain.Types.Extra.MerchantPaymentMethod as DMPM
+import qualified Domain.Types.FareBreakup as DFareBreakup
+import qualified Domain.Types.Merchant as DM
+import qualified Domain.Types.MerchantOperatingCity as DMOC
+import qualified Domain.Types.MerchantServiceConfig as DMSC
+import qualified Domain.Types.Person as DP
+import qualified Domain.Types.Ride as DRide
+import qualified Domain.Types.RideStatus as DRide
+import Environment
+import GHC.Generics ()
+import Kernel.Beam.Functions as B
+import Kernel.External.Encryption
+import qualified Kernel.External.Payment.Interface as KPayment
+import qualified Kernel.External.Payment.Interface.Events.Types as PEInterface
+import qualified Kernel.External.Payment.Interface.Juspay as Juspay
+import qualified Kernel.External.Payment.Interface.Stripe as Stripe
+import qualified Kernel.External.Payment.Interface.Types as Payment
+import qualified Kernel.External.Payment.Stripe.Types.Common as Stripe
+import qualified Kernel.External.Payment.Types as Payment
+import Kernel.External.Types (SchedulerFlow, ServiceFlow)
+import qualified Kernel.External.Wallet as Wallet
+import Kernel.Prelude hiding (head)
+import Kernel.Storage.Esqueleto as Esq hiding (Value)
+import qualified Kernel.Storage.Hedis as Redis
+import Kernel.Streaming.Kafka.Producer.Types (HasKafkaProducer)
+import Kernel.Tools.Logging (withDynamicLogLevel)
+import qualified Kernel.Types.Beckn.Context as Context
+import Kernel.Types.Common hiding (id)
+import Kernel.Types.Id
+import Kernel.Types.Servant (RawByteString (..))
+import Kernel.Utils.Common
+import Lib.ConfigPilot.Interface.Types (getOneConfig)
+import qualified Lib.JourneyModule.Utils as JMU
+import qualified Lib.Payment.Domain.Action as DPayment
+import qualified Lib.Payment.Domain.Types.Common as DPayment
+import qualified Lib.Payment.Domain.Types.PaymentOrder as DOrder
+import qualified Lib.Payment.Domain.Types.PersonWallet as DPersonWallet
+import qualified Lib.Payment.Domain.Types.Refunds as DRefunds
+import qualified Lib.Payment.Storage.Queries.PaymentOrder as QOrder
+import qualified Lib.Payment.Storage.Queries.PersonWallet as QPersonWallet
+import qualified Lib.Types.SpecialLocation as SL
+import Servant (BasicAuthData)
+import qualified SharedLogic.BookingDeposit as BookingDeposit
+import qualified SharedLogic.CallBPP as CallBPP
+import qualified SharedLogic.CallFRFSBPP as CallFRFSBPP
+import qualified SharedLogic.FareBreakupInfo as SFareBreakupInfo
+import qualified SharedLogic.Finance.RidePayment as RidePaymentFinance
+import qualified SharedLogic.Payment as SPayment
+import qualified SharedLogic.Utils as SLUtils
+import Storage.Beam.Payment ()
+import qualified Storage.CachedQueries.Merchant as CQM
+import qualified Storage.CachedQueries.Merchant.MerchantOperatingCity as CQMOC
+import qualified Storage.CachedQueries.PlaceBasedServiceConfig as CQPBSC
+import Storage.ConfigPilot.Config.MerchantServiceConfig (MerchantServiceConfigDimensions (..))
+import qualified Storage.Queries.Booking as QRideB
+import qualified Storage.Queries.BookingPartiesLink as QBPL
+import qualified Storage.Queries.BookingPayment as QBookingPayment
+import qualified Storage.Queries.EDCMachineMappingExtra as QEDCMachineMapping
+import qualified Storage.Queries.FareBreakup as QFareBreakup
+import qualified Storage.Queries.Person as QP
+import qualified Storage.Queries.RefundRequest as QRefundRequest
+import qualified Storage.Queries.Ride as QRide
+import qualified Storage.Queries.TicketBooking as QTB
+import Tools.Error
+import Tools.Metrics
+import qualified Tools.Payment as Payment
+import qualified Tools.Wallet as TWallet
+
+-- create order -----------------------------------------------------
+
+createOrder ::
+  (Id DP.Person, Id DM.Merchant) ->
+  Id DRide.Ride ->
+  Flow Payment.CreateOrderResp
+createOrder (personId, merchantId) rideId = do
+  logInfo $ "Order created for rideId" <> show rideId
+  ride <- B.runInReplica $ QRide.findById rideId >>= fromMaybeM (RideDoesNotExist rideId.getId)
+  -- ride <- QRide.findById rideId >>= fromMaybeM (RideDoesNotExist rideId.getId)
+  unless (ride.status == DRide.COMPLETED) $ throwError (RideInvalidStatus $ show ride.status)
+  totalFare <- ride.totalFare & fromMaybeM (RideFieldNotPresent "totalFare")
+  person <- B.runInReplica $ QP.findById personId >>= fromMaybeM (PersonNotFound $ getId personId)
+  -- person <- QP.findById personId >>= fromMaybeM (PersonNotFound $ getId personId)
+  riderId <- B.runInReplica $ QRide.findRiderIdByRideId ride.id >>= fromMaybeM (InternalError "riderId not found")
+  -- riderId <- QRide.findRiderIdByRideId ride.id >>= fromMaybeM (InternalError "riderId not found")
+  unless (person.id == riderId) $ throwError NotAnExecutor
+  customerEmail <- person.email & fromMaybeM (PersonFieldNotPresent "email") >>= decrypt
+  customerPhone <- person.mobileNumber & fromMaybeM (PersonFieldNotPresent "mobileNumber") >>= decrypt
+  isSplitEnabled <- Payment.getIsSplitEnabled merchantId person.merchantOperatingCityId Nothing Payment.Normal
+  isPercentageSplitEnabled <- Payment.getIsPercentageSplit merchantId person.merchantOperatingCityId Nothing Payment.Normal
+  splitSettlementDetails <- Payment.mkSplitSettlementDetails isSplitEnabled totalFare.amount [] isPercentageSplitEnabled False
+  staticCustomerId <- SLUtils.getStaticCustomerId person customerPhone
+  nwAddress <- asks (.nwAddress)
+  udf1 <- SLUtils.getPersonUdf1 person
+  offerBasket <- Payment.mkOfferBasket merchantId person.merchantOperatingCityId Nothing Payment.Normal totalFare.amount 1
+  let createOrderReq =
+        Payment.CreateOrderReq
+          { orderId = rideId.getId,
+            orderShortId = ride.shortId.getShortId, -- should be Alphanumeric with character length less than 18.
+            amount = totalFare.amount,
+            customerId = staticCustomerId,
+            customerEmail,
+            customerPhone,
+            customerFirstName = person.firstName,
+            customerLastName = person.lastName,
+            createMandate = Nothing,
+            mandateMaxAmount = Nothing,
+            mandateFrequency = Nothing,
+            mandateStartDate = Nothing,
+            mandateEndDate = Nothing,
+            optionsGetUpiDeepLinks = Nothing,
+            metadataExpiryInMins = Nothing,
+            metadataGatewayReferenceId = Nothing,
+            webhookUrl = Just nwAddress,
+            splitSettlementDetails = splitSettlementDetails,
+            basket = offerBasket,
+            paymentRules = Nothing,
+            autoRefundPostSuccess = Nothing,
+            paymentFilter = Nothing,
+            udf1 = udf1,
+            udf2 = Nothing
+          }
+
+  let commonMerchantId = cast @DM.Merchant @DPayment.Merchant merchantId
+      commonPersonId = cast @DP.Person @DPayment.Person personId
+  isMetroTestTransaction <- asks (.isMetroTestTransaction)
+  let createOrderCall = Payment.createOrder merchantId person.merchantOperatingCityId Nothing Payment.Normal (Just person.id.getId) person.clientSdkVersion (Just False)
+      createWalletCall = TWallet.createWallet merchantId person.merchantOperatingCityId
+  DPayment.createOrderService commonMerchantId (Just $ cast person.merchantOperatingCityId) commonPersonId Nothing Nothing Payment.Normal isMetroTestTransaction createOrderReq createOrderCall (Just createWalletCall) False Nothing False >>= fromMaybeM (InternalError "Order expired please try again")
+
+-- | Create a RideBooking payment order (payment-before-confirm flow). Sets domainEntityId = bookingId on the order.
+createRideBookingPaymentOrder :: DRB.Booking -> Flow (Maybe Payment.CreateOrderResp)
+createRideBookingPaymentOrder booking = do
+  person <- QP.findById booking.riderId >>= fromMaybeM (PersonNotFound booking.riderId.getId)
+  let merchantOperatingCityId = booking.merchantOperatingCityId
+  customerEmail <- fromMaybe "noreply@nammayatri.in" <$> mapM decrypt person.email
+  customerPhone <- person.mobileNumber & fromMaybeM (PersonFieldNotPresent "mobileNumber") >>= decrypt
+  staticCustomerId <- SLUtils.getStaticCustomerId person customerPhone
+  paymentOrderId <- generateGUID
+  orderShortId <- generateShortId
+  -- Parking amount (when EDC-collected) has to be read back from the fare breakup persisted at
+  -- on_init (createFareBreakup) - the rider-app's Booking only carries fare totals, not an
+  -- itemized breakdown, so there's no other source for "just the parking portion" on this side.
+  parkingAmount <-
+    if SL.edcCollectsParking booking.fareSettlementType
+      then do
+        breakups <-
+          SFareBreakupInfo.getFareBreakupsWithFallback
+            booking.id.getId
+            DFareBreakup.BOOKING
+            (QFareBreakup.findAllByEntityIdAndEntityType booking.id.getId DFareBreakup.BOOKING)
+        let resolvedParkingAmount = case RD.parseProjectFareParamsBreakup ((\b -> (b.description, b.amount.amount)) <$> breakups) of
+              Just b -> b.parkingChargeTaxExclusive + b.parkingChargeTax
+              Nothing -> sumByDescription (show Enums.PARKING_CHARGE) breakups
+        when (resolvedParkingAmount == 0) $
+          logError $
+            "createRideBookingPaymentOrder: resolved parking amount is 0 for bookingId="
+              <> booking.id.getId
+              <> ", fareSettlementType="
+              <> show booking.fareSettlementType
+        pure resolvedParkingAmount
+      else pure 0
+  let commissionAmount = fromMaybe 0 booking.commission
+      amount = case booking.fareSettlementType of
+        Just SL.CommissionOnly -> commissionAmount
+        Just SL.ParkingOnly -> parkingAmount
+        Just SL.CommissionAndParking -> commissionAmount + parkingAmount
+        _ -> booking.estimatedTotalFare.amount
+  isSplitEnabled <- Payment.getIsSplitEnabled booking.merchantId merchantOperatingCityId Nothing DOrder.RideBooking
+  isPercentageSplitEnabled <- Payment.getIsPercentageSplit booking.merchantId merchantOperatingCityId Nothing DOrder.RideBooking
+  splitSettlementDetails <- Payment.mkSplitSettlementDetails isSplitEnabled amount [] isPercentageSplitEnabled False
+  nwAddress <- asks (.nwAddress)
+
+  -- Check if dashboardAgentId exists and fetch EDC machine mapping
+  mbPaytmTid <- case booking.dashboardAgentId of
+    Just dashboardAgentId -> do
+      -- Dashboard user must have assigned EDC machine
+      mapping <-
+        QEDCMachineMapping.findActiveByPersonIdAndMerchant
+          (Id dashboardAgentId)
+          booking.merchantId
+          merchantOperatingCityId
+          >>= fromMaybeM (InvalidRequest "Dashboard user does not have an assigned EDC machine. Booking cannot be done.")
+      -- terminalId is plain Text (not encrypted) - use directly
+      pure $ Just mapping.terminalId
+    Nothing -> pure Nothing
+
+  udf1 <- SLUtils.getPersonUdf1 person
+  offerBasket <- Payment.mkOfferBasket booking.merchantId merchantOperatingCityId Nothing DOrder.RideBooking amount 1
+  let createOrderReq =
+        Payment.CreateOrderReq
+          { orderId = paymentOrderId,
+            orderShortId = orderShortId.getShortId,
+            amount,
+            customerId = staticCustomerId,
+            customerEmail,
+            customerPhone,
+            customerFirstName = person.firstName,
+            customerLastName = person.lastName,
+            createMandate = Nothing,
+            mandateMaxAmount = Nothing,
+            mandateFrequency = Nothing,
+            mandateStartDate = Nothing,
+            mandateEndDate = Nothing,
+            optionsGetUpiDeepLinks = Nothing,
+            metadataExpiryInMins = Nothing,
+            metadataGatewayReferenceId = mbPaytmTid, -- Set terminal ID from machine mapping
+            webhookUrl = Just nwAddress,
+            splitSettlementDetails = splitSettlementDetails,
+            basket = offerBasket,
+            paymentRules = Nothing,
+            autoRefundPostSuccess = Nothing,
+            paymentFilter = Nothing,
+            udf1 = udf1,
+            udf2 = Nothing
+          }
+  let commonMerchantId = cast @DM.Merchant @DPayment.Merchant booking.merchantId
+      commonPersonId = cast @DP.Person @DPayment.Person person.id
+      createOrderCall = Payment.createOrder booking.merchantId merchantOperatingCityId Nothing DOrder.RideBooking (Just person.id.getId) person.clientSdkVersion Nothing
+  isMetroTestTransaction <- asks (.isMetroTestTransaction)
+  let createWalletCall = TWallet.createWallet booking.merchantId merchantOperatingCityId
+  mbOrderResp <- DPayment.createOrderService commonMerchantId (Just $ cast merchantOperatingCityId) commonPersonId Nothing Nothing DOrder.RideBooking isMetroTestTransaction createOrderReq createOrderCall (Just createWalletCall) False Nothing False
+  whenJust mbOrderResp $ \resp -> do
+    void $ QOrder.updatePaymentFulfillmentStatus (Id paymentOrderId) (Just DPayment.FulfillmentPending) (Just booking.id.getId) Nothing
+    -- Store paytmTid in PaymentOrder for audit trail (plain text)
+    whenJust mbPaytmTid $ \paytmTid ->
+      void $ QOrder.updatePaytmTid (Id paymentOrderId) (Just paytmTid)
+    whenJust resp.payment_links $ \links ->
+      whenJust links.web $ \url ->
+        void $ QRideB.updatePaymentInfo booking.id booking.estimatedFare booking.discount booking.estimatedTotalFare (Just $ showBaseUrl url)
+    -- Fork background status polling as fallback alongside Paytm EDC webhook
+    fork "RideBooking:PaytmEDC:StatusPoll" $
+      pollPaytmEdcPaymentStatus booking.merchantId booking.merchantOperatingCityId booking.riderId (Id paymentOrderId)
+  pure mbOrderResp
+
+data BookingDepositOrderResult
+  = BookingDepositCoveredByBalance
+  | BookingDepositOrderReady Payment.CreateOrderResp
+  | BookingDepositOrderProcessing
+  | BookingDepositOrderUnavailable
+
+bookingDepositFulfilLockKey, bookingDepositFulfilTriggeredKey :: Text -> Text
+bookingDepositFulfilLockKey bookingIdText = "BookingDeposit:Fulfil:" <> bookingIdText
+bookingDepositFulfilTriggeredKey bookingIdText = "BookingDeposit:FulfilTriggered:" <> bookingIdText
+
+fireWithheldConfirm ::
+  ( CacheFlow m r,
+    EsqDBFlow m r,
+    EncFlow m r,
+    HasBAPMetrics m r,
+    HasShortDurationRetryCfg r c,
+    CallFRFSBPP.BecknAPICallFlow m r
+  ) =>
+  Id DRB.Booking ->
+  m ()
+fireWithheldConfirm bookingId = do
+  onInitRes <- DOnInit.buildOnInitResFromBooking bookingId
+  confirmReq <- ACL.buildConfirmReqV2 onInitRes
+  void . withShortRetry $ CallBPP.confirmV2 onInitRes.bppUrl confirmReq onInitRes.merchant.id
+  Redis.setExp (bookingDepositFulfilTriggeredKey bookingId.getId) ("1" :: Text) 86400
+
+isBookingDepositPaymentInFlight :: DRB.Booking -> Flow Bool
+isBookingDepositPaymentInFlight booking = do
+  attempts <- QBookingPayment.findAllByBookingIdAndServiceType booking.id DOrder.BookingDeposit
+  case listToMaybe attempts of
+    Just row
+      | row.status == DBP.PENDING -> maybe False (\o -> o.status == Payment.CHARGED) <$> QOrder.findById row.paymentOrderId
+    _ -> pure False
+
+--   Charges the SHORTFALL, not the whole fee, so balance released by an earlier completed ride is actually reused
+createBookingDepositPaymentOrder :: DRB.Booking -> Bool -> Flow (BookingDepositOrderResult, Maybe HighPrecMoney)
+createBookingDepositPaymentOrder booking isMockPayment = do
+  fee <- booking.bookingDepositAmount & fromMaybeM (InvalidRequest "Booking has no booking fee to fund")
+  decision <- BookingDeposit.decideAndSecureBookingDeposit booking fee
+  case decision of
+    (BookingDeposit.FeeSecured, available) -> do
+      logInfo $ "Booking fee secured from balance, no order needed: " <> booking.id.getId
+      pure (BookingDepositCoveredByBalance, Just available)
+    (BookingDeposit.FeeShortfall shortfall, available) -> do
+      attempts <- QBookingPayment.findAllByBookingIdAndServiceType booking.id DOrder.BookingDeposit
+      paidInFlight <- isBookingDepositPaymentInFlight booking
+      if paidInFlight
+        then do
+          logInfo $ "Booking fee order already CHARGED for " <> booking.id.getId <> "; fulfilment in flight"
+          pure (BookingDepositOrderProcessing, Just available)
+        else do
+          res <- mintOrder shortfall attempts
+          pure (res, Just available)
+  where
+    mintOrder shortfall attempts = do
+      let mintLockKey = "BookingDeposit:OrderMint:" <> booking.id.getId
+      eRes <-
+        Redis.whenWithLockRedisAndReturnValue mintLockKey 120 $
+          withTryCatch "bookingDeposit:mintOrder" (mint shortfall attempts)
+      case eRes of
+        Left () -> do
+          logInfo $ "Booking fee order mint already in flight for " <> booking.id.getId <> "; not issuing a second gateway call"
+          pure BookingDepositOrderUnavailable
+        Right (Left err) -> do
+          logError $ "Booking fee order mint failed for " <> booking.id.getId <> ": " <> show err
+          pure BookingDepositOrderUnavailable
+        Right (Right res) -> pure res
+    mint shortfall attempts =
+      case listToMaybe attempts of
+        Just row | row.status == DBP.PENDING -> do
+          mbResp <- callCreateOrder row.paymentOrderId.getId shortfall
+          case mbResp of
+            Just orderResp -> pure (BookingDepositOrderReady orderResp)
+            Nothing -> do
+              mbOrd <- QOrder.findById row.paymentOrderId
+              let orderIsDead = maybe False (\o -> isTerminalStatus o.status && o.status /= Payment.CHARGED) mbOrd
+              if orderIsDead
+                then do
+                  QBookingPayment.updateStatusById DBP.FAILED row.id
+                  logInfo $ "Booking fee order " <> row.paymentOrderId.getId <> " is dead at gateway; minting fresh order for " <> booking.id.getId
+                  freshMint shortfall
+                else do
+                  logError $ "Booking fee order " <> row.paymentOrderId.getId <> " gave no SDK payload but is not dead (" <> show ((.status) <$> mbOrd) <> "); not minting a second order for " <> booking.id.getId
+                  pure BookingDepositOrderUnavailable
+        _ -> freshMint shortfall
+    freshMint shortfall = do
+      orderIdText <- generateGUID
+      mbResp <- callCreateOrder orderIdText shortfall
+      case mbResp of
+        Nothing -> do
+          logError $ "Booking fee order unavailable for booking " <> booking.id.getId <> " (expired or no SDK payload)"
+          pure BookingDepositOrderUnavailable
+        Just orderResp -> do
+          rowId <- generateGUID
+          now <- getCurrentTime
+          QBookingPayment.create $
+            DBP.BookingPayment
+              { id = rowId,
+                bookingId = booking.id,
+                paymentOrderId = Id orderIdText,
+                paymentServiceType = DOrder.BookingDeposit,
+                status = DBP.PENDING,
+                merchantId = Just booking.merchantId,
+                merchantOperatingCityId = Just booking.merchantOperatingCityId,
+                createdAt = now,
+                updatedAt = now
+              }
+          void $ QOrder.updatePaymentFulfillmentStatus (Id orderIdText) (Just DPayment.FulfillmentPending) (Just booking.id.getId) Nothing
+          pure (BookingDepositOrderReady orderResp)
+    callCreateOrder orderIdText amount = do
+      person <- QP.findById booking.riderId >>= fromMaybeM (PersonNotFound booking.riderId.getId)
+      let merchantOperatingCityId = booking.merchantOperatingCityId
+      customerEmail <- fromMaybe "noreply@nammayatri.in" <$> mapM decrypt person.email
+      customerPhone <- person.mobileNumber & fromMaybeM (PersonFieldNotPresent "mobileNumber") >>= decrypt
+      staticCustomerId <- SLUtils.getStaticCustomerId person customerPhone
+      orderShortId <- generateShortId
+      nwAddress <- asks (.nwAddress)
+      udf1 <- SLUtils.getPersonUdf1 person
+      let createOrderReq =
+            Payment.CreateOrderReq
+              { orderId = orderIdText,
+                orderShortId = orderShortId.getShortId,
+                amount = amount,
+                customerId = staticCustomerId,
+                customerEmail,
+                customerPhone,
+                customerFirstName = person.firstName,
+                customerLastName = person.lastName,
+                createMandate = Nothing,
+                mandateMaxAmount = Nothing,
+                mandateFrequency = Nothing,
+                mandateStartDate = Nothing,
+                mandateEndDate = Nothing,
+                optionsGetUpiDeepLinks = Nothing,
+                metadataExpiryInMins = Nothing,
+                metadataGatewayReferenceId = Nothing,
+                webhookUrl = Just nwAddress,
+                splitSettlementDetails = Nothing,
+                basket = [],
+                paymentRules = Nothing,
+                autoRefundPostSuccess = Nothing,
+                paymentFilter = Nothing,
+                udf1 = udf1,
+                udf2 = Nothing
+              }
+          commonMerchantId = cast @DM.Merchant @DPayment.Merchant booking.merchantId
+          commonPersonId = cast @DP.Person @DPayment.Person person.id
+          createOrderCall = Payment.createOrder booking.merchantId merchantOperatingCityId Nothing DOrder.BookingDeposit (Just person.id.getId) person.clientSdkVersion (Just isMockPayment)
+      mbPaymentOrderValidity <- Payment.getPaymentOrderValidity booking.merchantId merchantOperatingCityId Nothing DOrder.BookingDeposit
+      isMetroTestTransaction <- asks (.isMetroTestTransaction)
+      let createWalletCall = TWallet.createWallet booking.merchantId merchantOperatingCityId
+      DPayment.createOrderService commonMerchantId (Just $ cast merchantOperatingCityId) commonPersonId mbPaymentOrderValidity Nothing DOrder.BookingDeposit isMetroTestTransaction createOrderReq createOrderCall (Just createWalletCall) isMockPayment Nothing False
+
+-- | Payment succeeded for a booking fee: credit, hold, then resume the withheld Beckn confirm.
+bookingDepositOrderStatusHandler ::
+  ( CacheFlow m r,
+    EsqDBFlow m r,
+    EsqDBReplicaFlow m r,
+    ServiceFlow m r,
+    EncFlow m r,
+    MonadMask m,
+    HasActorInfo m r,
+    SchedulerFlow r,
+    HasBAPMetrics m r,
+    HasShortDurationRetryCfg r c,
+    CallFRFSBPP.BecknAPICallFlow m r,
+    HasField "blackListedJobs" r [Text]
+  ) =>
+  Id DOrder.PaymentOrder ->
+  Id DM.Merchant ->
+  DPayment.PaymentStatusResp ->
+  m (DPayment.PaymentFulfillmentStatus, Maybe Text, Maybe Text)
+bookingDepositOrderStatusHandler orderId _merchantId paymentStatusResp = do
+  status <- DPayment.getTransactionStatus paymentStatusResp
+  case status of
+    Payment.CHARGED -> do
+      order <- QOrder.findById orderId >>= fromMaybeM (PaymentOrderNotFound orderId.getId)
+      bookingIdText <- order.domainEntityId & fromMaybeM (InvalidRequest "BookingDeposit order has no domainEntityId")
+      let bookingId = Id bookingIdText :: Id DRB.Booking
+      ranToCompletion <- Redis.whenWithLockRedisAndReturnValue (bookingDepositFulfilLockKey bookingIdText) 60 $ do
+        booking <- QRideB.findById bookingId >>= fromMaybeM (BookingDoesNotExist bookingIdText)
+        if booking.status `elem` DRB.terminalBookingStatus
+          then do
+            alreadyCredited <- BookingDeposit.hasCreditForOrder order.id.getId
+            if alreadyCredited
+              then do
+                logInfo $ "Booking fee paid for terminal booking " <> bookingIdText <> "; wallet credit already landed, keeping it"
+                pure False
+              else do
+                logInfo $ "Booking fee paid for terminal booking " <> bookingIdText <> "; auto-refunding " <> show order.amount <> " to source"
+                void $ SPayment.initiateRefundWithPaymentStatusRespSync booking.riderId order.id
+                setAttemptStatus order.id DBP.REFUND_INITIATED
+                pure True
+          else do
+            BookingDeposit.creditRiderBalance booking.riderId booking.merchantId booking.merchantOperatingCityId order.amount order.id.getId
+            setAttemptStatus order.id DBP.SUCCESS
+            alreadyTriggered <- Redis.get @Text (bookingDepositFulfilTriggeredKey bookingIdText)
+            unless (alreadyTriggered == Just "1") $ do
+              secured <- case booking.bookingDepositAmount of
+                Nothing -> pure True
+                Just fee -> do
+                  bookingNow <- QRideB.findById bookingId >>= fromMaybeM (BookingDoesNotExist bookingIdText)
+                  when (bookingNow.status `elem` DRB.terminalBookingStatus) $
+                    throwError $ InvalidRequest $ "Booking " <> bookingIdText <> " went terminal mid-fulfilment; deferring to refund path"
+                  (decision, _) <- BookingDeposit.decideAndSecureBookingDeposit booking fee
+                  case decision of
+                    BookingDeposit.FeeSecured -> pure True
+                    BookingDeposit.FeeShortfall shortfall -> do
+                      logInfo $ "Booking fee payment credited for " <> bookingIdText <> " but still short by " <> show shortfall
+                      pure False
+              when secured $ do
+                void $ booking.bppBookingId & fromMaybeM (InvalidRequest $ "Booking fee paid but on_init not yet processed for " <> bookingIdText <> "; deferring confirm")
+                fireWithheldConfirm bookingId
+            pure False
+      case ranToCompletion of
+        Left () -> do
+          logInfo $ "Booking fee fulfilment for " <> bookingIdText <> " skipped: lock held elsewhere; leaving order pending for retry"
+          pure (DPayment.FulfillmentPending, Just bookingIdText, Nothing)
+        Right True -> pure (DPayment.FulfillmentRefundInitiated, Just bookingIdText, Nothing)
+        Right False -> pure (DPayment.FulfillmentSucceeded, Just bookingIdText, Nothing)
+    _ -> do
+      when (isTerminalStatus status) $
+        setAttemptStatus orderId DBP.FAILED
+      pure (DPayment.FulfillmentPending, Nothing, Nothing)
+  where
+    setAttemptStatus oid st = do
+      rows <- QBookingPayment.findAllByOrderId oid
+      forM_ rows $ \row ->
+        when (row.status /= st) $ QBookingPayment.updateStatusById st row.id
+
+-- | Resume the withheld Beckn confirm for a booking whose fee is already secured. Idempotent
+--   and safe from any trigger -- on_init's covered branch, the payment-intent poll -- because
+--   the Fulfil lock serialises resumers (the payment webhook uses the same key around its
+--   credit-hold-confirm block) and the FulfilTriggered marker bounds repeat confirms
+resumeBookingDepositConfirm ::
+  ( CacheFlow m r,
+    EsqDBFlow m r,
+    EncFlow m r,
+    MonadMask m,
+    HasBAPMetrics m r,
+    HasShortDurationRetryCfg r c,
+    CallFRFSBPP.BecknAPICallFlow m r
+  ) =>
+  Id DRB.Booking ->
+  m ()
+resumeBookingDepositConfirm bookingId = do
+  let bookingIdText = bookingId.getId
+  result <- Redis.whenWithLockRedisAndReturnValue (bookingDepositFulfilLockKey bookingIdText) 60 $ do
+    alreadyTriggered <- Redis.get @Text (bookingDepositFulfilTriggeredKey bookingIdText)
+    unless (alreadyTriggered == Just "1") $ do
+      booking <- QRideB.findById bookingId >>= fromMaybeM (BookingDoesNotExist bookingIdText)
+      if booking.status `elem` DRB.terminalBookingStatus
+        then logInfo $ "Booking " <> bookingIdText <> " already " <> show booking.status <> "; not resuming confirm"
+        else case booking.bppBookingId of
+          Nothing -> logError $ "Booking fee confirm resume for " <> bookingIdText <> " deferred: on_init not yet processed"
+          Just _ -> fireWithheldConfirm bookingId
+  case result of
+    Left () -> logInfo $ "Booking fee confirm resume for " <> bookingIdText <> " skipped: another resumer holds the lock"
+    Right () -> pure ()
+
+-- | Sum fare breakup line items matching an exact description (fallback path when the breakup
+--   isn't in the canonical V2 tax-slot shape parseProjectFareParamsBreakup expects).
+sumByDescription :: Text -> [DFareBreakup.FareBreakup] -> HighPrecMoney
+sumByDescription description_ = sum . map (.amount.amount) . filter ((== description_) . (.description))
+
+isTerminalStatus :: Payment.TransactionStatus -> Bool
+isTerminalStatus = \case
+  Payment.CHARGED -> True
+  Payment.AUTHENTICATION_FAILED -> True
+  Payment.AUTHORIZATION_FAILED -> True
+  Payment.JUSPAY_DECLINED -> True
+  Payment.CANCELLED -> True
+  Payment.CLIENT_AUTH_TOKEN_EXPIRED -> True
+  _ -> False
+
+syncBookingDepositOrderStatus :: Id DM.Merchant -> Id DP.Person -> Id DOrder.PaymentOrder -> Flow ()
+syncBookingDepositOrderStatus merchantId personId orderId = do
+  mbOrder <- QOrder.findById orderId
+  case mbOrder of
+    Nothing -> logError $ "BookingDeposit status sync: order not found " <> orderId.getId
+    Just order ->
+      unless (isTerminalStatus order.status && order.status /= Payment.CHARGED) $ do
+        let fulfillmentHandler = mkFulfillmentHandler DOrder.BookingDeposit (cast order.merchantId) order.id
+        eitherResult <- withTryCatch "BookingDeposit:StatusSync" $ SPayment.syncOrderStatus fulfillmentHandler merchantId personId order
+        case eitherResult of
+          Left err -> logError $ "BookingDeposit status sync for order " <> orderId.getId <> " errored: " <> show err
+          Right statusResp -> do
+            resolvedStatus <- DPayment.getTransactionStatus statusResp
+            logInfo $ "BookingDeposit status sync: order " <> orderId.getId <> " at " <> show resolvedStatus
+
+-- | Background polling for Paytm EDC payment status.
+-- Reuses orderStatusHandler (via syncOrderStatus): one status fetch + fulfillment handling per attempt.
+-- Starts first poll after initialDelaySec, then polls every pollIntervalSec.
+-- Stops when a terminal status is reached or max attempts / consecutive failures exhausted.
+pollPaytmEdcPaymentStatus ::
+  Id DM.Merchant ->
+  Id DMOC.MerchantOperatingCity ->
+  Id DP.Person ->
+  Id DOrder.PaymentOrder ->
+  Flow ()
+pollPaytmEdcPaymentStatus merchantId _merchantOperatingCityId personId orderId = do
+  let initialDelaySec = 10 :: Int -- wait 10s after create order before first poll
+      pollIntervalSec = 10 :: Int -- poll every 10s
+      maxAttempts = 20 :: Int
+      pollKey = "PaytmEDC:StatusPoll:" <> orderId.getId
+      maxConsecutiveFailures = 3 :: Int
+  Redis.setExp pollKey ("polling" :: Text) (initialDelaySec + maxAttempts * pollIntervalSec + 60)
+  liftIO $ threadDelay (initialDelaySec * 1000000)
+  go pollKey 1 maxAttempts pollIntervalSec maxConsecutiveFailures 0
+  where
+    go pollKey attempt maxAttempts pollIntervalSec maxConsecutiveFailures consecutiveFailures = do
+      when (attempt <= maxAttempts) $ do
+        when (attempt > 1) $ liftIO (threadDelay (pollIntervalSec * 1000000))
+        mbOrder <- QOrder.findById orderId
+        case mbOrder of
+          Nothing -> logError $ "PaytmEDC poll: Order not found " <> orderId.getId
+          Just order -> do
+            let paymentServiceType = fromMaybe DOrder.Normal order.paymentServiceType
+            if isTerminalStatus order.status
+              then do
+                logInfo $ "PaytmEDC poll: Order " <> orderId.getId <> " already terminal: " <> show order.status
+                when (paymentServiceType == DOrder.RideBooking && order.status /= Payment.CHARGED) $
+                  cancelBookingOnPollFailure order
+                Redis.del pollKey
+              else do
+                logInfo $ "PaytmEDC poll attempt " <> show attempt <> "/" <> show maxAttempts <> " for order " <> orderId.getId
+                let fulfillmentHandler = mkFulfillmentHandler paymentServiceType (cast order.merchantId) order.id
+                eitherResult <-
+                  withTryCatch "PaytmEDC:StatusPoll" $
+                    SPayment.syncOrderStatus fulfillmentHandler merchantId personId order
+                case eitherResult of
+                  Left err -> do
+                    let newConsecutiveFailures = consecutiveFailures + 1 :: Int
+                    logError $ "PaytmEDC poll error for " <> orderId.getId <> ": " <> show err <> " (consecutive failures: " <> show newConsecutiveFailures <> ")"
+                    if newConsecutiveFailures >= maxConsecutiveFailures
+                      then do
+                        logError $ "PaytmEDC poll: Cancelling booking due to " <> show newConsecutiveFailures <> " consecutive failures for order " <> orderId.getId
+                        cancelBookingOnPollFailure order
+                        Redis.del pollKey
+                      else go pollKey (attempt + 1) maxAttempts pollIntervalSec maxConsecutiveFailures newConsecutiveFailures
+                  Right statusResp -> do
+                    resolvedStatus <- DPayment.getTransactionStatus statusResp
+                    if isTerminalStatus resolvedStatus
+                      then do
+                        logInfo $ "PaytmEDC poll: Order " <> orderId.getId <> " resolved to " <> show resolvedStatus
+                        when (paymentServiceType == DOrder.RideBooking && resolvedStatus /= Payment.CHARGED) $
+                          cancelBookingOnPollFailure order
+                        Redis.del pollKey
+                      else
+                        if attempt >= maxAttempts
+                          then do
+                            logError $ "PaytmEDC poll: Exhausted " <> show maxAttempts <> " attempts for order " <> orderId.getId <> " - status " <> show resolvedStatus <> ". Cancelling booking."
+                            cancelBookingOnPollFailure order
+                            Redis.del pollKey
+                          else go pollKey (attempt + 1) maxAttempts pollIntervalSec maxConsecutiveFailures 0
+
+    cancelBookingOnPollFailure :: DOrder.PaymentOrder -> Flow ()
+    cancelBookingOnPollFailure paymentOrder = do
+      case paymentOrder.domainEntityId of
+        Just bookingIdText -> do
+          let bookingId = Id bookingIdText :: Id DRB.Booking
+          mbBooking <- QRideB.findById bookingId
+          case mbBooking of
+            Just booking -> do
+              -- Only cancel if booking is still in a cancellable state (not confirmed/started/completed)
+              if booking.status `elem` [SRB.NEW, SRB.AWAITING_REASSIGNMENT]
+                then do
+                  let cancelReq =
+                        DCancel.CancelReq
+                          { reasonCode = CancellationReasonCode "Paytm EDC status check failed: unable to verify payment status",
+                            reasonStage = OnInit,
+                            additionalInfo = Just "Payment status polling failed repeatedly - unable to verify payment status",
+                            reallocate = Nothing,
+                            blockOnCancellationRate = Nothing,
+                            abortPaytmEdc = Nothing
+                          }
+                  eitherCancelResult <- withTryCatch "PaytmEDC:CancelBookingOnPollFailure" $ DCancel.cancel booking Nothing cancelReq SBCR.ByApplication
+                  case eitherCancelResult of
+                    Right dCancelRes -> do
+                      void $ withTryCatch "PaytmEDC:refundBookingDeposit" $ BookingDeposit.refundBookingDeposit booking
+                      void $ QRideB.updateStatus booking.riderId booking.id SRB.CANCELLED
+                      void $ QBPL.makeAllInactiveByBookingId booking.id
+                      void . withShortRetry $ CallBPP.cancelV2 booking.merchantId dCancelRes.bppUrl =<< CancelACL.buildCancelReqV2 dCancelRes Nothing
+                      logInfo $ "PaytmEDC poll: Successfully cancelled booking " <> bookingIdText <> " due to poll failures"
+                    Left cancelErr -> logError $ "PaytmEDC poll: Failed to cancel booking " <> bookingIdText <> ": " <> show cancelErr
+                else logInfo $ "PaytmEDC poll: Booking " <> bookingIdText <> " already in non-cancellable state: " <> show booking.status
+            Nothing -> logError $ "PaytmEDC poll: Booking not found for domainEntityId: " <> bookingIdText
+        Nothing -> logError $ "PaytmEDC poll: PaymentOrder " <> paymentOrder.id.getId <> " has no domainEntityId, cannot cancel booking"
+
+-- | Abort an in-flight Paytm EDC transaction for a booking, if one exists.
+-- Should be called when a dashboard cancel is initiated for a BoothOnline booking
+-- that had payment-before-confirm enabled (i.e. an EDC popup was already sent to the machine).
+-- This is fire-and-forget; failures are logged but do not block the cancel flow.
+abortPaytmEdcIfActive :: Id DRB.Booking -> Flow ()
+abortPaytmEdcIfActive bookingId = do
+  mbPaymentOrder <- QOrder.findByDomainEntityIdAndServiceType bookingId.getId DOrder.RideBooking
+  case mbPaymentOrder of
+    Nothing -> logInfo $ "abortPaytmEdc: No payment order found for booking " <> bookingId.getId
+    Just paymentOrder -> do
+      let isRideBookingOrder = fromMaybe DOrder.Normal paymentOrder.paymentServiceType == DOrder.RideBooking
+          isPending = paymentOrder.paymentFulfillmentStatus == Just DPayment.FulfillmentPending
+      if not (isRideBookingOrder && isPending)
+        then logInfo $ "abortPaytmEdc: Order " <> paymentOrder.id.getId <> " is not a pending RideBooking order, skipping abort"
+        else case paymentOrder.paytmTid of
+          Nothing -> logInfo $ "abortPaytmEdc: No paytmTid on order " <> paymentOrder.id.getId <> ", skipping abort"
+          Just _paytmTid -> do
+            let merchantId = cast @DPayment.Merchant @DM.Merchant paymentOrder.merchantId
+                mbMerchantOperatingCityId = cast @DPayment.MerchantOperatingCity @DMOC.MerchantOperatingCity <$> paymentOrder.merchantOperatingCityId
+            case mbMerchantOperatingCityId of
+              Nothing -> logError $ "abortPaytmEdc: No merchantOperatingCityId on order " <> paymentOrder.id.getId <> ", cannot abort"
+              Just merchantOperatingCityId -> do
+                let abortReq =
+                      Payment.OrderStatusReq
+                        { orderShortId = paymentOrder.shortId.getShortId,
+                          orderId = paymentOrder.id.getId,
+                          transactionDateTime = Just paymentOrder.createdAt,
+                          terminalId = paymentOrder.paytmTid
+                        }
+                logInfo $ "abortPaytmEdc: Aborting Paytm EDC for order " <> paymentOrder.id.getId
+                eitherResult <-
+                  withTryCatch "PaytmEDC:Abort" $
+                    Payment.abortOrder merchantId merchantOperatingCityId Nothing DOrder.RideBooking Nothing Nothing Nothing abortReq
+                case eitherResult of
+                  Left err -> logError $ "abortPaytmEdc: Abort call failed for order " <> paymentOrder.id.getId <> ": " <> show err
+                  Right _ -> logInfo $ "abortPaytmEdc: Abort successful for order " <> paymentOrder.id.getId
+
+-- | Get payment status by booking id. With Paytm EDC callback, confirm is triggered server-side on success; this is optional (UI refresh / fallback only).
+getRideBookingPaymentStatusByBookingId ::
+  (Id DP.Person, Id DM.Merchant) ->
+  Id DRB.Booking ->
+  Flow DPayment.PaymentStatusResp
+getRideBookingPaymentStatusByBookingId (personId, merchantId) bookingId = do
+  booking <- QRideB.findById bookingId >>= fromMaybeM (BookingDoesNotExist bookingId.getId)
+  unless (booking.riderId == personId) $ throwError NotAnExecutor
+  paymentOrder <- QOrder.findByDomainEntityIdAndServiceType bookingId.getId DOrder.RideBooking >>= fromMaybeM (PaymentOrderNotFound bookingId.getId)
+  getStatus (personId, merchantId) paymentOrder.id
+
+-- order status -----------------------------------------------------
+
+getStatus ::
+  (Id DP.Person, Id DM.Merchant) ->
+  Id DOrder.PaymentOrder ->
+  Flow DPayment.PaymentStatusResp
+getStatus (personId, merchantId) orderId = do
+  paymentOrder <- QOrder.findById orderId |<|>| QOrder.findByShortId (ShortId orderId.getId) >>= fromMaybeM (PaymentOrderNotFound orderId.getId)
+  let paymentServiceType = fromMaybe DOrder.Normal paymentOrder.paymentServiceType
+      fulfillmentHandler = mkFulfillmentHandler paymentServiceType (cast paymentOrder.merchantId) paymentOrder.id
+  currentOrderStatus <- SPayment.syncOrderStatus fulfillmentHandler merchantId personId paymentOrder
+  -- Check if current order is not successful and has a groupId
+  case (currentOrderStatus.paymentFulfillmentStatus, paymentOrder.groupId) of
+    (Just DPayment.FulfillmentSucceeded, _) -> pure currentOrderStatus
+    (_, Nothing) -> pure currentOrderStatus
+    (_, Just groupId) -> do
+      now <- getCurrentTime
+      otherOrders <- QOrder.findAllByGroupId groupId now
+      let otherOrdersInGroup = filter (\o -> o.id /= paymentOrder.id) otherOrders
+          successOtherOrder = find (\o -> o.paymentFulfillmentStatus == Just DPayment.FulfillmentSucceeded) otherOrdersInGroup
+      fork "syncRemainingOrdersInGroup" $ do
+        let remainingOrders = filter (\o -> maybe True (\successOrder -> o.id /= successOrder.id) successOtherOrder) otherOrdersInGroup
+        mapM_
+          ( \order -> do
+              let orderPaymentServiceType = fromMaybe DOrder.Normal order.paymentServiceType
+                  orderFulfillmentHandler = mkFulfillmentHandler orderPaymentServiceType (cast order.merchantId) order.id
+              void $ SPayment.syncOrderStatus orderFulfillmentHandler merchantId personId order
+          )
+          remainingOrders
+      -- Check if any other order has FulfillmentSucceeded status
+      case successOtherOrder of
+        Just successfulOrder -> do
+          let successPaymentServiceType = fromMaybe DOrder.Normal successfulOrder.paymentServiceType
+              successFulfillmentHandler = mkFulfillmentHandler successPaymentServiceType (cast successfulOrder.merchantId) successfulOrder.id
+          logInfo $ "Found successful order in group: " <> successfulOrder.id.getId <> ", syncing instead of current order: " <> paymentOrder.id.getId
+          SPayment.syncOrderStatus successFulfillmentHandler merchantId personId successfulOrder
+        Nothing -> pure currentOrderStatus
+
+-- order status s2s -----------------------------------------------------
+getStatusS2S :: Id DOrder.PaymentOrder -> Id DP.Person -> Id DM.Merchant -> Maybe Data.Text.Text -> Flow DPayment.PaymentStatusResp
+getStatusS2S orderId personId merchantId mbApiKey = do
+  -- Verify API key
+  apiKey <- mbApiKey & fromMaybeM (MissingHeader "api-key")
+  expectedApiKey <- asks (.parkingApiKey)
+  unless (apiKey == expectedApiKey) $ throwError (InvalidRequest "Invalid API key")
+  getStatus (personId, merchantId) orderId
+
+getOrder ::
+  ( CacheFlow m r,
+    EsqDBReplicaFlow m r,
+    EsqDBFlow m r,
+    EncFlow m r,
+    CoreMetrics m,
+    HasKafkaProducer r
+  ) =>
+  (Id DP.Person, Id DM.Merchant) ->
+  Id DOrder.PaymentOrder ->
+  m DOrder.PaymentOrderAPIEntity
+getOrder (personId, _) orderId = do
+  order <- B.runInReplica $ QOrder.findById orderId >>= fromMaybeM (PaymentOrderNotFound orderId.getId)
+  -- order <- QOrder.findById orderId >>= fromMaybeM (PaymentOrderNotFound orderId.getId)
+  unless (order.personId == cast personId) $ throwError NotAnExecutor
+  mkOrderAPIEntity order
+
+mkOrderAPIEntity :: (EncFlow m r, HasKafkaProducer r) => DOrder.PaymentOrder -> m DOrder.PaymentOrderAPIEntity
+mkOrderAPIEntity DOrder.PaymentOrder {..} = do
+  clientAuthToken_ <- decrypt `mapM` clientAuthToken
+  return $ DOrder.PaymentOrderAPIEntity {clientAuthToken = clientAuthToken_, ..}
+
+-- Paytm EDC callback types following standard Paytm webhook structure: { head: {...}, body: {...} }
+data PaytmEdcCallbackHead = PaytmEdcCallbackHead
+  { requestTimestamp :: Text,
+    checksum :: Text
+  }
+  deriving (Generic, Show, FromJSON, ToJSON)
+
+instance ToSchema PaytmEdcCallbackHead
+
+data PaytmEdcCallbackBody = PaytmEdcCallbackBody
+  { resultInfo :: ResultInfo,
+    merchantRefereneceNo :: Text,
+    merchantTransactionId :: Text
+  }
+  deriving (Generic, Show, FromJSON, ToJSON)
+
+instance ToSchema PaytmEdcCallbackBody
+
+data ResultInfo = ResultInfo
+  { resultStatus :: Text,
+    resultCodeId :: Text,
+    resultCode :: Text,
+    resultMsg :: Text
+  }
+  deriving (Generic, Show, FromJSON, ToJSON)
+
+instance ToSchema ResultInfo
+
+data PaytmEdcCallbackReq = PaytmEdcCallbackReq
+  { head :: PaytmEdcCallbackHead,
+    body :: PaytmEdcCallbackBody
+  }
+  deriving (Generic, Show, FromJSON, ToJSON)
+
+instance ToSchema PaytmEdcCallbackReq
+
+-- Map Paytm resultStatus to our TransactionStatus
+-- Paytm values: "MA" (Accepted), "S" (Success), "F" (Failed), "U" (Pending), or numeric codes like "01"
+paytmStatusToTransactionStatus :: Text -> KPayment.TransactionStatus
+paytmStatusToTransactionStatus s =
+  case Data.Text.toUpper s of
+    "S" -> KPayment.CHARGED -- Success
+    "MA" -> KPayment.CHARGED -- Accepted (treated as success)
+    "01" -> KPayment.CHARGED -- Numeric success code
+    "F" -> KPayment.CANCELLED -- Failed
+    "U" -> KPayment.STARTED -- Pending
+    -- Legacy support for old format
+    "TXN_SUCCESS" -> KPayment.CHARGED
+    "SUCCESS" -> KPayment.CHARGED
+    "A" -> KPayment.CHARGED
+    "TXN_FAILURE" -> KPayment.CANCELLED
+    "FAIL" -> KPayment.CANCELLED
+    "PENDING" -> KPayment.STARTED
+    _ -> KPayment.STARTED -- Default to pending for unknown statuses
+
+-- webhook ----------------------------------------------------------
+
+fetchPaymentServiceConfig ::
+  ShortId DM.Merchant ->
+  Maybe Context.City ->
+  Maybe Payment.PaymentServiceType ->
+  Maybe Text ->
+  Payment.PaymentService ->
+  Flow (Payment.PaymentServiceConfig, DMOC.MerchantOperatingCity)
+fetchPaymentServiceConfig merchantShortId mbCity mbServiceType mbPlaceId service = do
+  merchant <- CQM.findByShortId merchantShortId >>= fromMaybeM (MerchantNotFound merchantShortId.getShortId)
+  let city = fromMaybe merchant.defaultCity mbCity
+  merchantOperatingCity <- CQMOC.findByMerchantShortIdAndCity merchantShortId city >>= fromMaybeM (MerchantOperatingCityNotFound $ "merchant-Id-" <> merchant.id.getId <> "-city-" <> show city)
+  placeBasedConfig <- case mbPlaceId of
+    Just id -> CQPBSC.findByPlaceIdAndServiceName (Id id) (DMSC.PaymentService service)
+    Nothing -> return Nothing
+  merchantServiceConfig' <-
+    getOneConfig (MerchantServiceConfigDimensions {merchantOperatingCityId = merchantOperatingCity.id.getId, merchantId = merchant.id.getId, serviceName = Just (getPaymentServiceByType mbServiceType)}) Nothing
+      >>= fromMaybeM (MerchantServiceConfigNotFound merchantOperatingCity.id.getId "Payment" (show service))
+  (,merchantOperatingCity) <$> case (placeBasedConfig <&> (.serviceConfig)) <|> Just merchantServiceConfig'.serviceConfig of
+    Just (DMSC.PaymentServiceConfig vsc) -> pure vsc
+    Just (DMSC.MetroPaymentServiceConfig vsc) -> pure vsc
+    Just (DMSC.BusPaymentServiceConfig vsc) -> pure vsc
+    Just (DMSC.BbpsPaymentServiceConfig vsc) -> pure vsc
+    Just (DMSC.MultiModalPaymentServiceConfig vsc) -> pure vsc
+    Just (DMSC.PassPaymentServiceConfig vsc) -> pure vsc
+    Just (DMSC.ParkingPaymentServiceConfig vsc) -> pure vsc
+    Just (DMSC.JuspayWalletServiceConfig vsc) -> pure vsc
+    _ -> throwError $ InternalError "Unknown Service Config"
+  where
+    getPaymentServiceByType = \case
+      Just Payment.Normal -> DMSC.PaymentService service
+      Just Payment.BBPS -> DMSC.BbpsPaymentService service
+      Just Payment.FRFSBooking -> DMSC.MetroPaymentService service
+      Just Payment.FRFSBusBooking -> DMSC.BusPaymentService service
+      Just Payment.FRFSMultiModalBooking -> DMSC.MultiModalPaymentService service
+      Just Payment.FRFSPassPurchase -> DMSC.PassPaymentService service
+      Just Payment.ParkingBooking -> DMSC.ParkingPaymentService service
+      Just DOrder.Wallet -> DMSC.JuspayWalletService service
+      Just DOrder.RideBooking -> DMSC.PaymentService service
+      _ -> DMSC.PaymentService service
+
+juspayWebhookHandler ::
+  ShortId DM.Merchant ->
+  Maybe Context.City ->
+  Maybe Payment.PaymentServiceType ->
+  Maybe Text ->
+  BasicAuthData ->
+  Value ->
+  Flow AckResponse
+juspayWebhookHandler merchantShortId mbCity mbServiceType mbPlaceId authData value = do
+  (paymentServiceConfig, merchantOperatingCity) <- fetchPaymentServiceConfig merchantShortId mbCity mbServiceType mbPlaceId Payment.Juspay
+  let commonMerchantOperatingCityId = Kernel.Types.Id.cast @DMOC.MerchantOperatingCity @DPayment.MerchantOperatingCity merchantOperatingCity.id
+  orderWebhookResponse <- Juspay.orderStatusWebhook paymentServiceConfig (DPayment.juspayWebhookService commonMerchantOperatingCityId) authData value
+  osr <- case orderWebhookResponse of
+    Nothing -> throwError $ InternalError "Order Contents not found."
+    Just osr' -> pure osr'
+  (orderShortId, status) <- getOrderData osr
+  logDebug $ "order short Id from Response bap webhook: " <> show orderShortId
+  whenJust mbServiceType $ \paymentServiceType -> do
+    Redis.whenWithLockRedis (mkOrderStatusCheckKey orderShortId status) 60 $ do
+      paymentOrder <- QOrder.findByShortId (ShortId orderShortId) >>= fromMaybeM (PaymentOrderNotFound orderShortId)
+      mocId <- paymentOrder.merchantOperatingCityId & fromMaybeM (InternalError "MerchantOperatingCityId not found in payment order")
+      person <- QP.findById (cast paymentOrder.personId) >>= fromMaybeM (InvalidRequest "Person not found")
+      ticketPlaceId <-
+        case paymentServiceType of
+          Payment.Normal -> do
+            ticketBooking <- QTB.findById (cast paymentOrder.id)
+            return $ ticketBooking <&> (.ticketPlaceId)
+          _ -> return Nothing
+      let orderStatusCall = Payment.orderStatus (cast paymentOrder.merchantId) (cast mocId) ticketPlaceId paymentServiceType (Just paymentOrder.personId.getId) person.clientSdkVersion paymentOrder.isMockPayment
+      void $ callWebhookHandlerWithOrderStatus merchantOperatingCity paymentServiceType (ShortId orderShortId) orderStatusCall
+  pure Ack
+  where
+    getOrderData osr = case osr of
+      Payment.OrderStatusResp {..} -> pure (orderShortId, transactionStatus)
+      _ -> throwError $ InternalError "Order Id not found in response."
+    callWebhookHandlerWithOrderStatus merchantOperatingCity paymentServiceType' orderShortId orderStatusCall = do
+      paymentOrder <- QOrder.findByShortId orderShortId >>= fromMaybeM (PaymentOrderNotFound orderShortId.getShortId)
+      let paymentServiceType = fromMaybe paymentServiceType' paymentOrder.paymentServiceType
+          fulfillmentHandler = mkFulfillmentHandler paymentServiceType (cast paymentOrder.merchantId) paymentOrder.id
+      SPayment.orderStatusHandler merchantOperatingCity.id fulfillmentHandler paymentServiceType paymentOrder orderStatusCall
+
+-- | Idempotent: confirm ride booking after payment success. Single place for Paytm EDC callback and rideBookingOrderStatusHandler.
+confirmRideBookingFromPaymentOrder :: DOrder.PaymentOrder -> Flow (DPayment.PaymentFulfillmentStatus, Maybe Text, Maybe Text)
+confirmRideBookingFromPaymentOrder paymentOrder = do
+  bookingIdText <- paymentOrder.domainEntityId & fromMaybeM (InvalidRequest "RideBooking order has no domainEntityId")
+  let bookingId = Id bookingIdText :: Id DRB.Booking
+      confirmLockKey = "RideBooking:Confirm:" <> bookingIdText
+      confirmTriggeredKey = "RideBooking:ConfirmTriggered:" <> bookingIdText
+  Redis.whenWithLockRedis confirmLockKey 60 $ do
+    alreadyTriggered <- Redis.get @Text confirmTriggeredKey
+    unless (alreadyTriggered == Just "1") $ do
+      onInitRes <- DOnInit.buildOnInitResFromBooking bookingId
+      confirmReq <- ACL.buildConfirmReqV2 onInitRes
+      void . withShortRetry $ CallBPP.confirmV2 onInitRes.bppUrl confirmReq onInitRes.merchant.id
+      Redis.setExp confirmTriggeredKey ("1" :: Text) 86400
+  pure (DPayment.FulfillmentSucceeded, Just bookingIdText, Nothing)
+
+-- | Paytm EDC callback: update order status; for RideBooking+CHARGED run confirm only (no PaymentStatus build). Other types use orderStatusHandlerWithRefunds.
+paytmEdcCallbackHandler :: PaytmEdcCallbackReq -> Flow AckResponse
+paytmEdcCallbackHandler req = do
+  let PaytmEdcCallbackReq {body = PaytmEdcCallbackBody {resultInfo = ResultInfo {resultStatus = statusText, resultCode = resultCode', resultMsg = resultMsg'}, merchantRefereneceNo = orderIdText, merchantTransactionId = merchantTxnId}, head = PaytmEdcCallbackHead {checksum = checksumValue}} = req
+      -- merchantRefereneceNo is our orderId (UUID) we sent to Paytm
+      -- merchantTransactionId is our orderShortId we sent to Paytm (Paytm may echo it back or use their own)
+      resultCode = Just resultCode'
+      resultMsg = Just resultMsg'
+      _checksumHash = Just checksumValue
+  logDebug $ "Paytm EDC callback received: " <> show req
+  -- Try finding by shortId first (merchantTransactionId), then by orderId (merchantRefereneceNo)
+  paymentOrder <-
+    QOrder.findByShortId (ShortId merchantTxnId)
+      >>= maybe (QOrder.findById (Id orderIdText) >>= fromMaybeM (PaymentOrderNotFound $ "orderId:" <> orderIdText <> " or shortId:" <> merchantTxnId)) pure
+  let lockKey = "PaytmEdcCallback:" <> getShortId paymentOrder.shortId
+      mappedStatus = paytmStatusToTransactionStatus statusText
+      paymentServiceType = fromMaybe DOrder.Normal paymentOrder.paymentServiceType
+  -- TODO: Validate checksumHash when Paytm merchant config is available
+  Redis.whenWithLockRedis lockKey 60 $ do
+    QOrder.updateStatus paymentOrder.id merchantTxnId mappedStatus
+    if paymentServiceType == DOrder.RideBooking
+      then when (mappedStatus == Payment.CHARGED) $ do
+        eitherResult <- withTryCatch "paytmEdcCallback:fulfillment" $ confirmRideBookingFromPaymentOrder paymentOrder
+        case eitherResult of
+          Right (fulfillmentStatus, domainEntityId, domainTransactionId) ->
+            void $ QOrder.updatePaymentFulfillmentStatus paymentOrder.id (Just fulfillmentStatus) domainEntityId domainTransactionId
+          Left err -> logError $ "Paytm EDC fulfillment failed: " <> show err
+      else do
+        let paymentStatusResp =
+              DPayment.PaymentStatus
+                { orderId = paymentOrder.id,
+                  orderShortId = paymentOrder.shortId,
+                  status = mappedStatus,
+                  bankErrorMessage = resultMsg,
+                  bankErrorCode = resultCode, -- Using resultCode (alphabetical) instead of resultCodeId (numeric)
+                  isRetried = Nothing,
+                  isRetargeted = Nothing,
+                  retargetLink = Nothing,
+                  refunds = [],
+                  payerVpa = Nothing,
+                  card = Nothing,
+                  paymentMethodType = Nothing,
+                  authIdCode = Nothing,
+                  txnUUID = Nothing,
+                  txnId = Just merchantTxnId,
+                  effectAmount = Nothing,
+                  offers = Nothing,
+                  paymentServiceType = paymentOrder.paymentServiceType,
+                  paymentFulfillmentStatus = paymentOrder.paymentFulfillmentStatus,
+                  domainEntityId = paymentOrder.domainEntityId,
+                  amount = paymentOrder.amount,
+                  validTill = paymentOrder.validTill,
+                  orderLoyaltyInfo = Nothing
+                }
+            fulfillmentHandler = mkFulfillmentHandler paymentServiceType (cast paymentOrder.merchantId) paymentOrder.id
+        void $
+          SPayment.orderStatusHandlerWithRefunds
+            fulfillmentHandler
+            paymentServiceType
+            paymentOrder
+            paymentOrder
+            paymentStatusResp
+  pure Ack
+
+rideBookingOrderStatusHandler ::
+  Id DOrder.PaymentOrder ->
+  Id DM.Merchant ->
+  DPayment.PaymentStatusResp ->
+  Flow (DPayment.PaymentFulfillmentStatus, Maybe Text, Maybe Text)
+rideBookingOrderStatusHandler orderId _merchantId paymentStatusResp = do
+  status <- DPayment.getTransactionStatus paymentStatusResp
+  case status of
+    Payment.CHARGED -> do
+      paymentOrder <- QOrder.findById orderId >>= fromMaybeM (PaymentOrderNotFound orderId.getId)
+      confirmRideBookingFromPaymentOrder paymentOrder
+    _ -> pure (DPayment.FulfillmentPending, Nothing, Nothing)
+
+mkFulfillmentHandler :: Payment.PaymentServiceType -> Id DM.Merchant -> Id DOrder.PaymentOrder -> SPayment.FulfillmentStatusHandler Flow
+mkFulfillmentHandler paymentServiceType merchantId orderId paymentStatusResp = case paymentServiceType of
+  DOrder.FRFSBooking -> FRFSTicketService.frfsOrderStatusHandler merchantId paymentStatusResp JMU.switchFRFSQuoteTierUtil
+  DOrder.FRFSBusBooking -> FRFSTicketService.frfsOrderStatusHandler merchantId paymentStatusResp JMU.switchFRFSQuoteTierUtil
+  DOrder.FRFSMultiModalBooking -> FRFSTicketService.frfsOrderStatusHandler merchantId paymentStatusResp JMU.switchFRFSQuoteTierUtil
+  DOrder.FRFSPassPurchase -> do
+    status <- DPayment.getTransactionStatus paymentStatusResp
+    Pass.passOrderStatusHandler orderId merchantId status
+  DOrder.ParkingBooking -> do
+    status <- DPayment.getTransactionStatus paymentStatusResp
+    ParkingBooking.parkingBookingOrderStatusHandler orderId merchantId status
+  DOrder.BBPS -> do
+    paymentFulfillStatus <- BBPS.bbpsOrderStatusHandler merchantId paymentStatusResp
+    pure (paymentFulfillStatus, Nothing, Nothing)
+  DOrder.RideBooking -> rideBookingOrderStatusHandler orderId merchantId paymentStatusResp
+  DOrder.BookingDeposit -> bookingDepositOrderStatusHandler orderId merchantId paymentStatusResp
+  _ -> SPayment.fallbackOrderStatusHandler paymentStatusResp
+
+mkOrderStatusCheckKey :: Text -> Payment.TransactionStatus -> Text
+mkOrderStatusCheckKey orderId status = "lockKey:orderId:" <> orderId <> ":status" <> show status
+
+-- FIXME payout
+stripeWebhookHandler,
+  stripeTestWebhookHandler ::
+    ShortId DM.Merchant ->
+    Maybe Context.City ->
+    Maybe Payment.PaymentServiceType ->
+    Maybe Text ->
+    Maybe Text ->
+    RawByteString ->
+    Flow AckResponse
+stripeWebhookHandler = stripeWebhookHandler' DMPM.LIVE
+stripeTestWebhookHandler = stripeWebhookHandler' DMPM.TEST
+
+stripeWebhookHandler' ::
+  DMPM.PaymentMode ->
+  ShortId DM.Merchant ->
+  Maybe Context.City ->
+  Maybe Payment.PaymentServiceType ->
+  Maybe Text ->
+  Maybe Text ->
+  RawByteString ->
+  Flow AckResponse
+stripeWebhookHandler' paymentMode merchantShortId mbCity mbServiceType mbPlaceId mbSigHeader rawBytes = withDynamicLogLevel "payment-mode" $ do
+  logDebug $ "paymentMode|webhook|endpointMode=" <> show paymentMode
+  let serviceName = case paymentMode of
+        DMPM.LIVE -> Payment.Stripe
+        DMPM.TEST -> Payment.StripeTest
+  (paymentServiceConfig, merchantOperatingCity) <- fetchPaymentServiceConfig merchantShortId mbCity mbServiceType mbPlaceId serviceName
+  let checkDuplicatedEvent eventId =
+        isDuplicateStripeWebhookEvent
+          (stripePaymentWebhookEventDedupKey paymentMode eventId)
+          stripeWebhookEventDedupTtl7Days
+  let modeCheckedWebhookAction resp respDump =
+        if resp.livemode /= (paymentMode == DMPM.LIVE)
+          then do
+            logInfo $ "paymentMode|webhook|livemode mismatch, ignoring. endpointMode=" <> show paymentMode <> " eventLivemode=" <> show resp.livemode
+            pure Ack
+          else stripeWebhookAction paymentMode merchantOperatingCity.id resp respDump
+  Stripe.serviceEventWebhook paymentServiceConfig checkDuplicatedEvent modeCheckedWebhookAction mbSigHeader rawBytes
+
+-- | TTL for Stripe webhook event deduplication (covers Stripe retry window with margin).
+stripeWebhookEventDedupTtl7Days :: Redis.ExpirationTime
+stripeWebhookEventDedupTtl7Days = 7 * 24 * 60 * 60
+
+stripePaymentWebhookEventDedupKey :: DMPM.PaymentMode -> Id Stripe.Event -> Text
+stripePaymentWebhookEventDedupKey paymentMode eventId = "Stripe:Payment:" <> show paymentMode <> ":Webhook:Event-" <> eventId.getId
+
+-- | Marks a Stripe webhook event as seen (SET NX + EX). Returns 'True' if this delivery is a duplicate.
+isDuplicateStripeWebhookEvent :: (Redis.HedisFlow m env, TryException m) => Text -> Redis.ExpirationTime -> m Bool
+isDuplicateStripeWebhookEvent key ttl =
+  not <$> Redis.setNxExpire key ttl True
+
+-- | True when the event targets an order created in the other Stripe environment.
+--   Legacy orders read back as 'Juspay' (unknown) and are allowed through.
+isCrossModeOrder :: DMPM.PaymentMode -> Maybe Text -> Flow Bool
+isCrossModeOrder _ Nothing = pure False
+isCrossModeOrder paymentMode (Just orderShortId) = do
+  let expectedService = case paymentMode of
+        DMPM.LIVE -> Payment.Stripe
+        DMPM.TEST -> Payment.StripeTest
+  QOrder.findByShortId (ShortId orderShortId) >>= \case
+    Nothing -> pure False
+    Just order -> do
+      let mismatched = order.serviceProvider `elem` [Payment.Stripe, Payment.StripeTest] && order.serviceProvider /= expectedService
+      logDebug $ "paymentMode|webhook|orderShortId=" <> orderShortId <> " orderServiceProvider=" <> show order.serviceProvider <> " expected=" <> show expectedService <> " crossMode=" <> show mismatched
+      when mismatched $
+        logError $
+          "Stripe webhook targets an order from another environment; ignoring. orderShortId=" <> orderShortId
+            <> " endpointMode="
+            <> show paymentMode
+            <> " orderServiceProvider="
+            <> show order.serviceProvider
+      pure mismatched
+
+stripeWebhookAction ::
+  DMPM.PaymentMode ->
+  Id DMOC.MerchantOperatingCity ->
+  PEInterface.ServiceEventResp ->
+  Text ->
+  Flow AckResponse
+stripeWebhookAction paymentMode merchantOperatingCityId resp respDump = do
+  let stripeWebhookData = DPayment.mkStripeWebhookData resp.eventData
+  let commonMerchantOperatingCityId = Kernel.Types.Id.cast @DMOC.MerchantOperatingCity @DPayment.MerchantOperatingCity merchantOperatingCityId
+  let eventOrderShortId = case stripeWebhookData of
+        DPayment.RefundWebhookData refundInfo -> refundInfo.orderShortId
+        DPayment.OrderTxnWebhookData (mbOrderShortId, _) -> mbOrderShortId
+        _ -> Nothing
+  crossMode <- isCrossModeOrder paymentMode eventOrderShortId
+  if crossMode
+    then pure Ack
+    else case stripeWebhookData of
+      DPayment.RefundWebhookData refundInfo -> do
+        orderId <- (Id @DOrder.PaymentOrder <$>) $ refundInfo.orderId & fromMaybeM (InvalidRequest "orderId not found")
+        refundsId <- (Id @DRefunds.Refunds <$>) $ refundInfo.refundsId & fromMaybeM (InvalidRequest "refundsId not found")
+        Redis.whenWithLockRedis (DRidePayment.refundRequestProccessingKey orderId) 60 $ do
+          void $ DPayment.stripeWebhookService commonMerchantOperatingCityId resp respDump stripeWebhookData
+          QRefundRequest.findByRefundsId (Just refundsId) >>= \case
+            Nothing -> logInfo $ "No refund request found for update in webhook with refundsId: " <> refundsId.getId
+            Just refundRequest -> do
+              let updStatus = DRidePayment.castRefundRequestStatus refundInfo.status
+              DRidePayment.processRefundResult refundRequest updStatus Nothing
+        pure Ack
+      DPayment.OrderTxnWebhookData (_mbOrderShortId, orderTxn) -> do
+        ackResp <- DPayment.stripeWebhookService commonMerchantOperatingCityId resp respDump stripeWebhookData
+        whenJust _mbOrderShortId $ \orderShortId -> do
+          mbOrder <- QOrder.findByShortId (ShortId orderShortId)
+          whenJust mbOrder $ \order ->
+            withRideIdFromOrderObj order $ \rideId -> do
+              let status = orderTxn.transactionStatus
+              pendingEntries <- RidePaymentFinance.findUnsettledRidePaymentEntries rideId
+              case pendingEntries of
+                [] -> pure ()
+                (firstEntry : _) -> do
+                  let entryIds = map (.id) pendingEntries
+                  case status of
+                    KPayment.CHARGED -> do
+                      let ctx =
+                            RidePaymentFinance.buildRiderFinanceCtx
+                              order.merchantId.getId
+                              (maybe "" (.getId) order.merchantOperatingCityId)
+                              firstEntry.currency
+                              True
+                              order.personId.getId
+                              rideId
+                              Nothing
+                              Nothing
+                              Nothing
+                      RidePaymentFinance.settleRidePaymentLedger ctx entryIds RidePaymentFinance.settledReasonRidePayment
+                        >>= \case
+                          Right () -> logInfo $ "Settled " <> show (length entryIds) <> " pending ledger entries via webhook for ride: " <> rideId
+                          Left err -> logError $ "Webhook failed to settle ledger entries for ride " <> rideId <> ": " <> show err
+                    KPayment.CANCELLED -> do
+                      RidePaymentFinance.voidRidePaymentLedger entryIds
+                      logInfo $ "Voided " <> show (length entryIds) <> " pending ledger entries via webhook for ride: " <> rideId
+                    _ -> pure ()
+        pure ackResp
+      _ -> DPayment.stripeWebhookService commonMerchantOperatingCityId resp respDump stripeWebhookData
+
+withRideIdFromOrderObj :: DOrder.PaymentOrder -> (Text -> Flow ()) -> Flow ()
+withRideIdFromOrderObj order action =
+  whenJust order.domainEntityId $ \rideId ->
+    unless (Data.Text.null rideId) $ action rideId
+
+----------------------------------------- wallet apis -----------------------------------------------------
+
+postWalletRecharge ::
+  (Id DP.Person, Id DM.Merchant) ->
+  PaymentAPI.WalletRechargeReq ->
+  Flow Payment.CreateOrderResp
+postWalletRecharge (personId, merchantId) req = do
+  person <- QP.findById personId >>= fromMaybeM (PersonNotFound "personId")
+  paymentOrderId <- generateGUID
+  operationId <- generateShortId
+  personEmail <- mapM decrypt person.email
+  personPhone <- person.mobileNumber & fromMaybeM (PersonFieldNotPresent "mobileNumber") >>= decrypt
+  nwAddress <- asks (.nwAddress)
+  let paymentRules =
+        Payment.PaymentRules
+          { paymentFlows =
+              Payment.PaymentFlows
+                { loyaltyOsTopup =
+                    Payment.PaymentFlowStatus
+                      { status = "REQUIRED",
+                        info = Payment.PaymentFlowInfo {programId = req.programId}
+                      }
+                }
+          }
+  udf1 <- SLUtils.getPersonUdf1 person
+  offerBasket <- Payment.mkOfferBasket merchantId person.merchantOperatingCityId Nothing DOrder.Wallet (fromIntegral req.pointsAmount) 1
+  let createOrderReq =
+        Payment.CreateOrderReq
+          { orderId = paymentOrderId,
+            orderShortId = operationId.getShortId,
+            amount = fromIntegral req.pointsAmount,
+            customerId = person.id.getId,
+            customerEmail = fromMaybe "growth@nammayatri.in" personEmail,
+            customerPhone = personPhone,
+            customerFirstName = person.firstName,
+            customerLastName = person.lastName,
+            createMandate = Nothing,
+            mandateMaxAmount = Nothing,
+            mandateFrequency = Nothing,
+            mandateEndDate = Nothing,
+            mandateStartDate = Nothing,
+            optionsGetUpiDeepLinks = Nothing,
+            metadataExpiryInMins = Nothing,
+            metadataGatewayReferenceId = Nothing,
+            webhookUrl = Just nwAddress,
+            splitSettlementDetails = Nothing,
+            basket = offerBasket,
+            paymentRules = Just paymentRules,
+            autoRefundPostSuccess = Nothing,
+            paymentFilter = Nothing,
+            udf1 = udf1,
+            udf2 = Nothing
+          }
+
+  let commonMerchantId = cast @DM.Merchant @DPayment.Merchant merchantId
+      commonPersonId = cast @DP.Person @DPayment.Person personId
+      commonMerchantOperatingCityId = cast @DMOC.MerchantOperatingCity @DPayment.MerchantOperatingCity person.merchantOperatingCityId
+      createOrderCall = Payment.createOrder merchantId person.merchantOperatingCityId Nothing DOrder.Wallet (Just person.id.getId) person.clientSdkVersion Nothing
+  mbPaymentOrderValidTill <- Payment.getPaymentOrderValidity merchantId person.merchantOperatingCityId Nothing DOrder.Wallet
+  isMetroTestTransaction <- asks (.isMetroTestTransaction)
+  mbOrderResp <- DPayment.createOrderService commonMerchantId (Just commonMerchantOperatingCityId) commonPersonId mbPaymentOrderValidTill Nothing DOrder.Wallet isMetroTestTransaction createOrderReq createOrderCall Nothing False Nothing False
+  orderResp <- mbOrderResp & fromMaybeM (InternalError "Failed to create payment order")
+  pure orderResp
+
+getWalletBalance ::
+  (Id DP.Person, Id DM.Merchant) ->
+  Flow Wallet.WalletBalanceData
+getWalletBalance (personId, merchantId) = do
+  person <- QP.findById personId >>= fromMaybeM (PersonNotFound personId.getId)
+  personWallet <- QPersonWallet.findByPersonId personId.getId >>= fromMaybeM (InternalError $ "Person wallet not found for personId: " <> show personId.getId)
+  let merchantOperatingCityId = person.merchantOperatingCityId
+  let walletBalanceReq = Wallet.WalletBalanceReq {customerId = personWallet.personId, requireHistory = Just True}
+      walletBalanceCall = TWallet.walletBalance merchantId merchantOperatingCityId
+  walletBalanceResp <- DPayment.walletBalanceService walletBalanceReq walletBalanceCall
+  case walletBalanceResp.success of
+    True -> do
+      now <- getCurrentTime
+      QPersonWallet.updateByPrimaryKey personWallet {DPersonWallet.pointsAmount = walletBalanceResp.walletData.pointsAmount, DPersonWallet.cashAmount = walletBalanceResp.walletData.cashAmount, DPersonWallet.expiredBalance = walletBalanceResp.walletData.expiredBalance, DPersonWallet.cashFromPointsRedemption = walletBalanceResp.walletData.cashFromPointsRedemption, DPersonWallet.usablePointsAmount = walletBalanceResp.walletData.usablePointsAmount, DPersonWallet.usableCashAmount = walletBalanceResp.walletData.usableCashAmount, DPersonWallet.updatedAt = now}
+      return walletBalanceResp.walletData
+    False -> throwError (InternalError $ "Failed to get wallet balance for personId: " <> show personId.getId)
+
+-- redeemWallet :: (PaymentBeamFlow.BeamFlow m r, MonadThrow m) => Id.Id DP.Person -> HighPrecMoney -> m (Maybe DWalletRewardPosting.WalletPostingStatus)
+-- redeemWallet personId pointsAmount = do
+--   personWallet <- QPersonWallet.findByPersonId personId.getId >>= fromMaybeM (InternalError $ "Person wallet not found for personId: " <> show personId.getId)
+--   walletRewardPosting <- QWalletRewardPosting.findByWalletIdAndStatus personWallet.id DWalletRewardPosting.NEW
+
+--   walletRewardPostingId <- generateGUID
+--   operationId <- generateShortId
+--   now <- getCurrentTime
+
+--   ------------- call payout service here ---------------
+
+--   -- payoutConfig <- CPC.findByPrimaryKey merchOpCity vehicleCategory Nothing >>= fromMaybeM (PayoutConfigNotFound (show vehicleCategory) merchOpCity.getId)
+--   -- let entityName = DPayment.BACKLOG
+--   --     createPayoutOrderCall = Payout.createPayoutOrder person.clientSdkVersion person.merchantId merchOpCity (Just person.id.getId)
+--   --     createPayoutOrderReq = DPayment.mkCreatePayoutOrderReq uid pendingAmount phoneNo person.email personId.getId payoutConfig.remark (Just person.firstName) vpa payoutConfig.orderType False
+--   -- void $ DPayment.createPayoutService (cast person.merchantId) (Just $ cast merchOpCity) (cast personId) (Just statsIds) (Just entityName) (show merchantOperatingCity.city) createPayoutOrderReq createPayoutOrderCall
+
+--   let walletRewardPosting =
+--         DWalletRewardPosting.WalletRewardPosting
+--           { id = walletRewardPostingId,
+--             shortId = operationId,
+--             walletId = personWallet.id,
+--             pointsAmount = pointsAmount,
+--             cashAmount = HighPrecMoney {getHighPrecMoney = 0},
+--             postingType = WalletInterface.REDEEM,
+--             status = DWalletRewardPosting.NEW,
+--             createdAt = now,
+--             updatedAt = now,
+--             merchantId = "",
+--             merchantOperatingCityId = Nothing
+--           }
+--   QWalletRewardPosting.create walletRewardPosting
+--   return (Just DWalletRewardPosting.NEW)

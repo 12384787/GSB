@@ -1,0 +1,799 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE TypeApplications #-}
+{-
+ Copyright 2022-23, Juspay India Pvt Ltd
+
+ This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License
+
+ as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. This program
+
+ is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+
+ or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details. You should have received a copy of
+
+ the GNU Affero General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+-}
+{-# OPTIONS_GHC -Wno-orphans #-}
+
+module Storage.Queries.Person where
+
+import API.Types.ProviderPlatform.Management.Endpoints.Account (FleetOwnerStatus (..))
+import qualified Data.List.NonEmpty as NE
+import qualified Data.Map.Strict as M
+import qualified Data.Text as T
+import qualified Database.Beam as B
+import Database.Beam.Postgres (Pg)
+import qualified Domain.Types.Entity as DEntity
+import Domain.Types.Merchant as Merchant
+import Domain.Types.MerchantAccess as MerchantAccess
+import Domain.Types.Person as Person
+import qualified Domain.Types.Person.Type as DPT
+import Domain.Types.Role as Role
+import qualified EulerHS.Language as L
+import Kernel.Beam.Functions
+import Kernel.External.Encryption
+import qualified Kernel.External.Types as KET
+import Kernel.Prelude
+import qualified Kernel.Types.Beckn.City as City
+import Kernel.Types.Error
+import Kernel.Types.Id
+import Kernel.Utils.Common
+import Sequelize as Se
+import Storage.Beam.BeamFlow
+import qualified Storage.Beam.Common as SBC
+import qualified Storage.Beam.EntityAccess as BeamEA
+import qualified Storage.Beam.MerchantAccess as BeamMA
+import qualified Storage.Beam.Person as BeamP
+import qualified Storage.Beam.Role as BeamR
+import Storage.Queries.MerchantAccess ()
+import Storage.Queries.Role ()
+
+create :: BeamFlow m r => Person -> m ()
+create = createWithKV
+
+-- Bypasses the KV write path so writes across two tables share one Postgres
+-- BEGIN/COMMIT. Readers hit Postgres on cache miss (findWithKVConnector fallback).
+createPersonsWithAccessAtomic ::
+  BeamFlow m r =>
+  [(Person, MerchantAccess.MerchantAccess)] ->
+  m ()
+createPersonsWithAccessAtomic [] = pure ()
+createPersonsWithAccessAtomic pairs = do
+  let personRows = map (toTType' . fst) pairs
+      accessRows = map (toTType' . snd) pairs
+  runMasterTransaction "PT bulkUpsert" $ do
+    L.insertRows $ B.insert (SBC.person SBC.atlasDB) (B.insertValues personRows)
+    L.insertRows $ B.insert (SBC.merchantAccess SBC.atlasDB) (B.insertValues accessRows)
+
+-- Generic BEGIN/COMMIT wrapper: any multi-statement batch writes can reuse this
+-- instead of hand-rolling `getMasterBeamConfig + L.runTransaction + case result`.
+runMasterTransaction ::
+  BeamFlow m r =>
+  Text ->
+  L.SqlDB Pg () ->
+  m ()
+runMasterTransaction label action = do
+  dbConf <- getMasterBeamConfig
+  result <- L.runTransaction dbConf action
+  case result of
+    Left err -> throwError (InternalError $ label <> " failed: " <> T.pack (show err))
+    Right _ -> pure ()
+
+findById ::
+  BeamFlow m r =>
+  Id Person ->
+  m (Maybe Person)
+findById personId = findOneWithKV [Se.Is BeamP.id $ Se.Eq $ getId personId]
+
+findByEmailWithType ::
+  forall (t :: DPT.DashboardTypeTag) m r.
+  (BeamFlow m r, EncFlow m r, DPT.KnownDashboardType t) =>
+  Text ->
+  m (Maybe Person)
+findByEmailWithType email = do
+  emailDbHash <- getDbHash (T.toLower email)
+  findOneWithKV
+    [ Se.Is BeamP.emailHash $ Se.Eq $ Just emailDbHash,
+      Se.Is BeamP.dashboardType $ Se.Eq (DPT.dashboardTypeVal (Proxy @t))
+    ]
+
+findByEmailOrMobile ::
+  (BeamFlow m r, EncFlow m r) =>
+  Maybe Text ->
+  Text ->
+  Text ->
+  m [Person]
+findByEmailOrMobile mbEmail mobileNumber mobileCountryCode = do
+  mobileDbHash <- getDbHash mobileNumber
+  case mbEmail of
+    Just email -> do
+      emailDbHash <- getDbHash email
+      findAllWithKV
+        [ Se.Or
+            [ Se.And
+                [ Se.Is BeamP.mobileNumberHash $ Se.Eq mobileDbHash,
+                  Se.Is BeamP.mobileCountryCode $ Se.Eq mobileCountryCode
+                ],
+              Se.Is BeamP.emailHash $ Se.Eq $ Just emailDbHash
+            ]
+        ]
+    Nothing -> findAllWithKV [Se.Is BeamP.mobileNumberHash $ Se.Eq mobileDbHash, Se.Is BeamP.mobileCountryCode $ Se.Eq mobileCountryCode]
+
+findByEmail ::
+  (BeamFlow m r, EncFlow m r) =>
+  Text ->
+  m (Maybe Person)
+findByEmail = findByEmailWithType @'DPT.DefaultDashboard
+
+findAllByIds ::
+  BeamFlow m r =>
+  [Id Person] ->
+  m [Person]
+findAllByIds personIds = findAllWithKV [Se.Is BeamP.id $ Se.In $ getId <$> personIds]
+
+-- Merchant scope needs merchant_access ⋈ person, which the KV helpers can't join, so: find
+-- holders by hash, then confirm membership. Unwrapped reads hit master (runInReplica is the
+-- opt-in), so replica lag inside the per-merchant lock can't hide a token committed by a prior batch.
+findTokenNoConflictsForMerchant ::
+  BeamFlow m r =>
+  Id Merchant.Merchant ->
+  [DbHash] ->
+  m [(DbHash, Id Person)]
+findTokenNoConflictsForMerchant _ [] = pure []
+findTokenNoConflictsForMerchant merchantId tokenHashes = do
+  holders <- findAllWithKV [Se.Is BeamP.tokenNoHash $ Se.In $ map Just tokenHashes]
+  memberIds <-
+    if null holders
+      then pure []
+      else
+        map (.personId)
+          <$> findAllWithKV
+            [ Se.And
+                [ Se.Is BeamMA.merchantId $ Se.Eq (getId merchantId),
+                  Se.Is BeamMA.personId $ Se.In (map (getId . (.id)) holders)
+                ]
+            ]
+  pure [(eh.hash, p.id) | p <- holders, Just eh <- [p.tokenNo], p.id `elem` memberIds]
+
+-- Keeps the legacy hash-only row lossless across a read/modify/write cycle: the placeholder
+-- ciphertext rebuilt in FromTType' maps back to NULL, not to ''.
+tokenNoEncryptedColumn :: Maybe (EncryptedHashedField 'AsEncrypted Text) -> Maybe Text
+tokenNoEncryptedColumn mbTokenNo =
+  mbTokenNo >>= \t ->
+    if DPT.isLegacyTokenNoPlaceholder t then Nothing else Just (unEncrypted t.encrypted)
+
+-- Key kept as bulkCreate: renaming it would stop an old binary mid-rollout excluding a new one.
+bulkUpsertLockKey :: ShortId Merchant -> Text
+bulkUpsertLockKey merchantShortId = "Person:bulkCreate:merchant:" <> merchantShortId.getShortId
+
+-- Sized for a 500-row batch.
+bulkUpsertLockTtl :: Int
+bulkUpsertLockTtl = 300
+
+-- Every owner of the hash must be self: picking one would ignore a second, non-self holder.
+requireTokenNoFree :: MonadFlow m => M.Map DbHash [Id Person] -> DbHash -> Maybe (Id Person) -> Text -> m ()
+requireTokenNoFree conflicts tokenHash mbSelfId rowTag =
+  unless (all ((== mbSelfId) . Just) (M.findWithDefault [] tokenHash conflicts)) $
+    throwError (InvalidRequest (rowTag <> "tokenNo is already in use for this merchant"))
+
+findAllByIdsAndReceiveNotification ::
+  BeamFlow m r =>
+  [Id Person] ->
+  m [Person]
+findAllByIdsAndReceiveNotification personIds = findAllWithKV [Se.And [Se.Is BeamP.id $ Se.In $ getId <$> personIds, Se.Or [Se.Is BeamP.receiveNotification $ Se.Eq $ Just True, Se.Is BeamP.receiveNotification $ Se.Eq Nothing]]]
+
+findAllByRoleWithType ::
+  forall (t :: DPT.DashboardTypeTag) m r.
+  (BeamFlow m r, DPT.KnownDashboardType t) =>
+  Id Role ->
+  m [Person]
+findAllByRoleWithType roleId =
+  findAllWithKV
+    [ Se.Is BeamP.roleId $ Se.Eq $ getId roleId,
+      Se.Is BeamP.dashboardType $ Se.Eq (DPT.dashboardTypeVal (Proxy @t))
+    ]
+
+findAllByRole ::
+  BeamFlow m r =>
+  Id Role ->
+  m [Person]
+findAllByRole roleId = findAllByRoleWithType @'DPT.DefaultDashboard roleId
+
+findAllByRoleAndReciveNotificationWithType ::
+  forall (t :: DPT.DashboardTypeTag) m r.
+  (BeamFlow m r, DPT.KnownDashboardType t) =>
+  Id Role ->
+  m [Person]
+findAllByRoleAndReciveNotificationWithType roleId = findAllWithKV [Se.And [Se.Is BeamP.roleId $ Se.Eq $ getId roleId, Se.Or [Se.Is BeamP.receiveNotification $ Se.Eq $ Just True, Se.Is BeamP.receiveNotification $ Se.Eq Nothing], Se.Is BeamP.dashboardType $ Se.Eq (DPT.dashboardTypeVal (Proxy @t))]]
+
+findAllByRoleAndReciveNotification ::
+  BeamFlow m r =>
+  Id Role ->
+  m [Person]
+findAllByRoleAndReciveNotification roleId = findAllByRoleAndReciveNotificationWithType @'DPT.DefaultDashboard roleId
+
+findByEmailAndPasswordWithType ::
+  forall (t :: DPT.DashboardTypeTag) m r.
+  (BeamFlow m r, EncFlow m r, DPT.KnownDashboardType t) =>
+  Text ->
+  Text ->
+  m (Maybe Person)
+findByEmailAndPasswordWithType email password = do
+  emailDbHash <- getDbHash (T.toLower email)
+  passwordDbHash <- getDbHash password
+  findOneWithKV
+    [ Se.Is BeamP.emailHash $ Se.Eq $ Just emailDbHash,
+      Se.Is BeamP.passwordHash $ Se.Eq $ Just passwordDbHash,
+      Se.Is BeamP.dashboardType $ Se.Eq (DPT.dashboardTypeVal (Proxy @t))
+    ]
+
+findByEmailAndPassword ::
+  (BeamFlow m r, EncFlow m r) =>
+  Text ->
+  Text ->
+  m (Maybe Person)
+findByEmailAndPassword = findByEmailAndPasswordWithType @'DPT.DefaultDashboard
+
+findByMobileNumberWithType ::
+  forall (t :: DPT.DashboardTypeTag) m r.
+  (BeamFlow m r, EncFlow m r, DPT.KnownDashboardType t) =>
+  Text ->
+  Text ->
+  m (Maybe Person)
+findByMobileNumberWithType mobileNumber mobileCountryCode = do
+  mobileDbHash <- getDbHash mobileNumber
+  findOneWithKV
+    [ Se.Is BeamP.mobileNumberHash $ Se.Eq mobileDbHash,
+      Se.Is BeamP.mobileCountryCode $ Se.Eq mobileCountryCode,
+      Se.Is BeamP.dashboardType $ Se.Eq (DPT.dashboardTypeVal (Proxy @t))
+    ]
+
+findByMobileNumber ::
+  forall m r.
+  (BeamFlow m r, EncFlow m r) =>
+  Text ->
+  Text ->
+  m (Maybe Person)
+findByMobileNumber = findByMobileNumberWithType @'DPT.DefaultDashboard
+
+findByMobileNumberAndRoleIdWithType ::
+  forall (t :: DPT.DashboardTypeTag) m r.
+  (BeamFlow m r, EncFlow m r, DPT.KnownDashboardType t) =>
+  Text ->
+  Text ->
+  Id Role ->
+  m (Maybe Person)
+findByMobileNumberAndRoleIdWithType mobileNumber mobileCountryCode roleId = do
+  mobileDbHash <- getDbHash mobileNumber
+  findOneWithKV [Se.And [Se.Is BeamP.mobileNumberHash $ Se.Eq mobileDbHash, Se.Is BeamP.mobileCountryCode $ Se.Eq mobileCountryCode, Se.Is BeamP.roleId $ Se.Eq $ getId roleId, Se.Is BeamP.dashboardType $ Se.Eq (DPT.dashboardTypeVal (Proxy @t))]]
+
+findByMobileNumberAndRoleId ::
+  (BeamFlow m r, EncFlow m r) =>
+  Text ->
+  Text ->
+  Id Role ->
+  m (Maybe Person)
+findByMobileNumberAndRoleId mobileNumber mobileCountryCode roleId = findByMobileNumberAndRoleIdWithType @'DPT.DefaultDashboard mobileNumber mobileCountryCode roleId
+
+findByMobileNumberAndRoleIdsWithType ::
+  forall (t :: DPT.DashboardTypeTag) m r.
+  (BeamFlow m r, EncFlow m r, DPT.KnownDashboardType t) =>
+  Text ->
+  Text ->
+  [Id Role] ->
+  m (Maybe Person)
+findByMobileNumberAndRoleIdsWithType mobileNumber mobileCountryCode roleIds = do
+  mobileDbHash <- getDbHash mobileNumber
+  findOneWithKV [Se.And [Se.Is BeamP.mobileNumberHash $ Se.Eq mobileDbHash, Se.Is BeamP.mobileCountryCode $ Se.Eq mobileCountryCode, Se.Is BeamP.roleId $ Se.In $ getId <$> roleIds, Se.Is BeamP.dashboardType $ Se.Eq (DPT.dashboardTypeVal (Proxy @t))]]
+
+findByMobileNumberAndRoleIds ::
+  (BeamFlow m r, EncFlow m r) =>
+  Text ->
+  Text ->
+  [Id Role] ->
+  m (Maybe Person)
+findByMobileNumberAndRoleIds mobileNumber mobileCountryCode roleIds = findByMobileNumberAndRoleIdsWithType @'DPT.DefaultDashboard mobileNumber mobileCountryCode roleIds
+
+updatePersonVerifiedStatus :: BeamFlow m r => Id Person -> Bool -> m ()
+updatePersonVerifiedStatus personId verified = do
+  now <- getCurrentTime
+  updateWithKV
+    [ Se.Set BeamP.verified $ Just verified,
+      Se.Set BeamP.updatedAt now
+    ]
+    [ Se.Is BeamP.id $ Se.Eq $ getId personId
+    ]
+
+updatePersonUpsertableFields :: BeamFlow m r => Person -> m ()
+updatePersonUpsertableFields p =
+  updateWithKV
+    [ Se.Set BeamP.firstName p.firstName,
+      Se.Set BeamP.lastName p.lastName,
+      Se.Set BeamP.roleId (getId p.roleId),
+      Se.Set BeamP.emailEncrypted (p.email <&> (unEncrypted . (.encrypted))),
+      Se.Set BeamP.emailHash (p.email <&> (.hash)),
+      Se.Set BeamP.dashboardAccessType p.dashboardAccessType,
+      Se.Set BeamP.tokenNoEncrypted (tokenNoEncryptedColumn p.tokenNo),
+      Se.Set BeamP.tokenNoHash (p.tokenNo <&> (.hash)),
+      Se.Set BeamP.vpaEncrypted (p.vpa <&> (unEncrypted . (.encrypted))),
+      Se.Set BeamP.vpaHash (p.vpa <&> (.hash)),
+      Se.Set BeamP.verified p.verified,
+      Se.Set BeamP.updatedAt p.updatedAt
+    ]
+    [Se.Is BeamP.id $ Se.Eq $ getId p.id]
+
+findAllWithLimitOffset ::
+  BeamFlow m r =>
+  Maybe Text ->
+  Maybe DbHash ->
+  Maybe Integer ->
+  Maybe Integer ->
+  Maybe (Id Person.Person) ->
+  m [(Person, Role, [ShortId Merchant.Merchant], [City.City])]
+findAllWithLimitOffset mbSearchString mbSearchStrDBHash mbLimit mbOffset personId = do
+  dbConf <- getReplicaBeamConfig
+  res <- L.runDB dbConf $
+    L.findRows $
+      B.select $
+        B.limit_ limitVal $
+          B.offset_ offsetVal $
+            B.orderBy_ (\(person, _, _) -> B.desc_ person.createdAt) $
+              B.filter_'
+                ( \(person, _role, _) ->
+                    ( maybe (B.sqlBool_ $ B.val_ True) (\searchString -> B.sqlBool_ (B.lower_ (B.concat_ [person.firstName, B.val_ " ", person.lastName]) `B.like_` B.val_ ("%" <> T.toLower (escapeLikeLiteral searchString) <> "%"))) mbSearchString
+                        B.||?. maybe (B.sqlBool_ $ B.val_ True) (\searchStrDBHash -> person.mobileNumberHash B.==?. B.val_ searchStrDBHash) mbSearchStrDBHash
+                        B.||?. maybe (B.sqlBool_ $ B.val_ True) (\searchStrDBHash -> person.emailHash B.==?. B.val_ (Just searchStrDBHash)) mbSearchStrDBHash
+                    )
+                      B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\defaultPerson -> person.id B.==?. B.val_ (getId defaultPerson)) personId
+                )
+                $ do
+                  person <- B.all_ (SBC.person SBC.atlasDB)
+                  role <- B.join_' (SBC.role SBC.atlasDB) (\role -> BeamP.roleId person B.==?. BeamR.id role)
+                  merchantAccess <- B.leftJoin_' (B.all_ $ SBC.merchantAccess SBC.atlasDB) (\merchantAccess -> BeamP.id person B.==?. BeamMA.personId merchantAccess)
+                  pure (person, role, merchantAccess)
+  case res of
+    Right res' -> do
+      finalRes <- forM res' $ \(person, role, mbMerchantAccess) -> runMaybeT $ do
+        p <- MaybeT $ fromTType' person
+        r <- MaybeT $ fromTType' role
+        ma <- forM mbMerchantAccess (MaybeT . fromTType')
+        pure (p, r, ma)
+      pure $ groupByPerson $ catMaybes finalRes
+    Left _ -> pure []
+  where
+    limitVal = fromMaybe 100 mbLimit
+    offsetVal = fromMaybe 0 mbOffset
+    groupByPerson ::
+      [(Person, Role, Maybe MerchantAccess)] ->
+      [(Person, Role, [ShortId Merchant.Merchant], [City.City])]
+    groupByPerson inputList =
+      map processGroup $ groupByPerson' inputList
+
+    groupByPerson' ::
+      [(Person, Role, Maybe MerchantAccess)] ->
+      [NonEmpty (Person, Role, Maybe MerchantAccess)]
+    groupByPerson' = NE.groupBy ((==) `on` (\(p, _, _) -> p.id))
+
+    processGroup ::
+      NonEmpty (Person, Role, Maybe MerchantAccess) ->
+      (Person, Role, [ShortId Merchant.Merchant], [City.City])
+    processGroup group =
+      let (person, role, _) = NE.head group
+          merchantAccessList = mapMaybe (\(_, _, ma) -> ma) $ toList group
+          cities = merchantAccessList <&> (.operatingCity)
+          merchantIds = merchantAccessList <&> MerchantAccess.merchantShortId
+       in (person, role, merchantIds, cities)
+
+-- Interpolated into a LIKE pattern, so unescaped %/_ act as wildcards; a bare "%" matched every row.
+escapeLikeLiteral :: Text -> Text
+escapeLikeLiteral = T.concatMap $ \c -> case c of
+  '\\' -> "\\\\"
+  '%' -> "\\%"
+  '_' -> "\\_"
+  _ -> T.singleton c
+
+-- Not KV: Sequelize's Clause is single-table (Is binds one Column table value) with no join,
+-- subquery or aggregate constructor. This needs person x role, a correlated EXISTS on
+-- merchant_access (tenancy) and on entity_access (depot filter), lower(concat_ [firstName, ' ', lastName])
+-- LIKE (case-insensitive, space-separated so "First Last" matches), and COUNT(*) for totalCount. Decomposing into ID-set lookups would move the tenancy
+-- filter out of SQL and pull every merchant_access row for the merchant on each page.
+-- Filter is duplicated, not shared: aggregate_ nests at a different Beam scope than the paged select, so one local binding cannot serve both. Keep the copies in sync.
+findAllPTWithLimitOffset ::
+  BeamFlow m r =>
+  Id Merchant.Merchant ->
+  Maybe Text ->
+  Maybe DbHash ->
+  Maybe Text ->
+  Maybe (Id DEntity.Entity) ->
+  Maybe Integer ->
+  Maybe Integer ->
+  m ([(Person, Role)], Int)
+findAllPTWithLimitOffset callerMerchantId mbSearchString mbSearchStrDBHash mbRoleName mbEntityId mbLimit mbOffset = do
+  dbConf <- getReplicaBeamConfig
+  pageRes <- L.runDB dbConf $
+    L.findRows $
+      B.select $
+        B.limit_ limitVal $
+          B.offset_ offsetVal $
+            B.orderBy_ (\(person, _role) -> B.desc_ person.createdAt) $
+              B.filter_'
+                ( \(person, role) ->
+                    ( maybe (B.sqlBool_ $ B.val_ True) (\searchString -> B.sqlBool_ (B.lower_ (B.concat_ [person.firstName, B.val_ " ", person.lastName]) `B.like_` B.val_ ("%" <> T.toLower (escapeLikeLiteral searchString) <> "%"))) mbSearchString
+                        B.||?. maybe (B.sqlBool_ $ B.val_ True) (\searchStrDBHash -> person.mobileNumberHash B.==?. B.val_ searchStrDBHash) mbSearchStrDBHash
+                        B.||?. maybe (B.sqlBool_ $ B.val_ True) (\searchStrDBHash -> person.emailHash B.==?. B.val_ (Just searchStrDBHash)) mbSearchStrDBHash
+                    )
+                      -- A tokenNo is what makes an account a PT login, so it defines the base set.
+                      B.&&?. B.sqlBool_ (B.isJust_ (BeamP.tokenNoHash person))
+                      B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\roleName -> BeamR.name role B.==?. B.val_ roleName) mbRoleName
+                      B.&&?. B.sqlBool_
+                        ( B.exists_ $ do
+                            access <- B.all_ (SBC.merchantAccess SBC.atlasDB)
+                            B.guard_' (BeamMA.personId access B.==?. BeamP.id person B.&&?. BeamMA.merchantId access B.==?. B.val_ (getId callerMerchantId))
+                            pure access
+                        )
+                      B.&&?. maybe
+                        (B.sqlBool_ $ B.val_ True)
+                        ( \entityId ->
+                            B.sqlBool_
+                              ( B.exists_ $ do
+                                  grant <- B.all_ (SBC.entityAccess SBC.atlasDB)
+                                  B.guard_' (BeamEA.personId grant B.==?. BeamP.id person B.&&?. BeamEA.entityId grant B.==?. B.val_ (getId entityId))
+                                  pure grant
+                              )
+                        )
+                        mbEntityId
+                )
+                $ do
+                  person <- B.all_ (SBC.person SBC.atlasDB)
+                  role <- B.join_' (SBC.role SBC.atlasDB) (\role -> BeamP.roleId person B.==?. BeamR.id role)
+                  pure (person, role)
+  let countRes =
+        L.runDB dbConf $
+          L.findRows $
+            B.select $
+              B.aggregate_ (\_ -> B.as_ @Int B.countAll_) $
+                B.filter_'
+                  ( \(person, role) ->
+                      ( maybe (B.sqlBool_ $ B.val_ True) (\searchString -> B.sqlBool_ (B.lower_ (B.concat_ [person.firstName, B.val_ " ", person.lastName]) `B.like_` B.val_ ("%" <> T.toLower (escapeLikeLiteral searchString) <> "%"))) mbSearchString
+                          B.||?. maybe (B.sqlBool_ $ B.val_ True) (\searchStrDBHash -> person.mobileNumberHash B.==?. B.val_ searchStrDBHash) mbSearchStrDBHash
+                          B.||?. maybe (B.sqlBool_ $ B.val_ True) (\searchStrDBHash -> person.emailHash B.==?. B.val_ (Just searchStrDBHash)) mbSearchStrDBHash
+                      )
+                        -- A tokenNo is what makes an account a PT login, so it defines the base set.
+                        B.&&?. B.sqlBool_ (B.isJust_ (BeamP.tokenNoHash person))
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\roleName -> BeamR.name role B.==?. B.val_ roleName) mbRoleName
+                        B.&&?. B.sqlBool_
+                          ( B.exists_ $ do
+                              access <- B.all_ (SBC.merchantAccess SBC.atlasDB)
+                              B.guard_' (BeamMA.personId access B.==?. BeamP.id person B.&&?. BeamMA.merchantId access B.==?. B.val_ (getId callerMerchantId))
+                              pure access
+                          )
+                        B.&&?. maybe
+                          (B.sqlBool_ $ B.val_ True)
+                          ( \entityId ->
+                              B.sqlBool_
+                                ( B.exists_ $ do
+                                    grant <- B.all_ (SBC.entityAccess SBC.atlasDB)
+                                    B.guard_' (BeamEA.personId grant B.==?. BeamP.id person B.&&?. BeamEA.entityId grant B.==?. B.val_ (getId entityId))
+                                    pure grant
+                                )
+                          )
+                          mbEntityId
+                  )
+                  $ do
+                    person <- B.all_ (SBC.person SBC.atlasDB)
+                    role <- B.join_' (SBC.role SBC.atlasDB) (\role -> BeamP.roleId person B.==?. BeamR.id role)
+                    pure (person, role)
+  case pageRes of
+    Left err -> throwError (InternalError $ "findAllPTWithLimitOffset failed: " <> T.pack (show err))
+    Right rows -> do
+      page <- fmap catMaybes $
+        forM rows $ \(person, role) ->
+          runMaybeT $ (,) <$> MaybeT (fromTType' person) <*> MaybeT (fromTType' role)
+      -- The count repeats both correlated EXISTS subqueries, so skip it when an unfilled first
+      -- page already bounds the total.
+      totalCount <-
+        if offsetVal == 0 && toInteger (length rows) < limitVal
+          then pure (length rows)
+          else
+            countRes >>= \case
+              Left err -> throwError (InternalError $ "findAllPTWithLimitOffset count failed: " <> T.pack (show err))
+              Right countRows -> pure $ if null countRows then 0 else head countRows
+      pure (page, totalCount)
+  where
+    limitVal = fromMaybe 100 mbLimit
+    offsetVal = fromMaybe 0 mbOffset
+
+updatePersonRole :: BeamFlow m r => Id Person -> Role -> m ()
+updatePersonRole personId role = do
+  now <- getCurrentTime
+  updateWithKV
+    [ Se.Set BeamP.roleId $ getId role.id,
+      Se.Set BeamP.dashboardAccessType $ Just role.dashboardAccessType,
+      Se.Set BeamP.updatedAt now
+    ]
+    [ Se.Is BeamP.id $ Se.Eq $ getId personId
+    ]
+
+updatePerson2FaSecret :: BeamFlow m r => Id Person -> Text -> m ()
+updatePerson2FaSecret personId secretKey = do
+  now <- getCurrentTime
+  updateWithKV
+    [ Se.Set BeamP.secretKey $ Just secretKey,
+      Se.Set BeamP.is2faEnabled True,
+      Se.Set BeamP.updatedAt now
+    ]
+    [Se.Is BeamP.id $ Se.Eq $ getId personId]
+
+clearPerson2Fa :: BeamFlow m r => Id Person -> m ()
+clearPerson2Fa personId = do
+  now <- getCurrentTime
+  updateWithKV
+    [ Se.Set BeamP.secretKey Nothing,
+      Se.Set BeamP.is2faEnabled False,
+      Se.Set BeamP.updatedAt now
+    ]
+    [Se.Is BeamP.id $ Se.Eq $ getId personId]
+
+updatePersonPassword :: BeamFlow m r => Id Person -> DbHash -> m ()
+updatePersonPassword personId newPasswordHash = do
+  now <- getCurrentTime
+  updateWithKV
+    [ Se.Set BeamP.passwordHash $ Just newPasswordHash,
+      Se.Set BeamP.updatedAt now,
+      Se.Set BeamP.passwordUpdatedAt $ Just now,
+      -- The person has now chosen their own secret, so the forced-change gate is satisfied.
+      Se.Set BeamP.forcePasswordChange $ Just False
+    ]
+    [ Se.Is BeamP.id $ Se.Eq $ getId personId
+    ]
+
+-- | Admin-assigned password. Deliberately does NOT refresh passwordUpdatedAt and marks the
+-- credential as requiring replacement, so a temporary password cannot become a lasting one.
+updatePersonPasswordByAdmin :: BeamFlow m r => Id Person -> DbHash -> m ()
+updatePersonPasswordByAdmin personId newPasswordHash = do
+  now <- getCurrentTime
+  updateWithKV
+    [ Se.Set BeamP.passwordHash $ Just newPasswordHash,
+      Se.Set BeamP.updatedAt now,
+      Se.Set BeamP.forcePasswordChange $ Just True
+    ]
+    [ Se.Is BeamP.id $ Se.Eq $ getId personId
+    ]
+
+updatePersonPasswordUpdatedAt :: BeamFlow m r => Id Person -> m ()
+updatePersonPasswordUpdatedAt personId = do
+  now <- getCurrentTime
+  updateWithKV
+    [ Se.Set BeamP.passwordUpdatedAt $ Just now
+    ]
+    [ Se.Is BeamP.id $ Se.Eq $ getId personId
+    ]
+
+updatePersonEmail :: BeamFlow m r => Id Person -> EncryptedHashed Text -> m ()
+updatePersonEmail personId encEmail = do
+  now <- getCurrentTime
+  updateWithKV
+    [ Se.Set BeamP.emailEncrypted $ Just (unEncrypted encEmail.encrypted),
+      Se.Set BeamP.emailHash $ Just encEmail.hash,
+      Se.Set BeamP.updatedAt now
+    ]
+    [ Se.Is BeamP.id $ Se.Eq $ getId personId
+    ]
+
+updatePerson :: BeamFlow m r => Id Person -> Person -> m ()
+updatePerson personId person = do
+  now <- getCurrentTime
+  updateWithKV
+    [ Se.Set BeamP.firstName $ person.firstName,
+      Se.Set BeamP.lastName $ person.lastName,
+      Se.Set BeamP.emailEncrypted $ person.email <&> (unEncrypted . (.encrypted)),
+      Se.Set BeamP.emailHash $ person.email <&> (.hash),
+      Se.Set BeamP.mobileNumberEncrypted $ unEncrypted (person.mobileNumber.encrypted),
+      Se.Set BeamP.mobileNumberHash $ person.mobileNumber.hash,
+      Se.Set BeamP.mobileCountryCode $ person.mobileCountryCode,
+      Se.Set BeamP.updatedAt now
+    ]
+    [ Se.Is BeamP.id $ Se.Eq $ getId personId
+    ]
+
+updateLanguage :: BeamFlow m r => Id Person -> KET.Language -> m ()
+updateLanguage personId lang = do
+  now <- getCurrentTime
+  updateWithKV
+    [ Se.Set BeamP.language $ Just lang,
+      Se.Set BeamP.updatedAt now
+    ]
+    [ Se.Is BeamP.id $ Se.Eq $ getId personId
+    ]
+
+deletePerson :: BeamFlow m r => Id Person -> m ()
+deletePerson personId = deleteWithKV [Se.Is BeamP.id $ Se.Eq $ getId personId]
+
+updatePersonMobile :: BeamFlow m r => Id Person -> EncryptedHashed Text -> m ()
+updatePersonMobile personId encMobileNumber = do
+  now <- getCurrentTime
+  updateWithKV
+    [ Se.Set BeamP.mobileNumberEncrypted $ unEncrypted encMobileNumber.encrypted,
+      Se.Set BeamP.mobileNumberHash $ encMobileNumber.hash,
+      Se.Set BeamP.updatedAt now
+    ]
+    [ Se.Is BeamP.id $ Se.Eq $ getId personId
+    ]
+
+-- findAllByIdAndRoleId :: BeamFlow m r => [Id Person] -> Id Role -> m [Person]
+-- findAllByIdAndRoleId personIds roleId = findAllWithKV [Se.And [Se.Is BeamP.id $ Se.In $ getId <$> personIds, Se.Is BeamP.roleId $ Se.Eq $ getId roleId]]
+
+updatePersonReceiveNotificationStatus :: BeamFlow m r => Id Person -> Bool -> m ()
+updatePersonReceiveNotificationStatus personId receiveNotification = do
+  now <- getCurrentTime
+  updateWithKV
+    [ Se.Set BeamP.receiveNotification $ Just receiveNotification,
+      Se.Set BeamP.updatedAt now
+    ]
+    [ Se.Is BeamP.id $ Se.Eq $ getId personId
+    ]
+
+findAllByIdRoleIdAndReceiveNotification :: BeamFlow m r => [Id Person] -> Id Role -> m [Person]
+findAllByIdRoleIdAndReceiveNotification personIds roleId = findAllWithKV [Se.And [Se.Is BeamP.id $ Se.In $ getId <$> personIds, Se.Is BeamP.roleId $ Se.Eq $ getId roleId, Se.Or [Se.Is BeamP.receiveNotification $ Se.Eq $ Just True, Se.Is BeamP.receiveNotification $ Se.Eq Nothing]]]
+
+instance FromTType' BeamP.Person Person.Person where
+  fromTType' BeamP.PersonT {..} = do
+    return $
+      Just
+        Person.Person
+          { id = Id id,
+            roleId = Id roleId,
+            email = case (emailEncrypted, emailHash) of
+              (Just email, Just hash) -> Just $ EncryptedHashed (Encrypted email) hash
+              _ -> Nothing,
+            mobileNumber = EncryptedHashed (Encrypted mobileNumberEncrypted) mobileNumberHash,
+            tokenNo = case tokenNoHash of
+              Just hash -> Just $ EncryptedHashed (Encrypted (fromMaybe "" tokenNoEncrypted)) hash
+              Nothing -> Nothing,
+            vpa = case (vpaEncrypted, vpaHash) of
+              (Just vpa, Just hash) -> Just $ EncryptedHashed (Encrypted vpa) hash
+              _ -> Nothing,
+            dashboardType = dashboardType,
+            approvedBy = approvedBy <&> Id,
+            rejectedBy = rejectedBy <&> Id,
+            merchantId = merchantId <&> Id,
+            language = language,
+            ..
+          }
+
+instance ToTType' BeamP.Person Person.Person where
+  toTType' Person.Person {..} =
+    BeamP.PersonT
+      { id = getId id,
+        roleId = getId roleId,
+        emailEncrypted = email <&> (unEncrypted . (.encrypted)),
+        emailHash = email <&> (.hash),
+        mobileNumberEncrypted = mobileNumber & unEncrypted . (.encrypted),
+        mobileNumberHash = mobileNumber.hash,
+        tokenNoEncrypted = tokenNoEncryptedColumn tokenNo,
+        tokenNoHash = tokenNo <&> (.hash),
+        vpaEncrypted = vpa <&> (unEncrypted . (.encrypted)),
+        vpaHash = vpa <&> (.hash),
+        dashboardType = dashboardType,
+        approvedBy = approvedBy <&> getId,
+        rejectedBy = rejectedBy <&> getId,
+        merchantId = merchantId <&> getId,
+        language = language,
+        ..
+      }
+
+findAllByFromDateAndToDateAndMobileNumberAndStatusWithLimitOffset ::
+  (BeamFlow m r, EncFlow m r) =>
+  Maybe UTCTime ->
+  Maybe UTCTime ->
+  Maybe Text ->
+  Maybe FleetOwnerStatus ->
+  Maybe Int ->
+  Maybe Int ->
+  m [Person]
+findAllByFromDateAndToDateAndMobileNumberAndStatusWithLimitOffset mbFromDate mbToDate mbMobileNumber mbStatus mbLimit mbOffset = do
+  mbMobileNumberDbHash <- traverse getDbHash mbMobileNumber
+  findAllWithOptionsDb
+    [ Se.And
+        ( [ Se.Or
+              [ Se.Is BeamP.verified $ Se.Eq (Just False),
+                Se.Is BeamP.verified $ Se.Eq Nothing
+              ]
+          ]
+            <> [Se.Is BeamP.createdAt $ Se.GreaterThanOrEq (fromJust mbFromDate) | isJust mbFromDate]
+            <> [Se.Is BeamP.createdAt $ Se.LessThanOrEq (fromJust mbToDate) | isJust mbToDate]
+            <> [Se.Is BeamP.mobileNumberHash $ Se.Eq (fromJust mbMobileNumberDbHash) | isJust mbMobileNumber]
+            <> [Se.Is BeamP.verified $ checkStatus | isJust mbStatus]
+            <> [Se.Is BeamP.dashboardType $ Se.Eq DPT.DEFAULT_DASHBOARD]
+        )
+    ]
+    (Se.Asc BeamP.createdAt)
+    (Just . min 10 . fromMaybe 5 $ mbLimit)
+    (Just $ fromMaybe 0 mbOffset)
+  where
+    checkStatus =
+      case mbStatus of
+        Just Rejected -> Se.Eq (Just False)
+        _ -> Se.Not $ Se.Eq (Just False)
+
+softDeletePerson :: BeamFlow m r => Id Person -> Maybe Text -> m ()
+softDeletePerson personId mbReason = do
+  now <- getCurrentTime
+  updateWithKV
+    [ Se.Set BeamP.verified $ Just False,
+      Se.Set BeamP.updatedAt now,
+      Se.Set BeamP.rejectionReason mbReason,
+      Se.Set BeamP.rejectedAt $ Just now
+    ]
+    [ Se.Is BeamP.id $ Se.Eq $ getId personId
+    ]
+
+updatePersonApprovedBy :: BeamFlow m r => Id Person -> Id Person -> m ()
+updatePersonApprovedBy personId approverId = do
+  now <- getCurrentTime
+  updateWithKV
+    [ Se.Set BeamP.approvedBy $ Just (getId approverId),
+      Se.Set BeamP.updatedAt now
+    ]
+    [ Se.Is BeamP.id $ Se.Eq $ getId personId
+    ]
+
+updatePersonRejectedBy :: BeamFlow m r => Id Person -> Id Person -> m ()
+updatePersonRejectedBy personId rejecterId = do
+  now <- getCurrentTime
+  updateWithKV
+    [ Se.Set BeamP.rejectedBy $ Just (getId rejecterId),
+      Se.Set BeamP.updatedAt now
+    ]
+    [ Se.Is BeamP.id $ Se.Eq $ getId personId
+    ]
+
+findByIdWithRoleAndCheckMobileHash ::
+  BeamFlow m r =>
+  Id Person ->
+  Maybe DbHash ->
+  m (Maybe (Person, Role), [Person])
+findByIdWithRoleAndCheckMobileHash personId mbMobileHash = do
+  dbConf <- getReplicaBeamConfig
+  res <- L.runDB dbConf $
+    L.findRows $
+      B.select $ do
+        person <- B.all_ (SBC.person SBC.atlasDB)
+        role <- B.join_' (SBC.role SBC.atlasDB) (\role -> BeamP.roleId person B.==?. BeamR.id role)
+        _ <-
+          B.filter_
+            ( \_ ->
+                case mbMobileHash of
+                  Just mobileHash ->
+                    (person.id B.==. B.val_ (getId personId)) B.||. (person.mobileNumberHash B.==. B.val_ mobileHash)
+                  Nothing ->
+                    person.id B.==. B.val_ (getId personId)
+            )
+            (pure ())
+
+        pure (person, role)
+
+  case res of
+    Right res' -> do
+      finalRes <- forM res' $ \(person, role) -> runMaybeT $ do
+        p <- MaybeT $ fromTType' person
+        r <- MaybeT $ fromTType' role
+        pure (p, r)
+
+      let results = catMaybes finalRes
+
+      let targetPersonAndRole = find (\(p, _) -> p.id == personId) results
+
+          conflictingPersons =
+            map fst $
+              filter
+                ( \(p, _) ->
+                    p.id /= personId
+                      && case mbMobileHash of
+                        Just hash -> p.mobileNumber.hash == hash
+                        Nothing -> False
+                )
+                results
+
+      pure (targetPersonAndRole, conflictingPersons)
+    Left _ -> pure (Nothing, [])

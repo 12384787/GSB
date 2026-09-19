@@ -1,0 +1,1280 @@
+import {
+  createPaginatedResponseSchema,
+  PaginationQuerySchema,
+  RouteId,
+} from "@archestra/shared";
+import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
+import { z } from "zod";
+import {
+  getAgentTypePermissionChecker,
+  requireAgentModifyPermission,
+  userHasPermission,
+} from "@/auth";
+import logger from "@/logging";
+import {
+  A2ATaskModel,
+  AgentModel,
+  AgentRunModel,
+  AgentRunShareModel,
+  AgentWorkspaceModel,
+  MemberModel,
+  ProjectModel,
+  ProjectShareModel,
+  TeamModel,
+} from "@/models";
+import {
+  isAnyAgentRuntimeBackendDriverEnabled,
+  resolveAgentRuntimeBackendDriver,
+} from "@/services/agent-runtime/backends";
+import { claudeCodeAccountManager } from "@/services/agent-runtime/claude-code-account";
+import {
+  deleteAgentRuntimeCredential,
+  preflightAgentRuntimeCredentials,
+  setAgentRuntimeCredential,
+} from "@/services/agent-runtime/credentials";
+import { getResolvedAgentRuntimeModelCompatibility } from "@/services/agent-runtime/model-compatibility";
+import { resolveAgentRuntime } from "@/services/agent-runtime/pod-run";
+import {
+  cancelDetachedAgentTask,
+  startDetachedAgentTask,
+} from "@/services/agent-runtime/start-task";
+import { accessAgentWorkspaceFile } from "@/services/agent-runtime/workspace-files";
+import { deleteAgentWorkspace } from "@/services/agent-runtime/workspace-lifecycle";
+import {
+  type Agent,
+  type AgentRunSession,
+  AgentRunShareVisibilitySchema,
+  type AgentRunStartupProgress,
+  ApiError,
+  constructResponseSchema,
+  GetAgentRunResponseSchema,
+  MissingAgentRuntimeCredentialSchema,
+  type ResolvedAgentRuntime,
+  SelectAgentRunListItemSchema,
+  SelectAgentRunSessionSchema,
+  SelectAgentRunShareWithTargetsSchema,
+  StartAgentRunResponseSchema,
+  UpdateAgentRunSchema,
+} from "@/types";
+import { agentRunAttachmentsSchema } from "@/types/agent-run-attachments";
+import {
+  AgentWorkspaceFileRequestSchema,
+  AgentWorkspaceFileResultSchema,
+} from "@/types/agent-workspace-file";
+import {
+  ClaudeCodeAccountSchema,
+  ClaudeCodeModelsSchema,
+} from "@/types/claude-code-account";
+
+const agentRuntimeRoutes: FastifyPluginAsyncZod = async (fastify) => {
+  fastify.addHook("preHandler", async () => {
+    if (!isAnyAgentRuntimeBackendDriverEnabled())
+      throw new ApiError(404, "Not found");
+  });
+
+  fastify.get(
+    "/api/agent-runs/:taskId/workspace/files",
+    {
+      schema: {
+        operationId: RouteId.ReadAgentWorkspaceFile,
+        tags: ["Agents"],
+        description:
+          "Read a bounded file from the caller's retained runtime workspace",
+        params: z.object({ taskId: z.string().uuid() }),
+        querystring: AgentWorkspaceFileRequestSchema.options[0].omit({
+          operation: true,
+        }),
+        response: constructResponseSchema(AgentWorkspaceFileResultSchema),
+      },
+    },
+    async (request, reply) =>
+      reply.send(
+        await accessAgentWorkspaceFile({
+          actor: {
+            kind: "user",
+            id: request.user.id,
+            organizationId: request.organizationId,
+          },
+          taskId: request.params.taskId,
+          request: { operation: "read", path: request.query.path },
+        }),
+      ),
+  );
+
+  fastify.delete(
+    "/api/agent-runs/:taskId/workspace",
+    {
+      schema: {
+        operationId: RouteId.DeleteAgentWorkspace,
+        tags: ["Agents"],
+        description:
+          "Permanently delete an owned idle workspace and its files; saved transcripts remain available",
+        params: z.object({ taskId: z.string().uuid() }),
+        response: constructResponseSchema(
+          z.object({ state: z.literal("deleted") }),
+        ),
+      },
+    },
+    async (request, reply) => {
+      const result = await deleteAgentWorkspace({
+        actor: {
+          kind: "user",
+          id: request.user.id,
+          organizationId: request.organizationId,
+        },
+        taskId: request.params.taskId,
+      });
+      request.auditBefore = { workspaceState: result.previousState };
+      request.auditAfter = { workspaceState: result.state };
+      return reply.send({ state: result.state });
+    },
+  );
+
+  fastify.put(
+    "/api/agent-runs/:taskId/workspace/files",
+    {
+      bodyLimit: 6 * 1024 * 1024,
+      schema: {
+        operationId: RouteId.WriteAgentWorkspaceFile,
+        tags: ["Agents"],
+        description:
+          "Write a bounded file in the caller's retained runtime workspace",
+        params: z.object({ taskId: z.string().uuid() }),
+        body: AgentWorkspaceFileRequestSchema.options[1].omit({
+          operation: true,
+        }),
+        response: constructResponseSchema(AgentWorkspaceFileResultSchema),
+      },
+    },
+    async (request, reply) => {
+      const result = await accessAgentWorkspaceFile({
+        actor: {
+          kind: "user",
+          id: request.user.id,
+          organizationId: request.organizationId,
+        },
+        taskId: request.params.taskId,
+        request: { operation: "write", ...request.body },
+      });
+      request.auditBefore = {
+        workspaceFile: { path: request.body.path, writeApplied: false },
+      };
+      request.auditAfter = {
+        workspaceFile: {
+          path: result.path,
+          writeApplied: true,
+          size: result.size,
+          sha256: result.sha256,
+        },
+      };
+      return reply.send(result);
+    },
+  );
+
+  fastify.get(
+    "/api/agents/:id/runtime/preflight",
+    {
+      schema: {
+        operationId: RouteId.GetAgentRuntimePreflight,
+        description:
+          "Report credentials and model compatibility the current user needs before this Agent can execute delegated work in its runtime",
+        tags: ["Agents"],
+        params: z.object({ id: z.string().uuid() }),
+        response: constructResponseSchema(
+          z.object({
+            ready: z.boolean(),
+            configured: z.array(z.string()),
+            missing: z.array(MissingAgentRuntimeCredentialSchema),
+            misconfigured: z.array(MissingAgentRuntimeCredentialSchema),
+            incompatible: z.string().nullable(),
+          }),
+        ),
+      },
+    },
+    async (request, reply) => {
+      const { agent, runtime } = await requireReadableAgentRuntime(request);
+      const preflight = await preflightAgentRuntimeCredentials({
+        runtime,
+        organizationId: request.organizationId,
+        userId: request.user.id,
+      });
+      const modelCompatibility =
+        await getResolvedAgentRuntimeModelCompatibility({
+          runtime,
+          agent,
+          organizationId: request.organizationId,
+          userId: request.user.id,
+        });
+      if (modelCompatibility.usesClaudeCodeSubscription) {
+        const account = await claudeCodeAccountManager.status({
+          runtime,
+          userId: request.user.id,
+        });
+        if (account.state === "connected")
+          preflight.configured.push("CLAUDE_CODE_ACCOUNT");
+        else
+          preflight.missing.push({
+            key: "CLAUDE_CODE_ACCOUNT",
+            label: "Claude Code account",
+            description:
+              "Sign in with your own Claude account in the native runtime.",
+          });
+      }
+      return reply.send({
+        ready:
+          preflight.missing.length === 0 &&
+          preflight.misconfigured.length === 0 &&
+          modelCompatibility.compatibility.compatible,
+        incompatible: modelCompatibility.compatibility.compatible
+          ? null
+          : modelCompatibility.compatibility.message,
+        ...preflight,
+      });
+    },
+  );
+
+  fastify.get(
+    "/api/agents/:id/runtime/claude-code/account",
+    {
+      schema: {
+        operationId: RouteId.GetClaudeCodeAccount,
+        tags: ["Agents"],
+        params: z.object({ id: z.string().uuid() }),
+        response: constructResponseSchema(ClaudeCodeAccountSchema),
+      },
+    },
+    async (request) => {
+      const { runtime } = await requireReadableAgentRuntime(request);
+      return claudeCodeAccountManager.status({
+        runtime,
+        userId: request.user.id,
+      });
+    },
+  );
+
+  fastify.post(
+    "/api/agents/:id/runtime/claude-code/account",
+    {
+      schema: {
+        operationId: RouteId.StartClaudeCodeSignIn,
+        body: z
+          .object({
+            vaultReference: z.string().trim().min(1).max(2048).optional(),
+          })
+          .nullish(),
+        tags: ["Agents"],
+        params: z.object({ id: z.string().uuid() }),
+        response: constructResponseSchema(ClaudeCodeAccountSchema),
+      },
+    },
+    async (request) => {
+      const { runtime } = await requireReadableAgentRuntime(request);
+      const owner = { runtime, userId: request.user.id };
+      const before = await claudeCodeAccountManager.status({
+        ...owner,
+        inspectFlow: false,
+      });
+      const after = await claudeCodeAccountManager.start({
+        ...owner,
+        ...request.body,
+      });
+      request.auditBefore = {
+        claudeCodeAccount: {
+          state: before.state,
+          flowId: before.flowId ?? null,
+        },
+      };
+      request.auditAfter = {
+        claudeCodeAccount: { state: after.state, flowId: after.flowId ?? null },
+      };
+      return after;
+    },
+  );
+
+  fastify.post(
+    "/api/agents/:id/runtime/claude-code/account/complete",
+    {
+      schema: {
+        operationId: RouteId.CompleteClaudeCodeSignIn,
+        tags: ["Agents"],
+        params: z.object({ id: z.string().uuid() }),
+        body: z.object({
+          flowId: z.string().uuid(),
+          code: z.string().trim().min(1).max(4096).optional(),
+        }),
+        response: constructResponseSchema(ClaudeCodeAccountSchema),
+      },
+    },
+    async (request) => {
+      const { runtime } = await requireReadableAgentRuntime(request);
+      const result = await claudeCodeAccountManager.complete({
+        runtime,
+        userId: request.user.id,
+        ...request.body,
+      });
+      if (result.state === "connected") {
+        request.auditBefore = { claudeCodeAccount: { state: "connecting" } };
+        request.auditAfter = { claudeCodeAccount: { state: "connected" } };
+      } else if (request.body.code) {
+        request.auditBefore = {
+          claudeCodeAccount: { authorizationSubmitted: false },
+        };
+        request.auditAfter = {
+          claudeCodeAccount: { authorizationSubmitted: true },
+        };
+      } else {
+        request.auditSkip = true;
+      }
+      return result;
+    },
+  );
+
+  fastify.delete(
+    "/api/agents/:id/runtime/claude-code/account",
+    {
+      schema: {
+        operationId: RouteId.DisconnectClaudeCodeAccount,
+        tags: ["Agents"],
+        params: z.object({ id: z.string().uuid() }),
+        response: constructResponseSchema(ClaudeCodeAccountSchema),
+      },
+    },
+    async (request) => {
+      const { runtime } = await requireReadableAgentRuntime(request);
+      const owner = { runtime, userId: request.user.id };
+      const before = await claudeCodeAccountManager.status({
+        ...owner,
+        inspectFlow: false,
+      });
+      const after = await claudeCodeAccountManager.disconnect(owner);
+      request.auditBefore = {
+        claudeCodeAccount: {
+          state: before.state,
+          flowId: before.flowId ?? null,
+        },
+      };
+      request.auditAfter = {
+        claudeCodeAccount: { state: after.state, flowId: after.flowId ?? null },
+      };
+      return after;
+    },
+  );
+
+  fastify.get(
+    "/api/agents/:id/runtime/claude-code/models",
+    {
+      schema: {
+        operationId: RouteId.GetClaudeCodeModels,
+        tags: ["Agents"],
+        params: z.object({ id: z.string().uuid() }),
+        response: constructResponseSchema(ClaudeCodeModelsSchema),
+      },
+    },
+    async (request) => {
+      const { runtime } = await requireReadableAgentRuntime(request);
+      return claudeCodeAccountManager.models({
+        runtime,
+        userId: request.user.id,
+      });
+    },
+  );
+
+  fastify.put(
+    "/api/agents/:id/runtime/credentials/:key",
+    {
+      schema: {
+        operationId: RouteId.SetAgentRuntimeCredential,
+        description:
+          "Store or replace one credential declared by an Agent's Agent Runtime configuration",
+        tags: ["Agents"],
+        params: z.object({
+          id: z.string().uuid(),
+          key: z.string().min(1).max(128),
+        }),
+        body: z.object({ value: z.string().min(1).max(20_000) }),
+        response: constructResponseSchema(
+          z.object({ configured: z.literal(true) }),
+        ),
+      },
+    },
+    async (request, reply) => {
+      const { agent, runtime } = await requireReadableAgentRuntime(request);
+      const declaration = requireCredentialDeclaration(
+        runtime,
+        request.params.key,
+      );
+      if (declaration.scope === "shared") {
+        if (declaration.credentialId) {
+          await requireRuntimeCredentialAdmin(request);
+          const before = await preflightAgentRuntimeCredentials({
+            runtime,
+            organizationId: request.organizationId,
+            userId: request.user.id,
+          });
+          request.auditBefore = {
+            runtimeConnection: {
+              credentialId: declaration.credentialId,
+              configured: before.configured.includes(declaration.key),
+            },
+          };
+          request.auditAfter = {
+            runtimeConnection: {
+              credentialId: declaration.credentialId,
+              configured: true,
+            },
+          };
+        } else {
+          await requireWritableAgent({ request, agent });
+        }
+      } else {
+        request.auditSkip = true;
+      }
+      await setAgentRuntimeCredential({
+        runtime,
+        organizationId: request.organizationId,
+        userId: request.user.id,
+        key: declaration.key,
+        value: request.body.value,
+      });
+      return reply.send({ configured: true as const });
+    },
+  );
+
+  fastify.delete(
+    "/api/agents/:id/runtime/credentials/:key",
+    {
+      schema: {
+        operationId: RouteId.DeleteAgentRuntimeCredential,
+        description:
+          "Remove one stored Agent Runtime credential value without changing its declaration",
+        tags: ["Agents"],
+        params: z.object({
+          id: z.string().uuid(),
+          key: z.string().min(1).max(128),
+        }),
+        response: constructResponseSchema(z.object({ deleted: z.boolean() })),
+      },
+    },
+    async (request, reply) => {
+      const { agent, runtime } = await requireReadableAgentRuntime(request);
+      const declaration = requireCredentialDeclaration(
+        runtime,
+        request.params.key,
+      );
+      if (declaration.scope === "shared") {
+        if (declaration.credentialId) {
+          await requireRuntimeCredentialAdmin(request);
+          request.auditBefore = {
+            runtimeConnection: {
+              credentialId: declaration.credentialId,
+              configured: true,
+            },
+          };
+          request.auditAfter = {
+            runtimeConnection: {
+              credentialId: declaration.credentialId,
+              configured: false,
+            },
+          };
+        } else {
+          await requireWritableAgent({ request, agent });
+        }
+      } else {
+        request.auditSkip = true;
+      }
+      const result = await deleteAgentRuntimeCredential({
+        runtime,
+        organizationId: request.organizationId,
+        userId: request.user.id,
+        key: declaration.key,
+      });
+      if (!result.deleted) {
+        throw new ApiError(404, "Credential is not configured");
+      }
+      return reply.send({ deleted: true });
+    },
+  );
+
+  fastify.get(
+    "/api/agents/:id/runs",
+    {
+      schema: {
+        operationId: RouteId.GetAgentRuns,
+        description:
+          "List Agent Runtime runs created by delegated tasks for this Agent",
+        tags: ["Agents"],
+        params: z.object({ id: z.string().uuid() }),
+        response: constructResponseSchema(
+          z.array(SelectAgentRunListItemSchema),
+        ),
+      },
+    },
+    async (request, reply) => {
+      await requireReadableAgent(request);
+      const runs = await AgentRunModel.listForAgent({
+        agentId: request.params.id,
+        organizationId: request.organizationId,
+      });
+      return reply.send(
+        runs.map((run) => ({
+          ...run,
+          shareTeamNames:
+            run.actorUserId === request.user.id ? run.shareTeamNames : null,
+          shareUserNames:
+            run.actorUserId === request.user.id ? run.shareUserNames : null,
+        })),
+      );
+    },
+  );
+
+  fastify.post(
+    "/api/agents/:id/runs",
+    {
+      schema: {
+        operationId: RouteId.StartAgentRun,
+        description: "Start a durable Agent Runtime session with this Agent",
+        tags: ["Agents"],
+        params: z.object({ id: z.string().uuid() }),
+        body: z.object({
+          message: z.string().trim().min(1).max(100_000),
+          projectId: z.string().uuid().optional(),
+          attachments: agentRunAttachmentsSchema(),
+        }),
+        response: constructResponseSchema(StartAgentRunResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      const { agent, runtime } = await requireReadableAgentRuntime(request);
+      if (request.body.projectId) {
+        await requireReadableProject({
+          projectId: request.body.projectId,
+          organizationId: request.organizationId,
+          userId: request.user.id,
+        });
+      }
+      const preflight = await preflightAgentRuntimeCredentials({
+        runtime,
+        organizationId: request.organizationId,
+        userId: request.user.id,
+      });
+      if (preflight.missing.length > 0) {
+        throw new ApiError(
+          409,
+          `Add your required credentials before starting this run: ${preflight.missing
+            .map((entry) => entry.label)
+            .join(", ")}`,
+        );
+      }
+      if (preflight.misconfigured.length > 0) {
+        throw new ApiError(
+          409,
+          `An Agent administrator must configure: ${preflight.misconfigured
+            .map((entry) => entry.label)
+            .join(", ")}`,
+        );
+      }
+
+      const modelCompatibility =
+        await getResolvedAgentRuntimeModelCompatibility({
+          runtime,
+          agent,
+          organizationId: request.organizationId,
+          userId: request.user.id,
+        });
+      if (
+        modelCompatibility.usesClaudeCodeSubscription &&
+        (
+          await claudeCodeAccountManager.status({
+            runtime,
+            userId: request.user.id,
+          })
+        ).state !== "connected"
+      ) {
+        throw new ApiError(
+          409,
+          "Sign in to Claude Code before starting this Agent.",
+        );
+      }
+
+      const task = await startDetachedAgentTask({
+        actor: {
+          id: request.user.id,
+          kind: "user",
+          organizationId: request.organizationId,
+        },
+        agentId: agent.id,
+        message: request.body.message,
+        attachments: request.body.attachments,
+        systemParams: {
+          sessionId: crypto.randomUUID(),
+          source: "chat",
+          projectId: request.body.projectId,
+          runtimeMode: "interactive",
+        },
+      });
+      request.auditResourceId = { value: task.id };
+      request.auditAfter = {
+        taskId: task.id,
+        agentId: agent.id,
+        state: task.state,
+        attachmentCount: request.body.attachments?.length ?? 0,
+        projectId: request.body.projectId ?? null,
+      };
+      return reply.send({
+        taskId: task.id,
+        state: task.state,
+        agentId: agent.id,
+        agentName: agent.name,
+        prompt: request.body.message,
+        projectId: request.body.projectId ?? null,
+        createdAt: task.createdAt,
+      });
+    },
+  );
+
+  fastify.get(
+    "/api/agent-runs",
+    {
+      schema: {
+        operationId: RouteId.GetMyAgentRuns,
+        description: "List Agent Runtime runs started by this user",
+        tags: ["Agents"],
+        querystring: PaginationQuerySchema,
+        response: constructResponseSchema(
+          createPaginatedResponseSchema(SelectAgentRunSessionSchema),
+        ),
+      },
+    },
+    async (request, reply) => {
+      return reply.send(
+        await AgentRunModel.listForActor({
+          actorUserId: request.user.id,
+          organizationId: request.organizationId,
+          pagination: request.query,
+        }),
+      );
+    },
+  );
+
+  fastify.get(
+    "/api/agent-runs/:taskId",
+    {
+      schema: {
+        operationId: RouteId.GetMyAgentRun,
+        description:
+          "Get one Agent Runtime the user started or was granted access to",
+        tags: ["Agents"],
+        params: z.object({ taskId: z.string().uuid() }),
+        response: constructResponseSchema(GetAgentRunResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      const owned = await AgentRunModel.findCurrentSessionForActor({
+        taskId: request.params.taskId,
+        actorUserId: request.user.id,
+        organizationId: request.organizationId,
+      });
+      if (owned) {
+        const workspace = await AgentWorkspaceModel.findByWorkloadName(
+          owned.workloadName,
+        );
+        return reply.send({
+          ...owned,
+          workspace: workspace
+            ? {
+                state: workspace.state,
+                expiresAt: workspace.expiresAt,
+                idleAt: workspace.idleAt,
+                terminalAvailable:
+                  workspace.state === "idle" &&
+                  workspace.lastTaskId === owned.taskId &&
+                  workspace.expiresAt.getTime() > Date.now()
+                    ? await resolveAgentRuntimeBackendDriver(
+                        owned.backend,
+                      ).hasRetainedTerminal(owned)
+                    : false,
+                connection: ["active", "idle"].includes(workspace.state)
+                  ? await resolveAgentRuntimeBackendDriver(
+                      owned.backend,
+                    ).getWorkspaceConnection(owned)
+                  : null,
+              }
+            : null,
+          viewerRole: "owner" as const,
+          startupProgress: await inspectStartupProgress(owned),
+        });
+      }
+
+      // Non-owners may still open the run read-only when a share grants
+      // them access. Attaching interactively stays owner-only (enforced in the
+      // WebSocket attach handler) because attach runs under the owner's
+      // credentials; a share only unlocks the log stream.
+      const shared = await AgentRunModel.findSessionByTaskId({
+        taskId: request.params.taskId,
+        organizationId: request.organizationId,
+      });
+      if (shared) {
+        const explicitlyShared =
+          await AgentRunShareModel.findAccessibleByTaskId({
+            taskId: request.params.taskId,
+            organizationId: request.organizationId,
+            userId: request.user.id,
+          });
+        const sharedThroughProject = shared.projectId
+          ? await mayReadProjectSession({
+              projectId: shared.projectId,
+              organizationId: request.organizationId,
+              userId: request.user.id,
+            })
+          : false;
+        if (explicitlyShared || sharedThroughProject) {
+          return reply.send({
+            ...shared,
+            viewerRole: "shared" as const,
+            startupProgress: null,
+          });
+        }
+      }
+
+      throw new ApiError(404, "Run not found");
+    },
+  );
+
+  fastify.post(
+    "/api/agent-runs/:taskId/continue",
+    {
+      schema: {
+        operationId: RouteId.ContinueAgentRun,
+        description: "Start a new Agent turn in an owned, retained workspace",
+        tags: ["Agents"],
+        params: z.object({ taskId: z.string().uuid() }),
+        body: z.object({
+          message: z.string().trim().min(1).max(100_000),
+          attachments: agentRunAttachmentsSchema(),
+        }),
+        response: constructResponseSchema(StartAgentRunResponseSchema),
+      },
+    },
+    async (request, reply) => {
+      const run = await requireOwnedRun(request);
+      const workspace = await AgentWorkspaceModel.findByWorkloadName(
+        run.workloadName,
+      );
+      if (
+        !run.endedAt ||
+        !workspace ||
+        !["idle", "suspended"].includes(workspace.state) ||
+        workspace.expiresAt.getTime() <= Date.now()
+      ) {
+        throw new ApiError(
+          409,
+          "This workspace is busy or is no longer retained",
+        );
+      }
+      const session = await AgentRunModel.findByTaskId(run.taskId);
+      request.auditBefore = { taskId: run.taskId, state: run.state };
+      const task = await startDetachedAgentTask({
+        actor: {
+          kind: "user",
+          id: request.user.id,
+          organizationId: request.organizationId,
+        },
+        agentId: run.agentId,
+        message: request.body.message,
+        attachments: request.body.attachments,
+        systemParams: {
+          resumeFromTaskId: run.taskId,
+          runtimeMode: "interactive",
+          completionTarget: session?.completionTarget ?? undefined,
+          projectId: run.projectId ?? undefined,
+        },
+      });
+      request.auditResourceId = { value: task.id };
+      request.auditAfter = {
+        taskId: task.id,
+        state: task.state,
+        previousTaskId: run.taskId,
+        attachmentCount: request.body.attachments?.length ?? 0,
+      };
+      return reply.send({
+        sessionId: workspace.id,
+        taskId: task.id,
+        state: task.state,
+        agentId: run.agentId,
+        agentName: run.agent.name,
+        prompt: request.body.message,
+        projectId: run.projectId,
+        createdAt: task.createdAt,
+      });
+    },
+  );
+
+  fastify.patch(
+    "/api/agent-runs/:taskId",
+    {
+      schema: {
+        operationId: RouteId.UpdateAgentRun,
+        description: "Update one Agent Runtime started by this user",
+        tags: ["Agents"],
+        params: z.object({ taskId: z.string().uuid() }),
+        body: UpdateAgentRunSchema,
+        response: constructResponseSchema(SelectAgentRunSessionSchema),
+      },
+    },
+    async (request, reply) => {
+      const run = await requireOwnedRun(request);
+      request.auditResourceId = { value: run.taskId };
+      request.auditBefore = {
+        taskId: run.taskId,
+        agentId: run.agentId,
+        title: run.title,
+        pinnedAt: run.pinnedAt,
+        projectId: run.projectId,
+      };
+      if (request.body.projectId) {
+        await requireReadableProject({
+          projectId: request.body.projectId,
+          organizationId: request.organizationId,
+          userId: request.user.id,
+        });
+      }
+      const updated = await AgentRunModel.updateForActor({
+        taskId: run.taskId,
+        actorUserId: request.user.id,
+        organizationId: request.organizationId,
+        title: request.body.title,
+        pinnedAt:
+          request.body.pinnedAt === undefined
+            ? undefined
+            : request.body.pinnedAt === null
+              ? null
+              : new Date(request.body.pinnedAt),
+        projectId: request.body.projectId,
+      });
+      if (!updated) throw new ApiError(404, "Run not found");
+      request.auditAfter = {
+        taskId: updated.taskId,
+        agentId: updated.agentId,
+        title: updated.title,
+        pinnedAt: updated.pinnedAt,
+        projectId: updated.projectId,
+      };
+      return reply.send(updated);
+    },
+  );
+
+  fastify.post(
+    "/api/agent-runs/:taskId/cancel",
+    {
+      schema: {
+        operationId: RouteId.CancelAgentRun,
+        description:
+          "Cancel one active Agent Runtime session started by this user",
+        tags: ["Agents"],
+        params: z.object({ taskId: z.string().uuid() }),
+        response: constructResponseSchema(
+          z.object({
+            taskId: z.string().uuid(),
+            state: z.literal("TASK_STATE_CANCELED"),
+          }),
+        ),
+      },
+    },
+    async (request, reply) => {
+      const run = await requireOwnedRun(request);
+      request.auditResourceId = { value: run.taskId };
+      request.auditBefore = {
+        taskId: run.taskId,
+        agentId: run.agentId,
+        state: run.state,
+      };
+
+      const canceled = await cancelDetachedAgentTask({
+        actor: {
+          id: request.user.id,
+          kind: "user",
+          organizationId: request.organizationId,
+        },
+        agentId: run.agentId,
+        taskId: run.taskId,
+      });
+      request.auditAfter = {
+        taskId: run.taskId,
+        agentId: run.agentId,
+        state: canceled.status.state,
+      };
+      return reply.send({
+        taskId: run.taskId,
+        state: "TASK_STATE_CANCELED" as const,
+      });
+    },
+  );
+
+  fastify.delete(
+    "/api/agent-runs/:taskId",
+    {
+      schema: {
+        operationId: RouteId.DeleteAgentRun,
+        description:
+          "Delete one finished Agent Runtime session started by this user",
+        tags: ["Agents"],
+        params: z.object({ taskId: z.string().uuid() }),
+        response: constructResponseSchema(
+          z.object({ deleted: z.literal(true) }),
+        ),
+      },
+    },
+    async (request, reply) => {
+      const run = await requireOwnedRun(request);
+      if (!run.endedAt) {
+        throw new ApiError(409, "Stop the run before deleting it");
+      }
+      request.auditResourceId = { value: run.taskId };
+      request.auditBefore = {
+        taskId: run.taskId,
+        agentId: run.agentId,
+        title: run.title,
+        state: run.state,
+      };
+      await A2ATaskModel.delete(run.taskId);
+      request.auditAfter = { deleted: true };
+      return reply.send({ deleted: true as const });
+    },
+  );
+
+  fastify.get(
+    "/api/agent-runs/:taskId/share",
+    {
+      schema: {
+        operationId: RouteId.GetAgentRunShare,
+        description: "Get share status for an Agent Runtime run",
+        tags: ["Agents"],
+        params: z.object({ taskId: z.string().uuid() }),
+        response: constructResponseSchema(
+          SelectAgentRunShareWithTargetsSchema.nullable(),
+        ),
+      },
+    },
+    async (request, reply) => {
+      // Only the owner may read or change share settings.
+      await requireOwnedRun(request);
+      const share = await AgentRunShareModel.findByTaskId({
+        taskId: request.params.taskId,
+        organizationId: request.organizationId,
+      });
+      return reply.send(share);
+    },
+  );
+
+  fastify.put(
+    "/api/agent-runs/:taskId/share",
+    {
+      schema: {
+        operationId: RouteId.ShareAgentRun,
+        description:
+          "Share an Agent Runtime run with your organization, specific teams, or specific users",
+        tags: ["Agents"],
+        params: z.object({ taskId: z.string().uuid() }),
+        body: z
+          .object({
+            visibility: AgentRunShareVisibilitySchema,
+            teamIds: z.array(z.string()).optional(),
+            userIds: z.array(z.string()).optional(),
+          })
+          .superRefine((value, ctx) => {
+            if (
+              value.visibility === "team" &&
+              (value.teamIds ?? []).length === 0
+            ) {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: "Select at least one team",
+                path: ["teamIds"],
+              });
+            }
+
+            if (
+              value.visibility === "user" &&
+              (value.userIds ?? []).length === 0
+            ) {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: "Select at least one user",
+                path: ["userIds"],
+              });
+            }
+          }),
+        response: constructResponseSchema(SelectAgentRunShareWithTargetsSchema),
+      },
+    },
+    async (request, reply) => {
+      const run = await requireOwnedRun(request);
+      request.auditResourceId = { value: run.taskId };
+      request.auditBefore = await AgentRunShareModel.findByTaskId({
+        taskId: run.taskId,
+        organizationId: request.organizationId,
+      });
+
+      const teamIds = Array.from(new Set(request.body.teamIds ?? []));
+      const userIds = Array.from(new Set(request.body.userIds ?? []));
+
+      if (request.body.visibility === "team") {
+        const teams = await TeamModel.findByIds(teamIds);
+        const validTeamIds = new Set(
+          teams
+            .filter((team) => team.organizationId === request.organizationId)
+            .map((team) => team.id),
+        );
+        if (validTeamIds.size !== teamIds.length) {
+          throw new ApiError(400, "One or more selected teams are invalid");
+        }
+      }
+
+      if (request.body.visibility === "user") {
+        const validUserIds = new Set(
+          await MemberModel.findUserIdsInOrganization({
+            organizationId: request.organizationId,
+            userIds,
+          }),
+        );
+        if (validUserIds.size !== userIds.length) {
+          throw new ApiError(400, "One or more selected users are invalid");
+        }
+      }
+
+      const share = await AgentRunShareModel.upsert({
+        taskId: run.taskId,
+        organizationId: request.organizationId,
+        createdByUserId: request.user.id,
+        visibility: request.body.visibility,
+        teamIds: request.body.visibility === "team" ? teamIds : [],
+        userIds: request.body.visibility === "user" ? userIds : [],
+      });
+      request.auditAfter = share;
+      return reply.send(share);
+    },
+  );
+
+  fastify.delete(
+    "/api/agent-runs/:taskId/share",
+    {
+      schema: {
+        operationId: RouteId.UnshareAgentRun,
+        description: "Revoke sharing of an Agent Runtime run",
+        tags: ["Agents"],
+        params: z.object({ taskId: z.string().uuid() }),
+        response: constructResponseSchema(z.object({ success: z.boolean() })),
+      },
+    },
+    async (request, reply) => {
+      const run = await requireOwnedRun(request);
+      request.auditResourceId = { value: run.taskId };
+      request.auditBefore = await AgentRunShareModel.findByTaskId({
+        taskId: run.taskId,
+        organizationId: request.organizationId,
+      });
+
+      const deleted = await AgentRunShareModel.delete({
+        taskId: run.taskId,
+        organizationId: request.organizationId,
+        userId: request.user.id,
+      });
+      if (!deleted) {
+        throw new ApiError(404, "Share not found");
+      }
+      request.auditAfter = { success: true };
+      return reply.send({ success: true });
+    },
+  );
+};
+
+export default agentRuntimeRoutes;
+
+// ===================== internals =====================
+
+type AgentRequest = {
+  params: { id: string };
+  user: { id: string };
+  organizationId: string;
+};
+
+type OwnedRunRequest = {
+  params: { taskId: string };
+  user: { id: string };
+  organizationId: string;
+};
+
+async function inspectStartupProgress(
+  run: AgentRunSession,
+): Promise<AgentRunStartupProgress | null> {
+  if (run.endedAt || run.lastModelActivityAt) return null;
+
+  try {
+    return await resolveAgentRuntimeBackendDriver(
+      run.backend,
+    ).getStartupProgress(run);
+  } catch (error) {
+    // Run metadata remains useful even when the runtime control plane cannot
+    // be inspected. The live attach path may still recover independently.
+    logger.warn(
+      { error, taskId: run.taskId },
+      "Could not inspect Agent Runtime startup progress",
+    );
+    return null;
+  }
+}
+
+async function requireOwnedRun(request: OwnedRunRequest) {
+  const run = await AgentRunModel.findCurrentSessionForActor({
+    taskId: request.params.taskId,
+    actorUserId: request.user.id,
+    organizationId: request.organizationId,
+  });
+  if (!run) throw new ApiError(404, "Run not found");
+  return run;
+}
+
+async function requireReadableProject(params: {
+  projectId: string;
+  organizationId: string;
+  userId: string;
+}) {
+  const project = await ProjectModel.findById(params.projectId);
+  if (
+    !project ||
+    !(await ProjectShareModel.userCanAccessProject({
+      project,
+      userId: params.userId,
+      organizationId: params.organizationId,
+    }))
+  ) {
+    throw new ApiError(404, "Project not found");
+  }
+  return project;
+}
+
+async function mayReadProjectSession(params: {
+  projectId: string;
+  organizationId: string;
+  userId: string;
+}): Promise<boolean> {
+  const project = await ProjectModel.findById(params.projectId);
+  if (
+    !project ||
+    !(await ProjectShareModel.userCanAccessProject({
+      project,
+      userId: params.userId,
+      organizationId: params.organizationId,
+    }))
+  ) {
+    return false;
+  }
+  return userHasPermission(
+    params.userId,
+    params.organizationId,
+    "project",
+    "read-all",
+  );
+}
+
+async function requireReadableAgentRuntime(
+  request: AgentRequest,
+): Promise<{ agent: Agent; runtime: ResolvedAgentRuntime }> {
+  if (!isAnyAgentRuntimeBackendDriverEnabled()) {
+    throw new ApiError(404, "Not found");
+  }
+  const agent = await requireReadableAgent(request);
+  const runtime = resolveAgentRuntime(agent);
+  if (!runtime) {
+    throw new ApiError(404, "Agent Runtime is not configured");
+  }
+  resolveAgentRuntimeBackendDriver(runtime.backend);
+  return { agent, runtime };
+}
+
+async function requireReadableAgent(request: AgentRequest): Promise<Agent> {
+  const candidate = await AgentModel.findById(
+    request.params.id,
+    request.user.id,
+    true,
+  );
+  if (
+    !candidate ||
+    candidate.organizationId !== request.organizationId ||
+    candidate.agentType !== "agent"
+  ) {
+    throw new ApiError(404, "Agent not found");
+  }
+  const checker = await getAgentTypePermissionChecker({
+    userId: request.user.id,
+    organizationId: request.organizationId,
+  });
+  try {
+    checker.require("agent", "read");
+  } catch {
+    throw new ApiError(404, "Agent not found");
+  }
+  if (!checker.isAdmin("agent")) {
+    const visible = await AgentModel.findById(
+      request.params.id,
+      request.user.id,
+      false,
+    );
+    if (!visible) throw new ApiError(404, "Agent not found");
+  }
+  return candidate;
+}
+
+async function requireWritableAgent(params: {
+  request: AgentRequest;
+  agent: Agent;
+}): Promise<void> {
+  const checker = await getAgentTypePermissionChecker({
+    userId: params.request.user.id,
+    organizationId: params.request.organizationId,
+  });
+  checker.require("agent", "update");
+  const userTeamIds = checker.isAdmin("agent")
+    ? []
+    : await TeamModel.getUserTeamIds(params.request.user.id);
+  requireAgentModifyPermission({
+    checker,
+    agentType: "agent",
+    agentScope: params.agent.scope,
+    agentAuthorId: params.agent.authorId,
+    agentTeamIds: params.agent.teams.map((team) => team.id),
+    userTeamIds,
+    userId: params.request.user.id,
+  });
+}
+
+async function requireRuntimeCredentialAdmin(
+  request: AgentRequest,
+): Promise<void> {
+  const permitted = await userHasPermission(
+    request.user.id,
+    request.organizationId,
+    "agentSettings",
+    "update",
+  );
+  if (!permitted) {
+    throw new ApiError(
+      403,
+      "Organization Agent settings permission is required to manage this connection",
+    );
+  }
+}
+
+function requireCredentialDeclaration(
+  runtime: ResolvedAgentRuntime,
+  key: string,
+): NonNullable<ResolvedAgentRuntime["credentials"]>[number] {
+  const declaration = runtime.credentials?.find((entry) => entry.key === key);
+  if (!declaration) {
+    throw new ApiError(
+      404,
+      "Credential is not declared by this Agent's Agent Runtime configuration",
+    );
+  }
+  return declaration;
+}

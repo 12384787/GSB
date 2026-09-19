@@ -1,0 +1,446 @@
+import type { EnvironmentDefaultableResource } from "@archestra/shared";
+import { daggerEnvironmentRuntimeManager } from "@/k8s/dagger-environment-runtime/manager";
+import mcpServerRuntimeManager from "@/k8s/mcp-server-runtime/manager";
+import logger from "@/logging";
+import {
+  EnvironmentLabelModel,
+  EnvironmentModel,
+  EnvironmentResourceDefaultModel,
+  InternalMcpCatalogModel,
+  OrganizationModel,
+  PlaywrightRuntimeModel,
+} from "@/models";
+import {
+  ApiError,
+  type CreateEnvironment,
+  type Environment,
+  type EnvironmentList,
+  type EnvironmentResourceDefaults,
+  type InternalMcpCatalogServerType,
+  type TrustedImageRegistries,
+  type UpdateEnvironment,
+  type UpdateEnvironmentResourceDefaults,
+} from "@/types";
+import { validateValuesAgainstRegex } from "@/utils/validate-values-against-regex";
+import { evaluateRemoteServerUrlAgainstNetworkPolicy } from "./remote-server-network-policy";
+
+/**
+ * Provision (or update) the environment's per-env Dagger engine + egress
+ * NetworkPolicy in the background. Fire-and-forget: a k8s hiccup must not fail
+ * environment CRUD, and the manager no-ops when code-runtime/k8s is off.
+ */
+function reconcileEnvironmentEngine(environment: Environment): void {
+  void daggerEnvironmentRuntimeManager
+    .reconcileEnvironment(environment)
+    .catch((err) =>
+      logger.error(
+        { err, environmentId: environment.id },
+        "[DaggerEnvRuntime] background reconcile failed",
+      ),
+    );
+}
+
+/** Persist the Environment-bound browser runtime, then provision its pod in the background. */
+async function reconcilePlaywrightRuntime(
+  environment: Environment,
+): Promise<void> {
+  const server = await PlaywrightRuntimeModel.ensureForEnvironment({
+    environmentId: environment.id,
+    organizationId: environment.organizationId,
+  });
+  if (server && mcpServerRuntimeManager.isEnabled) {
+    void mcpServerRuntimeManager
+      .startServer(server)
+      .catch((err) =>
+        logger.error(
+          { err, environmentId: environment.id },
+          "[PlaywrightRuntime] background reconcile failed",
+        ),
+      );
+  }
+}
+
+/**
+ * Tear down the environment's Dagger engine after the environment is deleted,
+ * so it does not leave a privileged pod and retained cache PVC behind.
+ * Fire-and-forget for symmetry with reconcile: the row is already gone, a k8s
+ * hiccup must not fail the deletion, and the manager no-ops when
+ * code-runtime/k8s is off.
+ */
+function teardownEnvironmentEngine(environment: Environment): void {
+  void daggerEnvironmentRuntimeManager
+    .teardownEnvironmentEngine(environment)
+    .catch((err) =>
+      logger.error(
+        { err, environmentId: environment.id },
+        "[DaggerEnvRuntime] background teardown failed",
+      ),
+    );
+}
+
+// === Public API ===
+
+export async function listEnvironments(
+  organizationId: string,
+  labels?: Record<string, string[]>,
+): Promise<EnvironmentList> {
+  const [environments, defaultAssignedCatalogCount, resourceDefaults] =
+    await Promise.all([
+      EnvironmentModel.listForOrganization(organizationId, labels),
+      EnvironmentModel.countDefaultAssigned(organizationId),
+      EnvironmentResourceDefaultModel.getForOrganization(organizationId),
+    ]);
+  return { environments, defaultAssignedCatalogCount, resourceDefaults };
+}
+
+/**
+ * Point one or more resource kinds at the environment their new items should
+ * land in. Omitted kinds are untouched; an explicit null resets that kind to
+ * the org Default environment. Each named environment must belong to the
+ * organization, so a default can never point across tenants.
+ */
+export async function updateEnvironmentResourceDefaults(params: {
+  organizationId: string;
+  data: UpdateEnvironmentResourceDefaults;
+}): Promise<EnvironmentResourceDefaults> {
+  const { organizationId, data } = params;
+  const changes = entriesOf(data);
+
+  // Validate every named environment before writing any of them, so a payload
+  // with one bad id is rejected whole rather than applied halfway.
+  for (const [, environmentId] of changes) {
+    if (environmentId === null) continue;
+    const environment = await EnvironmentModel.findByIdForOrganization(
+      environmentId,
+      organizationId,
+    );
+    if (!environment) {
+      throw new ApiError(404, "Environment not found");
+    }
+  }
+
+  for (const [resource, environmentId] of changes) {
+    await EnvironmentResourceDefaultModel.setForResource({
+      organizationId,
+      resource,
+      environmentId,
+    });
+  }
+
+  return EnvironmentResourceDefaultModel.getForOrganization(organizationId);
+}
+
+/**
+ * The environment a newly created resource of this kind should be bound to when
+ * its creator did not choose one. Returns null — the org Default environment,
+ * i.e. the historical behavior — when no default is configured, or when the
+ * configured one is restricted and the caller may not deploy there. Falling
+ * back rather than throwing keeps an admin's convenience setting from blocking
+ * a create the caller is otherwise allowed to perform; explicitly *choosing*
+ * that environment is still refused by `assertCanAssignEnvironment`.
+ */
+export async function resolveDefaultEnvironmentForNewResource(params: {
+  organizationId: string;
+  resource: EnvironmentDefaultableResource;
+  canDeployToRestricted: boolean;
+}): Promise<string | null> {
+  const { organizationId, resource, canDeployToRestricted } = params;
+
+  const environmentId = await EnvironmentResourceDefaultModel.findForResource({
+    organizationId,
+    resource,
+  });
+  if (!environmentId) return null;
+
+  const environment = await EnvironmentModel.findByIdForOrganization(
+    environmentId,
+    organizationId,
+  );
+  if (!environment) return null;
+  if (environment.restricted && !canDeployToRestricted) return null;
+
+  return environment.id;
+}
+
+export async function createEnvironment(params: {
+  organizationId: string;
+  data: CreateEnvironment;
+}): Promise<Environment> {
+  const { organizationId, data } = params;
+  const existing = await EnvironmentModel.listForOrganization(organizationId);
+  if (existing.some((e) => e.name === data.name)) {
+    throw new ApiError(409, "An environment with this name already exists.");
+  }
+  const created = await EnvironmentModel.create({
+    organizationId,
+    name: data.name,
+    description: data.description ?? null,
+    namespace: data.namespace ?? null,
+    networkPolicy: data.networkPolicy ?? null,
+    restricted: data.restricted,
+    validationRegex: data.validationRegex ?? null,
+    trustedImageRegistries: data.trustedImageRegistries ?? null,
+  });
+
+  if (data.labels?.length) {
+    await EnvironmentLabelModel.syncLabels(created.id, data.labels);
+  }
+
+  reconcileEnvironmentEngine(created);
+  await reconcilePlaywrightRuntime(created);
+  return created;
+}
+
+export async function updateEnvironment(params: {
+  id: string;
+  organizationId: string;
+  data: UpdateEnvironment;
+}): Promise<Environment> {
+  const { id, organizationId, data } = params;
+
+  if (data.name !== undefined) {
+    const existing = await EnvironmentModel.listForOrganization(organizationId);
+    if (existing.some((e) => e.id !== id && e.name === data.name)) {
+      throw new ApiError(409, "An environment with this name already exists.");
+    }
+  }
+  const updated = await EnvironmentModel.update({
+    id,
+    organizationId,
+    name: data.name,
+    description: data.description,
+    namespace: data.namespace,
+    networkPolicy: data.networkPolicy,
+    restricted: data.restricted,
+    validationRegex: data.validationRegex,
+    trustedImageRegistries: data.trustedImageRegistries,
+  });
+  if (!updated) {
+    throw new ApiError(404, "Environment not found");
+  }
+
+  // Only touch labels when the caller sent them, so an update that omits the
+  // field leaves existing labels alone.
+  if (data.labels !== undefined) {
+    await EnvironmentLabelModel.syncLabels(id, data.labels);
+  }
+
+  reconcileEnvironmentEngine(updated);
+  return updated;
+}
+
+/**
+ * Gate assigning a catalog item to an environment. Unrestricted environments
+ * are open; a `restricted` environment requires the caller to hold the
+ * resource-specific `deploy-to-restricted` permission (e.g.
+ * `mcpRegistry:deploy-to-restricted` for catalog items,
+ * `agent:deploy-to-restricted` for agents). The default (null) environment is
+ * open unless the org has marked its default environment restricted, in which
+ * case it is gated the same way. Callers compute `canDeployToRestricted` with
+ * their own auth primitive (route headers vs. MCP user context) and pass the
+ * result in, so this stays free of HTTP concerns.
+ */
+export async function assertCanAssignEnvironment(params: {
+  environmentId: string | null | undefined;
+  organizationId: string;
+  canDeployToRestricted: boolean;
+}): Promise<void> {
+  const { environmentId, organizationId, canDeployToRestricted } = params;
+
+  if (!environmentId) {
+    const organization = await OrganizationModel.getById(organizationId);
+    if (organization?.defaultEnvironmentRestricted && !canDeployToRestricted) {
+      throw new ApiError(
+        403,
+        "You do not have permission to assign catalog items to the default environment.",
+      );
+    }
+    return;
+  }
+
+  const environment = await EnvironmentModel.findByIdForOrganization(
+    environmentId,
+    organizationId,
+  );
+  if (!environment) {
+    throw new ApiError(404, "Environment not found");
+  }
+  if (environment.restricted && !canDeployToRestricted) {
+    throw new ApiError(
+      403,
+      "You do not have permission to assign catalog items to this restricted environment.",
+    );
+  }
+}
+
+/**
+ * Enforce a catalog item's governing environment regex against one or more sets
+ * of user-supplied config values. No-op when the resolved regex is null. Throws
+ * `ApiError(400)` (without echoing the pattern) on the first mismatch.
+ */
+export async function assertValuesMatchEnvironmentRegex(params: {
+  environmentId: string | null | undefined;
+  organizationId: string;
+  valueSets: Array<Record<string, unknown> | null | undefined>;
+}): Promise<void> {
+  const { environmentId, organizationId, valueSets } = params;
+
+  const { regex, label } = await resolveEnvironmentValidationRegex({
+    environmentId,
+    organizationId,
+  });
+  if (!regex) return;
+
+  try {
+    for (const values of valueSets) {
+      validateValuesAgainstRegex(values, regex, label);
+    }
+  } catch (e) {
+    throw new ApiError(400, (e as Error).message);
+  }
+}
+
+/**
+ * Resolve the trusted image registries governing a catalog item, plus a
+ * human-readable label for messages. A set `environmentId` resolves to that
+ * environment's list; a null/undefined one falls back to the org's default
+ * environment (`defaultEnvironmentTrustedImageRegistries`), mirroring
+ * `resolveEnvironmentValidationRegex`. A NULL or empty list means "no
+ * restriction" (any image allowed).
+ */
+export async function resolveTrustedImageRegistries(params: {
+  environmentId: string | null | undefined;
+  organizationId: string;
+}): Promise<{ registries: TrustedImageRegistries | null; label: string }> {
+  const { environmentId, organizationId } = params;
+
+  if (!environmentId) {
+    const organization = await OrganizationModel.getById(organizationId);
+    return {
+      registries:
+        organization?.defaultEnvironmentTrustedImageRegistries ?? null,
+      label: organization?.defaultEnvironmentName ?? "Default",
+    };
+  }
+
+  const environment = await EnvironmentModel.findByIdForOrganization(
+    environmentId,
+    organizationId,
+  );
+  return {
+    registries: environment?.trustedImageRegistries ?? null,
+    label: environment?.name ?? "Default",
+  };
+}
+
+/**
+ * Enforce that a remote MCP server's URL is reachable under its governing
+ * environment's network egress policy. No-op for self-hosted servers (their
+ * egress is enforced by the real k8s NetworkPolicy on the pod) and for
+ * unrestricted / built-in policies. Throws `ApiError(400)` when the policy
+ * would block the backend's outbound connection to the server URL.
+ *
+ * This is the create/edit-time guard, for early feedback in the form. The
+ * runtime connection guard in the MCP client enforces the same policy on actual
+ * calls, so a grandfathered server is still blocked at call time.
+ */
+export async function assertRemoteServerUrlAllowedByNetworkPolicy(params: {
+  serverType: InternalMcpCatalogServerType;
+  serverUrl: string | null | undefined;
+  environmentId: string | null | undefined;
+  organizationId: string;
+}): Promise<void> {
+  const verdict = await evaluateRemoteServerUrlAgainstNetworkPolicy(params);
+  if (!verdict.allowed) {
+    // internal_code lets the frontend attach this to the Server URL field
+    // inline instead of a generic toast. Keep in sync with the frontend
+    // constant of the same value.
+    throw new ApiError(400, verdict.message, "remote_server_url_not_allowed");
+  }
+}
+
+export async function deleteEnvironment(params: {
+  id: string;
+  organizationId: string;
+}): Promise<void> {
+  const { id, organizationId } = params;
+
+  const environment = await EnvironmentModel.findByIdForOrganization(
+    id,
+    organizationId,
+  );
+  if (!environment) {
+    throw new ApiError(404, "Environment not found");
+  }
+
+  const assignedCount = await EnvironmentModel.countAssignedCatalogItems(id);
+  if (assignedCount > 0) {
+    throw new ApiError(
+      409,
+      `This environment still has ${assignedCount} catalog item${
+        assignedCount === 1 ? "" : "s"
+      } assigned. Reassign or remove them before deleting it.`,
+    );
+  }
+
+  const playwrightCatalog =
+    await PlaywrightRuntimeModel.findCatalogForEnvironment(id);
+  if (playwrightCatalog) {
+    await InternalMcpCatalogModel.delete(playwrightCatalog.id);
+  }
+
+  const deleted = await EnvironmentModel.delete(id, organizationId);
+  if (!deleted) {
+    throw new ApiError(404, "Environment not found");
+  }
+
+  teardownEnvironmentEngine(environment);
+}
+
+// === Internal helpers ===
+
+/**
+ * The resource kinds a partial defaults payload actually names, with their
+ * keys typed (`Object.entries` widens them to `string`). A kind that is absent
+ * — or present but undefined — is dropped, so only an explicit null clears a
+ * kind and everything else is left unchanged.
+ */
+function entriesOf(
+  data: UpdateEnvironmentResourceDefaults,
+): Array<[EnvironmentDefaultableResource, string | null]> {
+  return Object.entries(data).filter(
+    (entry): entry is [EnvironmentDefaultableResource, string | null] =>
+      entry[1] !== undefined,
+  );
+}
+
+/**
+ * Resolve the allowlist validation regex governing a catalog item, plus the
+ * human-readable label to name in errors. A set `environmentId` resolves to
+ * that environment's rule; a null/undefined one falls back to the org's default
+ * environment (`defaultEnvironmentValidationRegex`), mirroring how
+ * `assertCanAssignEnvironment` treats the implicit default.
+ */
+async function resolveEnvironmentValidationRegex(params: {
+  environmentId: string | null | undefined;
+  organizationId: string;
+}): Promise<{ regex: string | null; label: string }> {
+  const { environmentId, organizationId } = params;
+
+  if (!environmentId) {
+    const organization = await OrganizationModel.getById(organizationId);
+    return {
+      regex: organization?.defaultEnvironmentValidationRegex ?? null,
+      label: organization?.defaultEnvironmentName ?? "Default",
+    };
+  }
+
+  const environment = await EnvironmentModel.findByIdForOrganization(
+    environmentId,
+    organizationId,
+  );
+  return {
+    regex: environment?.validationRegex ?? null,
+    label: environment?.name ?? "Default",
+  };
+}

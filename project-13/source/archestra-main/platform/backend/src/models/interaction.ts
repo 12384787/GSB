@@ -1,0 +1,2568 @@
+import type {
+  ClientFilter,
+  CursorQuery,
+  InteractionSource,
+  PaginationQuery,
+} from "@archestra/shared";
+import {
+  clientFilterToAgentIds,
+  DynamicInteraction,
+  isClaudeSessionSource,
+  LEGACY_CLAUDE_CODE_SESSION_SOURCE,
+  TimeInMs,
+} from "@archestra/shared";
+import {
+  and,
+  asc,
+  count,
+  desc,
+  eq,
+  gte,
+  inArray,
+  isNotNull,
+  lte,
+  max,
+  min,
+  or,
+  type SQL,
+  sql,
+  sum,
+} from "drizzle-orm";
+import { LRUCacheManager } from "@/cache-manager";
+import {
+  decryptInteractionContent,
+  encryptInteractionContent,
+  readInteractionRow,
+} from "@/content-encryption/audit-rows";
+import type { LockedChatAuditContext } from "@/content-encryption/locked-chat";
+import db, { schema } from "@/database";
+import { notDeleted } from "@/database/schemas/soft-deletable-table";
+import {
+  type CursorPaginatedResult,
+  createPaginatedResult,
+  decodeCursor,
+  encodeCursor,
+  type PaginatedResult,
+} from "@/database/utils/pagination";
+import logger from "@/logging";
+import type {
+  InsertInteraction,
+  Interaction,
+  InteractionAuthMethod,
+  InteractionSummary,
+  InteractionVirtualKey,
+  SessionSummary,
+  SessionUnattributedReason,
+  SortingQuery,
+  UserInfo,
+} from "@/types";
+import {
+  InteractionAuthMethodSchema,
+  LAST_USER_MESSAGE_PREVIEW_MAX_LENGTH,
+  normalizeInteractionResponse,
+} from "@/types";
+import { trackBackgroundWork } from "@/utils/background-work";
+import { repairLoneSurrogateText } from "@/utils/lone-surrogates";
+import { isUuid, uuidv7 } from "@/utils/uuid";
+import AgentModel from "./agent";
+import AgentTeamModel from "./agent-team";
+import ConversationChatErrorModel from "./conversation-chat-error";
+import InteractionDeltaManager from "./interaction-delta-manager";
+import LimitModel from "./limit";
+import { interactionBelongsToOrganization } from "./log-organization";
+import VirtualApiKeyModel from "./virtual-api-key";
+
+/**
+ * How long a session total stays reusable across pages of the same filter set.
+ * Long enough to cover a client paging through the whole result, short enough
+ * that a total on screen is never meaningfully behind the table.
+ */
+const SESSION_TOTAL_CACHE_TTL_MS = 30 * TimeInMs.Second;
+
+/**
+ * Rows read per step of the session-key walk (see findSessionKeysForPage).
+ * Sized so a default page of sessions is normally covered by the first step:
+ * interactions-per-session averages a small single digit, and over-reading a
+ * few hundred indexed rows is far cheaper than a second round trip.
+ */
+const SESSION_SCAN_BATCH_ROWS = 500;
+
+/**
+ * Ceiling on rows the walk will read before giving up and grouping the whole
+ * table instead. Only reached when a filter matches very few sessions spread
+ * over very many rows, where the walk would be the slower of the two.
+ */
+const SESSION_SCAN_MAX_ROWS = 20_000;
+
+/**
+ * Session totals keyed by filter set (see getSessions). Per-pod and in-process
+ * on purpose: the value is cheap to recompute on a miss, so it is not worth a
+ * round-trip to the distributed cache to share it between pods. Bounded well
+ * above the number of distinct filter combinations in flight at once.
+ */
+/**
+ * Returned by the session-list condition builder when the caller can reach
+ * no agents at all. A distinct value rather than `undefined`, which already
+ * means "no predicates" — returning that for a denial would list everything.
+ */
+const SESSION_ACCESS_DENIED = Symbol("session-access-denied");
+
+const sessionTotalCache = new LRUCacheManager<number>({
+  maxSize: 500,
+  defaultTtl: SESSION_TOTAL_CACHE_TTL_MS,
+});
+
+async function findChatErrorsForSessionId(sessionId: string | null) {
+  if (!sessionId || !isUuid(sessionId)) {
+    return [];
+  }
+
+  return ConversationChatErrorModel.findByConversation(sessionId);
+}
+
+/**
+ * Extracts text content from a message content field.
+ * Handles both string content and array of content blocks.
+ */
+function getMessageText(
+  content: string | Array<{ text?: string; type?: string }> | undefined,
+): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((block) => (typeof block === "string" ? block : (block.text ?? "")))
+      .join(" ");
+  }
+  return "";
+}
+
+/**
+ * Detects if a request is a "main" request or "subagent" request.
+ *
+ * Applies to the Claude agentic sources (Claude Code and Claude Desktop, both
+ * built on the Claude Agent SDK); every other source is "main".
+ *
+ * Shared heuristics:
+ * - Single short utility messages ("count", "quota") are subagents
+ * - Prompt suggestion generator requests are subagents
+ * - The Agent SDK spawns single-purpose tool sub-agents (e.g. web search) whose
+ *   system prompt is "You are an assistant for performing a <tool> tool use"
+ *
+ * Source-specific: Claude Code main requests carry the "Task" tool (they can
+ * spawn subagents) and subagents don't — so absence of "Task" means subagent.
+ * Claude Desktop main agents do NOT carry the "Task" tool, so that negative
+ * signal can't be used there; a Claude Desktop request that matched none of the
+ * subagent markers is "main".
+ */
+function computeRequestType(
+  request: unknown,
+  sessionSource: string | null,
+  source: string | null,
+): "main" | "subagent" {
+  // Archestra Chat marks its auxiliary LLM calls with a `chat:<subtype>` source
+  // (title generation, context compaction, tool-call repair); the user's own
+  // turn is plain "chat". These auxiliary calls are sub-agent work — title
+  // generation and compaction even run under dedicated built-in sub-agents — so
+  // the session detail view must badge them as "subagent". A chat session's
+  // session_source is not a Claude source, so without this the heuristics below
+  // would fall through to "main" and mislabel every auxiliary chat call.
+  if (source?.startsWith("chat:")) {
+    return "subagent";
+  }
+
+  // Only apply detection heuristics for Claude sessions (claude_metadata, plus
+  // the legacy claude_code / claude_desktop values on older rows).
+  if (!isClaudeSessionSource(sessionSource)) {
+    return "main";
+  }
+
+  const req = request as {
+    system?: string | Array<{ text?: string; type?: string }>;
+    tools?: Array<{ name: string }>;
+    messages?: Array<{
+      content: string | Array<{ text?: string; type?: string }>;
+      role: string;
+    }>;
+  };
+
+  const messages = req?.messages ?? [];
+
+  // Utility requests with single short message are subagents
+  if (messages.length === 1) {
+    const content = getMessageText(messages[0]?.content);
+    // Single word utility messages like "count", "quota"
+    if (content.length < 20 && !content.includes(" ")) {
+      return "subagent";
+    }
+  }
+
+  // Prompt suggestion generator requests are subagents (check last message)
+  if (messages.length > 0) {
+    const lastMessage = messages[messages.length - 1];
+    const lastContent = getMessageText(lastMessage?.content);
+    if (lastContent.includes("prompt suggestion generator")) {
+      return "subagent";
+    }
+  }
+
+  // Claude Agent SDK tool sub-agents (e.g. web search) are marked by their
+  // system prompt. This is the reliable signal for Claude Desktop, whose main
+  // agent — unlike Claude Code's — does not carry the Task tool.
+  if (getMessageText(req?.system).includes("an assistant for performing a")) {
+    return "subagent";
+  }
+
+  // Legacy rows only: newer Claude requests record session_source as
+  // claude_metadata, which can no longer be distinguished from Claude Desktop,
+  // so the Task-tool negative signal (unsafe for Desktop main agents) is not
+  // applied to them — they fall through to the default below.
+  if (sessionSource === LEGACY_CLAUDE_CODE_SESSION_SOURCE) {
+    const tools = req?.tools ?? [];
+    const hasTaskTool = tools.some((tool) => tool.name === "Task");
+    return hasTaskTool ? "main" : "subagent";
+  }
+
+  return "main";
+}
+
+/**
+ * Extract all agent IDs from external agent IDs.
+ * External agent IDs can be:
+ * - A single agent ID (UUID)
+ * - A delegation chain (colon-separated UUIDs like "agentA:agentB:agentC")
+ * - A non-UUID string like "Archestra Chat" (ignored)
+ */
+function extractAllAgentIdsFromExternalAgentIds(
+  externalAgentIds: (string | null)[],
+): string[] {
+  const allIds = new Set<string>();
+
+  for (const id of externalAgentIds) {
+    if (!id) continue;
+
+    // Check if it's a delegation chain (contains colons)
+    if (id.includes(":")) {
+      for (const part of id.split(":")) {
+        if (isUuid(part)) {
+          allIds.add(part);
+        }
+      }
+    } else if (isUuid(id)) {
+      allIds.add(id);
+    }
+  }
+
+  return [...allIds];
+}
+
+/**
+ * Fetch agent names for a list of agent IDs.
+ */
+async function getAgentNamesById(
+  agentIds: string[],
+): Promise<Map<string, string>> {
+  if (agentIds.length === 0) return new Map();
+
+  const agents = await db
+    .select({ id: schema.agentsTable.id, name: schema.agentsTable.name })
+    .from(schema.agentsTable)
+    .where(inArray(schema.agentsTable.id, agentIds));
+
+  return new Map(agents.map((a) => [a.id, a.name]));
+}
+
+/**
+ * Resolve an external agent ID to a human-readable label.
+ * - Single agent ID: Returns the agent name
+ * - Delegation chain: Returns only the last (most specific) agent name
+ * - Non-UUID: Returns the original string as-is
+ */
+function resolveExternalAgentIdLabel(
+  externalAgentId: string | null,
+  agentNamesMap: Map<string, string>,
+): string | null {
+  if (!externalAgentId) return null;
+
+  // Check if it's a delegation chain (contains colons)
+  if (externalAgentId.includes(":")) {
+    const parts = externalAgentId.split(":");
+    // Get the last agent ID in the chain (the actual executing agent)
+    const lastAgentId = parts[parts.length - 1];
+    if (isUuid(lastAgentId)) {
+      return agentNamesMap.get(lastAgentId) ?? null;
+    }
+    return null;
+  }
+
+  // Single ID - return the agent name if it exists
+  if (isUuid(externalAgentId)) {
+    return agentNamesMap.get(externalAgentId) ?? null;
+  }
+
+  // Non-UUID (like "Archestra Chat") - no label
+  return null;
+}
+
+/**
+ * Build a display name for an external agent ID.
+ * - Single agent ID: Returns "AgentName" or the ID if not found
+ * - Delegation chain: Returns "Agent1 → Agent2 → Agent3" format
+ * - Non-UUID: Returns the original string as-is
+ */
+function buildExternalAgentDisplayName(
+  externalAgentId: string,
+  agentNamesMap: Map<string, string>,
+): string {
+  // Check if it's a delegation chain (contains colons)
+  if (externalAgentId.includes(":")) {
+    const parts = externalAgentId.split(":");
+    const names = parts.map((part) => {
+      if (isUuid(part)) {
+        return agentNamesMap.get(part) ?? part.slice(0, 8);
+      }
+      return part;
+    });
+    return names.join(" → ");
+  }
+
+  // Single ID - return the agent name or truncated ID
+  if (isUuid(externalAgentId)) {
+    return agentNamesMap.get(externalAgentId) ?? externalAgentId.slice(0, 8);
+  }
+
+  // Non-UUID (like "Archestra Chat") - return as-is
+  return externalAgentId;
+}
+
+/**
+ * Strips characters PostgreSQL JSONB cannot store from JSON-serializable data.
+ *
+ * Two kinds, both of which appear in real LLM traffic and both of which fail the
+ * insert outright — losing the whole interaction row rather than one field:
+ *  - Null bytes (\u0000), which JSONB rejects as an escape sequence (e.g. in
+ *    Gemini's thoughtSignature fields).
+ *  - Unpaired UTF-16 surrogates, half an astral character left by a completion
+ *    or tool result cut mid-character. JSONB is UTF-8, which cannot encode one.
+ */
+function stripUnstorableChars<T>(value: T): T {
+  if (value === null || value === undefined) return value;
+  if (typeof value === "string") {
+    return repairLoneSurrogateText(value.replaceAll("\u0000", "")) as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map(stripUnstorableChars) as T;
+  }
+  if (typeof value === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      result[k] = stripUnstorableChars(v);
+    }
+    return result as T;
+  }
+  return value;
+}
+
+/**
+ * Join predicate linking an interaction's `session_id` (VARCHAR) to a
+ * conversation's `id` (UUID) — used for Archestra Chat sessions whose
+ * session_id IS the conversation id.
+ *
+ * The only reason a cast is needed at all is type compatibility: Postgres has no
+ * `varchar = uuid` operator. We cast the TRUSTED side (`conversations.id::text`,
+ * which can never fail) rather than the untrusted `session_id::uuid` — a non-uuid
+ * session_id (e.g. some a2a / external-agent ids) would otherwise throw
+ * "invalid input syntax for type uuid" and 500 the whole query (see utils/uuid.ts).
+ * Comparing as text, a non-conversation session_id simply matches no row, and the
+ * equality on the bare `session_id` column can use interactions_session_*_idx.
+ * Conversation ids are generated as canonical lowercase uuids, so they match the
+ * canonical lowercase form `id::text` produces.
+ */
+function sessionIdMatchesConversation(): SQL {
+  return sql`${schema.interactionsTable.sessionId} = ${schema.conversationsTable.id}::text`;
+}
+
+class InteractionModel {
+  static async existsByRunId(runId: string): Promise<boolean> {
+    const [result] = await db
+      .select({ id: schema.interactionsTable.id })
+      .from(schema.interactionsTable)
+      .where(eq(schema.interactionsTable.runId, runId))
+      .limit(1);
+    return result !== undefined;
+  }
+
+  /**
+   * @param auditContext when present, this interaction belongs to a locked-chat
+   * conversation: its content columns are encrypted under that conversation's
+   * browser-held key and the row is stamped with the discriminator, instead of
+   * being encrypted under the server key (or left plaintext).
+   */
+  static async create(
+    data: InsertInteraction,
+    auditContext?: LockedChatAuditContext | null,
+    opts?: {
+      /**
+       * Environment to stamp instead of the executing agent's own. The proxy
+       * supplies it for advisor consultations (loopback-verified), which bill
+       * to the delegating caller's environment because the advisor's row is
+       * org-wide and env-less.
+       */
+      environmentIdOverride?: string;
+    },
+  ) {
+    const audit = auditContext ?? null;
+    // Snapshot the environment from the agent at creation time (single funnel
+    // for all interaction writes) so per-environment cost-limit usage stays
+    // stable under later agent reassignment. The agent is authoritative: when a
+    // profile is present its current environment wins over any caller-supplied
+    // value. Only profile-less system interactions may set it explicitly, and
+    // only the proxy's verified advisor-delegation path may override it.
+    const environmentId =
+      opts?.environmentIdOverride ??
+      (data.profileId
+        ? await AgentModel.findEnvironmentId(data.profileId)
+        : (data.environmentId ?? null));
+
+    // Sanitize JSONB fields to strip null bytes (\u0000) that PostgreSQL rejects
+    const sanitized = {
+      ...data,
+      environmentId,
+      request: stripUnstorableChars(data.request),
+      processedRequest: stripUnstorableChars(data.processedRequest),
+      response: stripUnstorableChars(data.response),
+    };
+
+    // Delta-encode Claude Code / Claude Desktop requests so we don't re-store the
+    // whole conversation on every row (no-op for all other interactions, and
+    // disabled entirely under content encryption — see isEligible).
+    //
+    // LockedChat rows are excluded outright. Today they could not qualify anyway
+    // (isEligible demands a Claude session source, and these are chat sources),
+    // but relying on that coincidence would be fragile: a delta chain mixes rows
+    // across requests and only the request that created a row carries its key,
+    // so a chain spanning keys could not be reconstructed by any reader.
+    const { values, tip } = audit
+      ? { values: sanitized, tip: null }
+      : await InteractionDeltaManager.encodeOnWrite(sanitized);
+
+    const [interaction] = await db
+      .insert(schema.interactionsTable)
+      // Monotonic v7 id: created_at ties happen under load, and the delta
+      // manager's "most recent interaction" lookup breaks ties with the id.
+      .values({ id: uuidv7(), ...encryptInteractionContent(values, audit) })
+      .returning();
+    // The RETURNING row is this method's public return value — decrypt it so
+    // callers never see envelopes. Safe for locked-chat rows too: this caller
+    // supplied the very key that just encrypted them.
+    decryptInteractionContent(interaction, audit);
+
+    if (tip) {
+      InteractionDeltaManager.commitTip(interaction.id, tip);
+    }
+
+    // Update usage tracking after interaction is created
+    // Run in background to not block the response
+    trackBackgroundWork(
+      InteractionModel.updateUsageAfterInteraction(
+        interaction as InsertInteraction & { id: string },
+      ).catch((error) => {
+        logger.error(
+          { error },
+          `Failed to update usage tracking for interaction ${interaction.id}`,
+        );
+      }),
+    );
+
+    return interaction;
+  }
+
+  /**
+   * Find all interactions with pagination, sorting, and filtering support
+   */
+  static async findAllPaginated(
+    pagination: PaginationQuery,
+    sorting?: SortingQuery,
+    requestingUserId?: string,
+    isAgentAdmin?: boolean,
+    filters?: {
+      organizationId?: string;
+      profileId?: string;
+      externalAgentId?: string;
+      userId?: string;
+      sessionId?: string;
+      startDate?: Date;
+      endDate?: Date;
+    },
+  ): Promise<PaginatedResult<Interaction>> {
+    // Determine the ORDER BY clause based on sorting params
+    const orderByClause = InteractionModel.getOrderByClause(sorting);
+
+    // Build where clauses
+    const conditions: SQL[] = [];
+
+    if (filters?.organizationId) {
+      conditions.push(interactionBelongsToOrganization(filters.organizationId));
+    }
+
+    // Access control filter
+    if (requestingUserId && !isAgentAdmin) {
+      const accessibleAgentIds = await AgentTeamModel.getUserAccessibleAgentIds(
+        requestingUserId,
+        false,
+      );
+
+      if (accessibleAgentIds.length === 0) {
+        return createPaginatedResult([], 0, pagination);
+      }
+
+      conditions.push(
+        inArray(schema.interactionsTable.profileId, accessibleAgentIds),
+      );
+    }
+
+    // Profile filter (internal Archestra profile ID)
+    if (filters?.profileId) {
+      conditions.push(
+        eq(schema.interactionsTable.profileId, filters.profileId),
+      );
+    }
+
+    // External agent ID filter (from X-Archestra-Agent-Id header)
+    if (filters?.externalAgentId) {
+      conditions.push(
+        eq(schema.interactionsTable.externalAgentId, filters.externalAgentId),
+      );
+    }
+
+    // User ID filter (from X-Archestra-User-Id header)
+    if (filters?.userId) {
+      conditions.push(eq(schema.interactionsTable.userId, filters.userId));
+    }
+
+    // Session ID filter
+    if (filters?.sessionId) {
+      conditions.push(
+        eq(schema.interactionsTable.sessionId, filters.sessionId),
+      );
+    }
+
+    // Date range filter
+    if (filters?.startDate) {
+      conditions.push(
+        gte(schema.interactionsTable.createdAt, filters.startDate),
+      );
+    }
+    if (filters?.endDate) {
+      conditions.push(lte(schema.interactionsTable.createdAt, filters.endDate));
+    }
+
+    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const [rows, [{ total }]] = await Promise.all([
+      db
+        .select({
+          interaction: schema.interactionsTable,
+          activeProfileId: schema.agentsTable.id,
+        })
+        .from(schema.interactionsTable)
+        .leftJoin(
+          schema.agentsTable,
+          and(
+            eq(schema.interactionsTable.profileId, schema.agentsTable.id),
+            notDeleted(schema.agentsTable),
+          ),
+        )
+        .where(whereClause)
+        .orderBy(orderByClause)
+        .limit(pagination.limit)
+        .offset(pagination.offset),
+      db
+        .select({ total: count() })
+        .from(schema.interactionsTable)
+        .where(whereClause),
+    ]);
+    const data = rows.map(({ interaction, activeProfileId }) => ({
+      ...interaction,
+      profileId: activeProfileId,
+    }));
+
+    // Resolve external agent IDs (including delegation chains) to agent names
+    const allAgentIds = extractAllAgentIdsFromExternalAgentIds(
+      data.map((i) => i.externalAgentId),
+    );
+    const agentNamesMap = await getAgentNamesById(allAgentIds);
+
+    // Reconstruct full delta-encoded requests in a single batched query so the
+    // API returns the same data as before delta-encoding was introduced.
+    const reconstructed = await reconstructInteractionRequests(data);
+
+    // Add computed requestType and externalAgentIdLabel fields to each interaction
+    const dataWithComputedFields = data.map((interaction) => {
+      const full = reconstructed.get(interaction.id);
+      return {
+        ...interaction,
+        request: full?.request ?? interaction.request,
+        processedRequest:
+          full?.processedRequest ?? interaction.processedRequest,
+        // Coerce a stored response that no longer matches its provider schema
+        // into a serializable sentinel so one bad row can't 500 the whole list.
+        response: normalizeInteractionResponse(
+          interaction.type,
+          interaction.response,
+        ),
+        // computeRequestType must run on the reconstructed (full) request — it
+        // inspects messages.length and the first/last message content.
+        requestType: computeRequestType(
+          full?.request ?? interaction.request,
+          interaction.sessionSource,
+          interaction.source,
+        ),
+        // Resolve externalAgentId to human-readable label (supports delegation chains)
+        externalAgentIdLabel: resolveExternalAgentIdLabel(
+          interaction.externalAgentId,
+          agentNamesMap,
+        ),
+      };
+    });
+
+    return createPaginatedResult(
+      dataWithComputedFields as unknown as (Interaction & {
+        requestType: "main" | "subagent";
+        externalAgentIdLabel: string | null;
+      })[],
+      Number(total),
+      pagination,
+    );
+  }
+
+  /**
+   * Paginated interaction metadata for list views. Content columns are
+   * deliberately absent: they dominate row size and require decryption and
+   * delta reconstruction, while list rows render only scalar usage metadata.
+   */
+  static async findSummariesPaginated(params: {
+    pagination: PaginationQuery;
+    sorting?: SortingQuery;
+    requestingUserId?: string;
+    isAgentAdmin?: boolean;
+    filters?: {
+      organizationId?: string;
+      profileId?: string;
+      externalAgentId?: string;
+      userId?: string;
+      sessionId?: string;
+      startDate?: Date;
+      endDate?: Date;
+    };
+  }): Promise<PaginatedResult<InteractionSummary>> {
+    const { pagination, sorting, requestingUserId, isAgentAdmin, filters } =
+      params;
+    const conditions: SQL[] = [];
+    if (filters?.organizationId) {
+      conditions.push(interactionBelongsToOrganization(filters.organizationId));
+    }
+    if (requestingUserId && !isAgentAdmin) {
+      const accessibleAgentIds = await AgentTeamModel.getUserAccessibleAgentIds(
+        requestingUserId,
+        false,
+      );
+      if (accessibleAgentIds.length === 0) {
+        return createPaginatedResult([], 0, pagination);
+      }
+      conditions.push(
+        inArray(schema.interactionsTable.profileId, accessibleAgentIds),
+      );
+    }
+    if (filters?.profileId) {
+      conditions.push(
+        eq(schema.interactionsTable.profileId, filters.profileId),
+      );
+    }
+    if (filters?.externalAgentId) {
+      conditions.push(
+        eq(schema.interactionsTable.externalAgentId, filters.externalAgentId),
+      );
+    }
+    if (filters?.userId) {
+      conditions.push(eq(schema.interactionsTable.userId, filters.userId));
+    }
+    if (filters?.sessionId) {
+      conditions.push(
+        eq(schema.interactionsTable.sessionId, filters.sessionId),
+      );
+    }
+    if (filters?.startDate) {
+      conditions.push(
+        gte(schema.interactionsTable.createdAt, filters.startDate),
+      );
+    }
+    if (filters?.endDate) {
+      conditions.push(lte(schema.interactionsTable.createdAt, filters.endDate));
+    }
+
+    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+    const [rows, [{ total }]] = await Promise.all([
+      db
+        .select({
+          id: schema.interactionsTable.id,
+          profileId: schema.agentsTable.id,
+          externalAgentId: schema.interactionsTable.externalAgentId,
+          sessionId: schema.interactionsTable.sessionId,
+          type: schema.interactionsTable.type,
+          model: schema.interactionsTable.model,
+          baselineModel: schema.interactionsTable.baselineModel,
+          billingMode: schema.interactionsTable.billingMode,
+          inputTokens: schema.interactionsTable.inputTokens,
+          outputTokens: schema.interactionsTable.outputTokens,
+          cacheReadTokens: schema.interactionsTable.cacheReadTokens,
+          cacheWriteTokens: schema.interactionsTable.cacheWriteTokens,
+          cost: schema.interactionsTable.cost,
+          baselineCost: schema.interactionsTable.baselineCost,
+          createdAt: schema.interactionsTable.createdAt,
+        })
+        .from(schema.interactionsTable)
+        .leftJoin(
+          schema.agentsTable,
+          and(
+            eq(schema.interactionsTable.profileId, schema.agentsTable.id),
+            notDeleted(schema.agentsTable),
+          ),
+        )
+        .where(whereClause)
+        .orderBy(InteractionModel.getOrderByClause(sorting))
+        .limit(pagination.limit)
+        .offset(pagination.offset),
+      db
+        .select({ total: count() })
+        .from(schema.interactionsTable)
+        .where(whereClause),
+    ]);
+
+    const agentNamesMap = await getAgentNamesById(
+      extractAllAgentIdsFromExternalAgentIds(
+        rows.map((row) => row.externalAgentId),
+      ),
+    );
+    return createPaginatedResult(
+      rows.map((row) => ({
+        ...row,
+        externalAgentIdLabel: resolveExternalAgentIdLabel(
+          row.externalAgentId,
+          agentNamesMap,
+        ),
+      })),
+      Number(total),
+      pagination,
+    );
+  }
+
+  /**
+   * Helper to get the appropriate ORDER BY clause based on sorting params
+   */
+  private static getOrderByClause(sorting?: SortingQuery) {
+    const direction = sorting?.sortDirection === "asc" ? asc : desc;
+
+    switch (sorting?.sortBy) {
+      case "createdAt":
+        return direction(schema.interactionsTable.createdAt);
+      case "profileId":
+        return direction(schema.interactionsTable.profileId);
+      case "externalAgentId":
+        return direction(schema.interactionsTable.externalAgentId);
+      case "userId":
+        return direction(schema.interactionsTable.userId);
+      case "model":
+        // The scalar column, NOT `request ->> 'model'`: the jsonb payload can
+        // be an encrypted envelope under content encryption, and the scalar is
+        // populated for every row anyway.
+        return direction(schema.interactionsTable.model);
+      default:
+        // Default: newest first
+        return desc(schema.interactionsTable.createdAt);
+    }
+  }
+
+  static async findById(
+    idOrScope: string | { id: string; organizationId: string },
+    userId?: string,
+    isAgentAdmin?: boolean,
+  ): Promise<Interaction | null> {
+    const id = typeof idOrScope === "string" ? idOrScope : idOrScope.id;
+    const organizationId =
+      typeof idOrScope === "string" ? undefined : idOrScope.organizationId;
+    const [row] = await db
+      .select({
+        interaction: schema.interactionsTable,
+        activeProfileId: schema.agentsTable.id,
+      })
+      .from(schema.interactionsTable)
+      .leftJoin(
+        schema.agentsTable,
+        and(
+          eq(schema.interactionsTable.profileId, schema.agentsTable.id),
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .where(
+        and(
+          eq(schema.interactionsTable.id, id),
+          ...(organizationId
+            ? [interactionBelongsToOrganization(organizationId)]
+            : []),
+        ),
+      );
+
+    if (!row) {
+      return null;
+    }
+    const interaction = {
+      ...row.interaction,
+      profileId: row.activeProfileId,
+    };
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    readInteractionRow(interaction);
+    // SPDX-SnippetEnd
+
+    // Check access control for non-agent admins
+    if (userId && !isAgentAdmin) {
+      // If profileId is null (agent was deleted), only admins can see the interaction
+      if (!interaction.profileId) {
+        return null;
+      }
+      const hasAccess = await AgentTeamModel.userHasAgentAccess(
+        userId,
+        interaction.profileId,
+        false,
+      );
+      if (!hasAccess) {
+        return null;
+      }
+    }
+
+    const reconstructed = await InteractionDeltaManager.reconstructRow(
+      interaction as unknown as {
+        id: string;
+        threadId: string | null;
+        request: unknown;
+        processedRequest: unknown;
+      },
+    );
+
+    return {
+      ...interaction,
+      request: reconstructed.request,
+      processedRequest: reconstructed.processedRequest,
+      // Coerce a stored response that no longer matches its provider schema
+      // into a serializable sentinel so a bad row can't 500 the detail route.
+      response: normalizeInteractionResponse(
+        interaction.type,
+        interaction.response,
+      ),
+      chatErrors: await findChatErrorsForSessionId(interaction.sessionId),
+    } as Interaction;
+  }
+
+  static async getAllInteractionsForProfile(
+    profileId: string,
+    whereClauses?: SQL[],
+  ) {
+    const rows = await db
+      .select()
+      .from(schema.interactionsTable)
+      .where(
+        and(
+          eq(schema.interactionsTable.profileId, profileId),
+          ...(whereClauses ?? []),
+        ),
+      )
+      .orderBy(
+        asc(schema.interactionsTable.createdAt),
+        asc(schema.interactionsTable.id),
+      );
+
+    return withReconstructedRequests(rows);
+  }
+
+  /**
+   * Get all interactions for a profile with pagination and sorting support
+   */
+  static async getAllInteractionsForProfilePaginated(
+    profileId: string,
+    pagination: PaginationQuery,
+    sorting?: SortingQuery,
+    whereClauses?: SQL[],
+  ): Promise<PaginatedResult<Interaction>> {
+    const whereCondition = and(
+      eq(schema.interactionsTable.profileId, profileId),
+      ...(whereClauses ?? []),
+    );
+
+    const orderByClause = InteractionModel.getOrderByClause(sorting);
+
+    const [data, [{ total }]] = await Promise.all([
+      db
+        .select()
+        .from(schema.interactionsTable)
+        .where(whereCondition)
+        .orderBy(orderByClause)
+        .limit(pagination.limit)
+        .offset(pagination.offset),
+      db
+        .select({ total: count() })
+        .from(schema.interactionsTable)
+        .where(whereCondition),
+    ]);
+
+    return createPaginatedResult(
+      // `data` are raw Drizzle rows (they still carry the internal delta columns
+      // that `withReconstructedRequests` needs); the public type omits them.
+      (await withReconstructedRequests(data)) as unknown as Interaction[],
+      Number(total),
+      pagination,
+    );
+  }
+
+  static async getCount() {
+    const [result] = await db
+      .select({ total: count() })
+      .from(schema.interactionsTable);
+    return result.total;
+  }
+
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  /**
+   * Enterprise data-retention sweep: delete interactions older than the
+   * retention window, leaf-first.
+   *
+   * A row is only deletable when no other row references it as `parent_id`,
+   * so delta chains erode tip-first across iterations and any ancestor of a
+   * fresh surviving row is retained — reconstruction for survivors can never
+   * truncate, and the deployed `ON DELETE RESTRICT` self-FK can never fire by
+   * design. A concurrent insert racing the NOT EXISTS check trips the FK
+   * (23503); that batch is skipped and re-evaluated on the next sweep.
+   *
+   * The cutoff is computed in SQL (`now() - make_interval(...)`): `created_at`
+   * is `timestamp without time zone`, and a JS Date parameter would shift by
+   * the host's UTC offset.
+   */
+  static async deleteExpired(params: {
+    retentionDays: number;
+    batchSize?: number;
+    maxBatches?: number;
+  }): Promise<number> {
+    const batchSize = params.batchSize ?? 1000;
+    const maxBatches = params.maxBatches ?? 500;
+    let totalDeleted = 0;
+
+    for (let batch = 0; batch < maxBatches; batch++) {
+      let deleted: number;
+      try {
+        const result = await db.execute<{ deleted: number }>(sql`
+          WITH fence AS (
+            SELECT i.id
+            FROM ${schema.interactionsTable} AS i
+            WHERE i.created_at < now()::timestamp - make_interval(days => ${params.retentionDays})
+              AND NOT EXISTS (
+                SELECT 1 FROM ${schema.interactionsTable} AS c
+                WHERE c.parent_id = i.id
+              )
+            LIMIT ${batchSize}
+          ),
+          removed AS (
+            DELETE FROM ${schema.interactionsTable}
+            WHERE id IN (SELECT id FROM fence)
+            RETURNING 1
+          )
+          SELECT COUNT(*)::int AS deleted FROM removed
+        `);
+        deleted = Number(result.rows[0]?.deleted ?? 0);
+      } catch (error) {
+        // Most likely the parent_id RESTRICT FK racing a concurrent insert
+        // that chained onto a row selected for deletion. Safe to stop — the
+        // next sweep re-evaluates leaves from scratch.
+        logger.warn(
+          {
+            error: error instanceof Error ? error.message : String(error),
+            totalDeleted,
+          },
+          "interaction retention sweep: batch failed, deferring to next run",
+        );
+        return totalDeleted;
+      }
+
+      totalDeleted += deleted;
+      // Leaf-first must loop even on short batches: deleting tips can expose
+      // their parents as new leaves. Only an empty round means done.
+      if (deleted === 0) break;
+    }
+
+    return totalDeleted;
+  }
+  // SPDX-SnippetEnd
+
+  /**
+   * Get all unique external agent IDs with display names
+   * Used for filtering dropdowns in the UI
+   * Returns agent info (id and displayName) for the dropdown to display names but filter by id
+   */
+  static async getUniqueExternalAgentIds(params: {
+    requestingUserId?: string;
+    isAgentAdmin?: boolean;
+    /** Narrow to rows attributed to this user (the own-logs log:read view). */
+    ownUserId?: string;
+    organizationId?: string;
+  }): Promise<{ id: string; displayName: string }[]> {
+    const { requestingUserId, isAgentAdmin, ownUserId, organizationId } =
+      params;
+    // Build where clause for access control
+    const conditions: SQL[] = [
+      isNotNull(schema.interactionsTable.externalAgentId),
+    ];
+    if (organizationId) {
+      conditions.push(interactionBelongsToOrganization(organizationId));
+    }
+    if (ownUserId) {
+      conditions.push(eq(schema.interactionsTable.userId, ownUserId));
+    }
+
+    if (requestingUserId && !isAgentAdmin) {
+      const accessibleAgentIds = await AgentTeamModel.getUserAccessibleAgentIds(
+        requestingUserId,
+        false,
+      );
+
+      if (accessibleAgentIds.length === 0) {
+        return [];
+      }
+
+      conditions.push(
+        inArray(schema.interactionsTable.profileId, accessibleAgentIds),
+      );
+    }
+
+    const result = await db
+      .selectDistinct({
+        externalAgentId: schema.interactionsTable.externalAgentId,
+      })
+      .from(schema.interactionsTable)
+      .where(and(...conditions))
+      .orderBy(asc(schema.interactionsTable.externalAgentId));
+
+    const externalAgentIds = result
+      .map((r) => r.externalAgentId)
+      .filter((id): id is string => id !== null);
+
+    // Get all unique agent IDs from the external agent IDs (including from chains)
+    const allAgentIds =
+      extractAllAgentIdsFromExternalAgentIds(externalAgentIds);
+    const agentNamesMap = await getAgentNamesById(allAgentIds);
+
+    // Build display names for each external agent ID
+    return externalAgentIds.map((id) => ({
+      id,
+      displayName: buildExternalAgentDisplayName(id, agentNamesMap),
+    }));
+  }
+
+  /**
+   * Get all unique user IDs with user names
+   * Used for filtering dropdowns in the UI
+   * Returns user info (id and name) for the dropdown to display names but filter by id
+   */
+  static async getUniqueUserIds(params: {
+    requestingUserId?: string;
+    isAgentAdmin?: boolean;
+    organizationId?: string;
+  }): Promise<UserInfo[]> {
+    const { requestingUserId, isAgentAdmin, organizationId } = params;
+    // Build where clause for access control
+    const conditions: SQL[] = [isNotNull(schema.interactionsTable.userId)];
+    if (organizationId) {
+      conditions.push(interactionBelongsToOrganization(organizationId));
+    }
+
+    if (requestingUserId && !isAgentAdmin) {
+      const accessibleAgentIds = await AgentTeamModel.getUserAccessibleAgentIds(
+        requestingUserId,
+        false,
+      );
+
+      if (accessibleAgentIds.length === 0) {
+        return [];
+      }
+
+      conditions.push(
+        inArray(schema.interactionsTable.profileId, accessibleAgentIds),
+      );
+    }
+
+    // Put the most active users first so a large organization's filter surfaces
+    // likely choices before its alphabetical tail. Names and ids close ties to
+    // keep the order stable between requests.
+    const activityCount = count();
+    const result = await db
+      .select({
+        userId: schema.interactionsTable.userId,
+        userName: schema.usersTable.name,
+      })
+      .from(schema.interactionsTable)
+      .innerJoin(
+        schema.usersTable,
+        eq(schema.interactionsTable.userId, schema.usersTable.id),
+      )
+      .where(and(...conditions))
+      .groupBy(schema.interactionsTable.userId, schema.usersTable.name)
+      .orderBy(
+        desc(activityCount),
+        asc(schema.usersTable.name),
+        asc(schema.interactionsTable.userId),
+      );
+
+    return result
+      .filter(
+        (r): r is { userId: string; userName: string } => r.userId !== null,
+      )
+      .map((r) => ({
+        id: r.userId,
+        name: r.userName,
+      }));
+  }
+
+  /**
+   * Update usage limits after an interaction is created
+   */
+  static async updateUsageAfterInteraction(
+    interaction: InsertInteraction & { id: string },
+  ): Promise<void> {
+    try {
+      // Subscription-billed interactions (e.g. Claude Pro/Max OAuth credentials)
+      // cost the organization $0, so they must not burn down token-cost limits.
+      if (interaction.billingMode === "subscription") {
+        logger.debug(
+          `Interaction ${interaction.id} is subscription-billed - skipping limit update`,
+        );
+        return;
+      }
+
+      // Calculate token usage for this interaction
+      const inputTokens = interaction.inputTokens || 0;
+      const outputTokens = interaction.outputTokens || 0;
+      const model = interaction.model;
+
+      if (inputTokens === 0 && outputTokens === 0) {
+        // No tokens used, nothing to update
+        return;
+      }
+
+      if (!model) {
+        logger.warn(
+          `Interaction ${interaction.id} has no model - cannot update limits`,
+        );
+        return;
+      }
+
+      // Get agent's teams to update team and organization limits
+      // If profileId is null (agent was deleted), we can't update usage - skip silently
+      if (!interaction.profileId) {
+        logger.info(
+          `Interaction ${interaction.id} has null profileId (agent deleted) - skipping limit update`,
+        );
+        return;
+      }
+      const agentTeamIds = await AgentTeamModel.getTeamsForAgent(
+        interaction.profileId,
+      );
+
+      const updatePromises: Promise<void>[] = [];
+
+      if (agentTeamIds.length === 0) {
+        logger.warn(
+          `Profile ${interaction.profileId} has no team assignments for interaction ${interaction.id}`,
+        );
+
+        // Even if agent has no teams, update organization limits for its own org.
+        try {
+          const organizationId = await AgentModel.findOrganizationId(
+            interaction.profileId,
+          );
+
+          if (organizationId) {
+            updatePromises.push(
+              LimitModel.updateTokenLimitUsage(
+                "organization",
+                organizationId,
+                model,
+                inputTokens,
+                outputTokens,
+              ),
+            );
+          }
+        } catch (error) {
+          logger.error(
+            { error },
+            "Failed to find organization for agent with no teams",
+          );
+        }
+      } else {
+        // Get team details to access organizationId
+        const teams = await db
+          .select()
+          .from(schema.teamsTable)
+          .where(inArray(schema.teamsTable.id, agentTeamIds));
+
+        // Update organization-level token cost limits (from first team's organization)
+        if (teams.length > 0 && teams[0].organizationId) {
+          updatePromises.push(
+            LimitModel.updateTokenLimitUsage(
+              "organization",
+              teams[0].organizationId,
+              model,
+              inputTokens,
+              outputTokens,
+            ),
+          );
+        }
+
+        // Update team-level token cost limits
+        for (const team of teams) {
+          updatePromises.push(
+            LimitModel.updateTokenLimitUsage(
+              "team",
+              team.id,
+              model,
+              inputTokens,
+              outputTokens,
+            ),
+          );
+        }
+      }
+
+      // Update profile-level token cost limits (if any exist)
+      updatePromises.push(
+        LimitModel.updateTokenLimitUsage(
+          "agent",
+          interaction.profileId,
+          model,
+          inputTokens,
+          outputTokens,
+        ),
+      );
+
+      if (interaction.userId) {
+        updatePromises.push(
+          LimitModel.updateTokenLimitUsage(
+            "user",
+            interaction.userId,
+            model,
+            inputTokens,
+            outputTokens,
+          ),
+        );
+      }
+
+      if (interaction.virtualKeyId) {
+        updatePromises.push(
+          LimitModel.updateTokenLimitUsage(
+            "virtual_key",
+            interaction.virtualKeyId,
+            model,
+            inputTokens,
+            outputTokens,
+          ),
+        );
+      }
+
+      // A passthrough virtual key accrues usage independently from the standard
+      // virtual key (distinct limit entities), so record against both when present.
+      if (interaction.passthroughVirtualKeyId) {
+        updatePromises.push(
+          LimitModel.updateTokenLimitUsage(
+            "virtual_key",
+            interaction.passthroughVirtualKeyId,
+            model,
+            inputTokens,
+            outputTokens,
+          ),
+        );
+      }
+
+      // Update environment-level token cost limits using the environment
+      // snapshotted on the interaction at creation time.
+      if (interaction.environmentId) {
+        updatePromises.push(
+          LimitModel.updateTokenLimitUsage(
+            "environment",
+            interaction.environmentId,
+            model,
+            inputTokens,
+            outputTokens,
+          ),
+        );
+      }
+
+      // Execute all updates in parallel
+      await Promise.all(updatePromises);
+    } catch (error) {
+      logger.error({ error }, "Error updating usage limits after interaction");
+      // Don't throw - usage tracking should not break interaction creation
+    }
+  }
+
+  /**
+   * Session summary returned by getSessions
+   *
+   * Performance optimization: This method splits the query into two phases:
+   * 1. Fast aggregation query for session stats (no ARRAY_AGG on large JSON columns)
+   * 2. Batch fetch of "last interaction" data using efficient indexed lookups
+   *
+   * The previous approach used ARRAY_AGG with FILTER on request::text which was O(n) on JSON size
+   * and caused 17+ second queries due to scanning megabytes of JSON per session.
+   */
+  static async getSessions(
+    pagination: PaginationQuery,
+    requestingUserId?: string,
+    isAgentAdmin?: boolean,
+    filters?: {
+      organizationId?: string;
+      profileId?: string;
+      userId?: string;
+      source?: InteractionSource;
+      client?: ClientFilter;
+      externalAgentId?: string;
+      sessionId?: string;
+      startDate?: Date;
+      endDate?: Date;
+    },
+  ): Promise<PaginatedResult<SessionSummary>> {
+    const access = await InteractionModel.buildSessionConditions(
+      requestingUserId,
+      isAgentAdmin,
+      filters,
+    );
+    if (access === SESSION_ACCESS_DENIED) {
+      return createPaginatedResult([], 0, pagination);
+    }
+    const whereClause = access;
+
+    // The session total is the same for every page of one filter set, but the
+    // count it needs scans `interactions` — the largest, write-hot table — so
+    // paying it per page made a client walking the pages re-run a full scan on
+    // every request (the dominant cost of this endpoint, and enough on its own
+    // to push the query into statement timeout as the table grows). Compute it
+    // for the first page of a sweep and reuse it for the rest; a total that
+    // trails new rows by at most SESSION_TOTAL_CACHE_TTL_MS is the intended
+    // trade, since it only sizes the pager.
+    const sessionTotalCacheKey = JSON.stringify([
+      requestingUserId ?? null,
+      isAgentAdmin ?? false,
+      filters?.profileId ?? null,
+      filters?.organizationId ?? null,
+      filters?.userId ?? null,
+      filters?.source ?? null,
+      filters?.client ?? null,
+      filters?.externalAgentId ?? null,
+      filters?.sessionId ?? null,
+      filters?.startDate?.toISOString() ?? null,
+      filters?.endDate?.toISOString() ?? null,
+    ]);
+    const cachedTotal = sessionTotalCache.get(sessionTotalCacheKey);
+
+    // PHASE 1: Find only the session keys for this page. The summary query has
+    // several joins and aggregates; applying LIMIT after all of that made every
+    // page summarize every session in the table before discarding almost all of
+    // the work. Selecting the page first keeps the expensive phase bounded by
+    // the requested page instead of total history size.
+    const [sessionPage, [{ total }]] = await Promise.all([
+      InteractionModel.findSessionKeysForPage(whereClause, pagination),
+      // Total = distinct sessions + sessionless interactions (each its own
+      // "session"). Counted without COUNT(DISTINCT COALESCE(session_id,
+      // id::text)) — the per-row uuid cast defeats the session_id index — and
+      // without the conversations join the summary query needs for titles: the
+      // filters only touch interactions columns, and joining on the
+      // conversations PK can't change the count.
+      cachedTotal !== undefined
+        ? [{ total: cachedTotal }]
+        : db
+            .select({
+              total: sql<number>`COUNT(DISTINCT ${schema.interactionsTable.sessionId}) + COUNT(*) FILTER (WHERE ${schema.interactionsTable.sessionId} IS NULL)`,
+            })
+            .from(schema.interactionsTable)
+            .where(whereClause),
+    ]);
+
+    if (cachedTotal === undefined) {
+      sessionTotalCache.set(sessionTotalCacheKey, Number(total));
+    }
+
+    if (sessionPage.length === 0) {
+      return createPaginatedResult([], Number(total), pagination);
+    }
+
+    const sessions = await InteractionModel.summarizeSessionPage(
+      sessionPage,
+      whereClause,
+    );
+
+    return createPaginatedResult(sessions, Number(total), pagination);
+  }
+
+  /**
+   * The session keys for one page, most recently active first.
+   *
+   * Grouping the whole table to produce twenty keys meant every page paid a
+   * sequential scan of `interactions` plus a sort of one row per interaction —
+   * on a table whose row count grows with every proxied call, and large enough
+   * that the sort spilled to disk. Nothing about a page of recent sessions
+   * needs that: walking `interactions_created_at_idx` newest-first and taking
+   * distinct session keys in the order they first appear yields exactly the
+   * same ordering, because the first row seen for a session IS that session's
+   * most recent one. The scan stops as soon as the page is covered, so the
+   * cost tracks the page, not the history.
+   *
+   * Falls back to the whole-table grouping if a page cannot be filled within
+   * SESSION_SCAN_MAX_ROWS — a pathological case (a filter matching very few
+   * sessions spread over very many rows) where the walk would be the slower of
+   * the two. Correctness is identical either way.
+   */
+
+  /**
+   * The same session list, walked by cursor instead of offset.
+   *
+   * Two costs disappear. There is no total, so a page stops scanning every
+   * interaction in the table to count distinct sessions for a page number.
+   * And there is no offset, so a page deep in the log costs what the first
+   * page costs, instead of walking every session above it.
+   *
+   * Phase 1 changes shape entirely. The offset walk reads batches of
+   * interactions and dedupes session keys in memory, which needs
+   * `offset + limit` keys in hand before it can serve page N. A cursor
+   * cannot work that way, and does not need to: a session's place in the
+   * list is its newest interaction, so the list *is* the rows that have no
+   * newer sibling in their own session. Selecting those directly gives each
+   * session exactly once, in the right order, with no dedupe pass and no
+   * whole-table grouping to fall back to.
+   */
+  static async getSessionsCursor(
+    cursorQuery: CursorQuery,
+    requestingUserId?: string,
+    isAgentAdmin?: boolean,
+    filters?: {
+      organizationId?: string;
+      profileId?: string;
+      userId?: string;
+      source?: InteractionSource;
+      client?: ClientFilter;
+      externalAgentId?: string;
+      sessionId?: string;
+      startDate?: Date;
+      endDate?: Date;
+    },
+  ): Promise<CursorPaginatedResult<SessionSummary>> {
+    const emptyPage = (): CursorPaginatedResult<SessionSummary> => ({
+      data: [],
+      pagination: {
+        limit: cursorQuery.limit,
+        hasNext: false,
+        nextCursor: null,
+      },
+    });
+
+    const access = await InteractionModel.buildSessionConditions(
+      requestingUserId,
+      isAgentAdmin,
+      filters,
+    );
+    if (access === SESSION_ACCESS_DENIED) {
+      return emptyPage();
+    }
+    const whereClause = access;
+
+    // One row past the page is fetched so its presence can answer "is there
+    // another page" — the job the total count used to do.
+    const heads = await InteractionModel.findSessionHeadsForCursor(
+      whereClause,
+      cursorQuery,
+    );
+    const hasNext = heads.length > cursorQuery.limit;
+    const pageRows = hasNext ? heads.slice(0, cursorQuery.limit) : heads;
+    if (pageRows.length === 0) {
+      return emptyPage();
+    }
+
+    const summaries = await InteractionModel.summarizeSessionPage(
+      pageRows.map(({ sessionId, interactionId }) => ({
+        sessionId,
+        interactionId,
+      })),
+      whereClause,
+    );
+
+    // The summary query groups, so its row order is not the head order. Emit
+    // in head order instead, because that is the order the cursor is cut from
+    // — returning them in any other order would make the next page skip or
+    // repeat rows.
+    const byKey = new Map(
+      summaries.map((summary) => [
+        summary.sessionId ?? summary.interactionId ?? "",
+        summary,
+      ]),
+    );
+    const data = pageRows.flatMap((row) => {
+      const summary = byKey.get(row.sessionId ?? row.interactionId ?? "");
+      return summary ? [summary] : [];
+    });
+
+    const last = pageRows[pageRows.length - 1];
+
+    return {
+      data,
+      pagination: {
+        limit: cursorQuery.limit,
+        hasNext,
+        // No cursor past the end: it could only produce an empty page.
+        nextCursor:
+          hasNext && last
+            ? encodeCursor({
+                value: last.headCreatedAt.toISOString(),
+                id: last.headId,
+              })
+            : null,
+      },
+    };
+  }
+
+  /**
+   * Access-control and filter predicates for the session list, shared by the
+   * offset and cursor paths so they cannot drift into showing different rows.
+   *
+   * Returns {@link SESSION_ACCESS_DENIED} when the caller can reach no agents.
+   * That is deliberately distinct from `undefined`, which means "no
+   * predicates, show everything" — conflating the two would turn a permission
+   * denial into a full listing.
+   */
+  private static async buildSessionConditions(
+    requestingUserId?: string,
+    isAgentAdmin?: boolean,
+    filters?: {
+      organizationId?: string;
+      profileId?: string;
+      userId?: string;
+      source?: InteractionSource;
+      client?: ClientFilter;
+      externalAgentId?: string;
+      sessionId?: string;
+      startDate?: Date;
+      endDate?: Date;
+    },
+  ): Promise<SQL | undefined | typeof SESSION_ACCESS_DENIED> {
+    // Build where clauses for access control
+    const conditions: SQL[] = [];
+
+    if (filters?.organizationId) {
+      conditions.push(interactionBelongsToOrganization(filters.organizationId));
+    }
+
+    if (requestingUserId && !isAgentAdmin) {
+      const accessibleAgentIds = await AgentTeamModel.getUserAccessibleAgentIds(
+        requestingUserId,
+        false,
+      );
+
+      if (accessibleAgentIds.length === 0) {
+        return SESSION_ACCESS_DENIED;
+      }
+
+      conditions.push(
+        inArray(schema.interactionsTable.profileId, accessibleAgentIds),
+      );
+    }
+
+    // Profile filter
+    if (filters?.profileId) {
+      conditions.push(
+        eq(schema.interactionsTable.profileId, filters.profileId),
+      );
+    }
+
+    // User filter
+    if (filters?.userId) {
+      conditions.push(eq(schema.interactionsTable.userId, filters.userId));
+    }
+
+    // Source filter
+    if (filters?.source) {
+      conditions.push(eq(schema.interactionsTable.source, filters.source));
+    }
+
+    // Client-app filter — queries external_agent_id (the client-attribution
+    // column). Each filter value expands to its client's agent ids, matched
+    // case-insensitively (header values, auto-discovered, and backfilled).
+    if (filters?.client) {
+      // Lower both sides so the match stays case-insensitive even if a
+      // mixed-case id is ever added to a client's agent-id set.
+      conditions.push(
+        inArray(
+          sql`lower(${schema.interactionsTable.externalAgentId})`,
+          clientFilterToAgentIds(filters.client).map((id) => id.toLowerCase()),
+        ),
+      );
+    }
+
+    // External agent ID filter
+    if (filters?.externalAgentId) {
+      conditions.push(
+        eq(schema.interactionsTable.externalAgentId, filters.externalAgentId),
+      );
+    }
+
+    // Session ID filter
+    if (filters?.sessionId) {
+      conditions.push(
+        eq(schema.interactionsTable.sessionId, filters.sessionId),
+      );
+    }
+
+    // Date range filter
+    if (filters?.startDate) {
+      conditions.push(
+        gte(schema.interactionsTable.createdAt, filters.startDate),
+      );
+    }
+    if (filters?.endDate) {
+      conditions.push(lte(schema.interactionsTable.createdAt, filters.endDate));
+    }
+
+    return conditions.length > 0 ? and(...conditions) : undefined;
+  }
+
+  /**
+   * The newest interaction of each session, newest first, for one cursor page.
+   *
+   * A row qualifies when no newer row shares its session — that row is the
+   * session's head, and a session has exactly one, so the result needs no
+   * deduplication. Ordering by the head row's own `(created_at, id)` is
+   * therefore the same ordering as by the session's last activity, which is
+   * what makes a keyset cursor possible here at all.
+   *
+   * The `NOT EXISTS` probe runs against `interactions_session_created_at_idx`
+   * — `(session_id, created_at DESC)` — so it is an index lookup per candidate
+   * row rather than a scan. Sessionless rows skip the probe: each one is its
+   * own session, so it is always its own head.
+   *
+   * Fetches `limit + 1` rows; the caller uses the extra to decide whether
+   * another page exists.
+   */
+  private static async findSessionHeadsForCursor(
+    whereClause: SQL | undefined,
+    cursorQuery: CursorQuery,
+  ): Promise<
+    Array<{
+      sessionId: string | null;
+      interactionId: string | null;
+      headCreatedAt: Date;
+      headId: string;
+    }>
+  > {
+    const t = schema.interactionsTable;
+
+    const conditions: SQL[] = [];
+    if (whereClause) conditions.push(whereClause);
+
+    // An unreadable cursor is treated as absent, so a stale or hand-edited
+    // link lands on the newest page instead of erroring.
+    const position = decodeCursor(cursorQuery.cursor);
+    if (position) {
+      const at = new Date(position.value);
+      if (!Number.isNaN(at.getTime())) {
+        conditions.push(
+          sql`(${t.createdAt}, ${t.id}) < (${position.value}::timestamp, ${position.id}::uuid)`,
+        );
+      }
+    }
+
+    // Newer sibling in the same session => this row is not the head.
+    const newerSibling = sql`
+      NOT EXISTS (
+        SELECT 1
+        FROM ${t} AS newer
+        WHERE newer.session_id = ${t.sessionId}
+          AND (newer.created_at, newer.id) > (${t.createdAt}, ${t.id})
+      )
+    `;
+    conditions.push(sql`(${t.sessionId} IS NULL OR ${newerSibling})`);
+
+    const rows = await db
+      .select({
+        id: t.id,
+        sessionId: t.sessionId,
+        createdAt: t.createdAt,
+      })
+      .from(t)
+      .where(and(...conditions))
+      .orderBy(desc(t.createdAt), desc(t.id))
+      .limit(cursorQuery.limit + 1);
+
+    return rows.map((row) => ({
+      sessionId: row.sessionId,
+      interactionId: row.sessionId ? null : row.id,
+      headCreatedAt: row.createdAt,
+      headId: row.id,
+    }));
+  }
+
+  /**
+   * Phases 2 and 3 for one page of session keys: aggregate the sessions, then
+   * fetch the interaction window each row's tip is read from.
+   *
+   * Split out of {@link getSessions} so the offset and cursor paths share it.
+   * Everything expensive here is already bounded by the page, which is the
+   * property both phase-1 strategies exist to preserve.
+   */
+  private static async summarizeSessionPage(
+    sessionPage: Array<{
+      sessionId: string | null;
+      interactionId: string | null;
+    }>,
+    whereClause: SQL | undefined,
+  ): Promise<SessionSummary[]> {
+    // Sessionless interactions each form their own group; real sessions group
+    // by their shared session id.
+    const sessionGroupExpr = sql`COALESCE(${schema.interactionsTable.sessionId}, ${schema.interactionsTable.id}::text)`;
+    const pageSessionIds = sessionPage.flatMap((session) =>
+      session.sessionId ? [session.sessionId] : [],
+    );
+    const pageInteractionIds = sessionPage.flatMap((session) =>
+      session.interactionId ? [session.interactionId] : [],
+    );
+    const pageConditions: SQL[] = [];
+    if (pageSessionIds.length > 0) {
+      pageConditions.push(
+        inArray(schema.interactionsTable.sessionId, pageSessionIds),
+      );
+    }
+    if (pageInteractionIds.length > 0) {
+      pageConditions.push(
+        inArray(schema.interactionsTable.id, pageInteractionIds),
+      );
+    }
+    const pageCondition =
+      pageConditions.length === 1 ? pageConditions[0] : or(...pageConditions);
+    const pageWhereClause = whereClause
+      ? and(whereClause, pageCondition)
+      : pageCondition;
+
+    // PHASE 2: Aggregate and join only the sessions selected above.
+    const sessionsData = await db
+      .select({
+        sessionId: max(schema.interactionsTable.sessionId),
+        sessionSource: max(schema.interactionsTable.sessionSource),
+        source: sql<InteractionSource | null>`CASE WHEN COUNT(DISTINCT ${schema.interactionsTable.source}) = 1 THEN MAX(${schema.interactionsTable.source}) ELSE NULL END`,
+        sources: sql<
+          InteractionSource[]
+        >`ARRAY_REMOVE(ARRAY_AGG(DISTINCT ${schema.interactionsTable.source} ORDER BY ${schema.interactionsTable.source}), NULL)`,
+        // For single interactions (no session), return the interaction ID for direct navigation
+        interactionId: sql<string>`CASE WHEN MAX(${schema.interactionsTable.sessionId}) IS NULL THEN MAX(${schema.interactionsTable.id}::text) ELSE NULL END`,
+        requestCount: count(),
+        totalInputTokens: sum(schema.interactionsTable.inputTokens),
+        totalOutputTokens: sum(schema.interactionsTable.outputTokens),
+        totalCacheReadTokens: sum(schema.interactionsTable.cacheReadTokens),
+        totalCacheWriteTokens: sum(schema.interactionsTable.cacheWriteTokens),
+        // `totalCost` is the full list-price estimate across the session.
+        // `totalBilledCost` / `totalSubscriptionCost` split it by billing mode
+        // (metered = billed spend; subscription = flat-rate, not billed), so a
+        // session's Cost cell can show what was actually charged plus what the
+        // subscription-covered portion would have cost. A session may mix modes
+        // (e.g. a mid-session switch), so both filtered sums are needed.
+        totalCost: sum(schema.interactionsTable.cost),
+        totalBilledCost: sql<
+          string | null
+        >`SUM(${schema.interactionsTable.cost}) FILTER (WHERE ${schema.interactionsTable.billingMode} = 'metered')`,
+        totalSubscriptionCost: sql<
+          string | null
+        >`SUM(${schema.interactionsTable.cost}) FILTER (WHERE ${schema.interactionsTable.billingMode} = 'subscription')`,
+        totalBaselineCost: sum(schema.interactionsTable.baselineCost),
+        totalCacheSavings: sum(schema.interactionsTable.cacheSavings),
+        firstRequestTime: min(schema.interactionsTable.createdAt),
+        lastRequestTime: max(schema.interactionsTable.createdAt),
+        models: sql<string>`STRING_AGG(DISTINCT ${schema.interactionsTable.model}, ',')`,
+        // Attribute the session to its primary (non-built-in) agent. A chat
+        // session mixes the user's agent with built-in utility subagents (e.g.
+        // title generation), all sharing one session_id; without the FILTER,
+        // MAX(id) and MAX(name) could resolve to different interactions and
+        // surface the utility subagent. Preferring built_in = false keeps id
+        // and name from the same agent; COALESCE falls back to any agent for
+        // sessions that only ran built-in agents. API/Claude-Code sessions have
+        // a single profile per session, so this is a no-op for them.
+        profileId: sql<
+          string | null
+        >`COALESCE(MAX(${schema.agentsTable.id}::text) FILTER (WHERE ${schema.agentsTable.builtIn} = false), MAX(${schema.agentsTable.id}::text))`,
+        profileName: sql<
+          string | null
+        >`COALESCE(MAX(${schema.agentsTable.name}) FILTER (WHERE ${schema.agentsTable.builtIn} = false), MAX(${schema.agentsTable.name}))`,
+        externalAgentIds: sql<string>`STRING_AGG(DISTINCT ${schema.interactionsTable.externalAgentId}, ',')`,
+        authMethods: sql<string>`STRING_AGG(DISTINCT ${schema.interactionsTable.authMethod}, ',')`,
+        authenticatedAppNames: sql<
+          string[]
+        >`ARRAY_REMOVE(ARRAY_AGG(DISTINCT ${schema.interactionsTable.authenticatedAppName}), NULL)`,
+        // ARRAY_AGG (not STRING_AGG) — user names can contain commas
+        // (e.g. "Last, First" display names), so a delimited string can't
+        // be split back apart reliably
+        userNames: sql<
+          string[]
+        >`ARRAY_REMOVE(ARRAY_AGG(DISTINCT ${schema.usersTable.name} ORDER BY ${schema.usersTable.name}), NULL)`,
+        // Ids alongside names: two members can share a display name, which
+        // collapses them into a single entry above and leaves consumers
+        // matching on an ambiguous string. Ids identify the actual users.
+        userIds: sql<
+          string[]
+        >`ARRAY_REMOVE(ARRAY_AGG(DISTINCT ${schema.usersTable.id}), NULL)`,
+        // Both virtual-key columns, aggregated as ids and resolved to names in
+        // phase 3. A request can carry one of each: a standard key for the
+        // provider credential and a passthrough key for the acting user.
+        virtualKeyIds: sql<
+          string[]
+        >`ARRAY_REMOVE(ARRAY_AGG(DISTINCT ${schema.interactionsTable.virtualKeyId}::text), NULL)`,
+        passthroughVirtualKeyIds: sql<
+          string[]
+        >`ARRAY_REMOVE(ARRAY_AGG(DISTINCT ${schema.interactionsTable.passthroughVirtualKeyId}::text), NULL)`,
+        // Get conversation title if sessionId matches a conversation (for Archestra Chat sessions)
+        conversationTitle: max(schema.conversationsTable.title),
+      })
+      .from(schema.interactionsTable)
+      .leftJoin(
+        schema.agentsTable,
+        and(
+          eq(schema.interactionsTable.profileId, schema.agentsTable.id),
+          notDeleted(schema.agentsTable),
+        ),
+      )
+      .leftJoin(
+        schema.usersTable,
+        eq(schema.interactionsTable.userId, schema.usersTable.id),
+      )
+      .leftJoin(schema.conversationsTable, sessionIdMatchesConversation())
+      .where(pageWhereClause)
+      // A session is identified by its session id alone (COALESCE(session_id,
+      // id) for sessionless rows). profile_id / agent name must NOT be part of
+      // the group key: an Archestra Chat writes its title-generation call under
+      // a separate built-in subagent, so grouping by agent split one chat into
+      // two "sessions". This matches the `total` count above, which already
+      // counts distinct session ids only. Agent attribution is aggregated in
+      // the SELECT (MAX) instead of being part of the key.
+      .groupBy(sessionGroupExpr)
+      .orderBy(desc(max(schema.interactionsTable.createdAt)));
+
+    // PHASE 3: Batch fetch "last interaction" info for all sessions
+    // This is much faster than ARRAY_AGG because:
+    // 1. We only fetch for the paginated sessions (typically 10-50 rows)
+    // 2. Uses index on (session_id, created_at DESC)
+    // 3. Filtering happens in JS on already-fetched data, not in SQL on JSON text
+    const sessionKeys = sessionsData.map((s) => s.sessionId ?? s.interactionId);
+    const lastInteractionMap =
+      await InteractionModel.getLastInteractionsForSessions(
+        sessionKeys.filter((k): k is string => k !== null),
+      );
+
+    // Collect all external agent IDs to resolve prompt names
+    const allExternalAgentIds = sessionsData.flatMap((s) =>
+      s.externalAgentIds ? s.externalAgentIds.split(",").filter(Boolean) : [],
+    );
+    const agentNamesMap = await getAgentNamesById(
+      extractAllAgentIdsFromExternalAgentIds(allExternalAgentIds),
+    );
+
+    // Resolve every virtual key referenced by the page in one query, rather
+    // than per session.
+    const virtualKeyMap = await VirtualApiKeyModel.findSummariesByIds({
+      ids: sessionsData.flatMap((s) => [
+        ...(s.virtualKeyIds ?? []),
+        ...(s.passthroughVirtualKeyIds ?? []),
+      ]),
+    });
+
+    // Transform the data to the expected format
+    const sessions = sessionsData.map((s) => {
+      const externalAgentIds = s.externalAgentIds
+        ? s.externalAgentIds.split(",").filter(Boolean)
+        : [];
+      const authMethods = parseInteractionAuthMethods(s.authMethods);
+      const userIds = s.userIds ?? [];
+
+      const sessionKey = s.sessionId ?? s.interactionId;
+      const lastInteraction = sessionKey
+        ? lastInteractionMap.get(sessionKey)
+        : null;
+
+      return {
+        sessionId: s.sessionId,
+        sessionSource: s.sessionSource,
+        source: s.source,
+        sources: s.sources ?? [],
+        interactionId: s.interactionId, // Only set for single interactions (null session)
+        requestCount: Number(s.requestCount),
+        totalInputTokens: Number(s.totalInputTokens) || 0,
+        totalOutputTokens: Number(s.totalOutputTokens) || 0,
+        totalCacheReadTokens: Number(s.totalCacheReadTokens) || 0,
+        totalCacheWriteTokens: Number(s.totalCacheWriteTokens) || 0,
+        totalCost: s.totalCost,
+        totalBilledCost: s.totalBilledCost,
+        totalSubscriptionCost: s.totalSubscriptionCost,
+        totalBaselineCost: s.totalBaselineCost,
+        totalCacheSavings: s.totalCacheSavings,
+        firstRequestTime: s.firstRequestTime ?? new Date(),
+        lastRequestTime: s.lastRequestTime ?? new Date(),
+        models: s.models ? s.models.split(",").filter(Boolean) : [],
+        profileId: s.profileId,
+        profileName: s.profileName,
+        externalAgentIds,
+        externalAgentIdLabels: externalAgentIds.map((id) =>
+          resolveExternalAgentIdLabel(id, agentNamesMap),
+        ),
+        authMethods,
+        authenticatedAppNames: s.authenticatedAppNames ?? [],
+        userNames: s.userNames ?? [],
+        userIds,
+        unattributedReason: deriveUnattributedReason(userIds, authMethods),
+        // Deduplicated across both columns: the two hold disjoint keys today
+        // (each header rejects the other's key type), but a key reported twice
+        // would render as two identical badges, so do not rely on that here.
+        virtualKeys: [
+          ...new Set([
+            ...(s.virtualKeyIds ?? []),
+            ...(s.passthroughVirtualKeyIds ?? []),
+          ]),
+        ]
+          .map((id) => virtualKeyMap.get(id))
+          .filter((key): key is InteractionVirtualKey => key !== undefined)
+          .sort((a, b) => a.name.localeCompare(b.name)),
+        lastUserMessagePreview: lastInteraction?.lastUserMessagePreview ?? null,
+        lastInteractionId: lastInteraction?.lastInteractionId ?? null,
+        lastInteractionType: lastInteraction?.lastInteractionType ?? null,
+        conversationTitle: s.conversationTitle,
+        claudeCodeTitle: lastInteraction?.claudeCodeTitle ?? null,
+      };
+    });
+    return sessions;
+  }
+
+  private static async findSessionKeysForPage(
+    whereClause: SQL | undefined,
+    pagination: PaginationQuery,
+    /**
+     * Overridable so tests can drive the fallback without seeding twenty
+     * thousand rows. Production always uses the module default.
+     */
+    maxScanRows: number = SESSION_SCAN_MAX_ROWS,
+  ): Promise<
+    Array<{ sessionId: string | null; interactionId: string | null }>
+  > {
+    const needed = pagination.offset + pagination.limit;
+    const keys: Array<{
+      sessionId: string | null;
+      interactionId: string | null;
+    }> = [];
+    const seen = new Set<string>();
+    let scanned = 0;
+
+    while (keys.length < needed && scanned < maxScanRows) {
+      const batch = await db
+        .select({
+          id: schema.interactionsTable.id,
+          sessionId: schema.interactionsTable.sessionId,
+        })
+        .from(schema.interactionsTable)
+        .where(whereClause)
+        // `id` only breaks ties on identical timestamps; without it a row could
+        // be seen twice (or skipped) across two OFFSET windows.
+        //
+        // Rows inserted between two steps land at the newest end and push the
+        // window back over ground already covered, which the `seen` set
+        // absorbs. Nothing is skipped: that would take a deletion above the
+        // cursor, and the only thing that removes interactions is retention,
+        // which works from the oldest end — far below anything this walk
+        // reads.
+        .orderBy(
+          desc(schema.interactionsTable.createdAt),
+          desc(schema.interactionsTable.id),
+        )
+        .limit(SESSION_SCAN_BATCH_ROWS)
+        .offset(scanned);
+
+      for (const row of batch) {
+        const key = row.sessionId ?? row.id;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        keys.push({
+          sessionId: row.sessionId,
+          interactionId: row.sessionId ? null : row.id,
+        });
+      }
+
+      scanned += batch.length;
+      // A short batch means the filtered set is exhausted: every session that
+      // matches has been seen, so the page is as complete as it can be.
+      if (batch.length < SESSION_SCAN_BATCH_ROWS) {
+        return keys.slice(pagination.offset, needed);
+      }
+    }
+
+    if (keys.length >= needed) {
+      return keys.slice(pagination.offset, needed);
+    }
+
+    return db
+      .select({
+        sessionId: max(schema.interactionsTable.sessionId),
+        interactionId: sql<
+          string | null
+        >`CASE WHEN MAX(${schema.interactionsTable.sessionId}) IS NULL THEN MAX(${schema.interactionsTable.id}::text) ELSE NULL END`,
+      })
+      .from(schema.interactionsTable)
+      .where(whereClause)
+      .groupBy(
+        sql`COALESCE(${schema.interactionsTable.sessionId}, ${schema.interactionsTable.id}::text)`,
+      )
+      .orderBy(desc(max(schema.interactionsTable.createdAt)))
+      .limit(pagination.limit)
+      .offset(pagination.offset);
+  }
+
+  /**
+   * Batch fetch the "last main interaction" info for a list of sessions.
+   *
+   * This is optimized for performance:
+   * - Uses window functions (ROW_NUMBER) instead of ARRAY_AGG to pick the first row
+   * - Filtering for "main" vs "subagent" requests happens in JS, not SQL text scanning
+   * - Returns only the needed columns, not the full interaction object
+   *
+   * For each session, returns the most recent interaction that qualifies as "main":
+   * - Not a prompt suggestion generator request
+   * - Not a title generation request
+   * - Has meaningful content (message > 20 chars)
+   */
+  private static async getLastInteractionsForSessions(
+    sessionKeys: string[],
+  ): Promise<
+    Map<
+      string,
+      {
+        lastUserMessagePreview: string | null;
+        lastInteractionId: string | null;
+        lastInteractionType: string | null;
+        claudeCodeTitle: string | null;
+      }
+    >
+  > {
+    if (sessionKeys.length === 0) {
+      return new Map();
+    }
+
+    // Separate session IDs from interaction IDs (UUIDs)
+    // Session IDs can be any string, but interaction IDs must be valid UUIDs
+    const uuidKeys = sessionKeys.filter((k) => isUuid(k));
+
+    // Two narrow windows per session instead of one deep one. The scan below
+    // needs exactly two things: the session's latest "main" interaction, which
+    // lives among its newest rows, and — for Claude Code — the one-off
+    // title-generation call, which the client issues at the *start* of a
+    // session. Reading 20 newest rows to look for both was the heaviest part of
+    // the sessions list by a wide margin: each of a session's newest turns
+    // carries the whole conversation so far, so every one of them had to be
+    // pulled out of TOAST, decrypted and stringified. Three rows from each end
+    // cover both signals for a fraction of the bytes, and they find titles in
+    // long sessions, where a newest-only window has long since scrolled past
+    // the opening turns.
+    const NEWEST_PER_SESSION = 3;
+    const OLDEST_PER_SESSION = 3;
+    // Fallback depth, used only for sessions the narrow windows leave without a
+    // main interaction (see below).
+    const DEEP_PER_SESSION = 20;
+
+    const interactions = await InteractionModel.fetchSessionWindowRows({
+      sessionKeys,
+      uuidKeys,
+      newest: NEWEST_PER_SESSION,
+      oldest: OLDEST_PER_SESSION,
+    });
+
+    // Group by session and find the "last main interaction" and "title interaction"
+    const result = new Map<
+      string,
+      {
+        lastUserMessagePreview: string | null;
+        lastInteractionId: string | null;
+        lastInteractionType: string | null;
+        claudeCodeTitle: string | null;
+      }
+    >();
+
+    // Group interactions by session key (sessionId or interaction id for single interactions)
+    const groupedBySession = groupRowsBySession(interactions);
+
+    // For each session, find the last "main" interaction and title. Selection
+    // is pure, so it runs for every session first and the chosen tips are
+    // reconstructed in one batch below — reconstructing inside this loop issued
+    // a recursive ancestor query per session, i.e. one per row on the page.
+    const selectedPerSession = new Map<
+      string,
+      {
+        lastMainInteraction: (typeof interactions)[0] | null;
+        claudeCodeTitle: string | null | undefined;
+      }
+    >();
+
+    // Selection is pure, so it can run a second time over a deeper window.
+    const selectTip = (
+      windowRows: SessionWindowRow[],
+    ): {
+      lastMainInteraction: SessionWindowRow | null;
+      claudeCodeTitle: string | null | undefined;
+    } => {
+      let lastMainInteraction: SessionWindowRow | null = null;
+      // undefined = not yet found, null = found but no text, string = found with text
+      let claudeCodeTitle: string | null | undefined;
+
+      for (const interaction of windowRows) {
+        const requestStr = JSON.stringify(interaction.request);
+
+        // Check for title generation request (Claude Code)
+        if (
+          requestStr.includes("Please write a 5-10 word title") &&
+          claudeCodeTitle === undefined
+        ) {
+          // Extract title from response
+          const response = interaction.response as {
+            content?: Array<{ text?: string }>;
+          };
+          claudeCodeTitle = response?.content?.[0]?.text ?? null;
+          continue;
+        }
+
+        // Skip if this is not a "main" interaction
+        if (
+          !lastMainInteraction &&
+          !requestStr.includes("prompt suggestion generator") &&
+          !requestStr.includes("Please write a 5-10 word title")
+        ) {
+          // Check if request has valid content - support both OpenAI/Anthropic and Gemini formats
+          // We accept any interaction that has a valid request structure, not just text content.
+          // This ensures we don't skip requests with images, files, or function calls.
+          const request = interaction.request as {
+            // OpenAI/Anthropic chat-completions format
+            messages?: Array<{ content?: string | Array<unknown> }>;
+            // OpenAI Responses format (e.g. Codex) carries turns in `input`
+            input?: Array<unknown>;
+            // Gemini format
+            contents?: Array<{
+              role?: string;
+              parts?: Array<unknown>;
+            }>;
+          };
+
+          // Check if request has valid content (a messages / input / contents
+          // array with items) across all supported provider request shapes.
+          const hasOpenAiContent =
+            Array.isArray(request?.messages) && request.messages.length > 0;
+          const hasResponsesContent =
+            Array.isArray(request?.input) && request.input.length > 0;
+          const hasGeminiContent =
+            Array.isArray(request?.contents) && request.contents.length > 0;
+
+          if (hasOpenAiContent || hasResponsesContent || hasGeminiContent) {
+            lastMainInteraction = interaction;
+          }
+        }
+
+        // Early exit if we found both (undefined = not yet searched for title)
+        if (lastMainInteraction && claudeCodeTitle !== undefined) {
+          break;
+        }
+      }
+
+      return { lastMainInteraction, claudeCodeTitle };
+    };
+
+    for (const [sessionKey, windowRows] of groupedBySession) {
+      const selection = selectTip(windowRows);
+      if (selection.lastMainInteraction || selection.claudeCodeTitle) {
+        selectedPerSession.set(sessionKey, selection);
+      }
+    }
+
+    // A session whose sampled rows are all scaffolding — title generation,
+    // prompt suggestions — yields no main interaction, and would lose the
+    // preview the old deep window used to find. Re-read just those sessions at
+    // the old depth so the preview cannot regress; in the common case the list
+    // is empty and this costs nothing.
+    const unresolvedKeys = [...groupedBySession.keys()].filter(
+      (key) => !selectedPerSession.get(key)?.lastMainInteraction,
+    );
+    if (unresolvedKeys.length > 0) {
+      const deepRows = await InteractionModel.fetchSessionWindowRows({
+        sessionKeys: unresolvedKeys,
+        uuidKeys: [],
+        newest: DEEP_PER_SESSION,
+        oldest: 0,
+      });
+      for (const [sessionKey, windowRows] of groupRowsBySession(deepRows)) {
+        const selection = selectTip(windowRows);
+        if (selection.lastMainInteraction || selection.claudeCodeTitle) {
+          selectedPerSession.set(sessionKey, selection);
+        }
+      }
+    }
+
+    // Reconstruct every chosen tip's full request from deltas in one pass (a
+    // no-op for legacy/non-delta rows, which reconstructMany returns as-is).
+    // Still at most one tip per session, now in a single ancestor query.
+    const reconstructed = await InteractionDeltaManager.reconstructMany(
+      [...selectedPerSession.values()]
+        .map(({ lastMainInteraction }) => lastMainInteraction)
+        .filter((tip): tip is (typeof interactions)[0] => tip !== null)
+        .map((tip) => ({
+          id: tip.id,
+          threadId: tip.threadId,
+          request: tip.request,
+          processedRequest: null,
+        })),
+    );
+
+    for (const [
+      sessionKey,
+      { lastMainInteraction, claudeCodeTitle },
+    ] of selectedPerSession) {
+      const tipRequest = lastMainInteraction
+        ? (reconstructed.get(lastMainInteraction.id)?.request ??
+          lastMainInteraction.request)
+        : null;
+
+      result.set(sessionKey, {
+        lastUserMessagePreview: lastMainInteraction
+          ? buildLastUserMessagePreview(tipRequest, lastMainInteraction.type)
+          : null,
+        lastInteractionId: lastMainInteraction?.id ?? null,
+        lastInteractionType: lastMainInteraction?.type ?? null,
+        claudeCodeTitle: claudeCodeTitle ?? null,
+      });
+    }
+
+    return result;
+  }
+
+  /**
+   * Rows from the head and/or tail of each session's interaction list,
+   * decrypted and returned newest-first across all sessions.
+   *
+   * `newest`/`oldest` are per-session row budgets. A session shorter than their
+   * sum simply yields its rows once — the two windows overlap and are
+   * de-duplicated by id. Sessionless interaction ids in `uuidKeys` are fetched
+   * whole, since each such row is its own "session".
+   */
+  private static async fetchSessionWindowRows({
+    sessionKeys,
+    uuidKeys,
+    newest,
+    oldest,
+  }: {
+    sessionKeys: string[];
+    uuidKeys: string[];
+    newest: number;
+    oldest: number;
+  }): Promise<SessionWindowRow[]> {
+    if (sessionKeys.length === 0) {
+      return [];
+    }
+
+    // Per-key top-N via LATERAL instead of one `session_id IN (...) OR
+    // id IN (...)` query ranked with ROW_NUMBER(): the window form had to
+    // materialize and sort EVERY interaction of every listed session —
+    // request/response payloads included — before discarding all but the
+    // first N, which pushed busy organizations into statement timeout. Each
+    // LATERAL branch is one (session_id, created_at) index descent per key
+    // that stops after N rows; sessionless interaction ids are a separate
+    // primary-key lookup (each such row is its own "session", so N does not
+    // apply). A uuid key that matches a row owned by a *different* session is
+    // not fetched — the JS grouping filed such rows under a key nobody asked
+    // for and never read them.
+    const sessionKeyList = sql.join(
+      sessionKeys.map((k) => sql`${k}`),
+      sql`, `,
+    );
+    const oldestBranch =
+      oldest > 0
+        ? sql`
+        UNION ALL
+        (SELECT id, session_id, thread_id, request, response, type, created_at,
+                locked_chat_conversation_id
+         FROM interactions
+         WHERE session_id = keys.key
+         ORDER BY created_at ASC, id ASC
+         LIMIT ${oldest})`
+        : sql``;
+    const sessionlessBranch =
+      uuidKeys.length > 0
+        ? sql`
+      UNION ALL
+      SELECT id, session_id, thread_id, request, response, type, created_at,
+             locked_chat_conversation_id
+      FROM interactions
+      WHERE id IN (${sql.join(
+        uuidKeys.map((k) => sql`${k}::uuid`),
+        sql`, `,
+      )})
+        AND session_id IS NULL`
+        : sql``;
+
+    // thread_id is selected so the chosen tip can be reconstructed from deltas.
+    const interactionsResult = await db.execute<{
+      id: string;
+      session_id: string | null;
+      thread_id: string | null;
+      request: unknown;
+      response: unknown;
+      type: string;
+      // Raw SQL bypasses Drizzle's column mapping, so timestamps arrive as
+      // whatever the driver hands back — a Date on one, a string on another.
+      created_at: Date | string;
+      // Selected so readInteractionRow can tell a locked-chat row from an
+      // ordinary one; without it the guard cannot fire and a DEK envelope
+      // would be handed to the server-key decryptor.
+      locked_chat_conversation_id: string | null;
+    }>(sql`
+      -- id tiebreak: turns within one session commonly land on the same
+      -- millisecond, and created_at alone leaves their order undefined — which
+      -- let an earlier turn be picked as the session's latest, showing a stale
+      -- preview. Ids are monotonic UUIDv7, so they settle the tie by true
+      -- insertion order (the same tiebreak the write path already uses to
+      -- resolve a delta parent). Final ordering is applied in JS, since the
+      -- per-key UNION below has no single ordering to inherit.
+      SELECT t.id, t.session_id, t.thread_id, t.request, t.response, t.type,
+             t.created_at, t.locked_chat_conversation_id
+      FROM (SELECT DISTINCT k.key FROM unnest(ARRAY[${sessionKeyList}]::text[]) AS k(key)) keys
+      CROSS JOIN LATERAL (
+        (SELECT id, session_id, thread_id, request, response, type, created_at,
+                locked_chat_conversation_id
+         FROM interactions
+         WHERE session_id = keys.key
+         ORDER BY created_at DESC, id DESC
+         LIMIT ${newest})
+        ${oldestBranch}
+      ) t
+      ${sessionlessBranch}
+    `);
+
+    // SPDX-SnippetBegin
+    // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+    // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    // Raw-SQL rows bypass the model select paths — decrypt before the caller
+    // scans their content.
+    for (const row of interactionsResult.rows) {
+      readInteractionRow(row);
+    }
+    // SPDX-SnippetEnd
+
+    // De-duplicate: on a session shorter than newest + oldest the two windows
+    // overlap, and the caller's scan must not see the same row twice.
+    const byId = new Map<string, SessionWindowRow>();
+    for (const row of interactionsResult.rows) {
+      byId.set(row.id, {
+        id: row.id,
+        sessionId: row.session_id,
+        threadId: row.thread_id,
+        request: row.request,
+        response: row.response,
+        type: row.type,
+        createdAt: new Date(row.created_at).getTime(),
+      });
+    }
+
+    return [...byId.values()].sort(
+      (a, b) => b.createdAt - a.createdAt || b.id.localeCompare(a.id),
+    );
+  }
+
+  /**
+   * Number of distinct users with at least one attributed interaction since
+   * `since`. Backs the `llm_active_users` gauge.
+   *
+   * Deliberately an aggregate: per-user identity is not exported to Prometheus
+   * (a user_id label would multiply every LLM metric's series count by the size
+   * of the org — the same reason external_agent_id is not a label). Per-user
+   * detail belongs to the statistics API, which reads this table directly.
+   */
+  static async countDistinctActiveUsersSince(since: Date): Promise<number> {
+    const [row] = await db
+      .select({
+        activeUsers: sql<number>`CAST(COUNT(DISTINCT ${schema.interactionsTable.userId}) AS INTEGER)`,
+      })
+      .from(schema.interactionsTable)
+      .where(
+        and(
+          gte(schema.interactionsTable.createdAt, since),
+          isNotNull(schema.interactionsTable.userId),
+        ),
+      );
+
+    return Number(row?.activeUsers) || 0;
+  }
+}
+
+export default InteractionModel;
+
+/** One interaction row sampled for a session's list entry. */
+type SessionWindowRow = {
+  id: string;
+  sessionId: string | null;
+  threadId: string | null;
+  request: unknown;
+  response: unknown;
+  type: string;
+  /** Epoch milliseconds — see the driver note in fetchSessionWindowRows. */
+  createdAt: number;
+};
+
+/** Key by session id, falling back to the row's own id for sessionless rows. */
+function groupRowsBySession(
+  rows: SessionWindowRow[],
+): Map<string, SessionWindowRow[]> {
+  const grouped = new Map<string, SessionWindowRow[]>();
+  for (const row of rows) {
+    const key = row.sessionId ?? row.id;
+    const existing = grouped.get(key) ?? [];
+    existing.push(row);
+    grouped.set(key, existing);
+  }
+  return grouped;
+}
+
+/**
+ * Batch-reconstruct full request/processedRequest for delta-encoded rows.
+ * Legacy / non-Claude rows pass through untouched. One bounded query per call.
+ */
+function reconstructInteractionRequests(
+  rows: {
+    id: string;
+    threadId: string | null;
+    request: unknown;
+    processedRequest?: unknown;
+  }[],
+): Promise<Map<string, { request: unknown; processedRequest: unknown }>> {
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  // Decrypt in place BEFORE delta folding — every list read path funnels
+  // through here, and callers keep using the same row objects afterwards.
+  for (const row of rows) {
+    readInteractionRow(row);
+  }
+  // SPDX-SnippetEnd
+  return InteractionDeltaManager.reconstructMany(rows);
+}
+
+/**
+ * Replace each row's delta-encoded request/processedRequest with the full
+ * reconstructed values. Legacy / non-Claude rows are returned unchanged.
+ */
+async function withReconstructedRequests<
+  T extends {
+    id: string;
+    threadId: string | null;
+    request: unknown;
+    processedRequest?: unknown;
+  },
+>(rows: T[]): Promise<T[]> {
+  const reconstructed = await reconstructInteractionRequests(rows);
+  return rows.map((row) => {
+    const full = reconstructed.get(row.id);
+    return full
+      ? {
+          ...row,
+          request: full.request,
+          processedRequest: full.processedRequest,
+        }
+      : row;
+  });
+}
+
+/**
+ * Derive the short last-user-message preview shown by the sessions listing,
+ * using the same provider-aware parsing as the interaction detail view.
+ * Returns null when the request has no extractable user text or an
+ * unsupported provider shape — the listing renders its fallback instead.
+ */
+function buildLastUserMessagePreview(
+  request: unknown,
+  type: string,
+): string | null {
+  try {
+    const interaction = new DynamicInteraction({
+      request,
+      response: {},
+      type,
+    } as never);
+    const message = interaction.getLastUserMessage().trim();
+    if (!message) {
+      return null;
+    }
+    let preview = message.slice(0, LAST_USER_MESSAGE_PREVIEW_MAX_LENGTH);
+    // Don't leave half a surrogate pair at the truncation point.
+    const lastCode = preview.charCodeAt(preview.length - 1);
+    if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+      preview = preview.slice(0, -1);
+    }
+    return preview;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Explain an unattributed session from the credentials its interactions used.
+ *
+ * Returns null when the session has users. Ordering matters: a session can mix
+ * auth methods, and the most specific explanation wins over `unknown`.
+ */
+function deriveUnattributedReason(
+  userIds: string[],
+  authMethods: InteractionAuthMethod[],
+): SessionUnattributedReason | null {
+  if (userIds.length > 0) {
+    return null;
+  }
+  const methods = new Set(authMethods);
+  // A virtual key that reached here is org-scoped by definition: a personal
+  // one sets the interaction's user, which would have populated userIds.
+  if (methods.has("virtual_key")) {
+    return "shared_virtual_key";
+  }
+  if (methods.has("provider_key")) {
+    return "provider_key";
+  }
+  if (methods.has("oauth_client_credentials")) {
+    return "client_credentials";
+  }
+  if (methods.has("internal")) {
+    return "internal";
+  }
+  return "unknown";
+}
+
+function parseInteractionAuthMethods(
+  value: string | null,
+): InteractionAuthMethod[] {
+  if (!value) {
+    return [];
+  }
+
+  return value
+    .split(",")
+    .filter(Boolean)
+    .flatMap((authMethod) => {
+      const result = InteractionAuthMethodSchema.safeParse(authMethod);
+      return result.success ? [result.data] : [];
+    });
+}

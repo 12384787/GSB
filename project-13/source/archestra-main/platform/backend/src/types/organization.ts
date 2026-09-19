@@ -1,0 +1,671 @@
+import {
+  BM25_B_MAX,
+  BM25_B_MIN,
+  BM25_K1_MAX,
+  BM25_K1_MIN,
+  ContextualRetrievalModeSchema,
+  EmbeddingDimensionsSchema,
+  KnowledgeConnectorOverridesSchema,
+  MessagingChannelOverridesSchema,
+  ModelProviderOverridesSchema,
+  OAUTH_ACCESS_TOKEN_MAX_LIFETIME_SECONDS,
+  OAUTH_ACCESS_TOKEN_MIN_LIFETIME_SECONDS,
+  OrganizationCustomFontSchema,
+  OrganizationThemeSchema,
+  RoleAssignmentSchema,
+  SESSION_MAX_AGE_MAX_SECONDS,
+  SESSION_MAX_AGE_MIN_SECONDS,
+  StoredKnowledgeConnectorOverridesSchema,
+  StoredMessagingChannelOverridesSchema,
+  StoredModelProviderOverridesSchema,
+  SupportedProvidersSchema,
+} from "@archestra/shared";
+import { createInsertSchema, createSelectSchema } from "drizzle-zod";
+import { z } from "zod";
+import { schema } from "@/database";
+import { sanitizeSvg } from "@/utils/sanitize-svg";
+import { ToolInvocation, TrustedData } from "./autonomy-policies";
+import {
+  KubernetesNamespaceSchema,
+  NetworkPolicyInputSchema,
+  NetworkPolicySchema,
+  TrustedImageRegistriesSchema,
+  ValidationRegexSchema,
+} from "./environment";
+import { LimitCleanupIntervalSchema } from "./limit";
+
+const DATA_URI_PREFIX = "data:image/png;base64,";
+const GIF_DATA_URI_PREFIX = "data:image/gif;base64,";
+const SVG_DATA_URI_PREFIX = "data:image/svg+xml;base64,";
+const MAX_LOGO_SIZE_BYTES = 2 * 1024 * 1024; // 2 MB decoded
+const PNG_MAGIC_BYTES = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+// "GIF87a" or "GIF89a"
+const GIF87A_MAGIC_BYTES = [0x47, 0x49, 0x46, 0x38, 0x37, 0x61];
+const GIF89A_MAGIC_BYTES = [0x47, 0x49, 0x46, 0x38, 0x39, 0x61];
+const MAX_CHAT_LINK_URL_LENGTH = 2000;
+
+/**
+ * Validates a Base64-encoded PNG data URI.
+ *
+ * Checks performed:
+ * 1. Correct `data:image/png;base64,` prefix
+ * 2. Valid Base64 encoding (round-trip check)
+ * 3. Decoded size ≤ 2 MB
+ * 4. PNG magic bytes (first 8 bytes of decoded data)
+ */
+const Base64PngSchema = z
+  .string()
+  .nullable()
+  .superRefine((val, ctx) => {
+    if (val === null) return;
+
+    if (!val.startsWith(DATA_URI_PREFIX)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Logo must be a PNG image in data URI format",
+      });
+      return;
+    }
+
+    const base64Payload = val.slice(DATA_URI_PREFIX.length);
+
+    // Validate Base64 encoding via round-trip
+    const decoded = Buffer.from(base64Payload, "base64");
+    if (decoded.toString("base64") !== base64Payload) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Logo contains invalid Base64 encoding",
+      });
+      return;
+    }
+
+    if (decoded.length > MAX_LOGO_SIZE_BYTES) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Logo must be less than 2MB",
+      });
+      return;
+    }
+
+    // Verify PNG magic bytes
+    if (
+      decoded.length < PNG_MAGIC_BYTES.length ||
+      !PNG_MAGIC_BYTES.every((byte, i) => decoded[i] === byte)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Logo must contain valid PNG image data",
+      });
+    }
+  });
+
+/**
+ * Validates a Base64-encoded PNG or SVG data URI. SVGs are sanitized (script
+ * tags, event handlers, foreignObject, and javascript: URLs are stripped) and
+ * re-encoded; the returned value is the cleaned data URI.
+ */
+const Base64LogoSchema = z
+  .string()
+  .nullable()
+  .transform((val, ctx) => {
+    if (val === null) return val;
+
+    const isPng = val.startsWith(DATA_URI_PREFIX);
+    const isSvg = val.startsWith(SVG_DATA_URI_PREFIX);
+    if (!isPng && !isSvg) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Logo must be a PNG or SVG image in data URI format",
+      });
+      return z.NEVER;
+    }
+
+    const prefix = isPng ? DATA_URI_PREFIX : SVG_DATA_URI_PREFIX;
+    const base64Payload = val.slice(prefix.length);
+    const decoded = Buffer.from(base64Payload, "base64");
+    if (decoded.toString("base64") !== base64Payload) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Logo contains invalid Base64 encoding",
+      });
+      return z.NEVER;
+    }
+    if (decoded.length > MAX_LOGO_SIZE_BYTES) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Logo must be less than 2MB",
+      });
+      return z.NEVER;
+    }
+
+    if (isPng) {
+      if (
+        decoded.length < PNG_MAGIC_BYTES.length ||
+        !PNG_MAGIC_BYTES.every((byte, i) => decoded[i] === byte)
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Logo must contain valid PNG image data",
+        });
+        return z.NEVER;
+      }
+      return val;
+    }
+
+    const svgSource = decoded.toString("utf8");
+    const cleaned = sanitizeSvg(svgSource);
+    if (cleaned === null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Logo must contain valid SVG image data",
+      });
+      return z.NEVER;
+    }
+    const cleanedBase64 = Buffer.from(cleaned, "utf8").toString("base64");
+    return `${SVG_DATA_URI_PREFIX}${cleanedBase64}`;
+  });
+
+/**
+ * Validates a Base64-encoded PNG or GIF data URI.
+ *
+ * Same 2MB cap as the PNG schema; also accepts GIF87a and GIF89a.
+ * Used for onboarding-wizard page images (GIFs allowed so admins can embed
+ * animated screen recordings).
+ */
+export const Base64ImageSchema = z
+  .string()
+  .nullable()
+  .superRefine((val, ctx) => {
+    if (val === null) return;
+
+    const isPng = val.startsWith(DATA_URI_PREFIX);
+    const isGif = val.startsWith(GIF_DATA_URI_PREFIX);
+    if (!isPng && !isGif) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Image must be a PNG or GIF in data URI format",
+      });
+      return;
+    }
+
+    const base64Payload = val.slice(
+      isPng ? DATA_URI_PREFIX.length : GIF_DATA_URI_PREFIX.length,
+    );
+
+    const decoded = Buffer.from(base64Payload, "base64");
+    if (decoded.toString("base64") !== base64Payload) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Image contains invalid Base64 encoding",
+      });
+      return;
+    }
+
+    if (decoded.length > MAX_LOGO_SIZE_BYTES) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Image must be less than 2MB",
+      });
+      return;
+    }
+
+    if (isPng) {
+      if (
+        decoded.length < PNG_MAGIC_BYTES.length ||
+        !PNG_MAGIC_BYTES.every((byte, i) => decoded[i] === byte)
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Image must contain valid PNG data",
+        });
+      }
+      return;
+    }
+
+    // GIF
+    const matchesGif87a =
+      decoded.length >= GIF87A_MAGIC_BYTES.length &&
+      GIF87A_MAGIC_BYTES.every((byte, i) => decoded[i] === byte);
+    const matchesGif89a =
+      decoded.length >= GIF89A_MAGIC_BYTES.length &&
+      GIF89A_MAGIC_BYTES.every((byte, i) => decoded[i] === byte);
+    if (!matchesGif87a && !matchesGif89a) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Image must contain valid GIF data",
+      });
+    }
+  });
+
+const ChatLinkUrlSchema = z
+  .string()
+  .trim()
+  .max(MAX_CHAT_LINK_URL_LENGTH)
+  .refine((value) => isValidHttpUrl(value), {
+    message: "Chat link URL must be a valid HTTP or HTTPS URL",
+  });
+
+export const OrganizationChatLinkSchema = z.object({
+  label: z.string().trim().min(1).max(25),
+  url: ChatLinkUrlSchema,
+});
+
+/**
+ * Admin-curated metadata for a connection base URL. The URL itself is still
+ * supplied via `NEXT_PUBLIC_ARCHESTRA_API_BASE_URL`; this lets admins attach a
+ * human description and pick one as the default for the /connection page.
+ */
+export const ConnectionBaseUrlSchema = z.object({
+  url: z.string().trim().min(1).max(2000),
+  description: z.string().trim().max(500).default(""),
+  isDefault: z.boolean().default(false),
+  visible: z.boolean().default(true),
+});
+
+/** provider → llm_provider_api_keys.id for auto-provisioned connection virtual keys. */
+export const ConnectionDefaultProviderKeysSchema = z.partialRecord(
+  SupportedProvidersSchema,
+  z.string().uuid(),
+);
+export type ConnectionDefaultProviderKeys = z.infer<
+  typeof ConnectionDefaultProviderKeysSchema
+>;
+
+export const OnboardingWizardPageSchema = z.object({
+  image: Base64ImageSchema.optional(),
+  content: z.string(),
+});
+
+export const OnboardingWizardSchema = z.object({
+  label: z.string().trim().min(1).max(25),
+  pages: z.array(OnboardingWizardPageSchema).min(1).max(10),
+});
+
+/**
+ * Appearance settings schema - used for unauthenticated access to branding settings.
+ * Only exposes theme, logo, and font - no sensitive organization data.
+ */
+export const AppearanceSettingsSchema = z.object({
+  theme: OrganizationThemeSchema,
+  customFont: OrganizationCustomFontSchema,
+  logo: z.string().nullable(),
+  logoDark: z.string().nullable(),
+  favicon: z.string().nullable(),
+  iconLogo: z.string().nullable(),
+  iconLogoDark: z.string().nullable(),
+  appName: z.string().nullable(),
+  ogDescription: z.string().nullable(),
+  footerText: z.string().nullable(),
+  chatLinks: z.array(OrganizationChatLinkSchema).nullable(),
+  // No onboardingWizard here: this payload is served pre-auth and fetched on
+  // every page load, and wizard configs can embed large images. Its consumers
+  // (chat, the settings editor) read it from the authed /api/organization.
+  chatErrorSupportMessage: z.string().nullable(),
+  slimChatErrorUi: z.boolean(),
+  animateChatPlaceholders: z.boolean(),
+});
+
+export const OAuthAccessTokenLifetimeSecondsSchema = z
+  .number()
+  .int()
+  .min(OAUTH_ACCESS_TOKEN_MIN_LIFETIME_SECONDS)
+  .max(OAUTH_ACCESS_TOKEN_MAX_LIFETIME_SECONDS);
+
+const extendedFields = {
+  theme: OrganizationThemeSchema,
+  customFont: OrganizationCustomFontSchema,
+  defaultDiscoveredToolInvocationPolicy:
+    ToolInvocation.ToolInvocationPolicyActionSchema,
+  defaultDiscoveredToolResultPolicy: TrustedData.TrustedDataPolicyActionSchema,
+  analyticsInstanceId: z.string().uuid(),
+  analyticsInstanceStartedAt: z.date().nullable(),
+  analyticsInstanceLastHeartbeatAt: z.date().nullable(),
+  embeddingModel: z.string().nullable(),
+  embeddingDimensions: EmbeddingDimensionsSchema.nullable(),
+  kbContextualRetrievalMode: ContextualRetrievalModeSchema.nullable(),
+  defaultLlmModel: z.string().nullable(),
+  defaultLlmProvider: SupportedProvidersSchema.nullable(),
+  defaultUserLimitValue: z.number().int().positive().nullable(),
+  defaultUserLimitModel: z.array(z.string()).nullable(),
+  defaultUserLimitCleanupInterval: LimitCleanupIntervalSchema.nullable(),
+  defaultMemberRole: z.string().nullable(),
+  defaultAgentId: z.string().uuid().nullable(),
+  favicon: z.string().nullable(),
+  iconLogo: z.string().nullable(),
+  iconLogoDark: z.string().nullable(),
+  appName: z.string().nullable(),
+  ogDescription: z.string().nullable(),
+  footerText: z.string().nullable(),
+  chatLinks: z.array(OrganizationChatLinkSchema).nullable(),
+  onboardingWizard: OnboardingWizardSchema.nullable(),
+  chatErrorSupportMessage: z.string().nullable(),
+  slimChatErrorUi: z.boolean(),
+  chatPlaceholders: z.array(z.string()).nullable(),
+  animateChatPlaceholders: z.boolean(),
+  requireTwoFactor: z.boolean(),
+  sessionMaxAgeSeconds: z.number().int().nullable(),
+  oauthAccessTokenLifetimeSeconds: OAuthAccessTokenLifetimeSecondsSchema,
+  connectionBaseUrls: z.array(ConnectionBaseUrlSchema).nullable(),
+  connectionDefaultProviderKeys: ConnectionDefaultProviderKeysSchema.nullable(),
+  // The stored (lenient) shapes: a jsonb value written by an older build must
+  // not 500 the organization read.
+  modelProviderOverrides: StoredModelProviderOverridesSchema.nullable(),
+  messagingChannelOverrides: StoredMessagingChannelOverridesSchema.nullable(),
+  knowledgeConnectorOverrides:
+    StoredKnowledgeConnectorOverridesSchema.nullable(),
+  defaultNetworkPolicy: NetworkPolicySchema.nullable(),
+  defaultEnvironmentTrustedImageRegistries:
+    TrustedImageRegistriesSchema.nullable(),
+};
+
+const InternalSelectOrganizationSchema = createSelectSchema(
+  schema.organizationsTable,
+  extendedFields,
+);
+export const SelectOrganizationSchema = InternalSelectOrganizationSchema.omit({
+  analyticsInstanceStartedAt: true,
+  analyticsInstanceLastHeartbeatAt: true,
+  // Deprecated "security engine on/off" toggle (see schema). The security engine
+  // is always enabled now; the inert column is retained in the DB for rollout
+  // safety but never exposed via the API.
+  globalToolPolicy: true,
+  // Deprecated leftover column from the reverted PR #6027 (see schema). Retained
+  // in the DB for backward-compatibility but never exposed via the API.
+  discoveredToolPolicy: true,
+  // Preset feature removed; columns retained in DB (non-destructive) but no
+  // longer exposed via the API.
+  presetEntityName: true,
+  presetEntityNamePlural: true,
+  presetEntityDefaultLabel: true,
+  presetEntityDefaultValidationRegex: true,
+});
+export const InsertOrganizationSchema = createInsertSchema(
+  schema.organizationsTable,
+  extendedFields,
+).omit({
+  // Deprecated "security engine on/off" toggle (see schema). Inert column,
+  // retained for rollout safety but never accepted by the API.
+  globalToolPolicy: true,
+  // Deprecated leftover column from the reverted PR #6027 (see schema). Retained
+  // in the DB for backward-compatibility but never accepted by the API.
+  discoveredToolPolicy: true,
+  // Preset feature removed; columns retained in DB (non-destructive) but no
+  // longer accepted by the API, mirroring SelectOrganizationSchema.
+  presetEntityName: true,
+  presetEntityNamePlural: true,
+  presetEntityDefaultLabel: true,
+  presetEntityDefaultValidationRegex: true,
+});
+/**
+ * The white-label app name is not only shown in the UI: it is substituted into
+ * the built-in skills' stored name, description, and body, which are later
+ * served through the skill catalog and read as model context. A free-form
+ * string would therefore let the substitution introduce line breaks, markdown
+ * structure, or imperative text into that context, so the name is held to a
+ * single line of ordinary label characters: it must start with a letter or
+ * digit, and may then contain letters, digits, spaces, and the punctuation that
+ * appears in real product names. Newlines, control characters, and markdown
+ * syntax (`#`, `*`, backticks, brackets, angle brackets, pipes) are rejected.
+ * Clearing the name is done with `null`, not an empty string.
+ */
+const AppNameSchema = z
+  .string()
+  .min(1)
+  .max(100)
+  .regex(
+    /^[\p{L}\p{N}][\p{L}\p{N} .,'’\-&()+:!?_/]*$/u,
+    "App name must be a single line starting with a letter or digit, and may only contain letters, digits, spaces, and the punctuation . , ' - & ( ) + : ! ? _ /",
+  );
+
+export const UpdateAppearanceSettingsSchema = z.object({
+  theme: OrganizationThemeSchema.optional(),
+  customFont: OrganizationCustomFontSchema.optional(),
+  logo: Base64LogoSchema.optional(),
+  logoDark: Base64LogoSchema.optional(),
+  favicon: Base64PngSchema.optional(),
+  iconLogo: Base64LogoSchema.optional(),
+  iconLogoDark: Base64LogoSchema.optional(),
+  appName: AppNameSchema.nullable().optional(),
+  ogDescription: z.string().max(500).nullable().optional(),
+  footerText: z.string().max(500).nullable().optional(),
+  chatLinks: z.array(OrganizationChatLinkSchema).max(3).nullable().optional(),
+  onboardingWizard: OnboardingWizardSchema.nullable().optional(),
+  chatErrorSupportMessage: z.string().max(500).nullable().optional(),
+  slimChatErrorUi: z.boolean().optional(),
+  chatPlaceholders: z.array(z.string().max(80)).max(20).nullable().optional(),
+  animateChatPlaceholders: z.boolean().optional(),
+});
+
+export const UpdateSecuritySettingsSchema = z.object({
+  defaultDiscoveredToolInvocationPolicy:
+    ToolInvocation.ToolInvocationPolicyActionSchema.optional(),
+  defaultDiscoveredToolResultPolicy:
+    TrustedData.TrustedDataPolicyActionSchema.optional(),
+  allowChatFileUploads: z.boolean().optional(),
+  appsHackathonRecorderEnabled: z.boolean().optional(),
+  newAppsDisabledByDefault: z.boolean().optional(),
+  newAppsLockedByDefault: z.boolean().optional(),
+  /** @deprecated No longer gates anything; accepted for backwards-compat and ignored. */
+  allowToolAutoAssignment: z.boolean().optional(),
+});
+
+export const UpdateMcpSettingsSchema = z.object({
+  onlineMcpCatalogEnabled: z.boolean().optional(),
+  // SPDX-SnippetBegin
+  // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
+  // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+  // Enterprise-gated on the route: scaling idle MCP servers to zero replicas.
+  mcpIdleHibernationEnabled: z.boolean().optional(),
+  // SPDX-SnippetEnd
+});
+
+export const UpdateSkillsSettingsSchema = z.object({
+  onlineSkillCatalogEnabled: z.boolean().optional(),
+  skillMarketplaceAnonymousAccess: z.boolean().optional(),
+});
+
+export const UpdateAgentSettingsSchema = z.object({
+  defaultModelId: z.string().uuid().nullable().optional(),
+  defaultLlmApiKeyId: z.string().uuid().nullable().optional(),
+  defaultAgentId: z.string().uuid().nullable().optional(),
+});
+
+export const UpdateKnowledgeSettingsSchema = z.object({
+  embeddingModel: z.string().min(1).nullable().optional(),
+  embeddingChatApiKeyId: z.string().uuid().nullable().optional(),
+  rerankerChatApiKeyId: z.string().uuid().nullable().optional(),
+  rerankerModel: z.string().nullable().optional(),
+  ocrChatApiKeyId: z.string().uuid().nullable().optional(),
+  ocrModel: z.string().nullable().optional(),
+  // BM25 keyword-ranker tuning. `null` clears the override back to the
+  // deployment default; bounds are shared with the env parser and the UI.
+  kbBm25K1: z
+    .number()
+    .finite()
+    .min(BM25_K1_MIN)
+    .max(BM25_K1_MAX)
+    .nullable()
+    .optional(),
+  kbBm25B: z
+    .number()
+    .finite()
+    .min(BM25_B_MIN)
+    .max(BM25_B_MAX)
+    .nullable()
+    .optional(),
+  kbContextualRetrievalMode:
+    ContextualRetrievalModeSchema.nullable().optional(),
+});
+
+/**
+ * Where BM25 keyword ranking stands for an organization — shown under
+ * Keyword ranking in Knowledge settings.
+ *
+ * BM25 scores from corpus statistics that the `kb_bm25_stats_refresh` task
+ * rebuilds on a schedule; until a language's statistics exist, keyword search
+ * ranks it with PostgreSQL's built-in `ts_rank`. `status` is that fact for
+ * everything the organization can search; the timestamps say when the
+ * statistics were last rebuilt and when they will be next.
+ */
+export const KeywordRankingStatusSchema = z.object({
+  status: z.enum([
+    // Statistics exist for every language with indexed documents.
+    "ready",
+    // Documents are indexed in a language whose statistics are not built
+    // yet — keyword search ranks it with ts_rank until the next refresh.
+    "pending",
+    // Nothing indexed yet; statistics are built on the first refresh after a
+    // sync indexes documents.
+    "no_documents",
+  ]),
+  lastRefreshedAt: z.string().datetime().nullable(),
+  nextRefreshAt: z.string().datetime().nullable(),
+  refreshing: z.boolean(),
+  // Whether the latest finished rebuild failed; false once a later one
+  // succeeds. Deliberately a flag and not the error text: the rebuild is
+  // deployment-wide, so its message can describe another organization's
+  // corpus, and it is a raw database error. The text stays in the task row
+  // and the logs, where operators look.
+  lastRefreshFailed: z.boolean(),
+});
+
+export type KeywordRankingStatus = z.infer<typeof KeywordRankingStatusSchema>;
+
+export const UpdateAuthSettingsSchema = z.object({
+  oauthAccessTokenLifetimeSeconds:
+    OAuthAccessTokenLifetimeSecondsSchema.optional(),
+  requireTwoFactor: z.boolean().optional(),
+  // Absolute session lifetime cap in seconds; null = no cap.
+  sessionMaxAgeSeconds: z
+    .number()
+    .int()
+    .min(SESSION_MAX_AGE_MIN_SECONDS)
+    .max(SESSION_MAX_AGE_MAX_SECONDS)
+    .nullable()
+    .optional(),
+  // Role slug (predefined or custom) assigned to new self-signup / ChatOps
+  // members. `null` clears it back to the built-in "member" fallback.
+  defaultMemberRole: RoleAssignmentSchema.nullable().optional(),
+});
+
+export const UpdateConnectionSettingsSchema = z.object({
+  connectionDefaultMcpGatewayId: z.string().uuid().nullable().optional(),
+  connectionDefaultProviderKeys:
+    ConnectionDefaultProviderKeysSchema.nullable().optional(),
+  connectionDefaultClientId: z.string().max(64).nullable().optional(),
+  connectionShownClientIds: z
+    .array(z.string().max(64))
+    .max(50)
+    .nullable()
+    .optional(),
+  /**
+   * Retired: the connect page carried its own provider list, which only ever
+   * narrowed what it displayed rather than what could be configured. One
+   * deployment-wide list under LLM settings now answers both.
+   *
+   * Rejected rather than stripped, so a browser tab left open across the
+   * upgrade cannot appear to gate providers and change nothing.
+   */
+  connectionShownProviders: z
+    .never({
+      error:
+        "connectionShownProviders was retired. Set provider availability under Settings → LLM → Available model providers.",
+    })
+    .optional(),
+  connectionSkillsEnabled: z.boolean().optional(),
+  connectionLlmProxyEnabled: z.boolean().optional(),
+  connectionPluginsEnabled: z.boolean().optional(),
+  connectionBaseUrls: z
+    .array(ConnectionBaseUrlSchema)
+    .max(50)
+    .nullable()
+    .optional()
+    .superRefine((value, ctx) => {
+      if (!value) return;
+      const seen = new Set<string>();
+      let defaults = 0;
+      for (const item of value) {
+        if (seen.has(item.url)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "Duplicate connection base URL",
+          });
+        }
+        seen.add(item.url);
+        if (item.isDefault) defaults += 1;
+      }
+      if (defaults > 1) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Only one connection base URL can be marked as default",
+        });
+      }
+    }),
+});
+
+/**
+ * Admin customization of the built-in integration catalogs. Each map is keyed
+ * by the catalog entry's id and only needs entries for the ones the admin
+ * actually changed; `null` clears every override for that catalog. Omitted
+ * fields are left untouched, so the three surfaces can be saved independently.
+ */
+export const UpdateIntegrationSettingsSchema = z.object({
+  modelProviderOverrides: ModelProviderOverridesSchema.nullable().optional(),
+  messagingChannelOverrides:
+    MessagingChannelOverridesSchema.nullable().optional(),
+  knowledgeConnectorOverrides:
+    KnowledgeConnectorOverridesSchema.nullable().optional(),
+});
+
+/**
+ * Clean API shape for configuring the implicit "default" environment. The
+ * handler maps these to the org columns (`defaultEnvironmentName`,
+ * `defaultEnvironmentNamespace`, `defaultEnvironmentRestricted`,
+ * `defaultEnvironmentValidationRegex`). Omitting a field leaves it unchanged;
+ * an explicit null clears the nullable ones.
+ */
+export const UpdateDefaultEnvironmentSchema = z.object({
+  name: z.string().trim().min(1).max(50).nullable().optional(),
+  description: z.string().trim().max(500).nullable().optional(),
+  // Becomes the code-managed engine's namespace and part of its kube-pod://
+  // target, which the NAPI boundary validates as an RFC1123 label.
+  namespace: KubernetesNamespaceSchema.nullable().optional(),
+  networkPolicy: NetworkPolicyInputSchema.nullable().optional(),
+  restricted: z.boolean().optional(),
+  validationRegex: ValidationRegexSchema.nullable().optional(),
+  trustedImageRegistries: TrustedImageRegistriesSchema.nullable().optional(),
+});
+
+export type UpdateDefaultEnvironment = z.infer<
+  typeof UpdateDefaultEnvironmentSchema
+>;
+
+export const CompleteOnboardingSchema = z.object({
+  onboardingComplete: z.literal(true),
+});
+export type Organization = z.infer<typeof SelectOrganizationSchema>;
+export type OrganizationAnalyticsState = Pick<
+  z.infer<typeof InternalSelectOrganizationSchema>,
+  | "id"
+  | "analyticsInstanceId"
+  | "analyticsInstanceStartedAt"
+  | "analyticsInstanceLastHeartbeatAt"
+>;
+export type InsertOrganization = z.infer<typeof InsertOrganizationSchema>;
+export type AppearanceSettings = z.infer<typeof AppearanceSettingsSchema>;
+export type OrganizationChatLink = z.infer<typeof OrganizationChatLinkSchema>;
+export type OnboardingWizardPage = z.infer<typeof OnboardingWizardPageSchema>;
+export type OnboardingWizard = z.infer<typeof OnboardingWizardSchema>;
+export type OAuthAccessTokenLifetimeSeconds = z.infer<
+  typeof OAuthAccessTokenLifetimeSecondsSchema
+>;
+export type ConnectionBaseUrl = z.infer<typeof ConnectionBaseUrlSchema>;
+
+function isValidHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}

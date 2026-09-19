@@ -1,0 +1,133 @@
+{-
+ Copyright 2022-23, Juspay India Pvt Ltd
+
+ This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License
+
+ as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. This program
+
+ is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+
+ or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details. You should have received a copy of
+
+ the GNU Affero General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
+-}
+
+module SharedLogic.Allocator.Jobs.SendSearchRequestToDrivers.Handle
+  ( HandleMonad,
+    Handle (..),
+    MetricsHandle (..),
+    handler,
+  )
+where
+
+import qualified Data.HashMap.Strict as HM
+import Domain.Types.GoHomeConfig (GoHomeConfig)
+import Domain.Types.Person (Driver)
+import qualified Domain.Types.SearchTry as DST
+import Kernel.Prelude
+import Kernel.Streaming.Kafka.Producer.Types (KafkaProducerTools)
+import Kernel.Tools.Metrics.CoreMetrics
+import Kernel.Types.Id (Id)
+import Kernel.Utils.Common
+import Lib.Scheduler.Types (ExecutionResult (..))
+import SharedLogic.CallBAPInternal as CallBAPInternal
+import SharedLogic.DriverPool
+
+type HandleMonad m r = (MonadClock m, MonadTime m, Log m, CoreMetrics m, HasFlowEnv m r '["kafkaProducerTools" ::: KafkaProducerTools], HasFlowEnv m r '["appBackendBapInternal" ::: AppBackendBapInternal], HasFlowEnv m r '["internalEndPointHashMap" ::: HM.HashMap BaseUrl BaseUrl], HasRequestId r)
+
+data MetricsHandle m = MetricsHandle
+  { incrementTaskCounter :: m (),
+    incrementFailedTaskCounter :: m (),
+    putTaskDuration :: Milliseconds -> m ()
+  }
+
+data Handle m r = Handle
+  { isBatchNumExceedLimit :: m Bool,
+    isReceivedMaxDriverQuotes :: m Bool,
+    getNextDriverPoolBatch :: GoHomeConfig -> m DriverPoolWithActualDistResultWithFlags,
+    sendSearchRequestToDrivers :: [DriverPoolWithActualDistResult] -> [Id Driver] -> GoHomeConfig -> m (),
+    logDriversExhausted :: m (),
+    -- | Takes the batch-start time as anchor so slow pool computation doesn't
+    -- push every subsequent batch back.
+    getRescheduleTime :: UTCTime -> m UTCTime,
+    metrics :: MetricsHandle m,
+    isSearchTryValid :: m Bool,
+    isBookingValid :: Bool,
+    initiateDriverSearchBatch :: m DST.SearchTry,
+    cancelSearchTry :: m (),
+    cancelBookingIfApplies :: m (),
+    isScheduledBooking :: Bool,
+    mbTopUpSize :: Maybe Int,
+    popTopUpDrivers :: Int -> m [DriverPoolWithActualDistResult],
+    markDriversAttempted :: [DriverPoolWithActualDistResult] -> m ()
+  }
+
+handler :: HandleMonad m r => Handle m r -> GoHomeConfig -> Text -> m (ExecutionResult, PoolType, Maybe Seconds)
+handler h@Handle {..} goHomeCfg transactionId = do
+  logInfo "Starting job execution"
+  metrics.incrementTaskCounter
+  measuringDuration (\ms (_, _, _) -> metrics.putTaskDuration ms) $ do
+    isSearchTryValid' <- isSearchTryValid
+    if not isSearchTryValid' || not isBookingValid
+      then do
+        logInfo "Search request is either assigned, cancelled or expired."
+        return (Complete, NormalPool, Nothing)
+      else do
+        isReceivedMaxDriverQuotes' <- isReceivedMaxDriverQuotes
+        if isReceivedMaxDriverQuotes'
+          then do
+            logInfo "Received enough quotes from drivers."
+            return (Complete, NormalPool, Nothing)
+          else processRequestSending h goHomeCfg transactionId
+
+processRequestSending :: HandleMonad m r => Handle m r -> GoHomeConfig -> Text -> m (ExecutionResult, PoolType, Maybe Seconds)
+processRequestSending h@Handle {..} goHomeCfg transactionId =
+  case mbTopUpSize of
+    Just topUpSize -> processTopUpDispatch h goHomeCfg topUpSize
+    Nothing -> processBatchChainDispatch h goHomeCfg transactionId
+
+processTopUpDispatch :: HandleMonad m r => Handle m r -> GoHomeConfig -> Int -> m (ExecutionResult, PoolType, Maybe Seconds)
+processTopUpDispatch Handle {..} goHomeCfg topUpSize = do
+  topUpDrivers <- popTopUpDrivers topUpSize
+  if null topUpDrivers
+    then logInfo "Reserve pool empty; batch chain continues on its timer."
+    else do
+      logInfo $ "processTopUpDispatch sending to " <> show (length topUpDrivers) <> " reserve driver(s)"
+      sendSearchRequestToDrivers topUpDrivers [] goHomeCfg
+      markDriversAttempted topUpDrivers
+  return (Complete, NormalPool, Nothing)
+
+processBatchChainDispatch :: HandleMonad m r => Handle m r -> GoHomeConfig -> Text -> m (ExecutionResult, PoolType, Maybe Seconds)
+processBatchChainDispatch Handle {..} goHomeCfg transactionId = do
+  isBatchNumExceedLimit' <- isBatchNumExceedLimit
+  logInfo $ "processRequestSending isBatchNumExceedLimit: " <> show isBatchNumExceedLimit'
+  if isBatchNumExceedLimit'
+    then do
+      if isScheduledBooking
+        then do
+          void initiateDriverSearchBatch
+          return (Complete, NormalPool, Nothing)
+        else do
+          metrics.incrementFailedTaskCounter
+          logInfo "No driver accepted"
+          appBackendBapInternal <- asks (.appBackendBapInternal)
+          let request = CallBAPInternal.RideSearchExpiredReq {transactionId = transactionId}
+          void $ CallBAPInternal.rideSearchExpired appBackendBapInternal.apiKey appBackendBapInternal.url request
+          cancelSearchTry
+          cancelBookingIfApplies
+          return (Complete, NormalPool, Nothing)
+    else do
+      batchStartTime <- getCurrentTime
+      driverPoolWithFlags <- getNextDriverPoolBatch goHomeCfg
+      -- Pool computation can take seconds; an accept or customer cancel landing in that
+      -- window must not produce a batch of offers for a ride that is already gone.
+      isStillValid <- isSearchTryValid
+      if not isStillValid
+        then do
+          logInfo "Search try became invalid during pool computation; skipping dispatch."
+          return (Complete, driverPoolWithFlags.poolType, Nothing)
+        else do
+          if not $ null driverPoolWithFlags.driverPoolWithActualDistResult
+            then sendSearchRequestToDrivers driverPoolWithFlags.driverPoolWithActualDistResult driverPoolWithFlags.prevBatchDrivers goHomeCfg
+            else logDriversExhausted -- ran out of drivers mid-search (empty pool before batch limit); mark for analytics
+          ReSchedule <$> getRescheduleTime batchStartTime <&> (,driverPoolWithFlags.poolType,driverPoolWithFlags.nextScheduleTime)

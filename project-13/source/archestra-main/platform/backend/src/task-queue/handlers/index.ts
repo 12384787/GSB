@@ -1,0 +1,86 @@
+import {
+  checkDueAppaGithubSyncs,
+  syncAppaGithubPolicy,
+} from "@/services/openappa-github-sync";
+import type { TaskQueueService } from "../task-queue";
+import { handleAuditLogCleanup } from "./audit-log-cleanup-handler";
+import { handleBatchEmbedding } from "./batch-embedding-handler";
+import { handleCheckDueConnectors } from "./check-due-connectors-handler";
+import { handleCheckDuePermissionSyncs } from "./check-due-permission-syncs-handler";
+import { handleCheckDuePluginGithubSyncs } from "./check-due-plugin-github-syncs-handler";
+import { handleCheckDueScheduleTriggers } from "./check-due-schedule-triggers-handler";
+import { handleCheckDueSkillGithubSyncs } from "./check-due-skill-github-syncs-handler";
+import { handleConnectorSync } from "./connector-sync-handler";
+// biome-ignore lint/style/noRestrictedImports: dual-licensed, no-op unless the feature is enabled
+import { handleContentEncryptionBackfill } from "./content-encryption-backfill-handler.ee";
+// biome-ignore lint/style/noRestrictedImports: dual-licensed, gated at boot by the retention license gate
+import { handleContentRetentionCleanup } from "./content-retention-cleanup-handler.ee";
+import { handleKbBm25StatsRefresh } from "./kb-bm25-stats-refresh-handler";
+import { handleP4ShimReconcile } from "./p4-shim-reconcile-handler";
+import { handlePermissionSync } from "./permission-sync-handler";
+import { handlePluginGithubSync } from "./plugin-github-sync-handler";
+import { handleScheduleTriggerRunExecution } from "./schedule-trigger-run-handler";
+import { handleSkillGithubSync } from "./skill-github-sync-handler";
+import { handleSkillPublicationBackfill } from "./skill-publication-backfill-handler";
+
+export function registerTaskHandlers(taskQueueService: TaskQueueService): void {
+  taskQueueService.registerHandler("connector_sync", handleConnectorSync);
+  taskQueueService.registerHandler("batch_embedding", handleBatchEmbedding);
+  taskQueueService.registerHandler("permission_sync", handlePermissionSync);
+  taskQueueService.registerHandler(
+    "check_due_connectors",
+    handleCheckDueConnectors,
+  );
+  taskQueueService.registerHandler(
+    "check_due_permission_syncs",
+    handleCheckDuePermissionSyncs,
+  );
+  taskQueueService.registerHandler(
+    "check_due_schedule_triggers",
+    handleCheckDueScheduleTriggers,
+  );
+  taskQueueService.registerHandler(
+    "schedule_trigger_run_execute",
+    handleScheduleTriggerRunExecution,
+  );
+  taskQueueService.registerHandler("p4_shim_reconcile", handleP4ShimReconcile);
+  taskQueueService.registerHandler("audit_log_cleanup", handleAuditLogCleanup);
+  taskQueueService.registerHandler(
+    "kb_bm25_stats_refresh",
+    handleKbBm25StatsRefresh,
+  );
+  taskQueueService.registerHandler(
+    "content_retention_cleanup",
+    handleContentRetentionCleanup,
+  );
+  taskQueueService.registerHandler(
+    "content_encryption_backfill",
+    handleContentEncryptionBackfill,
+  );
+  taskQueueService.registerHandler(
+    "check_due_skill_github_syncs",
+    handleCheckDueSkillGithubSyncs,
+  );
+  taskQueueService.registerHandler(
+    "check_due_openappa_github_syncs",
+    checkDueAppaGithubSyncs,
+  );
+  taskQueueService.registerHandler("openappa_github_sync", async (payload) => {
+    if (typeof payload.organizationId !== "string")
+      throw new Error("Missing organizationId");
+    await syncAppaGithubPolicy(payload.organizationId);
+  });
+  taskQueueService.registerHandler("skill_github_sync", handleSkillGithubSync);
+  taskQueueService.registerHandler(
+    "check_due_plugin_github_syncs",
+    handleCheckDuePluginGithubSyncs,
+  );
+  taskQueueService.registerHandler(
+    "plugin_github_sync",
+    handlePluginGithubSync,
+  );
+  taskQueueService.registerHandler(
+    "skill_publication_backfill",
+    handleSkillPublicationBackfill,
+  );
+}

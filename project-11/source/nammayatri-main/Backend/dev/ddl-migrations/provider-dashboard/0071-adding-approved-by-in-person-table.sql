@@ -1,0 +1,1 @@
+ALTER table atlas_dashboard.person ADD COLUMN approved_by character varying(255);

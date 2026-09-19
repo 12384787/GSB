@@ -1,0 +1,820 @@
+import { archestraApiSdk, type archestraApiTypes } from "@archestra/shared";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { usePathname } from "next/navigation";
+import type { ReactNode } from "react";
+import { beforeEach, describe, expect, it, test, vi } from "vitest";
+import { handleApiError } from "@/lib/utils";
+import {
+  invalidateConversationFileQueries,
+  mergeUpdatedConversationIntoCache,
+  useClearChatErrors,
+  useConversation,
+  useConversationEnabledTools,
+  useConversationFiles,
+  useConversations,
+  useConversationUpdatedCacheSync,
+  useCreateConversation,
+  useDeleteConversation,
+  useKeepViewedConversationRead,
+  useMarkConversationRead,
+  useMemberDefaultModel,
+  useStopChatStream,
+  useUpdateConversation,
+} from "./chat.query";
+
+vi.mock("@archestra/shared", () => ({
+  archestraApiSdk: {
+    getChatConversations: vi.fn(),
+    getChatConversation: vi.fn(),
+    getChatConversationFiles: vi.fn(),
+    getMemberDefaultModel: vi.fn(),
+    getConversationEnabledTools: vi.fn(),
+    markChatConversationRead: vi.fn(),
+    deleteChatConversation: vi.fn(),
+    clearChatConversationErrors: vi.fn(),
+    updateChatConversation: vi.fn(),
+    createChatConversation: vi.fn(),
+    stopChatStream: vi.fn(),
+  },
+  PLAYWRIGHT_MCP_CATALOG_ID: "playwright-catalog-id",
+  PLAYWRIGHT_MCP_SERVER_NAME: "playwright-mcp",
+}));
+
+vi.mock("next/navigation");
+
+const wsHandlers: Record<string, (msg: unknown) => void> = {};
+vi.mock("@/lib/websocket/websocket", () => ({
+  default: {
+    connect: vi.fn(),
+    subscribe: (type: string, handler: (msg: unknown) => void) => {
+      wsHandlers[type] = handler;
+      return () => delete wsHandlers[type];
+    },
+  },
+}));
+
+vi.mock("@/lib/utils", async () => {
+  const actual = await vi.importActual("@/lib/utils");
+  return {
+    ...actual,
+    handleApiError: vi.fn(),
+  };
+});
+
+const mockedHandleApiError = vi.mocked(handleApiError);
+
+type ErrorResult = {
+  data: undefined;
+  error: unknown;
+  response?: { status: number };
+};
+const errorResult = (status?: number): ErrorResult => ({
+  data: undefined,
+  error: { message: "boom" },
+  response: status === undefined ? undefined : { status },
+});
+
+const createWrapper = () => {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  return ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
+};
+
+describe("useConversations", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(archestraApiSdk.getChatConversations).mockResolvedValue({
+      data: [makeConversation()],
+      error: undefined,
+    } as Awaited<ReturnType<typeof archestraApiSdk.getChatConversations>>);
+  });
+
+  it("does not fetch while disabled", () => {
+    renderHook(() => useConversations({ enabled: false }), {
+      wrapper: createWrapper(),
+    });
+
+    expect(archestraApiSdk.getChatConversations).not.toHaveBeenCalled();
+  });
+
+  it("fetches once it becomes enabled after starting disabled", async () => {
+    // Regression: the search palette mounts permanently with enabled=false,
+    // so a cached empty result must not stick once the palette opens.
+    const { result, rerender } = renderHook(
+      ({ enabled }) => useConversations({ enabled }),
+      { wrapper: createWrapper(), initialProps: { enabled: false } },
+    );
+
+    expect(archestraApiSdk.getChatConversations).not.toHaveBeenCalled();
+
+    rerender({ enabled: true });
+
+    await waitFor(() => {
+      expect(result.current.data).toHaveLength(1);
+    });
+    expect(archestraApiSdk.getChatConversations).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("useConversation error handling", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each([400, 404])("suppresses the toast for status %i", async (status) => {
+    vi.mocked(archestraApiSdk.getChatConversation).mockResolvedValue(
+      errorResult(status) as Awaited<
+        ReturnType<typeof archestraApiSdk.getChatConversation>
+      >,
+    );
+
+    const { result } = renderHook(() => useConversation("c1"), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.data).toBeNull());
+    expect(mockedHandleApiError).not.toHaveBeenCalled();
+  });
+
+  it("toasts for non-400/404 errors and returns null", async () => {
+    vi.mocked(archestraApiSdk.getChatConversation).mockResolvedValue(
+      errorResult(500) as Awaited<
+        ReturnType<typeof archestraApiSdk.getChatConversation>
+      >,
+    );
+
+    const { result } = renderHook(() => useConversation("c1"), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.data).toBeNull());
+    expect(mockedHandleApiError).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("useMemberDefaultModel error handling", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("returns the null model/key fallback on an HTTP error", async () => {
+    vi.mocked(archestraApiSdk.getMemberDefaultModel).mockResolvedValue(
+      errorResult(500) as Awaited<
+        ReturnType<typeof archestraApiSdk.getMemberDefaultModel>
+      >,
+    );
+
+    const { result } = renderHook(() => useMemberDefaultModel(), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() =>
+      expect(result.current.data).toEqual({
+        modelId: null,
+        chatApiKeyId: null,
+      }),
+    );
+    expect(mockedHandleApiError).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns the fallback without throwing on a network error", async () => {
+    vi.mocked(archestraApiSdk.getMemberDefaultModel).mockResolvedValue(
+      errorResult(undefined) as Awaited<
+        ReturnType<typeof archestraApiSdk.getMemberDefaultModel>
+      >,
+    );
+
+    const { result } = renderHook(() => useMemberDefaultModel(), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() =>
+      expect(result.current.data).toEqual({
+        modelId: null,
+        chatApiKeyId: null,
+      }),
+    );
+    expect(result.current.isError).toBe(false);
+  });
+});
+
+describe("useConversationFiles error handling", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each([
+    500,
+    undefined,
+  ])("returns null silently on error (status %s)", async (status) => {
+    vi.mocked(archestraApiSdk.getChatConversationFiles).mockResolvedValue(
+      errorResult(status) as Awaited<
+        ReturnType<typeof archestraApiSdk.getChatConversationFiles>
+      >,
+    );
+
+    const { result } = renderHook(() => useConversationFiles("c1"), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.data).toBeNull());
+    expect(result.current.isError).toBe(false);
+    expect(mockedHandleApiError).not.toHaveBeenCalled();
+  });
+});
+
+describe("useConversationEnabledTools status handling", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("stays silent and returns null on a 404", async () => {
+    vi.mocked(archestraApiSdk.getConversationEnabledTools).mockResolvedValue(
+      errorResult(404) as Awaited<
+        ReturnType<typeof archestraApiSdk.getConversationEnabledTools>
+      >,
+    );
+
+    const { result } = renderHook(() => useConversationEnabledTools("c1"), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.data).toBeNull());
+    expect(mockedHandleApiError).not.toHaveBeenCalled();
+  });
+
+  it("toasts and returns null on a non-404 error", async () => {
+    vi.mocked(archestraApiSdk.getConversationEnabledTools).mockResolvedValue(
+      errorResult(500) as Awaited<
+        ReturnType<typeof archestraApiSdk.getConversationEnabledTools>
+      >,
+    );
+
+    const { result } = renderHook(() => useConversationEnabledTools("c1"), {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.data).toBeNull());
+    expect(mockedHandleApiError).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("mergeUpdatedConversationIntoCache", () => {
+  test("applies implicit model, provider, and key changes from an agent switch", () => {
+    const oldConversation = makeConversation();
+    const updatedConversation = {
+      ...oldConversation,
+      agentId: "agent-b",
+      agent: {
+        id: "agent-b",
+        name: "Agent B",
+        systemPrompt: null,
+        agentType: "agent",
+        toolExposureMode: "full",
+        llmApiKeyId: "key-anthropic",
+      },
+      modelId: "model-claude",
+      chatApiKeyId: "key-anthropic",
+    } satisfies archestraApiTypes.UpdateChatConversationResponses["200"];
+
+    const merged = mergeUpdatedConversationIntoCache(
+      oldConversation,
+      updatedConversation,
+      {
+        id: "conversation-1",
+        agentId: "agent-b",
+      },
+    );
+
+    expect(merged.agentId).toBe("agent-b");
+    expect(merged.agent?.id).toBe("agent-b");
+    expect(merged.modelId).toBe("model-claude");
+    expect(merged.chatApiKeyId).toBe("key-anthropic");
+  });
+
+  test("keeps unrelated fields stable for a model-only update", () => {
+    const oldConversation = makeConversation();
+    const updatedConversation = {
+      ...oldConversation,
+      modelId: "model-gpt41",
+    } satisfies archestraApiTypes.UpdateChatConversationResponses["200"];
+
+    const merged = mergeUpdatedConversationIntoCache(
+      oldConversation,
+      updatedConversation,
+      {
+        id: "conversation-1",
+        modelId: "model-gpt41",
+      },
+    );
+
+    expect(merged.agentId).toBe("agent-a");
+    expect(merged.chatApiKeyId).toBe("key-openai");
+    expect(merged.modelId).toBe("model-gpt41");
+  });
+
+  test("leaves the reasoning depth to the composer", () => {
+    // The composer owns what it displays, including clicks its write queue
+    // coalesces away; echoing a response back here would flip the control to
+    // whichever request answered last.
+    const oldConversation = makeConversation();
+    const updatedConversation = {
+      ...oldConversation,
+      thinkingEffort: "high",
+    } satisfies archestraApiTypes.UpdateChatConversationResponses["200"];
+
+    const merged = mergeUpdatedConversationIntoCache(
+      oldConversation,
+      updatedConversation,
+      { id: "conversation-1", thinkingEffort: "high" },
+    );
+
+    expect(merged.thinkingEffort).toBe("low");
+  });
+
+  test("a rename carries the cleared placeholder flag into the cache", () => {
+    // Stale `true` here would make the chat look retitleable to the auto-title
+    // gate for the rest of the session, undoing the rename the user just made.
+    const oldConversation = { ...makeConversation(), titleIsPlaceholder: true };
+    const updatedConversation = {
+      ...oldConversation,
+      title: "Q3 budget planning",
+      titleIsPlaceholder: false,
+    } satisfies archestraApiTypes.UpdateChatConversationResponses["200"];
+
+    const merged = mergeUpdatedConversationIntoCache(
+      oldConversation,
+      updatedConversation,
+      { id: "conversation-1", title: "Q3 budget planning" },
+    );
+
+    expect(merged.title).toBe("Q3 budget planning");
+    expect(merged.titleIsPlaceholder).toBe(false);
+  });
+
+  test("leaves the placeholder flag alone for a model-only update", () => {
+    const oldConversation = { ...makeConversation(), titleIsPlaceholder: true };
+    const updatedConversation = {
+      ...oldConversation,
+      modelId: "model-gpt41",
+      titleIsPlaceholder: false,
+    } satisfies archestraApiTypes.UpdateChatConversationResponses["200"];
+
+    const merged = mergeUpdatedConversationIntoCache(
+      oldConversation,
+      updatedConversation,
+      { id: "conversation-1", modelId: "model-gpt41" },
+    );
+
+    expect(merged.titleIsPlaceholder).toBe(true);
+  });
+
+  test("applies a project change to the cached conversation", () => {
+    const oldConversation = makeConversation();
+    const updatedConversation = {
+      ...oldConversation,
+      projectId: "project-1",
+    } satisfies archestraApiTypes.UpdateChatConversationResponses["200"];
+
+    const merged = mergeUpdatedConversationIntoCache(
+      oldConversation,
+      updatedConversation,
+      { id: "conversation-1", projectId: "project-1" },
+    );
+
+    expect(merged.projectId).toBe("project-1");
+  });
+});
+
+describe("invalidateConversationFileQueries", () => {
+  test("refreshes the project Files panel for a project chat", () => {
+    const queryClient = new QueryClient();
+    const spy = vi.spyOn(queryClient, "invalidateQueries");
+
+    invalidateConversationFileQueries(queryClient, {
+      conversationId: "c1",
+      projectId: "p1",
+    });
+
+    expect(spy).toHaveBeenCalledWith({
+      queryKey: ["conversation-files", "c1"],
+    });
+    expect(spy).toHaveBeenCalledWith({ queryKey: ["conversation", "c1"] });
+    // The fix: a file created in a project chat must mark the project's Files
+    // list stale so navigating to the project view refetches it.
+    expect(spy).toHaveBeenCalledWith({
+      queryKey: ["projects", "p1", "files"],
+    });
+  });
+
+  test("leaves project queries untouched for a non-project chat", () => {
+    const queryClient = new QueryClient();
+    const spy = vi.spyOn(queryClient, "invalidateQueries");
+
+    invalidateConversationFileQueries(queryClient, {
+      conversationId: "c1",
+      projectId: null,
+    });
+
+    expect(spy).toHaveBeenCalledWith({
+      queryKey: ["conversation-files", "c1"],
+    });
+    expect(spy).toHaveBeenCalledWith({ queryKey: ["conversation", "c1"] });
+    // Only the two conversation keys — no `["projects", …]` invalidation that
+    // would refetch an unrelated project's files for a plain chat.
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+});
+
+function makeConversation(): archestraApiTypes.GetChatConversationResponses["200"] {
+  return {
+    id: "conversation-1",
+    userId: "user-1",
+    organizationId: "org-1",
+    agentId: "agent-a",
+    chatApiKeyId: "key-openai",
+    title: "Test",
+    titleIsPlaceholder: false,
+    thinkingEffort: "low",
+    selectedModel: "gpt-4o",
+    selectedProvider: "openai",
+    modelId: null,
+    hasCustomToolSelection: false,
+    hooksDebugEnabled: false,
+    todoList: null,
+    artifact: null,
+    projectId: null,
+    origin: "user",
+    lockedChat: false,
+    pinnedAt: null,
+    lastMessageAt: "2026-03-17T00:00:00.000Z",
+    createdAt: "2026-03-17T00:00:00.000Z",
+    updatedAt: "2026-03-17T00:00:00.000Z",
+    deletedAt: null,
+    agent: {
+      id: "agent-a",
+      name: "Agent A",
+      systemPrompt: null,
+      agentType: "agent",
+      toolExposureMode: "full",
+      llmApiKeyId: "key-openai",
+    },
+    share: null,
+    messages: [],
+    chatErrors: [],
+    compactions: [],
+  };
+}
+
+describe("conversation read-state hooks", () => {
+  const seededList = (...convs: Array<{ id: string; unread: boolean }>) =>
+    convs.map((c) => ({ ...makeConversation(), id: c.id, unread: c.unread }));
+
+  const renderWithSeed = <T,>(
+    hook: () => T,
+    seed: ReturnType<typeof seededList>,
+  ) => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    // Seeded fresh (staleTime > 0), so useConversations serves it without an
+    // immediate refetch — the hooks read this directly.
+    queryClient.setQueryData(["conversations", undefined], seed);
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+    return { queryClient, ...renderHook(hook, { wrapper }) };
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(usePathname).mockReturnValue("/chat");
+    for (const key of Object.keys(wsHandlers)) delete wsHandlers[key];
+    vi.mocked(archestraApiSdk.markChatConversationRead).mockResolvedValue({
+      data: { success: true },
+      error: undefined,
+    } as Awaited<ReturnType<typeof archestraApiSdk.markChatConversationRead>>);
+  });
+
+  it("useMarkConversationRead optimistically clears unread in cached lists", async () => {
+    const { queryClient, result } = renderWithSeed(
+      () => useMarkConversationRead(),
+      seededList({ id: "c1", unread: true }, { id: "c2", unread: true }),
+    );
+
+    act(() => {
+      result.current.mutate({ id: "c1" });
+    });
+
+    const list = queryClient.getQueryData<
+      Array<{ id: string; unread: boolean }>
+    >(["conversations", undefined]);
+    expect(list?.find((c) => c.id === "c1")?.unread).toBe(false);
+    expect(list?.find((c) => c.id === "c2")?.unread).toBe(true);
+    await waitFor(() =>
+      expect(archestraApiSdk.markChatConversationRead).toHaveBeenCalledWith({
+        path: { id: "c1" },
+      }),
+    );
+  });
+
+  it("useKeepViewedConversationRead marks the viewed unread conversation read", async () => {
+    vi.mocked(usePathname).mockReturnValue("/chat/c1");
+    renderWithSeed(
+      () => useKeepViewedConversationRead(),
+      seededList({ id: "c1", unread: true }),
+    );
+
+    await waitFor(() =>
+      expect(archestraApiSdk.markChatConversationRead).toHaveBeenCalledWith({
+        path: { id: "c1" },
+      }),
+    );
+  });
+
+  it("useKeepViewedConversationRead does not mark an already-read viewed conversation", async () => {
+    vi.mocked(usePathname).mockReturnValue("/chat/c1");
+    renderWithSeed(
+      () => useKeepViewedConversationRead(),
+      seededList({ id: "c1", unread: false }),
+    );
+
+    await Promise.resolve();
+    expect(archestraApiSdk.markChatConversationRead).not.toHaveBeenCalled();
+  });
+
+  it("useKeepViewedConversationRead does not mark read off a conversation route", async () => {
+    vi.mocked(usePathname).mockReturnValue("/chat");
+    renderWithSeed(
+      () => useKeepViewedConversationRead(),
+      seededList({ id: "c1", unread: true }),
+    );
+
+    await Promise.resolve();
+    expect(archestraApiSdk.markChatConversationRead).not.toHaveBeenCalled();
+  });
+
+  it("useConversationUpdatedCacheSync invalidates conversations on a push", () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+    renderHook(() => useConversationUpdatedCacheSync(), { wrapper });
+
+    expect(wsHandlers.conversation_updated).toBeDefined();
+    act(() => {
+      wsHandlers.conversation_updated({
+        type: "conversation_updated",
+        payload: { conversationId: "c1" },
+      });
+    });
+
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+  });
+});
+
+describe("useDeleteConversation project-list invalidation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(archestraApiSdk.deleteChatConversation).mockResolvedValue({
+      data: { success: true },
+      error: undefined,
+    } as Awaited<ReturnType<typeof archestraApiSdk.deleteChatConversation>>);
+  });
+
+  const renderDelete = (conversation: {
+    id: string;
+    projectId: string | null;
+  }) => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    queryClient.setQueryData(
+      ["conversations", undefined],
+      [{ ...makeConversation(), ...conversation }],
+    );
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+    return {
+      invalidateSpy,
+      ...renderHook(() => useDeleteConversation(), { wrapper }),
+    };
+  };
+
+  it("invalidates the project's conversation list when a project chat is deleted", async () => {
+    const { invalidateSpy, result } = renderDelete({
+      id: "c1",
+      projectId: "p1",
+    });
+
+    await act(async () => {
+      await result.current.mutateAsync("c1");
+    });
+
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ["projects", "p1", "conversations"],
+    });
+  });
+
+  it("does not invalidate any project query for a non-project chat", async () => {
+    const { invalidateSpy, result } = renderDelete({
+      id: "c1",
+      projectId: null,
+    });
+
+    await act(async () => {
+      await result.current.mutateAsync("c1");
+    });
+
+    const touchedProjects = invalidateSpy.mock.calls.some(
+      ([arg]) => Array.isArray(arg?.queryKey) && arg.queryKey[0] === "projects",
+    );
+    expect(touchedProjects).toBe(false);
+  });
+});
+
+describe("useStopChatStream", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each([
+    500,
+    undefined,
+  ])("rejects a failed stop with status %s", async (status) => {
+    vi.mocked(archestraApiSdk.stopChatStream).mockResolvedValue(
+      errorResult(status) as Awaited<
+        ReturnType<typeof archestraApiSdk.stopChatStream>
+      >,
+    );
+    const { result } = renderHook(() => useStopChatStream(), {
+      wrapper: createWrapper(),
+    });
+
+    await act(async () => {
+      await expect(result.current.mutateAsync("c1")).rejects.toThrow("boom");
+    });
+    expect(mockedHandleApiError).toHaveBeenCalledWith({ message: "boom" });
+  });
+});
+
+describe("useClearChatErrors", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const renderClear = (chatErrors: unknown[]) => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    queryClient.setQueryData(["conversation", "c1"], { id: "c1", chatErrors });
+    const cancelSpy = vi.spyOn(queryClient, "cancelQueries");
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+    return {
+      queryClient,
+      cancelSpy,
+      invalidateSpy,
+      ...renderHook(() => useClearChatErrors(), { wrapper }),
+    };
+  };
+
+  const cachedChatErrors = (queryClient: QueryClient) =>
+    queryClient.getQueryData<{ chatErrors: unknown[] }>(["conversation", "c1"])
+      ?.chatErrors;
+
+  it("optimistically drops the error rows and cancels in-flight refetches", async () => {
+    vi.mocked(archestraApiSdk.clearChatConversationErrors).mockResolvedValue({
+      data: { success: true },
+      error: undefined,
+    } as Awaited<
+      ReturnType<typeof archestraApiSdk.clearChatConversationErrors>
+    >);
+    const { queryClient, cancelSpy, invalidateSpy, result } = renderClear([
+      { id: "err-1", error: { message: "boom" } },
+    ]);
+
+    await act(async () => {
+      await result.current.mutateAsync({ id: "c1" });
+    });
+
+    // Cancels the competing conversation refetch so it can't resurrect the rows.
+    expect(cancelSpy).toHaveBeenCalledWith({
+      queryKey: ["conversation", "c1"],
+    });
+    // The card is gone immediately and stays gone after the delete settles.
+    expect(cachedChatErrors(queryClient)).toEqual([]);
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ["conversation", "c1"],
+    });
+  });
+
+  it("restores the error rows when the delete fails", async () => {
+    const rows = [{ id: "err-1", error: { message: "boom" } }];
+    vi.mocked(archestraApiSdk.clearChatConversationErrors).mockResolvedValue(
+      errorResult(500) as Awaited<
+        ReturnType<typeof archestraApiSdk.clearChatConversationErrors>
+      >,
+    );
+    const { queryClient, result } = renderClear(rows);
+
+    await act(async () => {
+      await result.current.mutateAsync({ id: "c1" }).catch(() => {});
+    });
+
+    // The delete didn't take, so the user must still see the error.
+    expect(cachedChatErrors(queryClient)).toEqual(rows);
+  });
+});
+
+describe("conversation settings reach the wire", () => {
+  // Both mutations rebuild the request body from an explicit field list, so a
+  // new field is dropped silently unless it is added there. Type-checking does
+  // not catch it: the extra property is accepted by the argument type.
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("sends the effort when updating a conversation", async () => {
+    vi.mocked(archestraApiSdk.updateChatConversation).mockResolvedValue({
+      data: { ...makeConversation(), thinkingEffort: "high" },
+      error: undefined,
+    } as Awaited<ReturnType<typeof archestraApiSdk.updateChatConversation>>);
+
+    const { result } = renderHook(() => useUpdateConversation(), {
+      wrapper: createWrapper(),
+    });
+
+    await act(async () => {
+      await result.current.mutateAsync({
+        id: "c1",
+        thinkingEffort: "high",
+      });
+    });
+
+    expect(archestraApiSdk.updateChatConversation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ thinkingEffort: "high" }),
+      }),
+    );
+  });
+
+  it("sends a project assignment when updating a conversation", async () => {
+    vi.mocked(archestraApiSdk.updateChatConversation).mockResolvedValue({
+      data: { ...makeConversation(), projectId: "project-1" },
+      error: undefined,
+    } as Awaited<ReturnType<typeof archestraApiSdk.updateChatConversation>>);
+
+    const { result } = renderHook(() => useUpdateConversation(), {
+      wrapper: createWrapper(),
+    });
+
+    await act(async () => {
+      await result.current.mutateAsync({
+        id: "c1",
+        projectId: "project-1",
+      });
+    });
+
+    expect(archestraApiSdk.updateChatConversation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ projectId: "project-1" }),
+      }),
+    );
+  });
+
+  it("sends the effort when creating a conversation", async () => {
+    vi.mocked(archestraApiSdk.createChatConversation).mockResolvedValue({
+      data: { ...makeConversation(), thinkingEffort: "high" },
+      error: undefined,
+    } as Awaited<ReturnType<typeof archestraApiSdk.createChatConversation>>);
+
+    const { result } = renderHook(() => useCreateConversation(), {
+      wrapper: createWrapper(),
+    });
+
+    await act(async () => {
+      await result.current.mutateAsync({
+        agentId: "agent-a",
+        thinkingEffort: "high",
+      });
+    });
+
+    expect(archestraApiSdk.createChatConversation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ thinkingEffort: "high" }),
+      }),
+    );
+  });
+});

@@ -1,0 +1,236 @@
+{-# LANGUAGE RankNTypes #-}
+
+module SharedLogic.DriverPool.DriverPoolMigrations
+  ( Migrator,
+    MigrationEntry (..),
+    migrations,
+    currentSchemaVersion,
+    applyMigrations,
+  )
+where
+
+import qualified Data.HashMap.Strict as HashMap
+import Data.List (partition, sortOn)
+import qualified Data.List as DL
+import qualified Domain.Types.Person as Person
+import Kernel.Prelude
+import Kernel.Types.Id
+import Kernel.Utils.Common
+import Lib.Finance.Storage.Beam.BeamFlow (BeamFlow)
+import SharedLogic.DriverPool.DriverPoolData
+import qualified Storage.Queries.DriverBankAccount as QDBA
+import qualified Storage.Queries.DriverInformation as QDI
+import qualified Storage.Queries.FleetDriverAssociation as QFDA
+import qualified Storage.Queries.FleetOwnerInformation as QFOI
+import qualified Storage.Queries.Person as QP
+
+-- | A migrator takes a batch of LTS-loaded entries and returns the same entries
+-- with ONLY the fields it owns rewritten from DB. It MUST NOT touch
+-- 'schemaVersion' — 'applyMigrations' stamps that after the migrator returns
+-- so a migrator cannot lie about which version its outputs satisfy.
+type Migrator m = [DriverPoolData] -> m [DriverPoolData]
+
+-- | One entry in the migrations registry: its target schema version + the
+-- migrator function. Using a record (with a Rank-2 field) lets us extract
+-- 'meVersion' without picking a monad, so 'currentSchemaVersion' is a plain
+-- Int derived from the same registry the runtime walks.
+data MigrationEntry = MigrationEntry
+  { meVersion :: Int,
+    meMigrator ::
+      forall m r.
+      (BeamFlow m r, MonadFlow m, EsqDBFlow m r, CacheFlow m r) =>
+      Migrator m
+  }
+
+-- | Append-only registry of all schema-version bumps.
+--
+-- A migrator runs for an entry IFF the entry's stored 'poolDataSchemaVersion'
+-- is strictly less than its 'meVersion'. 'applyMigrations' stamps
+-- 'schemaVersion = Just meVersion' on each entry the migrator touched.
+--
+-- ## Iteration semantics
+--
+--   stored=0  -> runs migrator 1, then migrator 2, then 3, …
+--   stored=1  -> skips migrator 1, runs migrator 2, then 3, …
+--   stored=N  -> skips everything (no DB hit)
+--
+-- Adding a future field (e.g. driverTrustScore in v2):
+--   1. Add the field to DriverPoolData / defaultDriverPoolData / buildDriverPoolDataFromDB.
+--   2. Write a migrator that fills ONLY the new field from DB. DO NOT touch
+--      'schemaVersion' inside the migrator — 'applyMigrations' stamps it.
+--   3. Append 'MigrationEntry 2 backfillDriverTrustScore' below.
+--   4. Do NOT remove existing entries — legacy v0 entries chain through them.
+--
+-- No constant to bump anywhere: 'currentSchemaVersion' moves with the list.
+migrations :: [MigrationEntry]
+migrations =
+  [ MigrationEntry 1 backfillEffectiveBankAccount,
+    MigrationEntry 2 backfillEnabled,
+    MigrationEntry 3 backfillCloudType,
+    MigrationEntry 4 backfillEnableForAirport,
+    MigrationEntry 5 backfillEnableCashRide,
+    MigrationEntry 6 backfillMerchantOperatingCityId
+  ]
+
+-- | The "head" version, derived from the registry. Equals the largest
+-- 'meVersion' in 'migrations', or 0 if the list is empty.
+currentSchemaVersion :: Int
+currentSchemaVersion = maximum (0 : map meVersion migrations)
+
+-- | v1: introduce 'bankAccountPaymentMode' AND retroactively fix 'chargesEnabled'
+-- to reflect the effective (fleet-or-driver) BA. Pre-migration entries had
+-- 'chargesEnabled' populated from the driver's own BA only, which is wrong for
+-- fleet drivers (their fleet owner holds the BA). One batched DB pass covers
+-- both fields.
+backfillEffectiveBankAccount ::
+  (BeamFlow m r, MonadFlow m, EsqDBFlow m r, CacheFlow m r) =>
+  Migrator m
+backfillEffectiveBankAccount entries = do
+  let personIds = map (cast . (.driverId)) entries :: [Id Person.Person]
+  fleetAssocs <- QFDA.findAllByDriverIds personIds
+  let faMap = HashMap.fromList $ map (\fa -> (cast fa.driverId :: Id Person.Person, fa)) fleetAssocs
+      fleetOwnerPersonIds = DL.nub $ map (\fa -> Id @Person.Person fa.fleetOwnerId) fleetAssocs
+  bankAccounts <- QDBA.getDriverBankAccounts (DL.nub (personIds <> fleetOwnerPersonIds))
+  let baMap = HashMap.fromList $ map (\ba -> (ba.driverId, ba)) bankAccounts
+  pure $
+    map
+      ( \e ->
+          let pid = cast e.driverId :: Id Person.Person
+              effective = case HashMap.lookup pid faMap of
+                Just fa -> HashMap.lookup (Id @Person.Person fa.fleetOwnerId) baMap
+                Nothing -> HashMap.lookup pid baMap
+           in e
+                { chargesEnabled = maybe False (.chargesEnabled) effective,
+                  bankAccountPaymentMode = (.paymentMode) =<< effective
+                  -- schemaVersion intentionally not set here — applyMigrations stamps it.
+                }
+      )
+      entries
+
+-- | v2: backfill the new 'enabled' flag on pool entries written before the
+-- nearby-driver eligibility check started gating on it. Without this every
+-- legacy entry would default to 'enabled = False' and be filtered out.
+backfillEnabled ::
+  (BeamFlow m r, MonadFlow m, EsqDBFlow m r, CacheFlow m r) =>
+  Migrator m
+backfillEnabled entries = do
+  let driverIdTexts = map (getId . (.driverId)) entries
+  dis <- QDI.findAllByDriverIds driverIdTexts
+  let enabledMap = HashMap.fromList $ map (\di -> (cast di.driverId :: Id Person.Person, di.enabled)) dis
+  pure $
+    map
+      (\e -> e {enabled = HashMap.lookupDefault e.enabled (cast e.driverId :: Id Person.Person) enabledMap})
+      entries
+
+-- | v3: backfill the new 'cloudType' field from the person table.
+-- Without this, legacy entries would default to 'cloudType = Nothing'.
+backfillCloudType ::
+  (BeamFlow m r, MonadFlow m, EsqDBFlow m r, CacheFlow m r) =>
+  Migrator m
+backfillCloudType entries = do
+  let personIds = map (.driverId) entries
+  persons <- QP.getDriversByIdIn personIds
+  let ctMap = HashMap.fromList $ map (\p -> (cast p.id :: Id Person.Person, p.cloudType)) persons
+  pure $
+    map
+      (\e -> e {cloudType = join $ HashMap.lookup (cast e.driverId :: Id Person.Person) ctMap})
+      entries
+
+-- | v4: backfill the new 'enableForAirport' field from driver_information.
+-- Without this, legacy entries would default to 'enableForAirport = Nothing'
+-- regardless of the driver's actual airport restriction.
+backfillEnableForAirport ::
+  (BeamFlow m r, MonadFlow m, EsqDBFlow m r, CacheFlow m r) =>
+  Migrator m
+backfillEnableForAirport entries = do
+  let driverIdTexts = map (getId . (.driverId)) entries
+  dis <- QDI.findAllByDriverIds driverIdTexts
+  let airportMap = HashMap.fromList $ map (\di -> (cast di.driverId :: Id Person.Person, Just di.enableForAirport)) dis
+  pure $
+    map
+      (\e -> e {enableForAirport = HashMap.lookupDefault e.enableForAirport (cast e.driverId :: Id Person.Person) airportMap})
+      entries
+
+-- | v5: backfill the new 'enableCashRide' field. While a driver has an
+-- active fleet association, the fleet governs entirely (its own flag AND
+-- this driver's association-level override) -- driver_information's admin
+-- flag is dormant and only takes effect once there's no active fleet
+-- association at all (same rule as the effective-flag computation in
+-- 'buildDriverPoolDataFromDB' and 'Storage.Queries.FleetDriverAssociationExtra'
+-- 's updateEnableCashRideFor* helpers). Without this, legacy entries would
+-- default to 'enableCashRide = True' regardless of what's actually stored,
+-- which is the safe direction (never wrongly deny cash rides) but still
+-- needs correcting once real data exists.
+backfillEnableCashRide ::
+  (BeamFlow m r, MonadFlow m, EsqDBFlow m r, CacheFlow m r) =>
+  Migrator m
+backfillEnableCashRide entries = do
+  let driverIdTexts = map (getId . (.driverId)) entries
+      -- only entries already carrying a fleetOwnerId need the fleet-scoped flags;
+      -- for the rest 'enableCashRide' comes from driver_information alone.
+      fleetDriverPersonIds = [cast e.driverId :: Id Person.Person | e <- entries, isJust e.fleetOwnerId]
+  fleetAssocs <- if null fleetDriverPersonIds then pure [] else QFDA.findAllByDriverIds fleetDriverPersonIds
+  let faMap = HashMap.fromList $ map (\fa -> (cast fa.driverId :: Id Person.Person, fa)) fleetAssocs
+      fleetOwnerPersonIds = DL.nub $ map (\fa -> Id @Person.Person fa.fleetOwnerId) fleetAssocs
+  dis <- QDI.findAllByDriverIds driverIdTexts
+  let driverFlagMap = HashMap.fromList $ map (\di -> (cast di.driverId :: Id Person.Person, fromMaybe True di.enableCashRide)) dis
+  fleetOwnerInfos <- if null fleetOwnerPersonIds then pure [] else QFOI.findAllByPrimaryKeys fleetOwnerPersonIds
+  let fleetOwnerFlagMap = HashMap.fromList $ map (\foi -> (foi.fleetOwnerPersonId, fromMaybe True foi.enableCashRide)) fleetOwnerInfos
+  pure $
+    map
+      ( \e ->
+          let pid = cast e.driverId :: Id Person.Person
+              mbFa = HashMap.lookup pid faMap
+              effective = case mbFa of
+                Just fa ->
+                  fromMaybe True (HashMap.lookup (Id @Person.Person fa.fleetOwnerId) fleetOwnerFlagMap)
+                    && fromMaybe True fa.enableCashRide
+                Nothing -> HashMap.lookupDefault True pid driverFlagMap
+           in e {enableCashRide = Just effective}
+      )
+      entries
+
+-- | v6: backfill the new 'merchantOperatingCityId' field from driver_information.
+-- Without this, legacy entries would default to Nothing and the supply counter would
+-- silently skip every driver whose pool entry predates the field.
+backfillMerchantOperatingCityId ::
+  (BeamFlow m r, MonadFlow m, EsqDBFlow m r, CacheFlow m r) =>
+  Migrator m
+backfillMerchantOperatingCityId entries = do
+  let driverIdTexts = map (getId . (.driverId)) entries
+  dis <- QDI.findAllByDriverIds driverIdTexts
+  let cityMap = HashMap.fromList $ map (\di -> (cast di.driverId :: Id Person.Person, di.merchantOperatingCityId)) dis
+  pure $
+    map
+      (\e -> e {merchantOperatingCityId = HashMap.lookupDefault e.merchantOperatingCityId (cast e.driverId :: Id Person.Person) cityMap})
+      entries
+
+-- | Walk the registry in ascending version order (sorted defensively in case
+-- the source list isn't). For each step partition into 'due'
+-- ('poolDataSchemaVersion < meVersion') and 'skip'; run the migrator on 'due'
+-- only; stamp 'schemaVersion = Just meVersion' on each migrated result; merge
+-- back. Returns each final entry paired with a flag indicating whether any
+-- migrator touched it (so the caller persists only changed records).
+applyMigrations ::
+  (BeamFlow m r, MonadFlow m, EsqDBFlow m r, CacheFlow m r) =>
+  [DriverPoolData] ->
+  m [(DriverPoolData, Bool)]
+applyMigrations input = do
+  let initial = map (,False) input
+      ordered = sortOn meVersion migrations
+  foldM step initial ordered
+  where
+    step working (MigrationEntry targetVersion migrator) = do
+      let (due, skip) =
+            partition
+              (\(e, _) -> poolDataSchemaVersion e < targetVersion)
+              working
+      if null due
+        then pure working
+        else do
+          migrated <- migrator (map fst due)
+          let stamped = map (\e -> (e {schemaVersion = Just targetVersion}, True)) migrated
+          pure $ skip <> stamped
+
+    poolDataSchemaVersion :: DriverPoolData -> Int
+    poolDataSchemaVersion = fromMaybe 0 . schemaVersion

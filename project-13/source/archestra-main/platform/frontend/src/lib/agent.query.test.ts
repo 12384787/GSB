@@ -1,0 +1,214 @@
+import { archestraApiSdk } from "@archestra/shared";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { renderHook, waitFor } from "@testing-library/react";
+import { createElement, type ReactNode } from "react";
+import { toast } from "sonner";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  useChatAgents,
+  useCreateProfile,
+  usePinAgent,
+  useUpdateProfile,
+} from "@/lib/agent.query";
+import { isReportedApiError } from "@/lib/utils";
+
+// Partial: `@/consts` (pulled in by agent.query.ts) reads real exports of this
+// module at import time, so only the two SDK calls under test are replaced.
+vi.mock("@archestra/shared", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@archestra/shared")>();
+  return {
+    ...actual,
+    archestraApiSdk: {
+      ...actual.archestraApiSdk,
+      createAgent: vi.fn(),
+      getAllAgents: vi.fn(),
+      pinAgent: vi.fn(),
+      unpinAgent: vi.fn(),
+      updateAgent: vi.fn(),
+    },
+  };
+});
+
+vi.mock("sonner");
+
+const sdk = vi.mocked(archestraApiSdk);
+
+function setup<T>(hook: () => T) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client: queryClient }, children);
+  return { ...renderHook(hook, { wrapper }), queryClient };
+}
+
+const refused = {
+  data: undefined,
+  error: {
+    error: {
+      message: "Environment is restricted",
+      type: "api_authorization_error",
+    },
+  },
+};
+
+describe("agent write mutations", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // Resolving `undefined` on a refused write made a failure look like a save
+  // that returned nothing: the form went on to toast success, fire `onCreated`,
+  // and run its follow-up writes against an agent that was never created.
+  it("rejects when the create is refused", async () => {
+    sdk.createAgent.mockResolvedValue(refused as never);
+
+    const { result } = setup(() => useCreateProfile());
+
+    await expect(
+      result.current.mutateAsync({ name: "New", agentType: "agent" } as never),
+    ).rejects.toThrow(/environment is restricted/i);
+  });
+
+  it("rejects when the update is refused", async () => {
+    sdk.updateAgent.mockResolvedValue(refused as never);
+
+    const { result } = setup(() => useUpdateProfile());
+
+    await expect(
+      result.current.mutateAsync({ id: "agent-1", data: { name: "New" } }),
+    ).rejects.toThrow(/environment is restricted/i);
+  });
+
+  // The mutation toasts the refusal on its way out. A caller that also toasts
+  // its own orchestration failures needs to tell the two apart, or the user
+  // reads one refusal twice.
+  it("marks the refusal as one the user has already been shown", async () => {
+    sdk.updateAgent.mockResolvedValue(refused as never);
+
+    const { result } = setup(() => useUpdateProfile());
+
+    const error = await result.current
+      .mutateAsync({ id: "agent-1", data: { name: "New" } })
+      .catch((thrown: unknown) => thrown);
+
+    expect(isReportedApiError(error)).toBe(true);
+    expect(isReportedApiError(new Error("Environment is restricted"))).toBe(
+      false,
+    );
+  });
+
+  it("still resolves the created agent on success", async () => {
+    sdk.createAgent.mockResolvedValue({
+      data: { id: "agent-1", name: "New" },
+      error: undefined,
+    } as never);
+
+    const { result } = setup(() => useCreateProfile());
+
+    await expect(
+      result.current.mutateAsync({ name: "New", agentType: "agent" } as never),
+    ).resolves.toMatchObject({ id: "agent-1" });
+  });
+
+  it("shows a caller-specific message after an update succeeds", async () => {
+    sdk.updateAgent.mockResolvedValue({
+      data: { id: "agent-1", systemPrompt: "New prompt" },
+      error: undefined,
+    } as never);
+
+    const { result } = setup(() =>
+      useUpdateProfile({ successMessage: "System prompt saved" }),
+    );
+
+    await result.current.mutateAsync({
+      id: "agent-1",
+      data: { systemPrompt: "New prompt" },
+    });
+
+    expect(toast.success).toHaveBeenCalledWith("System prompt saved");
+  });
+});
+
+describe("chat agent roster", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("requests the compact chat view without tool payloads", async () => {
+    sdk.getAllAgents.mockResolvedValue({
+      data: [{ id: "agent-1", name: "Agent" }],
+      error: undefined,
+    } as never);
+
+    const { result } = setup(() => useChatAgents());
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(sdk.getAllAgents).toHaveBeenCalledWith({
+      query: {
+        agentType: "agent",
+        excludeBuiltIn: true,
+        includeTools: false,
+        view: "chat",
+      },
+    });
+  });
+
+  // A transient roster failure must self-heal: the app-wide default is
+  // `retry: false`, so without the query's own retry a single blip left the
+  // new-chat composer stranded on "Select agent" with no default (T-1317).
+  it("recovers the roster after a transient fetch failure", async () => {
+    sdk.getAllAgents
+      .mockResolvedValueOnce({
+        data: undefined,
+        error: {
+          error: { message: "boom", type: "api_internal_server_error" },
+        },
+      } as never)
+      .mockResolvedValueOnce({
+        data: [{ id: "agent-1", name: "Agent" }],
+        error: undefined,
+      } as never);
+
+    // retryDelay: 0 keeps the retry instant; the query's own retry still
+    // overrides the client-wide `retry: false`.
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, retryDelay: 0 } },
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useChatAgents(), { wrapper });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual([{ id: "agent-1", name: "Agent" }]);
+    expect(sdk.getAllAgents).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("agent pin mutation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("pins and unpins through the matching API endpoints, then refreshes both list sections", async () => {
+    sdk.pinAgent.mockResolvedValue({
+      data: { ok: true },
+      error: undefined,
+    } as never);
+    sdk.unpinAgent.mockResolvedValue({
+      data: { ok: true },
+      error: undefined,
+    } as never);
+
+    const { result, queryClient } = setup(() => usePinAgent());
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+
+    await result.current.mutateAsync({ id: "agent-1", pinned: true });
+    await result.current.mutateAsync({ id: "agent-1", pinned: false });
+
+    expect(sdk.pinAgent).toHaveBeenCalledWith({ path: { id: "agent-1" } });
+    expect(sdk.unpinAgent).toHaveBeenCalledWith({ path: { id: "agent-1" } });
+    expect(invalidate).toHaveBeenCalledTimes(2);
+    expect(invalidate).toHaveBeenNthCalledWith(1, { queryKey: ["agents"] });
+  });
+});

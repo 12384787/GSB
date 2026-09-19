@@ -1,0 +1,376 @@
+import { z } from "zod";
+import type { SupportedProvider } from "../model-constants";
+
+/**
+ * Client-app attribution for an interaction lives in
+ * `interactions.external_agent_id`. It is set from the caller's
+ * `X-Archestra-Agent-Id` header (e.g. the connect-page setup scripts send
+ * {@link CLAUDE_CODE_CLIENT_ID} / {@link CLAUDE_DESKTOP_CLIENT_ID}) or, when
+ * absent, from auto-discovery of a Claude client (recorded as the generic
+ * {@link CLAUDE_CLIENT_ID}). Explicit Desktop ids render a Desktop badge; generic Claude attribution
+ * is treated as Claude Code for compatibility with older installations.
+ */
+
+/**
+ * The prefix coding-CLI clients put on MCP-server tool names in their LLM
+ * requests (`mcp__<server>__<tool>`). Claude Code always applies it; Codex
+ * uses the same prefix by default (codex-rs `LEGACY_MCP_TOOL_NAME_PREFIX`),
+ * though it ships an opt-in mode that omits it per server. A tool name in an
+ * attributed coding-CLI request WITHOUT this prefix is one of the client's own
+ * native tools (Bash, shell, apply_patch, …).
+ */
+export const CLIENT_MCP_TOOL_NAME_PREFIX = "mcp__";
+
+/** Label for Claude Code, including legacy generic Claude attribution. */
+export const CLAUDE_CLIENT_LABEL = "Claude Code";
+
+/** Human-readable label for the Codex client id in the UI. */
+export const CODEX_CLIENT_LABEL = "Codex";
+
+/** Human-readable label for the Copilot CLI client id in the UI. */
+export const COPILOT_CLI_CLIENT_LABEL = "Copilot CLI";
+
+/** Human-readable label for the Cursor client id in the UI. */
+export const CURSOR_CLIENT_LABEL = "Cursor";
+
+/**
+ * `external_agent_id` values for Claude clients:
+ * - {@link CLAUDE_CLIENT_ID} — generic; recorded by auto-discovery when no
+ *   `X-Archestra-Agent-Id` header is present, and the backfill target for legacy
+ *   rows that only carried a Claude `session_source`.
+ * - {@link CLAUDE_CODE_CLIENT_ID} / {@link CLAUDE_DESKTOP_CLIENT_ID} — set
+ *   explicitly by the connect-page setup scripts so Claude Code and Claude
+ *   Desktop can be told apart.
+ */
+export const CLAUDE_CLIENT_ID = "anthropic_claude";
+export const CLAUDE_CODE_CLIENT_ID = "anthropic_claude_code";
+export const CLAUDE_DESKTOP_CLIENT_ID = "anthropic_claude_desktop";
+
+/**
+ * `external_agent_id` value for the Codex CLI. Set explicitly by the
+ * connect-page setup script via an `X-Archestra-Agent-Id` request header and,
+ * when that header is absent, recorded by auto-discovery of a first-party Codex
+ * `originator` (see {@link isCodexOriginator}).
+ */
+export const CODEX_CLIENT_ID = "openai_codex";
+
+/**
+ * `external_agent_id` value for the GitHub Copilot CLI. Set explicitly by the
+ * connect-page setup scripts via the CLI's COPILOT_PROVIDER_HEADERS env var —
+ * the CLI sends those headers only to its BYOK provider endpoint (the LLM
+ * proxy), never to GitHub's own services.
+ */
+export const COPILOT_CLI_CLIENT_ID = "github_copilot_cli";
+
+/**
+ * `external_agent_id` value for the Cursor IDE. There is no connect-page setup
+ * script for Cursor (its BYOK flow only takes an API key and base URL, no
+ * custom headers), so this id is only ever recorded by auto-discovery of the
+ * Cursor User-Agent (see {@link isCursorUserAgent}).
+ */
+export const CURSOR_CLIENT_ID = "cursor";
+
+/**
+ * First-party Codex originators. Codex stamps its client identity on every
+ * request in the `originator` header (default `codex_cli_rs`, overridable via
+ * `CODEX_INTERNAL_ORIGINATOR_OVERRIDE`) and repeats it as the leading token of
+ * the User-Agent — this mirrors codex-rs `is_first_party_originator`. It is the
+ * Codex analog of the Anthropic billing header: a purpose-built client-identity
+ * signal the proxy uses to auto-attribute a Codex request to
+ * {@link CODEX_CLIENT_ID} when no explicit `X-Archestra-Agent-Id` is sent.
+ */
+const CODEX_FIRST_PARTY_ORIGINATORS = new Set<string>([
+  "codex_cli_rs",
+  "codex-tui",
+  "codex_vscode",
+]);
+
+/** Whether an `originator` value denotes a first-party Codex client. */
+export function isCodexOriginator(
+  originator: string | null | undefined,
+): boolean {
+  if (!originator) {
+    return false;
+  }
+  const value = originator.trim().toLowerCase();
+  return CODEX_FIRST_PARTY_ORIGINATORS.has(value) || value.startsWith("codex ");
+}
+
+/**
+ * Whether a User-Agent denotes a first-party Codex client. Codex builds its UA
+ * with the originator as the leading product token, e.g.
+ * `codex_cli_rs/0.20.0 (Linux 6.6; x86_64) …` — checked as a fallback for when
+ * a middlebox drops the `originator` header itself.
+ */
+export function isCodexUserAgent(
+  userAgent: string | null | undefined,
+): boolean {
+  return !!userAgent && isCodexOriginator(userAgent.split("/", 1)[0]);
+}
+
+/**
+ * Whether a User-Agent denotes the Cursor IDE. Cursor's BYOK requests are
+ * built and sent by Cursor's backend with `User-Agent: Cursor/1.0` — the UA is
+ * the only client-identity signal on the request (no originator-style header,
+ * no metadata body field). Matched on the leading product token so a version
+ * bump (`Cursor/2.3`) keeps matching.
+ */
+export function isCursorUserAgent(
+  userAgent: string | null | undefined,
+): boolean {
+  return (
+    !!userAgent && userAgent.split("/", 1)[0]?.trim().toLowerCase() === "cursor"
+  );
+}
+
+/**
+ * Extracts the Codex session id from a Responses-request `client_metadata`
+ * object. Codex sends `client_metadata: { session_id, thread_id, turn_id, … }`
+ * on every request (session_id is a UUID; per-run, unlike the durable
+ * thread_id). Returns the session id when the value matches that shape, null
+ * otherwise — a strict shape-match, since `client_metadata` is not a standard
+ * OpenAI field but could still be sent by other clients.
+ */
+export function codexClientMetadataSessionId(
+  clientMetadata: unknown,
+): string | null {
+  if (!clientMetadata || typeof clientMetadata !== "object") {
+    return null;
+  }
+  const sessionId = (clientMetadata as { session_id?: unknown }).session_id;
+  if (typeof sessionId === "string" && isCodexSessionId(sessionId.trim())) {
+    return sessionId.trim();
+  }
+  return null;
+}
+
+/** Whether a request body value shape-matches Codex `client_metadata`. */
+export function isCodexClientMetadata(clientMetadata: unknown): boolean {
+  return codexClientMetadataSessionId(clientMetadata) !== null;
+}
+
+/**
+ * Whether a value has the shape of a Codex session id. Codex session/thread
+ * ids are UUIDs (codex-rs generates them via `Uuid`).
+ */
+export function isCodexSessionId(
+  value: string | null | undefined,
+): value is string {
+  return !!value && UUID_PATTERN.test(value);
+}
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export const CLAUDE_CLIENT_AGENT_IDS = [
+  CLAUDE_CLIENT_ID,
+  CLAUDE_CODE_CLIENT_ID,
+  CLAUDE_DESKTOP_CLIENT_ID,
+] as const;
+
+const CLAUDE_CLIENT_AGENT_ID_SET = new Set<string>(CLAUDE_CLIENT_AGENT_IDS);
+
+/** Whether an `external_agent_id` value denotes a Claude client app. */
+export function isClaudeClientAgentId(
+  externalAgentId: string | null | undefined,
+): boolean {
+  if (!externalAgentId) {
+    return false;
+  }
+  return CLAUDE_CLIENT_AGENT_ID_SET.has(externalAgentId.trim().toLowerCase());
+}
+
+/**
+ * `external_agent_id` values for Codex clients. Only the generic
+ * {@link CODEX_CLIENT_ID} exists today (the connect script sets it explicitly
+ * and auto-discovery records the same id), but this stays a set to mirror the
+ * Claude shape and leave room for a future per-app split.
+ */
+export const CODEX_CLIENT_AGENT_IDS = [CODEX_CLIENT_ID] as const;
+
+const CODEX_CLIENT_AGENT_ID_SET = new Set<string>(CODEX_CLIENT_AGENT_IDS);
+
+/** Whether an `external_agent_id` value denotes a Codex client app. */
+export function isCodexClientAgentId(
+  externalAgentId: string | null | undefined,
+): boolean {
+  if (!externalAgentId) {
+    return false;
+  }
+  return CODEX_CLIENT_AGENT_ID_SET.has(externalAgentId.trim().toLowerCase());
+}
+
+/**
+ * `external_agent_id` values for Copilot CLI clients. Only the one explicit
+ * id exists today (set by the connect scripts; there is no auto-discovery
+ * signal), but this stays a set to mirror the Claude/Codex shape.
+ */
+export const COPILOT_CLI_CLIENT_AGENT_IDS = [COPILOT_CLI_CLIENT_ID] as const;
+
+const COPILOT_CLI_CLIENT_AGENT_ID_SET = new Set<string>(
+  COPILOT_CLI_CLIENT_AGENT_IDS,
+);
+
+/** Whether an `external_agent_id` value denotes the Copilot CLI. */
+export function isCopilotCliClientAgentId(
+  externalAgentId: string | null | undefined,
+): boolean {
+  if (!externalAgentId) {
+    return false;
+  }
+  return COPILOT_CLI_CLIENT_AGENT_ID_SET.has(
+    externalAgentId.trim().toLowerCase(),
+  );
+}
+
+/**
+ * `external_agent_id` values for Cursor clients. Only the one auto-discovered
+ * id exists today, but this stays a set to mirror the other client families.
+ */
+export const CURSOR_CLIENT_AGENT_IDS = [CURSOR_CLIENT_ID] as const;
+
+const CURSOR_CLIENT_AGENT_ID_SET = new Set<string>(CURSOR_CLIENT_AGENT_IDS);
+
+/** Whether an `external_agent_id` value denotes the Cursor IDE. */
+export function isCursorClientAgentId(
+  externalAgentId: string | null | undefined,
+): boolean {
+  if (!externalAgentId) {
+    return false;
+  }
+  return CURSOR_CLIENT_AGENT_ID_SET.has(externalAgentId.trim().toLowerCase());
+}
+
+/**
+ * Values used by the `/llm/logs` "Client" filter (URL/query key). Distinct from
+ * the stored ids above: the backend expands each to its client's agent-id set
+ * (see {@link clientFilterToAgentIds}).
+ */
+export const CLAUDE_CLIENT_FILTER = "claude";
+export const CODEX_CLIENT_FILTER = "codex";
+export const COPILOT_CLI_CLIENT_FILTER = "copilot-cli";
+export const CURSOR_CLIENT_FILTER = "cursor";
+
+export const ClientFilterSchema = z.enum([
+  CLAUDE_CLIENT_FILTER,
+  "claude-code",
+  "claude-desktop",
+  CODEX_CLIENT_FILTER,
+  COPILOT_CLI_CLIENT_FILTER,
+  CURSOR_CLIENT_FILTER,
+]);
+
+export type ClientFilter = z.infer<typeof ClientFilterSchema>;
+
+/**
+ * Everything the UI derives per known client family: its display label, the
+ * provider whose logo represents it, its logs-filter value, and the
+ * `external_agent_id` values it covers.
+ */
+export interface ClientFamily {
+  filter: ClientFilter;
+  label: string;
+  provider: SupportedProvider;
+  /**
+   * App-served logo path for clients that have their own mark rather than a
+   * vendor's (e.g. Cursor). When set, the UI renders it instead of the
+   * `provider` logo.
+   */
+  icon?: string;
+  agentIds: ReadonlyArray<string>;
+  isClientAgentId: (externalAgentId: string | null | undefined) => boolean;
+}
+
+/**
+ * The known client families — the single source for every per-client piece of
+ * UI/filter logic ({@link CLIENT_FILTER_OPTIONS},
+ * {@link clientFilterToAgentIds}, {@link clientForExternalAgentIds}). A new
+ * client family is added here, once, and inherits all of them.
+ */
+const CLIENT_FAMILIES: ReadonlyArray<ClientFamily> = [
+  {
+    filter: "claude-code",
+    label: CLAUDE_CLIENT_LABEL,
+    provider: "anthropic",
+    agentIds: [CLAUDE_CLIENT_ID, CLAUDE_CODE_CLIENT_ID],
+    isClientAgentId: (id) =>
+      id?.trim().toLowerCase() === CLAUDE_CLIENT_ID ||
+      id?.trim().toLowerCase() === CLAUDE_CODE_CLIENT_ID,
+  },
+  {
+    filter: "claude-desktop",
+    label: "Claude Desktop",
+    provider: "anthropic",
+    agentIds: [CLAUDE_DESKTOP_CLIENT_ID],
+    isClientAgentId: (id) =>
+      id?.trim().toLowerCase() === CLAUDE_DESKTOP_CLIENT_ID,
+  },
+  {
+    filter: CODEX_CLIENT_FILTER,
+    label: CODEX_CLIENT_LABEL,
+    provider: "openai",
+    agentIds: CODEX_CLIENT_AGENT_IDS,
+    isClientAgentId: isCodexClientAgentId,
+  },
+  {
+    filter: COPILOT_CLI_CLIENT_FILTER,
+    label: COPILOT_CLI_CLIENT_LABEL,
+    provider: "github-copilot",
+    agentIds: COPILOT_CLI_CLIENT_AGENT_IDS,
+    isClientAgentId: isCopilotCliClientAgentId,
+  },
+  {
+    filter: CURSOR_CLIENT_FILTER,
+    label: CURSOR_CLIENT_LABEL,
+    // Cursor is not itself a provider; `provider` is only the logo fallback,
+    // and the dedicated Cursor mark below takes precedence in the UI.
+    provider: "openai",
+    icon: "/icons/cursor.png",
+    agentIds: CURSOR_CLIENT_AGENT_IDS,
+    isClientAgentId: isCursorClientAgentId,
+  },
+];
+
+/**
+ * The client family an interaction's `external_agent_id` list belongs to, or
+ * `null` when none match. Drives the client badge on the logs table + session
+ * details page (vendor logo via `provider` + `label`).
+ */
+export function clientForExternalAgentIds(
+  externalAgentIds: ReadonlyArray<string | null | undefined>,
+): ClientFamily | null {
+  return (
+    CLIENT_FAMILIES.find((family) =>
+      externalAgentIds.some(family.isClientAgentId),
+    ) ?? null
+  );
+}
+
+/** The client-attribution agent ids a given filter value expands to. */
+export function clientFilterToAgentIds(
+  filter: ClientFilter,
+): ReadonlyArray<string> {
+  return (
+    CLIENT_FAMILIES.find(
+      (family) =>
+        family.filter ===
+        (filter === CLAUDE_CLIENT_FILTER ? "claude-code" : filter),
+    )?.agentIds ?? []
+  );
+}
+
+/**
+ * Options for the logs "Client" filter dropdown. `provider` selects the logo
+ * shown next to each option (Claude → Anthropic, Codex → OpenAI).
+ */
+export const CLIENT_FILTER_OPTIONS: ReadonlyArray<{
+  value: ClientFilter;
+  label: string;
+  provider: SupportedProvider;
+  icon?: string;
+}> = CLIENT_FAMILIES.map(({ filter, label, provider, icon }) => ({
+  value: filter,
+  label,
+  provider,
+  icon,
+}));

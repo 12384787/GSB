@@ -1,0 +1,968 @@
+module Storage.Queries.FleetDriverAssociationExtra where
+
+import Control.Applicative (liftA2, liftA3)
+import Data.List.Split (chunksOf)
+import qualified Data.Map as M
+import Data.Text (takeEnd, toLower)
+import qualified Database.Beam as B
+import qualified Database.Beam.Query ()
+import qualified Domain.Types.Common as DI
+import qualified Domain.Types.DocsVerificationStatus as DDVS
+import qualified Domain.Types.DriverBankAccount as DDBA
+import Domain.Types.DriverInformation
+import Domain.Types.FleetDriverAssociation
+import Domain.Types.Merchant (Merchant)
+import Domain.Types.MerchantOperatingCity (MerchantOperatingCity)
+import Domain.Types.Person
+import Domain.Types.VehicleCategory
+import Domain.Utils
+import qualified EulerHS.Language as L
+import Kernel.Beam.Functions
+import Kernel.External.Encryption (DbHash, getDbHash)
+import Kernel.Prelude
+import qualified Kernel.Storage.Hedis as Redis
+import Kernel.Types.Common
+import Kernel.Types.Id as KTI
+import Kernel.Utils.Common
+import qualified Sequelize as Se
+import qualified SharedLogic.DriverPool.LTSDataSync as LTSSync
+import qualified Storage.Beam.Common as BeamCommon
+import qualified Storage.Beam.DriverBankAccount as BeamDBA
+import qualified Storage.Beam.DriverInformation as BeamDI
+import qualified Storage.Beam.FleetDriverAssociation as BeamFDVA
+import qualified Storage.Beam.Person as BeamP
+import qualified Storage.Beam.Vehicle as BeamV
+import qualified Storage.Queries.DriverInformationExtra as QDIE
+import qualified Storage.Queries.FleetOwnerInformation as FOI
+import Storage.Queries.OrphanInstances.DriverBankAccount ()
+import Storage.Queries.OrphanInstances.DriverInformation ()
+import Storage.Queries.OrphanInstances.FleetDriverAssociation ()
+import Storage.Queries.OrphanInstances.Person ()
+
+-- Extra code goes here --
+
+-- | Serialises the read-flags -> compute-effective -> push-to-LTS sequence for a
+-- (driver, fleet owner) pair, so a concurrent association change and cash-ride
+-- toggle can't publish a stale 'enableCashRide' to the driver pool.
+driverFleetLockKey :: Text -> Text -> Text
+driverFleetLockKey dId fId = "fleet_driver_association:driver:" <> dId <> ":fleet_owner:" <> fId
+
+createFleetDriverAssociationIfNotExists ::
+  (MonadFlow m, EsqDBFlow m r, CacheFlow m r, Redis.HedisFlow m r, Redis.HedisLTSFlowEnv r) =>
+  Id Person ->
+  Id Person ->
+  Maybe (Id Person) ->
+  VehicleCategory ->
+  Bool ->
+  Maybe Text ->
+  Maybe (Id Merchant) ->
+  Maybe (Id MerchantOperatingCity) ->
+  m ()
+createFleetDriverAssociationIfNotExists driverId fleetOwnerId onboardedOperatorId onboardingVehicleCategory isActive requestReason merchantId merchantOperatingCityId = do
+  now <- getCurrentTime
+  Redis.withWaitOnLockRedisWithExpiry (driverFleetLockKey driverId.getId fleetOwnerId.getId) 10 10 $ do
+    mbFleetDriverAssociation <- findAllWithOptionsKV [Se.And [Se.Is BeamFDVA.driverId $ Se.Eq (driverId.getId), Se.Is BeamFDVA.fleetOwnerId $ Se.Eq fleetOwnerId.getId, Se.Is BeamFDVA.isActive $ Se.Eq isActive, Se.Is BeamFDVA.associatedTill (Se.GreaterThan $ Just now)]] (Se.Desc BeamFDVA.createdAt) (Just 1) Nothing <&> listToMaybe
+    case mbFleetDriverAssociation of
+      Just fleetDriverAssociation ->
+        when (isNothing fleetDriverAssociation.onboardingVehicleCategory) $ do
+          updateWithKV
+            [ Se.Set BeamFDVA.onboardingVehicleCategory (Just onboardingVehicleCategory),
+              Se.Set BeamFDVA.updatedAt now
+            ]
+            [Se.And [Se.Is BeamFDVA.id $ Se.Eq fleetDriverAssociation.id.getId]]
+      Nothing -> do
+        id <- generateGUID
+        let newAssociationEnableCashRide = Nothing
+        createWithKV $
+          FleetDriverAssociation
+            { associatedTill = defaultAssociationEnd,
+              driverId = driverId,
+              fleetOwnerId = fleetOwnerId.getId,
+              associatedOn = Just now,
+              onboardingVehicleCategory = Just onboardingVehicleCategory,
+              enableCashRide = newAssociationEnableCashRide,
+              onboardedOperatorId,
+              createdAt = now,
+              updatedAt = now,
+              responseReason = Nothing,
+              ..
+            }
+        (mbFleetBa :: Maybe DDBA.DriverBankAccount) <- findOneWithKV [Se.Is BeamDBA.driverId $ Se.Eq fleetOwnerId.getId]
+        mbFleetOwnerInfo <- FOI.findByPrimaryKey fleetOwnerId
+        let fleetOwnerCashRideFlag = maybe True (fromMaybe True . (.enableCashRide)) mbFleetOwnerInfo
+            cashRideEffective = fleetOwnerCashRideFlag && fromMaybe True newAssociationEnableCashRide
+        LTSSync.syncDriverPoolDataToLTS (cast driverId) $
+          LTSSync.emptyUpdate
+            { LTSSync.fleetOwnerId = LTSSync.Set (Just fleetOwnerId.getId),
+              LTSSync.chargesEnabled = LTSSync.Set (maybe False (.chargesEnabled) mbFleetBa),
+              LTSSync.bankAccountPaymentMode = LTSSync.Set ((.paymentMode) =<< mbFleetBa),
+              LTSSync.enableCashRide = LTSSync.Set (Just cashRideEffective)
+            }
+
+findAllActiveByFleetOwnerIds :: (MonadFlow m, EsqDBFlow m r, CacheFlow m r) => [Text] -> m [FleetDriverAssociation]
+findAllActiveByFleetOwnerIds [] = pure []
+findAllActiveByFleetOwnerIds fleetOwnerIds = do
+  now <- getCurrentTime
+  findAllWithKV
+    [ Se.And
+        [ Se.Is BeamFDVA.fleetOwnerId $ Se.In fleetOwnerIds,
+          Se.Is BeamFDVA.isActive $ Se.Eq True,
+          Se.Is BeamFDVA.associatedTill (Se.GreaterThan $ Just now)
+        ]
+    ]
+
+fleetOwnerEnableCashRideFlags :: (MonadFlow m, EsqDBFlow m r, CacheFlow m r) => [FleetDriverAssociation] -> m (M.Map Text Bool)
+fleetOwnerEnableCashRideFlags assocs =
+  M.fromList . map (\o -> (o.fleetOwnerPersonId.getId, fromMaybe True o.enableCashRide))
+    <$> FOI.findAllByPrimaryKeys (KTI.Id <$> M.keys (M.fromList [(a.fleetOwnerId, ()) | a <- assocs]))
+
+syncEnableCashRideToLTS ::
+  (MonadFlow m, Forkable m, CacheFlow m r, Redis.HedisFlow m r, Redis.HedisLTSFlowEnv r) =>
+  Int ->
+  [(Id Person, Bool)] ->
+  m ()
+syncEnableCashRideToLTS batchSize xs =
+  forM_ (chunksOf batchSize xs) $ \chunk ->
+    void $
+      mapConcurrently
+        ( \(driverId, effective) ->
+            LTSSync.syncDriverPoolDataToLTS (cast driverId) $
+              LTSSync.emptyUpdate {LTSSync.enableCashRide = LTSSync.Set (Just effective)}
+        )
+        chunk
+
+updateEnableCashRideForFleetOwnersWithSync ::
+  (MonadFlow m, Forkable m, EsqDBFlow m r, CacheFlow m r, Redis.HedisFlow m r, Redis.HedisLTSFlowEnv r) =>
+  Maybe Bool ->
+  Int ->
+  [Id Person] ->
+  m ()
+updateEnableCashRideForFleetOwnersWithSync _ _ [] = pure ()
+updateEnableCashRideForFleetOwnersWithSync enableCashRide batchSize fleetOwnerPersonIds = do
+  FOI.updateEnableCashRideForFleetOwners enableCashRide fleetOwnerPersonIds
+  assocs <- findAllActiveByFleetOwnerIds (getId <$> fleetOwnerPersonIds)
+  syncEnableCashRideToLTS
+    batchSize
+    [(a.driverId, fromMaybe True enableCashRide && fromMaybe True a.enableCashRide) | a <- assocs]
+
+updateEnableCashRideForAssociations ::
+  (MonadFlow m, Forkable m, EsqDBFlow m r, CacheFlow m r, Redis.HedisFlow m r, Redis.HedisLTSFlowEnv r) =>
+  Maybe Bool ->
+  Int ->
+  [FleetDriverAssociation] ->
+  m ()
+updateEnableCashRideForAssociations _ _ [] = pure ()
+updateEnableCashRideForAssociations enableCashRide batchSize assocs = do
+  now <- getCurrentTime
+  updateWithKV
+    [Se.Set BeamFDVA.enableCashRide enableCashRide, Se.Set BeamFDVA.updatedAt now]
+    [Se.Is BeamFDVA.id $ Se.In (map (\a -> a.id.getId) assocs)]
+  ownerFlag <- fleetOwnerEnableCashRideFlags assocs
+  syncEnableCashRideToLTS
+    batchSize
+    [(a.driverId, M.findWithDefault True a.fleetOwnerId ownerFlag && fromMaybe True enableCashRide) | a <- assocs]
+
+updateEnableCashRideForDriversWithSync ::
+  (MonadFlow m, Forkable m, EsqDBFlow m r, CacheFlow m r, Redis.HedisFlow m r, Redis.HedisLTSFlowEnv r) =>
+  Maybe Bool ->
+  Int ->
+  [Id Person] ->
+  m ()
+updateEnableCashRideForDriversWithSync _ _ [] = pure ()
+updateEnableCashRideForDriversWithSync enableCashRide batchSize driverIds = do
+  QDIE.updateEnableCashRideForDrivers enableCashRide (cast <$> driverIds)
+  assocs <- findAllByDriverIds driverIds
+  ownerFlag <- fleetOwnerEnableCashRideFlags assocs
+  let assocByDriver = M.fromList [(a.driverId.getId, a) | a <- assocs]
+  syncEnableCashRideToLTS batchSize $
+    driverIds
+      <&> \d -> case M.lookup d.getId assocByDriver of
+        Just a -> (d, M.findWithDefault True a.fleetOwnerId ownerFlag && fromMaybe True a.enableCashRide)
+        Nothing -> (d, fromMaybe True enableCashRide)
+
+findByDriverId ::
+  (EsqDBFlow m r, MonadFlow m, CacheFlow m r) =>
+  (Id Person -> Bool -> m (Maybe FleetDriverAssociation))
+findByDriverId driverId isActive = do
+  now <- getCurrentTime
+  findAllWithOptionsKV [Se.And [Se.Is BeamFDVA.driverId $ Se.Eq (driverId.getId), Se.Is BeamFDVA.isActive $ Se.Eq isActive, Se.Is BeamFDVA.associatedTill (Se.GreaterThan $ Just now)]] (Se.Desc BeamFDVA.createdAt) (Just 1) Nothing <&> listToMaybe
+
+findAllByDriverId ::
+  (EsqDBFlow m r, MonadFlow m, CacheFlow m r) =>
+  Id Person ->
+  Bool ->
+  m [FleetDriverAssociation]
+findAllByDriverId driverId isActive = do
+  now <- getCurrentTime
+  findAllWithOptionsKV [Se.And [Se.Is BeamFDVA.driverId $ Se.Eq (driverId.getId), Se.Is BeamFDVA.isActive $ Se.Eq isActive, Se.Is BeamFDVA.associatedTill (Se.GreaterThan $ Just now)]] (Se.Desc BeamFDVA.createdAt) Nothing Nothing
+
+findAllByDriverIdWithStatus ::
+  (EsqDBFlow m r, MonadFlow m, CacheFlow m r) =>
+  Id Person ->
+  m [FleetDriverAssociation]
+findAllByDriverIdWithStatus driverId = do
+  now <- getCurrentTime
+  findAllWithOptionsKV [Se.And [Se.Is BeamFDVA.driverId $ Se.Eq (driverId.getId), Se.Is BeamFDVA.associatedTill (Se.GreaterThan $ Just now)]] (Se.Desc BeamFDVA.createdAt) Nothing Nothing
+
+findOneByDriverIdWithStatus ::
+  (EsqDBFlow m r, MonadFlow m, CacheFlow m r) =>
+  Id Person ->
+  m (Maybe FleetDriverAssociation)
+findOneByDriverIdWithStatus driverId = do
+  now <- getCurrentTime
+  findAllWithOptionsKV [Se.And [Se.Is BeamFDVA.driverId $ Se.Eq (driverId.getId), Se.Is BeamFDVA.associatedTill (Se.GreaterThan $ Just now)]] (Se.Desc BeamFDVA.createdAt) (Just 1) (Just 0) <&> listToMaybe
+
+findAllByDriverIds ::
+  (EsqDBFlow m r, MonadFlow m, CacheFlow m r) =>
+  [Id Person] ->
+  m [FleetDriverAssociation]
+findAllByDriverIds driverIds = do
+  now <- getCurrentTime
+  findAllWithKV [Se.And [Se.Is BeamFDVA.driverId $ Se.In (getId <$> driverIds), Se.Is BeamFDVA.isActive $ Se.Eq True, Se.Is BeamFDVA.associatedTill (Se.GreaterThan $ Just now)]]
+
+findActiveOrMostRecentByDriverIds ::
+  (EsqDBFlow m r, MonadFlow m, CacheFlow m r) =>
+  [Id Person] ->
+  m [FleetDriverAssociation]
+findActiveOrMostRecentByDriverIds [] = pure []
+findActiveOrMostRecentByDriverIds driverIds = do
+  now <- getCurrentTime
+  activeAssocs <-
+    findAllWithKV
+      [ Se.And
+          [ Se.Is BeamFDVA.driverId $ Se.In (getId <$> driverIds),
+            Se.Is BeamFDVA.isActive $ Se.Eq True,
+            Se.Is BeamFDVA.associatedTill (Se.GreaterThan $ Just now)
+          ]
+      ]
+  let driversWithActive = M.fromList $ map (\assoc -> (assoc.driverId, ())) activeAssocs
+      driversWithoutActive = filter (\driverId -> not (M.member driverId driversWithActive)) driverIds
+  dbConf <- getReplicaBeamConfig
+  mostRecentAssocs <-
+    fmap catMaybes $
+      forM driversWithoutActive $ \driverId -> do
+        result <-
+          L.runDB dbConf $
+            L.findRows $
+              B.select $
+                B.limit_ 1 $
+                  B.orderBy_ (\fda -> B.nullsLast_ (B.desc_ fda.associatedTill)) $
+                    B.filter_ (\fda -> fda.driverId B.==. B.val_ (getId driverId)) $
+                      B.all_ (BeamCommon.fleetDriverAssociation BeamCommon.atlasDB)
+        case result of
+          Right (row : _) -> fromTType' row
+          _ -> pure Nothing
+  pure $ activeAssocs <> mostRecentAssocs
+
+getActiveDriverIdsByFleetOwnerId ::
+  (MonadFlow m, EsqDBFlow m r, CacheFlow m r) =>
+  Text ->
+  m [Id Person]
+getActiveDriverIdsByFleetOwnerId fleetOwnerId = do
+  now <- getCurrentTime
+  associations <-
+    findAllWithKV
+      [ Se.And
+          [ Se.Is BeamFDVA.fleetOwnerId $ Se.Eq fleetOwnerId,
+            Se.Is BeamFDVA.isActive $ Se.Eq True,
+            Se.Is BeamFDVA.associatedTill (Se.GreaterThan $ Just now)
+          ]
+      ]
+  pure $ map (.driverId) associations
+
+findAllActiveByFleetOwnerId ::
+  (MonadFlow m, EsqDBFlow m r, CacheFlow m r) =>
+  Text ->
+  m [FleetDriverAssociation]
+findAllActiveByFleetOwnerId fleetOwnerId = do
+  now <- getCurrentTime
+  findAllWithKV
+    [ Se.And
+        [ Se.Is BeamFDVA.fleetOwnerId $ Se.Eq fleetOwnerId,
+          Se.Is BeamFDVA.isActive $ Se.Eq True,
+          Se.Is BeamFDVA.associatedTill (Se.GreaterThan $ Just now)
+        ]
+    ]
+
+findByDriverIdAndFleetOwnerId ::
+  (EsqDBFlow m r, MonadFlow m, CacheFlow m r) =>
+  (Id Person -> Text -> Bool -> m (Maybe FleetDriverAssociation))
+findByDriverIdAndFleetOwnerId driverId fleetOwnerId isActive = do
+  now <- getCurrentTime
+  findAllWithOptionsKV [Se.And [Se.Is BeamFDVA.driverId $ Se.Eq (driverId.getId), Se.Is BeamFDVA.fleetOwnerId $ Se.Eq fleetOwnerId, Se.Is BeamFDVA.isActive $ Se.Eq isActive, Se.Is BeamFDVA.associatedTill (Se.GreaterThan $ Just now)]] (Se.Desc BeamFDVA.createdAt) (Just 1) Nothing <&> listToMaybe
+
+findByDriverIdAndFleetOwnerIdWithStatus ::
+  (EsqDBFlow m r, MonadFlow m, CacheFlow m r) =>
+  Id Person ->
+  Text ->
+  m (Maybe FleetDriverAssociation)
+findByDriverIdAndFleetOwnerIdWithStatus driverId fleetOwnerId = do
+  now <- getCurrentTime
+  findAllWithOptionsKV [Se.And [Se.Is BeamFDVA.driverId $ Se.Eq (driverId.getId), Se.Is BeamFDVA.fleetOwnerId $ Se.Eq fleetOwnerId, Se.Is BeamFDVA.associatedTill (Se.GreaterThan $ Just now)]] (Se.Desc BeamFDVA.createdAt) (Just 1) Nothing <&> listToMaybe
+
+findAllActiveDriverByFleetOwnerIdWithDriverInfo :: (EsqDBFlow m r, MonadFlow m, CacheFlow m r, EncFlow m r) => Text -> Int -> Int -> Maybe DbHash -> Maybe Text -> Maybe Text -> Maybe Bool -> Maybe DI.DriverMode -> m [(FleetDriverAssociation, Person, DriverInformation)]
+findAllActiveDriverByFleetOwnerIdWithDriverInfo fleetOwnerId limit offset mbMobileNumberSearchStringHash mbName mbSearchString mbIsActive mbMode = do
+  now <- getCurrentTime
+  dbConf <- getReplicaBeamConfig
+  encryptedMobileNumberHash <- mapM getDbHash mbSearchString
+
+  res <-
+    L.runDB dbConf $
+      L.findRows $
+        B.select $
+          B.limit_ (toInteger limit) $
+            B.offset_ (toInteger offset) $
+              B.orderBy_ (\(fleetDriverAssociation', _, _) -> B.desc_ fleetDriverAssociation'.updatedAt) $
+                B.filter_'
+                  ( \(fleetDriverAssociation, driver, driverInformation) ->
+                      fleetDriverAssociation.fleetOwnerId B.==?. B.val_ fleetOwnerId
+                        B.&&?. B.sqlBool_ (fleetDriverAssociation.associatedTill B.>=. B.val_ (Just now))
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\mode -> driverInformation.mode B.==?. B.val_ (Just mode)) mbMode
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\isActive -> fleetDriverAssociation.isActive B.==?. B.val_ isActive) mbIsActive
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbName
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) mbMobileNumberSearchStringHash
+                        B.&&?. ( maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.val_ ("%" <> toLower name <> "%"))) mbSearchString
+                                   B.||?. maybe (B.sqlBool_ $ B.val_ True) (\searchString -> B.sqlBool_ (B.like_ (B.coalesce_ [driver.maskedMobileDigits] (B.val_ "")) (B.val_ ("%" <> searchString <> "%")))) mbSearchString
+                                   B.||?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) encryptedMobileNumberHash
+                               )
+                  )
+                  do
+                    fleetDriverAssociation <- B.all_ (BeamCommon.fleetDriverAssociation BeamCommon.atlasDB)
+                    driver <- B.join_ (BeamCommon.person BeamCommon.atlasDB) (\driver -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamP.id driver)
+                    driverInformation <- B.join_ (BeamCommon.driverInformation BeamCommon.atlasDB) (\driverInfo -> BeamP.id driver B.==. BeamDI.driverId driverInfo)
+                    pure (fleetDriverAssociation, driver, driverInformation)
+  case res of
+    Right res' -> do
+      let fleetDriverList = (\(fleetDriverAssociation, driver, driverInformation) -> (fleetDriverAssociation, driver, driverInformation)) <$> res'
+      catMaybes <$> mapM (\(f, d, di) -> liftA3 (,,) <$> fromTType' f <*> fromTType' d <*> fromTType' di) fleetDriverList
+    Left _ -> pure []
+
+findAllActiveDriverByFleetOwnerId :: (EsqDBFlow m r, MonadFlow m, CacheFlow m r, EncFlow m r) => Text -> Maybe Int -> Maybe Int -> Maybe DbHash -> Maybe Text -> Maybe Text -> Maybe Bool -> m [(FleetDriverAssociation, Person)]
+findAllActiveDriverByFleetOwnerId fleetOwnerId Nothing Nothing mbMobileNumberSearchStringHash mbName mbSearchString mbIsActive = do
+  now <- getCurrentTime
+  dbConf <- getReplicaBeamConfig
+  encryptedMobileNumberHash <- mapM getDbHash mbSearchString
+  res <-
+    L.runDB dbConf $
+      L.findRows $
+        B.select $
+          B.orderBy_ (\(fleetDriverAssociation', _, _) -> B.desc_ fleetDriverAssociation'.updatedAt) $
+            B.filter_'
+              ( \(fleetDriverAssociation, driver, _) ->
+                  fleetDriverAssociation.fleetOwnerId B.==?. B.val_ fleetOwnerId
+                    B.&&?. B.sqlBool_ (fleetDriverAssociation.associatedTill B.>=. B.val_ (Just now))
+                    B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\isActive -> fleetDriverAssociation.isActive B.==?. B.val_ isActive) mbIsActive
+                    B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbName
+                    B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) mbMobileNumberSearchStringHash
+                    B.&&?. ( maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbSearchString
+                               B.||?. maybe (B.sqlBool_ $ B.val_ True) (\searchString -> B.sqlBool_ (B.like_ (B.coalesce_ [driver.maskedMobileDigits] (B.val_ "")) (B.val_ ("%" <> searchString <> "%")))) mbSearchString
+                               B.||?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) encryptedMobileNumberHash
+                           )
+              )
+              do
+                fleetDriverAssociation <- B.all_ (BeamCommon.fleetDriverAssociation BeamCommon.atlasDB)
+                driver <- B.join_ (BeamCommon.person BeamCommon.atlasDB) (\driver -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamP.id driver)
+                vehicle <- B.join_ (BeamCommon.vehicle BeamCommon.atlasDB) (\vehicle -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamV.driverId vehicle)
+                pure (fleetDriverAssociation, driver, vehicle)
+  case res of
+    Right fleetDriverList ->
+      catMaybes <$> mapM (\(f, d, _) -> liftA2 (,) <$> fromTType' f <*> fromTType' d) fleetDriverList
+    Left _ -> pure []
+findAllActiveDriverByFleetOwnerId fleetOwnerId mbLimit mbOffset mbMobileNumberSearchStringHash mbName mbSearchString mbIsActive = do
+  now <- getCurrentTime
+  dbConf <- getReplicaBeamConfig
+  encryptedMobileNumberHash <- mapM getDbHash mbSearchString
+  let limit = fromMaybe 10 mbLimit
+      offset = fromMaybe 0 mbOffset
+  res <-
+    L.runDB dbConf $
+      L.findRows $
+        B.select $
+          B.limit_ (fromIntegral limit) $
+            B.offset_ (fromIntegral offset) $
+              B.orderBy_ (\(fleetDriverAssociation', _, _) -> B.desc_ fleetDriverAssociation'.updatedAt) $
+                B.filter_'
+                  ( \(fleetDriverAssociation, driver, _) ->
+                      fleetDriverAssociation.fleetOwnerId B.==?. B.val_ fleetOwnerId
+                        B.&&?. B.sqlBool_ (fleetDriverAssociation.associatedTill B.>=. B.val_ (Just now))
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\isActive -> fleetDriverAssociation.isActive B.==?. B.val_ isActive) mbIsActive
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbName
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) mbMobileNumberSearchStringHash
+                        B.&&?. ( maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbSearchString
+                                   B.||?. maybe (B.sqlBool_ $ B.val_ True) (\searchString -> B.sqlBool_ (B.like_ (B.coalesce_ [driver.maskedMobileDigits] (B.val_ "")) (B.val_ ("%" <> searchString <> "%")))) mbSearchString
+                                   B.||?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) encryptedMobileNumberHash
+                               )
+                  )
+                  do
+                    fleetDriverAssociation <- B.all_ (BeamCommon.fleetDriverAssociation BeamCommon.atlasDB)
+                    driver <- B.join_ (BeamCommon.person BeamCommon.atlasDB) (\driver -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamP.id driver)
+                    vehicle <- B.join_ (BeamCommon.vehicle BeamCommon.atlasDB) (\vehicle -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamV.driverId vehicle)
+                    pure (fleetDriverAssociation, driver, vehicle)
+  case res of
+    Right fleetDriverList ->
+      catMaybes <$> mapM (\(f, d, _) -> liftA2 (,) <$> fromTType' f <*> fromTType' d) fleetDriverList
+    Left _ -> pure []
+
+findAllInactiveDriverByFleetOwnerId :: (EsqDBFlow m r, MonadFlow m, CacheFlow m r, EncFlow m r) => Text -> Maybe Int -> Maybe Int -> Maybe DbHash -> Maybe Text -> Maybe Text -> m [(FleetDriverAssociation, Person)]
+findAllInactiveDriverByFleetOwnerId fleetOwnerId mbLimit mbOffset mbMobileNumberSearchStringHash mbName mbSearchString = do
+  dbConf <- getReplicaBeamConfig
+  encryptedMobileNumberHash <- mapM getDbHash mbSearchString
+  let limit = fromMaybe 10 mbLimit
+      offset = fromMaybe 0 mbOffset
+  allActiveDriverIds <- findAllActiveDriverByFleetOwnerId fleetOwnerId Nothing Nothing mbMobileNumberSearchStringHash mbName mbSearchString (Just True)
+  let allActiveDriverIds' = (\(_, driver) -> driver.id) <$> allActiveDriverIds
+  res <-
+    L.runDB dbConf $
+      L.findRows $
+        B.select $
+          B.limit_ (fromIntegral limit) $
+            B.offset_ (fromIntegral offset) $
+              B.orderBy_ (\(fleetDriverAssociation', _) -> B.desc_ fleetDriverAssociation'.updatedAt) $
+                B.filter_'
+                  ( \(fleetDriverAssociation, driver) ->
+                      fleetDriverAssociation.fleetOwnerId B.==?. B.val_ fleetOwnerId
+                        B.&&?. B.sqlBool_ (B.not_ (fleetDriverAssociation.driverId `B.in_` (B.val_ . getId <$> allActiveDriverIds')))
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbName
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) mbMobileNumberSearchStringHash
+                        B.&&?. ( maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbSearchString
+                                   B.||?. maybe (B.sqlBool_ $ B.val_ True) (\lastDigits -> B.sqlBool_ (B.like_ (B.coalesce_ [driver.maskedMobileDigits] (B.val_ "")) (B.val_ ("%" <> takeEnd 4 lastDigits <> "%")))) mbSearchString
+                                   B.||?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) encryptedMobileNumberHash
+                               )
+                  )
+                  do
+                    fleetDriverAssociation <- B.all_ (BeamCommon.fleetDriverAssociation BeamCommon.atlasDB)
+                    driver <- B.join_ (BeamCommon.person BeamCommon.atlasDB) (\driver -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamP.id driver)
+                    pure (fleetDriverAssociation, driver)
+  case res of
+    Right fleetDriverList -> catMaybes <$> mapM (\(f, d) -> liftA2 (,) <$> fromTType' f <*> fromTType' d) fleetDriverList
+    Left _ -> pure []
+
+findAllDriverByFleetOwnerId :: (EsqDBFlow m r, MonadFlow m, CacheFlow m r, EncFlow m r) => Text -> Maybe Int -> Maybe Int -> Maybe DbHash -> Maybe Text -> Maybe Text -> m [(FleetDriverAssociation, Person)]
+findAllDriverByFleetOwnerId fleetOwnerId mbLimit mbOffset mbMobileNumberSearchStringHash mbName mbSearchString = do
+  dbConf <- getReplicaBeamConfig
+  now <- getCurrentTime
+  encryptedMobileNumberHash <- mapM getDbHash mbSearchString
+  let limit = fromMaybe 10 mbLimit
+      offset = fromMaybe 0 mbOffset
+  res <-
+    L.runDB dbConf $
+      L.findRows $
+        B.select $
+          B.limit_ (fromIntegral limit) $
+            B.offset_ (fromIntegral offset) $
+              B.orderBy_ (\(fleetDriverAssociation', _) -> B.desc_ fleetDriverAssociation'.updatedAt) $
+                B.filter_'
+                  ( \(fleetDriverAssociation, driver) ->
+                      fleetDriverAssociation.fleetOwnerId B.==?. B.val_ fleetOwnerId
+                        B.&&?. B.sqlBool_ (fleetDriverAssociation.associatedTill B.>=. B.val_ (Just now))
+                        B.&&?. (fleetDriverAssociation.isActive B.==?. B.val_ True)
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbName
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) mbMobileNumberSearchStringHash
+                        B.&&?. ( maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbSearchString
+                                   B.||?. maybe (B.sqlBool_ $ B.val_ True) (\searchString -> B.sqlBool_ (B.like_ (B.coalesce_ [driver.maskedMobileDigits] (B.val_ "")) (B.val_ ("%" <> searchString <> "%")))) mbSearchString
+                                   B.||?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) encryptedMobileNumberHash
+                               )
+                  )
+                  do
+                    fleetDriverAssociation <- B.all_ (BeamCommon.fleetDriverAssociation BeamCommon.atlasDB)
+                    driver <- B.join_ (BeamCommon.person BeamCommon.atlasDB) (\driver -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamP.id driver)
+                    pure (fleetDriverAssociation, driver)
+  case res of
+    Right fleetDriverList -> catMaybes <$> mapM (\(f, d) -> liftA2 (,) <$> fromTType' f <*> fromTType' d) fleetDriverList
+    Left _ -> pure []
+
+findAllDriverByFleetOwnerIdAndMbIsActive ::
+  (MonadFlow m, EsqDBFlow m r, CacheFlow m r) =>
+  Text ->
+  Maybe Bool ->
+  Int ->
+  Int ->
+  m [FleetDriverAssociation]
+findAllDriverByFleetOwnerIdAndMbIsActive fleetOwnerId mbIsActive limit offset = do
+  now <- getCurrentTime
+  findAllWithOptionsKV
+    [ Se.And $
+        [Se.Is BeamFDVA.fleetOwnerId $ Se.Eq fleetOwnerId, Se.Is BeamFDVA.associatedTill (Se.GreaterThan $ Just now)]
+          <> [Se.Is BeamFDVA.isActive (Se.Eq isActive) | Just isActive <- [mbIsActive]]
+    ]
+    (Se.Desc BeamFDVA.updatedAt)
+    (Just limit)
+    (Just offset)
+
+findActiveDriverByFleetOwnerId ::
+  (MonadFlow m, EsqDBFlow m r, CacheFlow m r) =>
+  Text ->
+  m (Maybe FleetDriverAssociation)
+findActiveDriverByFleetOwnerId fleetOwnerId = do
+  now <- getCurrentTime
+  listToMaybe
+    <$> findAllWithOptionsKV'
+      [ Se.And
+          [ Se.Is BeamFDVA.fleetOwnerId $ Se.Eq fleetOwnerId,
+            Se.Is BeamFDVA.isActive $ Se.Eq True,
+            Se.Is BeamFDVA.associatedTill (Se.GreaterThan $ Just now)
+          ]
+      ]
+      (Just 1)
+      Nothing
+
+endFleetDriverAssociation :: (MonadFlow m, EsqDBFlow m r, CacheFlow m r, Redis.HedisFlow m r, Redis.HedisLTSFlowEnv r) => Text -> Id Person -> m ()
+endFleetDriverAssociation fleetOwnerId (Id driverId) = do
+  now <- getCurrentTime
+  Redis.withWaitOnLockRedisWithExpiry (driverFleetLockKey driverId fleetOwnerId) 10 10 $ do
+    updateWithKV
+      [Se.Set BeamFDVA.associatedTill $ Just now, Se.Set BeamFDVA.isActive False]
+      [Se.And [Se.Is BeamFDVA.fleetOwnerId (Se.Eq fleetOwnerId), Se.Is BeamFDVA.associatedTill (Se.GreaterThan $ Just now), Se.Is BeamFDVA.driverId (Se.Eq driverId)]]
+    mbDriverInfo <- QDIE.findById (Id driverId)
+    let effective = maybe True (fromMaybe True . (.enableCashRide)) mbDriverInfo
+    LTSSync.syncDriverPoolDataToLTS (Id driverId) $
+      LTSSync.emptyUpdate {LTSSync.fleetOwnerId = LTSSync.Set Nothing, LTSSync.enableCashRide = LTSSync.Set (Just effective)}
+
+findAllDriversByFleetOwnerIdByMode :: (MonadFlow m, EsqDBFlow m r, CacheFlow m r) => Text -> DI.DriverMode -> Maybe Bool -> Integer -> Integer -> m [FleetDriverAssociation]
+findAllDriversByFleetOwnerIdByMode fleetOwnerId mode mbIsActive limitVal offsetVal = do
+  now <- getCurrentTime
+  dbConf <- getReplicaBeamConfig
+  res <-
+    L.runDB dbConf $
+      L.findRows $
+        B.select $
+          B.limit_ limitVal $
+            B.offset_ offsetVal $
+              B.orderBy_ (\(rc', _) -> B.desc_ rc'.createdAt) $
+                B.filter_'
+                  ( \(fleetDriverAssociation, driverInformation) ->
+                      fleetDriverAssociation.fleetOwnerId B.==?. B.val_ fleetOwnerId
+                        B.&&?. driverInformation.mode B.==?. B.val_ (Just mode)
+                        B.&&?. B.sqlBool_ (fleetDriverAssociation.associatedTill B.>=. B.val_ (Just now))
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\isActive -> fleetDriverAssociation.isActive B.==?. B.val_ isActive) mbIsActive
+                  )
+                  do
+                    fleetDriverAssociation <- B.all_ (BeamCommon.fleetDriverAssociation BeamCommon.atlasDB)
+                    driverInformation <- B.join_ (BeamCommon.driverInformation BeamCommon.atlasDB) (\driverInfo -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamDI.driverId driverInfo)
+                    pure (fleetDriverAssociation, driverInformation)
+  case res of
+    Right res' -> do
+      let fleetDriverList = fst <$> res'
+      catMaybes <$> mapM fromTType' fleetDriverList
+    Left _ -> pure []
+
+----------------------------- multi fleet owner queries ----------------------------------
+
+findAllActiveDriverByFleetOwnerIds ::
+  (EsqDBFlow m r, MonadFlow m, CacheFlow m r, EncFlow m r) =>
+  [Text] ->
+  Maybe Int ->
+  Maybe Int ->
+  Maybe DbHash ->
+  Maybe Text ->
+  Maybe Text ->
+  Maybe Bool ->
+  Maybe Bool ->
+  Maybe (Maybe Bool) ->
+  Maybe Bool ->
+  Maybe Bool ->
+  Maybe OnboardingAs ->
+  Maybe Bool ->
+  m [(FleetDriverAssociation, Person)]
+findAllActiveDriverByFleetOwnerIds fleetOwnerIds Nothing Nothing mbMobileNumberSearchStringHash mbName mbSearchString mbIsActive mbVerified mbApprovalFilter mbEnabled mbBlocked mbOnboardingAs mbHasRequestReason = do
+  now <- getCurrentTime
+  dbConf <- getReplicaBeamConfig
+  encryptedMobileNumberHash <- mapM getDbHash mbSearchString
+  res <-
+    L.runDB dbConf $
+      L.findRows $
+        B.select $
+          B.orderBy_ (\(fleetDriverAssociation', _, _, _) -> B.desc_ fleetDriverAssociation'.updatedAt) $
+            B.filter_'
+              ( \(fleetDriverAssociation, driver, _, driverInfo) ->
+                  B.sqlBool_ (fleetDriverAssociation.fleetOwnerId `B.in_` (B.val_ <$> fleetOwnerIds))
+                    B.&&?. B.sqlBool_ (fleetDriverAssociation.associatedTill B.>=. B.val_ (Just now))
+                    B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\isActive -> fleetDriverAssociation.isActive B.==?. B.val_ isActive) mbIsActive
+                    B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbName
+                    B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) mbMobileNumberSearchStringHash
+                    B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\verified -> driverInfo.verified B.==?. B.val_ verified) mbVerified
+                    B.&&?. case mbApprovalFilter of
+                      Nothing -> B.sqlBool_ $ B.val_ True
+                      Just Nothing -> B.sqlBool_ (B.isNothing_ driverInfo.approved)
+                      Just (Just approved) -> driverInfo.approved B.==?. B.val_ (Just approved)
+                    B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\enabled -> driverInfo.enabled B.==?. B.val_ enabled) mbEnabled
+                    B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\blocked -> driverInfo.blocked B.==?. B.val_ blocked) mbBlocked
+                    B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\onboardingAs -> driverInfo.onboardingAs B.==?. B.val_ (Just onboardingAs)) mbOnboardingAs
+                    B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\hasRR -> if hasRR then fleetDriverAssociation.requestReason B./=?. B.val_ Nothing else fleetDriverAssociation.requestReason B.==?. B.val_ Nothing) mbHasRequestReason
+                    B.&&?. ( maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbSearchString
+                               B.||?. maybe (B.sqlBool_ $ B.val_ True) (\lastDigits -> B.sqlBool_ (B.like_ (B.coalesce_ [driver.maskedMobileDigits] (B.val_ "")) (B.val_ ("%" <> takeEnd 4 lastDigits <> "%")))) mbSearchString
+                               B.||?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) encryptedMobileNumberHash
+                           )
+              )
+              do
+                fleetDriverAssociation <- B.all_ (BeamCommon.fleetDriverAssociation BeamCommon.atlasDB)
+                driver <- B.join_ (BeamCommon.person BeamCommon.atlasDB) (\driver -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamP.id driver)
+                vehicle <- B.join_ (BeamCommon.vehicle BeamCommon.atlasDB) (\vehicle -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamV.driverId vehicle)
+                driverInfo <- B.join_ (BeamCommon.driverInformation BeamCommon.atlasDB) (\info' -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamDI.driverId info')
+                pure (fleetDriverAssociation, driver, vehicle, driverInfo)
+  case res of
+    Right fleetDriverList ->
+      catMaybes <$> mapM (\(f, d, _, _) -> liftA2 (,) <$> fromTType' f <*> fromTType' d) fleetDriverList
+    Left _ -> pure []
+findAllActiveDriverByFleetOwnerIds fleetOwnerIds mbLimit mbOffset mbMobileNumberSearchStringHash mbName mbSearchString mbIsActive mbVerified mbApprovalFilter mbEnabled mbBlocked mbOnboardingAs mbHasRequestReason = do
+  now <- getCurrentTime
+  dbConf <- getReplicaBeamConfig
+  encryptedMobileNumberHash <- mapM getDbHash mbSearchString
+  let limit = fromMaybe 10 mbLimit
+      offset = fromMaybe 0 mbOffset
+  res <-
+    L.runDB dbConf $
+      L.findRows $
+        B.select $
+          B.limit_ (fromIntegral limit) $
+            B.offset_ (fromIntegral offset) $
+              B.orderBy_ (\(fleetDriverAssociation', _, _, _) -> B.desc_ fleetDriverAssociation'.updatedAt) $
+                B.filter_'
+                  ( \(fleetDriverAssociation, driver, _, driverInfo) ->
+                      B.sqlBool_ (fleetDriverAssociation.fleetOwnerId `B.in_` (B.val_ <$> fleetOwnerIds))
+                        B.&&?. B.sqlBool_ (fleetDriverAssociation.associatedTill B.>=. B.val_ (Just now))
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\isActive -> fleetDriverAssociation.isActive B.==?. B.val_ isActive) mbIsActive
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbName
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) mbMobileNumberSearchStringHash
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\verified -> driverInfo.verified B.==?. B.val_ verified) mbVerified
+                        B.&&?. ( case mbApprovalFilter of
+                                   Nothing -> B.sqlBool_ $ B.val_ True
+                                   Just Nothing -> B.sqlBool_ (B.isNothing_ driverInfo.approved)
+                                   Just (Just approved) -> driverInfo.approved B.==?. B.val_ (Just approved)
+                               )
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\enabled -> driverInfo.enabled B.==?. B.val_ enabled) mbEnabled
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\blocked -> driverInfo.blocked B.==?. B.val_ blocked) mbBlocked
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\onboardingAs -> driverInfo.onboardingAs B.==?. B.val_ (Just onboardingAs)) mbOnboardingAs
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\hasRR -> if hasRR then fleetDriverAssociation.requestReason B./=?. B.val_ Nothing else fleetDriverAssociation.requestReason B.==?. B.val_ Nothing) mbHasRequestReason
+                        B.&&?. ( maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbSearchString
+                                   B.||?. maybe (B.sqlBool_ $ B.val_ True) (\lastDigits -> B.sqlBool_ (B.like_ (B.coalesce_ [driver.maskedMobileDigits] (B.val_ "")) (B.val_ ("%" <> takeEnd 4 lastDigits <> "%")))) mbSearchString
+                                   B.||?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) encryptedMobileNumberHash
+                               )
+                  )
+                  do
+                    fleetDriverAssociation <- B.all_ (BeamCommon.fleetDriverAssociation BeamCommon.atlasDB)
+                    driver <- B.join_ (BeamCommon.person BeamCommon.atlasDB) (\driver -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamP.id driver)
+                    vehicle <- B.join_ (BeamCommon.vehicle BeamCommon.atlasDB) (\vehicle -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamV.driverId vehicle)
+                    driverInfo <- B.join_ (BeamCommon.driverInformation BeamCommon.atlasDB) (\info' -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamDI.driverId info')
+                    pure (fleetDriverAssociation, driver, vehicle, driverInfo)
+  case res of
+    Right fleetDriverList ->
+      catMaybes <$> mapM (\(f, d, _, _) -> liftA2 (,) <$> fromTType' f <*> fromTType' d) fleetDriverList
+    Left _ -> pure []
+
+findAllInactiveDriverByFleetOwnerIds :: (EsqDBFlow m r, MonadFlow m, CacheFlow m r, EncFlow m r) => [Text] -> Maybe Int -> Maybe Int -> Maybe DbHash -> Maybe Text -> Maybe Text -> m [(FleetDriverAssociation, Person)]
+findAllInactiveDriverByFleetOwnerIds fleetOwnerIds mbLimit mbOffset mbMobileNumberSearchStringHash mbName mbSearchString = do
+  dbConf <- getReplicaBeamConfig
+  encryptedMobileNumberHash <- mapM getDbHash mbSearchString
+  let limit = fromMaybe 10 mbLimit
+      offset = fromMaybe 0 mbOffset
+  allActiveDriverIds <- findAllActiveDriverByFleetOwnerIds fleetOwnerIds Nothing Nothing mbMobileNumberSearchStringHash mbName mbSearchString (Just True) Nothing Nothing Nothing Nothing Nothing Nothing
+  let allActiveDriverIds' = (\(_, driver) -> driver.id) <$> allActiveDriverIds
+  res <-
+    L.runDB dbConf $
+      L.findRows $
+        B.select $
+          B.limit_ (fromIntegral limit) $
+            B.offset_ (fromIntegral offset) $
+              B.orderBy_ (\(fleetDriverAssociation', _) -> B.desc_ fleetDriverAssociation'.updatedAt) $
+                B.filter_'
+                  ( \(fleetDriverAssociation, driver) ->
+                      B.sqlBool_ (fleetDriverAssociation.fleetOwnerId `B.in_` (B.val_ <$> fleetOwnerIds))
+                        B.&&?. B.sqlBool_ (B.not_ (fleetDriverAssociation.driverId `B.in_` (B.val_ . getId <$> allActiveDriverIds')))
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbName
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) mbMobileNumberSearchStringHash
+                        B.&&?. ( maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbSearchString
+                                   B.||?. maybe (B.sqlBool_ $ B.val_ True) (\lastDigits -> B.sqlBool_ (B.like_ (B.coalesce_ [driver.maskedMobileDigits] (B.val_ "")) (B.val_ ("%" <> takeEnd 4 lastDigits <> "%")))) mbSearchString
+                                   B.||?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) encryptedMobileNumberHash
+                               )
+                  )
+                  do
+                    fleetDriverAssociation <- B.all_ (BeamCommon.fleetDriverAssociation BeamCommon.atlasDB)
+                    driver <- B.join_ (BeamCommon.person BeamCommon.atlasDB) (\driver -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamP.id driver)
+                    pure (fleetDriverAssociation, driver)
+  case res of
+    Right fleetDriverList -> catMaybes <$> mapM (\(f, d) -> liftA2 (,) <$> fromTType' f <*> fromTType' d) fleetDriverList
+    Left _ -> pure []
+
+findAllDriverByFleetOwnerIds ::
+  (EsqDBFlow m r, MonadFlow m, CacheFlow m r, EncFlow m r) =>
+  [Text] ->
+  Maybe Int ->
+  Maybe Int ->
+  Maybe DbHash ->
+  Maybe Text ->
+  Maybe Text ->
+  Maybe Bool ->
+  Maybe (Maybe Bool) ->
+  Maybe Bool ->
+  Maybe Bool ->
+  Maybe OnboardingAs ->
+  m [(FleetDriverAssociation, Person)]
+findAllDriverByFleetOwnerIds fleetOwnerIds mbLimit mbOffset mbMobileNumberSearchStringHash mbName mbSearchString mbVerified mbApprovalFilter mbEnabled mbBlocked mbOnboardingAs = do
+  dbConf <- getReplicaBeamConfig
+  now <- getCurrentTime
+  encryptedMobileNumberHash <- mapM getDbHash mbSearchString
+  let limit = fromMaybe 10 mbLimit
+      offset = fromMaybe 0 mbOffset
+  res <-
+    L.runDB dbConf $
+      L.findRows $
+        B.select $
+          B.limit_ (fromIntegral limit) $
+            B.offset_ (fromIntegral offset) $
+              B.orderBy_ (\(fleetDriverAssociation', _, _) -> B.desc_ fleetDriverAssociation'.updatedAt) $
+                B.filter_'
+                  ( \(fleetDriverAssociation, driver, driverInfo) ->
+                      B.sqlBool_ (fleetDriverAssociation.fleetOwnerId `B.in_` (B.val_ <$> fleetOwnerIds))
+                        B.&&?. B.sqlBool_ (fleetDriverAssociation.associatedTill B.>=. B.val_ (Just now))
+                        B.&&?. (fleetDriverAssociation.isActive B.==?. B.val_ True)
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbName
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) mbMobileNumberSearchStringHash
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\verified -> driverInfo.verified B.==?. B.val_ verified) mbVerified
+                        B.&&?. ( case mbApprovalFilter of
+                                   Nothing -> B.sqlBool_ $ B.val_ True
+                                   Just Nothing -> B.sqlBool_ (B.isNothing_ driverInfo.approved)
+                                   Just (Just approved) -> driverInfo.approved B.==?. B.val_ (Just approved)
+                               )
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\enabled -> driverInfo.enabled B.==?. B.val_ enabled) mbEnabled
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\blocked -> driverInfo.blocked B.==?. B.val_ blocked) mbBlocked
+                        B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\onboardingAs -> driverInfo.onboardingAs B.==?. B.val_ (Just onboardingAs)) mbOnboardingAs
+                        B.&&?. ( maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbSearchString
+                                   B.||?. maybe (B.sqlBool_ $ B.val_ True) (\lastDigits -> B.sqlBool_ (B.like_ (B.coalesce_ [driver.maskedMobileDigits] (B.val_ "")) (B.val_ ("%" <> takeEnd 4 lastDigits <> "%")))) mbSearchString
+                                   B.||?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) encryptedMobileNumberHash
+                               )
+                  )
+                  do
+                    fleetDriverAssociation <- B.all_ (BeamCommon.fleetDriverAssociation BeamCommon.atlasDB)
+                    driver <- B.join_ (BeamCommon.person BeamCommon.atlasDB) (\driver -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamP.id driver)
+                    driverInfo <- B.join_ (BeamCommon.driverInformation BeamCommon.atlasDB) (\info' -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamDI.driverId info')
+                    pure (fleetDriverAssociation, driver, driverInfo)
+  case res of
+    Right fleetDriverList -> catMaybes <$> mapM (\(f, d, _) -> liftA2 (,) <$> fromTType' f <*> fromTType' d) fleetDriverList
+    Left _ -> pure []
+
+--------------------------------- multi fleet owner queries ----------------------------------
+
+findAllActiveDriverByFleetOwnerIdWithDriverInfoMF :: (EsqDBFlow m r, MonadFlow m, CacheFlow m r, EncFlow m r) => [Text] -> Text -> Text -> Int -> Int -> Maybe DbHash -> Maybe Text -> Maybe Text -> Maybe Text -> Maybe Bool -> Maybe DI.DriverMode -> Maybe Bool -> Maybe Bool -> Maybe UTCTime -> Maybe UTCTime -> Maybe Bool -> Maybe DDVS.DocsVerificationStatus -> m [(FleetDriverAssociation, Person, DriverInformation)]
+findAllActiveDriverByFleetOwnerIdWithDriverInfoMF fleetOwnerIds merchantId merchantOperatingCityId limit offset mbMobileNumberSearchStringHash mbName mbSearchString mbDriverId mbIsActive mbMode mbHasRequestReason mbEnabled mbFrom mbTo mbApproved mbDocsVerificationStatus = do
+  now <- getCurrentTime
+  dbConf <- getReplicaBeamConfig
+  encryptedMobileNumberHash <- mapM getDbHash mbSearchString
+  let needsDriverInfoJoin = isJust mbMode || isJust mbEnabled || isJust mbApproved || isJust mbDocsVerificationStatus
+
+  if needsDriverInfoJoin
+    then do
+      res <-
+        L.runDB dbConf $
+          L.findRows $
+            B.select $
+              B.limit_ (toInteger limit) $
+                B.offset_ (toInteger offset) $
+                  B.orderBy_ (\(fleetDriverAssociation', _, _) -> B.desc_ fleetDriverAssociation'.updatedAt) $
+                    B.filter_'
+                      ( \(fleetDriverAssociation, driver, driverInformation) ->
+                          ( if null fleetOwnerIds
+                              then B.sqlBool_ (B.val_ True)
+                              else B.sqlBool_ (fleetDriverAssociation.fleetOwnerId `B.in_` (B.val_ <$> fleetOwnerIds))
+                          )
+                            B.&&?. driver.merchantId B.==?. B.val_ merchantId
+                            B.&&?. ( B.sqlBool_ (B.isNothing_ driver.merchantOperatingCityId)
+                                       B.||?. driver.merchantOperatingCityId B.==?. B.val_ (Just merchantOperatingCityId)
+                                   )
+                            B.&&?. ( B.sqlBool_ (B.isJust_ driver.merchantOperatingCityId)
+                                       B.||?. ( driverInformation.merchantId B.==?. B.val_ (Just merchantId)
+                                                  B.&&?. driverInformation.merchantOperatingCityId B.==?. B.val_ (Just merchantOperatingCityId)
+                                              )
+                                   )
+                            B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\driverId -> driver.id B.==?. B.val_ driverId) mbDriverId
+                            B.&&?. B.sqlBool_ (fleetDriverAssociation.associatedTill B.>=. B.val_ (Just now))
+                            B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\from -> B.sqlBool_ (fleetDriverAssociation.associatedOn B.>=. B.val_ (Just from))) mbFrom
+                            B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\to -> B.sqlBool_ (fleetDriverAssociation.associatedOn B.<=. B.val_ (Just to))) mbTo
+                            B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\mode -> driverInformation.mode B.==?. B.val_ (Just mode)) mbMode
+                            B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\isActive -> fleetDriverAssociation.isActive B.==?. B.val_ isActive) mbIsActive
+                            B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbName
+                            B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) mbMobileNumberSearchStringHash
+                            B.&&?. ( maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.val_ ("%" <> toLower name <> "%"))) mbSearchString
+                                       B.||?. maybe (B.sqlBool_ $ B.val_ True) (\lastDigits -> B.sqlBool_ (B.like_ (B.coalesce_ [driver.maskedMobileDigits] (B.val_ "")) (B.val_ ("%" <> takeEnd 4 lastDigits <> "%")))) mbSearchString
+                                       B.||?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) encryptedMobileNumberHash
+                                   )
+                            B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\hasRequestReason -> if hasRequestReason then fleetDriverAssociation.requestReason B./=?. B.val_ Nothing else B.sqlBool_ $ B.val_ True) mbHasRequestReason
+                            B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\enabled -> driverInformation.enabled B.==?. B.val_ enabled) mbEnabled
+                            B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\approved -> driverInformation.approved B.==?. B.val_ (Just approved)) mbApproved
+                            B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\docsVerificationStatus -> driverInformation.docsVerificationStatus B.==?. B.val_ (Just docsVerificationStatus)) mbDocsVerificationStatus
+                      )
+                      do
+                        fleetDriverAssociation <- B.all_ (BeamCommon.fleetDriverAssociation BeamCommon.atlasDB)
+                        driver <- B.join_ (BeamCommon.person BeamCommon.atlasDB) (\driver -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamP.id driver)
+                        driverInformation <- B.join_ (BeamCommon.driverInformation BeamCommon.atlasDB) (\driverInfo -> BeamP.id driver B.==. BeamDI.driverId driverInfo)
+                        pure (fleetDriverAssociation, driver, driverInformation)
+      case res of
+        Right res' -> catMaybes <$> mapM (\(f, d, di) -> liftA3 (,,) <$> fromTType' f <*> fromTType' d <*> fromTType' di) res'
+        Left _ -> pure []
+    else do
+      let hasPersonSideFilter = isJust mbName || isJust mbSearchString || isJust mbMobileNumberSearchStringHash
+      if not (null fleetOwnerIds) && not hasPersonSideFilter
+        then do
+          -- Fast path: a specific fleet (or fleets) with no person-side (name / mobile / free-text) filter.
+          -- Joining `person` inside this query lets the planner drive from the huge `person` table and
+          -- full-scan it. Instead we resolve the small, fleet-scoped set from `fleet_driver_association`
+          -- first (fleetOwnerId is selective + indexed), then batch-fetch `person` and `driver_information`
+          -- by primary key. This eliminates the `person` scan. The merchant/city scope is applied directly
+          -- on the fda columns (populated going forward + backfilled) instead of the earlier `person` join;
+          -- rows not yet backfilled carry NULL merchantId / merchantOperatingCityId and are treated as a
+          -- match so they are not dropped during the backfill window.
+          fdaRes <-
+            L.runDB dbConf $
+              L.findRows $
+                B.select $
+                  B.limit_ (toInteger limit) $
+                    B.offset_ (toInteger offset) $
+                      B.orderBy_ (\fleetDriverAssociation' -> B.desc_ fleetDriverAssociation'.updatedAt) $
+                        B.filter_'
+                          ( \fleetDriverAssociation ->
+                              B.sqlBool_ (fleetDriverAssociation.fleetOwnerId `B.in_` (B.val_ <$> fleetOwnerIds))
+                                B.&&?. ( B.sqlBool_ (B.isNothing_ fleetDriverAssociation.merchantId)
+                                           B.||?. fleetDriverAssociation.merchantId B.==?. B.val_ (Just merchantId)
+                                       )
+                                B.&&?. ( B.sqlBool_ (B.isNothing_ fleetDriverAssociation.merchantOperatingCityId)
+                                           B.||?. fleetDriverAssociation.merchantOperatingCityId B.==?. B.val_ (Just merchantOperatingCityId)
+                                       )
+                                B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\driverId -> fleetDriverAssociation.driverId B.==?. B.val_ driverId) mbDriverId
+                                B.&&?. B.sqlBool_ (fleetDriverAssociation.associatedTill B.>=. B.val_ (Just now))
+                                B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\from -> B.sqlBool_ (fleetDriverAssociation.associatedOn B.>=. B.val_ (Just from))) mbFrom
+                                B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\to -> B.sqlBool_ (fleetDriverAssociation.associatedOn B.<=. B.val_ (Just to))) mbTo
+                                B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\isActive -> fleetDriverAssociation.isActive B.==?. B.val_ isActive) mbIsActive
+                                B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\hasRequestReason -> if hasRequestReason then fleetDriverAssociation.requestReason B./=?. B.val_ Nothing else B.sqlBool_ $ B.val_ True) mbHasRequestReason
+                          )
+                          (B.all_ (BeamCommon.fleetDriverAssociation BeamCommon.atlasDB))
+          case fdaRes of
+            Right fdaRows -> do
+              fdas <- catMaybes <$> mapM fromTType' fdaRows
+              let driverIds = (\f -> f.driverId.getId) <$> fdas
+              persons <- findAllWithKV [Se.Is BeamP.id $ Se.In driverIds]
+              driverInfos <- QDIE.findAllByDriverIds driverIds
+              let personMap = M.fromList [(p.id.getId, p) | p <- persons]
+                  driverInfoMap = M.fromList [(di.driverId.getId, di) | di <- driverInfos]
+              pure $
+                mapMaybe
+                  (\f -> (,,) f <$> M.lookup f.driverId.getId personMap <*> M.lookup f.driverId.getId driverInfoMap)
+                  fdas
+            Left _ -> pure []
+        else do
+          res <-
+            L.runDB dbConf $
+              L.findRows $
+                B.select $
+                  B.limit_ (toInteger limit) $
+                    B.offset_ (toInteger offset) $
+                      B.orderBy_ (\(fleetDriverAssociation', _) -> B.desc_ fleetDriverAssociation'.updatedAt) $
+                        B.filter_'
+                          ( \(fleetDriverAssociation, driver) ->
+                              ( if null fleetOwnerIds
+                                  then B.sqlBool_ (B.val_ True)
+                                  else B.sqlBool_ (fleetDriverAssociation.fleetOwnerId `B.in_` (B.val_ <$> fleetOwnerIds))
+                              )
+                                B.&&?. ( if null fleetOwnerIds
+                                           then
+                                             driver.merchantId B.==?. B.val_ merchantId
+                                               B.&&?. driver.merchantOperatingCityId B.==?. B.val_ (Just merchantOperatingCityId)
+                                           else B.sqlBool_ (B.val_ True)
+                                       )
+                                B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\driverId -> driver.id B.==?. B.val_ driverId) mbDriverId
+                                B.&&?. B.sqlBool_ (fleetDriverAssociation.associatedTill B.>=. B.val_ (Just now))
+                                B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\from -> B.sqlBool_ (fleetDriverAssociation.associatedOn B.>=. B.val_ (Just from))) mbFrom
+                                B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\to -> B.sqlBool_ (fleetDriverAssociation.associatedOn B.<=. B.val_ (Just to))) mbTo
+                                B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\isActive -> fleetDriverAssociation.isActive B.==?. B.val_ isActive) mbIsActive
+                                B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.lower_ (B.val_ ("%" <> name <> "%")))) mbName
+                                B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) mbMobileNumberSearchStringHash
+                                B.&&?. ( maybe (B.sqlBool_ $ B.val_ True) (\name -> B.sqlBool_ (B.lower_ driver.firstName `B.like_` B.val_ ("%" <> toLower name <> "%"))) mbSearchString
+                                           B.||?. maybe (B.sqlBool_ $ B.val_ True) (\lastDigits -> B.sqlBool_ (B.like_ (B.coalesce_ [driver.maskedMobileDigits] (B.val_ "")) (B.val_ ("%" <> takeEnd 4 lastDigits <> "%")))) mbSearchString
+                                           B.||?. maybe (B.sqlBool_ $ B.val_ True) (\mobileNumberSearchStringDB -> driver.mobileNumberHash B.==?. B.val_ (Just mobileNumberSearchStringDB)) encryptedMobileNumberHash
+                                       )
+                                B.&&?. maybe (B.sqlBool_ $ B.val_ True) (\hasRequestReason -> if hasRequestReason then fleetDriverAssociation.requestReason B./=?. B.val_ Nothing else B.sqlBool_ $ B.val_ True) mbHasRequestReason
+                          )
+                          do
+                            fleetDriverAssociation <- B.all_ (BeamCommon.fleetDriverAssociation BeamCommon.atlasDB)
+                            driver <- B.join_ (BeamCommon.person BeamCommon.atlasDB) (\driver -> BeamFDVA.driverId fleetDriverAssociation B.==. BeamP.id driver)
+                            pure (fleetDriverAssociation, driver)
+          case res of
+            Right res' -> do
+              fdaPersonPairs <- catMaybes <$> mapM (\(f, d) -> liftA2 (,) <$> fromTType' f <*> fromTType' d) res'
+              let driverIds = (\(f, _) -> f.driverId.getId) <$> fdaPersonPairs
+              driverInfos <- QDIE.findAllByDriverIds driverIds
+              let driverInfoMap = M.fromList [(di.driverId.getId, di) | di <- driverInfos]
+              pure $ mapMaybe (\(f, d) -> (f,d,) <$> M.lookup d.id.getId driverInfoMap) fdaPersonPairs
+            Left _ -> pure []
+
+approveFleetDriverAssociation ::
+  (MonadFlow m, EsqDBFlow m r, CacheFlow m r, Redis.HedisFlow m r, Redis.HedisLTSFlowEnv r) =>
+  Id Person ->
+  Id Person ->
+  Maybe Text ->
+  m ()
+approveFleetDriverAssociation driverId fleetOwnerId responseReason = do
+  now <- getCurrentTime
+  Redis.withWaitOnLockRedisWithExpiry (driverFleetLockKey driverId.getId fleetOwnerId.getId) 10 10 $ do
+    updateWithKV
+      [ Se.Set BeamFDVA.isActive True,
+        Se.Set BeamFDVA.responseReason responseReason,
+        Se.Set BeamFDVA.updatedAt now
+      ]
+      [Se.And [Se.Is BeamFDVA.driverId $ Se.Eq (driverId.getId), Se.Is BeamFDVA.fleetOwnerId $ Se.Eq fleetOwnerId.getId]]
+    (mbFleetBa :: Maybe DDBA.DriverBankAccount) <- findOneWithKV [Se.Is BeamDBA.driverId $ Se.Eq fleetOwnerId.getId]
+    mbFleetOwnerInfo <- FOI.findByPrimaryKey fleetOwnerId
+    mbAssociation <- findByDriverIdAndFleetOwnerIdWithStatus driverId fleetOwnerId.getId
+    let fleetOwnerCashRideFlag = maybe True (fromMaybe True . (.enableCashRide)) mbFleetOwnerInfo
+        cashRideEffective = fleetOwnerCashRideFlag && maybe True (fromMaybe True . (.enableCashRide)) mbAssociation
+    LTSSync.syncDriverPoolDataToLTS (cast driverId) $
+      LTSSync.emptyUpdate
+        { LTSSync.fleetOwnerId = LTSSync.Set (Just fleetOwnerId.getId),
+          LTSSync.chargesEnabled = LTSSync.Set (maybe False (.chargesEnabled) mbFleetBa),
+          LTSSync.bankAccountPaymentMode = LTSSync.Set ((.paymentMode) =<< mbFleetBa),
+          LTSSync.enableCashRide = LTSSync.Set (Just cashRideEffective)
+        }
+
+rejectFleetDriverAssociation ::
+  (MonadFlow m, EsqDBFlow m r, CacheFlow m r) =>
+  Id Person ->
+  Id Person ->
+  Maybe Text ->
+  m ()
+rejectFleetDriverAssociation driverId fleetOwnerId responseReason = do
+  now <- getCurrentTime
+  updateWithKV
+    [ Se.Set BeamFDVA.isActive False,
+      Se.Set BeamFDVA.responseReason responseReason,
+      Se.Set BeamFDVA.associatedTill (Just now),
+      Se.Set BeamFDVA.updatedAt now
+    ]
+    [Se.And [Se.Is BeamFDVA.driverId $ Se.Eq (driverId.getId), Se.Is BeamFDVA.fleetOwnerId $ Se.Eq fleetOwnerId.getId]]
+
+revokeFleetDriverAssociation ::
+  (MonadFlow m, EsqDBFlow m r, CacheFlow m r, Redis.HedisFlow m r, Redis.HedisLTSFlowEnv r) =>
+  Id Person ->
+  Id Person ->
+  m ()
+revokeFleetDriverAssociation driverId fleetOwnerId = do
+  now <- getCurrentTime
+  Redis.withWaitOnLockRedisWithExpiry (driverFleetLockKey driverId.getId fleetOwnerId.getId) 10 10 $ do
+    updateWithKV
+      [ Se.Set BeamFDVA.associatedTill (Just now),
+        Se.Set BeamFDVA.isActive False,
+        Se.Set BeamFDVA.updatedAt now
+      ]
+      [Se.And [Se.Is BeamFDVA.driverId $ Se.Eq (driverId.getId), Se.Is BeamFDVA.fleetOwnerId $ Se.Eq fleetOwnerId.getId]]
+    mbDriverInfo <- QDIE.findById driverId
+    let effective = maybe True (fromMaybe True . (.enableCashRide)) mbDriverInfo
+    LTSSync.syncDriverPoolDataToLTS (cast driverId) $
+      LTSSync.emptyUpdate {LTSSync.fleetOwnerId = LTSSync.Set Nothing, LTSSync.enableCashRide = LTSSync.Set (Just effective)}
+
+-- Mark the association ended (isActive=false, associatedTill=now). This UPDATE
+-- streams to ClickHouse (drainer -> Kafka) as the terminal history event; the
+-- caller then hard-deletes the row. Hard deletes are NOT pushed to Kafka.
+endById :: (MonadFlow m, EsqDBFlow m r, CacheFlow m r) => Id FleetDriverAssociation -> m ()
+endById rowId = do
+  now <- getCurrentTime
+  updateWithKV
+    [Se.Set BeamFDVA.isActive False, Se.Set BeamFDVA.associatedTill (Just now), Se.Set BeamFDVA.updatedAt now]
+    [Se.Is BeamFDVA.id $ Se.Eq rowId.getId]

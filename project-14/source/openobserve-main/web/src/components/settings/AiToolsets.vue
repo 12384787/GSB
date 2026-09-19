@@ -1,0 +1,478 @@
+<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<!-- eslint-disable vue/x-invalid-end-tag -->
+<template>
+  <!-- eslint-disable-next-line local/no-hardcoded-px -- mixed with vh/vw — vh tracks the window while rem tracks font-size; keep the expression unit-consistent -->
+  <div class="p-0" style="min-height: inherit; height: calc(100vh - 88px)">
+    <OPageLayout
+      v-if="!showAddDialog"
+      :title="t('aiToolset.header')"
+      icon="smart-toy"
+      :subtitle="t('settings.aiToolsetsPage.subtitle')"
+      bleed
+    >
+      <template #actions>
+        <OButton
+          data-test="ai-toolsets-add-btn"
+          variant="primary"
+          size="sm-action"
+          @click="addToolset"
+          >{{ t("aiToolset.add") }}</OButton
+        >
+      </template>
+
+      <!-- Table -->
+      <div class="bg-card-glass-bg mt-2.5 overflow-hidden">
+        <OTable
+          :forbidden="forbidden"
+          :frame="false"
+          :data="visibleRows"
+          :columns="columns"
+          row-key="id"
+          pagination="client"
+          :page-size="20"
+          :page-size-options="[20, 50, 100]"
+          sorting="client"
+          :default-columns="false"
+          show-index
+          :enable-column-resize="true"
+          :persist-columns="true"
+          table-id="settings-ai-toolsets"
+          :show-global-filter="false"
+        >
+          <template #toolbar>
+            <OSearchInput
+              v-model="filterQuery"
+              class="no-border o2-search-input w-64 max-md:w-full"
+              :placeholder="t('aiToolset.search')"
+            />
+          </template>
+          <template #toolbar-trailing>
+            <ORefreshButton
+              layout="inline"
+              variant="outline"
+              :last-run-at="lastUpdatedAt"
+              :loading="fetching"
+              shortcut-id="aiToolsetsRefresh"
+              data-test="ai-toolsets-list-refresh-btn"
+              @click="refreshData"
+            />
+          </template>
+          <template #empty>
+            <OEmptyState
+              size="hero"
+              preset="no-ai-toolsets"
+              :filtered="!!filterQuery"
+              @action="(id) => (id === 'clear-filters' ? (filterQuery = '') : addToolset())"
+            />
+          </template>
+
+          <template #cell-kind="{ row }">
+            <OTag type="aiToolsetKind" :value="row.kind" />
+          </template>
+
+          <template #cell-actions="{ row }">
+            <OButton
+              :data-test="`ai-toolset-${row.name}-edit`"
+              data-row-action="edit"
+              variant="ghost"
+              size="icon-sm"
+              class="max-md:hidden"
+              :title="t('common.edit')"
+              @click="editToolset(row)"
+              icon-left="edit"
+            />
+            <OButton
+              :data-test="`ai-toolset-${row.name}-delete`"
+              data-row-action="delete"
+              variant="ghost-destructive"
+              size="icon-sm"
+              class="max-md:hidden"
+              :title="t('common.delete')"
+              @click="confirmDeleteToolset(row)"
+              icon-left="delete"
+            />
+            <ODropdown side="bottom" align="end">
+              <template #trigger>
+                <OButton
+                  icon-left="more-vert"
+                  variant="ghost"
+                  size="icon-xs-sq"
+                  class="md:hidden"
+                  data-test="ai-toolsets-row-more-actions"
+                  @click.stop
+                />
+              </template>
+              <ODropdownItem
+                icon-left="edit"
+                class="md:hidden"
+                :data-test="`ai-toolset-${row.name}-edit-menu`"
+                @select="editToolset(row)"
+              >
+                <span>{{ t("common.edit") }}</span>
+              </ODropdownItem>
+              <ODropdownItem
+                icon-left="delete"
+                variant="destructive"
+                class="md:hidden"
+                :data-test="`ai-toolset-${row.name}-delete-menu`"
+                @select="confirmDeleteToolset(row)"
+              >
+                <span>{{ t("common.delete") }}</span>
+              </ODropdownItem>
+            </ODropdown>
+          </template>
+        </OTable>
+      </div>
+    </OPageLayout>
+
+    <!-- Add / Edit form -->
+    <div v-else>
+      <AddAiToolset @cancel:hideform="hideAddDialog" />
+    </div>
+  </div>
+
+  <!-- Delete confirmation -->
+  <ConfirmDialog
+    :title="t('aiToolset.deleteTitle')"
+    :message="t('aiToolset.deleteMessage', { name: confirmDelete.data?.name ?? '' })"
+    @update:ok="deleteToolset"
+    @update:cancel="cancelDelete"
+    v-model="confirmDelete.visible"
+  />
+</template>
+
+<script lang="ts">
+import { aiToolsetsQuery } from "@/services/ai_toolsets.queries";
+import { aiToolsetKeys } from "@/services/ai_toolsets.querykeys";
+import { queryClient } from "@/composables/query/queryClient";
+import { useOrgId } from "@/composables/query/useOrgId";
+import { useQuery } from "@tanstack/vue-query";
+import { defineComponent, ref, computed, watch, onMounted, onUpdated, Ref } from "vue";
+import { useStore } from "vuex";
+import { useRouter } from "vue-router";
+import { raw, useI18nTyped } from "@/types/i18n";
+import OButton from "@/lib/core/Button/OButton.vue";
+import ODropdown from "@/lib/overlay/Dropdown/ODropdown.vue";
+import ODropdownItem from "@/lib/overlay/Dropdown/ODropdownItem.vue";
+import ORefreshButton from "@/lib/core/RefreshButton/ORefreshButton.vue";
+import OTag from "@/lib/core/Badge/OTag.vue";
+import OSearchInput from "@/lib/forms/SearchInput/OSearchInput.vue";
+import { toast } from "@/lib/feedback/Toast/useToast";
+import OPageLayout from "@/lib/core/PageLayout/OPageLayout.vue";
+import OTable from "@/lib/core/Table/OTable.vue";
+import { COL, type OTableColumnDef } from "@/lib/core/Table/OTable.types";
+import OEmptyState from "@/lib/core/EmptyState/OEmptyState.vue";
+import ConfirmDialog from "@/components/ConfirmDialog.vue";
+import AddAiToolset from "@/components/ai_toolsets/AddAiToolset.vue";
+import { useShortcuts } from "@/lib/vue-shortcut-manager";
+import { isInputFocused } from "@/utils/keyboardShortcuts";
+import aiToolsetsService from "@/services/ai_toolsets";
+
+export default defineComponent({
+  name: "PageAiToolsets",
+  components: {
+    OPageLayout,
+    OEmptyState,
+    ConfirmDialog,
+    AddAiToolset,
+    OButton,
+    ODropdown,
+    ODropdownItem,
+    ORefreshButton,
+    OTag,
+    OSearchInput,
+    OTable,
+  },
+  setup() {
+    const store = useStore();
+    const router = useRouter();
+    const { t } = useI18nTyped();
+
+    const orgIdForList = useOrgId();
+    const toolsetsList = useQuery(() =>
+      Object.assign(aiToolsetsQuery(orgIdForList.value), { enabled: !!orgIdForList.value }),
+    );
+
+    // The list is the query, not a copy: only an observer applies `staleTime` and revalidates on mount.
+    const tabledata: any = computed(() =>
+      (toolsetsList.data.value ?? []).map((item: any) => ({
+        id: item.id,
+        name: item.name,
+        kind: item.kind,
+        description: item.description || "",
+      })),
+    );
+    const showAddDialog = ref(false);
+    const loading = toolsetsList.isPending;
+    // A request is in flight while rows stay on screen — the refresh button's
+    // spinner. `loading` is the skeleton, which only a cold read wants.
+    const fetching = toolsetsList.isFetching;
+    // Epoch ms of the last successful read — drives the button's "1m ago" label.
+    const lastUpdatedAt = toolsetsList.dataUpdatedAt;
+    // A 403 lands in the query's error rather than a loader's catch, so derive the no-access state from it.
+    const forbidden = computed(() => {
+      const e: any = toolsetsList.error.value;
+      return e?.status === 403 || e?.response?.status === 403;
+    });
+    const filterQuery = ref("");
+
+    const columns: OTableColumnDef[] = [
+      {
+        id: "name",
+        header: t("aiToolset.name"),
+        accessorKey: "name",
+        sortable: true,
+        resizable: true,
+        hideable: true,
+        size: COL.name,
+        minSize: 160,
+        meta: { align: "left", flex: true },
+      },
+      {
+        id: "kind",
+        header: t("aiToolset.kind"),
+        accessorKey: "kind",
+        sortable: true,
+        resizable: true,
+        hideable: true,
+        size: COL.type,
+        meta: { align: "left" },
+      },
+      {
+        id: "description",
+        header: t("aiToolset.description"),
+        accessorKey: "description",
+        resizable: true,
+        hideable: true,
+        size: COL.description,
+        meta: { align: "left" },
+      },
+      {
+        id: "actions",
+        header: t("aiToolset.actions"),
+        isAction: true,
+        pinned: "right",
+        size: 80,
+        meta: { align: "center" },
+      },
+    ];
+
+    const resultTotal = ref(0);
+
+    const confirmDelete: Ref<{ visible: boolean; data: any }> = ref({
+      visible: false,
+      data: null,
+    });
+
+    // -----------------------------------------------------------------------
+    // Route-driven show/hide form
+    // -----------------------------------------------------------------------
+    watch(
+      () => router.currentRoute.value.query?.action,
+      (action) => {
+        showAddDialog.value = action === "add" || action === "edit";
+      },
+    );
+
+    onMounted(() => {
+      const action = router.currentRoute.value.query.action;
+      if (action === "add" || action === "edit") showAddDialog.value = true;
+    });
+
+    onUpdated(() => {
+      const action = router.currentRoute.value.query.action;
+      showAddDialog.value = action === "add" || action === "edit";
+    });
+
+    // -----------------------------------------------------------------------
+    // Data loading
+    // -----------------------------------------------------------------------
+    // Bound to refresh / "list changed" events: always hits the server.
+    const refreshData = () => getData(true);
+
+    const getData = async (force = false) => {
+      if (force) await toolsetsList.refetch();
+    };
+
+    let dismissLoading: (() => void) | null = null;
+    watch(
+      loading,
+      (pending) => {
+        if (pending && !dismissLoading) {
+          dismissLoading = toast({
+            variant: "loading",
+            message: t("common.loading"),
+            timeout: 0,
+          });
+        } else if (!pending && dismissLoading) {
+          dismissLoading();
+          dismissLoading = null;
+        }
+      },
+      { immediate: true },
+    );
+
+    watch(toolsetsList.error, (err: any) => {
+      if (!err || err?.status === 403) return;
+      toast({
+        variant: "error",
+        message:
+          err?.response?.data?.message ||
+          t("aiToolset.loadFailed", { product: raw("AI Toolsets") }),
+        timeout: 5000,
+      });
+    });
+
+    // -----------------------------------------------------------------------
+    // Filter
+    // -----------------------------------------------------------------------
+    const visibleRows = computed(() => {
+      const q = filterQuery.value.toLowerCase();
+      if (!q) return tabledata.value;
+      return tabledata.value.filter(
+        (r: any) =>
+          r.name.toLowerCase().includes(q) ||
+          r.kind.toLowerCase().includes(q) ||
+          (r.description || "").toLowerCase().includes(q),
+      );
+    });
+
+    watch(
+      visibleRows,
+      (rows) => {
+        resultTotal.value = rows.length;
+      },
+      { immediate: true },
+    );
+
+    useShortcuts([
+      {
+        id: "aiToolsetsRefresh",
+        handler: () => {
+          if (!isInputFocused()) getData(true);
+        },
+      },
+    ]);
+
+    // -----------------------------------------------------------------------
+    // Navigation helpers
+    // -----------------------------------------------------------------------
+    const addToolset = () => {
+      router.push({
+        query: {
+          action: "add",
+          org_identifier: store.state.selectedOrganization.identifier,
+        },
+      });
+    };
+
+    const editToolset = (row: any) => {
+      router.push({
+        query: {
+          action: "edit",
+          id: row.id,
+          org_identifier: store.state.selectedOrganization.identifier,
+        },
+      });
+    };
+
+    const hideAddDialog = async () => {
+      showAddDialog.value = false;
+      await getData(true);
+      router.push({
+        name: "aiToolsets",
+        query: { org_identifier: store.state.selectedOrganization.identifier },
+      });
+    };
+
+    // -----------------------------------------------------------------------
+    // Delete
+    // -----------------------------------------------------------------------
+    const confirmDeleteToolset = (row: any) => {
+      confirmDelete.value = { visible: true, data: row };
+    };
+
+    const cancelDelete = () => {
+      confirmDelete.value = { visible: false, data: null };
+    };
+
+    const deleteToolset = () => {
+      const row = confirmDelete.value.data;
+      if (!row?.id) return;
+
+      const dismiss = toast({
+        variant: "loading",
+        message: t("common.pleaseWait"),
+        timeout: 0,
+      });
+
+      aiToolsetsService
+        .delete(store.state.selectedOrganization.identifier, row.id)
+        .then(() => {
+          toast({ variant: "success", message: t("aiToolset.deletedSuccessfully") });
+          // Drop the row from the cache first so it disappears now, not when
+          // the refetch lands; the forced reload re-persists the list.
+          queryClient.setQueriesData(
+            { queryKey: aiToolsetKeys.all(store.state.selectedOrganization.identifier) },
+            (list: any) =>
+              Array.isArray(list) ? list.filter((tool: any) => tool.id !== row.id) : list,
+          );
+          getData(true);
+        })
+        .catch((err) => {
+          if (err?.status !== 403) {
+            toast({
+              variant: "error",
+              message:
+                err?.response?.data?.message ||
+                t("aiToolset.deleteFailed", { product: raw("AI Toolset") }),
+            });
+          }
+        })
+        .finally(() => {
+          dismiss();
+          confirmDelete.value = { visible: false, data: null };
+        });
+    };
+
+    return {
+      refreshData,
+      t,
+      store,
+      loading,
+      fetching,
+      lastUpdatedAt,
+      forbidden,
+      tabledata,
+      columns,
+      showAddDialog,
+      resultTotal,
+      filterQuery,
+      visibleRows,
+      confirmDelete,
+      addToolset,
+      editToolset,
+      hideAddDialog,
+      getData,
+      confirmDeleteToolset,
+      cancelDelete,
+      deleteToolset,
+    };
+  },
+});
+</script>
