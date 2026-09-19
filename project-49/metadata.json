@@ -1,0 +1,10 @@
+{
+  "number": 49,
+  "repository": "openxla/xla",
+  "url": "https://github.com/openxla/xla",
+  "description": "A machine learning compiler for GPUs, CPUs, and ML accelerators",
+  "language": "C++",
+  "stars": 4540,
+  "default_branch": "main",
+  "source_zip_url": "https://github.com/openxla/xla/archive/refs/heads/main.zip"
+}

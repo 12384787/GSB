@@ -1,0 +1,10 @@
+{
+  "number": 50,
+  "repository": "github/spec-kit",
+  "url": "https://github.com/github/spec-kit",
+  "description": "💫 Toolkit to help you get started with Spec-Driven Development",
+  "language": "Python",
+  "stars": 137734,
+  "default_branch": "main",
+  "source_zip_url": "https://github.com/github/spec-kit/archive/refs/heads/main.zip"
+}

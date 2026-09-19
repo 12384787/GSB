@@ -1,0 +1,5 @@
+任务类型：Bug 修复
+任务难度：困难
+语言/框架：多语言
+
+请在已有的 langgenius/dify 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：。围绕真实入口（.agents,.claude .coveragerc,.devcontainer .dockerignore,.editorconfig .gitattributes,.github .gitignore,.vite-hooks .vscode,AGENTS.md AUTHORS,CLAUDE.md CONTRIBUTING.md,LICENSE Makefile,README.md SECURITY.md,api cli,codecov.yml depot.json,dev dify-agent-runtime,dify-agent docker,docs e2e,eslint.config.mjs images,knip.config.ts lint.config.ts,oxlint-suppressions.json package.json,packages pnpm-lock.yaml,pnpm-workspace.yaml scripts,sdks vite.config.ts,web）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
