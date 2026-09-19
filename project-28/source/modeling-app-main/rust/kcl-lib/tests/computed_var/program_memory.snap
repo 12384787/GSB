@@ -1,0 +1,127 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Variables in memory after executing computed_var.kcl
+---
+{
+  "arr": {
+    "type": "HomArray",
+    "value": [
+      {
+        "type": "Number",
+        "value": 0.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 0.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 0.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 10.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      }
+    ]
+  },
+  "i": {
+    "type": "Number",
+    "value": 3.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "obj": {
+    "type": "Object",
+    "value": {
+      "bar": {
+        "type": "Number",
+        "value": 0.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      "foo": {
+        "type": "Number",
+        "value": 1.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      }
+    },
+    "constrainable": false
+  },
+  "one": {
+    "type": "Number",
+    "value": 1.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "ten": {
+    "type": "Number",
+    "value": 10.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "x": {
+    "type": "Number",
+    "value": 1.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  }
+}

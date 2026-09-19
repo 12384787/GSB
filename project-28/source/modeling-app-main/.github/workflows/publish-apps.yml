@@ -1,0 +1,154 @@
+name: publish-apps
+
+on:
+  release:
+    types: [published]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  release-desktop:
+    runs-on: namespace-profile-ubuntu-2-cores
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Find tag workflow ID
+        id: tag_workflow_id
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          id=$(gh run ls --repo kittycad/modeling-app -w build-apps.yml --branch "${RELEASE_TAG_NAME}" --json databaseId | jq '.[0].databaseId')
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: out-universal-windows
+          path: out
+          run-id: ${{ steps.tag_workflow_id.outputs.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: out-yml-windows
+          path: out
+          run-id: ${{ steps.tag_workflow_id.outputs.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: out-universal-macos
+          path: out
+          run-id: ${{ steps.tag_workflow_id.outputs.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: out-yml-macos
+          path: out
+          run-id: ${{ steps.tag_workflow_id.outputs.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: out-arm64-linux
+          path: out
+          run-id: ${{ steps.tag_workflow_id.outputs.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: out-x64-linux
+          path: out
+          run-id: ${{ steps.tag_workflow_id.outputs.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: out-yml-linux
+          path: out
+          run-id: ${{ steps.tag_workflow_id.outputs.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: out-download-json
+          path: out
+          run-id: ${{ steps.tag_workflow_id.outputs.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: List artifacts
+        run: ls -R out
+
+      - name: Override release notes
+        env:
+          NOTES: ${{ github.event.release.body }}
+        run: npm run files:set-notes
+
+      - name: Authenticate to Google Cloud
+        uses: 'google-github-actions/auth@v3.0.0'
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CLOUD_DL_SA }}'
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3.0.1
+        with:
+          project_id: ${{ env.GOOGLE_CLOUD_PROJECT_ID }}
+
+      - name: Upload release files to public bucket
+        uses: google-github-actions/upload-cloud-storage@v3.0.0
+        with:
+          path: out
+          glob: '*'
+          parent: false
+          process_gcloudignore: false
+          destination: 'dl.kittycad.io/releases/design-studio'
+
+      - name: Invalidate bucket cache on latest*.yml and last_download.json files
+        run: npm run files:invalidate-bucket
+
+      - name: Upload release files to Github
+        if: ${{ github.event_name == 'release' }}
+        uses: softprops/action-gh-release@v3.0.3
+        with:
+          files: 'out/Zoo*'
+
+  release-web:
+    runs-on: namespace-profile-ubuntu-2-cores
+    permissions: {}
+    steps:
+      - name: Deploy to Vercel Production
+        run: curl --request POST "${{ secrets.VERCEL_DEPLOY_HOOK_URL }}"
+
+  announce-release:
+    needs: [release-desktop, release-web]
+    runs-on: namespace-profile-ubuntu-2-cores
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version-file: .tool-versions
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Announce Release
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RELEASE_VERSION: ${{ github.event.release.tag_name }}
+          RELEASE_BODY: ${{ github.event.release.body }}
+        run: python public/announce_release.py

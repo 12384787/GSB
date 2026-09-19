@@ -1,0 +1,83 @@
+import {ChevronLeftIcon} from '@sanity/icons/ChevronLeft'
+import {ChevronRightIcon} from '@sanity/icons/ChevronRight'
+import {Text} from '@sanity/ui'
+import {getTheme_v2} from '@sanity/ui/theme'
+import {useCallback} from 'react'
+import {styled} from 'styled-components'
+import {Flex, Box} from 'ui5'
+
+import {Button} from '../../../../ui-components/button/Button'
+import {Tooltip} from '../../../../ui-components/tooltip/Tooltip'
+import {TooltipDelayGroupProvider} from '../../../../ui-components/tooltipDelayGroupProvider/TooltipDelayGroupProvider'
+import {useTranslation} from '../../../i18n/hooks/useTranslation'
+import {useTasksNavigation} from '../../context/navigation/useTasksNavigation'
+import {tasksLocaleNamespace} from '../../i18n'
+import {type TaskDocument} from '../../types'
+
+interface TasksActiveTabNavigationProps {
+  items: TaskDocument[]
+}
+
+const Divider = styled.div((props) => {
+  const theme = getTheme_v2(props.theme)
+
+  return `
+    height: 25px;
+    width: 1px;
+    background-color: ${theme.color.input.default.enabled.border};
+  `
+})
+
+/**
+ * @internal
+ * Navigation buttons for the active tab the user selected, will be shown when editing a task.
+ */
+export function TasksActiveTabNavigation(props: TasksActiveTabNavigationProps) {
+  const {items: allItems} = props
+  const {state, setViewMode} = useTasksNavigation()
+  const {selectedTask} = state
+  const items = allItems.filter((t) => t.status === 'open')
+  const currentItemIndex = items.findIndex((item) => item._id === selectedTask)
+
+  const goToPreviousTask = useCallback(() => {
+    const prevTaskId =
+      currentItemIndex > 0 ? items[currentItemIndex - 1]._id : items[items.length - 1]._id
+    setViewMode({type: 'edit', id: prevTaskId})
+  }, [currentItemIndex, items, setViewMode])
+
+  const goToNextTask = useCallback(() => {
+    const nextTaskId =
+      currentItemIndex < items.length - 1 ? items[currentItemIndex + 1]._id : items[0]._id
+    setViewMode({type: 'edit', id: nextTaskId})
+  }, [currentItemIndex, items, setViewMode])
+
+  const {t} = useTranslation(tasksLocaleNamespace)
+
+  if (!items.length) return null
+  return (
+    <TooltipDelayGroupProvider>
+      <Flex gap={1} alignItems="center">
+        <Button
+          tooltipProps={{content: t('buttons.previous.tooltip')}}
+          mode="bleed"
+          icon={ChevronLeftIcon}
+          onClick={goToPreviousTask}
+        />
+        <Tooltip content={t('panel.navigation.tooltip')}>
+          <Box paddingY={2}>
+            <Text size={1}>
+              {currentItemIndex + 1} / {items.length}
+            </Text>
+          </Box>
+        </Tooltip>
+        <Button
+          tooltipProps={{content: t('buttons.next.tooltip')}}
+          mode="bleed"
+          icon={ChevronRightIcon}
+          onClick={goToNextTask}
+        />
+        <Divider />
+      </Flex>
+    </TooltipDelayGroupProvider>
+  )
+}

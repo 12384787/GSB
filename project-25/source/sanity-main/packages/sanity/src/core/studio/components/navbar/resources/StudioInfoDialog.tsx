@@ -1,0 +1,391 @@
+import {CogIcon} from '@sanity/icons/Cog'
+import {GithubIcon} from '@sanity/icons/Github'
+import {LaunchIcon} from '@sanity/icons/Launch'
+import {RefreshIcon} from '@sanity/icons/Refresh'
+import {WarningOutlineIcon} from '@sanity/icons/WarningOutline'
+import {SanityMonogram} from '@sanity/logos'
+import {Badge, Card, Inline, Spinner, Stack, Text} from '@sanity/ui'
+import {useEffect, useId} from 'react'
+import semver, {type SemVer} from 'semver'
+import {styled} from 'styled-components'
+import {Grid, Flex} from 'ui5'
+
+import {Button} from '../../../../../ui-components/button/Button'
+import {Dialog} from '../../../../../ui-components/dialog/Dialog'
+import {Tooltip} from '../../../../../ui-components/tooltip/Tooltip'
+import {TextWithTone} from '../../../../components/textWithTone/TextWithTone'
+import {isProd} from '../../../../environment'
+import {useTranslation} from '../../../../i18n/hooks/useTranslation'
+import {Translate} from '../../../../i18n/Translate'
+import {useEnvAwareSanityWebsiteUrl} from '../../../hooks/useEnvAwareSanityWebsiteUrl'
+import {usePackageVersionStatus} from '../../../packageVersionStatus/usePackageVersionStatus'
+import {useWorkspace} from '../../../workspace'
+
+interface StudioInfoDialogProps {
+  onClose: () => void
+}
+
+const MonogramContainer = styled(Card).attrs({
+  overflow: 'hidden',
+  radius: 4,
+})`
+  height: ${75}px;
+  width: ${75}px;
+`
+
+function reload() {
+  window.location.reload()
+}
+
+function getVersionType(ver: SemVer): 'development' | 'prerelease' | 'default' {
+  if (ver.prerelease.length === 0) {
+    return 'default'
+  }
+  if (ver.prerelease.length === 1 && ver.prerelease[0] === 'dev') {
+    return 'development'
+  }
+  return 'prerelease'
+}
+
+const TruncateBadge = styled(Badge)`
+  display: block;
+
+  span {
+    display: block;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    overflow: clip;
+  }
+`
+
+const HEX_ONLY = /^[0-9a-fA-F]+$/i
+function resolveGithubURLFromVersion(ver: SemVer) {
+  const preids = ver.prerelease
+  if (preids.length === 0) {
+    return `https://github.com/sanity-io/sanity/releases/tag/v${ver.version}`
+  }
+  const isPR = preids[0] === 'pr' && typeof preids[1] === 'number'
+  if (isPR) {
+    return `https://github.com/sanity-io/sanity/pull/${preids[1]}`
+  }
+  const isNextWithCommitHash =
+    preids[0] === 'next' && ver.build.length === 1 && HEX_ONLY.test(ver.build[0])
+  if (isNextWithCommitHash) {
+    return `https://github.com/sanity-io/sanity/tree/${ver.build[0]}`
+  }
+  const isGitBranch = ver.prerelease[0] === 'git'
+  const hasBuildInfo = ver.build.length > 0 && HEX_ONLY.test(ver.build[0])
+
+  // note: slugified branch names in semver preids cannot be mapped back to their original branch name on github
+  // due to the limited set of chars that's valid for preids
+  if (isGitBranch && hasBuildInfo) {
+    return `https://github.com/sanity-io/sanity/commit/${ver.build[0]}`
+  }
+  return undefined
+}
+export function StudioInfoDialog(props: StudioInfoDialogProps) {
+  const {t} = useTranslation()
+  const {onClose} = props
+  const dialogId = useId()
+  const {projectId} = useWorkspace()
+
+  const {
+    isAutoUpdating,
+    autoUpdatingVersion,
+    currentVersion,
+    importMapInfo,
+    latestTaggedVersion,
+    versionCheckStatus,
+    checkForUpdates,
+    versionDeprecation,
+  } = usePackageVersionStatus()
+
+  const isUpToDate =
+    latestTaggedVersion &&
+    currentVersion &&
+    // let prereleases that's higher than latest count as up-to-date
+    currentVersion.compareMain(latestTaggedVersion) >= 0
+
+  const currentVersionType = getVersionType(currentVersion)
+
+  const newAutoUpdateVersionAvailable =
+    currentVersion && autoUpdatingVersion ? semver.neq(currentVersion, autoUpdatingVersion) : false
+
+  useEffect(() => {
+    checkForUpdates()
+    // check for updates every 10s while dialog is open
+    const interval = setInterval(checkForUpdates, 10_000)
+    return () => clearInterval(interval)
+  }, [checkForUpdates])
+
+  const githubUrl = resolveGithubURLFromVersion(currentVersion)
+  const sanityWebsiteUrl = useEnvAwareSanityWebsiteUrl()
+
+  const importMapWarning =
+    importMapInfo?.valid && !importMapInfo.appId ? (
+      <Card padding={4} tone="caution">
+        <Flex alignItems="flex-start" gap={3}>
+          <TextWithTone tone="caution">
+            <WarningOutlineIcon />
+          </TextWithTone>
+          <Stack gap={4}>
+            <TextWithTone size={1} tone="caution" weight="medium">
+              {t('about-dialog.configuration-issue.header')}
+            </TextWithTone>
+            <TextWithTone size={1} tone="caution">
+              <Translate t={t} i18nKey="about-dialog.configuration-issue.missing-appid" />
+            </TextWithTone>
+            <TextWithTone size={1} tone="caution">
+              <Text muted size={1}>
+                <a
+                  href="https://www.sanity.io/docs/studio/latest-version-of-sanity"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {t('about-dialog.configuration-issue.missing-appid.view-documentation')} &rarr;
+                </a>
+              </Text>
+            </TextWithTone>
+          </Stack>
+        </Flex>
+        <Stack gap={2} />
+      </Card>
+    ) : null
+
+  const deprecationWarning = versionDeprecation ? (
+    <Card padding={4} tone="caution" data-testid="studio-version-deprecation-warning">
+      <Flex alignItems="flex-start" gap={3}>
+        <TextWithTone tone="caution">
+          <WarningOutlineIcon />
+        </TextWithTone>
+        <Stack gap={4}>
+          <TextWithTone size={1} tone="caution" weight="medium">
+            {t('about-dialog.version-info.deprecated.header')}
+          </TextWithTone>
+          <TextWithTone size={1} tone="caution">
+            {t('about-dialog.version-info.deprecated.current', {
+              version: versionDeprecation.version.version,
+            })}
+          </TextWithTone>
+          {versionDeprecation.reason ? (
+            <TextWithTone size={1} tone="caution">
+              {t('about-dialog.version-info.deprecated.reason', {
+                reason: versionDeprecation.reason,
+              })}
+            </TextWithTone>
+          ) : null}
+          <TextWithTone size={1} tone="caution">
+            {versionDeprecation.isPinned
+              ? // the "Manage version" button below the card leads to the pin settings
+                t('about-dialog.version-info.deprecated.next-step.pinned')
+              : t('about-dialog.version-info.deprecated.next-step.upgrade')}
+          </TextWithTone>
+          {versionDeprecation.isPinned ? null : (
+            <TextWithTone size={1} tone="caution">
+              <Text muted size={1}>
+                <a
+                  href="https://www.sanity.io/docs/studio/upgrade"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {t('about-dialog.version-info.deprecated.next-step.upgrade.learn-how')} &rarr;
+                </a>
+              </Text>
+            </TextWithTone>
+          )}
+        </Stack>
+      </Flex>
+    </Card>
+  ) : null
+
+  const currentVersionDeprecated =
+    versionDeprecation !== undefined && semver.eq(versionDeprecation.version, currentVersion)
+  const autoUpdatingVersionDeprecated =
+    versionDeprecation !== undefined &&
+    autoUpdatingVersion !== undefined &&
+    semver.eq(versionDeprecation.version, autoUpdatingVersion)
+
+  const versionBadgeTone = currentVersionDeprecated
+    ? 'caution'
+    : currentVersionType === 'development'
+      ? 'caution'
+      : currentVersionType === 'prerelease'
+        ? 'suggest'
+        : 'neutral'
+  return (
+    <Dialog width={0} onClickOutside={onClose} id={dialogId} padding={false}>
+      {versionCheckStatus?.checking ? (
+        <Flex margin={2} padding={2} style={{position: 'absolute', right: 0}}>
+          <Spinner size={0} />
+        </Flex>
+      ) : null}
+
+      <Stack gap={3} paddingY={3}>
+        <Flex alignItems="center" justifyContent="center" paddingY={4}>
+          <MonogramContainer>
+            <SanityMonogram height={75} width={75} />
+          </MonogramContainer>
+        </Flex>
+        <Grid gridTemplateColumns="repeat(2, minmax(0, 1fr))" gap={2}>
+          <Flex justifyContent="flex-end" alignItems="center">
+            <Text as="h2" size={1} weight="semibold">
+              Sanity Studio
+            </Text>
+          </Flex>
+          <Tooltip
+            placement="bottom"
+            content={
+              <Card>
+                <Inline gap={1}>
+                  <Badge tone={versionBadgeTone}>
+                    {ensureVersionPrefix(currentVersion.version)}
+                  </Badge>
+                  <Badge>
+                    {currentVersionDeprecated
+                      ? t('about-dialog.version-info.tooltip.deprecated')
+                      : currentVersionType === 'development'
+                        ? t('about-dialog.version-info.tooltip.development')
+                        : currentVersionType === 'prerelease'
+                          ? t('about-dialog.version-info.tooltip.prerelease')
+                          : t('about-dialog.version-info.tooltip.up-to-date')}
+                  </Badge>
+                </Inline>
+              </Card>
+            }
+          >
+            <Flex gap={2} alignItems="center" paddingRight={2}>
+              <TruncateBadge tone={versionBadgeTone}>
+                {currentVersion ? ensureVersionPrefix(currentVersion.version) : 'unknown'}
+              </TruncateBadge>
+              {githubUrl && (
+                <Button
+                  as="a"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  icon={GithubIcon}
+                  mode="bleed"
+                  tooltipProps={{content: t('about-dialog.version-info.view-on-github')}}
+                  href={githubUrl}
+                />
+              )}
+            </Flex>
+          </Tooltip>
+
+          {isAutoUpdating && newAutoUpdateVersionAvailable ? (
+            <>
+              <Flex justifyContent="flex-end" alignItems="center">
+                <Text size={1} weight="semibold">
+                  {/* Note that this is not necessary a *higher* version than current, it's the new version made available for auto updates,
+                   which in some cases could even be a downgrade compared to current */}
+                  {t('about-dialog.version-info.new-version.text')}
+                </Text>
+              </Flex>
+              <Flex justifyContent="flex-start" alignItems="center" gap={2}>
+                <Badge tone={autoUpdatingVersionDeprecated ? 'caution' : 'primary'}>
+                  {autoUpdatingVersion && ensureVersionPrefix(autoUpdatingVersion?.version)}
+                </Badge>
+                <Button
+                  onClick={reload}
+                  mode="bleed"
+                  tone="primary"
+                  text={
+                    // save some space by not showing text on button if prerelease
+                    autoUpdatingVersion && getVersionType(autoUpdatingVersion) === 'prerelease'
+                      ? undefined
+                      : t('about-dialog.version-info.update-button.text')
+                  }
+                  tooltipProps={{
+                    content: (
+                      <Text size={1}>{t('about-dialog.version-info.reload-to-update')}</Text>
+                    ),
+                  }}
+                  icon={RefreshIcon}
+                />
+              </Flex>
+            </>
+          ) : isUpToDate ? null : (
+            <>
+              <Flex justifyContent="flex-end" alignItems="center">
+                <Text size={1} weight="semibold">
+                  {t('about-dialog.version-info.latest-version.header')}
+                </Text>
+              </Flex>
+              <Flex justifyContent="flex-start" alignItems="center" gap={2}>
+                <Badge tone="primary">
+                  {latestTaggedVersion
+                    ? ensureVersionPrefix(latestTaggedVersion.version)
+                    : 'unknown'}
+                </Badge>
+
+                {
+                  // this row only renders when a reload won't deliver the latest version, so
+                  // link to how to upgrade manually (hidden on dev/prerelease builds to save space)
+                  currentVersionType !== 'default' ? null : (
+                    <Button
+                      as="a"
+                      href="https://www.sanity.io/docs/upgrade"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      mode="bleed"
+                      tooltipProps={{content: t('about-dialog.version-info.update-button.tooltip')}}
+                      text={t('about-dialog.version-info.update-button.text')}
+                      iconRight={LaunchIcon}
+                    />
+                  )
+                }
+              </Flex>
+            </>
+          )}
+        </Grid>
+        <Stack gap={2} paddingY={3}>
+          {isAutoUpdating ? (
+            <Card tone="transparent" padding={2} radius={3} marginX={2}>
+              <Flex alignItems="center" justifyContent="space-evenly" gap={2}>
+                <Text size={1} muted>
+                  {t('about-dialog.version-info.auto-updates.enabled')}
+                </Text>
+                <Button
+                  as="a"
+                  href={`${sanityWebsiteUrl}/manage/project/${projectId}/studios?host=${document.location.hostname}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  mode="ghost"
+                  text={t('about-dialog.version-info.auto-updates.manage-version')}
+                  icon={CogIcon}
+                />
+              </Flex>
+            </Card>
+          ) : isProd ? (
+            // note: in dev we currently can't tell if auto updates is enabled or not,
+            // so instead of showing misleading info, we just don't show anything
+            <Card tone="transparent" padding={2} radius={3} marginX={2}>
+              <Flex alignItems="center" justifyContent="space-evenly" gap={2}>
+                <Text size={1} muted>
+                  {t('about-dialog.version-info.auto-updates.disabled')}
+                </Text>
+                <Button
+                  as="a"
+                  href="https://www.sanity.io/docs/auto-updating-studios"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  mode="ghost"
+                  text={t('about-dialog.version-info.auto-updates.how-to-enable')}
+                  iconRight={LaunchIcon}
+                />
+              </Flex>
+            </Card>
+          ) : null}
+          {deprecationWarning}
+          {importMapWarning}
+        </Stack>
+        <Stack paddingX={3}>
+          <Button tone="primary" text="OK" paddingY={3} onClick={onClose} />
+        </Stack>
+      </Stack>
+    </Dialog>
+  )
+}
+
+function ensureVersionPrefix(str: string) {
+  return str.startsWith('v') ? str : `v${str}`
+}

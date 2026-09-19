@@ -1,0 +1,20 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Result of unparsing pipe_as_arg.kcl
+---
+fn cube(length, center) {
+  return length
+}
+
+fn double(@x) {
+  return x * 2
+}
+fn width() {
+  return 200
+}
+
+myCube = cube(
+  length = 200
+    |> double(%),
+  center = [0, 0],
+)

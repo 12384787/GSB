@@ -1,0 +1,344 @@
+# Change Log
+
+All notable changes to this project will be documented in this file.
+See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
+## [6.0.0](https://github.com/sanity-io/sanity/compare/v5.31.0...v6.0.0) (2026-06-11)
+
+### ⚠ BREAKING CHANGES
+
+* drop support for node 20 (#12859)
+
+### Bug Fixes
+
+* drop support for node 20 ([#12859](https://github.com/sanity-io/sanity/issues/12859)) ([d02289a](https://github.com/sanity-io/sanity/commit/d02289a2ac5aca3de55853812ac6e0b659fa2ef4))
+## [5.26.0](https://github.com/sanity-io/sanity/compare/v5.25.1...v5.26.0) (2026-05-19)
+
+### Reverts
+
+* "chore(release): publish v5.26.0" ([#12849](https://github.com/sanity-io/sanity/issues/12849)) ([70545b8](https://github.com/sanity-io/sanity/commit/70545b8d5421f875a171145fe5312742c0c4f959))
+
+## [5.18.0](https://github.com/sanity-io/sanity/compare/v5.17.1...v5.18.0) (2026-03-24)
+
+**Note:** Version bump only for package groq
+
+## [5.17.1](https://github.com/sanity-io/sanity/compare/v5.17.0...v5.17.1) (2026-03-17)
+
+**Note:** Version bump only for package groq
+
+## [5.17.0](https://github.com/sanity-io/sanity/compare/v5.16.0...v5.17.0) (2026-03-17)
+
+**Note:** Version bump only for package groq
+
+## [5.16.0](https://github.com/sanity-io/sanity/compare/v5.15.0...v5.16.0) (2026-03-14)
+
+**Note:** Version bump only for package groq
+
+## [5.15.0](https://github.com/sanity-io/sanity/compare/v5.14.1...v5.15.0) (2026-03-12)
+
+### Features
+
+* upgrade to new `@sanity/cli` ([#12200](https://github.com/sanity-io/sanity/issues/12200)) ([902075d](https://github.com/sanity-io/sanity/commit/902075d3a4567223745988ab706a6009a86419b7)) by Espen Hovlandsdal (espen@hovlandsdal.com)
+
+## [5.14.1](https://github.com/sanity-io/sanity/compare/v5.14.0...v5.14.1) (2026-03-10)
+
+**Note:** Version bump only for package groq
+
+## [5.14.0](https://github.com/sanity-io/sanity/compare/v5.13.0...v5.14.0) (2026-03-10)
+
+**Note:** Version bump only for package groq
+
+## [5.13.0](https://github.com/sanity-io/sanity/compare/v5.12.0...v5.13.0) (2026-03-03)
+
+### Bug Fixes
+
+* **groq:** resolve CJS type export issue by removing groq.d.cts ([#12293](https://github.com/sanity-io/sanity/issues/12293)) ([9485b3c](https://github.com/sanity-io/sanity/commit/9485b3c0f8fd7747b5645c504c0291586318f014)) by Copilot (198982749+Copilot@users.noreply.github.com)
+
+## [5.12.0](https://github.com/sanity-io/sanity/compare/v5.11.0...v5.12.0) (2026-02-24)
+
+**Note:** Version bump only for package groq
+
+## [5.11.0](https://github.com/sanity-io/sanity/compare/v5.10.0...v5.11.0) (2026-02-19)
+
+**Note:** Version bump only for package groq
+
+## [5.10.0](https://github.com/sanity-io/sanity/compare/v5.9.0...v5.10.0) (2026-02-17)
+
+**Note:** Version bump only for package groq
+
+## [5.9.0](https://github.com/sanity-io/sanity/compare/v5.8.1...v5.9.0) (2026-02-10)
+
+### Reverts
+
+* rollback v5.9.0 version bump ([#12139](https://github.com/sanity-io/sanity/issues/12139)) ([4195d26](https://github.com/sanity-io/sanity/commit/4195d269f400347fb16765400842f765eb1625ec)) by Bjørge Næss (bjoerge@gmail.com)
+
+## [5.8.1](https://github.com/sanity-io/sanity/compare/v5.8.0...v5.8.1) (2026-02-05)
+
+**Note:** Version bump only for package groq
+
+## [5.8.0](https://github.com/sanity-io/sanity/compare/v5.7.0...v5.8.0) (2026-02-03)
+
+**Note:** Version bump only for package groq
+
+## [5.7.0](https://github.com/sanity-io/sanity/compare/v5.6.0...v5.7.0) (2026-01-27)
+
+**Note:** Version bump only for package groq
+
+## [5.6.0](https://github.com/sanity-io/sanity/compare/v5.5.0...v5.6.0) (2026-01-22)
+
+**Note:** Version bump only for package groq
+
+## [5.5.0](https://github.com/sanity-io/sanity/compare/v5.4.0...v5.5.0) (2026-01-19)
+
+**Note:** Version bump only for package groq
+
+## [5.4.0](https://github.com/sanity-io/sanity/compare/v5.3.1...v5.4.0) (2026-01-15)
+
+**Note:** Version bump only for package groq
+
+## [5.3.1](https://github.com/sanity-io/sanity/compare/v5.3.0...v5.3.1) (2026-01-14)
+
+**Note:** Version bump only for package groq
+
+## [5.3.0](https://github.com/sanity-io/sanity/compare/v5.2.0...v5.3.0) (2026-01-13)
+
+**Note:** Version bump only for package groq
+
+## [5.2.0](https://github.com/sanity-io/sanity/compare/v5.1.0...v5.2.0) (2026-01-07)
+
+**Note:** Version bump only for package groq
+
+## [5.1.0](https://github.com/sanity-io/sanity/compare/v5.0.1...v5.1.0) (2025-12-22)
+
+**Note:** Version bump only for package groq
+
+## [5.0.1](https://github.com/sanity-io/sanity/compare/v5.0.0...v5.0.1) (2025-12-17)
+
+**Note:** Version bump only for package groq
+
+## [5.0.0](https://github.com/sanity-io/sanity/compare/v4.22.0...v5.0.0) (2025-12-16)
+
+**Note:** Version bump only for package groq
+
+## [4.22.0](https://github.com/sanity-io/sanity/compare/v4.21.1...v4.22.0) (2025-12-16)
+
+**Note:** Version bump only for package groq
+
+## [4.21.1](https://github.com/sanity-io/sanity/compare/v4.21.0...v4.21.1) (2025-12-11)
+
+**Note:** Version bump only for package groq
+
+## [4.21.0](https://github.com/sanity-io/sanity/compare/v4.20.3...v4.21.0) (2025-12-09)
+
+**Note:** Version bump only for package groq
+
+## [4.20.3](https://github.com/sanity-io/sanity/compare/v4.20.2...v4.20.3) (2025-12-04)
+
+**Note:** Version bump only for package groq
+
+## [4.20.2](https://github.com/sanity-io/sanity/compare/v4.20.1...v4.20.2) (2025-12-04)
+
+**Note:** Version bump only for package groq
+
+## [4.20.1](https://github.com/sanity-io/sanity/compare/v4.20.0...v4.20.1) (2025-12-03)
+
+**Note:** Version bump only for package groq
+
+## [4.20.0](https://github.com/sanity-io/sanity/compare/v4.19.0...v4.20.0) (2025-12-02)
+
+**Note:** Version bump only for package groq
+
+## [4.19.0](https://github.com/sanity-io/sanity/compare/v4.18.0...v4.19.0) (2025-11-25)
+
+**Note:** Version bump only for package groq
+
+## [4.18.0](https://github.com/sanity-io/sanity/compare/v4.17.0...v4.18.0) (2025-11-21)
+
+**Note:** Version bump only for package groq
+
+## [4.17.0](https://github.com/sanity-io/sanity/compare/v4.16.0...v4.17.0) (2025-11-20)
+
+**Note:** Version bump only for package groq
+
+## [4.16.0](https://github.com/sanity-io/sanity/compare/v4.15.0...v4.16.0) (2025-11-18)
+
+**Note:** Version bump only for package groq
+
+## [4.15.0](https://github.com/sanity-io/sanity/compare/v4.14.2...v4.15.0) (2025-11-11)
+
+**Note:** Version bump only for package groq
+
+## [4.14.2](https://github.com/sanity-io/sanity/compare/v4.14.1...v4.14.2) (2025-11-07)
+
+**Note:** Version bump only for package groq
+
+## [4.14.1](https://github.com/sanity-io/sanity/compare/v4.14.0...v4.14.1) (2025-11-06)
+
+**Note:** Version bump only for package groq
+
+## [4.14.0](https://github.com/sanity-io/sanity/compare/v4.13.0...v4.14.0) (2025-11-06)
+
+**Note:** Version bump only for package groq
+
+## [4.13.0](https://github.com/sanity-io/sanity/compare/v4.12.0...v4.13.0) (2025-11-03)
+
+**Note:** Version bump only for package groq
+
+## [4.12.0](https://github.com/sanity-io/sanity/compare/v4.11.0...v4.12.0) (2025-10-28)
+
+**Note:** Version bump only for package groq
+
+## [4.11.0](https://github.com/sanity-io/sanity/compare/v4.10.3...v4.11.0) (2025-10-21)
+
+**Note:** Version bump only for package groq
+
+## [4.10.3](https://github.com/sanity-io/sanity/compare/v4.10.2...v4.10.3) (2025-10-14)
+
+**Note:** Version bump only for package groq
+
+## [4.10.2](https://github.com/sanity-io/sanity/compare/v4.10.1...v4.10.2) (2025-09-30)
+
+**Note:** Version bump only for package groq
+
+## [4.10.1](https://github.com/sanity-io/sanity/compare/v4.10.0...v4.10.1) (2025-09-25)
+
+**Note:** Version bump only for package groq
+
+## [4.10.0](https://github.com/sanity-io/sanity/compare/v4.9.0...v4.10.0) (2025-09-23)
+
+**Note:** Version bump only for package groq
+
+## [4.9.0](https://github.com/sanity-io/sanity/compare/v4.8.1...v4.9.0) (2025-09-16)
+
+**Note:** Version bump only for package groq
+
+## [4.8.1](https://github.com/sanity-io/sanity/compare/v4.8.0...v4.8.1) (2025-09-10)
+
+**Note:** Version bump only for package groq
+
+## [4.8.0](https://github.com/sanity-io/sanity/compare/v4.7.0...v4.8.0) (2025-09-10)
+
+**Note:** Version bump only for package groq
+
+## [4.7.0](https://github.com/sanity-io/sanity/compare/v4.6.1...v4.7.0) (2025-09-09)
+
+**Note:** Version bump only for package groq
+
+## [4.6.1](https://github.com/sanity-io/sanity/compare/v4.6.0...v4.6.1) (2025-09-02)
+
+**Note:** Version bump only for package groq
+
+## [4.6.0](https://github.com/sanity-io/sanity/compare/v4.5.0...v4.6.0) (2025-08-26)
+
+**Note:** Version bump only for package groq
+
+## [4.5.0](https://github.com/sanity-io/sanity/compare/v4.4.1...v4.5.0) (2025-08-19)
+
+**Note:** Version bump only for package groq
+
+## [4.4.1](https://github.com/sanity-io/sanity/compare/v4.4.0...v4.4.1) (2025-08-14)
+
+### Bug Fixes
+
+* allow v20 in node engines ([#10290](https://github.com/sanity-io/sanity/issues/10290)) ([73150e9](https://github.com/sanity-io/sanity/commit/73150e9befde5cb531279c9b206a08682df3ff38))
+
+## [4.4.0](https://github.com/sanity-io/sanity/compare/v4.3.0...v4.4.0) (2025-08-13)
+
+### Bug Fixes
+
+* update engines to require node >=22.12.0 ([#10227](https://github.com/sanity-io/sanity/issues/10227)) ([c1b9fe2](https://github.com/sanity-io/sanity/commit/c1b9fe2b70ccbb9ff4bce0845dfaad25cafcd35a))
+
+## [4.3.0](https://github.com/sanity-io/sanity/compare/v4.2.0...v4.3.0) (2025-08-05)
+
+**Note:** Version bump only for package groq
+
+## [4.2.0](https://github.com/sanity-io/sanity/compare/v4.1.1...v4.2.0) (2025-07-29)
+
+**Note:** Version bump only for package groq
+
+## [4.1.1](https://github.com/sanity-io/sanity/compare/v4.1.0...v4.1.1) (2025-07-22)
+
+**Note:** Version bump only for package groq
+
+## [4.1.0](https://github.com/sanity-io/sanity/compare/v4.0.1...v4.1.0) (2025-07-21)
+
+**Note:** Version bump only for package groq
+
+## [4.0.1](https://github.com/sanity-io/sanity/compare/v4.0.0...v4.0.1) (2025-07-16)
+
+**Note:** Version bump only for package groq
+
+## [4.0.0](https://github.com/sanity-io/sanity/compare/v3.99.0...v4.0.0) (2025-07-14)
+
+### ⚠ BREAKING CHANGES
+
+* remove node 18, make base 20 (#9804)
+
+### Bug Fixes
+
+* remove node 18, make base 20 ([#9804](https://github.com/sanity-io/sanity/issues/9804)) ([8fa2157](https://github.com/sanity-io/sanity/commit/8fa2157bf7d5f1390f0e1663cb32bb1ffd361188))
+
+## [3.99.0](https://github.com/sanity-io/sanity/compare/v3.98.1...v3.99.0) (2025-07-11)
+
+**Note:** Version bump only for package groq
+
+## <small>3.98.1 (2025-07-09)</small>
+
+**Note:** Version bump only for package groq
+
+## [3.98.0](https://github.com/sanity-io/sanity/compare/v3.97.1...v3.98.0) (2025-07-07)
+
+**Note:** Version bump only for package groq
+
+## [3.97.1](https://github.com/sanity-io/sanity/compare/v3.97.0...v3.97.1) (2025-07-04)
+
+**Note:** Version bump only for package groq
+
+## [3.97.0](https://github.com/sanity-io/sanity/compare/v3.96.0...v3.97.0) (2025-07-04)
+
+**Note:** Version bump only for package groq
+
+## [3.96.0](https://github.com/sanity-io/sanity/compare/v3.95.0...v3.96.0) (2025-07-02)
+
+**Note:** Version bump only for package groq
+
+## [3.95.0](https://github.com/sanity-io/sanity/compare/v3.94.2...v3.95.0) (2025-06-25)
+
+**Note:** Version bump only for package groq
+
+## [3.94.2](https://github.com/sanity-io/sanity/compare/v3.94.1...v3.94.2) (2025-06-24)
+
+**Note:** Version bump only for package groq
+
+## [3.94.1](https://github.com/sanity-io/sanity/compare/v3.94.0...v3.94.1) (2025-06-24)
+
+**Note:** Version bump only for package groq
+
+## [3.94.0](https://github.com/sanity-io/sanity/compare/v3.93.0...v3.94.0) (2025-06-24)
+
+### Bug Fixes
+
+* stop publishing src folders to npm ([#9744](https://github.com/sanity-io/sanity/issues/9744)) ([e9296c1](https://github.com/sanity-io/sanity/commit/e9296c12d1c68ea912a309a6bfe6cb752172ba07)) by Cody Olsen (81981+stipsan@users.noreply.github.com)
+
+## [3.93.0](https://github.com/sanity-io/sanity/compare/v3.92.0...v3.93.0) (2025-06-17)
+
+**Note:** Version bump only for package groq
+
+## [3.92.0](https://github.com/sanity-io/sanity/compare/v3.91.0...v3.92.0) (2025-06-10)
+
+**Note:** Version bump only for package groq
+
+## [3.91.0](https://github.com/sanity-io/sanity/compare/v3.90.0...v3.91.0) (2025-06-03)
+
+### Reverts
+
+* publish v3.91.0 ([#9546](https://github.com/sanity-io/sanity/issues/9546)) ([#9550](https://github.com/sanity-io/sanity/issues/9550)) ([d191e4c](https://github.com/sanity-io/sanity/commit/d191e4cdbccc68cda01f864c0290528df91d9571)) by Bjørge Næss (bjoerge@gmail.com)
+
+# Changelog
+
+## [3.86.1](https://github.com/sanity-io/sanity/compare/v3.86.0...v3.86.1) (2025-04-23)
+
+## [3.86.0](https://github.com/sanity-io/sanity/compare/groq-v3.85.1...groq-v3.86.0) (2025-04-22)
+
+### Miscellaneous Chores
+
+* **groq:** Synchronize studio versions

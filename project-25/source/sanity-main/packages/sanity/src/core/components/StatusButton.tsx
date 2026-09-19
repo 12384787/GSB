@@ -1,0 +1,65 @@
+import {type HTMLProps, type ReactNode, useMemo, type RefAttributes} from 'react'
+import {styled} from 'styled-components'
+
+import {Button, type ButtonProps} from '../../ui-components/button/Button'
+
+/** @hidden @beta */
+export type StatusButtonProps = ButtonProps & {
+  ['aria-label']: HTMLProps<HTMLButtonElement>['aria-label']
+  'forwardedAs'?: string
+  'disabled'?: boolean | {reason: ReactNode}
+  'mode'?: ButtonProps['mode']
+  'iconRight'?: undefined
+}
+
+const StyledButton = styled(Button)`
+  position: relative;
+  /* The children in button is rendered inside a span, we need to absolutely position it. */
+  & > span:nth-child(2) {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    padding: 0;
+  }
+`
+
+const Dot = styled.div({
+  width: 4,
+  height: 4,
+  borderRadius: 3,
+  boxShadow: '0 0 0 1px var(--card-bg-color)',
+})
+
+/** @hidden @beta */
+export function StatusButton(
+  props: StatusButtonProps &
+    Omit<HTMLProps<HTMLButtonElement>, 'disabled' | 'ref' | 'size' | 'title'> &
+    RefAttributes<HTMLButtonElement>,
+) {
+  const {
+    ref,
+    disabled: disabledProp,
+    'aria-label': label,
+    mode = 'bleed',
+    tone,
+    // `text` and `icon` stay in `restProps` so the ButtonWithText | IconButton
+    // union stays correlated when spread onto the styled component.
+    ...restProps
+  } = props
+
+  const dotStyle = useMemo(() => ({backgroundColor: `var(--card-badge-${tone}-dot-color)`}), [tone])
+  const disabled = Boolean(disabledProp)
+
+  return (
+    <StyledButton
+      data-ui="StatusButton"
+      {...restProps}
+      aria-label={label}
+      disabled={disabled}
+      mode={mode}
+      ref={ref}
+    >
+      {tone && <Dot style={dotStyle} />}
+    </StyledButton>
+  )
+}

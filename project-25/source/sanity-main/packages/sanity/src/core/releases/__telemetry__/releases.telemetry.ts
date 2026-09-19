@@ -1,0 +1,144 @@
+import {defineEvent} from '@sanity/telemetry'
+
+import {type DocumentVariantType} from '../../util/getDocumentVariantType'
+
+interface VersionInfo {
+  /**
+   * document type that was added
+   */
+
+  /**
+   * the origin of the version created (from a draft or from a version)
+   */
+  documentOrigin: DocumentVariantType
+}
+
+export interface OriginInfo {
+  /**
+   * determines where the release was created, either from the structure view or the release plugin
+   */
+  origin: 'structure' | 'release-plugin'
+}
+
+export interface RevertInfo {
+  /**
+   * determined whether reverting a release created a new staged release, or immediately reverted
+   */
+  revertType: 'immediate' | 'staged'
+}
+
+export interface ReleaseDescriptionInfo {
+  /**
+   * whether the description was set when creating the release, or edited on an existing release
+   */
+  action: 'create' | 'edit'
+  /**
+   * number of characters in the description - never the description content itself
+   */
+  characterCount: number
+  /**
+   * whether the description contains a URL
+   */
+  containsUrl: boolean
+}
+
+/**
+ * When a document (version) is successfully added to a release
+ */
+export const AddedVersion = defineEvent<VersionInfo>({
+  name: 'Version Document Added to Release ',
+  version: 1,
+  description: 'User added a document to a release',
+})
+
+/** When a release is successfully created */
+export const CreatedRelease = defineEvent<OriginInfo>({
+  name: 'Release Created',
+  version: 1,
+  description: 'User created a release',
+})
+
+/** When a release is successfully deleted */
+export const DeletedRelease = defineEvent({
+  name: 'Release Deleted',
+  version: 1,
+  description: 'User deleted a release',
+})
+
+/** When a release is successfully published */
+export const PublishedRelease = defineEvent({
+  name: 'Release Published',
+  version: 1,
+  description: 'User published a release',
+})
+
+/** When a release is successfully scheduled*/
+export const ScheduledRelease = defineEvent({
+  name: 'Release Scheduled',
+  version: 1,
+  description: 'User scheduled a release',
+})
+
+/** When a release is successfully scheduled */
+export const UnscheduledRelease = defineEvent({
+  name: 'Release Unscheduled',
+  version: 1,
+  description: 'User unscheduled a release',
+})
+
+/** When a release is successfully archived*/
+export const ArchivedRelease = defineEvent({
+  name: 'Release Archived',
+  version: 1,
+  description: 'User archived a release',
+})
+
+/** When a release is successfully unarchived */
+export const UnarchivedRelease = defineEvent({
+  name: 'Release Unarchived',
+  version: 1,
+  description: 'User unarchived a release',
+})
+
+/** When a release is successfully reverted */
+export const RevertRelease = defineEvent<RevertInfo>({
+  name: 'Release Reverted',
+  version: 1,
+  description: 'User reverted a release',
+})
+
+/** When a release is successfully duplicated */
+export const DuplicatedRelease = defineEvent({
+  name: 'Release Duplicated',
+  version: 1,
+  description: 'User duplicated a release',
+})
+
+/** When a release link is copied to clipboard */
+export const ReleaseLinkCopied = defineEvent({
+  name: 'Release Link Copied',
+  version: 1,
+  description: 'User copied release link to clipboard',
+})
+
+/** When a release ID is copied to clipboard */
+export const ReleaseIdCopied = defineEvent({
+  name: 'Release ID Copied',
+  version: 1,
+  description: 'User copied release ID to clipboard',
+})
+
+/** When a release title is copied to clipboard */
+export const ReleaseTitleCopied = defineEvent({
+  name: 'Release Title Copied',
+  version: 1,
+  description: 'User copied release title to clipboard',
+})
+
+/** Records release description usage - set at creation or edited in Studio */
+export const ReleaseDescriptionSet = defineEvent<ReleaseDescriptionInfo>({
+  name: 'Release Description Set',
+  version: 1,
+  description:
+    'Whether a release description was set at creation or edited in Studio, with its character count (never the content itself)',
+})

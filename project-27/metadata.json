@@ -1,0 +1,10 @@
+{
+  "number": 27,
+  "repository": "ultralytics/ultralytics",
+  "url": "https://github.com/ultralytics/ultralytics",
+  "description": "Ultralytics YOLO27, YOLO26, YOLO11, YOLOv8 — object detection, instance segmentation, semantic segmentation, image classification, pose estimation, object tracking",
+  "language": "Python",
+  "stars": 61751,
+  "default_branch": "main",
+  "source_zip_url": "https://github.com/ultralytics/ultralytics/archive/refs/heads/main.zip"
+}

@@ -1,0 +1,820 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Result of parsing if_else.kcl
+---
+{
+  "Ok": {
+    "body": [
+      {
+        "commentStart": 0,
+        "declaration": {
+          "commentStart": 0,
+          "end": 0,
+          "id": {
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "name": "a",
+            "start": 0,
+            "type": "Identifier"
+          },
+          "init": {
+            "commentStart": 0,
+            "cond": {
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "raw": "true",
+              "start": 0,
+              "type": "Literal",
+              "type": "Literal",
+              "value": true
+            },
+            "digest": null,
+            "else_ifs": [
+              {
+                "commentStart": 0,
+                "cond": {
+                  "commentStart": 0,
+                  "end": 0,
+                  "moduleId": 0,
+                  "raw": "true",
+                  "start": 0,
+                  "type": "Literal",
+                  "type": "Literal",
+                  "value": true
+                },
+                "digest": null,
+                "end": 0,
+                "moduleId": 0,
+                "start": 0,
+                "then_val": {
+                  "body": [
+                    {
+                      "commentStart": 0,
+                      "end": 0,
+                      "expression": {
+                        "commentStart": 0,
+                        "end": 0,
+                        "moduleId": 0,
+                        "raw": "4",
+                        "start": 0,
+                        "type": "Literal",
+                        "type": "Literal",
+                        "value": {
+                          "value": 4.0,
+                          "suffix": "None"
+                        }
+                      },
+                      "moduleId": 0,
+                      "start": 0,
+                      "type": "ExpressionStatement",
+                      "type": "ExpressionStatement"
+                    }
+                  ],
+                  "commentStart": 0,
+                  "end": 0,
+                  "moduleId": 0,
+                  "start": 0,
+                  "type": "Program"
+                },
+                "type": "ElseIf"
+              }
+            ],
+            "end": 0,
+            "final_else": {
+              "body": [
+                {
+                  "commentStart": 0,
+                  "end": 0,
+                  "expression": {
+                    "commentStart": 0,
+                    "end": 0,
+                    "moduleId": 0,
+                    "raw": "5",
+                    "start": 0,
+                    "type": "Literal",
+                    "type": "Literal",
+                    "value": {
+                      "value": 5.0,
+                      "suffix": "None"
+                    }
+                  },
+                  "moduleId": 0,
+                  "start": 0,
+                  "type": "ExpressionStatement",
+                  "type": "ExpressionStatement"
+                }
+              ],
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "start": 0,
+              "type": "Program"
+            },
+            "moduleId": 0,
+            "start": 0,
+            "then_val": {
+              "body": [
+                {
+                  "commentStart": 0,
+                  "end": 0,
+                  "expression": {
+                    "commentStart": 0,
+                    "end": 0,
+                    "moduleId": 0,
+                    "raw": "3",
+                    "start": 0,
+                    "type": "Literal",
+                    "type": "Literal",
+                    "value": {
+                      "value": 3.0,
+                      "suffix": "None"
+                    }
+                  },
+                  "moduleId": 0,
+                  "start": 0,
+                  "type": "ExpressionStatement",
+                  "type": "ExpressionStatement"
+                }
+              ],
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "start": 0,
+              "type": "Program"
+            },
+            "type": "IfExpression",
+            "type": "IfExpression"
+          },
+          "moduleId": 0,
+          "start": 0,
+          "type": "VariableDeclarator"
+        },
+        "end": 0,
+        "kind": "const",
+        "moduleId": 0,
+        "start": 0,
+        "type": "VariableDeclaration",
+        "type": "VariableDeclaration"
+      },
+      {
+        "commentStart": 0,
+        "end": 0,
+        "expression": {
+          "arguments": [
+            {
+              "type": "LabeledArg",
+              "label": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "name": "isEqualTo",
+                "start": 0,
+                "type": "Identifier"
+              },
+              "arg": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "raw": "3",
+                "start": 0,
+                "type": "Literal",
+                "type": "Literal",
+                "value": {
+                  "value": 3.0,
+                  "suffix": "None"
+                }
+              }
+            },
+            {
+              "type": "LabeledArg",
+              "label": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "name": "error",
+                "start": 0,
+                "type": "Identifier"
+              },
+              "arg": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "raw": "\"the 'if' branch gets returned\"",
+                "start": 0,
+                "type": "Literal",
+                "type": "Literal",
+                "value": "the 'if' branch gets returned"
+              }
+            }
+          ],
+          "callee": {
+            "abs_path": false,
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "name": {
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "name": "assert",
+              "start": 0,
+              "type": "Identifier"
+            },
+            "path": [],
+            "start": 0,
+            "type": "Name"
+          },
+          "commentStart": 0,
+          "end": 0,
+          "moduleId": 0,
+          "start": 0,
+          "type": "CallExpressionKw",
+          "type": "CallExpressionKw",
+          "unlabeled": {
+            "abs_path": false,
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "name": {
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "name": "a",
+              "start": 0,
+              "type": "Identifier"
+            },
+            "path": [],
+            "start": 0,
+            "type": "Name",
+            "type": "Name"
+          }
+        },
+        "moduleId": 0,
+        "start": 0,
+        "type": "ExpressionStatement",
+        "type": "ExpressionStatement"
+      },
+      {
+        "commentStart": 0,
+        "declaration": {
+          "commentStart": 0,
+          "end": 0,
+          "id": {
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "name": "b",
+            "start": 0,
+            "type": "Identifier"
+          },
+          "init": {
+            "commentStart": 0,
+            "cond": {
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "raw": "false",
+              "start": 0,
+              "type": "Literal",
+              "type": "Literal",
+              "value": false
+            },
+            "digest": null,
+            "else_ifs": [
+              {
+                "commentStart": 0,
+                "cond": {
+                  "commentStart": 0,
+                  "end": 0,
+                  "moduleId": 0,
+                  "raw": "true",
+                  "start": 0,
+                  "type": "Literal",
+                  "type": "Literal",
+                  "value": true
+                },
+                "digest": null,
+                "end": 0,
+                "moduleId": 0,
+                "start": 0,
+                "then_val": {
+                  "body": [
+                    {
+                      "commentStart": 0,
+                      "end": 0,
+                      "expression": {
+                        "commentStart": 0,
+                        "end": 0,
+                        "moduleId": 0,
+                        "raw": "4",
+                        "start": 0,
+                        "type": "Literal",
+                        "type": "Literal",
+                        "value": {
+                          "value": 4.0,
+                          "suffix": "None"
+                        }
+                      },
+                      "moduleId": 0,
+                      "start": 0,
+                      "type": "ExpressionStatement",
+                      "type": "ExpressionStatement"
+                    }
+                  ],
+                  "commentStart": 0,
+                  "end": 0,
+                  "moduleId": 0,
+                  "start": 0,
+                  "type": "Program"
+                },
+                "type": "ElseIf"
+              }
+            ],
+            "end": 0,
+            "final_else": {
+              "body": [
+                {
+                  "commentStart": 0,
+                  "end": 0,
+                  "expression": {
+                    "commentStart": 0,
+                    "end": 0,
+                    "moduleId": 0,
+                    "raw": "5",
+                    "start": 0,
+                    "type": "Literal",
+                    "type": "Literal",
+                    "value": {
+                      "value": 5.0,
+                      "suffix": "None"
+                    }
+                  },
+                  "moduleId": 0,
+                  "start": 0,
+                  "type": "ExpressionStatement",
+                  "type": "ExpressionStatement"
+                }
+              ],
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "start": 0,
+              "type": "Program"
+            },
+            "moduleId": 0,
+            "start": 0,
+            "then_val": {
+              "body": [
+                {
+                  "commentStart": 0,
+                  "end": 0,
+                  "expression": {
+                    "commentStart": 0,
+                    "end": 0,
+                    "moduleId": 0,
+                    "raw": "3",
+                    "start": 0,
+                    "type": "Literal",
+                    "type": "Literal",
+                    "value": {
+                      "value": 3.0,
+                      "suffix": "None"
+                    }
+                  },
+                  "moduleId": 0,
+                  "start": 0,
+                  "type": "ExpressionStatement",
+                  "type": "ExpressionStatement"
+                }
+              ],
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "start": 0,
+              "type": "Program"
+            },
+            "type": "IfExpression",
+            "type": "IfExpression"
+          },
+          "moduleId": 0,
+          "start": 0,
+          "type": "VariableDeclarator"
+        },
+        "end": 0,
+        "kind": "const",
+        "moduleId": 0,
+        "start": 0,
+        "type": "VariableDeclaration",
+        "type": "VariableDeclaration"
+      },
+      {
+        "commentStart": 0,
+        "end": 0,
+        "expression": {
+          "arguments": [
+            {
+              "type": "LabeledArg",
+              "label": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "name": "isEqualTo",
+                "start": 0,
+                "type": "Identifier"
+              },
+              "arg": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "raw": "4",
+                "start": 0,
+                "type": "Literal",
+                "type": "Literal",
+                "value": {
+                  "value": 4.0,
+                  "suffix": "None"
+                }
+              }
+            },
+            {
+              "type": "LabeledArg",
+              "label": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "name": "error",
+                "start": 0,
+                "type": "Identifier"
+              },
+              "arg": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "raw": "\"the 'else if' branch gets returned\"",
+                "start": 0,
+                "type": "Literal",
+                "type": "Literal",
+                "value": "the 'else if' branch gets returned"
+              }
+            }
+          ],
+          "callee": {
+            "abs_path": false,
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "name": {
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "name": "assert",
+              "start": 0,
+              "type": "Identifier"
+            },
+            "path": [],
+            "start": 0,
+            "type": "Name"
+          },
+          "commentStart": 0,
+          "end": 0,
+          "moduleId": 0,
+          "start": 0,
+          "type": "CallExpressionKw",
+          "type": "CallExpressionKw",
+          "unlabeled": {
+            "abs_path": false,
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "name": {
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "name": "b",
+              "start": 0,
+              "type": "Identifier"
+            },
+            "path": [],
+            "start": 0,
+            "type": "Name",
+            "type": "Name"
+          }
+        },
+        "moduleId": 0,
+        "start": 0,
+        "type": "ExpressionStatement",
+        "type": "ExpressionStatement"
+      },
+      {
+        "commentStart": 0,
+        "declaration": {
+          "commentStart": 0,
+          "end": 0,
+          "id": {
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "name": "c",
+            "start": 0,
+            "type": "Identifier"
+          },
+          "init": {
+            "commentStart": 0,
+            "cond": {
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "raw": "false",
+              "start": 0,
+              "type": "Literal",
+              "type": "Literal",
+              "value": false
+            },
+            "digest": null,
+            "else_ifs": [
+              {
+                "commentStart": 0,
+                "cond": {
+                  "commentStart": 0,
+                  "end": 0,
+                  "moduleId": 0,
+                  "raw": "false",
+                  "start": 0,
+                  "type": "Literal",
+                  "type": "Literal",
+                  "value": false
+                },
+                "digest": null,
+                "end": 0,
+                "moduleId": 0,
+                "start": 0,
+                "then_val": {
+                  "body": [
+                    {
+                      "commentStart": 0,
+                      "end": 0,
+                      "expression": {
+                        "commentStart": 0,
+                        "end": 0,
+                        "moduleId": 0,
+                        "raw": "4",
+                        "start": 0,
+                        "type": "Literal",
+                        "type": "Literal",
+                        "value": {
+                          "value": 4.0,
+                          "suffix": "None"
+                        }
+                      },
+                      "moduleId": 0,
+                      "start": 0,
+                      "type": "ExpressionStatement",
+                      "type": "ExpressionStatement"
+                    }
+                  ],
+                  "commentStart": 0,
+                  "end": 0,
+                  "moduleId": 0,
+                  "start": 0,
+                  "type": "Program"
+                },
+                "type": "ElseIf"
+              }
+            ],
+            "end": 0,
+            "final_else": {
+              "body": [
+                {
+                  "commentStart": 0,
+                  "end": 0,
+                  "expression": {
+                    "commentStart": 0,
+                    "end": 0,
+                    "moduleId": 0,
+                    "raw": "5",
+                    "start": 0,
+                    "type": "Literal",
+                    "type": "Literal",
+                    "value": {
+                      "value": 5.0,
+                      "suffix": "None"
+                    }
+                  },
+                  "moduleId": 0,
+                  "start": 0,
+                  "type": "ExpressionStatement",
+                  "type": "ExpressionStatement"
+                }
+              ],
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "start": 0,
+              "type": "Program"
+            },
+            "moduleId": 0,
+            "start": 0,
+            "then_val": {
+              "body": [
+                {
+                  "commentStart": 0,
+                  "end": 0,
+                  "expression": {
+                    "commentStart": 0,
+                    "end": 0,
+                    "moduleId": 0,
+                    "raw": "3",
+                    "start": 0,
+                    "type": "Literal",
+                    "type": "Literal",
+                    "value": {
+                      "value": 3.0,
+                      "suffix": "None"
+                    }
+                  },
+                  "moduleId": 0,
+                  "start": 0,
+                  "type": "ExpressionStatement",
+                  "type": "ExpressionStatement"
+                }
+              ],
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "start": 0,
+              "type": "Program"
+            },
+            "type": "IfExpression",
+            "type": "IfExpression"
+          },
+          "moduleId": 0,
+          "start": 0,
+          "type": "VariableDeclarator"
+        },
+        "end": 0,
+        "kind": "const",
+        "moduleId": 0,
+        "start": 0,
+        "type": "VariableDeclaration",
+        "type": "VariableDeclaration"
+      },
+      {
+        "commentStart": 0,
+        "end": 0,
+        "expression": {
+          "arguments": [
+            {
+              "type": "LabeledArg",
+              "label": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "name": "isEqualTo",
+                "start": 0,
+                "type": "Identifier"
+              },
+              "arg": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "raw": "5",
+                "start": 0,
+                "type": "Literal",
+                "type": "Literal",
+                "value": {
+                  "value": 5.0,
+                  "suffix": "None"
+                }
+              }
+            },
+            {
+              "type": "LabeledArg",
+              "label": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "name": "error",
+                "start": 0,
+                "type": "Identifier"
+              },
+              "arg": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "raw": "\"the 'else' branch gets returned\"",
+                "start": 0,
+                "type": "Literal",
+                "type": "Literal",
+                "value": "the 'else' branch gets returned"
+              }
+            }
+          ],
+          "callee": {
+            "abs_path": false,
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "name": {
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "name": "assert",
+              "start": 0,
+              "type": "Identifier"
+            },
+            "path": [],
+            "start": 0,
+            "type": "Name"
+          },
+          "commentStart": 0,
+          "end": 0,
+          "moduleId": 0,
+          "start": 0,
+          "type": "CallExpressionKw",
+          "type": "CallExpressionKw",
+          "unlabeled": {
+            "abs_path": false,
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "name": {
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "name": "c",
+              "start": 0,
+              "type": "Identifier"
+            },
+            "path": [],
+            "start": 0,
+            "type": "Name",
+            "type": "Name"
+          }
+        },
+        "moduleId": 0,
+        "start": 0,
+        "type": "ExpressionStatement",
+        "type": "ExpressionStatement"
+      }
+    ],
+    "commentStart": 0,
+    "end": 0,
+    "moduleId": 0,
+    "nonCodeMeta": {
+      "nonCodeNodes": {
+        "1": [
+          {
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "start": 0,
+            "type": "NonCodeNode",
+            "value": {
+              "type": "newLine"
+            }
+          }
+        ],
+        "3": [
+          {
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "start": 0,
+            "type": "NonCodeNode",
+            "value": {
+              "type": "newLine"
+            }
+          }
+        ]
+      },
+      "startNodes": [
+        {
+          "commentStart": 0,
+          "end": 0,
+          "moduleId": 0,
+          "start": 0,
+          "type": "NonCodeNode",
+          "value": {
+            "type": "blockComment",
+            "value": "This tests evaluating if-else expressions.",
+            "style": "line"
+          }
+        },
+        {
+          "commentStart": 0,
+          "end": 0,
+          "moduleId": 0,
+          "start": 0,
+          "type": "NonCodeNode",
+          "value": {
+            "type": "newLine"
+          }
+        }
+      ]
+    },
+    "start": 0,
+    "type": "Program"
+  }
+}

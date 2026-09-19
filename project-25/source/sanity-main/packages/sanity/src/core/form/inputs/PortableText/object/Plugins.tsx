@@ -1,0 +1,217 @@
+import {defineBehavior, raise} from '@portabletext/editor/behaviors'
+import {BehaviorPlugin} from '@portabletext/editor/plugins'
+import {htmlToPortableText} from '@portabletext/html'
+import {MarkdownShortcutsPlugin} from '@portabletext/plugin-markdown-shortcuts'
+import {OneLinePlugin} from '@portabletext/plugin-one-line'
+import {PasteLinkPlugin} from '@portabletext/plugin-paste-link'
+import {createDecoratorGuard, TypographyPlugin} from '@portabletext/plugin-typography'
+import {type ArraySchemaType, type PortableTextBlock} from '@sanity/types'
+import {type ComponentType, useMemo} from 'react'
+
+import {useMiddlewareComponents} from '../../../../config/components/useMiddlewareComponents'
+import {pickPortableTextEditorPluginsComponent} from '../../../form-components-hooks/picks'
+import {type MarkdownConfig, type PortableTextPluginsProps} from '../../../types/blockProps'
+import {usePortableTextMemberSchemaTypes} from '../contexts/PortableTextMemberSchemaTypes'
+import {PortableTextTablePlugin} from './TablePlugin'
+
+const markdownConfig: MarkdownConfig = {
+  boldDecorator: ({context: {schema}}) =>
+    schema.decorators.find((decorator) => decorator.name === 'strong')?.name,
+  codeDecorator: ({context: {schema}}) =>
+    schema.decorators.find((decorator) => decorator.name === 'code')?.name,
+  italicDecorator: ({context: {schema}}) =>
+    schema.decorators.find((decorator) => decorator.name === 'em')?.name,
+  strikeThroughDecorator: ({context: {schema}}) =>
+    schema.decorators.find((decorator) => decorator.name === 'strike-through')?.name,
+  defaultStyle: ({context: {schema}}) =>
+    schema.styles.find((style) => style.name === 'normal')?.name,
+  blockquoteStyle: ({context: {schema}}) =>
+    schema.styles.find((style) => style.name === 'blockquote')?.name,
+  headingStyle: ({context: {schema}, props: {level}}) =>
+    schema.styles.find((style) => style.name === `h${level}`)?.name,
+  orderedList: ({context: {schema}}) => schema.lists.find((list) => list.name === 'number')?.name,
+  unorderedList: ({context: {schema}}) => schema.lists.find((list) => list.name === 'bullet')?.name,
+}
+
+export const PortableTextEditorPlugins = (props: {
+  schemaType: ArraySchemaType<PortableTextBlock>
+}) => {
+  const schemaTypes = usePortableTextMemberSchemaTypes()
+  const isOneLineEditor = Boolean(schemaTypes.block.options?.oneLine)
+
+  // Studio owns HTML paste deserialization so it can pass
+  // unstable_whitespaceOnPasteMode from the Sanity schema config directly to
+  // @portabletext/html. This bypasses PTE's built-in HTML converter, which
+  // doesn't have access to Sanity-specific schema options.
+  const htmlPasteBehaviors = useMemo(
+    () => [
+      defineBehavior({
+        on: 'deserialize.data',
+        guard: ({snapshot, event}) => {
+          if (event.mimeType !== 'text/html') {
+            return false
+          }
+
+          const blocks = htmlToPortableText(event.data, {
+            schema: snapshot.context.schema,
+            keyGenerator: snapshot.context.keyGenerator,
+            whitespaceMode: schemaTypes.block.options?.unstable_whitespaceOnPasteMode,
+          }) as Array<PortableTextBlock>
+
+          if (blocks.length === 0) {
+            return {
+              type: 'deserialization.failure' as const,
+              mimeType: 'text/html' as const,
+              reason: 'No blocks deserialized',
+            }
+          }
+
+          return {
+            type: 'deserialization.success' as const,
+            mimeType: 'text/html' as const,
+            data: blocks,
+          }
+        },
+        actions: [
+          ({event}, deserializeEvent) => [
+            raise({
+              ...deserializeEvent,
+              originEvent: event.originEvent,
+            }),
+          ],
+        ],
+      }),
+    ],
+    [schemaTypes.block.options?.unstable_whitespaceOnPasteMode],
+  )
+
+  const componentProps = useMemo(
+    (): PortableTextPluginsProps => ({
+      plugins: {
+        markdown: {
+          // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+          config: markdownConfig,
+        },
+        pasteLink: {},
+        typography: {
+          guard: createDecoratorGuard({
+            decorators: ({context}) =>
+              context.schema.decorators.flatMap((decorator) =>
+                decorator.name === 'code' ? [] : [decorator.name],
+              ),
+          }),
+        },
+        table: {},
+      },
+      renderDefault: RenderDefault,
+    }),
+    [],
+  )
+
+  const CustomComponent = props.schemaType.components?.portableText?.plugins as
+    | ComponentType<PortableTextPluginsProps>
+    | undefined
+
+  return (
+    <>
+      <BehaviorPlugin behaviors={htmlPasteBehaviors} />
+      {isOneLineEditor && (
+        <>
+          <OneLinePlugin />
+          <BehaviorPlugin
+            behaviors={[
+              defineBehavior({
+                on: 'insert.soft break',
+                actions: [],
+              }),
+            ]}
+          />
+        </>
+      )}
+      {CustomComponent ? (
+        <CustomComponent {...componentProps} />
+      ) : (
+        <RenderDefault {...componentProps} />
+      )}
+    </>
+  )
+}
+
+function DefaultPortableTextEditorPlugins(props: Omit<PortableTextPluginsProps, 'renderDefault'>) {
+  return (
+    <>
+      <DefaultMarkdownShortcutsPlugin {...props.plugins.markdown} />
+      <DefaultPasteLinkPlugin {...props.plugins.pasteLink} />
+      <DefaultTypographyPlugin {...props.plugins.typography} />
+      <DefaultTablePlugin {...props.plugins.table} />
+    </>
+  )
+}
+
+function DefaultMarkdownShortcutsPlugin(
+  incomingProps: PortableTextPluginsProps['plugins']['markdown'],
+) {
+  const props = incomingProps ?? {}
+
+  if (props.enabled === false) {
+    return null
+  }
+
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+  if (!props.config) {
+    const {enabled: _enabled, config: _config, ...markdownShortcutsPluginProps} = props
+
+    return <MarkdownShortcutsPlugin {...markdownShortcutsPluginProps} />
+  }
+
+  // oxlint-disable-next-line no-deprecated -- backwards-compat bridge for plugin authors still using the old field names
+  const {orderedList, orderedListStyle, unorderedList, unorderedListStyle, ...restMarkdownConfig} =
+    // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+    props.config
+
+  return (
+    <MarkdownShortcutsPlugin
+      orderedList={orderedList ?? orderedListStyle}
+      unorderedList={unorderedList ?? unorderedListStyle}
+      {...restMarkdownConfig}
+    />
+  )
+}
+
+function DefaultTablePlugin(props: PortableTextPluginsProps['plugins']['table']) {
+  // Tables are opt-in, unlike the other built-in plugins.
+  if (props?.enabled !== true) {
+    return null
+  }
+
+  return <PortableTextTablePlugin containers={props.containers} />
+}
+
+function DefaultPasteLinkPlugin(props: PortableTextPluginsProps['plugins']['pasteLink']) {
+  const {enabled, ...pasteLinkPluginProps} = props ?? {}
+
+  if (enabled === false) {
+    return null
+  }
+
+  return <PasteLinkPlugin {...pasteLinkPluginProps} />
+}
+
+function DefaultTypographyPlugin(props: PortableTextPluginsProps['plugins']['typography']) {
+  const {enabled, ...typographyPluginProps} = props ?? {}
+
+  if (enabled === false) {
+    return null
+  }
+
+  return <TypographyPlugin {...typographyPluginProps} />
+}
+
+const RenderDefault = (props: Omit<PortableTextPluginsProps, 'renderDefault'>) => {
+  const RenderPlugins = useMiddlewareComponents({
+    defaultComponent: DefaultPortableTextEditorPlugins,
+    pick: pickPortableTextEditorPluginsComponent,
+  })
+  // oxlint-disable-next-line react/static-components -- this is intentional and how the middleware components has to work
+  return <RenderPlugins {...props} />
+}

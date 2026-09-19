@@ -1,0 +1,180 @@
+import {CloseIcon} from '@sanity/icons/Close'
+import {InfoOutlineIcon} from '@sanity/icons/InfoOutline'
+import {Card, TabList, TabPanel, Text} from '@sanity/ui'
+import {useState} from 'react'
+import {
+  type DocumentInspectorProps,
+  isReleaseDocument,
+  type TargetPerspective,
+  type TFunction,
+  Translate,
+  usePerspective,
+  useSource,
+  useTranslation,
+} from 'sanity'
+import {styled} from 'styled-components'
+import {Flex, Box} from 'ui5'
+
+import {Button} from '../../../../../ui-components/button/Button'
+import {Tab} from '../../../../../ui-components/tab/Tab'
+import {Tooltip} from '../../../../../ui-components/tooltip/Tooltip'
+import {usePaneRouter} from '../../../../components/paneRouter/usePaneRouter'
+import {structureLocaleNamespace} from '../../../../i18n'
+import {HISTORY_INSPECTOR_NAME} from '../../constants'
+import {ChangesInspector} from './ChangesInspector'
+import {EventsInspector} from './EventsInspector'
+import {EventsSelector} from './EventsSelector'
+import {HistorySelector} from './HistorySelector'
+
+const FadeInFlex = styled(Flex)`
+  opacity: 0;
+  transition: opacity 200ms;
+  &[data-ready] {
+    opacity: 1;
+  }
+`
+const TABS = ['history', 'review'] as const
+const isValidTab = (tab: string | undefined): tab is (typeof TABS)[number] =>
+  // @ts-expect-error TS doesn't understand the type guard
+  tab && TABS.includes(tab)
+
+export function ChangesTabs(props: DocumentInspectorProps) {
+  const {params, setParams} = usePaneRouter()
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+  const source = useSource()
+  const [parentRef, setParentRef] = useState<HTMLDivElement | null>(null)
+  const {t} = useTranslation(structureLocaleNamespace)
+  const {t: tCore} = useTranslation()
+  const isReady = params?.inspect === HISTORY_INSPECTOR_NAME
+  const {selectedPerspective} = usePerspective()
+
+  const paneRouterTab = isValidTab(params?.changesInspectorTab)
+    ? params.changesInspectorTab
+    : TABS[0]
+
+  const setPaneRouterTab = (tab: (typeof TABS)[number]) =>
+    setParams({
+      ...params,
+      changesInspectorTab: tab,
+      // Reset the since when changing the tab, as it's not relevant for the history tab
+      since: tab === 'history' ? undefined : params?.since,
+    })
+
+  return (
+    <FadeInFlex
+      flexDirection="column"
+      padding={0}
+      height="100%"
+      data-ready={isReady ? '' : undefined}
+      ref={setParentRef}
+    >
+      <Card paddingBottom={1}>
+        <Flex alignItems="center" padding={3} gap={2}>
+          <TabList gap={1} flex={1}>
+            <Tab
+              aria-controls="history-panel"
+              id="history-tab"
+              label={t('changes.tab.history')}
+              onClick={() => setPaneRouterTab('history')}
+              selected={paneRouterTab === 'history'}
+            />
+            <Tab
+              aria-controls="review-changes-panel"
+              id="changes-tab"
+              label={t('changes.tab.review-changes')}
+              onClick={() => setPaneRouterTab('review')}
+              selected={paneRouterTab === 'review'}
+            />
+          </TabList>
+          <Button
+            aria-label={t('changes.action.close-label')}
+            icon={CloseIcon}
+            mode="bleed"
+            onClick={props.onClose}
+            tooltipProps={{content: t('document-inspector.close-button.tooltip')}}
+          />
+        </Flex>
+      </Card>
+      <Card padding={2} marginBottom={3} marginX={3} tone="neutral" border radius={3}>
+        <Flex gap={2} alignItems="flex-start">
+          <Tooltip
+            portal
+            placement="bottom-end"
+            boundaryElement={parentRef}
+            content={
+              <Box flexBasis="0%" flexGrow={1} padding={1}>
+                <Text size={1}>
+                  <Translate t={t} i18nKey="changes.banner.tooltip" />
+                </Text>
+              </Box>
+            }
+          >
+            <Text size={0} muted>
+              <InfoOutlineIcon fontSize={1} />
+            </Text>
+          </Tooltip>
+          <Text size={0} muted>
+            <Translate
+              t={t}
+              values={{
+                perspective: perspectiveLabel(selectedPerspective, {t, tCore}),
+              }}
+              i18nKey="changes.banner.description"
+            />
+          </Text>
+        </Flex>
+      </Card>
+
+      <TabPanel
+        aria-labelledby="history-tab"
+        height="fill"
+        hidden={paneRouterTab !== 'history'}
+        id="history-panel"
+      >
+        {/* oxlint-disable-next-line no-deprecated -- the legacy timeline opt-out keeps working until the next major */}
+        {source.beta?.eventsAPI?.documents ? (
+          <EventsSelector showList={paneRouterTab === 'history'} />
+        ) : (
+          <HistorySelector showList={paneRouterTab === 'history'} />
+        )}
+      </TabPanel>
+
+      <TabPanel
+        aria-labelledby="review-tab"
+        hidden={paneRouterTab !== 'review'}
+        id="review-panel"
+        height="fill"
+      >
+        {/* oxlint-disable-next-line no-deprecated -- the legacy timeline opt-out keeps working until the next major */}
+        {source.beta?.eventsAPI?.documents ? (
+          <>
+            {paneRouterTab === 'review' ? (
+              <EventsInspector showChanges={paneRouterTab === 'review'} />
+            ) : null}
+          </>
+        ) : (
+          <ChangesInspector showChanges={paneRouterTab === 'review'} />
+        )}
+      </TabPanel>
+    </FadeInFlex>
+  )
+}
+
+function perspectiveLabel(
+  perspective: TargetPerspective,
+  {t, tCore}: {t: TFunction; tCore: TFunction},
+): string {
+  if (isReleaseDocument(perspective)) {
+    return perspective.metadata.title || tCore('release.placeholder-untitled-release')
+  }
+
+  if (perspective === 'drafts') {
+    return t('compare-versions.status.draft')
+  }
+
+  if (perspective === 'published') {
+    return t('compare-versions.status.published')
+  }
+
+  return perspective
+}

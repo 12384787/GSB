@@ -1,0 +1,365 @@
+import {type ReleaseType} from '@sanity/client'
+import {PublishIcon} from '@sanity/icons/Publish'
+import {Card, Spinner, TabList, Text, useClickOutsideEvent} from '@sanity/ui'
+import {useToast} from '@sanity/ui/toast'
+import {isBefore} from 'date-fns/isBefore'
+import {startOfMinute} from 'date-fns/startOfMinute'
+import {dequal as isEqual} from 'dequal/lite'
+import {useCallback, useMemo, useRef, useState} from 'react'
+import {styled} from 'styled-components'
+import {Flex, VStack} from 'ui5'
+
+import {Button} from '../../../../ui-components/button/Button'
+import {Popover} from '../../../../ui-components/popover/Popover'
+import {Tab} from '../../../../ui-components/tab/Tab'
+import {Tooltip} from '../../../../ui-components/tooltip/Tooltip'
+import {MONTH_PICKER_VARIANT} from '../../../components/inputs/DateInputs/calendar/Calendar'
+import {type CalendarLabels} from '../../../components/inputs/DateInputs/calendar/types'
+import {DatePicker} from '../../../components/inputs/DateInputs/DatePicker'
+import {getCalendarLabels} from '../../../form/inputs/DateInputs/utils'
+import {useTranslation} from '../../../i18n/hooks/useTranslation'
+import {CONTENT_RELEASES_TIME_ZONE_SCOPE} from '../../../studio/constants'
+import {useWorkspace} from '../../../studio/workspace'
+import {ReleaseAvatar} from '../../components/ReleaseAvatar'
+import {useReleaseTime} from '../../hooks/useReleaseTime'
+import {releasesLocaleNamespace} from '../../i18n'
+import {useReleaseOperations} from '../../store/useReleaseOperations'
+import {getIsScheduledDateInPast} from '../../util/getIsScheduledDateInPast'
+import {getReleaseTone} from '../../util/getReleaseTone'
+import {
+  getPublishDateFromRelease,
+  isReleaseScheduledOrScheduling,
+  type NotArchivedRelease,
+} from '../../util/util'
+import {ReleaseTime} from '../components/ReleaseTime'
+import {ReleaseDateInput} from './ReleaseDateInput'
+
+// The Schedule value reads as plain text (matching the other property values), but stays clickable
+// to open the picker: a flush, chrome-free button that only underlines on hover — no pill, and its
+// text sits on the same left edge as every other value.
+const ScheduleTrigger = styled.button`
+  appearance: none;
+  background: none;
+  border: 0;
+  margin: 0;
+  padding: 0;
+  display: block;
+  width: 100%;
+  min-width: 0;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  &:hover {
+    text-decoration: underline;
+  }
+`
+
+export function ReleaseTypePicker(props: {release: NotArchivedRelease}): React.JSX.Element {
+  const {release} = props
+  const variantsEnabled = Boolean(useWorkspace().beta?.variants?.enabled)
+  const popoverRef = useRef<HTMLDivElement | null>(null)
+  const buttonRef = useRef<HTMLButtonElement | null>(null)
+  const inputRef = useRef<HTMLInputElement | null>(null)
+  const datePickerRef = useRef<HTMLDivElement | null>(null)
+
+  const {t: tRelease} = useTranslation(releasesLocaleNamespace)
+  const {t} = useTranslation()
+  const {updateRelease} = useReleaseOperations()
+  const toast = useToast()
+  const getReleaseTime = useReleaseTime()
+
+  const [open, setOpen] = useState(false)
+  const [releaseType, setReleaseType] = useState<ReleaseType>(release.metadata.releaseType)
+  const publishDate = useMemo(() => getPublishDateFromRelease(release), [release])
+  const [isUpdating, setIsUpdating] = useState(false)
+  const [isIntendedScheduleDateInPast, setIsIntendedScheduleDateInPast] = useState(
+    publishDate && isBefore(new Date(publishDate), new Date()),
+  )
+
+  const [intendedPublishAt, setIntendedPublishAt] = useState<Date | undefined>(
+    publishDate ? new Date(publishDate) : undefined,
+  )
+  const updatedDate = intendedPublishAt?.toISOString()
+
+  const calendarLabels: CalendarLabels = useMemo(() => getCalendarLabels(t), [t])
+
+  const close = useCallback(() => {
+    // a bit of a hack to make sure the timezone dialog is not immediately closed on out
+    // the dialog itself is in the Calendar component who is basically unrealted to this one
+    const dialog = document.querySelector('#time-zone')
+
+    if (open && !dialog) {
+      const newRelease = {
+        ...release,
+        metadata: {
+          ...release.metadata,
+          releaseType,
+          ...(typeof updatedDate === 'undefined' || releaseType !== 'scheduled'
+            ? {}
+            : {
+                intendedPublishAt: updatedDate,
+              }),
+        },
+      }
+
+      if (!isEqual(newRelease, release)) {
+        /**
+         * If in past, the reset type and intendedPublish to the actual release values
+         * and discard the changes made
+         */
+        if (getIsScheduledDateInPast(newRelease)) {
+          setReleaseType(release.metadata.releaseType)
+          setIntendedPublishAt(
+            release.metadata.intendedPublishAt
+              ? new Date(release.metadata.intendedPublishAt)
+              : undefined,
+          )
+
+          toast.push({
+            closable: true,
+            status: 'warning',
+            title: t('release.schedule-dialog.publish-date-in-past-warning'),
+          })
+        } else {
+          setIsUpdating(true)
+          void updateRelease(newRelease).finally(() => {
+            setIsUpdating(false)
+          })
+        }
+      }
+
+      setOpen(false)
+    }
+  }, [open, release, updatedDate, releaseType, toast, t, updateRelease])
+
+  useClickOutsideEvent(close, () => [
+    popoverRef.current,
+    buttonRef.current,
+    inputRef.current,
+    datePickerRef.current,
+  ])
+
+  const isPublishDateInPast = !!publishDate && isBefore(new Date(publishDate), new Date())
+  const isReleaseScheduled = isReleaseScheduledOrScheduling(release)
+
+  const publishDateLabel = useMemo(() => {
+    if (release.state === 'published') {
+      if (isPublishDateInPast && publishDate)
+        return tRelease('dashboard.details.published-on', {
+          date: getReleaseTime(release),
+        })
+
+      return tRelease('dashboard.details.published-asap')
+    }
+
+    return <ReleaseTime release={release} />
+  }, [getReleaseTime, isPublishDateInPast, publishDate, release, tRelease])
+
+  // A compact, single-line label for the properties-panel value: no seconds, and no
+  // "Estimated ·"/"Scheduled ·" prefix (the row's leading glyph + label already convey the type).
+  const compactLabel = useMemo(() => {
+    if (release.state === 'published') {
+      return isPublishDateInPast && publishDate
+        ? tRelease('dashboard.details.published-on', {
+            date: getReleaseTime(release, {compact: true}),
+          })
+        : tRelease('dashboard.details.published-asap')
+    }
+    if (release.metadata.releaseType === 'asap') return t('release.type.asap')
+    if (release.metadata.releaseType === 'undecided') return t('release.type.undecided')
+    return getReleaseTime(release, {compact: true}) ?? t('release.type.scheduled')
+  }, [getReleaseTime, isPublishDateInPast, publishDate, release, t, tRelease])
+
+  const handleButtonReleaseTypeChange = useCallback(
+    (pickedReleaseType: ReleaseType) => {
+      setReleaseType(pickedReleaseType)
+      const nextPublishAt =
+        pickedReleaseType === 'scheduled'
+          ? (publishDate ?? startOfMinute(new Date()))
+          : (publishDate ?? undefined)
+      setIntendedPublishAt(nextPublishAt)
+      setIsIntendedScheduleDateInPast(true)
+    },
+    [publishDate],
+  )
+
+  const handlePublishAtCalendarChange = useCallback((date: Date | null) => {
+    if (!date) return
+
+    const cleanDate = startOfMinute(new Date(date))
+    setIsIntendedScheduleDateInPast(isBefore(cleanDate, new Date()))
+    setIntendedPublishAt(cleanDate)
+  }, [])
+
+  const handleOnPickerClick = () => {
+    if (open) close()
+    else setOpen(true)
+  }
+
+  const tone = release.state === 'published' ? 'positive' : getReleaseTone(release)
+
+  const releaseTypeIcon = useMemo(() => {
+    if (isUpdating) return <Spinner size={1} data-testid="updating-release-spinner" />
+    if (release.state === 'published') return <PublishIcon />
+
+    return <ReleaseAvatar release={release} padding={0} />
+  }, [isUpdating, release])
+
+  const productionLabelContent = useMemo(
+    () => (
+      <Flex flexBasis="0%" flexGrow={1} gap={2} alignItems={'center'}>
+        {releaseTypeIcon}
+        <span data-testid="release-type-label">{publishDateLabel}</span>
+      </Flex>
+    ),
+    [publishDateLabel, releaseTypeIcon],
+  )
+
+  const popoverContent = (
+    <VStack gap={1}>
+      <TabList gap={0.5}>
+        <Tab
+          aria-controls="release-timing-asap"
+          id="release-timing-asap-tab"
+          onClick={() => handleButtonReleaseTypeChange('asap')}
+          label={t('release.type.asap')}
+          selected={releaseType === 'asap'}
+        />
+        <Tab
+          aria-controls="release-timing-at-time"
+          id="release-timing-at-time-tab"
+          onClick={() => handleButtonReleaseTypeChange('scheduled')}
+          selected={releaseType === 'scheduled'}
+          label={t('release.type.scheduled')}
+        />
+        <Tab
+          aria-controls="release-timing-undecided"
+          id="release-timing-undecided-tab"
+          onClick={() => handleButtonReleaseTypeChange('undecided')}
+          selected={releaseType === 'undecided'}
+          label={t('release.type.undecided')}
+        />
+      </TabList>
+      {releaseType === 'scheduled' && (
+        <>
+          {isIntendedScheduleDateInPast && (
+            <Card margin={1} padding={2} radius={2} shadow={1} tone="critical">
+              <Text size={1}>{t('release.schedule-dialog.publish-date-in-past-warning')}</Text>
+            </Card>
+          )}
+          <ReleaseDateInput
+            setIsIntendedScheduleDateInPast={setIsIntendedScheduleDateInPast}
+            setIntendedPublishAt={setIntendedPublishAt}
+            intendedPublishAt={intendedPublishAt}
+          />
+          <DatePicker
+            ref={datePickerRef}
+            monthPickerVariant={MONTH_PICKER_VARIANT.carousel}
+            calendarLabels={calendarLabels}
+            selectTime
+            padding={0}
+            value={intendedPublishAt}
+            onChange={handlePublishAtCalendarChange}
+            isPastDisabled
+            showTimeZone
+            timeZoneScope={CONTENT_RELEASES_TIME_ZONE_SCOPE}
+          />
+        </>
+      )}
+    </VStack>
+  )
+
+  if (!variantsEnabled) {
+    return (
+      <Popover
+        content={popoverContent}
+        open={open}
+        padding={1}
+        placement="bottom-start"
+        ref={popoverRef}
+      >
+        {release.state === 'published' ? (
+          <Card
+            tone="default"
+            data-testid="published-release-type-label"
+            padding={2}
+            style={{borderRadius: '999px'}}
+          >
+            {productionLabelContent}
+          </Card>
+        ) : (
+          <Button
+            disabled={isReleaseScheduled}
+            mode="bleed"
+            onClick={handleOnPickerClick}
+            ref={buttonRef}
+            tooltipProps={{
+              placement: 'bottom',
+              content: isReleaseScheduled && tRelease('type-picker.tooltip.scheduled'),
+            }}
+            selected={open}
+            tone={tone}
+            style={{borderRadius: '999px'}}
+            data-testid="release-type-picker"
+          >
+            {productionLabelContent}
+          </Button>
+        )}
+      </Popover>
+    )
+  }
+
+  const valueText = (
+    <Text
+      data-testid="release-type-label"
+      size={1}
+      weight="medium"
+      textOverflow="ellipsis"
+      title={compactLabel}
+      style={{opacity: isUpdating ? 0.5 : 1}}
+    >
+      {compactLabel}
+    </Text>
+  )
+
+  return (
+    <Popover
+      content={popoverContent}
+      open={open}
+      padding={1}
+      placement="bottom-start"
+      ref={popoverRef}
+    >
+      {/* The tone-scoped Card (transparent bg) colours the value text; no filled pill. When the
+          schedule is editable it's a flush, chrome-free clickable trigger; when locked/published
+          it's static text. Either way it reads as plain text aligned with the other values. */}
+      {release.state === 'published' || isReleaseScheduled ? (
+        // When the schedule is locked because the release is scheduled, keep the same explanation the
+        // production disabled control shows. Disabled for published releases (no scheduled tooltip).
+        <Tooltip content={tRelease('type-picker.tooltip.scheduled')} disabled={!isReleaseScheduled}>
+          <Card
+            tone={tone}
+            padding={0}
+            style={{background: 'transparent'}}
+            data-testid={
+              release.state === 'published' ? 'published-release-type-label' : 'release-type-picker'
+            }
+          >
+            {valueText}
+          </Card>
+        </Tooltip>
+      ) : (
+        <Card tone={tone} padding={0} style={{background: 'transparent'}}>
+          <ScheduleTrigger
+            ref={buttonRef}
+            onClick={handleOnPickerClick}
+            data-testid="release-type-picker"
+          >
+            {valueText}
+          </ScheduleTrigger>
+        </Card>
+      )}
+    </Popover>
+  )
+}

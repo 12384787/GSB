@@ -1,0 +1,5 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Artifact commands object_prop_not_found.kcl
+---
+{}

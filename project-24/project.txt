@@ -1,0 +1,1 @@
+encode/httpx	A next generation HTTP client for Python. 🦋	Python

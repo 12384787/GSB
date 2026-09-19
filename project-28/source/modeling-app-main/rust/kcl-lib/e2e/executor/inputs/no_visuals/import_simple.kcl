@@ -1,0 +1,25 @@
+import identity from "identity.kcl"
+
+answer = identity(42)
+assert(answer, isEqualTo = 42, error = "identity")
+
+import identity as id from "identity.kcl"
+
+answer43 = id(43)
+assert(answer43, isEqualTo = 43, error = "identity")
+
+import increment, decrement from "numbers.kcl"
+
+answer3 = increment(2)
+assert(answer3, isEqualTo = 3, error = "increment")
+
+answer5 = decrement(6)
+assert(answer5, isEqualTo = 5, error = "decrement")
+
+import increment as inc, decrement as dec from "numbers.kcl"
+
+answer4 = inc(3)
+assert(answer4, isEqualTo = 4, error = "inc")
+
+answer6 = dec(7)
+assert(answer6, isEqualTo = 6, error = "dec")

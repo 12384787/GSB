@@ -1,0 +1,58 @@
+import {AddUserIcon} from '@sanity/icons/AddUser'
+import {CogIcon} from '@sanity/icons/Cog'
+import {Card, Stack} from '@sanity/ui'
+
+import {Button} from '../../../../../ui-components/button/Button'
+import {useTranslation} from '../../../../i18n/hooks/useTranslation'
+import {useEnvAwareSanityWebsiteUrl} from '../../../hooks/useEnvAwareSanityWebsiteUrl'
+import {useWorkspace} from '../../../workspace'
+import {FreeTrial} from '../free-trial/FreeTrial'
+import {useCanInviteProjectMembers} from '../useCanInviteMembers'
+
+export function ManageMenu() {
+  const {projectId} = useWorkspace()
+
+  const {t} = useTranslation()
+  const envAwareWebsiteUrl = useEnvAwareSanityWebsiteUrl()
+  const canInviteMembers = useCanInviteProjectMembers()
+
+  return (
+    <Card borderTop flex="none" padding={2}>
+      <Stack as="ul" gap={1}>
+        <Stack as="li">
+          <FreeTrial type="sidebar" />
+        </Stack>
+
+        <Stack as="li">
+          <Button
+            aria-label={t('user-menu.action.manage-project-aria-label')}
+            as="a"
+            href={`${envAwareWebsiteUrl}/manage/project/${projectId}`}
+            icon={CogIcon}
+            justify="flex-start"
+            mode="bleed"
+            size="large"
+            target="_blank"
+            text={t('user-menu.action.manage-project')}
+          />
+        </Stack>
+
+        {canInviteMembers && (
+          <Stack as="li">
+            <Button
+              aria-label={t('user-menu.action.invite-members-aria-label')}
+              as="a"
+              href={`${envAwareWebsiteUrl}/manage/project/${projectId}/members?invite=true`}
+              icon={AddUserIcon}
+              justify="flex-start"
+              mode="bleed"
+              size="large"
+              target="_blank"
+              text={t('user-menu.action.invite-members')}
+            />
+          </Stack>
+        )}
+      </Stack>
+    </Card>
+  )
+}

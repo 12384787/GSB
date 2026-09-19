@@ -1,0 +1,95 @@
+import {useMemo} from 'react'
+import {prepareForPreview, useTranslation, useValuePreview, isGoingToUnpublish} from 'sanity'
+
+import {structureLocaleNamespace} from '../../i18n'
+import {useDocumentPane} from './useDocumentPane'
+
+/**
+ * useDocumentTitle hook return type.
+ *
+ * @beta
+ * @hidden
+ */
+export interface UseDocumentTitle {
+  error?: string
+  title?: string
+}
+
+/**
+ * React hook that returns the document title for the current document in the document pane.
+ *
+ * @beta
+ * @hidden
+ *
+ * @returns The document title or error. See {@link UseDocumentTitle}
+ */
+export function useDocumentTitle(): UseDocumentTitle {
+  const {
+    connectionState,
+    schemaType,
+    isDeleted,
+    lastRevisionDocument,
+    value: documentPaneValue,
+    editState,
+  } = useDocumentPane()
+  const {t} = useTranslation(structureLocaleNamespace)
+
+  // follows the same logic as the StructureTitle component
+  const documentValue = useMemo(() => {
+    if (isDeleted) return lastRevisionDocument
+    return documentPaneValue
+  }, [isDeleted, lastRevisionDocument, documentPaneValue])
+  const subscribed = Boolean(documentValue)
+
+  // For deleted documents, we need to handle the preview differently since useValuePreview
+  // will return null for deleted documents. Instead, we directly prepare the preview
+  // from the lastRevisionDocument data.
+  const deletedDocumentPreview = useMemo(() => {
+    if (isDeleted && lastRevisionDocument && schemaType) {
+      try {
+        const prepared = prepareForPreview(lastRevisionDocument, schemaType)
+        return prepared
+      } catch (error) {
+        console.warn('Failed to prepare preview for deleted document:', error)
+        return null
+      }
+    }
+    return null
+  }, [isDeleted, lastRevisionDocument, schemaType])
+
+  const {error, value} = useValuePreview({
+    // disable useValuePreview for deleted documents
+    enabled: subscribed && !isDeleted,
+    schemaType,
+    value: documentValue,
+    // Documents that are going to be unpublished need to be handled specially
+    perspectiveStack: editState?.version && isGoingToUnpublish(editState?.version) ? [] : undefined,
+  })
+
+  if (connectionState === 'connecting' && !subscribed) {
+    return {error: undefined, title: undefined}
+  }
+
+  // For deleted documents, use the directly prepared preview
+  if (isDeleted && deletedDocumentPreview) {
+    return {error: undefined, title: deletedDocumentPreview.title}
+  }
+
+  if (!value && !isDeleted) {
+    return {
+      error: undefined,
+      title: t('panes.document-header-title.new.text', {
+        schemaType: schemaType?.title || schemaType?.name,
+      }),
+    }
+  }
+
+  if (error) {
+    return {
+      error: t('panes.document-list-pane.error.text', {error: error.message}),
+      title: undefined,
+    }
+  }
+
+  return {error: undefined, title: value?.title}
+}

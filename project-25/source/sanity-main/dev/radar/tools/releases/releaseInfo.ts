@@ -1,0 +1,176 @@
+/**
+ * Pure helpers for the Releases tool: external URLs per release and the
+ * regression attribution (which release first shipped each confirmed
+ * regression, per the bisect sessions).
+ */
+import {type BisectCommit, type ReleaseTag, releasesContaining} from '../bisect/bisect'
+
+/**
+ * The sanity.io changelog URL for a release. The changelog document id is
+ * derived from the release's BASE version — the previous release on the
+ * first-parent chain, exactly what release automation computes with
+ * `git describe` (see packages/@repo/release-notes/src/utils/ids.ts, which
+ * base64url-encodes it into `studio-<...>`).
+ */
+export function changelogUrl(baseVersion: string): string {
+  const encoded = btoa(baseVersion).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  return `https://www.sanity.io/changelog/studio-${encoded}`
+}
+
+export function npmxUrl(version: string): string {
+  return `https://npmx.dev/package/sanity/v/${encodeURIComponent(version)}`
+}
+
+/**
+ * The previous release on the first-parent chain — the tag NAME (e.g.
+ * "v6.10.0"). Undefined when the walk leaves the synced set (off-mainline
+ * tags) or hits the sync cutoff before another tag.
+ *
+ * Prerelease tags are deliberately NOT skipped. This mirrors release
+ * automation's base-version computation (`git describe --first-parent
+ * --match "v*"` in @repo/release-notes bump.ts, which matches rc tags too),
+ * and the changelog URL derived from this value must reproduce the id that
+ * automation generated — filtering here would break the link whenever an rc
+ * ever lands on mainline. It also matches the blame model: releases are
+ * blamed for the commits they FIRST shipped, and an rc that shipped them
+ * first is the correct base for the span that follows it.
+ */
+export function baseTagOf(
+  commitsBySha: Map<string, BisectCommit>,
+  tagBySha: Map<string, string>,
+  tag: {sha: string},
+): string | undefined {
+  const visited = new Set<string>()
+  let current = commitsBySha.get(tag.sha)
+  current = current?.parentSha ? commitsBySha.get(current.parentSha) : undefined
+  while (current && !visited.has(current.sha)) {
+    const found = tagBySha.get(current.sha)
+    if (found) return found
+    visited.add(current.sha)
+    current = current.parentSha ? commitsBySha.get(current.parentSha) : undefined
+  }
+  return undefined
+}
+
+/**
+ * The previous release as a bare VERSION ("6.10.0") — the release
+ * automation's "base version" for a tag, which the changelog URL is derived
+ * from.
+ */
+export function baseVersionOf(
+  commitsBySha: Map<string, BisectCommit>,
+  tagBySha: Map<string, string>,
+  tag: {sha: string},
+): string | undefined {
+  return baseTagOf(commitsBySha, tagBySha, tag)?.replace(/^v/, '')
+}
+
+/**
+ * Group confirmed regressions by INTRODUCING release: for each item's
+ * first-bad sha, the oldest release whose ancestry contains it gets the
+ * blame. Items no release contains (unreleased regressions) are dropped.
+ * Order within a release follows the input.
+ */
+export function regressionsByTag<T extends ReleaseTag, R extends {firstBadSha: string}>(
+  commitsBySha: Map<string, BisectCommit>,
+  tags: T[],
+  regressions: R[],
+): Map<string, R[]> {
+  const byTag = new Map<string, R[]>()
+  for (const regression of regressions) {
+    const introducing = releasesContaining(commitsBySha, tags, regression.firstBadSha)[0]
+    if (!introducing) continue
+    const list = byTag.get(introducing.tag) ?? []
+    list.push(regression)
+    byTag.set(introducing.tag, list)
+  }
+  return byTag
+}
+
+/** `regressionsByTag` reduced to counts, for the badge. */
+export function regressionCountByTag<T extends ReleaseTag>(
+  commitsBySha: Map<string, BisectCommit>,
+  tags: T[],
+  firstBadShas: string[],
+): Map<string, number> {
+  const grouped = regressionsByTag(
+    commitsBySha,
+    tags,
+    firstBadShas.map((firstBadSha) => ({firstBadSha})),
+  )
+  return new Map([...grouped].map(([tag, list]) => [tag, list.length]))
+}
+
+/**
+ * Semver order for `vMAJOR.MINOR.PATCH[-prerelease]` tags, newest first —
+ * the releases list is a version list, not a timeline, and tag dates put a
+ * maintenance patch cut last week above the minor it backports from.
+ * A prerelease sorts below its release (`v7.0.0-rc.1` < `v7.0.0`);
+ * prerelease identifiers compare numerically when both are numbers, else as
+ * strings. Anything that doesn't parse sorts last, by tag name.
+ */
+export function compareTagsSemverDesc(a: string, b: string): number {
+  const pa = parseSemverTag(a)
+  const pb = parseSemverTag(b)
+  if (!pa && !pb) return compareCodePointsDesc(a, b)
+  if (!pa) return 1
+  if (!pb) return -1
+  for (const key of ['major', 'minor', 'patch'] as const) {
+    if (pa[key] !== pb[key]) return pb[key] - pa[key]
+  }
+  if (!pa.prerelease && !pb.prerelease) return 0
+  if (!pa.prerelease) return -1
+  if (!pb.prerelease) return 1
+  return comparePrereleaseDesc(pa.prerelease, pb.prerelease)
+}
+
+function parseSemverTag(
+  tag: string,
+): {major: number; minor: number; patch: number; prerelease?: string} | undefined {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(tag)
+  if (!match) return undefined
+  const [, major, minor, patch, prerelease] = match
+  return {major: Number(major), minor: Number(minor), patch: Number(patch), prerelease}
+}
+
+function comparePrereleaseDesc(a: string, b: string): number {
+  const as = a.split('.')
+  const bs = b.split('.')
+  for (let i = 0; i < Math.max(as.length, bs.length); i++) {
+    // A shorter identifier list is the lower precedence (rc < rc.1)
+    if (as[i] === undefined) return 1
+    if (bs[i] === undefined) return -1
+    const an = /^\d+$/.test(as[i]) ? Number(as[i]) : undefined
+    const bn = /^\d+$/.test(bs[i]) ? Number(bs[i]) : undefined
+    if (an !== undefined && bn !== undefined) {
+      if (an !== bn) return bn - an
+    } else if (an !== undefined) {
+      return 1 // numeric identifiers rank below alphanumeric ones
+    } else if (bn !== undefined) {
+      return -1
+    } else if (as[i] !== bs[i]) {
+      return compareCodePointsDesc(as[i], bs[i])
+    }
+  }
+  return 0
+}
+
+/** SemVer wants ASCII order for non-numeric identifiers; `localeCompare` is locale- and case-folding-dependent. */
+function compareCodePointsDesc(a: string, b: string): number {
+  if (a === b) return 0
+  return a < b ? 1 : -1
+}
+
+/**
+ * The Bisect tool URL for a session, from the Releases tool's own location.
+ * Tools are top-level studio routes (`<basePath>/<tool name>`), and the
+ * Bisect tool reads `?session=` from the location rather than router state,
+ * so this is plain path surgery on the current pathname: swap the trailing
+ * `releases` segment for `bisect` and append the query. Router-based
+ * resolution is not an option here — `useRouter()` inside a tool is scoped
+ * to that tool, so a `{tool: 'bisect'}` state can't be encoded from it.
+ */
+export function bisectSessionPath(pathname: string, sessionId: string): string {
+  const base = pathname.replace(/\/releases(?:\/.*)?$/, '')
+  return `${base}/bisect?session=${encodeURIComponent(sessionId)}`
+}

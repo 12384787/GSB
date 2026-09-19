@@ -1,0 +1,118 @@
+import {type Path} from '@sanity/types'
+import {Card, Inline, Text} from '@sanity/ui'
+import {type ReactNode} from 'react'
+import {Flex, VStack} from 'ui5'
+
+import {Tooltip, type TooltipProps} from '../../../../ui-components/tooltip/Tooltip'
+import {LegacyLayerProvider} from '../../../components/transitional/LegacyLayerProvider'
+import {UserAvatar} from '../../../components/userAvatar/UserAvatar'
+import {useRelativeTime} from '../../../hooks/useRelativeTime'
+import {useTranslation} from '../../../i18n/hooks/useTranslation'
+import {useUser} from '../../../store/user/hooks'
+import {type AnnotationDetails, type Diff} from '../../types'
+import {getAnnotationAtPath} from '../annotations/helpers'
+import {useAnnotationColor} from '../annotations/hooks'
+import {Event} from '../components/Event'
+
+/** @internal */
+export interface DiffTooltipProps extends TooltipProps {
+  children: React.JSX.Element
+  description?: ReactNode
+  diff: Diff
+  path?: Path | string
+}
+
+/** @internal */
+export interface DiffTooltipWithAnnotationsProps extends TooltipProps {
+  annotations: AnnotationDetails[]
+  children: React.JSX.Element
+  description?: ReactNode
+}
+
+/** @internal */
+export function DiffTooltip(props: DiffTooltipProps | DiffTooltipWithAnnotationsProps) {
+  if (!('diff' in props)) {
+    return <DiffTooltipWithAnnotation {...props} />
+  }
+
+  const {diff, path = [], ...restProps} = props
+  const annotation = getAnnotationAtPath(diff, path)
+
+  return <DiffTooltipWithAnnotation {...restProps} annotations={annotation ? [annotation] : []} />
+}
+
+function DiffTooltipWithAnnotation(props: DiffTooltipWithAnnotationsProps) {
+  const {annotations, children, description, ...restProps} = props
+  const {t} = useTranslation()
+
+  if (!annotations) {
+    return children
+  }
+
+  const content = (
+    <Flex gap={2} style={{minWidth: '240px'}} paddingTop={1} flexDirection="column" flexShrink={0}>
+      <Text muted size={1} weight="medium">
+        {description || t('changes.changed-label')}
+      </Text>
+      <VStack gap={2}>
+        {annotations.map((annotation, idx) => (
+          // oxlint-disable-next-line no-array-index-key
+          <AnnotationItem key={idx} annotation={annotation} />
+        ))}
+      </VStack>
+    </Flex>
+  )
+
+  return (
+    <LegacyLayerProvider zOffset="paneFooter">
+      <Tooltip content={content} portal {...restProps}>
+        {children}
+      </Tooltip>
+    </LegacyLayerProvider>
+  )
+}
+
+function AnnotationItem({annotation}: {annotation: AnnotationDetails}) {
+  const {author, timestamp} = annotation
+  const [user] = useUser(author)
+  const color = useAnnotationColor(annotation)
+  const timeAgo = useRelativeTime(timestamp, {minimal: true})
+  const {t} = useTranslation()
+
+  return (
+    <>
+      {annotation.event ? (
+        <>
+          <Card borderBottom marginBottom={2} />
+          <Event event={annotation.event} showChangesBy="inline" />
+        </>
+      ) : (
+        <Inline gap={2}>
+          <Flex
+            alignItems="center"
+            paddingRight={3}
+            style={{
+              backgroundColor: color.background,
+              color: color.text,
+              borderRadius: 'calc(23px / 2)',
+            }}
+          >
+            {author && (
+              <>
+                <UserAvatar user={author} />
+                <Inline paddingLeft={2}>
+                  <Text muted size={1} style={{color: color.text}}>
+                    {user ? user.displayName : t('changes.loading-author')}
+                  </Text>
+                </Inline>
+              </>
+            )}
+          </Flex>
+          <Text as="time" muted size={1} dateTime={timestamp}>
+            {timeAgo}
+          </Text>
+        </Inline>
+      )}
+    </>
+  )
+}

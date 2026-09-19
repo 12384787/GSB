@@ -1,0 +1,113 @@
+import {ReadOnlyIcon} from '@sanity/icons/ReadOnly'
+import {useTelemetry} from '@sanity/telemetry/react'
+import {Text} from '@sanity/ui'
+import {useMemo, useState} from 'react'
+import {Translate, useCurrentUser, useListFormat, useTranslation, useWorkspace} from 'sanity'
+
+import {AskToEditDialogOpened} from '../../../../components/requestPermissionDialog/__telemetry__/RequestPermissionDialog.telemetry'
+import {RequestPermissionDialog} from '../../../../components/requestPermissionDialog/RequestPermissionDialog'
+import {useRoleRequestsStatus} from '../../../../components/requestPermissionDialog/useRoleRequestsStatus'
+import {structureLocaleNamespace} from '../../../../i18n'
+import {useDocumentPane} from '../../useDocumentPane'
+import {Banner} from './Banner'
+
+interface InsufficientPermissionBannerProps {
+  requiredPermission: 'update' | 'create'
+}
+
+function Roles({roleList}: {children?: React.ReactNode; roleList?: React.ReactNode}) {
+  return roleList
+}
+
+export function InsufficientPermissionBanner({
+  requiredPermission,
+}: InsufficientPermissionBannerProps) {
+  const currentUser = useCurrentUser()
+  const workspace = useWorkspace()
+  const {documentId, schemaType} = useDocumentPane()
+
+  const askToEditEnabled = workspace.document.askToEdit.enabled({
+    documentId,
+    documentType: schemaType.name,
+  })
+
+  const {
+    data: roleRequestStatus,
+    loading: requestStatusLoading,
+    error: requestStatusError,
+  } = useRoleRequestsStatus()
+  const [requestSent, setRequestSent] = useState(false)
+  const requestPending = useMemo(
+    () => roleRequestStatus === 'pending' || roleRequestStatus === 'declined' || requestSent,
+    [roleRequestStatus, requestSent],
+  )
+  const currentUserRoles = currentUser?.roles || []
+  const isOnlyViewer = currentUserRoles.length === 1 && currentUserRoles[0].name === 'viewer'
+  const [showRequestPermissionDialog, setShowRequestPermissionDialog] = useState(false)
+
+  const listFormat = useListFormat({style: 'short'})
+  const {t} = useTranslation(structureLocaleNamespace)
+  const telemetry = useTelemetry()
+
+  const roleTitles = currentUserRoles.map((role) => role.title)
+  const roles = listFormat
+    .formatToParts(roleTitles)
+    .map((part) =>
+      part.type === 'element' ? <code key={part.value}>{part.value}</code> : part.value,
+    )
+
+  const showAskToEditAction =
+    askToEditEnabled &&
+    isOnlyViewer &&
+    roleRequestStatus &&
+    !requestStatusError &&
+    !requestStatusLoading
+
+  return (
+    <>
+      <Banner
+        content={
+          <Text size={1} weight="medium">
+            <Translate
+              t={t}
+              i18nKey="banners.permission-check-banner.missing-permission"
+              components={{Roles}}
+              componentProps={{roleList: roles}}
+              values={{count: roles.length, roles: roleTitles}}
+              context={requiredPermission}
+            />
+          </Text>
+        }
+        action={
+          showAskToEditAction
+            ? {
+                onClick: requestPending
+                  ? undefined
+                  : () => {
+                      setShowRequestPermissionDialog(true)
+                      telemetry.log(AskToEditDialogOpened)
+                    },
+                text: requestPending
+                  ? t('banners.permission-check-banner.request-permission-button.sent')
+                  : t('banners.permission-check-banner.request-permission-button.text'),
+                tone: requestPending ? 'default' : 'primary',
+                disabled: requestPending,
+                mode: requestPending ? 'bleed' : undefined,
+              }
+            : undefined
+        }
+        data-testid="permission-check-banner"
+        icon={ReadOnlyIcon}
+      />
+      {showRequestPermissionDialog && (
+        <RequestPermissionDialog
+          onClose={() => setShowRequestPermissionDialog(false)}
+          onRequestSubmitted={() => {
+            setRequestSent(true)
+            setShowRequestPermissionDialog(false)
+          }}
+        />
+      )}
+    </>
+  )
+}

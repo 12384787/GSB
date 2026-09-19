@@ -1,0 +1,35 @@
+{
+  "name": "@kittycad/codemirror-lang-kcl",
+  "version": "1.0.0",
+  "description": "Zoo KCL language support for CodeMirror 6.",
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "tsc --emitDeclarationOnly && rollup -c",
+    "tsc": "tsc",
+    "test": "vitest --config vitest.main.config.ts run"
+  },
+  "type": "module",
+  "repository": "https://github.com/KittyCAD/modeling-app",
+  "author": "Zoo Engineering Team",
+  "license": "MIT",
+  "private": false,
+  "exports": {
+    "import": "./dist/index.js",
+    "require": "./dist/index.cjs"
+  },
+  "types": "dist/index.d.ts",
+  "dependencies": {
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/state": "^6.5.4",
+    "@lezer/highlight": "^1.2.1",
+    "typescript": "7.0.2"
+  },
+  "devDependencies": {
+    "@lezer/generator": "^1.7.3",
+    "rollup": "^4.61.0",
+    "rollup-plugin-esbuild": "^6.2.1",
+    "vite-tsconfig-paths": "^6.0.3",
+    "vitest": "^4.1.10"
+  },
+  "files": ["dist/"]
+}

@@ -1,0 +1,78 @@
+import {type UploadState} from '@sanity/types'
+import {Card, Inline, Text} from '@sanity/ui'
+import {useEffect} from 'react'
+import {Flex} from 'ui5'
+
+import {Button} from '../../../../../ui-components/button/Button'
+import {LinearProgress} from '../../../../components/progress/LinearProgress'
+import {useTranslation} from '../../../../i18n/hooks/useTranslation'
+import {Translate} from '../../../../i18n/Translate'
+import {STALE_UPLOAD_MS} from '../constants'
+import {CardWrapper, CodeWrapper, FlexWrapper, LeftSection} from './UploadProgress.styled'
+
+type Props = {
+  uploadState: UploadState
+  onCancel?: () => void
+  onStale?: () => void
+}
+const elapsedMs = (date: string): number => new Date().getTime() - new Date(date).getTime()
+
+function FileName({filename}: {children?: React.ReactNode; filename?: string}) {
+  return <CodeWrapper size={1}>{filename ? filename : '…'}</CodeWrapper>
+}
+
+export function UploadProgress({uploadState, onCancel, onStale}: Props) {
+  const filename = uploadState.file.name
+
+  useEffect(() => {
+    if (elapsedMs(uploadState.updatedAt) > STALE_UPLOAD_MS) {
+      onStale?.()
+    }
+  }, [uploadState.updatedAt, onStale])
+
+  const {t} = useTranslation()
+  return (
+    <CardWrapper tone="primary" border>
+      <FlexWrapper
+        padding={4}
+        alignItems="center"
+        justifyContent="space-between"
+        height="100%"
+        flexDirection="row"
+        gap={2}
+      >
+        <LeftSection>
+          <Flex
+            justifyContent="center"
+            gap={[3, 3, 2, 2]}
+            flexDirection={['column', 'column', 'row']}
+          >
+            <Text size={1}>
+              <Inline gap={2}>
+                <Translate
+                  t={t}
+                  i18nKey="input.files.common.upload-progress"
+                  components={{FileName}}
+                  componentProps={{filename}}
+                />
+              </Inline>
+            </Text>
+          </Flex>
+
+          <Card border marginTop={3} radius={5}>
+            <LinearProgress value={uploadState.progress} />
+          </Card>
+        </LeftSection>
+
+        {onCancel ? (
+          <Button
+            mode="ghost"
+            onClick={onCancel}
+            text={t('input.files.common.cancel-upload')}
+            tone="critical"
+          />
+        ) : null}
+      </FlexWrapper>
+    </CardWrapper>
+  )
+}

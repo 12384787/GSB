@@ -1,0 +1,5 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Artifact commands invalid_member_object_prop.kcl
+---
+{}

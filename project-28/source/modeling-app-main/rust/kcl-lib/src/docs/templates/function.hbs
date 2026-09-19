@@ -1,0 +1,77 @@
+---
+title: "{{name}}"
+subtitle: "Function in {{module}}"
+excerpt: "{{safe_yaml summary}}"
+layout: manual
+---
+
+{{#if deprecated}}
+**WARNING:** This function is deprecated.
+
+{{/if}}
+{{#if deprecated_since}}
+**WARNING:** This function is deprecated as of KCL {{deprecated_since}}.
+
+{{/if}}
+{{#if experimental}}
+**WARNING:** This function is experimental and may change or be removed.
+
+{{/if}}
+{{{summary}}}
+
+```kcl
+{{{fn_signature}}}
+```
+
+{{{description}}}
+
+{{#if args}}
+### Arguments
+
+| Name | Type | Description | Required |
+|----------|------|-------------|----------|
+{{#each args}}
+| `{{name}}` | `{{type_}}` | {{#if added_in}}**Added in KCL {{added_in}}.** {{/if}}{{#if deprecated}}**Deprecated.** {{/if}}{{#if deprecated_since}}**Deprecated as of KCL {{deprecated_since}}.** {{/if}}{{#if removed_in}}**Removed in KCL {{removed_in}}.** {{/if}}{{#if experimental}}**Experimental.** {{/if}}{{{firstLine description}}} | {{#if required}}Yes{{else}}No{{/if}} |
+{{/each}}
+{{/if}}
+
+{{#if return_value}}
+### Returns
+
+`{{return_value.type_}}`{{#if return_value.description}} - {{{firstLine return_value.description}}}{{/if}}
+
+{{/if}}
+
+{{#if examples}}
+### Examples
+
+{{#each examples}}
+{{#if this.content}}
+```kcl
+{{{this.content}}}
+```
+{{/if}}
+
+
+{{#if this.gltf_path}}
+<model-viewer
+  class="kcl-example"
+  alt="Example showing a rendered KCL program that uses the {{@root.name}} function"
+  src="{{this.gltf_path}}"
+  ar
+  environment-image="/moon_1k.hdr"
+  poster="{{this.image_path}}"
+  shadow-intensity="1"
+  camera-controls
+  touch-action="pan-y"
+>
+</model-viewer>
+{{else}}
+	{{#if this.image_path}}
+![Rendered example of {{@root.name}} {{@index}}]({{this.image_path}})
+	{{/if}}
+{{/if}}
+
+{{/each}}
+{{/if}}
+

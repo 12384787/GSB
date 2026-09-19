@@ -1,0 +1,212 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Result of parsing array_range_negative_expr.kcl
+---
+{
+  "Ok": {
+    "body": [
+      {
+        "commentStart": 0,
+        "declaration": {
+          "commentStart": 0,
+          "end": 0,
+          "id": {
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "name": "xs",
+            "start": 0,
+            "type": "Identifier"
+          },
+          "init": {
+            "commentStart": 0,
+            "end": 0,
+            "endElement": {
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "raw": "5",
+              "start": 0,
+              "type": "Literal",
+              "type": "Literal",
+              "value": {
+                "value": 5.0,
+                "suffix": "None"
+              }
+            },
+            "endInclusive": true,
+            "moduleId": 0,
+            "start": 0,
+            "startElement": {
+              "argument": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "raw": "5",
+                "start": 0,
+                "type": "Literal",
+                "type": "Literal",
+                "value": {
+                  "value": 5.0,
+                  "suffix": "None"
+                }
+              },
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "operator": "-",
+              "start": 0,
+              "type": "UnaryExpression",
+              "type": "UnaryExpression"
+            },
+            "type": "ArrayRangeExpression",
+            "type": "ArrayRangeExpression"
+          },
+          "moduleId": 0,
+          "start": 0,
+          "type": "VariableDeclarator"
+        },
+        "end": 0,
+        "kind": "const",
+        "moduleId": 0,
+        "start": 0,
+        "type": "VariableDeclaration",
+        "type": "VariableDeclaration"
+      },
+      {
+        "commentStart": 0,
+        "end": 0,
+        "expression": {
+          "arguments": [
+            {
+              "type": "LabeledArg",
+              "label": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "name": "isEqualTo",
+                "start": 0,
+                "type": "Identifier"
+              },
+              "arg": {
+                "argument": {
+                  "commentStart": 0,
+                  "end": 0,
+                  "moduleId": 0,
+                  "raw": "5",
+                  "start": 0,
+                  "type": "Literal",
+                  "type": "Literal",
+                  "value": {
+                    "value": 5.0,
+                    "suffix": "None"
+                  }
+                },
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "operator": "-",
+                "start": 0,
+                "type": "UnaryExpression",
+                "type": "UnaryExpression"
+              }
+            },
+            {
+              "type": "LabeledArg",
+              "label": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "name": "error",
+                "start": 0,
+                "type": "Identifier"
+              },
+              "arg": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "raw": "\"first element is -5\"",
+                "start": 0,
+                "type": "Literal",
+                "type": "Literal",
+                "value": "first element is -5"
+              }
+            }
+          ],
+          "callee": {
+            "abs_path": false,
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "name": {
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "name": "assert",
+              "start": 0,
+              "type": "Identifier"
+            },
+            "path": [],
+            "start": 0,
+            "type": "Name"
+          },
+          "commentStart": 0,
+          "end": 0,
+          "moduleId": 0,
+          "start": 0,
+          "type": "CallExpressionKw",
+          "type": "CallExpressionKw",
+          "unlabeled": {
+            "commentStart": 0,
+            "computed": true,
+            "end": 0,
+            "moduleId": 0,
+            "object": {
+              "abs_path": false,
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "name": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "name": "xs",
+                "start": 0,
+                "type": "Identifier"
+              },
+              "path": [],
+              "start": 0,
+              "type": "Name",
+              "type": "Name"
+            },
+            "property": {
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "raw": "0",
+              "start": 0,
+              "type": "Literal",
+              "type": "Literal",
+              "value": {
+                "value": 0.0,
+                "suffix": "None"
+              }
+            },
+            "start": 0,
+            "type": "MemberExpression",
+            "type": "MemberExpression"
+          }
+        },
+        "moduleId": 0,
+        "start": 0,
+        "type": "ExpressionStatement",
+        "type": "ExpressionStatement"
+      }
+    ],
+    "commentStart": 0,
+    "end": 0,
+    "moduleId": 0,
+    "start": 0,
+    "type": "Program"
+  }
+}

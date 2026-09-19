@@ -1,0 +1,55 @@
+{
+  "compilerOptions": {
+    "noErrorTruncation": true,
+    "paths": {
+      "@kittycad/registry": ["./packages/registry/src/index.ts"],
+      "@kittycad/codemirror-lsp-client": [
+        "./packages/codemirror-lsp-client/src/index.ts"
+      ],
+      "@kittycad/codemirror-lang-kcl": [
+        "./packages/codemirror-lang-kcl/src/index.ts"
+      ],
+      "@kittycad/ui-components": ["./packages/ui-components/src/index.ts"],
+      "@rust/*": ["./rust/*"],
+      "@e2e/*": ["./e2e/*"],
+      "@src/*": ["./src/*"],
+      "@public/*": ["./public/*"],
+      "@root/*": ["./*"]
+    },
+    "types": [
+      "vite/client",
+      "@types/wicg-file-system-access",
+      "node",
+      "@lezer/generator"
+    ],
+    "target": "esnext",
+    "lib": ["dom", "dom.iterable", "es2024"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "noFallthroughCasesInSwitch": true,
+    "module": "es2022",
+    "moduleResolution": "bundler",
+    "resolvePackageJsonExports": false,
+    "resolveJsonModule": true,
+    "composite": false,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx"
+  },
+  "include": ["src", "e2e", "packages", "*.ts", "rust", "types"],
+  "exclude": [
+    "**/*.stories.tsx",
+    "node_modules",
+    "./*.grammar",
+    "vite.config.ts",
+    "forge.config.ts",
+    ".vscode-test",
+    "rust/kcl-lib/expected-bindings/**",
+    "rust/kcl-wasm-lib/pkg/**"
+  ],
+  "references": [{ "path": "./tsconfig.node.json" }]
+}

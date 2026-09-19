@@ -1,0 +1,49 @@
+import {type FormNodeValidation} from '@sanity/types'
+import {useMemo, useRef} from 'react'
+
+import {EMPTY_ARRAY} from '../../../../util/empty'
+import {type BaseFormNode} from '../../../store/types/nodes'
+import {immutableReconcile} from '../../../store/utils/immutableReconcile'
+import {useChildValidation} from '../../../studio/contexts/Validation'
+import {isBlockType} from '../_helpers'
+
+const NONEXISTENT_PATH = ['@@_NONEXISTENT_PATH_@@']
+
+/** @internal */
+export function useMemberValidation(member: BaseFormNode | undefined) {
+  const prev = useRef<FormNodeValidation[] | null>(null)
+  const memberValidation =
+    member?.validation && member.validation.length > 0 ? member.validation : EMPTY_ARRAY
+  const childValidation = useChildValidation(member?.path || NONEXISTENT_PATH)
+
+  const validation = useMemo(
+    () =>
+      member?.schemaType && isBlockType(member?.schemaType)
+        ? memberValidation
+        : memberValidation.concat(childValidation),
+    [childValidation, member, memberValidation],
+  )
+
+  const [hasError, hasWarning, hasInfo] = useMemo(
+    () => [
+      validation.filter((v) => v.level === 'error').length > 0,
+      validation.filter((v) => v.level === 'warning').length > 0,
+      validation.filter((v) => v.level === 'info').length > 0,
+    ],
+    [validation],
+  )
+
+  // oxlint-disable-next-line react/refs -- @todo fix later, requires research to avoid perf degradation, for now "this is fine"
+  const reconciled = immutableReconcile(prev.current, validation)
+  // oxlint-disable-next-line react/refs -- see above
+  prev.current = reconciled
+
+  return useMemo(() => {
+    return {
+      validation: reconciled,
+      hasError,
+      hasWarning,
+      hasInfo,
+    }
+  }, [reconciled, hasError, hasWarning, hasInfo])
+}

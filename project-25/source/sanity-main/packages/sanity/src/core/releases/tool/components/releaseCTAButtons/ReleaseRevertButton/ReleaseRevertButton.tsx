@@ -1,0 +1,377 @@
+import {type ReleaseDocument} from '@sanity/client'
+import {RestoreIcon} from '@sanity/icons/Restore'
+import {useTelemetry} from '@sanity/telemetry/react'
+import {Card, Checkbox, Text} from '@sanity/ui'
+import {useToast} from '@sanity/ui/toast'
+import {useCallback, useEffect, useRef, useState} from 'react'
+import {useRouter} from 'sanity/router'
+import {Box, Flex} from 'ui5'
+
+import {Button} from '../../../../../../ui-components/button/Button'
+import {Dialog} from '../../../../../../ui-components/dialog/Dialog'
+import {useTranslation} from '../../../../../i18n/hooks/useTranslation'
+import {Translate} from '../../../../../i18n/Translate'
+import {RevertRelease} from '../../../../__telemetry__/releases.telemetry'
+import {useReleasesUpsell} from '../../../../contexts/upsell/useReleasesUpsell'
+import {releasesLocaleNamespace} from '../../../../i18n'
+import {isReleaseLimitError} from '../../../../store/isReleaseLimitError'
+import {useReleaseOperations} from '../../../../store/useReleaseOperations'
+import {useReleasePermissions} from '../../../../store/useReleasePermissions'
+import {createReleaseId} from '../../../../util/createReleaseId'
+import {getReleaseIdFromReleaseDocumentId} from '../../../../util/getReleaseIdFromReleaseDocumentId'
+import {getReleaseDefaults} from '../../../../util/util'
+import {type DocumentInRelease} from '../../../detail/types'
+import {useDocumentRevertStates} from './useDocumentRevertStates'
+import {usePostPublishTransactions} from './usePostPublishTransactions'
+
+interface ReleasePublishAllButtonProps {
+  release: ReleaseDocument
+  documents: DocumentInRelease[]
+  disabled?: boolean
+}
+
+type RevertReleaseStatus = 'idle' | 'confirm' | 'reverting'
+
+function RevertStageSuccessLink({
+  linkText,
+  onLinkClick,
+}: {
+  children?: React.ReactNode
+  linkText?: string
+  onLinkClick?: () => void
+}) {
+  return (
+    <Text
+      size={1}
+      weight="medium"
+      data-as="a"
+      onClick={onLinkClick}
+      style={{
+        cursor: 'pointer',
+        marginBottom: '0.5rem',
+        display: 'flex',
+      }}
+      data-testid="revert-stage-success-link"
+    >
+      {linkText}
+    </Text>
+  )
+}
+
+const ConfirmReleaseDialog = ({
+  revertReleaseStatus,
+  documents,
+  setRevertReleaseStatus,
+  release,
+}: {
+  revertReleaseStatus: RevertReleaseStatus
+  documents: DocumentInRelease[]
+  setRevertReleaseStatus: (status: RevertReleaseStatus) => void
+  release: ReleaseDocument
+}) => {
+  const {t} = useTranslation(releasesLocaleNamespace)
+  const {t: tCore} = useTranslation()
+  const releaseDisplayTitle =
+    release.metadata.title || tCore('release.placeholder-untitled-release')
+  const hasPostPublishTransactions = usePostPublishTransactions(documents)
+  const documentRevertStates = useDocumentRevertStates(documents)
+  const isResolvingRevertStates = documentRevertStates === null
+  const unresolvedCount = documentRevertStates?.unresolvedDocumentIds.length ?? 0
+  // Two cards: a failed request can be retried, history pruned by retention cannot
+  const requestFailedCount =
+    documentRevertStates?.states.filter(
+      (state) => state.type === 'unresolved' && state.reason === 'request-failed',
+    ).length ?? 0
+  const historyUnavailableCount = unresolvedCount - requestFailedCount
+  const [stageNewRevertRelease, setStageNewRevertRelease] = useState(true)
+  const toast = useToast()
+  const telemetry = useTelemetry()
+  const {revertRelease} = useReleaseOperations()
+  const router = useRouter()
+
+  const navigateToRevertRelease = useCallback(
+    (revertReleaseId: string) => () =>
+      router.navigate({releaseId: getReleaseIdFromReleaseDocumentId(revertReleaseId)}),
+    [router],
+  )
+
+  const handleRevertRelease = useCallback(async () => {
+    setRevertReleaseStatus('reverting')
+
+    const revertReleaseId = createReleaseId()
+
+    // The run().catch().finally() syntax instead of try/catch/finally is because of the React Compiler not fully supporting the syntax yet
+    const run = async () => {
+      // The confirm button is disabled in these states; this guards against a stale click.
+      if (!documentRevertStates || documentRevertStates.unresolvedDocumentIds.length > 0) {
+        throw new Error('Unable to determine the previous state of every document in the release')
+      }
+
+      await revertRelease(
+        revertReleaseId,
+        documentRevertStates.revertDocuments,
+        {
+          title: t('revert-release.title', {
+            title: releaseDisplayTitle,
+          }),
+          description: t('revert-release.description', {
+            title: releaseDisplayTitle,
+          }),
+          releaseType: 'asap',
+        },
+        stageNewRevertRelease ? 'staged' : 'immediate',
+      )
+
+      if (stageNewRevertRelease) {
+        telemetry.log(RevertRelease, {revertType: 'staged'})
+        toast.push({
+          closable: true,
+          status: 'success',
+          title: (
+            <Text muted size={1}>
+              <Translate
+                components={{Link: RevertStageSuccessLink}}
+                componentProps={{
+                  linkText: t('toast.revert-stage.success-link'),
+                  onLinkClick: navigateToRevertRelease(revertReleaseId),
+                }}
+                t={t}
+                i18nKey="toast.revert-stage.success"
+                values={{
+                  title: releaseDisplayTitle,
+                }}
+              />
+            </Text>
+          ),
+        })
+      } else {
+        telemetry.log(RevertRelease, {revertType: 'immediate'})
+
+        toast.push({
+          closable: true,
+          status: 'success',
+          title: (
+            <Text muted size={1}>
+              <Translate
+                t={t}
+                i18nKey="toast.immediate-revert.success"
+                values={{
+                  title: releaseDisplayTitle,
+                }}
+              />
+            </Text>
+          ),
+        })
+      }
+    }
+    await run()
+      .catch((revertError) => {
+        if (isReleaseLimitError(revertError)) return
+
+        toast.push({
+          status: 'error',
+          title: (
+            <Text muted size={1}>
+              <Translate t={t} i18nKey="toast.revert.error" values={{error: revertError.message}} />
+            </Text>
+          ),
+        })
+        console.error(revertError)
+      })
+      .finally(() => {
+        setRevertReleaseStatus('idle')
+      })
+  }, [
+    setRevertReleaseStatus,
+    documentRevertStates,
+    revertRelease,
+    t,
+    releaseDisplayTitle,
+    stageNewRevertRelease,
+    telemetry,
+    toast,
+    navigateToRevertRelease,
+  ])
+
+  const description =
+    documents.length > 1
+      ? 'revert-dialog.confirm-revert-description_other'
+      : 'revert-dialog.confirm-revert-description_one'
+
+  return (
+    <Dialog
+      id="confirm-revert-dialog"
+      header={t('revert-dialog.confirm-revert.title', {
+        title: releaseDisplayTitle,
+      })}
+      onClose={() => setRevertReleaseStatus('idle')}
+      footer={{
+        confirmButton: {
+          text: t(
+            stageNewRevertRelease
+              ? 'action.create-revert-release'
+              : 'action.immediate-revert-release',
+          ),
+          tone: 'positive',
+          onClick: handleRevertRelease,
+          loading: revertReleaseStatus === 'reverting' || isResolvingRevertStates,
+          disabled:
+            revertReleaseStatus === 'reverting' || isResolvingRevertStates || unresolvedCount > 0,
+        },
+      }}
+    >
+      <Text muted size={1}>
+        {
+          <Translate
+            t={t}
+            i18nKey={description}
+            values={{
+              releaseDocumentsLength: documents.length,
+            }}
+          />
+        }
+      </Text>
+      {isResolvingRevertStates && (
+        <Box paddingTop={3}>
+          <Text muted size={1} data-testid="revert-resolving">
+            {t('revert-dialog.confirm-revert.resolving')}
+          </Text>
+        </Box>
+      )}
+      {documentRevertStates && documentRevertStates.revertCount > 0 && (
+        <Box paddingTop={3}>
+          <Text muted size={1} data-testid="revert-summary-restore">
+            {t('revert-dialog.confirm-revert.summary-restore', {
+              count: documentRevertStates.revertCount,
+            })}
+          </Text>
+        </Box>
+      )}
+      {documentRevertStates && documentRevertStates.unpublishCount > 0 && (
+        <Box paddingTop={3}>
+          <Text muted size={1} data-testid="revert-summary-unpublish">
+            {t('revert-dialog.confirm-revert.summary-unpublish', {
+              count: documentRevertStates.unpublishCount,
+            })}
+          </Text>
+        </Box>
+      )}
+      {historyUnavailableCount > 0 && (
+        <Card
+          marginTop={4}
+          padding={3}
+          radius={2}
+          shadow={1}
+          tone="critical"
+          data-testid="revert-history-unavailable-card"
+        >
+          <Text muted size={1}>
+            {t('revert-dialog.confirm-revert.history-unavailable-card', {
+              count: historyUnavailableCount,
+            })}
+          </Text>
+        </Card>
+      )}
+      {requestFailedCount > 0 && (
+        <Card
+          marginTop={4}
+          padding={3}
+          radius={2}
+          shadow={1}
+          tone="critical"
+          data-testid="revert-unresolved-card"
+        >
+          <Text muted size={1}>
+            {t('revert-dialog.confirm-revert.unresolved-card', {count: requestFailedCount})}
+          </Text>
+        </Card>
+      )}
+      <Flex alignItems="center" paddingTop={4}>
+        <Checkbox
+          onChange={() => setStageNewRevertRelease((current) => !current)}
+          id="immediate-revert-release"
+          style={{display: 'block'}}
+          checked={!stageNewRevertRelease}
+        />
+        <Box flexBasis="0%" flexGrow={1} paddingLeft={3}>
+          <Text muted size={1}>
+            <label htmlFor="immediate-revert-release">
+              {t('revert-dialog.confirm-revert.stage-revert-checkbox-label')}
+            </label>
+          </Text>
+        </Box>
+      </Flex>
+      {hasPostPublishTransactions && !stageNewRevertRelease && (
+        <Card marginTop={4} padding={3} radius={2} shadow={1} tone="critical">
+          <Text muted size={1}>
+            {t('revert-dialog.confirm-revert.warning-card')}
+          </Text>
+        </Card>
+      )}
+    </Dialog>
+  )
+}
+
+export const ReleaseRevertButton = ({
+  release,
+  documents,
+  disabled,
+}: ReleasePublishAllButtonProps) => {
+  const {t} = useTranslation(releasesLocaleNamespace)
+  const {t: tCore} = useTranslation()
+  const {guardWithReleaseLimitUpsell} = useReleasesUpsell()
+  const [revertReleaseStatus, setRevertReleaseStatus] = useState<RevertReleaseStatus>('idle')
+  const [isPendingGuardResponse, setIsPendingGuardResponse] = useState<boolean>(false)
+  const {createRelease} = useReleaseOperations()
+  const {checkWithPermissionGuard} = useReleasePermissions()
+  const [hasCreatePermission, setHasCreatePermission] = useState<boolean | null>(null)
+
+  const handleMoveToConfirmStatus = useCallback(async () => {
+    setIsPendingGuardResponse(true)
+    await guardWithReleaseLimitUpsell(() => setRevertReleaseStatus('confirm'))
+    setIsPendingGuardResponse(false)
+  }, [guardWithReleaseLimitUpsell])
+
+  const isMounted = useRef(false)
+  useEffect(() => {
+    isMounted.current = true
+    void checkWithPermissionGuard(createRelease, getReleaseDefaults()).then((hasPermissions) => {
+      if (isMounted.current) setHasCreatePermission(hasPermissions)
+    })
+
+    return () => {
+      isMounted.current = false
+    }
+  }, [checkWithPermissionGuard, createRelease])
+
+  return (
+    <>
+      <Button
+        icon={RestoreIcon}
+        onClick={handleMoveToConfirmStatus}
+        text={t('action.revert')}
+        tone="critical"
+        tooltipProps={{
+          disabled: hasCreatePermission === true,
+          content: tCore('release.action.permission.error'),
+        }}
+        /**
+         * This is an immature assertion of permissions
+         * The permissions needed to revert are:
+         * Permissions to create a request (implemented)
+         * @todo Permissions to create each schema type within the release (not implemented)
+         */
+        disabled={isPendingGuardResponse || !hasCreatePermission || disabled}
+        data-testid="revert-button"
+      />
+      {revertReleaseStatus !== 'idle' && (
+        <ConfirmReleaseDialog
+          release={release}
+          documents={documents}
+          revertReleaseStatus={revertReleaseStatus}
+          setRevertReleaseStatus={setRevertReleaseStatus}
+        />
+      )}
+    </>
+  )
+}

@@ -1,0 +1,229 @@
+import {isBooleanSchemaType, isNumberSchemaType} from '@sanity/types'
+import {type ChangeEvent, useCallback, useEffect, useMemo, useRef, useState} from 'react'
+
+import {set, unset} from '../../../patch/patch'
+import {PatchEvent} from '../../../patch/PatchEvent'
+import {type FormPatch} from '../../../patch/types'
+import {type FieldMember} from '../../../store/types/members'
+import {type PrimitiveFormNode} from '../../../store/types/nodes'
+import {useDocumentFieldActions} from '../../../studio/contexts/DocumentFieldActions'
+import {useFormCallbacks} from '../../../studio/contexts/FormCallbacks'
+import {useParseErrorForPath} from '../../../studio/contexts/ParseErrors'
+import {type PrimitiveFieldProps} from '../../../types/fieldProps'
+import {type PrimitiveInputProps} from '../../../types/inputProps'
+import {type RenderFieldCallback, type RenderInputCallback} from '../../../types/renderCallback'
+import {pathToAnchorIdent} from '../../../utils/pathToAnchorIdent'
+import {stripStegaFromPasteEvent} from '../../../utils/stegaPaste'
+import {createDescriptionId} from '../../common/createDescriptionId'
+import {resolveNativeNumberInputValue} from '../../common/resolveNativeNumberInputValue'
+
+/**
+ * Responsible for creating inputProps and fieldProps to pass to ´renderInput´ and ´renderField´ for a primitive field/input
+ * @param props - Component props
+ *
+ * @internal
+ */
+export function PrimitiveField(props: {
+  member: FieldMember<PrimitiveFormNode>
+  renderInput: RenderInputCallback<PrimitiveInputProps>
+  renderField: RenderFieldCallback<PrimitiveFieldProps>
+}) {
+  const {member, renderInput, renderField} = props
+
+  const fieldActions = useDocumentFieldActions()
+
+  const focusRef = useRef<{focus: () => void}>(undefined)
+
+  const [localValue, setLocalValue] = useState<string | undefined>()
+
+  const {onPathBlur, onPathFocus, onChange} = useFormCallbacks()
+
+  // Parse error reported by the input for the current path (e.g. a date input
+  // holding malformed text it cannot commit). When present we replace the
+  // schema-driven error markers for this path so the tooltip shows the parse
+  // message instead of misleading "required" noise.
+  const parseError = useParseErrorForPath(member.field.path)
+
+  useEffect(() => {
+    if (member.field.focused) {
+      focusRef.current?.focus()
+    }
+  }, [member.field.focused])
+
+  const handleBlur = useCallback(() => {
+    onPathBlur(member.field.path)
+  }, [member.field.path, onPathBlur])
+
+  const handleFocus = useCallback(() => {
+    onPathFocus(member.field.path)
+  }, [member.field.path, onPathFocus])
+
+  const handleChange = useCallback(
+    (event: FormPatch | FormPatch[] | PatchEvent) => {
+      onChange(PatchEvent.from(event).prefixAll(member.name))
+    },
+    [onChange, member.name],
+  )
+
+  const handleNativeChange = useCallback(
+    (event: ChangeEvent<HTMLInputElement>) => {
+      let inputValue: number | string | boolean = event.currentTarget.value
+      if (isNumberSchemaType(member.field.schemaType)) {
+        inputValue = event.currentTarget.valueAsNumber
+        if (inputValue > Number.MAX_SAFE_INTEGER || inputValue < Number.MIN_SAFE_INTEGER) {
+          return
+        }
+      } else if (isBooleanSchemaType(member.field.schemaType)) {
+        inputValue = event.currentTarget.checked
+      }
+
+      // `valueAsNumber` returns `NaN` on empty input
+      const hasEmptyValue =
+        inputValue === '' || (typeof inputValue === 'number' && isNaN(inputValue))
+
+      if (isNumberSchemaType(member.field.schemaType)) {
+        // Store the local value for number inputs in order to support intermediate values
+        // that includes more information than the numeric value
+        // E.g. if typing `0.0` the numeric value will be 0, but we still want to show `0.0` in the input to allow typing
+        // more digits
+        setLocalValue(hasEmptyValue ? undefined : event.currentTarget.value)
+      }
+
+      onChange(PatchEvent.from(hasEmptyValue ? unset() : set(inputValue)).prefixAll(member.name))
+    },
+    [member.name, member.field.schemaType, onChange],
+  )
+
+  const elementProps = useMemo(
+    (): PrimitiveInputProps['elementProps'] => ({
+      'onBlur': handleBlur,
+      'onFocus': handleFocus,
+      'id': member.field.id,
+      'ref': focusRef,
+      'onChange': handleNativeChange,
+      'onPaste': stripStegaFromPasteEvent,
+      'value': resolveNativeNumberInputValue(
+        member.field.schemaType,
+        member.field.value,
+        localValue,
+      ),
+      'readOnly': Boolean(member.field.readOnly),
+      // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+      'placeholder': member.field.schemaType.placeholder,
+      // Disable native browser autocomplete/autofill on content-editing fields
+      'autoComplete': 'off',
+      'aria-describedby': createDescriptionId(member.field.id, member.field.schemaType.description),
+      'style': {
+        anchorName: pathToAnchorIdent('input', member.field.path),
+      },
+    }),
+    [
+      handleBlur,
+      handleFocus,
+      handleNativeChange,
+      member.field.id,
+      member.field.readOnly,
+      member.field.schemaType,
+      member.field.value,
+      member.field.path,
+      localValue,
+    ],
+  )
+
+  const validation = useMemo(() => {
+    if (!parseError) return member.field.validation
+    const nonErrors = member.field.validation.filter((item) => item.level !== 'error')
+    return [{level: 'error' as const, message: parseError, path: member.field.path}, ...nonErrors]
+  }, [member.field.validation, member.field.path, parseError])
+
+  const inputProps = useMemo((): Omit<PrimitiveInputProps, 'renderDefault'> => {
+    const validationError =
+      validation
+        .filter((item) => item.level === 'error')
+        .map((item) => item.message)
+        .join('\n') || undefined
+    return {
+      value: member.field.value as any,
+      compareValue: member.field.compareValue,
+      __unstable_computeDiff: member.field.__unstable_computeDiff,
+      readOnly: member.field.readOnly,
+      schemaType: member.field.schemaType as any,
+      changed: member.field.changed,
+      hasUpstreamVersion: member.field.hasUpstreamVersion,
+      changedFromBaseVariant: member.field.changedFromBaseVariant,
+      baseVariantValue: member.field.baseVariantValue,
+      hasBaseVariant: member.field.hasBaseVariant,
+      id: member.field.id,
+      path: member.field.path,
+      focused: member.field.focused,
+      level: member.field.level,
+      onChange: handleChange,
+      validation,
+      presence: member.field.presence,
+      validationError,
+      elementProps,
+      displayInlineChanges: member.field.displayInlineChanges ?? false,
+    }
+  }, [
+    member.field.displayInlineChanges,
+    member.field.value,
+    member.field.compareValue,
+    member.field.__unstable_computeDiff,
+    member.field.readOnly,
+    member.field.schemaType,
+    member.field.changed,
+    member.field.hasUpstreamVersion,
+    member.field.changedFromBaseVariant,
+    member.field.baseVariantValue,
+    member.field.hasBaseVariant,
+    member.field.id,
+    member.field.path,
+    member.field.focused,
+    member.field.level,
+    validation,
+    member.field.presence,
+    handleChange,
+    elementProps,
+  ])
+
+  return (
+    <RenderField
+      actions={fieldActions}
+      changed={member.field.changed}
+      changedFromBaseVariant={member.field.changedFromBaseVariant}
+      description={member.field.schemaType.description}
+      index={member.index}
+      inputId={member.field.id}
+      inputProps={inputProps as any}
+      level={member.field.level}
+      name={member.name}
+      path={member.field.path}
+      presence={member.field.presence}
+      schemaType={member.field.schemaType as any}
+      title={member.field.schemaType.title}
+      validation={validation}
+      value={member.field.value as any}
+      render={renderField}
+    >
+      <RenderInput {...inputProps} render={renderInput} />
+    </RenderField>
+  )
+}
+
+// The RenderInput and RenderField wrappers workaround the strict refs checks in React Compiler
+function RenderInput({
+  render,
+  ...props
+}: Omit<PrimitiveInputProps, 'renderDefault'> & {
+  render: RenderInputCallback<PrimitiveInputProps>
+}) {
+  return render(props)
+}
+function RenderField({
+  render,
+  ...props
+}: Omit<PrimitiveFieldProps, 'renderDefault'> & {
+  render: RenderFieldCallback<PrimitiveFieldProps>
+}) {
+  return render(props)
+}

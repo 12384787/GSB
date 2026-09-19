@@ -1,0 +1,275 @@
+import {type SanityClient} from '@sanity/client'
+import {type ObjectSchemaType, type SanityDocument} from '@sanity/types'
+import {uuid} from '@sanity/uuid'
+import get from 'lodash-es/get.js'
+import {
+  type ComponentType,
+  type PropsWithChildren,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from 'react'
+import {useSyncObservable} from 'react-rx'
+import {BehaviorSubject, combineLatest, EMPTY, filter, map, of, Subject, tap} from 'rxjs'
+import {type DocumentDivergencesContextValue, DocumentDivergencesContext} from 'sanity/_singletons'
+
+import {
+  collateDocumentDivergences,
+  collateDocumentDivergencesInitialState,
+} from '../../divergence/collateDocumentDivergences'
+import {useDivergenceNavigator} from '../../divergence/divergenceNavigator'
+import {
+  isDivergenceResolutions,
+  type DivergenceResolution,
+  type FindDivergencesContext,
+} from '../../divergence/readDocumentDivergences'
+import {readMostRecentSharedTransaction} from '../../divergence/readMostRecentSharedTransaction'
+import {type ResolutionMarker} from '../../divergence/types/ResolutionMarker'
+import {useClient} from '../../hooks/useClient'
+import {type EditStateFor} from '../../store/document/document-pair/editState'
+import {selectUpstreamVersion} from '../../store/document/selectUpstreamVersion'
+import {getDocumentAtRevision} from '../../store/events/getDocumentAtRevision'
+import {DEFAULT_STUDIO_CLIENT_OPTIONS} from '../../studioClient'
+import {isPublishedId} from '../../util/draftUtils'
+import {type FormState} from '../store/useFormState'
+
+interface PropsEnabled extends PropsWithChildren {
+  enabled: true
+  formState: FormState
+  upstreamEditState: EditStateFor
+  editState: EditStateFor
+  subjectId: string
+  schemaType: ObjectSchemaType
+}
+
+interface PropsDisabled extends PropsWithChildren {
+  enabled: false
+}
+
+type Props = PropsEnabled | PropsDisabled
+
+/**
+ * @internal
+ */
+export const DivergencesProvider: ComponentType<Props> = (props) => {
+  if (props.enabled) {
+    return <DivergencesProviderEnabled {...props} />
+  }
+
+  return <DivergencesProviderDisabled {...props} />
+}
+
+const DivergencesProviderEnabled: ComponentType<PropsEnabled> = ({
+  formState,
+  upstreamEditState,
+  editState,
+  subjectId,
+  schemaType,
+  children,
+}) => {
+  const client = useClient(DEFAULT_STUDIO_CLIENT_OPTIONS)
+
+  const upstreamHead = selectUpstreamVersion(upstreamEditState)
+  const upstreamId = upstreamHead?._id
+  const hasUpstreamVersion = typeof upstreamId !== 'undefined'
+
+  const subject = isPublishedId(subjectId)
+    ? editState.published
+    : (editState.version ?? editState.draft)
+
+  const collatedDivergences = useMemo(
+    () =>
+      !hasUpstreamVersion || typeof upstreamId === 'undefined' || typeof subjectId === 'undefined'
+        ? {
+            context: new Subject<FindDivergencesContext>(),
+            observable: of(collateDocumentDivergencesInitialState),
+          }
+        : collateDocumentDivergences({
+            subjectId: subjectId,
+            upstreamId: upstreamId,
+          }),
+    [hasUpstreamVersion, upstreamId, subjectId],
+  )
+
+  useCollateDivergencesContext({
+    upstreamHead,
+    hasUpstreamVersion,
+    subjectHead: subject,
+    resolutions:
+      subject &&
+      '_systemDivergences' in subject &&
+      typeof subject._systemDivergences === 'object' &&
+      subject._systemDivergences !== null &&
+      'resolutions' in subject._systemDivergences &&
+      isDivergenceResolutions(subject._systemDivergences.resolutions)
+        ? subject._systemDivergences.resolutions
+        : [],
+    client,
+    context: collatedDivergences.context,
+  })
+
+  const divergenceNavigator = useDivergenceNavigator({
+    divergences: collatedDivergences.observable,
+    schemaType,
+    formState,
+  })
+
+  const [sessionId] = useState(() => uuid())
+
+  const value = useMemo<DocumentDivergencesContextValue>(
+    () => ({enabled: true, sessionId, ...divergenceNavigator}),
+    [sessionId, divergenceNavigator],
+  )
+
+  return (
+    <DocumentDivergencesContext.Provider value={value}>
+      {children}
+    </DocumentDivergencesContext.Provider>
+  )
+}
+
+const disabledContextValue: DocumentDivergencesContextValue = {
+  enabled: false,
+  sessionId: null,
+}
+
+const DivergencesProviderDisabled: ComponentType<PropsWithChildren> = ({children}) => {
+  return (
+    <DocumentDivergencesContext.Provider value={disabledContextValue}>
+      {children}
+    </DocumentDivergencesContext.Provider>
+  )
+}
+
+/**
+ * @internal
+ */
+export function useDocumentDivergences(): DocumentDivergencesContextValue {
+  return useContext(DocumentDivergencesContext)
+}
+
+/**
+ * Listen to the dependencies required to collate divergences, and update its
+ * context when they change.
+ */
+function useCollateDivergencesContext({
+  upstreamHead,
+  hasUpstreamVersion,
+  subjectHead,
+  resolutions,
+  client,
+  context,
+}: {
+  upstreamHead: SanityDocument | null
+  hasUpstreamVersion: boolean
+  subjectHead: SanityDocument | null
+  resolutions: {
+    _key: string
+    resolutionMarker: ResolutionMarker
+  }[]
+  client: SanityClient
+  context: Subject<FindDivergencesContext>
+}):
+  | {
+      upstreamHead: SanityDocument
+      subjectHead: SanityDocument
+      resolutions: DivergenceResolution[]
+      upstreamAtFork: SanityDocument
+    }
+  | undefined {
+  const shouldFindForkPoint = hasUpstreamVersion && subjectHead && upstreamHead
+
+  const baseIsForkPoint =
+    get(subjectHead, ['_system', 'base', 'id']) === upstreamHead?._id &&
+    get(subjectHead, ['_system', 'base', 'rev']) === upstreamHead?._rev
+
+  // Kept synchronous: this is an input to the `readUpstreamAtFork` stream that
+  // is combined with the live document heads below — a deferred snapshot could
+  // pair an outdated fork-point revision with newer heads.
+  const mostRecentSharedTransaction = useSyncObservable(
+    shouldFindForkPoint && baseIsForkPoint
+      ? EMPTY
+      : readMostRecentSharedTransaction({
+          a: upstreamHead?._id,
+          b: subjectHead?._id,
+          client,
+        }),
+    undefined,
+  )
+
+  const listenUpstreamHead = useMemo(() => new BehaviorSubject<SanityDocument | null>(null), [])
+  useEffect(() => listenUpstreamHead.next(upstreamHead), [upstreamHead, listenUpstreamHead])
+
+  const listenSubjectHead = useMemo(() => new BehaviorSubject<SanityDocument | null>(null), [])
+  useEffect(() => listenSubjectHead.next(subjectHead), [subjectHead, listenSubjectHead])
+
+  const listenResolutions = useMemo(
+    () => new BehaviorSubject<DivergenceResolution[] | null>(null),
+    [],
+  )
+
+  useEffect(() => listenResolutions.next(resolutions ?? []), [resolutions, listenResolutions])
+
+  // Read the base upstream document.
+  //
+  // - If the subject version's `_system.base.id` points to its current
+  //   upstream, the target of the subject's `_system.base` is inferred to be
+  //   the base upstream document.
+  // - Otherwise, the base upstream document is identified using the most recent
+  //   transaction shared by the subject and upstream versions.
+  const readUpstreamAtFork = useMemo(() => {
+    if (shouldFindForkPoint && baseIsForkPoint) {
+      return getDocumentAtRevision({
+        client,
+        documentId: get(subjectHead, ['_system', 'base', 'id']),
+        revisionId: get(subjectHead, ['_system', 'base', 'rev']),
+      })
+    }
+
+    if (
+      upstreamHead === null ||
+      subjectHead === null ||
+      !hasUpstreamVersion ||
+      typeof mostRecentSharedTransaction === 'undefined'
+    ) {
+      return EMPTY
+    }
+
+    return getDocumentAtRevision({
+      client,
+      documentId: mostRecentSharedTransaction.documentIDs[0],
+      revisionId: mostRecentSharedTransaction.id,
+    })
+  }, [
+    upstreamHead,
+    subjectHead,
+    hasUpstreamVersion,
+    mostRecentSharedTransaction,
+    client,
+    shouldFindForkPoint,
+    baseIsForkPoint,
+  ])
+
+  const listenContext = useMemo(() => {
+    return combineLatest({
+      upstreamHead: listenUpstreamHead.pipe(
+        filter((document) => typeof document !== 'undefined' && document !== null),
+      ),
+      subjectHead: listenSubjectHead.pipe(
+        filter((document) => typeof document !== 'undefined' && document !== null),
+      ),
+      resolutions: listenResolutions.pipe(map((nextResolutions) => nextResolutions ?? [])),
+      upstreamAtFork: readUpstreamAtFork.pipe(
+        filter((revision) => revision !== null),
+        map(({document}) => document),
+        filter((document) => typeof document !== 'undefined' && document !== null),
+      ),
+    }).pipe(tap((nextContext) => context.next(nextContext)))
+  }, [readUpstreamAtFork, context, listenUpstreamHead, listenSubjectHead, listenResolutions])
+
+  // The subscription exists to drive the `context.next` pipeline above; the
+  // returned snapshot is not consumed for rendering, so deferring it would
+  // only desynchronize the pipeline.
+  return useSyncObservable(listenContext, undefined)
+}

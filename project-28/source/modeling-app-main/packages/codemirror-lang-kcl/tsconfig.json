@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": "src",
+    "outDir": "dist",
+    "target": "esnext",
+    "lib": ["dom", "dom.iterable", "es2024"],
+    "module": "esnext",
+    "esModuleInterop": true,
+    "moduleResolution": "bundler",
+    "forceConsistentCasingInFileNames": true,
+    "strict": true,
+    "noImplicitAny": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "types":["node"]
+  },
+  "include": ["src", "./*.ts"],
+  "exclude": ["node_modules", "vitest.main.config.ts"]
+}

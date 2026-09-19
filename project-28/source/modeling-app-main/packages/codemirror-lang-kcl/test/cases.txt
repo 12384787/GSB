@@ -1,0 +1,60 @@
+# Booleans
+
+true
+false
+
+==>
+
+Program(ExpressionStatement(true), ExpressionStatement(false))
+
+# Identifiers
+
+one
+_Two_Three
+Four5
+
+==>
+
+Program(ExpressionStatement(VariableName),
+        ExpressionStatement(VariableName),
+        ExpressionStatement(VariableName))
+
+# Strings
+
+"hello"
+'hi'
+"one\"\\two"
+'3\'\\four\x'
+
+==>
+
+Program(ExpressionStatement(String),
+        ExpressionStatement(String),
+        ExpressionStatement(String),
+        ExpressionStatement(String))
+
+# VariableDeclaration
+
+a = 'abc'
+export x = 0.2
+
+==>
+
+Program(VariableDeclaration(VariableDefinition, Equals, String),
+        VariableDeclaration(export, VariableDefinition, Equals, Number))
+
+# IfExpression
+
+if x { 1 } else { $tag }
+
+==>
+
+Program(ExpressionStatement(IfExpression(if, VariableName, Body(ExpressionStatement(Number)), else, Body(ExpressionStatement(TagDeclarator)))))
+
+# Shebang
+
+#!anything
+
+==>
+
+Program(Shebang)

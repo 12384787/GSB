@@ -1,0 +1,48 @@
+import {CopyIcon} from '@sanity/icons/Copy'
+import {Button, Text} from '@sanity/ui'
+import {useToast} from '@sanity/ui/toast'
+import {useState} from 'react'
+import {type DocumentActionComponent, type DocumentActionDescription} from 'sanity'
+import {Grid} from 'ui5'
+
+export const useTestModalDialogAction: DocumentActionComponent = () => {
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const {push: pushToast} = useToast()
+
+  const handleOpen = () => {
+    setDialogOpen(true)
+    pushToast({closable: true, title: '[Modal] Opened'})
+  }
+
+  const handleClose = () => {
+    setDialogOpen(false)
+    pushToast({closable: true, title: '[Modal] Closed'})
+  }
+
+  return {
+    dialog:
+      dialogOpen &&
+      ({
+        type: 'dialog',
+        content: (
+          <Text>
+            This is the <code>dialog</code> modal
+          </Text>
+        ),
+        footer: (
+          <Grid gridTemplateColumns="repeat(1, minmax(0, 1fr))" gap={2}>
+            <Button onClick={handleClose} text="Close" />
+          </Grid>
+        ),
+        header: 'Test dialog modal',
+        onClose: handleClose,
+        showCloseButton: false,
+        width: 'medium',
+      } satisfies DocumentActionDescription['dialog']),
+    icon: CopyIcon,
+    label: 'Test dialog modal',
+    onHandle: handleOpen,
+  } satisfies DocumentActionDescription
+}
+
+useTestModalDialogAction.displayName = 'TestModalDialogAction'

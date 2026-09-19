@@ -1,0 +1,93 @@
+import {type SanityDocument} from '@sanity/types'
+import {Spinner, Text} from '@sanity/ui'
+import {Code} from '@sanity/ui/code'
+import {type Ref, useCallback, useEffect, useImperativeHandle, useRef, useState} from 'react'
+import {type Subscription} from 'rxjs'
+import {useClient} from 'sanity'
+import {Flex, Box} from 'ui5'
+
+export function JsonDocumentDump(props: {
+  itemId: string
+  ref: Ref<{actionHandlers: Record<string, () => void>}>
+}) {
+  const {itemId, ref} = props
+  const draftId = `drafts.${itemId}`
+  const query = '*[_id in [$itemId, $draftId]]'
+
+  const client = useClient({apiVersion: '2022-09-09'})
+  const [isLoading, setIsLoading] = useState(true)
+  const [document, setDocument] = useState<SanityDocument | null>(null)
+  const subscriptionRef = useRef<Subscription | undefined>(undefined)
+
+  const fetchDocument = useCallback(() => {
+    return client.observable
+      .fetch(`${query} | order(_updatedAt desc) [0]`, {itemId, draftId})
+      .subscribe((nextDocument) => {
+        setDocument(nextDocument || null)
+        setIsLoading(false)
+      })
+  }, [client.observable, draftId, itemId])
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      actionHandlers: {
+        reload: () => {
+          subscriptionRef.current?.unsubscribe()
+          setIsLoading(true)
+          subscriptionRef.current = fetchDocument()
+        },
+      },
+    }),
+    [fetchDocument],
+  )
+
+  useEffect(() => {
+    const subscription = client.observable
+      .listen(query, {itemId, draftId}, {includeAllVersions: true})
+      .subscribe((event) => {
+        if (event.type === 'mutation') {
+          setDocument(event.result || null)
+        }
+      })
+    return () => subscription.unsubscribe()
+  }, [client.observable, draftId, itemId])
+
+  const hasDocument = document !== null
+  useEffect(() => {
+    if (hasDocument) return undefined
+    const subscription = fetchDocument()
+    subscriptionRef.current = subscription
+
+    return () => subscription.unsubscribe()
+  }, [fetchDocument, hasDocument])
+
+  if (isLoading) {
+    return (
+      <Flex alignItems="center" flexDirection="column" height="100%" justifyContent="center">
+        <Spinner muted />
+        <Box marginTop={3}>
+          <Text align="center" muted size={1}>
+            Loading document…
+          </Text>
+        </Box>
+      </Flex>
+    )
+  }
+
+  if (!document) {
+    return (
+      <Box padding={4}>
+        <Text muted>Document not found.</Text>
+      </Box>
+    )
+  }
+
+  return (
+    <Box height="100%" overflow="auto" padding={4}>
+      <Code language="json" size={[1, 1, 2]}>
+        {JSON.stringify(document, null, 2)}
+      </Code>
+    </Box>
+  )
+}

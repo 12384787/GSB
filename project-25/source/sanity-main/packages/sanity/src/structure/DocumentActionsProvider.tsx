@@ -1,0 +1,124 @@
+import {useMemo, useRef} from 'react'
+import {
+  type DocumentActionComponent,
+  type DocumentActionDescription,
+  type DocumentActionProps,
+  EMPTY_ARRAY,
+  getDocumentIdForCanvasLink,
+  GetHookCollectionState,
+  getReleaseIdFromReleaseDocumentId,
+  useActiveReleases,
+  useCanvasCompanionDoc,
+  useTranslation,
+} from 'sanity'
+import {DocumentActionsStateContext} from 'sanity/_singletons'
+
+import {structureLocaleNamespace} from './i18n'
+import {useDocumentPane} from './panes/document/useDocumentPane'
+
+interface ResolvedAction extends DocumentActionDescription {
+  action?: DocumentActionComponent['action']
+}
+
+/** @internal */
+export function DocumentActionsProvider(props: {children: React.ReactNode}) {
+  const {children} = props
+
+  const {data: activeReleases} = useActiveReleases()
+
+  const {actions, editState, isInitialValueLoading, revisionId} = useDocumentPane()
+
+  const onCompleteRef = useRef<() => void>(null)
+
+  const actionProps: Omit<DocumentActionProps, 'onComplete'> | null = useMemo(() => {
+    // note: this is actually the bundle id of the current document
+
+    const matchingReleaseName = activeReleases
+      .map((r) => getReleaseIdFromReleaseDocumentId(r._id))
+      .find((candidate) => candidate === editState?.release)
+
+    return editState
+      ? {
+          ...editState,
+          release: matchingReleaseName,
+          revision: revisionId || undefined,
+          initialValueResolved: !isInitialValueLoading,
+        }
+      : null
+  }, [editState, isInitialValueLoading, revisionId, activeReleases])
+
+  if (!actionProps) {
+    return null
+  }
+
+  return (
+    <GetHookCollectionState<DocumentActionProps, ResolvedAction>
+      args={{
+        ...actionProps,
+        // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+        onComplete: () => onCompleteRef.current?.(),
+      }}
+      hooks={actions || EMPTY_ARRAY}
+      resetRef={onCompleteRef}
+    >
+      {({states}) => (
+        <ActionsGuardWrapper states={states} actionProps={actionProps}>
+          {children}
+        </ActionsGuardWrapper>
+      )}
+    </GetHookCollectionState>
+  )
+}
+
+/**
+ * The actions that remain available while a document is locked by Canvas (i.e. not editable in
+ * Studio). Custom actions and other unsupported actions are disabled with a tooltip explaining why.
+ * When the document is linked but editable, no actions are disabled.
+ */
+const SUPPORTED_CANVAS_LOCKED_ACTIONS: DocumentActionComponent['action'][] = [
+  'delete',
+  'duplicate',
+  'publish',
+  'unpublish',
+  'unlinkFromCanvas',
+  'editInCanvas',
+  'linkToCanvas',
+  'schedule',
+  'discardVersion',
+  'unpublishVersion',
+]
+
+interface ActionsGuardWrapperProps {
+  states: ResolvedAction[]
+  actionProps: Omit<DocumentActionProps, 'onComplete'>
+  children: React.ReactNode
+}
+
+// merge this into the DocumentActionsProvider itself
+function ActionsGuardWrapper(props: ActionsGuardWrapperProps) {
+  const {states, children, actionProps} = props
+  const {t} = useTranslation(structureLocaleNamespace)
+
+  const {isLockedByCanvas} = useCanvasCompanionDoc(getDocumentIdForCanvasLink(actionProps))
+
+  return (
+    <DocumentActionsStateContext.Provider
+      value={
+        isLockedByCanvas
+          ? states.map((s) => {
+              if (!s.action || !SUPPORTED_CANVAS_LOCKED_ACTIONS.includes(s.action)) {
+                return {
+                  ...s,
+                  disabled: true,
+                  title: t('action.disabled-by-canvas.tooltip'),
+                }
+              }
+              return s
+            })
+          : states
+      }
+    >
+      {children}
+    </DocumentActionsStateContext.Provider>
+  )
+}

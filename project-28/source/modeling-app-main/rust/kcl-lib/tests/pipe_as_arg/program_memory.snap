@@ -1,0 +1,26 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Variables in memory after executing pipe_as_arg.kcl
+---
+{
+  "cube": {
+    "type": "Function"
+  },
+  "double": {
+    "type": "Function"
+  },
+  "myCube": {
+    "type": "Number",
+    "value": 400.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "width": {
+    "type": "Function"
+  }
+}

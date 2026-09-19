@@ -1,0 +1,69 @@
+import {type Path} from '@sanity/types'
+import {Stack, Text} from '@sanity/ui'
+import isPlainObject from 'lodash-es/isPlainObject.js'
+
+import {Button} from '../../../../../ui-components/button/Button'
+import {isDev} from '../../../../environment'
+import {useTranslation} from '../../../../i18n/hooks/useTranslation'
+import {Alert} from '../../../components/Alert'
+import {Details} from '../../../components/Details'
+import {FormField} from '../../../components/formField/FormField'
+import {unset} from '../../../patch/patch'
+import {PatchEvent} from '../../../patch/PatchEvent'
+import {type MixedArrayError} from '../../../store/types/memberErrors'
+
+interface Props {
+  error: MixedArrayError
+  onChange: (patchEvent: PatchEvent) => void
+  path: Path
+}
+export function MixedArrayAlert(props: Props) {
+  const {error, onChange, path} = props
+
+  const handleRemoveNonObjectValues = () => {
+    const nonObjectIndices = (error.value || [])
+      .flatMap((item, index) => (isPlainObject(item) ? [] : [index]))
+      .reverse()
+
+    const patches = nonObjectIndices.map((index) => unset([index]))
+
+    onChange(PatchEvent.from(patches))
+  }
+
+  const {t} = useTranslation()
+
+  return (
+    <FormField
+      title={error.schemaType.title}
+      description={error.schemaType.description}
+      path={path}
+    >
+      <Alert
+        status="error"
+        suffix={
+          <Stack padding={2}>
+            <Button
+              onClick={handleRemoveNonObjectValues}
+              text={t('form.error.mixed-array-alert.remove-button.text')}
+              tone="critical"
+            />
+          </Stack>
+        }
+        title={t('form.error.mixed-array-alert.title')}
+      >
+        <Text as="p" muted size={1}>
+          {t('form.error.mixed-array-alert.summary')}
+        </Text>
+
+        <Details marginTop={4} open={isDev} title={t('form.error.mixed-array-alert.details.title')}>
+          <Stack gap={3}>
+            <Text as="p" muted size={1}>
+              {t('form.error.mixed-array-alert.details.description')}
+            </Text>
+          </Stack>
+          {/* TODO: render array items and highlight the wrong items (sc-26255) */}
+        </Details>
+      </Alert>
+    </FormField>
+  )
+}

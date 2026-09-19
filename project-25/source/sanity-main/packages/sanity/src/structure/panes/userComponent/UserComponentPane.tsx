@@ -1,0 +1,69 @@
+import {isValidElement, useState} from 'react'
+import {isValidElementType} from 'react-is'
+import {useI18nText} from 'sanity'
+
+import {Pane} from '../../components/pane/Pane'
+import {type StructureToolPaneActionHandler} from '../../types'
+import {type BaseStructureToolPaneProps} from '../types'
+import {UserComponentPaneContent} from './UserComponentPaneContent'
+import {UserComponentPaneHeader} from './UserComponentPaneHeader'
+
+type UserComponentPaneProps = BaseStructureToolPaneProps<'component'>
+
+/**
+ * @internal
+ */
+export function UserComponentPane(props: UserComponentPaneProps) {
+  const {index, pane, paneKey, ...restProps} = props
+  const {
+    child,
+    component: UserComponent,
+    currentMaxWidth,
+    maxWidth,
+    menuItems,
+    menuItemGroups,
+    minWidth = 320,
+    type: _unused,
+    ...restPane
+  } = pane
+  const [ref, setRef] = useState<{
+    actionHandlers?: Record<string, StructureToolPaneActionHandler>
+  } | null>(null)
+  const {title = ''} = useI18nText(pane)
+
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+  const {key, ...componentProps} = {...restProps, ...restPane}
+
+  return (
+    <Pane
+      currentMaxWidth={currentMaxWidth}
+      id={paneKey}
+      maxWidth={maxWidth}
+      minWidth={minWidth}
+      selected={restProps.isSelected}
+    >
+      <UserComponentPaneHeader
+        actionHandlers={ref?.actionHandlers}
+        index={index}
+        menuItems={menuItems}
+        menuItemGroups={menuItemGroups}
+        title={title}
+      />
+
+      <UserComponentPaneContent>
+        {isValidElementType(UserComponent) && (
+          <UserComponent
+            key={key}
+            {...componentProps}
+            // NOTE: here we're utilizing the function form of refs so setting
+            // the ref causes a re-render for `UserComponentPaneHeader`
+            ref={setRef as any}
+            child={child}
+            paneKey={paneKey}
+          />
+        )}
+        {isValidElement(UserComponent) && UserComponent}
+      </UserComponentPaneContent>
+    </Pane>
+  )
+}

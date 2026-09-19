@@ -1,0 +1,56 @@
+import {Card, Text} from '@sanity/ui'
+import {Flex, VStack} from 'ui5'
+
+import {useValidationStatus} from '../../../../hooks/useValidationStatus'
+import {getDraftId, getPublishedId} from '../../../../util/draftUtils'
+import {ValidationInfo} from '../../../components/validation/ValidationInfo'
+import {DOCUMENT_HAS_ERRORS_TEXT} from '../../../constants'
+import {useSchemaType} from '../../../hooks/useSchemaType'
+import {useValidationState} from '../../../utils/validationUtils'
+
+interface Props {
+  id: string
+  schemaType: string
+}
+
+export function NewScheduleInfo({id, schemaType}: Props) {
+  return (
+    <VStack gap={4}>
+      <Text size={1}>
+        Schedule this document to be published at any time in the future.
+        <br />
+        Any edits in the meantime will be added to the scheduled document.
+      </Text>
+      <Text size={1}>Visit the Schedules page to get an overview of all schedules.</Text>
+      <ValidationWarning id={id} type={schemaType} />
+    </VStack>
+  )
+}
+
+function ValidationWarning({id, type}: {id: string; type: string}) {
+  const schema = useSchemaType(type)
+  const draftId = getDraftId(id)
+  const publishedId = getPublishedId(id)
+  // No `getTargetScopeId(useTargetDocumentState())` here: scheduled publishing deliberately validates the
+  // explicit draft of the scheduled document, independent of the selected perspective.
+  // TODO: this will be supported in the future, look for SAPP-3986 and SAPP-3987.
+  const validationStatus = useValidationStatus(draftId, type, true)
+  const {hasError} = useValidationState(validationStatus.validation)
+
+  if (!hasError) {
+    return null
+  }
+
+  return (
+    <Card padding={2} radius={1} shadow={1} tone="critical">
+      <Flex gap={1} alignItems="center">
+        <ValidationInfo
+          markers={validationStatus.validation}
+          type={schema}
+          documentId={publishedId}
+        />
+        <Text size={1}>{DOCUMENT_HAS_ERRORS_TEXT}</Text>
+      </Flex>
+    </Card>
+  )
+}

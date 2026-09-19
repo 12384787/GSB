@@ -1,0 +1,766 @@
+import {
+  type AssetSource,
+  isSearchStrategy,
+  type SchemaTypeDefinition,
+  searchStrategies,
+  type SearchStrategy,
+} from '@sanity/types'
+import {type ErrorInfo, type ReactNode} from 'react'
+
+import {
+  type LocaleConfigContext,
+  type LocaleDefinition,
+  type LocaleResourceBundle,
+} from '../i18n/types'
+import {type Template, type TemplateItem} from '../templates/types'
+import {getPrintableType} from '../util/getPrintableType'
+import {isRecord} from '../util/isRecord'
+import {type DocumentActionComponent} from './document/actions'
+import {type DocumentBadgeComponent} from './document/badges'
+import {type DocumentInspector} from './document/inspector'
+import {flattenConfig} from './flattenConfig'
+import {type ReleaseActionComponent, type ReleaseActionsContext} from './releases/actions'
+import {
+  type AsyncConfigPropertyReducer,
+  type ConfigContext,
+  type ConfigPropertyReducer,
+  type DocumentActionsContext,
+  type DocumentAskToEditEnabledContext,
+  type DocumentBadgesContext,
+  type DocumentCommentsEnabledContext,
+  type DocumentInspectorContext,
+  type DocumentLanguageFilterComponent,
+  type DocumentLanguageFilterContext,
+  type NewDocumentOptionsContext,
+  type PluginOptions,
+  type ResolveProductionUrlContext,
+  type Tool,
+} from './types'
+
+export const initialDocumentBadges: DocumentBadgeComponent[] = []
+
+export const initialDocumentActions: DocumentActionComponent[] = []
+
+export const initialLanguageFilter: DocumentLanguageFilterComponent[] = []
+
+export const schemaTypesReducer: ConfigPropertyReducer<
+  SchemaTypeDefinition[],
+  Omit<ConfigContext, 'schema' | 'currentUser' | 'client' | 'getClient' | 'i18n'>
+> = (prev, {schema}, context) => {
+  const schemaTypes = schema?.types
+
+  if (!schemaTypes) return prev
+  if (typeof schemaTypes === 'function') return schemaTypes(prev, context)
+  if (Array.isArray(schemaTypes)) return [...prev, ...schemaTypes]
+
+  throw new Error(
+    `Expected \`schema.types\` to be an array or a function, but received ${getPrintableType(
+      schemaTypes,
+    )}`,
+  )
+}
+
+export const resolveProductionUrlReducer: AsyncConfigPropertyReducer<
+  string | undefined,
+  ResolveProductionUrlContext
+> = async (prev, {document}, context) => {
+  const resolveProductionUrl = document?.productionUrl
+  // the redundant await is useful for error logging because the error is caught
+  // in this stack vs somewhere down stream
+  if (resolveProductionUrl) return await resolveProductionUrl(prev, context)
+  return prev
+}
+
+export const toolsReducer: ConfigPropertyReducer<Tool[], ConfigContext> = (
+  prev,
+  {tools},
+  context,
+) => {
+  if (!tools) return prev
+  if (typeof tools === 'function') return tools(prev, context)
+  if (Array.isArray(tools)) return [...prev, ...tools]
+
+  throw new Error(
+    `Expected \`tools\` to be an array or a function, but received ${getPrintableType(tools)}`,
+  )
+}
+
+// we will need this when we ressurect user config for search
+/*export const searchFilterReducer: ConfigPropertyReducer<
+  SearchFilterDefinition<string>[],
+  ConfigContext
+> = (prev, {search}, context) => {
+  const filters = search?.filters
+  if (!filters) return prev
+  if (typeof filters === 'function') return filters(prev, context)
+  if (Array.isArray(filters)) return [...prev, ...filters]
+
+  throw new Error(
+    `Expected \`search.filters\` to be an array or a function, but received ${typeof filters}`
+  )
+}
+
+export const searchOperatorsReducer: ConfigPropertyReducer<
+  SearchOperatorDefinition[],
+  ConfigContext
+> = (prev, {search}, context) => {
+  const operators = search?.operators
+  if (!operators) return prev
+  if (typeof operators === 'function') return operators(prev, context)
+  if (Array.isArray(operators)) return [...prev, ...operators]
+
+  throw new Error(
+    `Expected \`operators\` to be be an array or a function, but received ${getPrintableType(operators)}`
+  )
+}*/
+
+export const schemaTemplatesReducer: ConfigPropertyReducer<Template[], ConfigContext> = (
+  prev,
+  {schema},
+  context,
+) => {
+  const schemaTemplates = schema?.templates
+  if (!schemaTemplates) return prev
+  if (typeof schemaTemplates === 'function') return schemaTemplates(prev, context)
+  if (Array.isArray(schemaTemplates)) return [...prev, ...schemaTemplates]
+
+  throw new Error(
+    `Expected \`schema.templates\` to be an array or a function, but received ${getPrintableType(
+      schemaTemplates,
+    )}`,
+  )
+}
+
+export const localeDefReducer: ConfigPropertyReducer<LocaleDefinition[], LocaleConfigContext> = (
+  prev,
+  {i18n},
+  context,
+) => {
+  const locales = i18n?.locales
+  if (!locales) return prev
+  if (typeof locales === 'function') return locales(prev, context)
+  if (Array.isArray(locales)) return [...prev, ...locales]
+
+  throw new Error(
+    `Expected \`i18n.locales\` to be an array or a function, but received ${getPrintableType(
+      locales,
+    )}`,
+  )
+}
+
+export const localeBundlesReducer: ConfigPropertyReducer<
+  LocaleResourceBundle[],
+  LocaleConfigContext
+> = (prev, {i18n}, context) => {
+  const bundles = i18n?.bundles
+  if (!bundles) return prev
+  if (Array.isArray(bundles)) return [...prev, ...bundles]
+  if (typeof bundles === 'function') return bundles(prev, context)
+
+  throw new Error(
+    `Expected \`i18n.bundles\` to be an array or a function, but received ${typeof bundles}`,
+  )
+}
+
+export const documentBadgesReducer: ConfigPropertyReducer<
+  DocumentBadgeComponent[],
+  DocumentBadgesContext
+> = (prev, {document}, context) => {
+  const documentBadges = document?.badges
+  if (!documentBadges) return prev
+
+  if (typeof documentBadges === 'function') return documentBadges(prev, context)
+  if (Array.isArray(documentBadges)) return [...prev, ...documentBadges]
+
+  throw new Error(
+    `Expected \`document.badges\` to be an array or a function, but received ${getPrintableType(
+      documentBadges,
+    )}`,
+  )
+}
+
+export const documentActionsReducer: ConfigPropertyReducer<
+  DocumentActionComponent[],
+  DocumentActionsContext
+> = (prev, {document}, context) => {
+  const documentActions = document?.actions
+  if (!documentActions) return prev
+
+  if (typeof documentActions === 'function') return documentActions(prev, context)
+  if (Array.isArray(documentActions)) return [...prev, ...documentActions]
+
+  throw new Error(
+    `Expected \`document.actions\` to be an array or a function, but received ${getPrintableType(
+      documentActions,
+    )}`,
+  )
+}
+
+export const releaseActionsReducer: ConfigPropertyReducer<
+  ReleaseActionComponent[],
+  ReleaseActionsContext
+> = (prev, {releases}, context) => {
+  const releaseActions = releases?.actions
+  if (!releaseActions) return prev
+
+  if (typeof releaseActions === 'function') return releaseActions(prev, context)
+  if (Array.isArray(releaseActions)) return [...prev, ...releaseActions]
+
+  throw new Error(
+    `Expected \`releases.actions\` to be an array or a function, but received ${getPrintableType(
+      releaseActions,
+    )}`,
+  )
+}
+
+export const newDocumentOptionsResolver: ConfigPropertyReducer<
+  TemplateItem[],
+  NewDocumentOptionsContext
+> = (prev, {document}, context) => {
+  const resolveNewDocumentOptions = document?.newDocumentOptions
+  if (!resolveNewDocumentOptions) return prev
+
+  if (typeof resolveNewDocumentOptions !== 'function') {
+    throw new Error(
+      `Expected \`document.resolveNewDocumentOptions\` to be a function, but received ${getPrintableType(
+        resolveNewDocumentOptions,
+      )}`,
+    )
+  }
+
+  return resolveNewDocumentOptions(prev, context)
+}
+
+export const fileAssetSourceResolver: ConfigPropertyReducer<AssetSource[], ConfigContext> = (
+  prev,
+  {form},
+  context,
+) => {
+  const assetSources = form?.file?.assetSources
+  if (!assetSources) return prev
+
+  if (typeof assetSources === 'function') return assetSources(prev, context)
+  if (Array.isArray(assetSources)) return [...prev, ...assetSources]
+
+  throw new Error(
+    `Expected \`form.file.assetSources\` to be an array or a function, but received ${getPrintableType(
+      assetSources,
+    )}`,
+  )
+}
+
+export const directUploadsReducer = (opts: {
+  config: PluginOptions
+  schemaTypeName: 'file' | 'image'
+}): boolean => {
+  const {config, schemaTypeName} = opts
+  const flattenedConfig = flattenConfig(config, [])
+
+  const result = flattenedConfig.reduce((acc, {config: innerConfig}) => {
+    const resolver = innerConfig.form?.[schemaTypeName]?.directUploads
+
+    if (!resolver && typeof resolver !== 'boolean') return acc
+    if (typeof resolver === 'boolean') return resolver
+
+    throw new Error(
+      `Expected \`form.${schemaTypeName}.directUploads\` to be a boolean, but received ${getPrintableType(
+        resolver,
+      )}`,
+    )
+  }, true)
+
+  return result
+}
+
+export const imageAssetSourceResolver: ConfigPropertyReducer<AssetSource[], ConfigContext> = (
+  prev,
+  {form},
+  context,
+) => {
+  const assetSources = form?.image?.assetSources
+  if (!assetSources) return prev
+
+  if (typeof assetSources === 'function') return assetSources(prev, context)
+  if (Array.isArray(assetSources)) return [...prev, ...assetSources]
+
+  throw new Error(
+    `Expected \`form.image.assetSources\` to be an array or a function, but received ${getPrintableType(
+      assetSources,
+    )}`,
+  )
+}
+
+/**
+ * @internal
+ */
+export const documentLanguageFilterReducer: ConfigPropertyReducer<
+  DocumentLanguageFilterComponent[],
+  DocumentLanguageFilterContext
+> = (prev, {document}, context) => {
+  const resolveDocumentLanguageFilter = document?.unstable_languageFilter
+  if (!resolveDocumentLanguageFilter) return prev
+
+  if (typeof resolveDocumentLanguageFilter === 'function')
+    return resolveDocumentLanguageFilter(prev, context)
+
+  if (Array.isArray(resolveDocumentLanguageFilter))
+    return [...prev, ...resolveDocumentLanguageFilter]
+
+  throw new Error(
+    `Expected \`document.unstable_languageFilter\` to be an array or a function, but received ${getPrintableType(
+      resolveDocumentLanguageFilter,
+    )}`,
+  )
+}
+
+export const documentInspectorsReducer: ConfigPropertyReducer<
+  DocumentInspector[],
+  DocumentInspectorContext
+> = (prev, {document}, context) => {
+  const resolveInspectorsFilter = document?.inspectors
+  if (!resolveInspectorsFilter) return prev
+
+  if (typeof resolveInspectorsFilter === 'function') return resolveInspectorsFilter(prev, context)
+
+  if (Array.isArray(resolveInspectorsFilter)) return [...prev, ...resolveInspectorsFilter]
+
+  throw new Error(
+    `Expected \`document.inspectors\` to be an array or a function, but received ${getPrintableType(
+      resolveInspectorsFilter,
+    )}`,
+  )
+}
+
+export const documentCommentsEnabledReducer = (opts: {
+  config: PluginOptions
+  context: DocumentCommentsEnabledContext
+  initialValue: boolean
+}): boolean => {
+  const {config, context, initialValue} = opts
+  const flattenedConfig = flattenConfig(config, [])
+
+  // There is no concept of 'previous value' in this API. We only care about the final value.
+  // That is, if a plugin returns true, but the next plugin returns false, the result will be false.
+  // The last plugin 'wins'.
+  const result = flattenedConfig.reduce((acc, {config: innerConfig}) => {
+    const resolver =
+      // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+      innerConfig.document?.comments?.enabled ?? innerConfig.document?.unstable_comments?.enabled
+
+    if (!resolver && typeof resolver !== 'boolean') return acc
+    if (typeof resolver === 'function') return resolver(context)
+    if (typeof resolver === 'boolean') return resolver
+
+    throw new Error(
+      `Expected \`document.comments.enabled\` to be a boolean or a function, but received ${getPrintableType(
+        resolver,
+      )}`,
+    )
+  }, initialValue)
+
+  return result
+}
+
+export const documentAskToEditEnabledReducer = (opts: {
+  config: PluginOptions
+  context: DocumentAskToEditEnabledContext
+  initialValue: boolean
+}): boolean => {
+  const {config, context, initialValue} = opts
+  const flattenedConfig = flattenConfig(config, [])
+
+  const result = flattenedConfig.reduce((acc, {config: innerConfig}) => {
+    const resolver = innerConfig.document?.askToEdit?.enabled
+
+    if (!resolver && typeof resolver !== 'boolean') return acc
+    if (typeof resolver === 'function') return resolver(context)
+    if (typeof resolver === 'boolean') return resolver
+
+    throw new Error(
+      `Expected \`document.askToEdit.enabled\` to be a boolean or a function, but received ${getPrintableType(
+        resolver,
+      )}`,
+    )
+  }, initialValue)
+
+  return result
+}
+
+export const onUncaughtErrorResolver = (opts: {
+  config: PluginOptions
+  context: {error: Error; errorInfo: ErrorInfo}
+}) => {
+  const {config, context} = opts
+  const flattenedConfig = flattenConfig(config, [])
+  flattenedConfig.forEach(({config: pluginConfig}) => {
+    // There is no concept of 'previous value' in this API. We only care about the final value.
+    // That is, if a plugin returns true, but the next plugin returns false, the result will be false.
+    // The last plugin 'wins'.
+    const resolver = pluginConfig.onUncaughtError
+
+    if (typeof resolver === 'function') return resolver(context.error, context.errorInfo)
+    if (!resolver) return undefined
+
+    throw new Error(
+      `Expected \`document.onUncaughtError\` to be a a function, but received ${getPrintableType(
+        resolver,
+      )}`,
+    )
+  })
+}
+
+export const internalTasksReducer = (opts: {
+  config: PluginOptions
+}): {footerAction: ReactNode} | undefined => {
+  const {config} = opts
+  const flattenedConfig = flattenConfig(config, [])
+
+  const result = flattenedConfig.reduce(
+    (acc: {footerAction: ReactNode} | undefined, {config: innerConfig}) => {
+      const resolver = innerConfig.__internal_tasks
+
+      if (!resolver) return acc
+      if (typeof resolver === 'object' && resolver.footerAction) return resolver
+
+      throw new Error(
+        `Expected \`__internal__tasks\` to be an object with footerAction, but received ${getPrintableType(
+          resolver,
+        )}`,
+      )
+    },
+    undefined,
+  )
+
+  return result
+}
+
+export const eventsAPIReducer = (opts: {
+  config: PluginOptions
+  initialValue: boolean
+  key: 'releases' | 'documents'
+}): boolean => {
+  const {config, initialValue} = opts
+  const flattenedConfig = flattenConfig(config, [])
+
+  const result = flattenedConfig.reduce((acc: boolean, {config: innerConfig}) => {
+    // @ts-expect-error enabled is a legacy option we want to warn beta testers in case they have enabled it.
+    if (innerConfig.beta?.eventsAPI?.enabled) {
+      throw new Error(
+        `The \`beta.eventsAPI.enabled\` option has been removed. Use \`beta.eventsAPI.${opts.key}\` instead.`,
+      )
+    }
+
+    const enabled = innerConfig.beta?.eventsAPI?.[opts.key]
+
+    if (typeof enabled === 'undefined') return acc
+    if (typeof enabled === 'boolean') return enabled
+
+    throw new Error(
+      `Expected \`beta.eventsAPI.${opts.key}\` to be a boolean, but received ${getPrintableType(
+        enabled,
+      )}`,
+    )
+  }, initialValue)
+
+  return result
+}
+
+export const variantsEnabledReducer = (opts: {
+  config: PluginOptions
+  initialValue: boolean
+}): boolean => {
+  const {config, initialValue} = opts
+  const flattenedConfig = flattenConfig(config, [])
+
+  const result = flattenedConfig.reduce((acc: boolean, {config: innerConfig}) => {
+    const variants: unknown = innerConfig.beta?.variants
+
+    if (typeof variants === 'undefined') return acc
+    if (!isRecord(variants)) {
+      throw new Error(
+        `Expected \`beta.variants\` to be an object, but received ${getPrintableType(variants)}`,
+      )
+    }
+
+    const enabled = variants.enabled
+
+    if (typeof enabled === 'undefined') return acc
+    if (typeof enabled === 'boolean') return enabled
+
+    throw new Error(
+      `Expected \`beta.variants.enabled\` to be a boolean, but received ${getPrintableType(
+        enabled,
+      )}`,
+    )
+  }, initialValue)
+
+  return result
+}
+
+export const commentsV2EnabledReducer = (opts: {
+  config: PluginOptions
+  initialValue: boolean
+}): boolean => {
+  const {config, initialValue} = opts
+  const flattenedConfig = flattenConfig(config, [])
+
+  return flattenedConfig.reduce((value: boolean, {config: innerConfig}) => {
+    const comments: unknown = innerConfig.beta?.comments
+
+    if (typeof comments === 'undefined') return value
+    if (!isRecord(comments)) {
+      throw new Error(
+        `Expected \`beta.comments\` to be an object, but received ${getPrintableType(comments)}`,
+      )
+    }
+
+    const v2 = comments.v2
+
+    if (typeof v2 === 'undefined') return value
+    if (typeof v2 === 'boolean') return v2
+
+    throw new Error(
+      `Expected \`beta.comments.v2\` to be a boolean, but received ${getPrintableType(v2)}`,
+    )
+  }, initialValue)
+}
+
+export const documentGroupInventoryEnabledReducer = ({
+  config,
+  initialValue,
+}: {
+  config: PluginOptions
+  initialValue: boolean
+}): boolean => {
+  const flattenedConfig = flattenConfig(config, [])
+
+  return flattenedConfig.reduce<boolean>((value, {config: innerConfig}) => {
+    const documentGroupInventory: unknown = innerConfig.beta?.documentGroupInventory
+
+    if (typeof documentGroupInventory === 'undefined') {
+      return value
+    }
+
+    if (!isRecord(documentGroupInventory)) {
+      throw new Error(
+        `Expected \`beta.documentGroupInventory\` to be an object, but received ${getPrintableType(
+          documentGroupInventory,
+        )}`,
+      )
+    }
+
+    const enabled = documentGroupInventory.enabled
+
+    if (typeof enabled === 'undefined') {
+      return value
+    }
+
+    if (typeof enabled === 'boolean') {
+      return enabled
+    }
+
+    throw new Error(
+      `Expected \`beta.documentGroupInventory.enabled\` to be a boolean, but received ${getPrintableType(
+        enabled,
+      )}`,
+    )
+  }, initialValue)
+}
+
+export const mediaLibraryEnabledReducer = (opts: {
+  config: PluginOptions
+  initialValue: boolean
+}): boolean => {
+  const {config, initialValue} = opts
+  const flattenedConfig = flattenConfig(config, [])
+
+  const result = flattenedConfig.reduce((acc, {config: innerConfig}) => {
+    const resolver = innerConfig.mediaLibrary?.enabled
+
+    if (!resolver && typeof resolver !== 'boolean') return acc
+    if (typeof resolver === 'boolean') return resolver
+
+    throw new Error(
+      `Expected \`mediaLibrary.enabled\` to be a boolean, but received ${getPrintableType(
+        resolver,
+      )}`,
+    )
+  }, initialValue)
+
+  return result
+}
+
+export const mediaLibraryLibraryIdReducer = (opts: {
+  config: PluginOptions
+  initialValue: string | undefined
+}): string | undefined => {
+  const {config, initialValue} = opts
+  const flattenedConfig = flattenConfig(config, [])
+
+  const result = flattenedConfig.reduce((acc, {config: innerConfig}) => {
+    const resolver = innerConfig.mediaLibrary?.libraryId
+
+    if (!resolver && typeof resolver !== 'string') return acc
+    if (typeof resolver === 'string') return resolver
+
+    throw new Error(
+      `Expected \`mediaLibrary.libraryId\` to be a string, but received ${getPrintableType(
+        resolver,
+      )}`,
+    )
+  }, initialValue)
+
+  return result
+}
+
+export const mediaLibraryFrontendHostReducer = (opts: {
+  config: PluginOptions
+  initialValue: string | undefined
+}): string | undefined => {
+  const {config, initialValue} = opts
+  const flattenedConfig = flattenConfig(config, [])
+
+  const result = flattenedConfig.reduce((acc, {config: innerConfig}) => {
+    const resolver = innerConfig.mediaLibrary?.__internal?.frontendHost
+
+    if (!resolver && typeof resolver !== 'string') return acc
+    if (typeof resolver === 'string') return resolver
+
+    throw new Error(
+      `Expected \`mediaLibrary.__internal.frontendHost\` to be a string, but received ${getPrintableType(
+        resolver,
+      )}`,
+    )
+  }, initialValue)
+
+  return result
+}
+
+export const scheduledDraftsEnabledReducer = (opts: {
+  config: PluginOptions
+  initialValue: boolean
+}): boolean => {
+  const {config, initialValue} = opts
+  const flattenedConfig = flattenConfig(config, [])
+
+  const result = flattenedConfig.reduce((acc: boolean, {config: innerConfig}) => {
+    const enabled = innerConfig.scheduledDrafts?.enabled
+
+    if (typeof enabled === 'undefined') return acc
+    if (typeof enabled === 'boolean') return enabled
+
+    throw new Error(`Expected a boolean, but received ${getPrintableType(enabled)}`)
+  }, initialValue)
+
+  return result
+}
+
+export const partialIndexingEnabledReducer = (opts: {
+  config: PluginOptions
+  initialValue: boolean
+}): boolean => {
+  const {config, initialValue} = opts
+  const flattenedConfig = flattenConfig(config, [])
+
+  const result = flattenedConfig.reduce((acc, {config: innerConfig}) => {
+    const resolver = innerConfig.search?.unstable_partialIndexing?.enabled
+
+    if (!resolver && typeof resolver !== 'boolean') return acc
+    if (typeof resolver === 'boolean') return resolver
+
+    throw new Error(
+      `Expected \`search.unstable_partialIndexing.enabled\` to be a boolean, but received ${getPrintableType(
+        resolver,
+      )}`,
+    )
+  }, initialValue)
+
+  return result
+}
+
+export const draftsEnabledReducer: ConfigPropertyReducer<boolean, ConfigContext> = (
+  prev,
+  {document},
+): boolean => {
+  if (typeof document?.drafts?.enabled === 'boolean') {
+    return document?.drafts?.enabled
+  }
+
+  if (typeof document?.drafts?.enabled !== 'undefined') {
+    throw new Error(`Expected boolean, but received ${getPrintableType(document?.drafts?.enabled)}`)
+  }
+
+  return prev
+}
+
+export const searchStrategyReducer = ({
+  config,
+  initialValue,
+}: {
+  config: PluginOptions
+  initialValue: SearchStrategy
+}): SearchStrategy => {
+  const flattenedConfig = flattenConfig(config, [])
+
+  return flattenedConfig.reduce<SearchStrategy>((currentStrategy, entry) => {
+    const {strategy} = entry.config.search ?? {}
+
+    if (typeof strategy !== 'undefined') {
+      if (!isSearchStrategy(strategy)) {
+        const listFormatter = new Intl.ListFormat('en-US', {type: 'disjunction'})
+        const options = listFormatter.format(searchStrategies.map((value) => `"${value}"`))
+        const received = typeof strategy === 'string' ? `"${strategy}"` : getPrintableType(strategy)
+        throw new Error(`Expected \`search.strategy\` to be ${options}, but received ${received}`)
+      }
+
+      return strategy
+    }
+
+    return currentStrategy
+  }, initialValue)
+}
+
+export const announcementsEnabledReducer = (opts: {
+  config: PluginOptions
+  initialValue: boolean
+}): boolean => {
+  const {config, initialValue} = opts
+  const flattenedConfig = flattenConfig(config, [])
+
+  const result = flattenedConfig.reduce((acc, {config: innerConfig}) => {
+    const resolver = innerConfig.announcements?.enabled
+
+    if (!resolver && typeof resolver !== 'boolean') return acc
+    if (typeof resolver === 'boolean') return resolver
+
+    throw new Error(
+      `Expected \`announcements.enabled\` to be a boolean, but received ${getPrintableType(
+        resolver,
+      )}`,
+    )
+  }, initialValue)
+
+  return result
+}
+
+export const advancedVersionControlEnabledReducer: ConfigPropertyReducer<boolean, ConfigContext> = (
+  prev,
+  {advancedVersionControl},
+  context,
+): boolean => {
+  const resolver = advancedVersionControl?.enabled
+
+  if (typeof resolver === 'boolean') {
+    return resolver
+  }
+
+  if (typeof resolver === 'function') {
+    return resolver(prev, context)
+  }
+
+  if (typeof resolver !== 'undefined') {
+    throw new Error(`Expected boolean, but received ${getPrintableType(resolver)}`)
+  }
+
+  return prev
+}

@@ -1,0 +1,476 @@
+import {render, screen, waitFor, within} from '@testing-library/react'
+import {userEvent} from '@testing-library/user-event'
+import {
+  cloneElement,
+  type FC,
+  type PropsWithChildren,
+  type ReactElement,
+  type RefObject,
+  useState,
+} from 'react'
+import {route, RouterProvider} from 'sanity/router'
+import {beforeEach, describe, expect, it, vi} from 'vitest'
+
+import {
+  getAllByDataUi,
+  getByDataUi,
+  queryByDataUi,
+} from '../../../../../../test/setup/customQueries'
+import {setupVirtualListEnv} from '../../../../../../test/testUtils/setupVirtualListEnv'
+import {createTestProvider} from '../../../../../../test/testUtils/TestProvider'
+import {type DocumentActionsResolver} from '../../../../config/types'
+import type * as ConnectionStatusStoreMod from '../../../../store/connection-status/connection-status-store'
+import {
+  activeASAPRelease,
+  activeCardinalityOneRelease,
+  archivedScheduledRelease,
+  scheduledRelease,
+} from '../../../__fixtures__/release.fixture'
+import {releasesUsEnglishLocaleBundle} from '../../../i18n'
+import {ReleaseSummary, type ReleaseSummaryProps} from '../ReleaseSummary'
+import {
+  documentsInRelease,
+  useBundleDocumentsMockReturnWithResults,
+} from './__mocks__/useBundleDocuments.mock'
+
+vi.mock('../useBundleDocuments', () => ({
+  useBundleDocuments: vi.fn(() => useBundleDocumentsMockReturnWithResults),
+}))
+
+vi.mock('../CopyReleaseActions', () => ({
+  CopyReleaseActions: () => <div data-testid="copy-release-actions" />,
+}))
+
+vi.mock('../../../../preview/components/SanityDefaultPreview', () => ({
+  SanityDefaultPreview: vi.fn(({isPlaceholder, title, subtitle, status}) => (
+    <div data-ui={isPlaceholder ? 'Placeholder' : 'Preview'}>
+      {!isPlaceholder && title && <div>{title}</div>}
+      {!isPlaceholder && subtitle && <div>{subtitle}</div>}
+      {status}
+    </div>
+  )),
+}))
+
+vi.mock('../../components/ReleaseDocumentPreview', () => ({
+  ReleaseDocumentPreview: vi.fn(({documentId}) => {
+    let title = 'Untitled'
+
+    if (documentId === '123') {
+      title = 'First document'
+    } else if (documentId === '456') {
+      title = 'Second document'
+    }
+
+    return <div data-testid={`document-preview-${documentId}`}>{title}</div>
+  }),
+}))
+
+vi.mock('../../../../studio/components/navbar/search/components/SearchPopover')
+
+vi.mock('../documentTable/useReleaseHistory', () => ({
+  useReleaseHistory: vi.fn().mockReturnValue({
+    documentsHistory: new Map(),
+  }),
+}))
+
+// Mock the preview streams to prevent RxJS unsubscription errors during test cleanup.
+// These streams use fromEvent(window, ...) which can cause errors when unsubscribing
+// after the test environment has been modified.
+vi.mock('../../../../preview/streams/scroll', async () => {
+  const {EMPTY} = await import('rxjs')
+  return {scroll$: EMPTY}
+})
+vi.mock('../../../../preview/streams/resize', async () => {
+  const {EMPTY} = await import('rxjs')
+  return {resize$: EMPTY}
+})
+vi.mock('../../../../preview/streams/orientationChange', async () => {
+  const {EMPTY} = await import('rxjs')
+  return {orientationChange$: EMPTY}
+})
+vi.mock('../../../../preview/streams/visibilityChange', async () => {
+  const {EMPTY} = await import('rxjs')
+  return {visibilityChange$: EMPTY}
+})
+vi.mock('../../../../store/debugParams/debugParams', async () => {
+  const {of} = await import('rxjs')
+  return {debugParams$: of([]), debugRolesParam$: of([])}
+})
+
+vi.mock('../../../../store/connection-status/connection-status-store', async (importOriginal) => {
+  const mod = await importOriginal<typeof ConnectionStatusStoreMod>()
+  const {of} = await import('rxjs')
+  return {
+    ...mod,
+    createConnectionStatusStore: () => ({connectionStatus$: of(mod.CONNECTING)}),
+  }
+})
+
+const releaseDocuments = [
+  {
+    ...documentsInRelease,
+    memoKey: '123',
+    history: undefined,
+    document: {
+      ...documentsInRelease.document,
+      title: 'First document',
+      _id: '123',
+      _rev: 'abc',
+      _type: 'document',
+    },
+  },
+  {
+    ...documentsInRelease,
+    memoKey: '456',
+    history: undefined,
+    document: {
+      ...documentsInRelease.document,
+      _updatedAt: new Date().toISOString(),
+      _id: '456',
+      _rev: 'abc',
+      title: 'Second document',
+      _type: 'document',
+    },
+  },
+]
+
+const ScrollContainer: FC<PropsWithChildren> = ({children}) => {
+  const [ref, setRef] = useState<HTMLDivElement | null>(null)
+
+  return (
+    <div style={{height: '400px'}} ref={setRef}>
+      {cloneElement(
+        children as ReactElement<{scrollContainerRef: RefObject<HTMLDivElement | null>}>,
+        {scrollContainerRef: {current: ref}},
+      )}
+    </div>
+  )
+}
+
+const renderTest = async (
+  props: Partial<ReleaseSummaryProps>,
+  options?: {variantsEnabled?: boolean; documentActions?: DocumentActionsResolver},
+) => {
+  const wrapper = await createTestProvider({
+    resources: [releasesUsEnglishLocaleBundle],
+    config: {
+      ...(options?.variantsEnabled ? {beta: {variants: {enabled: true}}} : undefined),
+      ...(options?.documentActions ? {document: {actions: options.documentActions}} : undefined),
+    },
+  })
+
+  return render(
+    <RouterProvider
+      state={{
+        releaseId: 'activeASAPRelease',
+      }}
+      onNavigate={vi.fn()}
+      router={route.create('/', [route.create('/:releaseId'), route.intents('/intents')])}
+    >
+      <ScrollContainer>
+        <ReleaseSummary documents={releaseDocuments} release={activeASAPRelease} {...props} />
+      </ScrollContainer>
+    </RouterProvider>,
+    {
+      wrapper,
+    },
+  )
+}
+
+const publishOnly: DocumentActionsResolver = (prev) =>
+  prev.filter(({action}) => action === 'publish')
+
+// Every row keeps its menu mounted, and closed ones are hidden with `display: none`. Runtime
+// styles are disabled in jsdom, so the open menu does not read as visible to `getByRole` either,
+// which is why it is picked by the absence of that hidden style.
+const getOpenRowMenu = () => {
+  const [openMenu] = getAllByDataUi(document.body, 'MenuButton__popover').filter(
+    (popover) => popover.style.display !== 'none',
+  )
+
+  return openMenu
+}
+
+describe('ReleaseSummary', () => {
+  setupVirtualListEnv()
+
+  describe('for an active release', () => {
+    const prerenderTest = async () => {
+      await renderTest({})
+      // oxlint-disable-next-line testing-library/prefer-find-by
+      await waitFor(() => screen.getByTestId('document-table-card'), {
+        timeout: 5000,
+        interval: 500,
+      })
+    }
+
+    it('shows list of all documents in release', async () => {
+      await prerenderTest()
+
+      const documents = screen.getAllByTestId('table-row')
+
+      expect(documents).toHaveLength(2)
+    })
+
+    it('allows for document to be discarded', async () => {
+      await prerenderTest()
+
+      const [firstDocumentRow] = screen.getAllByTestId('table-row')
+
+      await userEvent.click(getByDataUi(firstDocumentRow, 'MenuButton'))
+
+      await userEvent.click(
+        within(getOpenRowMenu()).getByRole('menuitem', {name: 'Discard version', hidden: true}),
+      )
+
+      expect(await screen.findByRole('dialog')).toBeInTheDocument()
+    })
+
+    it('allows for sorting of documents', async () => {
+      await prerenderTest()
+
+      const [initialFirstDocument, initialSecondDocument] = screen.getAllByTestId('table-row')
+
+      within(initialFirstDocument).getByText('First document')
+      within(initialSecondDocument).getByText('Second document')
+
+      await userEvent.click(within(screen.getByRole('table')).getByText('Edited'))
+
+      const [sortedCreatedAscFirstDocument, sortedCreatedAscSecondDocument] =
+        screen.getAllByTestId('table-row')
+
+      within(sortedCreatedAscFirstDocument).getByText('Second document')
+      within(sortedCreatedAscSecondDocument).getByText('First document')
+
+      await userEvent.click(within(screen.getByRole('table')).getByText('Edited'))
+
+      const [sortedEditedDescFirstDocument, sortedEditedDescSecondDocument] =
+        screen.getAllByTestId('table-row')
+
+      within(sortedEditedDescFirstDocument).getByText('First document')
+      within(sortedEditedDescSecondDocument).getByText('Second document')
+    })
+
+    it('allows for searching documents', async () => {
+      await prerenderTest()
+
+      await userEvent.type(screen.getByPlaceholderText('Search documents'), 'Second')
+
+      const [searchedFirstDocument] = screen.getAllByTestId('table-row')
+
+      within(searchedFirstDocument).getByText('Second document')
+    })
+
+    it('retains search input focus when search yields no results', async () => {
+      await prerenderTest()
+
+      const searchInput = screen.getByPlaceholderText('Search documents')
+      await userEvent.type(searchInput, 'nonexistent query')
+
+      expect(screen.queryAllByTestId('table-row')).toHaveLength(0)
+      expect(searchInput).toHaveFocus()
+    })
+
+    it('Allows for adding a document to an active release', async () => {
+      await prerenderTest()
+
+      screen.getByText('Add document')
+    })
+  })
+
+  describe('for an archived release', () => {
+    const prerenderTest = async () => {
+      await renderTest({release: archivedScheduledRelease})
+      await screen.findByTestId('document-table-card')
+    }
+
+    it('does not allow for adding documents', async () => {
+      await prerenderTest()
+      expect(screen.queryByText('Add document')).toBeNull()
+    })
+  })
+
+  describe('for a scheduled release', () => {
+    const prerenderTest = async () => {
+      await renderTest({release: scheduledRelease})
+      await screen.findByTestId('document-table-card')
+    }
+
+    it('does not allow for adding documents', async () => {
+      await prerenderTest()
+      expect(screen.queryByText('Add document')).toBeNull()
+    })
+  })
+
+  describe('for a cardinality-one release with no documents', () => {
+    it('shows the empty state message', async () => {
+      await renderTest({release: activeCardinalityOneRelease, documents: []})
+
+      expect(await screen.findByTestId('cardinality-one-empty-state')).toBeInTheDocument()
+      expect(screen.getByText('No document in this release')).toBeInTheDocument()
+      expect(
+        screen.getByText(
+          'This scheduled draft does not contain a document. It may have been removed.',
+        ),
+      ).toBeInTheDocument()
+    })
+
+    it('does not show the document table', async () => {
+      await renderTest({release: activeCardinalityOneRelease, documents: []})
+
+      expect(await screen.findByTestId('cardinality-one-empty-state')).toBeInTheDocument()
+      expect(screen.queryByTestId('document-table-card')).not.toBeInTheDocument()
+    })
+
+    it('does not show the add document button', async () => {
+      await renderTest({release: activeCardinalityOneRelease, documents: []})
+
+      expect(await screen.findByTestId('cardinality-one-empty-state')).toBeInTheDocument()
+      expect(screen.queryByText('Add document')).not.toBeInTheDocument()
+    })
+  })
+
+  describe('for a cardinality-one release with documents', () => {
+    it('shows the document table normally', async () => {
+      await renderTest({release: activeCardinalityOneRelease, documents: releaseDocuments})
+
+      // oxlint-disable-next-line testing-library/prefer-find-by
+      await waitFor(() => screen.getByTestId('document-table-card'), {
+        timeout: 5000,
+        interval: 500,
+      })
+
+      expect(screen.queryByTestId('cardinality-one-empty-state')).not.toBeInTheDocument()
+      expect(screen.getAllByTestId('table-row')).toHaveLength(2)
+    })
+  })
+
+  describe('with beta.variants (DocumentTable command lane)', () => {
+    const prerenderVariantsTest = async (props: Partial<ReleaseSummaryProps> = {}) => {
+      await renderTest(props, {variantsEnabled: true})
+      await screen.findByTestId('document-table-card')
+    }
+
+    it('keeps the command lane when the release has no documents', async () => {
+      await prerenderVariantsTest({documents: []})
+
+      expect(screen.getByTestId('release-documents-search')).toBeInTheDocument()
+      expect(screen.getByText('Add document')).toBeInTheDocument()
+      // Copy and Activity are release-level actions that now live in the always-rendered header
+      // (ReleaseDashboardHeader), not in this table's command lane, so they stay reachable when the
+      // table is loading/errored/empty. The command lane holds table operations only.
+      expect(screen.queryByTestId('copy-release-actions')).not.toBeInTheDocument()
+    })
+
+    it('keeps filter tabs when search yields no results', async () => {
+      await prerenderVariantsTest()
+
+      const searchInput = screen.getByTestId('release-documents-search')
+      await userEvent.type(searchInput, 'nonexistent query')
+
+      expect(screen.queryAllByTestId('table-row')).toHaveLength(0)
+      expect(screen.getByRole('tab', {name: /all/i})).toBeInTheDocument()
+      expect(searchInput).toHaveFocus()
+    })
+  })
+
+  // Both table shapes share one `renderRowActions`, so the document.actions gate has to hold for
+  // the default table and the beta.variants DocumentTable alike.
+  describe.each([
+    {tableShape: 'default table', variantsEnabled: false},
+    {tableShape: 'variants DocumentTable', variantsEnabled: true},
+  ])('row action menu in the $tableShape', ({variantsEnabled}) => {
+    const findFirstRowMenuButton = async (documentActions?: DocumentActionsResolver) => {
+      await renderTest({}, {variantsEnabled, documentActions})
+      await screen.findByTestId('document-table-card')
+
+      const [firstDocumentRow] = screen.getAllByTestId('table-row')
+      return queryByDataUi(firstDocumentRow, 'MenuButton')
+    }
+
+    it('renders while discardVersion and unpublishVersion are configured', async () => {
+      expect(await findFirstRowMenuButton()).toBeInTheDocument()
+    })
+
+    it('is gone once both action ids are omitted from document.actions', async () => {
+      expect(await findFirstRowMenuButton(publishOnly)).not.toBeInTheDocument()
+    })
+
+    it('drops unpublish for a cardinality-one release row', async () => {
+      await renderTest({release: activeCardinalityOneRelease}, {variantsEnabled})
+      await screen.findByTestId('document-table-card')
+
+      const [firstDocumentRow] = screen.getAllByTestId('table-row')
+      await userEvent.click(getByDataUi(firstDocumentRow, 'MenuButton'))
+
+      const openMenu = getOpenRowMenu()
+
+      expect(
+        within(openMenu).getByRole('menuitem', {name: 'Discard version', hidden: true}),
+      ).toBeInTheDocument()
+      expect(
+        within(openMenu).queryByRole('menuitem', {name: 'Unpublish', hidden: true}),
+      ).not.toBeInTheDocument()
+    })
+  })
+
+  describe('Release Badges in the Table component', () => {
+    beforeEach(async () => {
+      vi.clearAllMocks()
+    })
+
+    it('should show `unpublish` if a document is scheduled for unpublishing', async () => {
+      await renderTest({
+        release: scheduledRelease,
+        documents: [
+          {
+            ...releaseDocuments[0],
+            document: {...releaseDocuments[0].document, willBeUnpublished: true},
+          },
+        ],
+      })
+      await screen.findByTestId('document-table-card')
+    })
+
+    it('should show `change` if a document is published', async () => {
+      await renderTest({
+        release: scheduledRelease,
+        documents: [
+          {
+            ...releaseDocuments[0],
+            document: {
+              ...releaseDocuments[0].document,
+              publishedDocumentExists: true,
+            },
+          },
+        ],
+      })
+      await screen.findByTestId('document-table-card')
+
+      const [firstDocumentRow] = screen.getAllByTestId('table-row')
+
+      expect(within(firstDocumentRow).getByTestId('changed-badge-123')).toBeInTheDocument()
+    })
+
+    it('should show `add` if a document is not published and is not scheduled for unpublishing', async () => {
+      await renderTest({
+        release: scheduledRelease,
+        documents: [
+          {
+            ...releaseDocuments[0],
+            document: {
+              ...releaseDocuments[0].document,
+              publishedDocumentExists: false, // enforce these as false for the test purpose
+              willBeUnpublished: false, // enforce these as false for the test purpose
+            },
+          },
+        ],
+      })
+      await screen.findByTestId('document-table-card')
+
+      const [firstDocumentRow] = screen.getAllByTestId('table-row')
+
+      expect(within(firstDocumentRow).getByTestId('added-badge-123')).toBeInTheDocument()
+    })
+  })
+})

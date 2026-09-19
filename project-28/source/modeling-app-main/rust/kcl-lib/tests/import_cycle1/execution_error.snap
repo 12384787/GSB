@@ -1,0 +1,14 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Error from executing import_cycle1.kcl
+---
+KCL ImportCycle error
+
+  × import cycle: circular import of modules not allowed: import_cycle2.kcl,
+  │ import_cycle3.kcl, input.kcl
+   ╭─[1:1]
+ 1 │ @settings(defaultLengthUnit = in)
+   · ▲
+   · ╰── tests/import_cycle1/input.kcl
+ 2 │ 
+   ╰────

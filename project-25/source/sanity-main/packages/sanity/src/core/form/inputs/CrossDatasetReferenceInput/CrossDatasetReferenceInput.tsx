@@ -1,0 +1,409 @@
+import {ResetIcon as ClearIcon} from '@sanity/icons/Reset'
+import {SyncIcon as ReplaceIcon} from '@sanity/icons/Sync'
+import {type CrossDatasetReferenceSchemaType, type CrossDatasetReferenceValue} from '@sanity/types'
+import {Card, Inline, Stack, useClickOutsideEvent} from '@sanity/ui'
+import {Menu} from '@sanity/ui/menu'
+import {useToast} from '@sanity/ui/toast'
+import {
+  type FocusEvent,
+  type KeyboardEvent,
+  useCallback,
+  useId,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import {type Observable} from 'rxjs'
+import {Flex} from 'ui5'
+
+import {MenuButton} from '../../../../ui-components/menuButton/MenuButton'
+import {MenuItem} from '../../../../ui-components/menuItem/MenuItem'
+import {ChangeIndicator} from '../../../changeIndicators/ChangeIndicator'
+import {ContextMenuButton} from '../../../components/contextMenuButton/ContextMenuButton'
+import {PreviewCard, ReferenceInputPreviewCard} from '../../../components/previewCard/PreviewCard'
+import {type FIXME} from '../../../FIXME'
+import {useFeatureEnabled, FEATURES} from '../../../hooks/useFeatureEnabled'
+import {useTranslation} from '../../../i18n/hooks/useTranslation'
+import {useSearchMachine} from '../../../search/useSearchMachine'
+import {getPublishedId} from '../../../util/draftUtils'
+import {useDidUpdate} from '../../hooks/useDidUpdate'
+import {set, unset} from '../../patch/patch'
+import {type ObjectInputProps} from '../../types/inputProps'
+import {useArrayItemRootElementRef} from '../arrays/common/useArrayItemRootElementRef'
+import {ReferenceMetadataLoadErrorAlertStrip} from '../ReferenceInput/ReferenceMetadataLoadFailure'
+import {ReferenceStrengthMismatchAlertStrip} from '../ReferenceInput/ReferenceStrengthMismatchAlertStrip'
+import {DisabledFeatureWarning} from './DisabledFeatureWarning'
+import {OptionPreview} from './OptionPreview'
+import {PreviewReferenceValue} from './PreviewReferenceValue'
+import {ReferenceAutocomplete} from './ReferenceAutocomplete'
+import {type CrossDatasetReferenceInfo, type CrossDatasetSearchHit} from './types'
+import {type GetReferenceInfoFn, useReferenceInfo} from './useReferenceInfo'
+import {useProjectId} from './utils/useProjectId'
+
+/** @internal */
+export interface CrossDatasetReferenceInputProps extends ObjectInputProps<
+  CrossDatasetReferenceValue,
+  CrossDatasetReferenceSchemaType
+> {
+  getReferenceInfo: (
+    doc: {_id: string; _type?: string},
+    type: CrossDatasetReferenceSchemaType,
+  ) => Observable<CrossDatasetReferenceInfo>
+  onSearch: (query: string) => Observable<CrossDatasetSearchHit[]>
+}
+
+const NO_FILTER = () => true
+
+const REF_PATH = ['_ref']
+const CROSS_DATASET_FEATUREKEY = 'crossDatasetReferences'
+
+/** @internal */
+export function CrossDatasetReferenceInput(props: CrossDatasetReferenceInputProps) {
+  const {
+    changed,
+    focused,
+    focusPath,
+    getReferenceInfo,
+    onChange,
+    onPathFocus,
+    onSearch,
+    path,
+    readOnly,
+    schemaType,
+    validation,
+    value,
+    elementProps: {ref: forwardRef, ...elementProps},
+  } = props
+
+  const {t} = useTranslation()
+  const projectId = useProjectId()
+
+  const {push} = useToast()
+  const inputId = useId()
+
+  const {searchState, handleQueryChange} = useSearchMachine<CrossDatasetSearchHit>({
+    search: onSearch,
+    distinct: true,
+    onSearchFailed: (error) => {
+      push({
+        title: 'Reference search failed',
+        description: error.message,
+        status: 'error',
+        id: `reference-search-fail-${inputId}`,
+      })
+
+      console.error(error)
+    },
+  })
+
+  const handleChange = useCallback(
+    (id: string) => {
+      if (!id) {
+        onChange(unset())
+        onPathFocus([])
+        return
+      }
+
+      const hit = searchState.hits.find((h) => h.id === id)
+
+      if (!hit) {
+        throw new Error('Selected an item that wasnt part of the result set')
+      }
+
+      onChange(
+        set({
+          _type: schemaType.name,
+          _ref: getPublishedId(id),
+          _projectId: projectId,
+          _dataset: schemaType.dataset,
+          _weak: schemaType.weak,
+          // persist _key between mutations if the value is in an array
+          _key: value?._key,
+        }),
+      )
+
+      onPathFocus([])
+    },
+    [
+      value?._key,
+      searchState.hits,
+      schemaType.name,
+      schemaType.dataset,
+      schemaType.weak,
+      projectId,
+      onChange,
+      onPathFocus,
+    ],
+  )
+
+  const handleClear = useCallback(() => {
+    onChange(unset())
+  }, [onChange])
+
+  const handleAutocompleteKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLInputElement>) => {
+      if (event.key === 'Escape') {
+        onPathFocus?.([])
+      }
+    },
+    [onPathFocus],
+  )
+
+  const getReferenceInfoMemo: GetReferenceInfoFn = useCallback(
+    (doc) => getReferenceInfo(doc, schemaType),
+    [getReferenceInfo, schemaType],
+  )
+
+  const refDoc = useMemo(() => ({_id: value?._ref}), [value?._ref])
+
+  const loadableReferenceInfo = useReferenceInfo(refDoc as FIXME, getReferenceInfoMemo)
+  const featureInfo = useFeatureEnabled(FEATURES.crossDatasetReferences)
+
+  const [autocompletePopoverReferenceElement, setAutocompletePopoverReferenceElement] =
+    useState<HTMLDivElement | null>(null)
+
+  const hasFocusAtRef = focusPath.length === 1 && focusPath[0] === '_ref'
+
+  // --- focus handling
+  const focusElementRef = useRef<HTMLDivElement | null>(null)
+  useImperativeHandle(forwardRef, () => focusElementRef.current)
+  useDidUpdate({hasFocusAt: hasFocusAtRef, ref: value?._ref}, (prev, current) => {
+    const refUpdated = prev?.ref !== current.ref
+    const focusAtUpdated = prev?.hasFocusAt !== current.hasFocusAt
+
+    if ((focusAtUpdated || refUpdated) && current.hasFocusAt) {
+      // if search mode changed and we're having focus always ensure the
+      // ref element gets focus
+      focusElementRef.current?.focus()
+    }
+  })
+
+  const actualStrength = value?._weak ? 'weak' : 'strong'
+  const weakShouldBe = schemaType.weak === true ? 'weak' : 'strong'
+
+  const hasRef = Boolean(value?._ref)
+
+  const handleFixStrengthMismatch = useCallback(() => {
+    onChange(schemaType.weak === true ? set(true, ['_weak']) : unset(['_weak']))
+  }, [onChange, schemaType])
+
+  const errors = useMemo(() => validation.filter((item) => item.level === 'error'), [validation])
+
+  const handleFocus = useCallback(
+    (event: FocusEvent<HTMLDivElement>) => {
+      if (event.currentTarget === focusElementRef.current) {
+        onPathFocus?.(path)
+      }
+    },
+    [onPathFocus, path],
+  )
+
+  const handleAutocompleteFocus = useCallback(
+    (event: FocusEvent<HTMLInputElement>) => {
+      if (event.currentTarget === focusElementRef.current) {
+        onPathFocus?.(REF_PATH)
+      }
+    },
+    [onPathFocus],
+  )
+  const handleReplace = useCallback(() => {
+    onPathFocus?.(REF_PATH)
+  }, [onPathFocus])
+
+  const handleAutocompleteOpenButtonClick = useCallback(() => {
+    handleQueryChange('')
+  }, [handleQueryChange])
+
+  const showWeakRefMismatch =
+    !loadableReferenceInfo.isLoading && hasRef && actualStrength !== weakShouldBe
+
+  const studioUrl =
+    (value?._ref &&
+      schemaType.studioUrl?.({
+        id: value?._ref,
+        type: loadableReferenceInfo?.result?.type,
+      })) ||
+    null
+
+  const renderOption = useCallback(
+    (option: FIXME) => {
+      return (
+        <ReferenceInputPreviewCard forwardedAs="button" type="button" radius={2} tone="inherit">
+          <OptionPreview
+            referenceType={schemaType}
+            document={option.hit.published}
+            getReferenceInfo={getReferenceInfoMemo}
+          />
+        </ReferenceInputPreviewCard>
+      )
+    },
+    [schemaType, getReferenceInfoMemo],
+  )
+
+  const isEditing = hasFocusAtRef || !value?._ref
+
+  // --- click outside handling
+  const arrayItemRootElementRef = useArrayItemRootElementRef()
+  const clickOutsideBoundaryRef = useRef<HTMLDivElement | null>(null)
+  const autocompletePortalRef = useRef<HTMLDivElement | null>(null)
+  useClickOutsideEvent(hasFocusAtRef && (() => onPathFocus([])), () => [
+    clickOutsideBoundaryRef.current,
+    autocompletePortalRef.current,
+    // The enclosing array item (when inside one), so UI rendered by custom
+    // item/input components around the default input doesn't count as outside.
+    arrayItemRootElementRef?.current ?? null,
+  ])
+
+  return (
+    <div style={props.elementProps.style}>
+      {!featureInfo.isLoading && !featureInfo.enabled && (
+        <DisabledFeatureWarning value={value} onClearValue={handleClear} />
+      )}
+      {(featureInfo.isLoading || featureInfo.enabled) && (
+        <Stack gap={1}>
+          {isEditing ? (
+            <Stack gap={2} ref={clickOutsideBoundaryRef}>
+              <ChangeIndicator path={path} isChanged={changed} hasFocus={!!focused}>
+                <div ref={setAutocompletePopoverReferenceElement}>
+                  <ReferenceAutocomplete
+                    {...elementProps}
+                    data-testid="autocomplete"
+                    loading={searchState.isLoading}
+                    referenceElement={autocompletePopoverReferenceElement}
+                    portalRef={autocompletePortalRef}
+                    id={inputId || ''}
+                    options={searchState.hits.map((hit) => ({
+                      value: hit.id,
+                      hit: hit,
+                    }))}
+                    onFocus={handleAutocompleteFocus}
+                    radius={2}
+                    placeholder={t('inputs.reference.search-placeholder')}
+                    onKeyDown={handleAutocompleteKeyDown}
+                    readOnly={readOnly}
+                    disabled={loadableReferenceInfo.isLoading}
+                    onQueryChange={handleQueryChange}
+                    searchString={searchState.searchString}
+                    onChange={handleChange}
+                    filterOption={NO_FILTER}
+                    renderOption={renderOption}
+                    openButton={{onClick: handleAutocompleteOpenButtonClick}}
+                    ref={focusElementRef as unknown as React.Ref<HTMLInputElement>}
+                  />
+                </div>
+              </ChangeIndicator>
+            </Stack>
+          ) : (
+            <ChangeIndicator path={path} isChanged={changed} hasFocus={!!focused}>
+              <Card
+                padding={0}
+                border
+                flex={1}
+                radius={2}
+                tone={
+                  readOnly
+                    ? 'transparent'
+                    : loadableReferenceInfo.error || errors.length > 0
+                      ? 'critical'
+                      : 'default'
+                }
+              >
+                <Flex alignItems="center" padding={1}>
+                  {studioUrl ? (
+                    <PreviewCard
+                      as="a"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      href={studioUrl}
+                      data-as="a"
+                      flex={1}
+                      paddingRight={3}
+                      radius={2}
+                      tone="inherit"
+                      __unstable_focusRing
+                      tabIndex={0}
+                      onFocus={handleFocus}
+                      onBlur={elementProps.onBlur}
+                      ref={focusElementRef}
+                    >
+                      <PreviewReferenceValue
+                        value={value}
+                        referenceInfo={loadableReferenceInfo}
+                        showStudioUrlIcon
+                        hasStudioUrl={!!studioUrl}
+                        type={schemaType}
+                      />
+                    </PreviewCard>
+                  ) : (
+                    <PreviewCard
+                      flex={1}
+                      paddingRight={3}
+                      radius={2}
+                      tone="inherit"
+                      __unstable_focusRing
+                      tabIndex={0}
+                      onFocus={handleFocus}
+                      onBlur={elementProps.onBlur}
+                      ref={focusElementRef}
+                    >
+                      <PreviewReferenceValue
+                        value={value}
+                        referenceInfo={loadableReferenceInfo}
+                        showStudioUrlIcon
+                        type={schemaType}
+                      />
+                    </PreviewCard>
+                  )}
+
+                  <Inline paddingX={1}>
+                    <MenuButton
+                      button={<ContextMenuButton data-testid="menu-button" />}
+                      id={`${inputId}-menuButton`}
+                      menu={
+                        <Menu>
+                          {!readOnly && (
+                            <>
+                              <MenuItem
+                                text={t('inputs.reference.action.clear')}
+                                tone="critical"
+                                icon={ClearIcon}
+                                data-testid="menu-item-clear"
+                                onClick={handleClear}
+                              />
+
+                              <MenuItem
+                                text={t('inputs.reference.action.replace')}
+                                icon={ReplaceIcon}
+                                data-testid="menu-item-replace"
+                                onClick={handleReplace}
+                              />
+                            </>
+                          )}
+                        </Menu>
+                      }
+                      popover={{placement: 'right', portal: true, tone: 'default'}}
+                    />
+                  </Inline>
+                </Flex>
+                {showWeakRefMismatch && (
+                  <ReferenceStrengthMismatchAlertStrip
+                    actualStrength={actualStrength}
+                    handleFixStrengthMismatch={handleFixStrengthMismatch}
+                  />
+                )}
+
+                {loadableReferenceInfo.error && (
+                  <ReferenceMetadataLoadErrorAlertStrip
+                    errorMessage={loadableReferenceInfo.error.message}
+                    onHandleRetry={loadableReferenceInfo.retry}
+                  />
+                )}
+              </Card>
+            </ChangeIndicator>
+          )}
+        </Stack>
+      )}
+    </div>
+  )
+}

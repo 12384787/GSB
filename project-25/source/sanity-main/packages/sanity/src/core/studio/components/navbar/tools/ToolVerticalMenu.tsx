@@ -1,0 +1,51 @@
+import {Stack} from '@sanity/ui'
+import startCase from 'lodash-es/startCase.js'
+import {useMemo, type RefAttributes} from 'react'
+
+import {Button} from '../../../../../ui-components/button/Button'
+import {type Tool} from '../../../../config/types'
+import {ToolLink, type ToolLinkProps} from './ToolLink'
+
+interface ToolVerticalMenuProps {
+  activeToolName?: string
+  isVisible: boolean
+  tools: Tool[]
+}
+
+export function ToolVerticalMenu(props: ToolVerticalMenuProps) {
+  const {activeToolName, isVisible, tools} = props
+
+  return useMemo(
+    () => (
+      <Stack as="ul" gap={1}>
+        {tools.map((tool) => {
+          const title = tool?.title || startCase(tool.name)
+
+          function Link(linkProps: ToolLinkProps & RefAttributes<HTMLAnchorElement>) {
+            const {ref, ...rest} = linkProps
+            return (
+              <ToolLink {...rest} ref={ref} name={tool.name}>
+                {linkProps.children}
+              </ToolLink>
+            )
+          }
+
+          return (
+            <Stack key={tool.name} as="li">
+              <Button
+                as={Link}
+                justify="flex-start"
+                mode="bleed"
+                selected={activeToolName === tool.name}
+                size="large"
+                tabIndex={isVisible ? 0 : -1}
+                text={title}
+              />
+            </Stack>
+          )
+        })}
+      </Stack>
+    ),
+    [activeToolName, isVisible, tools],
+  )
+}

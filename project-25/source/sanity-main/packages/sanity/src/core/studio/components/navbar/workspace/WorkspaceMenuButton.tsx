@@ -1,0 +1,119 @@
+import {ChevronDownIcon} from '@sanity/icons/ChevronDown'
+import {
+  // oxlint-disable-next-line no-restricted-imports
+  Button as UIButton,
+  Stack,
+  Text,
+} from '@sanity/ui'
+import {Menu, MenuDivider} from '@sanity/ui/menu'
+import {useCallback, useMemo, useState} from 'react'
+import {useObservablePromise} from 'react-rx'
+import {take} from 'rxjs/operators'
+import {Box, Flex} from 'ui5'
+
+import {MenuButton, type MenuButtonProps} from '../../../../../ui-components/menuButton/MenuButton'
+import {Tooltip} from '../../../../../ui-components/tooltip/Tooltip'
+import {useTranslation} from '../../../../i18n/hooks/useTranslation'
+import {probeWorkspaceAuth} from '../../../../store/authStore/probeWorkspaceAuth'
+import {useProjectStore} from '../../../../store/datastores'
+import {useActiveWorkspace} from '../../../activeWorkspaceMatcher/useActiveWorkspace'
+import {useVisibleWorkspaces} from '../../../workspaces/useVisibleWorkspaces'
+import {ManageMenu} from './ManageMenu'
+import {WorkspaceMenuItem} from './WorkspaceMenuItem'
+
+const POPOVER_PROPS: MenuButtonProps['popover'] = {
+  constrainSize: true,
+  fallbackPlacements: ['bottom-end', 'bottom'],
+  placement: 'bottom-end',
+  tone: 'default',
+}
+
+export function WorkspaceMenuButton() {
+  const {visibleWorkspaces} = useVisibleWorkspaces()
+  const {activeWorkspace} = useActiveWorkspace()
+  const {t} = useTranslation()
+  const [scrollbarWidth, setScrollbarWidth] = useState(0)
+
+  const projectStore = useProjectStore()
+  const projectNamePromise = useObservablePromise(
+    useMemo(() => projectStore.getProjectName(), [projectStore]),
+  )
+
+  const stackRef = useCallback((node: HTMLDivElement | null) => {
+    if (node) {
+      const hasScroll = node.scrollHeight > node.clientHeight
+      setScrollbarWidth(hasScroll ? node.offsetWidth - node.clientWidth : 0)
+    }
+  }, [])
+
+  // Preload probes on hover/focus so the result is already buffered by the
+  // time the user clicks. The probe's grace window keeps the cached value
+  // alive across the transient subscribe/unsubscribe cycle from `take(1)`.
+  const handlePreload = useCallback(() => {
+    visibleWorkspaces.forEach((workspace) => {
+      probeWorkspaceAuth({
+        projectId: workspace.projectId,
+        dataset: workspace.dataset,
+        apiHost: workspace.apiHost,
+      })
+        .pipe(take(1))
+        .subscribe()
+    })
+  }, [visibleWorkspaces])
+
+  return (
+    <MenuButton
+      button={
+        <Flex onPointerEnter={handlePreload} onFocus={handlePreload}>
+          <Tooltip content={t('workspaces.select-workspace-tooltip')} portal>
+            <UIButton mode="bleed" padding={2} width="fill">
+              <Flex alignItems="center" gap={2}>
+                <Box>
+                  <Text size={1} textOverflow="ellipsis" weight="medium">
+                    {activeWorkspace.title}
+                  </Text>
+                </Box>
+                <Text size={1}>
+                  <ChevronDownIcon />
+                </Text>
+              </Flex>
+            </UIButton>
+          </Tooltip>
+        </Flex>
+      }
+      id="workspace-menu"
+      menu={
+        <Menu padding={0} style={{maxWidth: '350px', minWidth: '250px', overflowY: 'hidden'}}>
+          <ManageMenu
+            multipleWorkspaces={visibleWorkspaces.length > 1}
+            projectNamePromise={projectNamePromise}
+          />
+          {visibleWorkspaces.length > 1 && (
+            <>
+              <MenuDivider style={{padding: 0}} />
+              <Box paddingTop={2} paddingBottom={1}>
+                <Box paddingRight={5} paddingLeft={4} paddingBottom={3}>
+                  <Text size={0} weight="medium">
+                    {t('workspaces.action.switch-workspace')}
+                  </Text>
+                </Box>
+
+                <Stack ref={stackRef} gap={1} style={{overflowY: 'auto', maxHeight: '40vh'}}>
+                  {visibleWorkspaces.map((workspace) => (
+                    <WorkspaceMenuItem
+                      key={workspace.name}
+                      workspace={workspace}
+                      isSelected={workspace.name === activeWorkspace.name}
+                      scrollbarWidth={scrollbarWidth}
+                    />
+                  ))}
+                </Stack>
+              </Box>
+            </>
+          )}
+        </Menu>
+      }
+      popover={POPOVER_PROPS}
+    />
+  )
+}

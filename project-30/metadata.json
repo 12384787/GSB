@@ -1,0 +1,23 @@
+{
+  "number": 30,
+  "repository": "expressjs/express",
+  "url": "https://github.com/expressjs/express",
+  "description": "Fast, unopinionated, minimalist web framework for node.",
+  "language": "JavaScript",
+  "stars": 69454,
+  "default_branch": "master",
+  "source_zip_url": "https://github.com/expressjs/express/archive/refs/heads/master.zip",
+  "source_root": "source/express-master",
+  "top_level_entries": [
+    ".editorconfig",
+    ".eslintignore",
+    ".eslintrc.yml",
+    ".github",
+    ".gitignore",
+    ".npmrc",
+    "History.md",
+    "LICENSE",
+    "Readme.md",
+    "examples"
+  ]
+}

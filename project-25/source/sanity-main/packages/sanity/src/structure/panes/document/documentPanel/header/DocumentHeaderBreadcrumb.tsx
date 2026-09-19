@@ -1,0 +1,39 @@
+import {ArrowRightIcon} from '@sanity/icons/ArrowRight'
+import {Text} from '@sanity/ui'
+import {Fragment} from 'react'
+import {Flex, Box} from 'ui5'
+
+import {LOADING_PANE} from '../../../../constants'
+import {type Panes} from '../../../../structureResolvers/useResolvedPanes'
+import {DocumentHeaderBreadcrumbItem} from './DocumentHeaderBreadcrumbItem'
+
+export function DocumentHeaderBreadcrumb({
+  paneDataItems,
+  currentPaneIndex,
+}: {
+  paneDataItems: Panes['paneDataItems']
+  currentPaneIndex: number
+}): React.JSX.Element {
+  return (
+    <Flex flexDirection="row" alignItems="center" data-testid="document-header-breadcrumb">
+      {paneDataItems.map((paneData, idx) => {
+        if (idx > currentPaneIndex) return null
+        const isDocumentPane = paneData.pane !== LOADING_PANE && paneData.pane.type === 'document'
+        return (
+          <Fragment key={`breadcrumb-item-${paneData.key}-${idx}`}>
+            <DocumentHeaderBreadcrumbItem paneData={paneData} index={idx} />
+
+            {idx < currentPaneIndex &&
+              (isDocumentPane ? (
+                <Box padding={1}>
+                  <ArrowRightIcon />
+                </Box>
+              ) : (
+                <Text>/</Text>
+              ))}
+          </Fragment>
+        )
+      })}
+    </Flex>
+  )
+}

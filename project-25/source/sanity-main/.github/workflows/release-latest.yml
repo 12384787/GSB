@@ -1,0 +1,333 @@
+name: Release @latest
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Only run NPM publishing
+        required: true
+        default: false
+        type: boolean
+
+permissions: {}
+
+jobs:
+  build-and-validate:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.head_commit.message, 'chore(release): publish ')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+      TURBO_TEAM: ${{ vars.TURBO_TEAM }}
+    outputs:
+      version: ${{ steps.release-as.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup
+
+      - name: Build
+        run: pnpm build --output-logs=full --log-order=grouped
+
+      - name: Get version
+        id: release-as
+        run: |
+          version=$(jq -r .version package.json)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Validate version
+        run: |
+          echo "Release version: $RELEASE_AS"
+          if [[ ! "$RELEASE_AS" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid version: $RELEASE_AS"
+            exit 1
+          fi
+        env:
+          RELEASE_AS: ${{ steps.release-as.outputs.version }}
+
+  git-operations:
+    if: ${{ github.event.inputs.publish != 'true' }}
+    needs: build-and-validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Get version
+        id: release-as
+        run: |
+          version=$(jq -r .version package.json)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Configure git
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Tag and push version
+        run: |
+          git tag v$RELEASE_AS -m v$RELEASE_AS
+          git push origin v$RELEASE_AS
+        env:
+          RELEASE_AS: ${{ needs.build-and-validate.outputs.version}}
+
+  typedoc:
+    needs: [build-and-validate, git-operations]
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/typedoc.yml
+    with:
+      upload: true
+      version: ${{ needs.build-and-validate.outputs.version }}
+    secrets: inherit
+
+  npm-publish:
+    needs: [build-and-validate, git-operations]
+    if: always() && needs.build-and-validate.result == 'success' && (needs.git-operations.result == 'success' || needs.git-operations.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # to enable use of OIDC for npm provenance
+    env:
+      TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+      TURBO_TEAM: ${{ vars.TURBO_TEAM }}
+      EXPECTED_NPM_USER: sanity-svc.npm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+
+      - name: Build
+        run: pnpm build --output-logs=full --log-order=grouped
+
+      - name: Set publishing config
+        run: pnpm config set '//registry.npmjs.org/:_authToken' "${NPM_PUBLISH_TOKEN}"
+        env:
+          NPM_PUBLISH_TOKEN: ${{secrets.NPM_PUBLISH_TOKEN}}
+
+      - name: Check valid token
+        run: |
+          WHOAMI_RESULT=$(pnpm --silent whoami)
+          echo "pnpm whoami result: $WHOAMI_RESULT"
+          if [ "$WHOAMI_RESULT" != "$EXPECTED_NPM_USER" ]; then
+            echo "Error: pnpm whoami returned '$WHOAMI_RESULT', expected '$EXPECTED_NPM_USER'"
+            exit 1
+          fi
+          echo "✅ npm authentication validated - using $EXPECTED_NPM_USER account"
+
+      - name: Publish packages to npm
+        run: pnpm -r publish --provenance
+
+      - name: Wait for packages to be installable
+        # npm holds newly published versions for malware scanning (usually 5-15
+        # minutes, sometimes longer) before they become resolvable, so a package
+        # can be live while its exact-pinned workspace dependency still fails to
+        # install. Poll the registry until every published package resolves so
+        # the jobs that announce the release only run once it is installable.
+        # https://github.blog/changelog/2026-07-28-npm-publish-time-malware-scanning-and-dual-use-metadata/
+        run: |
+          # Get all published (non-private) packages in the workspace
+          pending=()
+          for pkg_dir in $(pnpm --silent tsx scripts/listPublishedPackages.ts); do
+            pending+=("$(jq -r '"\(.name)@\(.version)"' "$pkg_dir/package.json")")
+          done
+
+          echo "Waiting for ${#pending[@]} package(s) to resolve on the registry: ${pending[*]}"
+
+          deadline=$((SECONDS + 20 * 60))
+          while true; do
+            still_pending=()
+            for spec in "${pending[@]}"; do
+              if resolved=$(npm view "$spec" version --prefer-online 2>/dev/null) && [ -n "$resolved" ]; then
+                echo "✅ $spec is installable"
+              else
+                still_pending+=("$spec")
+              fi
+            done
+            pending=("${still_pending[@]}")
+
+            if [ "${#pending[@]}" -eq 0 ]; then
+              echo "✅ All published packages are installable"
+              break
+            fi
+
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "Error: timed out waiting for these packages to become installable:"
+              printf ' - %s\n' "${pending[@]}"
+              exit 1
+            fi
+
+            echo "⏳ Still waiting on ${#pending[@]} package(s): ${pending[*]} (retrying in 15s)"
+            sleep 15
+          done
+
+  sync-git-metrics:
+    # Mirror the new tag + npm data into the metrics dataset. After
+    # npm-publish so the registry already knows the version. Nothing
+    # downstream depends on it; a failure alerts Slack via the called
+    # workflow's alert job.
+    needs: [git-operations, npm-publish]
+    # always(): also sync on publish-only dispatch runs, where
+    # git-operations is skipped
+    if: always() && needs.npm-publish.result == 'success'
+    permissions:
+      contents: read
+      deployments: read
+    uses: ./.github/workflows/sync-git-metrics.yml
+    secrets:
+      RADAR_SANITY_WRITE_TOKEN: ${{ secrets.RADAR_SANITY_WRITE_TOKEN }}
+      SLACK_WEBHOOK_URL_CI_ALERTS: ${{ secrets.SLACK_WEBHOOK_URL_CI_ALERTS }}
+
+  bench-release:
+    name: Benchmark the released commit
+    # Measure the released commit. Without this, nothing in the metrics dataset
+    # ever measures a shipped version: the daily cron measures whatever main
+    # happens to be at 05:00, which landed on a release commit exactly once in
+    # the first 9 releases of the bench window. A release run is what makes
+    # "v6.10.1 regressed LCP" a statement about a release rather than an
+    # interpolation between two commits nobody shipped.
+    #
+    # Dispatched, not triggered by the tag push: git-operations pushes the tag
+    # with the default GITHUB_TOKEN, whose events never start workflows (the
+    # same reason sync-git-metrics is called rather than listening for tags).
+    #
+    # Dispatches an ordinary build of the release tag — `--ref` is the tag, so
+    # the checkout inside bench.yml lands exactly on the released commit and its
+    # normal build measures the right tree. `release_tag` labels the stored
+    # document, and bench.yml verifies the measured commit is the tag's.
+    #
+    # `--ref` is the tag rather than `main` on purpose: main moves every few
+    # minutes, and this job runs minutes after the release commit lands (behind
+    # build-and-validate and git-operations), so `main` is frequently no longer
+    # the release. The tag is immutable and cannot race.
+    #
+    # Deliberately no `backfill_sha`: that selects bench's historical replay
+    # path, which rebuilds a commit in its own worktree from that commit's
+    # lockfile and packs it for HEAD's harness. It is for trees that no longer
+    # match the checkout, which is not the case here.
+    #
+    # Non-blocking by construction: nothing depends on this job, so a failed
+    # benchmark can never fail or delay a release.
+    #
+    # Requires git-operations to have actually run (not 'skipped', which
+    # npm-publish tolerates), so a publish-only rerun does not re-measure a
+    # release that was already measured. The flip side: if the original run's
+    # dispatch failed, a rerun will not retry it. Measuring it by hand later
+    # needs the replay path, dispatched from main (a tag older than this
+    # workflow has no release_tag input of its own) — bench.yml resolves the
+    # tag to its commit and replays that:
+    # `gh workflow run bench.yml --ref main -f run_suite=true -f release_tag=<tag>`.
+    needs: [build-and-validate, git-operations]
+    if: >
+      always() && needs.build-and-validate.result == 'success' &&
+      needs.git-operations.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Dispatch the bench suite for this release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.build-and-validate.outputs.version }}
+        run: |
+          gh workflow run bench.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "v$VERSION" \
+            -f run_suite=true \
+            -f release_tag="v$VERSION"
+
+  publish-releases:
+    # Publish sanity.io Changelog & github release
+    needs: [build-and-validate, npm-publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ secrets.ECOSPARK_APP_ID }}
+          private-key: ${{ secrets.ECOSPARK_APP_PRIVATE_KEY }}
+
+      - name: Generate GitHub release
+        id: generate-github-release
+        run: |
+          pnpm --silent release-notes publish-releases --target-version="${{needs.build-and-validate.outputs.version}}"
+
+        env:
+          RELEASE_NOTES_SANITY_PROJECT_ID: ${{ vars.RELEASE_NOTES_SANITY_PROJECT_ID }}
+          RELEASE_NOTES_SANITY_DATASET: ${{ vars.RELEASE_NOTES_SANITY_DATASET }}
+          RELEASE_NOTES_ADMIN_STUDIO_URL: ${{ vars.RELEASE_NOTES_ADMIN_STUDIO_URL }}
+          RELEASE_NOTES_SANITY_TOKEN: ${{ secrets.RELEASE_NOTES_SANITY_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+  bundle-upload:
+    needs: npm-publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+      TURBO_TEAM: ${{ vars.TURBO_TEAM }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup
+
+      - name: Build
+        run: pnpm build --output-logs=full --log-order=grouped
+
+      - name: Build bundles for staging
+        env:
+          # sets the __SANITY_STAGING__ global variable to true in built bundles
+          SANITY_INTERNAL_ENV: "staging"
+        run: pnpm run build:bundle
+
+      - name: Upload bundles to staging bucket
+        env:
+          GOOGLE_PROJECT_ID: ${{ secrets.GCS_STAGING_PROJECT_ID }}
+          GCLOUD_SERVICE_KEY: ${{ secrets.GCS_STAGING_SERVICE_KEY }}
+          GCLOUD_BUCKET: ${{ secrets.GCS_STAGING_BUCKET }}
+        # tag both latest and next when doing an official release
+        # otherwise next tag will keep pointing to the old next release
+        run: pnpm bundle-manager publish --tag=latest --tag=next
+
+      - name: Build bundles for production
+        run: pnpm run build:bundle
+
+      - name: Upload bundles to production bucket
+        env:
+          GOOGLE_PROJECT_ID: ${{ secrets.GCS_PRODUCTION_PROJECT_ID }}
+          GCLOUD_SERVICE_KEY: ${{ secrets.GCS_PRODUCTION_SERVICE_KEY }}
+          GCLOUD_BUCKET: ${{ secrets.GCS_PRODUCTION_BUCKET }}
+        # tag both latest and next when doing an official release
+        # otherwise next tag will keep pointing to the old next release
+        run: pnpm bundle-manager publish --tag=latest --tag=next
+
+  notify-on-failure:
+    needs: [npm-publish, bundle-upload, publish-releases]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@0d95c9a7becc1e6e297d76df9bc735c44f4cbcbc # v3.0.5
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL_CI_ALERTS }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": ":alert-dot: The workflow \"${{github.workflow}}\" on <${{ github.server_url }}/${{ github.repository }}|${{github.repository}}> failed in branch <${{ github.server_url }}/${{ github.repository }}/tree/${{github.ref_name}}|${{github.ref_name}}> (<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run >)"
+            }

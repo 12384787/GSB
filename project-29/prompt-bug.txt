@@ -1,0 +1,5 @@
+任务类型：Bug 修复
+任务难度：困难
+语言/框架：Python
+
+请在已有的 psf/requests 项目上修复一个真实的跨模块缺陷。项目定位：A simple, yet elegant, HTTP library.。源码根目录为 requests-main，真实入口包括：.coveragerc, .git-blame-ignore-revs, .github, .gitignore, .pre-commit-config.yaml, .readthedocs.yaml, AUTHORS.rst, HISTORY.md, LICENSE, MANIFEST.in, Makefile, NOTICE, README.md, docs, ext, pyproject.toml, requirements-dev.txt, setup.py, src, tests, tox.ini。请围绕请求/响应处理、连接生命周期、错误传播、取消/超时、状态边界或兼容性链路，先构造可重复的失败用例并定位触发步骤和根因，再做最小范围修复。补充正常、失败、边界和回归测试；不能删除测试、放宽断言、改变无关公共 API 或引入无关依赖。验收要求：原有测试保持通过，新增测试稳定复现修复前问题并证明修复后的行为，错误信息和资源释放可验证。

@@ -1,0 +1,172 @@
+import {googleMapsInput} from '@sanity/google-maps-input'
+import {BookIcon} from '@sanity/icons/Book'
+import {PlayIcon} from '@sanity/icons/Play'
+import {visionTool} from '@sanity/vision'
+import {defineConfig, type ReleaseActionComponent} from 'sanity'
+import {internationalizedArray} from 'sanity-plugin-internationalized-array'
+import {media} from 'sanity-plugin-media'
+import {imageAssetSource} from 'sanity-test-studio/assetSources/imageAssetSource'
+import {resolveDocumentActions as documentActions} from 'sanity-test-studio/documentActions'
+import {assistFieldActionGroup} from 'sanity-test-studio/fieldActions/assistFieldActionGroup'
+import {resolveInitialValueTemplates} from 'sanity-test-studio/initialValueTemplates'
+import {customInspector} from 'sanity-test-studio/inspectors/custom'
+import {languageFilter} from 'sanity-test-studio/plugins/language-filter/plugin'
+import {newDocumentOptions} from 'sanity-test-studio/structure/resolveNewDocumentOptions'
+import {structure} from 'sanity-test-studio/structure/resolveStructure'
+import {defaultDocumentNode} from 'sanity-test-studio/structure/resolveStructureDocumentNode'
+import {presentationTool} from 'sanity/presentation'
+import {structureTool} from 'sanity/structure'
+
+import {customComponents} from './components-api'
+import {diagnosticsBridge} from './diagnosticsBridge'
+import {e2eI18nBundles} from './i18n/bundles'
+import {schemaTypes} from './schemaTypes'
+
+const TestReleaseAction: ReleaseActionComponent = (props) => {
+  const {release, documents} = props
+
+  return {
+    label: `E2E Test Action: ${release.metadata.title}`,
+    icon: PlayIcon,
+    disabled: false,
+    title: `Test action for release "${release.metadata.title}" with ${documents.length} documents`,
+    onHandle: () => {
+      console.warn(
+        `E2E Test Release Action executed! releaseTitle: ${release.metadata.title}, releaseId: ${release._id}, documentCount: ${documents.length}, releaseState: ${release.state}`,
+      )
+    },
+  }
+}
+
+const defaultConfig = defineConfig({
+  name: 'default',
+  title: 'studio-e2e-testing',
+  // Pin a workspace icon so Chromatic e2e snapshots stay stable. Without this,
+  // createDefaultIcon hashes projectId + dataset into a color, and e2e datasets
+  // change per PR / browser shard.
+  icon: PlayIcon,
+
+  projectId: process.env.SANITY_E2E_PROJECT_ID!,
+  dataset: process.env.SANITY_E2E_DATASET!,
+
+  schema: {
+    types: schemaTypes,
+    templates: resolveInitialValueTemplates,
+  },
+  form: {
+    image: {
+      assetSources: [imageAssetSource],
+    },
+  },
+
+  i18n: {
+    bundles: e2eI18nBundles,
+  },
+
+  document: {
+    actions: documentActions,
+    inspectors: (prev, ctx) => {
+      if (ctx.documentType === 'inspectorsTest') {
+        return [customInspector, ...prev]
+      }
+
+      return prev
+    },
+    unstable_fieldActions: (prev, ctx) => {
+      if (['fieldActionsTest', 'stringsTest'].includes(ctx.documentType)) {
+        return [...prev, assistFieldActionGroup]
+      }
+
+      return prev
+    },
+    newDocumentOptions,
+  },
+  plugins: [
+    diagnosticsBridge(),
+    customComponents(),
+    structureTool({
+      icon: BookIcon,
+      name: 'content',
+      title: 'Content',
+      structure,
+      defaultDocumentNode,
+    }),
+    presentationTool({
+      name: 'presentation',
+      title: 'Presentation',
+      previewUrl: {
+        origin: 'https://test-studio-preview-iframe.sanity.dev',
+        preview: '/',
+      },
+    }),
+    languageFilter({
+      defaultLanguages: ['nb'],
+      supportedLanguages: [
+        {id: 'ar', title: 'Arabic'},
+        {id: 'en', title: 'English'},
+        {id: 'nb', title: 'Norwegian (bokmål)'},
+        {id: 'nn', title: 'Norwegian (nynorsk)'},
+        {id: 'pt', title: 'Portuguese'},
+        {id: 'es', title: 'Spanish'},
+      ],
+      types: ['languageFilterDebug'],
+    }),
+    googleMapsInput({
+      apiKey: 'AIzaSyDDO2FFi5wXaQdk88S1pQUa70bRtWuMhkI',
+      defaultZoom: 11,
+      defaultLocation: {
+        lat: 40.7058254,
+        lng: -74.1180863,
+      },
+    }),
+    visionTool({
+      defaultApiVersion: '2022-08-08',
+    }),
+    media(),
+    internationalizedArray({
+      languages: [
+        {id: 'en', title: 'English'},
+        {id: 'fr', title: 'French'},
+      ],
+      defaultLanguages: ['en'],
+      fieldTypes: ['string'],
+    }),
+  ],
+  announcements: {
+    enabled: false,
+  },
+  releases: {
+    enabled: true,
+    actions: [TestReleaseAction],
+  },
+  create: {
+    startInCreateEnabled: false,
+  },
+  mediaLibrary: {
+    enabled: true,
+  },
+  beta: {
+    variants: {
+      enabled: true,
+    },
+  },
+})
+
+export default defineConfig([
+  {
+    ...defaultConfig,
+    basePath: '/chromium',
+    name: 'chromium',
+    title: 'studio-e2e-testing-chromium',
+    dataset: process.env.SANITY_E2E_DATASET_CHROMIUM || process.env.SANITY_E2E_DATASET!,
+    apiHost: 'https://api.sanity.work',
+  },
+  {
+    ...defaultConfig,
+    basePath: '/firefox',
+    name: 'firefox',
+    title: 'studio-e2e-testing-firefox',
+    dataset: process.env.SANITY_E2E_DATASET_FIREFOX || process.env.SANITY_E2E_DATASET!,
+    apiHost: 'https://api.sanity.work',
+  },
+])

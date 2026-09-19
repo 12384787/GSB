@@ -1,0 +1,24 @@
+import {type PreviewValue} from '@sanity/types'
+import {type Observable} from 'rxjs'
+
+import {type DocumentAvailability} from '../../../preview/types'
+
+/** @internal */
+export interface GlobalDocumentReferenceInfo {
+  id: string
+  type: string | undefined
+  availability: DocumentAvailability | null
+  preview: {
+    published: PreviewValue | undefined
+  }
+}
+
+/** @internal */
+type GlobalDocumentSearchFunction = (query: string) => Observable<SearchHit[]>
+
+/** @internal */
+export interface SearchHit {
+  id: string
+  type: string
+  published: undefined | {_id: string; _type: string}
+}

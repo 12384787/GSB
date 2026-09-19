@@ -1,0 +1,10 @@
+{
+  "number": 26,
+  "repository": "ankidroid/Anki-Android",
+  "url": "https://github.com/ankidroid/Anki-Android",
+  "description": "AnkiDroid: Anki flashcards on Android. Your secret trick to achieve superhuman information retention.",
+  "language": "Kotlin",
+  "stars": 11810,
+  "default_branch": "main",
+  "source_zip_url": "https://github.com/ankidroid/Anki-Android/archive/refs/heads/main.zip"
+}

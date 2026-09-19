@@ -1,0 +1,133 @@
+import {Card, type CardTone, Stack, Text} from '@sanity/ui'
+import {useCallback, useMemo} from 'react'
+
+import {useTranslation} from '../../../../../i18n/hooks/useTranslation'
+import {ArrayOfObjectsItem} from '../../../../members/array/items/ArrayOfObjectsItem'
+import {type ArrayOfObjectsInputProps} from '../../../../types/inputProps'
+import {type ObjectItem, type ObjectItemProps} from '../../../../types/itemProps'
+import {UploadTargetCard} from '../../../files/common/uploadTarget/UploadTargetCard'
+import {ArrayValidationProvider} from '../../common/ArrayValidationContext'
+import {Item, List} from '../../common/list'
+import {ArrayOfObjectsFunctions} from '../ArrayOfObjectsFunctions'
+import {createProtoArrayValue} from '../createProtoArrayValue'
+import {ErrorItem} from './ErrorItem'
+import {GridItem} from './GridItem'
+
+const EMPTY: [] = []
+
+export function GridArrayInput<Item extends ObjectItem>(props: ArrayOfObjectsInputProps<Item>) {
+  const {
+    arrayFunctions: ArrayFunctions = ArrayOfObjectsFunctions,
+    elementProps,
+    members,
+    onChange,
+    onItemPrepend,
+    onItemAppend,
+    onItemMove,
+    onSelectFile,
+    onUpload,
+    readOnly,
+    renderAnnotation,
+    renderBlock,
+    renderField,
+    renderInlineBlock,
+    renderInput,
+    renderPreview,
+    schemaType,
+    validation,
+    value = EMPTY,
+  } = props
+  const {t} = useTranslation()
+
+  const hasErrors = validation?.some((v) => v.level === 'error')
+  const errorTone: CardTone | undefined = hasErrors ? 'critical' : undefined
+
+  const sortable = schemaType.options?.sortable !== false
+
+  const renderItem = useCallback((itemProps: Omit<ObjectItemProps, 'renderDefault'>) => {
+    // todo: consider using a different item component for references
+    return <GridItem {...itemProps} />
+  }, [])
+
+  const memberKeys = useMemo(() => members.map((member) => member.key), [members])
+
+  return (
+    <ArrayValidationProvider schemaType={schemaType} itemCount={members.length}>
+      <Stack gap={2}>
+        <UploadTargetCard
+          {...elementProps}
+          isReadOnly={readOnly}
+          onSelectFile={onSelectFile}
+          onUpload={onUpload}
+          tabIndex={0}
+          types={schemaType.of}
+        >
+          <Stack data-ui="ArrayInput__content" gap={2}>
+            {members?.length === 0 && (
+              <Card padding={3} border radius={2} tone={errorTone}>
+                <Text align="center" muted size={1}>
+                  {/* oxlint-disable-next-line no-deprecated -- will fix in follow up PR */}
+                  {schemaType.placeholder || <>{t('inputs.array.no-items-label')}</>}
+                </Text>
+              </Card>
+            )}
+            {members?.length > 0 && (
+              <Card border radius={1} tone={errorTone}>
+                <List
+                  gridTemplateColumns={[
+                    'repeat(2, minmax(0, 1fr))',
+                    'repeat(3, minmax(0, 1fr))',
+                    'repeat(4, minmax(0, 1fr))',
+                  ]}
+                  gap={3}
+                  padding={1}
+                  margin={1}
+                  items={memberKeys}
+                  onItemMove={onItemMove}
+                  sortable={sortable}
+                >
+                  {members.map((member) => (
+                    <Item
+                      key={member.key}
+                      sortable={sortable}
+                      id={member.key}
+                      flexBasis="0%"
+                      flexGrow={1}
+                    >
+                      {member.kind === 'item' && (
+                        <ArrayOfObjectsItem
+                          member={member}
+                          renderAnnotation={renderAnnotation}
+                          renderBlock={renderBlock}
+                          renderInlineBlock={renderInlineBlock}
+                          renderItem={renderItem}
+                          renderField={renderField}
+                          renderInput={renderInput}
+                          renderPreview={renderPreview}
+                        />
+                      )}
+                      {member.kind === 'error' && (
+                        <ErrorItem sortable={sortable} member={member} readOnly={readOnly} />
+                      )}
+                    </Item>
+                  ))}
+                </List>
+              </Card>
+            )}
+          </Stack>
+        </UploadTargetCard>
+
+        <ArrayFunctions
+          onChange={onChange}
+          onItemAppend={onItemAppend}
+          onItemPrepend={onItemPrepend}
+          onValueCreate={createProtoArrayValue}
+          path={props.path}
+          readOnly={readOnly}
+          schemaType={schemaType}
+          value={value}
+        />
+      </Stack>
+    </ArrayValidationProvider>
+  )
+}

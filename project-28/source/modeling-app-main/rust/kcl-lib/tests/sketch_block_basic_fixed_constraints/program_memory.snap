@@ -1,0 +1,115 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Variables in memory after executing sketch_block_basic_fixed_constraints.kcl
+---
+{
+  "__sketch_1_on": {
+    "type": "Plane",
+    "value": {
+      "artifactId": "[uuid]",
+      "id": "[uuid]",
+      "kind": "Custom",
+      "origin": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0,
+        "units": "mm"
+      },
+      "xAxis": {
+        "x": 1.0,
+        "y": 0.0,
+        "z": 0.0,
+        "units": null
+      },
+      "yAxis": {
+        "x": 0.0,
+        "y": 1.0,
+        "z": 0.0,
+        "units": null
+      },
+      "zAxis": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 1.0,
+        "units": null
+      }
+    }
+  },
+  "myParam": {
+    "type": "Number",
+    "value": 4.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "s": {
+    "type": "Object",
+    "value": {
+      "len": {
+        "type": "Number",
+        "value": 5.0,
+        "ty": {
+          "type": "Known",
+          "value": {
+            "type": "Length",
+            "value": "mm"
+          }
+        }
+      },
+      "p1": {
+        "type": "HomArray",
+        "value": [
+          {
+            "type": "Number",
+            "value": 30.0,
+            "ty": {
+              "type": "Known",
+              "value": {
+                "type": "Length",
+                "value": "mm"
+              }
+            }
+          },
+          {
+            "type": "Number",
+            "value": 1016.0,
+            "ty": {
+              "type": "Known",
+              "value": {
+                "type": "Length",
+                "value": "mm"
+              }
+            }
+          }
+        ]
+      },
+      "x": {
+        "type": "Number",
+        "value": 3.0,
+        "ty": {
+          "type": "Known",
+          "value": {
+            "type": "Length",
+            "value": "mm"
+          }
+        }
+      },
+      "y": {
+        "type": "Number",
+        "value": 20.0,
+        "ty": {
+          "type": "Known",
+          "value": {
+            "type": "Length",
+            "value": "mm"
+          }
+        }
+      }
+    },
+    "constrainable": false
+  }
+}

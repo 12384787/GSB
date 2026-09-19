@@ -1,0 +1,74 @@
+# empty
+
+f()
+
+==>
+Program(ExpressionStatement(CallExpression(VariableName,
+                                           ArgumentList)))
+
+# single anon arg
+
+f(1)
+
+==>
+Program(ExpressionStatement(CallExpression(VariableName,
+                                           ArgumentList(Number))))
+
+# unlabeled first arg and labeled arg
+
+line(sketch001, end = [thickness, 0])
+
+==>
+Program(ExpressionStatement(CallExpression(VariableName,
+                                           ArgumentList(VariableName,
+                                                        LabeledArgument(ArgumentLabel,
+                                                                        Equals,
+                                                                        ArrayExpression(VariableName,
+                                                                                        Number))))))
+
+# % and labeled arg
+
+startSketchOn(XY)
+|> line(%, end = [thickness, 0])
+
+==>
+Program(ExpressionStatement(PipeExpression(CallExpression(VariableName,
+                                                          ArgumentList(VariableName)),
+                                           PipeOperator,
+                                           CallExpression(VariableName,
+                                                          ArgumentList(PipeSubstitution,
+                                                                       LabeledArgument(ArgumentLabel,
+                                                                                       Equals,
+                                                                                       ArrayExpression(VariableName,
+                                                                                                     Number)))))))
+
+# implied % and labeled arg
+
+startSketchOn(XY)
+|> line(end = [thickness, 0])
+
+==>
+Program(ExpressionStatement(PipeExpression(CallExpression(VariableName,
+                                                          ArgumentList(VariableName)),
+                                           PipeOperator,
+                                           CallExpression(VariableName,
+                                                          ArgumentList(LabeledArgument(ArgumentLabel,
+                                                                                       Equals,
+                                                                                       ArrayExpression(VariableName,
+                                                                                                     Number)))))))
+
+# multiple labeled arg
+
+ngon(plane = "XY", numSides = 5, radius = pentR)
+
+==>
+Program(ExpressionStatement(CallExpression(VariableName,
+                                           ArgumentList(LabeledArgument(ArgumentLabel,
+                                                                        Equals,
+                                                                        String),
+                                                        LabeledArgument(ArgumentLabel,
+                                                                        Equals,
+                                                                        Number),
+                                                        LabeledArgument(ArgumentLabel,
+                                                                        Equals,
+                                                                        VariableName)))))

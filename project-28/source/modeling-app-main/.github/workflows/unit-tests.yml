@@ -1,0 +1,136 @@
+name: App Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: 0 * * * * # hourly
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  track-setup:
+    runs-on: namespace-profile-ubuntu-2-cores
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Track setup
+        run: .github/ci-cd-scripts/track-step.sh
+        env:
+          TAB_API_URL: ${{ vars.TAB_API_URL }}
+          TAB_API_KEY: ${{ secrets.TAB_API_KEY }}
+          CI_COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_PR_NUMBER: ${{ github.event.pull_request.number }}
+          CI_SUITE: integration:app
+          CI_STEP: setup
+
+  build-wasm:
+    needs: [track-setup]
+    uses: ./.github/workflows/build-wasm.yml
+    secrets:
+      TAB_API_KEY: ${{ secrets.TAB_API_KEY }}
+
+  npm-test-unit:
+    runs-on: namespace-profile-ubuntu-2-cores
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+      - uses: taiki-e/install-action@c30ba1cbe2face7f695d394a2c95af204d417b29
+        with:
+          tool: wasm-pack
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+
+      - name: npm run test:unit
+        if: ${{ github.event_name != 'release' && github.event_name != 'schedule' }}
+        run: |-
+          npm run test:unit || true # let TAB determine failure
+          .github/ci-cd-scripts/upload-results.sh
+        env:
+          TAB_API_URL: ${{ vars.TAB_API_URL }}
+          TAB_API_KEY: ${{ secrets.TAB_API_KEY }}
+          CI_COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_PR_NUMBER: ${{ github.event.pull_request.number }}
+          CI_SUITE: unit
+
+  npm-test-integration:
+    runs-on: namespace-profile-ubuntu-2-cores
+    needs: build-wasm
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+      - uses: taiki-e/install-action@c30ba1cbe2face7f695d394a2c95af204d417b29
+        with:
+          tool: wasm-pack
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+
+      - name: Copy prepared wasm
+        run: |
+          ls -R prepared-wasm
+          cp prepared-wasm/kcl_wasm_lib_bg.wasm public
+          mkdir rust/kcl-wasm-lib/pkg
+          cp prepared-wasm/kcl_wasm_lib* rust/kcl-wasm-lib/pkg
+
+      - name: Copy prepared ts-rs bindings
+        run: |
+          ls -R prepared-ts-rs-bindings
+          mkdir rust/kcl-lib/bindings
+          cp -r prepared-ts-rs-bindings/* rust/kcl-lib/bindings/
+
+      - name: Track start
+        run: .github/ci-cd-scripts/track-step.sh
+        env:
+          TAB_API_URL: ${{ vars.TAB_API_URL }}
+          TAB_API_KEY: ${{ secrets.TAB_API_KEY }}
+          CI_COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_PR_NUMBER: ${{ github.event.pull_request.number }}
+          CI_SUITE: integration:app
+          CI_STEP: start
+
+      - name: npm run test:integration
+        if: ${{ github.event_name != 'release' }}
+        run: |-
+          xvfb-run -a npm run test:integration || true # let TAB determine failure
+          .github/ci-cd-scripts/upload-results.sh
+        env:
+          VITE_ZOO_API_TOKEN: ${{ secrets.ZOO_API_TOKEN }}
+          TAB_API_URL: ${{ vars.TAB_API_URL }}
+          TAB_API_KEY: ${{ secrets.TAB_API_KEY }}
+          CI_COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_PR_NUMBER: ${{ github.event.pull_request.number }}
+          CI_SUITE: integration:app
+
+      - name: Track teardown
+        if: always()
+        run: .github/ci-cd-scripts/track-step.sh
+        env:
+          TAB_API_URL: ${{ vars.TAB_API_URL }}
+          TAB_API_KEY: ${{ secrets.TAB_API_KEY }}
+          CI_COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_PR_NUMBER: ${{ github.event.pull_request.number }}
+          CI_SUITE: integration:app
+          CI_STEP: teardown

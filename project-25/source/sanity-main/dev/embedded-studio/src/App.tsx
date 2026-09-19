@@ -1,0 +1,73 @@
+import {Button, Card, studioTheme, ThemeProvider, usePrefersDark} from '@sanity/ui'
+import {useCallback, useMemo, useState} from 'react'
+import {Studio, StudioLayout, StudioProvider, type StudioThemeColorSchemeKey} from 'sanity'
+import {Flex} from 'ui5'
+
+import config from '../sanity.config'
+
+export function App() {
+  const prefersDark = usePrefersDark()
+  const [variant, setVariant] = useState<'layout' | 'studio'>('layout')
+
+  const initialScheme = prefersDark ? 'dark' : 'light'
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+  const [scheme, setScheme] = useState<StudioThemeColorSchemeKey>(initialScheme)
+
+  const _scheme = useMemo(
+    () => (scheme === 'system' ? initialScheme : scheme),
+    [initialScheme, scheme],
+  )
+
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+  const handleSchemeChange = useCallback((nextScheme: StudioThemeColorSchemeKey) => {
+    setScheme(nextScheme)
+  }, [])
+
+  const handleSetLayoutVariant = useCallback(() => {
+    setVariant('layout')
+  }, [])
+
+  const handleSetStudioVariant = useCallback(() => {
+    setVariant('studio')
+  }, [])
+
+  return (
+    // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+    <ThemeProvider scheme={_scheme} theme={studioTheme}>
+      <Flex flexDirection="column" height="100%" overflow="hidden">
+        <Card>
+          <Flex gap={1} padding={2}>
+            <Button
+              fontSize={1}
+              mode="ghost"
+              onClick={handleSetLayoutVariant}
+              padding={2}
+              selected={variant === 'layout'}
+              text="StudioLayout"
+              tone="primary"
+            />
+            <Button
+              fontSize={1}
+              mode="ghost"
+              onClick={handleSetStudioVariant}
+              padding={2}
+              selected={variant === 'studio'}
+              text="Studio"
+              tone="primary"
+            />
+          </Flex>
+        </Card>
+
+        <Flex flexDirection="column" flexBasis="0%" flexGrow={1}>
+          {variant === 'layout' && (
+            <StudioProvider config={config} onSchemeChange={handleSchemeChange}>
+              <StudioLayout />
+            </StudioProvider>
+          )}
+
+          {variant === 'studio' && <Studio config={config} onSchemeChange={handleSchemeChange} />}
+        </Flex>
+      </Flex>
+    </ThemeProvider>
+  )
+}

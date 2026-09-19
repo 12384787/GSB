@@ -1,0 +1,1041 @@
+//! Cache testing framework.
+
+use kcl_api::Artifact;
+use kcl_lib::ExecError;
+use kcl_lib::ExecOutcome;
+use kcl_lib::NodePathExt;
+use kcl_lib::NodePathStep;
+use kcl_lib::bust_cache;
+use kcl_lib::exec::Operation;
+use kcmc::ModelingCmd;
+use kcmc::each_cmd as mcmd;
+use kittycad_modeling_cmds as kcmc;
+use pretty_assertions::assert_eq;
+
+#[derive(Debug)]
+struct Variation<'a> {
+    code: &'a str,
+    other_files: Vec<(std::path::PathBuf, std::string::String)>,
+    settings: &'a kcl_lib::ExecutorSettings,
+}
+
+fn root_operations(outcome: &ExecOutcome) -> &Vec<Operation> {
+    outcome
+        .operations
+        .get(&kcl_lib::ModuleId::default())
+        .expect("root module operations should exist")
+}
+
+async fn cache_test(
+    test_name: &str,
+    variations: Vec<Variation<'_>>,
+) -> Vec<(String, image::DynamicImage, ExecOutcome)> {
+    let first = variations
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("No variations provided for test '{}'", test_name))
+        .unwrap();
+
+    let mut ctx = kcl_lib::ExecutorContext::new_with_client(first.settings.clone(), None, None)
+        .await
+        .unwrap();
+
+    bust_cache().await;
+    let mut img_results = Vec::new();
+    for (index, variation) in variations.iter().enumerate() {
+        let program = kcl_lib::Program::parse_no_errs(variation.code).unwrap();
+
+        // set the new settings.
+        ctx.settings = variation.settings.clone();
+
+        if !variation.other_files.is_empty() {
+            let tmp_dir = std::env::temp_dir();
+            let tmp_dir = tmp_dir
+                .join(format!("kcl_test_{test_name}"))
+                .join(uuid::Uuid::new_v4().to_string());
+
+            // Create a temporary file for each of the other files.
+            for (variant_path, variant_code) in &variation.other_files {
+                let tmp_file = tmp_dir.join(variant_path);
+                std::fs::create_dir_all(tmp_file.parent().unwrap()).unwrap();
+                std::fs::write(tmp_file, variant_code).unwrap();
+            }
+
+            ctx.settings.project_directory = Some(kcl_lib::TypedPath(tmp_dir.clone()));
+        }
+
+        let outcome = match ctx.run_with_caching(program).await {
+            Ok(outcome) => {
+                let errors = outcome.errors().collect::<Vec<_>>();
+                assert!(errors.is_empty(), "Execution resulted in error: {errors:#?}");
+                outcome
+            }
+            Err(error) => {
+                let report = error.into_miette_report_with_outputs(variation.code).unwrap();
+                let report = miette::Report::new(report);
+                panic!("{report:?}");
+            }
+        };
+
+        let snapshot_png_bytes = ctx.prepare_snapshot().await.unwrap().contents.0;
+
+        // Decode the snapshot, return it.
+        let img = image::ImageReader::new(std::io::Cursor::new(snapshot_png_bytes))
+            .with_guessed_format()
+            .map_err(|e| ExecError::BadPng(e.to_string()))
+            .and_then(|x| x.decode().map_err(|e| ExecError::BadPng(e.to_string())))
+            .unwrap();
+        // Save the snapshot.
+        let path = crate::assert_out(&format!("cache_{test_name}_{index}"), &img);
+
+        img_results.push((path, img, outcome));
+    }
+
+    ctx.close().await;
+
+    img_results
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kcl_test_cache_change_grid_visualizes_grid_off_to_on() {
+    let code = r#"part001 = startSketchOn(XY)
+  |> startProfile(at = [5.5229, 5.25217])
+  |> line(end = [10.50433, -1.19122])
+  |> line(end = [8.01362, -5.48731])
+  |> line(end = [-1.02877, -6.76825])
+  |> line(end = [-11.53311, 2.81559])
+  |> close()
+  |> extrude(length = 4)
+"#;
+
+    let result = cache_test(
+        "change_grid_visualizes_grid_off_to_on",
+        vec![
+            Variation {
+                code,
+                other_files: vec![],
+                settings: &kcl_lib::ExecutorSettings {
+                    show_grid: false,
+                    ..Default::default()
+                },
+            },
+            Variation {
+                code,
+                other_files: vec![],
+                settings: &kcl_lib::ExecutorSettings {
+                    show_grid: true,
+                    ..Default::default()
+                },
+            },
+        ],
+    )
+    .await;
+
+    let first = result.first().unwrap();
+    let second = result.last().unwrap();
+
+    assert_ne!(first.1, second.1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kcl_test_cache_change_grid_visualizes_grid_on_to_off() {
+    let code = r#"part001 = startSketchOn(XY)
+  |> startProfile(at = [5.5229, 5.25217])
+  |> line(end = [10.50433, -1.19122])
+  |> line(end = [8.01362, -5.48731])
+  |> line(end = [-1.02877, -6.76825])
+  |> line(end = [-11.53311, 2.81559])
+  |> close()
+  |> extrude(length = 4)
+"#;
+
+    let result = cache_test(
+        "change_grid_visualizes_grid_on_to_off",
+        vec![
+            Variation {
+                code,
+                other_files: vec![],
+                settings: &kcl_lib::ExecutorSettings {
+                    show_grid: true,
+                    ..Default::default()
+                },
+            },
+            Variation {
+                code,
+                other_files: vec![],
+                settings: &kcl_lib::ExecutorSettings {
+                    show_grid: false,
+                    ..Default::default()
+                },
+            },
+        ],
+    )
+    .await;
+
+    let first = result.first().unwrap();
+    let second = result.last().unwrap();
+
+    assert_ne!(first.1, second.1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kcl_test_cache_change_highlight_edges_changes_visual() {
+    let code = r#"part001 = startSketchOn(XY)
+  |> startProfile(at = [5.5229, 5.25217])
+  |> line(end = [10.50433, -1.19122])
+  |> line(end = [8.01362, -5.48731])
+  |> line(end = [-1.02877, -6.76825])
+  |> line(end = [-11.53311, 2.81559])
+  |> close()
+  |> extrude(length = 4)
+"#;
+
+    let result = cache_test(
+        "change_highlight_edges_changes_visual",
+        vec![
+            Variation {
+                code,
+                other_files: vec![],
+                settings: &kcl_lib::ExecutorSettings {
+                    highlight_edges: true,
+                    ..Default::default()
+                },
+            },
+            Variation {
+                code,
+                other_files: vec![],
+                settings: &kcl_lib::ExecutorSettings {
+                    highlight_edges: false,
+                    ..Default::default()
+                },
+            },
+        ],
+    )
+    .await;
+
+    let first = result.first().unwrap();
+    let second = result.last().unwrap();
+
+    assert_ne!(first.1, second.1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kcl_test_cache_multi_file_same_code_dont_reexecute() {
+    let code = r#"import "toBeImported.kcl" as importedCube
+
+importedCube
+
+sketch001 = startSketchOn(XZ)
+profile001 = startProfile(sketch001, at = [-134.53, -56.17])
+  |> angledLine(angle = 0, length = 79.05, tag = $rectangleSegmentA001)
+  |> angledLine(angle = segAng(rectangleSegmentA001) - 90, length = 76.28)
+  |> angledLine(angle = segAng(rectangleSegmentA001), length = -segLen(rectangleSegmentA001), tag = $seg01)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)], tag = $seg02)
+  |> close()
+extrude001 = extrude(profile001, length = 100)
+sketch003 = startSketchOn(extrude001, face = seg02)
+sketch002 = startSketchOn(extrude001, face = seg01)
+"#;
+
+    let other_file = (
+        std::path::PathBuf::from("toBeImported.kcl"),
+        r#"sketch001 = startSketchOn(XZ)
+profile001 = startProfile(sketch001, at = [281.54, 305.81])
+  |> angledLine(angle = 0, length = 123.43, tag = $rectangleSegmentA001)
+  |> angledLine(angle = segAng(rectangleSegmentA001) - 90, length = 85.99)
+  |> angledLine(angle = segAng(rectangleSegmentA001), length = -segLen(rectangleSegmentA001))
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude(profile001, length = 100)"#
+            .to_string(),
+    );
+
+    let result = cache_test(
+        "multi_file_same_code_dont_reexecute",
+        vec![
+            Variation {
+                code,
+                other_files: vec![other_file.clone()],
+                settings: &Default::default(),
+            },
+            Variation {
+                code,
+                other_files: vec![other_file],
+                settings: &Default::default(),
+            },
+        ],
+    )
+    .await;
+
+    let first = result.first().unwrap();
+    let last = result.last().unwrap();
+
+    assert!(first.1 == last.1, "The images should be the same");
+    assert_eq!(first.2, last.2, "The outcomes should be the same");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kcl_test_cache_add_line_preserves_artifact_graph() {
+    let code = r#"sketch001 = startSketchOn(XY)
+profile001 = startProfile(sketch001, at = [5.5, 5.25])
+  |> line(end = [10.5, -1.19])
+  |> line(end = [8, -5.5])
+  |> line(end = [-1.02, -6.76])
+  |> line(end = [-11.5, 2.8])
+  |> close()
+plane001 = offsetPlane(XY, offset = 20)
+"#;
+    // Use a new statement; don't extend the prior pipeline.  This allows us to
+    // detect a prefix.
+    let code_with_extrude = code.to_owned()
+        + r#"
+profile002 = startProfile(plane001, at = [0, 0])
+  |> line(end = [0, 10])
+  |> line(end = [10, 0])
+  |> close()
+extrude001 = extrude(profile001, length = 4)
+"#;
+
+    let result = cache_test(
+        "add_line_preserves_artifact_graph",
+        vec![
+            Variation {
+                code,
+                other_files: vec![],
+                settings: &Default::default(),
+            },
+            Variation {
+                code: code_with_extrude.as_str(),
+                other_files: vec![],
+                settings: &Default::default(),
+            },
+        ],
+    )
+    .await;
+
+    let first = &result.first().unwrap().2;
+    let second = &result.last().unwrap().2;
+
+    assert!(
+        first.artifact_graph.len() < second.artifact_graph.len(),
+        "Second should have all the artifacts of the first, plus more. first={:#?}, second={:#?}",
+        first.artifact_graph,
+        second.artifact_graph
+    );
+    assert!(
+        first.operations.count() < second.operations.count(),
+        "Second should have all the operations of the first, plus more. first={:?}, second={:?}",
+        first.operations.count(),
+        second.operations.count()
+    );
+    let Some(Operation::StdLibCall { name, .. }) = root_operations(second).last() else {
+        panic!("Last operation should be stdlib call extrude");
+    };
+    assert_eq!(name, "extrude");
+    // Make sure there are no duplicates.
+    assert_eq!(
+        root_operations(second).len(),
+        3,
+        "There should be exactly this many operations in the second run. {:#?}",
+        &second.operations
+    );
+    // Make sure we have NodePaths referring to the old code.
+    let graph = &second.artifact_graph;
+    assert!(!graph.is_empty());
+    for artifact in graph.values() {
+        assert!(!artifact.code_ref().map(|c| c.node_path.is_empty()).unwrap_or(false));
+        assert!(
+            !artifact
+                .face_code_ref()
+                // TODO: This fails, but it shouldn't.
+                // .map(|c| c.node_path.is_empty())
+                // Allowing the NodePath to be empty if the SourceRange is [0,
+                // 0] as a more lenient check.
+                .map(|c| !c.range.is_synthetic() && c.node_path.is_empty())
+                .unwrap_or(false),
+            "artifact={artifact:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kcl_test_cache_add_second_sketch_block_preserves_node_path() {
+    let code = r#"sketch001 = sketch(on = YZ) {
+  line1 = line(start = [var 4.14mm, var -0.05mm], end = [var 5.5mm, var 0mm])
+  line2 = line(start = [var 5.5mm, var 0mm], end = [var 5.5mm, var 3mm])
+  line3 = line(start = [var 5.5mm, var 3mm], end = [var 3.89mm, var 2.82mm])
+  line4 = line(start = [var 4.09mm, var 3.03mm], end = [var 4.5mm, var -0.16mm])
+  coincident([line1.end, line2.start])
+  coincident([line2.end, line3.start])
+  coincident([line3.end, line4.start])
+  coincident([line4.end, line1.start])
+  parallel([line2, line4])
+  parallel([line3, line1])
+  perpendicular([line1, line2])
+  horizontal(line3)
+}
+"#;
+    // Use a new statement; don't extend the prior pipeline.  This allows us to
+    // detect a prefix.
+    let code_with_extrude = code.to_owned()
+        + r#"
+sketch002 = sketch(on = -XZ) {
+  line1 = line(start = [var -5.33mm, var -0.06mm], end = [var -3.49mm, var -0.06mm])
+  line2 = line(start = [var -3.49mm, var -0.06mm], end = [var -3.49mm, var 3.09mm])
+  line3 = line(start = [var -3.52mm, var 4.47mm], end = [var -5.36mm, var 4.47mm])
+  line4 = line(start = [var -5.33mm, var 3.09mm], end = [var -5.33mm, var -0.06mm])
+  coincident([line1.end, line2.start])
+  coincident([line2.end, line3.start])
+  coincident([line3.end, line4.start])
+  coincident([line4.end, line1.start])
+  parallel([line2, line4])
+  parallel([line3, line1])
+  perpendicular([line1, line2])
+  horizontal(line3)
+}
+region001 = region(point = [-4.4175mm, -0.0575mm], sketch = sketch002)
+extrude001 = extrude(region001, length = 5)
+"#;
+
+    let result = cache_test(
+        "add_second_sketch_block_preserves_node_path",
+        vec![
+            Variation {
+                code,
+                other_files: vec![],
+                settings: &Default::default(),
+            },
+            Variation {
+                code: code_with_extrude.as_str(),
+                other_files: vec![],
+                settings: &Default::default(),
+            },
+        ],
+    )
+    .await;
+
+    let first = &result.first().unwrap().2;
+    let second = &result.last().unwrap().2;
+
+    assert!(
+        first.artifact_graph.len() < second.artifact_graph.len(),
+        "Second should have all the artifacts of the first, plus more. first={:#?}, second={:#?}",
+        first.artifact_graph,
+        second.artifact_graph
+    );
+    assert!(
+        first.operations.count() < second.operations.count(),
+        "Second should have all the operations of the first, plus more. first={:?}, second={:?}",
+        first.operations.count(),
+        second.operations.count()
+    );
+    let Some(Operation::StdLibCall { name, .. }) = root_operations(second).last() else {
+        panic!("Last operation should be stdlib call extrude");
+    };
+    assert_eq!(name, "extrude");
+    // Make sure we have NodePaths.
+    let first_graph = &first.artifact_graph;
+    assert!(!first_graph.is_empty());
+    for artifact in first_graph.values() {
+        assert!(
+            !artifact.code_ref().map(|c| c.node_path.is_empty()).unwrap_or(false),
+            "artifact={artifact:#?}"
+        );
+    }
+    // Make sure we have NodePaths.
+    let second_graph = &second.artifact_graph;
+    assert!(!second_graph.is_empty());
+    for artifact in second_graph.values() {
+        assert!(
+            !artifact.code_ref().map(|c| c.node_path.is_empty()).unwrap_or(false),
+            "artifact={artifact:#?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kcl_test_cache_add_offset_plane_computes_node_path() {
+    let code = r#"sketch001 = startSketchOn(XY)
+profile001 = startProfile(sketch001, at = [0, 0])
+"#;
+    let code_with_more = code.to_owned()
+        + r#"plane001 = offsetPlane(XY, offset = 500)
+"#;
+
+    let result = cache_test(
+        "add_offset_plane_preserves_artifact_commands",
+        vec![
+            Variation {
+                code,
+                other_files: vec![],
+                settings: &Default::default(),
+            },
+            Variation {
+                code: code_with_more.as_str(),
+                other_files: vec![],
+                settings: &Default::default(),
+            },
+        ],
+    )
+    .await;
+
+    let second = &result.last().unwrap().2;
+
+    let v = second.artifact_graph.values().collect::<Vec<_>>();
+    let path_step = &v[2].code_ref().unwrap().node_path.steps[0];
+    assert_eq!(*path_step, NodePathStep::ProgramBodyItem { index: 2 });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kcl_test_cache_empty_file_pop_cache_empty_file_planes_work() {
+    // Get the current working directory.
+    let code = "";
+
+    let ctx = kcl_lib::ExecutorContext::new_with_default_client().await.unwrap();
+    let program = kcl_lib::Program::parse_no_errs(code).unwrap();
+    let outcome = ctx.run_with_caching(program).await.unwrap();
+
+    // Ensure nothing is left in the batch
+    assert!(ctx.engine_batch.is_empty().await);
+
+    // Ensure the planes work, and we can show or hide them.
+    // Hide/show the grid.
+    let default_planes = ctx.engine.get_default_planes().read().await.clone().unwrap();
+
+    // Assure the outcome is the same.
+    assert_eq!(outcome.default_planes, Some(default_planes.clone()));
+
+    ctx.engine
+        .send_modeling_cmd(
+            &ctx.engine_batch,
+            uuid::Uuid::new_v4(),
+            Default::default(),
+            &ModelingCmd::from(
+                mcmd::ObjectVisible::builder()
+                    .hidden(false)
+                    .object_id(default_planes.xy)
+                    .build(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    // Now simulate an engine pause/network disconnect.
+    // Raw dog clear the scene entirely.
+    ctx.engine
+        .send_modeling_cmd(
+            &ctx.engine_batch,
+            uuid::Uuid::new_v4(),
+            Default::default(),
+            &ModelingCmd::from(mcmd::SceneClearAll::builder().build()),
+        )
+        .await
+        .unwrap();
+
+    // Bust the cache and reset the scene.
+    let outcome = ctx.bust_cache_and_reset_scene().await.unwrap();
+    // Get the default planes.
+    let default_planes = ctx.engine.get_default_planes().read().await.clone().unwrap();
+
+    assert_eq!(outcome.default_planes, Some(default_planes.clone()));
+
+    // Ensure we can show a plane.
+    ctx.engine
+        .send_modeling_cmd(
+            &ctx.engine_batch,
+            uuid::Uuid::new_v4(),
+            Default::default(),
+            &ModelingCmd::from(
+                mcmd::ObjectVisible::builder()
+                    .hidden(false)
+                    .object_id(default_planes.xz)
+                    .build(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    ctx.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kcl_test_cache_multi_file_after_empty_with_export() {
+    let code = r#"import importedCube from "toBeImported.kcl"
+
+importedCube
+
+sketch001 = startSketchOn(XZ)
+profile001 = startProfile(sketch001, at = [-134.53, -56.17])
+  |> angledLine(angle = 0, length = 79.05, tag = $rectangleSegmentA001)
+  |> angledLine(angle = segAng(rectangleSegmentA001) - 90, length = 76.28)
+  |> angledLine(angle = segAng(rectangleSegmentA001), length = -segLen(rectangleSegmentA001), tag = $seg01)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)], tag = $seg02)
+  |> close()
+extrude001 = extrude(profile001, length = 100)
+sketch003 = startSketchOn(extrude001, face = seg02)
+sketch002 = startSketchOn(extrude001, face = seg01)
+"#;
+
+    let other_file = (
+        std::path::PathBuf::from("toBeImported.kcl"),
+        r#"sketch001 = startSketchOn(XZ)
+profile001 = startProfile(sketch001, at = [281.54, 305.81])
+  |> angledLine(angle = 0, length = 123.43, tag = $rectangleSegmentA001)
+  |> angledLine(angle = segAng(rectangleSegmentA001) - 90, length = 85.99)
+  |> angledLine(angle = segAng(rectangleSegmentA001), length = -segLen(rectangleSegmentA001))
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+export importedCube = extrude(profile001, length = 100)
+"#
+        .to_string(),
+    );
+
+    let result = cache_test(
+        "multi_file_after_empty",
+        vec![
+            Variation {
+                code: "",
+                other_files: vec![],
+                settings: &Default::default(),
+            },
+            Variation {
+                code,
+                other_files: vec![other_file],
+                settings: &Default::default(),
+            },
+        ],
+    )
+    .await;
+
+    result.first().unwrap();
+    result.last().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kcl_test_cache_multi_file_after_empty_with_woo() {
+    let code = r#"import "toBeImported.kcl" as importedCube
+
+importedCube
+
+sketch001 = startSketchOn(XZ)
+profile001 = startProfile(sketch001, at = [-134.53, -56.17])
+  |> angledLine(angle = 0, length = 79.05, tag = $rectangleSegmentA001)
+  |> angledLine(angle = segAng(rectangleSegmentA001) - 90, length = 76.28)
+  |> angledLine(angle = segAng(rectangleSegmentA001), length = -segLen(rectangleSegmentA001), tag = $seg01)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)], tag = $seg02)
+  |> close()
+extrude001 = extrude(profile001, length = 100)
+sketch003 = startSketchOn(extrude001, face = seg02)
+sketch002 = startSketchOn(extrude001, face = seg01)
+"#;
+
+    let other_file = (
+        std::path::PathBuf::from("toBeImported.kcl"),
+        r#"sketch001 = startSketchOn(XZ)
+profile001 = startProfile(sketch001, at = [281.54, 305.81])
+  |> angledLine(angle = 0, length = 123.43, tag = $rectangleSegmentA001)
+  |> angledLine(angle = segAng(rectangleSegmentA001) - 90, length = 85.99)
+  |> angledLine(angle = segAng(rectangleSegmentA001), length = -segLen(rectangleSegmentA001))
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude(profile001, length = 100)
+"#
+        .to_string(),
+    );
+
+    let result = cache_test(
+        "multi_file_after_empty_with_woo",
+        vec![
+            Variation {
+                code: "",
+                other_files: vec![],
+                settings: &Default::default(),
+            },
+            Variation {
+                code,
+                other_files: vec![other_file],
+                settings: &Default::default(),
+            },
+        ],
+    )
+    .await;
+
+    result.first().unwrap();
+    result.last().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kcl_test_cache_multi_file_other_file_only_change() {
+    let code = r#"import "toBeImported.kcl" as importedCube
+
+importedCube
+
+sketch001 = startSketchOn(XZ)
+profile001 = startProfile(sketch001, at = [-134.53, -56.17])
+  |> angledLine(angle = 0, length = 79.05, tag = $rectangleSegmentA001)
+  |> angledLine(angle = segAng(rectangleSegmentA001) - 90, length = 76.28)
+  |> angledLine(angle = segAng(rectangleSegmentA001), length = -segLen(rectangleSegmentA001), tag = $seg01)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)], tag = $seg02)
+  |> close()
+extrude001 = extrude(profile001, length = 100)
+sketch003 = startSketchOn(extrude001, face = seg02)
+sketch002 = startSketchOn(extrude001, face = seg01)
+"#;
+
+    let other_file = (
+        std::path::PathBuf::from("toBeImported.kcl"),
+        r#"sketch001 = startSketchOn(XZ)
+profile001 = startProfile(sketch001, at = [281.54, 305.81])
+  |> angledLine(angle = 0, length = 123.43, tag = $rectangleSegmentA001)
+  |> angledLine(angle = segAng(rectangleSegmentA001) - 90, length = 85.99)
+  |> angledLine(angle = segAng(rectangleSegmentA001), length = -segLen(rectangleSegmentA001))
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude(profile001, length = 100)
+"#
+        .to_string(),
+    );
+
+    let other_file2 = (
+        std::path::PathBuf::from("toBeImported.kcl"),
+        r#"sketch001 = startSketchOn(XZ)
+profile001 = startProfile(sketch001, at = [281.54, 305.81])
+  |> angledLine(angle = 0, length = 123.43, tag = $rectangleSegmentA001)
+  |> angledLine(angle = segAng(rectangleSegmentA001) - 90, length = 85.99)
+  |> angledLine(angle = segAng(rectangleSegmentA001), length = -segLen(rectangleSegmentA001))
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude(profile001, length = 100)
+  |> clone()
+  |> translate(z = 100)
+"#
+        .to_string(),
+    );
+
+    let result = cache_test(
+        "multi_file_other_file_only_change",
+        vec![
+            Variation {
+                code,
+                other_files: vec![other_file],
+                settings: &Default::default(),
+            },
+            Variation {
+                code,
+                other_files: vec![other_file2],
+                settings: &Default::default(),
+            },
+        ],
+    )
+    .await;
+
+    let r1 = result.first().unwrap();
+    let r2 = result.last().unwrap();
+
+    assert_ne!(r1.1, r2.1, "The images should be different");
+    // Make sure the outcomes are different.
+    assert_ne!(
+        r1.2.artifact_graph, r2.2.artifact_graph,
+        "The outcomes artifact graphs should be different"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kcl_test_cache_multi_file_same_code_dont_reexecute_settings_only_change() {
+    let code = r#"import "toBeImported.kcl" as importedCube
+
+importedCube
+
+sketch001 = startSketchOn(XZ)
+profile001 = startProfile(sketch001, at = [-134.53, -56.17])
+  |> angledLine(angle = 0, length = 79.05, tag = $rectangleSegmentA001)
+  |> angledLine(angle = segAng(rectangleSegmentA001) - 90, length = 76.28)
+  |> angledLine(angle = segAng(rectangleSegmentA001), length = -segLen(rectangleSegmentA001), tag = $seg01)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)], tag = $seg02)
+  |> close()
+extrude001 = extrude(profile001, length = 100)
+sketch003 = startSketchOn(extrude001, face = seg02)
+sketch002 = startSketchOn(extrude001, face = seg01)
+"#;
+
+    let other_file = (
+        std::path::PathBuf::from("toBeImported.kcl"),
+        r#"sketch001 = startSketchOn(XZ)
+profile001 = startProfile(sketch001, at = [281.54, 305.81])
+  |> angledLine(angle = 0, length = 123.43, tag = $rectangleSegmentA001)
+  |> angledLine(angle = segAng(rectangleSegmentA001) - 90, length = 85.99)
+  |> angledLine(angle = segAng(rectangleSegmentA001), length = -segLen(rectangleSegmentA001))
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude(profile001, length = 100)"#
+            .to_string(),
+    );
+
+    let result = cache_test(
+        "multi_file_same_code_dont_reexecute_settings_only_change",
+        vec![
+            Variation {
+                code,
+                other_files: vec![other_file.clone()],
+                settings: &kcl_lib::ExecutorSettings {
+                    show_grid: false,
+                    ..Default::default()
+                },
+            },
+            Variation {
+                code,
+                other_files: vec![other_file],
+                settings: &kcl_lib::ExecutorSettings {
+                    show_grid: true,
+                    ..Default::default()
+                },
+            },
+        ],
+    )
+    .await;
+
+    let first = result.first().unwrap();
+    let last = result.last().unwrap();
+
+    assert_ne!(first.1, last.1, "The images should be different for the grid");
+    assert_eq!(first.2, last.2, "The outcomes should be the same");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kcl_test_cache_add_second_sketch_block_import_succeeds() {
+    let rectangle1 = (
+        std::path::PathBuf::from("rectangle1.kcl"),
+        r#"sketch001 = sketch(on = XY) {
+  line1 = line(start = [var 1.36mm, var 1.07mm], end = [var 3.73mm, var 1.07mm])
+  line2 = line(start = [var 3.73mm, var 1.07mm], end = [var 3.73mm, var 3.51mm])
+  line3 = line(start = [var 3.73mm, var 3.51mm], end = [var 1.36mm, var 3.51mm])
+  line4 = line(start = [var 1.36mm, var 3.51mm], end = [var 1.36mm, var 1.07mm])
+  coincident([line1.end, line2.start])
+  coincident([line2.end, line3.start])
+  coincident([line3.end, line4.start])
+  coincident([line4.end, line1.start])
+  parallel([line2, line4])
+  parallel([line3, line1])
+  perpendicular([line1, line2])
+  horizontal(line3)
+}
+"#
+        .to_string(),
+    );
+
+    let rectangle2 = (
+        std::path::PathBuf::from("rectangle2.kcl"),
+        r#"sketch001 = sketch(on = XY) {
+  line1 = line(start = [var 0.86mm, var 1.27mm], end = [var 3.04mm, var 1.27mm])
+  line2 = line(start = [var 3.04mm, var 1.27mm], end = [var 3.04mm, var 3.06mm])
+  line3 = line(start = [var 3.04mm, var 3.06mm], end = [var 0.86mm, var 3.06mm])
+  line4 = line(start = [var 0.86mm, var 3.06mm], end = [var 0.86mm, var 1.27mm])
+  coincident([line1.end, line2.start])
+  coincident([line2.end, line3.start])
+  coincident([line3.end, line4.start])
+  coincident([line4.end, line1.start])
+  parallel([line2, line4])
+  parallel([line3, line1])
+  perpendicular([line1, line2])
+  horizontal(line3)
+}
+"#
+        .to_string(),
+    );
+
+    let code = "import \"rectangle1.kcl\"\n";
+    let code_with_second_import = code.to_owned()
+        + "
+import \"rectangle2.kcl\"
+";
+
+    let result = cache_test(
+        "add_second_sketch_block_import_preserves_node_path",
+        vec![
+            Variation {
+                code,
+                other_files: vec![rectangle1.clone()],
+                settings: &Default::default(),
+            },
+            Variation {
+                code: &code_with_second_import,
+                other_files: vec![rectangle1, rectangle2],
+                settings: &Default::default(),
+            },
+        ],
+    )
+    .await;
+
+    let first = &result.first().unwrap().2;
+    let second = &result.last().unwrap().2;
+
+    assert!(
+        first.artifact_graph.len() < second.artifact_graph.len(),
+        "Second should have all the artifacts of the first, plus more. first={:#?}, second={:#?}",
+        first.artifact_graph,
+        second.artifact_graph
+    );
+    assert!(
+        first.operations.count() < second.operations.count(),
+        "Second should have all the operations of the first, plus more. first={:?}, second={:?}",
+        first.operations.count(),
+        second.operations.count()
+    );
+    // Make sure we have NodePaths.
+    let first_graph = &first.artifact_graph;
+    assert!(!first_graph.is_empty());
+    for artifact in first_graph.values() {
+        assert!(
+            !artifact.code_ref().map(|c| c.node_path.is_empty()).unwrap_or(false),
+            "artifact={artifact:#?}"
+        );
+    }
+    // Make sure we have NodePaths.
+    let second_graph = &second.artifact_graph;
+    assert!(!second_graph.is_empty());
+    for artifact in second_graph.values() {
+        assert!(
+            !artifact.code_ref().map(|c| c.node_path.is_empty()).unwrap_or(false),
+            "artifact={artifact:#?}"
+        );
+    }
+}
+
+/// Renaming a view reports the new name, rather than keeping the name its
+/// previous run registered.
+///
+/// Execution artifacts are folded into the graph with `entry(id).or_insert`, and
+/// artifact ids are stable across runs, so a re-executed declaration could in
+/// principle keep the payload of its earlier registration. It does not, because
+/// editing an existing statement clears the artifact state before re-executing,
+/// and the one path that preserves that state -- appending statements to an
+/// unchanged prefix -- does not re-run the prefix it appends to. `view::named`
+/// therefore registers plainly, with no guard of its own against a stale
+/// payload. This test is what keeps that true: were an edit ever routed through
+/// the preserving path, the view would still report `Front`.
+#[tokio::test(flavor = "multi_thread")]
+async fn kcl_test_cache_rename_named_view_reports_the_new_name() {
+    let code = |view_name: &str| {
+        format!(
+            r#"@settings(experimentalFeatures = allow)
+
+plateSketch = sketch(on = XY) {{
+  edge1 = line(start = [var 0mm, var 0mm], end = [var 40mm, var 0mm])
+  edge2 = line(start = [var 40mm, var 0mm], end = [var 40mm, var 20mm])
+  edge3 = line(start = [var 40mm, var 20mm], end = [var 0mm, var 20mm])
+  edge4 = line(start = [var 0mm, var 20mm], end = [var 0mm, var 0mm])
+  coincident([edge1.end, edge2.start])
+  coincident([edge2.end, edge3.start])
+  coincident([edge3.end, edge4.start])
+  coincident([edge4.end, edge1.start])
+}}
+plate = extrude(region(point = [20mm, 10mm], sketch = plateSketch), length = 5mm)
+
+view001 = view::named(
+  "{view_name}",
+  camera = view::oriented(view::Orientation::Front),
+  baseline = view::Visibility::Show,
+)
+"#
+        )
+    };
+    let before = code("Front");
+    let after = code("Front elevation");
+
+    let result = cache_test(
+        "rename_named_view",
+        vec![
+            Variation {
+                code: &before,
+                other_files: vec![],
+                settings: &Default::default(),
+            },
+            Variation {
+                code: &after,
+                other_files: vec![],
+                settings: &Default::default(),
+            },
+        ],
+    )
+    .await;
+
+    let view_names = |outcome: &ExecOutcome| -> Vec<String> {
+        outcome
+            .artifact_graph
+            .values()
+            .filter_map(|artifact| match artifact {
+                Artifact::NamedView(view) => Some(view.name.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    assert_eq!(view_names(&result.first().unwrap().2), ["Front"]);
+    // One view under the new name. Two entries here would mean the rename added
+    // a view; the old name alone would mean the stale payload survived.
+    assert_eq!(view_names(&result.last().unwrap().2), ["Front elevation"]);
+}
+
+/// A view name that duplicates one already in the file is rejected even when the
+/// duplicate arrives by APPENDING to an unchanged file.
+///
+/// This is the path the uniqueness check exists in two halves for. Appending
+/// leaves the prefix un-re-executed, so the views it declared stay in the
+/// artifact state kept from the previous run, while the appended declaration
+/// registers into the state of the current one. Reading only the current run's
+/// state would accept this program, and the same file would then be rejected on
+/// the next full re-execution -- accepted while typed, rejected after an
+/// unrelated edit.
+///
+/// `cache_test` cannot express this case: it panics on any execution error, so
+/// this drives the caching context directly.
+#[tokio::test(flavor = "multi_thread")]
+async fn kcl_test_cache_appended_duplicate_view_name_is_rejected() {
+    let first = r#"@settings(experimentalFeatures = allow)
+
+plateSketch = sketch(on = XY) {
+  edge1 = line(start = [var 0mm, var 0mm], end = [var 40mm, var 0mm])
+  edge2 = line(start = [var 40mm, var 0mm], end = [var 40mm, var 20mm])
+  edge3 = line(start = [var 40mm, var 20mm], end = [var 0mm, var 20mm])
+  edge4 = line(start = [var 0mm, var 20mm], end = [var 0mm, var 0mm])
+  coincident([edge1.end, edge2.start])
+  coincident([edge2.end, edge3.start])
+  coincident([edge3.end, edge4.start])
+  coincident([edge4.end, edge1.start])
+}
+plate = extrude(region(point = [20mm, 10mm], sketch = plateSketch), length = 5mm)
+
+view001 = view::named(
+  "Front",
+  camera = view::oriented(view::Orientation::Front),
+  baseline = view::Visibility::Show,
+)
+"#;
+    // The same text plus one appended declaration, so the cache takes the
+    // append path rather than clearing and re-executing.
+    let second = format!(
+        r#"{first}
+view002 = view::named(
+  "Front",
+  camera = view::oriented(view::Orientation::Back),
+  baseline = view::Visibility::Show,
+)
+"#
+    );
+
+    let ctx = kcl_lib::ExecutorContext::new_with_default_client().await.unwrap();
+    bust_cache().await;
+
+    ctx.run_with_caching(kcl_lib::Program::parse_no_errs(first).unwrap())
+        .await
+        .expect("the first program declares one view and executes");
+
+    let err = ctx
+        .run_with_caching(kcl_lib::Program::parse_no_errs(&second).unwrap())
+        .await
+        .expect_err("the appended view repeats a name the file already declares");
+    assert!(
+        err.error.message().contains("A view named `Front` already exists"),
+        "{:?}",
+        err.error
+    );
+}

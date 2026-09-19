@@ -1,0 +1,2 @@
+ankidroid/Anki-Android
+AnkiDroid: Anki flashcards on Android. Your secret trick to achieve superhuman information retention.

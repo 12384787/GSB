@@ -1,0 +1,92 @@
+import {useCallback, useEffect, useState} from 'react'
+import {Flex} from 'ui5'
+
+import {Button} from '../../../../../../../ui-components/button/Button'
+import {useTranslation} from '../../../../../../i18n/hooks/useTranslation'
+import {DEBUG_MODE} from '../../constants'
+import {useSearchState} from '../../contexts/search/useSearchState'
+import {getFilterKey} from '../../utils/filterUtils'
+import {AddFilterButton} from './addFilter/AddFilterButton'
+import {DebugDocumentTypesNarrowed} from './debug/_DebugDocumentTypesNarrowed'
+import {DebugFilterQuery} from './debug/_DebugFilterQuery'
+import {DocumentTypesButton} from './documentTypes/DocumentTypesButton'
+import {FilterButton} from './filter/FilterButton'
+
+/**
+ * @internal
+ */
+export function Filters({showTypeFilter = true}: {showTypeFilter?: boolean}) {
+  const {
+    dispatch,
+    state: {
+      filters,
+      fullscreen,
+      lastAddedFilter,
+      terms: {types},
+    },
+  } = useSearchState()
+  const {t} = useTranslation()
+
+  const [isMounted, setIsMounted] = useState(false)
+
+  const handleClear = useCallback(() => {
+    if (showTypeFilter) dispatch({type: 'TERMS_TYPES_CLEAR'})
+    dispatch({type: 'TERMS_FILTERS_CLEAR'})
+  }, [dispatch, showTypeFilter])
+
+  const clearFiltersButtonVisible = filters.length > 0 || (showTypeFilter && types.length > 0)
+
+  useEffect(() => {
+    // oxlint-disable-next-line react/set-state-in-effect -- pre-existing violation, to be fixed in a follow-up
+    setIsMounted(true)
+  }, [])
+
+  const lastAddedFilterKey = lastAddedFilter && getFilterKey(lastAddedFilter)
+
+  const clearFiltersButton = (
+    <Button
+      mode="bleed"
+      onClick={handleClear}
+      size={fullscreen ? 'large' : 'default'}
+      text={t('search.action.clear-filters')}
+      tone="critical"
+    />
+  )
+
+  return (
+    <>
+      <Flex alignItems="flex-start" gap={3} justifyContent="space-between" padding={2}>
+        <Flex flexBasis="0%" flexGrow={1} gap={2} flexWrap="wrap">
+          {showTypeFilter && <DocumentTypesButton />}
+          {filters?.map((filter) => {
+            const key = getFilterKey(filter)
+            return (
+              <FilterButton
+                key={key}
+                filter={filter}
+                initialOpen={isMounted && lastAddedFilterKey === key}
+              />
+            )
+          })}
+          {!fullscreen && <AddFilterButton />}
+        </Flex>
+        {clearFiltersButtonVisible && !fullscreen && clearFiltersButton}
+      </Flex>
+
+      {fullscreen && (
+        <Flex justifyContent="space-between" paddingBottom={2} paddingX={2}>
+          <AddFilterButton />
+          {clearFiltersButtonVisible && clearFiltersButton}
+        </Flex>
+      )}
+
+      {/* Debug panels */}
+      {DEBUG_MODE && (
+        <>
+          <DebugFilterQuery />
+          <DebugDocumentTypesNarrowed />
+        </>
+      )}
+    </>
+  )
+}

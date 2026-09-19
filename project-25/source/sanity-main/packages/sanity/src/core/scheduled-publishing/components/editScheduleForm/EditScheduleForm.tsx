@@ -1,0 +1,26 @@
+import {type PropsWithChildren} from 'react'
+import {VStack} from 'ui5'
+
+import {type ScheduleFormData} from '../../types'
+import ScheduleForm from './ScheduleForm'
+
+interface Props {
+  onChange?: (formData: ScheduleFormData) => void
+  value?: ScheduleFormData | null
+}
+
+/**
+ * Form for editing a schedule for a document when scheduled publishing is enabled.
+ * @deprecated we will be dropping support for scheduled publishing on a future major version
+ * @internal
+ */
+export function EditScheduleForm(props: PropsWithChildren<Props>) {
+  const {onChange, value} = props
+
+  return (
+    <VStack gap={4}>
+      {props.children}
+      <ScheduleForm onChange={onChange} value={value} />
+    </VStack>
+  )
+}

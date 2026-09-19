@@ -1,0 +1,16 @@
+// This tests computed properties. 
+
+arr = [0, 0, 0, 10]
+i = 3
+ten = arr[i]
+
+assert(ten, isEqualTo = 10, error = "oops")
+
+p = "foo"
+obj = {
+  foo: 1,
+  bar: 0,
+}
+one = obj[p]
+
+assert(one, isEqualTo = 1, error = "oops")

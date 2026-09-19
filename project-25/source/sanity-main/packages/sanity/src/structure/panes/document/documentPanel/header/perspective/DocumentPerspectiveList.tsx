@@ -1,0 +1,307 @@
+import {Stack, Text} from '@sanity/ui'
+import {memo} from 'react'
+import {
+  getDraftId,
+  getPublishedId,
+  getReleaseIdFromReleaseDocumentId,
+  getReleaseTone,
+  getVersionId,
+  isGoingToUnpublish,
+  isReleaseScheduledOrScheduling,
+  type ReleaseDocument,
+  ReleaseTitle,
+  type SanityDocumentLike,
+  Translate,
+  useActiveReleases,
+  useDateTimeFormat,
+  type UseDateTimeFormatOptions,
+  useFormatRelativeLocalePublishDate,
+  usePerspective,
+  useTranslation,
+  VersionChip,
+} from 'sanity'
+
+import {useDocumentPerspectiveList} from '../../../../../hooks/useDocumentPerspectiveList'
+import {useDocumentPane} from '../../../useDocumentPane'
+import {useDocumentPaneInfo} from '../../../useDocumentPaneInfo'
+import {NonReleaseVersionsSelect} from '../NonReleaseVersionsSelect'
+
+const TooltipContent = ({release}: {release: ReleaseDocument}) => {
+  const {t} = useTranslation()
+  const formatPublishDate = useFormatRelativeLocalePublishDate()
+
+  if (release.state === 'archived') {
+    return <Text size={1}>{t('release.chip.tooltip.archived')}</Text>
+  }
+  if (release.metadata.releaseType === 'asap') {
+    return <Text size={1}>{t('release.type.asap')}</Text>
+  }
+  if (release.metadata.releaseType === 'scheduled') {
+    const isActive = release.state === 'active'
+
+    return (
+      release.metadata.intendedPublishAt && (
+        <Text size={1}>
+          {isActive ? (
+            <Translate
+              t={t}
+              i18nKey="release.chip.tooltip.intended-for-date"
+              values={{
+                date: formatPublishDate(release),
+              }}
+            />
+          ) : (
+            <Translate
+              t={t}
+              i18nKey="release.chip.tooltip.scheduled-for-date"
+              values={{
+                date: formatPublishDate(release),
+              }}
+            />
+          )}
+        </Text>
+      )
+    )
+  }
+
+  if (release.metadata.releaseType === 'undecided') {
+    return <Text size={1}>{t('release.type.undecided')}</Text>
+  }
+  return null
+}
+
+const DATE_TIME_FORMAT: UseDateTimeFormatOptions = {
+  dateStyle: 'medium',
+  timeStyle: 'short',
+}
+
+export const DocumentPerspectiveList = memo(function DocumentPerspectiveList() {
+  const {selectedPerspectiveName} = usePerspective()
+  const {t} = useTranslation()
+  const dateTimeFormat = useDateTimeFormat(DATE_TIME_FORMAT)
+  const {loading} = useActiveReleases()
+  const {editState, displayed, documentId} = useDocumentPane()
+  const {documentType} = useDocumentPaneInfo()
+  const documentGroupId = getPublishedId(documentId)
+  const {
+    filteredReleases,
+    getVersionDisplay,
+    getReleaseChipState,
+    clearScheduledDraftPerspective,
+    handlePerspectiveChange,
+    handleVariantSelectionChange,
+    isDraftDisabled,
+    variantVersions,
+    isDraftModelEnabled,
+    isDraftSelected,
+    isLiveEdit,
+    isPublishedChipDisabled,
+    isPublishSelected,
+    nonReleaseVersions,
+  } = useDocumentPerspectiveList()
+
+  return (
+    <>
+      <VersionChip
+        tooltipContent={
+          <Text size={1}>
+            {editState?.published && editState?.published?._updatedAt ? (
+              <Translate
+                t={t}
+                i18nKey="release.chip.tooltip.published-date"
+                values={{date: dateTimeFormat.format(new Date(editState?.published._updatedAt))}}
+              />
+            ) : (
+              <>{t('release.chip.tooltip.not-published')}</>
+            )}
+          </Text>
+        }
+        disabled={isPublishedChipDisabled}
+        onClick={() => handlePerspectiveChange('published')}
+        selected={isPublishSelected}
+        text={t('release.chip.published')}
+        tone="positive"
+        onCopyToDraftsComplete={clearScheduledDraftPerspective}
+        contextValues={{
+          documentGroupId,
+          versionId: getPublishedId(documentGroupId),
+          releases: filteredReleases.notCurrentReleases,
+          releasesLoading: loading,
+          documentType,
+          bundleId: 'published',
+          isVersion: false,
+          disabled: !editState?.published,
+        }}
+      />
+      {isDraftModelEnabled && (
+        <VersionChip
+          tooltipContent={
+            <Text size={1}>
+              {editState?.draft ? (
+                <>
+                  {editState?.draft._updatedAt ? (
+                    <Translate
+                      t={t}
+                      i18nKey="release.chip.tooltip.edited-date"
+                      values={{date: dateTimeFormat.format(new Date(editState?.draft._updatedAt))}}
+                    />
+                  ) : (
+                    <Translate
+                      t={t}
+                      i18nKey="release.chip.tooltip.created-date"
+                      values={{date: dateTimeFormat.format(new Date(editState?.draft._createdAt))}}
+                    />
+                  )}
+                </>
+              ) : (
+                <>
+                  {isLiveEdit
+                    ? t('release.chip.tooltip.draft-disabled.live-edit')
+                    : t('release.chip.tooltip.no-edits')}
+                </>
+              )}
+            </Text>
+          }
+          selected={isDraftSelected}
+          disabled={isDraftDisabled}
+          text={t('release.chip.draft')}
+          tone={editState?.draft ? 'caution' : 'neutral'}
+          onClick={() => handlePerspectiveChange('drafts')}
+          onCopyToDraftsComplete={clearScheduledDraftPerspective}
+          contextValues={{
+            documentGroupId,
+            // With no draft the chip displays the published document, so act on that instead —
+            // adding to a release should duplicate the content on screen.
+            versionId:
+              editState?.draft?._id ?? editState?.published?._id ?? getDraftId(documentGroupId),
+            documentType: documentType,
+            releases: filteredReleases.notCurrentReleases,
+            releasesLoading: loading,
+            bundleId: 'draft',
+            isVersion: false,
+          }}
+        />
+      )}
+      {filteredReleases.inCreation && (
+        <ReleaseTitle
+          title={filteredReleases.inCreation.metadata.title}
+          fallback={t('release.placeholder-untitled-release')}
+          enableTooltip={false}
+        >
+          {({displayTitle, fullTitle, isTruncated}) => (
+            <VersionChip
+              tooltipContent={
+                isTruncated ? (
+                  <Stack gap={2} style={{maxWidth: '300px'}}>
+                    <Text size={1} weight="medium">
+                      {fullTitle}
+                    </Text>
+                    <TooltipContent release={filteredReleases.inCreation!} />
+                  </Stack>
+                ) : (
+                  <TooltipContent release={filteredReleases.inCreation!} />
+                )
+              }
+              selected
+              onClick={() => {}}
+              locked={false}
+              tone={getReleaseTone(filteredReleases.inCreation!)}
+              text={displayTitle}
+              onCopyToDraftsComplete={clearScheduledDraftPerspective}
+              contextValues={{
+                documentGroupId,
+                versionId: getVersionId(
+                  documentGroupId,
+                  getReleaseIdFromReleaseDocumentId(filteredReleases.inCreation!._id),
+                ),
+                documentType,
+                disabled: true,
+                releases: filteredReleases.notCurrentReleases,
+                releasesLoading: loading,
+                bundleId: getReleaseIdFromReleaseDocumentId(filteredReleases.inCreation!._id),
+                isVersion: true,
+                release: filteredReleases.inCreation!,
+              }}
+            />
+          )}
+        </ReleaseTitle>
+      )}
+
+      {displayed &&
+        filteredReleases.currentReleases?.map((release) => (
+          <ReleaseTitle
+            key={release._id}
+            title={release.metadata.title}
+            fallback={t('release.placeholder-untitled-release')}
+            enableTooltip={false}
+          >
+            {({displayTitle, fullTitle, isTruncated}) => (
+              <VersionChip
+                tooltipContent={
+                  isTruncated ? (
+                    <Stack gap={2} style={{maxWidth: '300px'}}>
+                      <Text size={1} weight="medium">
+                        {fullTitle}
+                      </Text>
+                      <TooltipContent release={release} />
+                    </Stack>
+                  ) : (
+                    <TooltipContent release={release} />
+                  )
+                }
+                {...getReleaseChipState(getReleaseIdFromReleaseDocumentId(release._id))}
+                onClick={() => handlePerspectiveChange(release)}
+                text={displayTitle}
+                tone={getReleaseTone(release)}
+                locked={isReleaseScheduledOrScheduling(release)}
+                onCopyToDraftsComplete={clearScheduledDraftPerspective}
+                contextValues={{
+                  documentGroupId,
+                  versionId: getVersionId(
+                    documentGroupId,
+                    getReleaseIdFromReleaseDocumentId(release._id),
+                  ),
+                  documentType,
+                  releases: filteredReleases.notCurrentReleases,
+                  releasesLoading: loading,
+                  bundleId: getReleaseIdFromReleaseDocumentId(release._id),
+                  isVersion: true,
+                  release,
+                  isGoingToUnpublish: editState?.version
+                    ? isGoingToUnpublish(editState?.version as SanityDocumentLike)
+                    : false,
+                }}
+              />
+            )}
+          </ReleaseTitle>
+        ))}
+      <NonReleaseVersionsSelect
+        nonReleaseVersions={nonReleaseVersions}
+        selectedPerspective={selectedPerspectiveName}
+        onSelectBundle={(version) => {
+          const scopeId = version._system.scopeId!
+          handlePerspectiveChange(scopeId)
+        }}
+        onCopyToDraftsComplete={clearScheduledDraftPerspective}
+        releases={filteredReleases.notCurrentReleases}
+        releasesLoading={loading}
+        documentType={documentType}
+        getVersionDisplay={getVersionDisplay}
+        mode="versions"
+      />
+      {variantVersions.length > 0 ? (
+        <NonReleaseVersionsSelect
+          nonReleaseVersions={variantVersions}
+          selectedPerspective={selectedPerspectiveName}
+          onSelectBundle={handleVariantSelectionChange}
+          onCopyToDraftsComplete={clearScheduledDraftPerspective}
+          releases={filteredReleases.notCurrentReleases}
+          releasesLoading={loading}
+          documentType={documentType}
+          getVersionDisplay={getVersionDisplay}
+          mode="variants"
+        />
+      ) : null}
+    </>
+  )
+})

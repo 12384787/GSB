@@ -1,0 +1,152 @@
+import {TrashIcon} from '@sanity/icons/Trash'
+import {useTelemetry} from '@sanity/telemetry/react'
+import {Switch, Text} from '@sanity/ui'
+import {useToast} from '@sanity/ui/toast'
+import {useCallback, useEffect, useState} from 'react'
+import {Flex, Box} from 'ui5'
+import {useEffectEvent} from 'use-effect-event'
+
+import {Button} from '../../../../../ui-components/button/Button'
+import {set} from '../../../../form/patch/patch'
+import {type ObjectInputProps} from '../../../../form/types/inputProps'
+import {useTranslation} from '../../../../i18n/hooks/useTranslation'
+import {TaskCreated} from '../../../__telemetry__/tasks.telemetry'
+import {useTasksNavigation} from '../../../context/navigation/useTasksNavigation'
+import {useTasks} from '../../../context/tasks/useTasks'
+import {useRemoveTask} from '../../../hooks/useRemoveTask'
+import {tasksLocaleNamespace} from '../../../i18n'
+import {type TaskDocument} from '../../../types'
+import {getMentionedUsers} from '../utils'
+
+const getTaskSubscribers = (task: TaskDocument): string[] => {
+  const subscribers = task.subscribers || []
+
+  getMentionedUsers(task.description).forEach((user) => {
+    if (!subscribers.includes(user)) subscribers.push(user)
+  })
+
+  // Check if the task has been assigned, add the assignee to the subscribers list.
+  if (task.assignedTo) {
+    if (!subscribers.includes(task.assignedTo)) {
+      subscribers.push(task.assignedTo)
+    }
+  }
+  return subscribers
+}
+export function FormCreate(props: ObjectInputProps) {
+  const [creating, setCreating] = useState(false)
+  const {onChange} = props
+  const {setViewMode, setActiveTab} = useTasksNavigation()
+  const toast = useToast()
+  const telemetry = useTelemetry()
+
+  const [createMore, setCreateMore] = useState(false)
+  const handleCreateMore = useCallback(() => setCreateMore((p) => !p), [])
+
+  const value = props.value as TaskDocument
+  const onRemove = useCallback(() => {
+    setViewMode({type: 'list'})
+  }, [setViewMode])
+  const {handleRemove, removeStatus} = useRemoveTask({id: value._id, onRemoved: onRemove})
+  const {t} = useTranslation(tasksLocaleNamespace)
+  const {data} = useTasks()
+  const savedTask = data.find((task) => task._id === value._id)
+
+  const handleCreatingSuccess = useEffectEvent(() => {
+    telemetry.log(TaskCreated)
+    toast.push({
+      closable: true,
+      status: 'success',
+      title: t('form.status.success'),
+    })
+
+    setCreating(false)
+    if (createMore) {
+      setViewMode({type: 'create'})
+    } else {
+      setActiveTab('subscribed')
+    }
+  })
+  useEffect(() => {
+    // This useEffect takes care of closing the form when a task entered the "creation" state.
+    // That action is async and we don't have access to the promise, once the value is updated in the form we will close the form.
+    if (creating && savedTask?.createdByUser) {
+      handleCreatingSuccess()
+    }
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- pre-existing violation, to be fixed in a follow-up
+  }, [creating, savedTask?.createdByUser])
+
+  const handleCreatingTimeout = useEffectEvent(() => {
+    setCreating(false)
+    toast.push({
+      closable: true,
+      status: 'error',
+      title: t('form.status.error.creation-failed'),
+    })
+  })
+  useEffect(() => {
+    // If after 10 seconds the task is still in the "creating" state, show an error and reset the creating state.
+    let timeoutId: ReturnType<typeof setTimeout> | null = null
+    if (creating) {
+      timeoutId = setTimeout(() => handleCreatingTimeout(), 10000)
+    }
+    // Cleanup function to clear the timeout
+    return () => {
+      if (timeoutId) clearTimeout(timeoutId)
+    }
+    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- pre-existing violation, to be fixed in a follow-up
+  }, [creating])
+
+  const handleCreate = useCallback(async () => {
+    setCreating(true)
+    if (!value?.title) {
+      toast.push({
+        closable: true,
+        status: 'error',
+        title: t('form.status.error.title-required'),
+      })
+      return
+    }
+    onChange([
+      set(getTaskSubscribers(value), ['subscribers']),
+      set(new Date().toISOString(), ['createdByUser']),
+    ])
+  }, [value, onChange, t, toast])
+
+  return (
+    <>
+      {props.renderDefault(props)}
+
+      <Box paddingY={5}>
+        <Flex paddingTop={1} gap={4}>
+          {value._rev && (
+            <Button
+              onClick={handleRemove}
+              mode="bleed"
+              icon={TrashIcon}
+              tooltipProps={{
+                content: t('buttons.discard.text'),
+              }}
+              disabled={removeStatus === 'loading'}
+              loading={removeStatus === 'loading'}
+            />
+          )}
+
+          <Flex alignItems="center" gap={2} justifyContent={'flex-end'} flexBasis="0%" flexGrow={1}>
+            <Switch onChange={handleCreateMore} checked={createMore} />
+            <Text size={1} muted>
+              {t('form.input.create-more.text')}
+            </Text>
+          </Flex>
+
+          <Button
+            text={t('buttons.create.text')}
+            onClick={handleCreate}
+            disabled={creating}
+            loading={creating}
+          />
+        </Flex>
+      </Box>
+    </>
+  )
+}

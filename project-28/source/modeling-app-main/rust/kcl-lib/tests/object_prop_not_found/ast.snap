@@ -1,0 +1,109 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Result of parsing object_prop_not_found.kcl
+---
+{
+  "Ok": {
+    "body": [
+      {
+        "commentStart": 0,
+        "declaration": {
+          "commentStart": 0,
+          "end": 0,
+          "id": {
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "name": "obj",
+            "start": 0,
+            "type": "Identifier"
+          },
+          "init": {
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "properties": [],
+            "start": 0,
+            "type": "ObjectExpression",
+            "type": "ObjectExpression"
+          },
+          "moduleId": 0,
+          "start": 0,
+          "type": "VariableDeclarator"
+        },
+        "end": 0,
+        "kind": "const",
+        "moduleId": 0,
+        "start": 0,
+        "type": "VariableDeclaration",
+        "type": "VariableDeclaration"
+      },
+      {
+        "commentStart": 0,
+        "declaration": {
+          "commentStart": 0,
+          "end": 0,
+          "id": {
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "name": "k",
+            "start": 0,
+            "type": "Identifier"
+          },
+          "init": {
+            "commentStart": 0,
+            "computed": true,
+            "end": 0,
+            "moduleId": 0,
+            "object": {
+              "abs_path": false,
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "name": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "name": "obj",
+                "start": 0,
+                "type": "Identifier"
+              },
+              "path": [],
+              "start": 0,
+              "type": "Name",
+              "type": "Name"
+            },
+            "property": {
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "raw": "\"age\"",
+              "start": 0,
+              "type": "Literal",
+              "type": "Literal",
+              "value": "age"
+            },
+            "start": 0,
+            "type": "MemberExpression",
+            "type": "MemberExpression"
+          },
+          "moduleId": 0,
+          "start": 0,
+          "type": "VariableDeclarator"
+        },
+        "end": 0,
+        "kind": "const",
+        "moduleId": 0,
+        "start": 0,
+        "type": "VariableDeclaration",
+        "type": "VariableDeclaration"
+      }
+    ],
+    "commentStart": 0,
+    "end": 0,
+    "moduleId": 0,
+    "start": 0,
+    "type": "Program"
+  }
+}

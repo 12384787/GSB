@@ -1,0 +1,535 @@
+//! Rust support for KCL (aka the KittyCAD Language).
+//!
+//! KCL is written in Rust. This crate contains the compiler tooling (e.g. parser, lexer, code generation),
+//! the standard library implementation, generator for the docs, and more.
+#![recursion_limit = "1024"]
+#![allow(clippy::boxed_local)]
+
+#[allow(unused_macros)]
+macro_rules! println {
+    ($($rest:tt)*) => {
+        #[cfg(all(feature = "disable-println", not(test)))]
+        {
+            let _ = format!($($rest)*);
+        }
+        #[cfg(any(not(feature = "disable-println"), test))]
+        std::println!($($rest)*)
+    }
+}
+
+#[allow(unused_macros)]
+macro_rules! eprintln {
+    ($($rest:tt)*) => {
+        #[cfg(all(feature = "disable-println", not(test)))]
+        {
+            let _ = format!($($rest)*);
+        }
+        #[cfg(any(not(feature = "disable-println"), test))]
+        std::eprintln!($($rest)*)
+    }
+}
+
+#[allow(unused_macros)]
+macro_rules! print {
+    ($($rest:tt)*) => {
+        #[cfg(all(feature = "disable-println", not(test)))]
+        {
+            let _ = format!($($rest)*);
+        }
+        #[cfg(any(not(feature = "disable-println"), test))]
+        std::print!($($rest)*)
+    }
+}
+
+#[allow(unused_macros)]
+macro_rules! eprint {
+    ($($rest:tt)*) => {
+        #[cfg(all(feature = "disable-println", not(test)))]
+        {
+            let _ = format!($($rest)*);
+        }
+        #[cfg(any(not(feature = "disable-println"), test))]
+        std::eprint!($($rest)*)
+    }
+}
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
+pub mod collections;
+mod docs;
+mod engine;
+mod errors;
+mod execution;
+mod fmt;
+mod frontend;
+mod fs;
+pub(crate) mod id;
+mod import_format;
+pub mod lint;
+mod log;
+mod lsp_types;
+mod modules;
+mod parsing;
+mod project;
+mod runtime_flags;
+mod settings;
+#[cfg(test)]
+mod simulation_tests;
+pub mod std;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod test_server;
+mod thread;
+#[doc(hidden)]
+pub mod tooling;
+pub mod unit_conversion;
+mod unparser;
+mod util;
+#[cfg(test)]
+mod variant_name;
+pub mod walk;
+#[cfg(target_arch = "wasm32")]
+mod wasm;
+
+/// Internal compiler APIs consumed by the standalone language-server crate.
+#[doc(hidden)]
+pub mod lsp_support {
+    pub mod docs {
+        pub mod kcl_doc {
+            pub use crate::docs::kcl_doc::ArgData;
+            pub use crate::docs::kcl_doc::DocData;
+            pub use crate::docs::kcl_doc::ModData;
+            pub use crate::docs::kcl_doc::walk_stdlib;
+        }
+    }
+
+    pub mod engine {
+        #[cfg(not(target_arch = "wasm32"))]
+        pub use crate::engine::new_zoo_client;
+    }
+
+    pub mod errors {
+        pub use crate::errors::Severity;
+        pub use crate::errors::Suggestion;
+    }
+
+    pub mod execution {
+        pub use crate::execution::ExecutorContext;
+        pub use crate::execution::MockConfig;
+
+        pub mod cache {
+            pub use crate::execution::cache::read_old_memory_var;
+        }
+
+        pub mod typed_path {
+            pub use crate::execution::typed_path::TypedPath;
+        }
+    }
+
+    pub mod fs {
+        pub use crate::fs::FileManager;
+        pub use crate::fs::FileSystemHandle;
+        pub use crate::fs::new_file_system_handle;
+
+        #[cfg(all(target_arch = "wasm32", not(test)))]
+        pub mod wasm {
+            pub use crate::fs::wasm::FileSystemManager;
+        }
+    }
+
+    pub mod parsing {
+        pub use crate::parsing::PIPE_OPERATOR;
+        pub use crate::parsing::parse_str;
+        pub use crate::parsing::parse_tokens;
+
+        pub mod ast {
+            pub mod types {
+                pub use crate::parsing::ast::types::*;
+            }
+        }
+
+        pub mod token {
+            pub use crate::parsing::token::LexerMode;
+            pub use crate::parsing::token::RESERVED_WORDS;
+            pub use crate::parsing::token::TokenStream;
+            pub use crate::parsing::token::lex;
+
+            pub mod adapter {
+                pub use crate::parsing::token::adapter::lex_with_diagnostics;
+            }
+        }
+    }
+}
+
+pub use engine::AsyncTasks;
+pub use engine::EngineBatchContext;
+pub use engine::EngineStats;
+pub use errors::BacktraceItem;
+pub use errors::BacktraceItemKind;
+pub use errors::CompilationIssue;
+pub use errors::CompilationIssueReport;
+pub use errors::ConnectionError;
+pub use errors::ExecError;
+pub use errors::IsRetryable;
+pub use errors::KclError;
+pub use errors::KclErrorWithOutputs;
+pub use errors::Report;
+pub use errors::ReportWithOutputs;
+pub use errors::render_compilation_issue_miette;
+pub use execution::ConstraintKind;
+pub use execution::EdgeRefactorMeta;
+pub use execution::EnvironmentRef;
+pub use execution::ExecOutcome;
+pub use execution::ExecState;
+pub use execution::ExecutionCallbacks;
+pub use execution::ExecutorContext;
+pub use execution::ExecutorSettings;
+pub use execution::KclValueView;
+pub use execution::KclVersion;
+pub use execution::LegacyAngleRefactorMeta;
+pub use execution::MetaSettings;
+pub use execution::MockConfig;
+pub use execution::OperationCallbackArgs;
+pub use execution::Point2d;
+pub use execution::RefactorMetadata;
+pub use execution::SegmentDragAnchor;
+pub use execution::SketchConstraintReport;
+pub use execution::SketchConstraintStatus;
+pub use execution::bust_cache;
+pub use execution::clear_mem_cache;
+pub use execution::typed_path::TypedPath;
+pub use fs::FileSystem;
+pub use fs::FileSystemHandle;
+pub use fs::in_memory::InMemoryFiles;
+pub use fs::new_file_system_handle;
+pub use kcl_error;
+pub use kcl_error::SourceRange;
+pub use lsp_types::IntoDiagnostic;
+pub use lsp_types::LspSuggestion;
+pub use lsp_types::ToLspRange;
+pub use modules::ModuleId;
+pub use parsing::ast::types::FormatOptions;
+pub use parsing::ast::types::NodePath;
+pub use parsing::ast::types::NodePathExt;
+pub use parsing::ast::types::Program as AstProgram;
+pub use parsing::ast::types::Step as NodePathStep;
+pub use project::ProjectManager;
+pub use runtime_flags::KclRuntimeFlags;
+pub use runtime_flags::RuntimeFlag;
+pub use runtime_flags::kcl_runtime_flags;
+pub use runtime_flags::set_kcl_runtime_flags;
+pub use settings::types::Configuration;
+pub use settings::types::project::ProjectConfiguration;
+#[cfg(not(target_arch = "wasm32"))]
+pub use unparser::recast_dir;
+#[cfg(not(target_arch = "wasm32"))]
+pub use unparser::walk_dir;
+
+pub mod engine_connection {
+    pub use crate::engine::engine_manager::EngineManager;
+    pub use crate::engine::engine_manager::EngineTransport;
+    pub use crate::engine::engine_manager::ResponseInformation;
+    pub use crate::engine::engine_manager::SocketHealth;
+    pub use crate::engine::engine_manager::TransportCloseError;
+}
+
+// Rather than make executor public and make lots of it pub(crate), just re-export into a new module.
+// Ideally we wouldn't export these things at all, they should only be used for testing.
+pub mod exec {
+    pub use kcl_api::NumericType;
+    pub use kcl_api::UnitAngle;
+    pub use kcl_api::UnitLength;
+    pub use kcl_api::UnitType;
+
+    pub use crate::execution::ArtifactCommand;
+    pub use crate::execution::DefaultPlanes;
+    pub use crate::execution::IdGenerator;
+    pub use crate::execution::KclObjectKind;
+    pub use crate::execution::KclValue;
+    pub use crate::execution::KclValueView;
+    pub use crate::execution::Operation;
+    pub use crate::execution::PlaneKind;
+    pub use crate::execution::Sketch;
+    pub use crate::execution::annotations::WarningLevel;
+    pub use crate::util::RetryConfig;
+    pub use crate::util::execute_with_retries;
+}
+
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_engine {
+    pub use crate::engine::conn_wasm::EngineCommandManager;
+    pub use crate::engine::conn_wasm::EngineConnection;
+    pub use crate::engine::conn_wasm::ResponseContext;
+    pub use crate::fs::wasm::FileManager;
+    pub use crate::fs::wasm::FileSystemManager;
+}
+
+pub mod std_utils {
+    pub use crate::std::utils::TangentialArcInfoInput;
+    pub use crate::std::utils::get_tangential_arc_to_info;
+    pub use crate::std::utils::is_points_ccw_wasm;
+    pub use crate::std::utils::untyped_point_to_unit;
+}
+
+pub mod pretty {
+    pub use crate::fmt::format_number_literal;
+    pub use crate::fmt::format_number_value;
+    pub use crate::fmt::human_display_number;
+    pub use crate::parsing::token::NumericSuffix;
+}
+
+pub mod front {
+    pub use crate::frontend::MAX_SKETCH_CHECKPOINTS;
+    pub(crate) use crate::frontend::modify::find_defined_names;
+    pub(crate) use crate::frontend::modify::next_free_name_using_max;
+    pub use crate::frontend::sketch::ExecResult;
+    pub use crate::frontend::{
+        EditConstraintOptions,
+        EditDistanceConstraintLabelPositionOptions,
+        EditSegmentsOptions,
+        FrontendState,
+        SetProgramOutcome,
+        api::{
+            Cap, CapKind, EditSketchOutcome, Error, Expr, Face, File, FileId, LifecycleApi, NewSketchOutcome, Number,
+            Object, ObjectId, ObjectKind, Plane, ProjectId, RestoreSketchCheckpointOutcome, Result, SceneGraph,
+            SceneGraphDelta, Settings, SketchCheckpointId, SketchMutationOutcome, SourceDelta, SourceRef, Version,
+            Wall,
+        },
+        sketch::{
+            Angle, Arc, ArcCtor, ArcDirection, Circle, CircleCtor, Coincident, Constraint, ConstraintLabelPositionEdit,
+            ControlPointSpline, ControlPointSplineCtor, Distance, EqualRadius, ExistingSegmentCtor, Fixed, FixedPoint,
+            Freedom, Horizontal, Line, LineCtor, LinesEqualLength, Midpoint, NewSegmentInfo, Parallel, Perpendicular,
+            Point, Point2d, PointCtor, Segment, SegmentCtor, Sketch, SketchApi, SketchCtor, StartOrEnd, Symmetric,
+            Tangent, Vertical,
+        },
+        // Re-export trim module items
+        trim::{
+            ArcPoint, AttachToEndpoint, CoincidentData, ConstraintToMigrate, Coords2d, EndpointChanged, LineEndpoint,
+            TrimDirection, TrimItem, TrimOperation, TrimTermination, TrimTerminations, execute_trim_loop_with_context,
+            get_next_trim_spawn, get_position_coords_for_line, get_position_coords_from_arc, is_point_on_line_segment,
+            line_segment_intersection, perpendicular_distance_to_segment, project_point_onto_arc,
+            project_point_onto_segment,
+        },
+    };
+}
+
+use serde::Deserialize;
+use serde::Serialize;
+
+use crate::exec::WarningLevel;
+#[allow(unused_imports)]
+use crate::log::log;
+#[allow(unused_imports)]
+use crate::log::logln;
+
+lazy_static::lazy_static! {
+
+    pub static ref IMPORT_FILE_EXTENSIONS: Vec<String> = {
+        import_format::IMPORT_FILE_EXTENSION_FORMATS
+            .iter()
+            .map(|(extension, _)| (*extension).to_owned())
+            .collect()
+    };
+
+    pub static ref RELEVANT_FILE_EXTENSIONS: Vec<String> = {
+        let mut relevant_extensions = IMPORT_FILE_EXTENSIONS.clone();
+        relevant_extensions.push("kcl".to_string());
+        relevant_extensions.push("md".to_string());
+        relevant_extensions
+    };
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Program {
+    #[serde(flatten)]
+    pub ast: parsing::ast::types::Node<parsing::ast::types::Program>,
+    // The ui doesn't need to know about this.
+    // It's purely used for saving the contents of the original file, so we can use it for errors.
+    // Because in the case of the root file, we don't want to read the file from disk again.
+    #[serde(skip)]
+    pub original_file_contents: String,
+}
+
+impl Program {
+    pub fn parse(input: &str) -> Result<(Option<Program>, Vec<CompilationIssue>), KclError> {
+        let module_id = ModuleId::default();
+        let (ast, errs) = parsing::parse_str(input, module_id).0?;
+
+        Ok((
+            ast.map(|ast| Program {
+                ast,
+                original_file_contents: input.to_string(),
+            }),
+            errs,
+        ))
+    }
+
+    pub fn parse_no_errs(input: &str) -> Result<Program, KclError> {
+        let module_id = ModuleId::default();
+        let ast = parsing::parse_str(input, module_id).parse_errs_as_err()?;
+
+        Ok(Program {
+            ast,
+            original_file_contents: input.to_string(),
+        })
+    }
+
+    pub fn compute_digest(&mut self) -> parsing::ast::digest::Digest {
+        self.ast.compute_digest()
+    }
+
+    /// Get the meta settings for the kcl file from the annotations.
+    pub fn meta_settings(&self) -> Result<Option<crate::MetaSettings>, KclError> {
+        self.ast.meta_settings()
+    }
+
+    /// Change the meta settings for the kcl file.
+    pub fn change_default_units(
+        &self,
+        length_units: Option<kittycad_modeling_cmds::units::UnitLength>,
+    ) -> Result<Self, KclError> {
+        Ok(Self {
+            ast: self.ast.change_default_units(length_units)?,
+            original_file_contents: self.original_file_contents.clone(),
+        })
+    }
+
+    pub fn change_kcl_version(&self, kcl_version: Option<String>) -> Result<Self, KclError> {
+        Ok(Self {
+            ast: self.ast.change_kcl_version(kcl_version)?,
+            original_file_contents: self.original_file_contents.clone(),
+        })
+    }
+
+    pub fn change_experimental_features(&self, warning_level: Option<WarningLevel>) -> Result<Self, KclError> {
+        Ok(Self {
+            ast: self.ast.change_experimental_features(warning_level)?,
+            original_file_contents: self.original_file_contents.clone(),
+        })
+    }
+
+    pub fn is_empty_or_only_settings(&self) -> bool {
+        self.ast.is_empty_or_only_settings()
+    }
+
+    pub fn lint_all(&self) -> Result<Vec<lint::Discovered>, anyhow::Error> {
+        self.ast.lint_all()
+    }
+
+    pub fn lint_all_with_options(&self, options: lint::LintOptions) -> Result<Vec<lint::Discovered>, anyhow::Error> {
+        self.ast.lint_all_with_options(options)
+    }
+
+    pub fn lint<'a>(&'a self, rule: impl lint::Rule<'a>) -> Result<Vec<lint::Discovered>, anyhow::Error> {
+        self.ast.lint(rule)
+    }
+
+    pub fn node_path_from_range(&self, cached_body_items: usize, range: SourceRange) -> Option<NodePath> {
+        let module_infos = indexmap::IndexMap::new();
+        let programs = crate::execution::ProgramLookup::new(self.ast.clone(), module_infos);
+        NodePath::from_range(&programs, cached_body_items, range)
+    }
+
+    /// Fill node paths and consume the input so that the program without paths
+    /// isn't accidentally used. Filling node paths happens automatically during
+    /// parsing. Calling this is only needed after the caller invalidates the
+    /// node paths such as by mutating an AST or by making a round-trip through
+    /// serialization.
+    pub fn fill_node_paths(mut self) -> Program {
+        parsing::ast::types::fill_node_paths(&mut self.ast);
+        self
+    }
+
+    pub fn recast(&self) -> String {
+        // Use the default options until we integrate into the UI the ability to change them.
+        self.ast.recast_top(&Default::default(), 0)
+    }
+
+    pub fn recast_with_options(&self, options: &FormatOptions) -> String {
+        self.ast.recast_top(options, 0)
+    }
+
+    /// Create an empty program.
+    pub fn empty() -> Self {
+        Self {
+            ast: parsing::ast::types::Node::no_src(parsing::ast::types::Program::default()),
+            original_file_contents: String::new(),
+        }
+    }
+}
+
+#[inline]
+fn try_f64_to_usize(f: f64) -> Option<usize> {
+    let i = f as usize;
+    if i as f64 == f { Some(i) } else { None }
+}
+
+#[inline]
+fn try_f64_to_u32(f: f64) -> Option<u32> {
+    let i = f as u32;
+    if i as f64 == f { Some(i) } else { None }
+}
+
+#[inline]
+fn try_f64_to_u64(f: f64) -> Option<u64> {
+    let i = f as u64;
+    if i as f64 == f { Some(i) } else { None }
+}
+
+#[inline]
+fn try_f64_to_i64(f: f64) -> Option<i64> {
+    let i = f as i64;
+    if i as f64 == f { Some(i) } else { None }
+}
+
+/// Get the version of the KCL library.
+pub fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn proprietary_file_extensions_use_real_suffixes() {
+        for extension in ["sat", "sab", "catpart", "prt", "ipt", "x_t", "x_b", "sldprt"] {
+            assert!(IMPORT_FILE_EXTENSIONS.iter().any(|candidate| candidate == extension));
+        }
+    }
+
+    #[test]
+    fn convert_int() {
+        assert_eq!(try_f64_to_usize(0.0), Some(0));
+        assert_eq!(try_f64_to_usize(42.0), Some(42));
+        assert_eq!(try_f64_to_usize(0.00000000001), None);
+        assert_eq!(try_f64_to_usize(-1.0), None);
+        assert_eq!(try_f64_to_usize(f64::NAN), None);
+        assert_eq!(try_f64_to_usize(f64::INFINITY), None);
+        assert_eq!(try_f64_to_usize((0.1 + 0.2) * 10.0), None);
+
+        assert_eq!(try_f64_to_u32(0.0), Some(0));
+        assert_eq!(try_f64_to_u32(42.0), Some(42));
+        assert_eq!(try_f64_to_u32(0.00000000001), None);
+        assert_eq!(try_f64_to_u32(-1.0), None);
+        assert_eq!(try_f64_to_u32(f64::NAN), None);
+        assert_eq!(try_f64_to_u32(f64::INFINITY), None);
+        assert_eq!(try_f64_to_u32((0.1 + 0.2) * 10.0), None);
+
+        assert_eq!(try_f64_to_u64(0.0), Some(0));
+        assert_eq!(try_f64_to_u64(42.0), Some(42));
+        assert_eq!(try_f64_to_u64(0.00000000001), None);
+        assert_eq!(try_f64_to_u64(-1.0), None);
+        assert_eq!(try_f64_to_u64(f64::NAN), None);
+        assert_eq!(try_f64_to_u64(f64::INFINITY), None);
+        assert_eq!(try_f64_to_u64((0.1 + 0.2) * 10.0), None);
+
+        assert_eq!(try_f64_to_i64(0.0), Some(0));
+        assert_eq!(try_f64_to_i64(42.0), Some(42));
+        assert_eq!(try_f64_to_i64(0.00000000001), None);
+        assert_eq!(try_f64_to_i64(-1.0), Some(-1));
+        assert_eq!(try_f64_to_i64(f64::NAN), None);
+        assert_eq!(try_f64_to_i64(f64::INFINITY), None);
+        assert_eq!(try_f64_to_i64((0.1 + 0.2) * 10.0), None);
+    }
+}

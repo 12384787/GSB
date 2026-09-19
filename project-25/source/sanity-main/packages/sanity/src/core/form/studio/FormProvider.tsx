@@ -1,0 +1,178 @@
+import {type ObjectSchemaType, type Path, type ValidationMarker} from '@sanity/types'
+import {type ReactNode, useCallback} from 'react'
+
+import {type DocumentFieldAction} from '../../config/document/fieldActions/types'
+import {type FormNodePresence} from '../../presence/types'
+import {PreviewLoader} from '../../preview/components/PreviewLoader'
+import {useSource} from '../../studio/source'
+import {useAnnotationComponent} from '../form-components-hooks/useAnnotationComponent'
+import {useBlockComponent} from '../form-components-hooks/useBlockComponent'
+import {useFieldComponent} from '../form-components-hooks/useFieldComponent'
+import {useInlineBlockComponent} from '../form-components-hooks/useInlineBlockComponent'
+import {useInputComponent} from '../form-components-hooks/useInputComponent'
+import {useItemComponent} from '../form-components-hooks/useItemComponent'
+import {usePreviewComponent} from '../form-components-hooks/usePreviewComponent'
+import {FormBuilderProvider} from '../FormBuilderProvider'
+import {type PatchChannel} from '../patch/PatchChannel'
+import {type PatchEvent} from '../patch/PatchEvent'
+import {type FormFieldGroup} from '../store/types/fieldGroup'
+import {type StateTree} from '../store/types/state'
+import {type BlockAnnotationProps, type BlockProps} from '../types/blockProps'
+import {type FieldProps} from '../types/fieldProps'
+import {type InputProps} from '../types/inputProps'
+import {type ItemProps} from '../types/itemProps'
+import {type RenderPreviewCallbackProps} from '../types/renderCallback'
+
+/**
+ * @alpha This API might change.
+ */
+export interface FormProviderProps {
+  /** @internal */
+  __internal_fieldActions?: DocumentFieldAction[]
+  /** @internal Considered internal, do not use. */
+  __internal_patchChannel: PatchChannel
+  /** @internal Considered internal, do not use. */
+  __internal_inspectOpen?: boolean
+
+  autoFocus?: boolean
+  changesOpen?: boolean
+  children?: ReactNode
+  collapsedFieldSets: StateTree<boolean> | undefined
+  collapsedPaths: StateTree<boolean> | undefined
+  documentId?: string
+  focusPath: Path
+  focused: boolean | undefined
+  groups: FormFieldGroup[]
+  id: string
+  onChange: (changeEvent: PatchEvent) => void
+  onPathBlur: (path: Path) => void
+  onPathFocus: (path: Path) => void
+  onPathOpen: (path: Path) => void
+  onFieldGroupSelect: (path: Path, groupName: string) => void
+  onSetPathCollapsed: (path: Path, collapsed: boolean) => void
+  onSetFieldSetCollapsed: (path: Path, collapsed: boolean) => void
+  presence: FormNodePresence[]
+  readOnly?: boolean
+  schemaType: ObjectSchemaType
+  validation: ValidationMarker[]
+}
+
+/**
+ * Default wiring for `FormBuilderProvider` when used with Sanity
+ *
+ * @alpha This API might change.
+ */
+export function FormProvider(props: FormProviderProps) {
+  const {
+    __internal_fieldActions: fieldActions,
+    __internal_patchChannel: patchChannel,
+    __internal_inspectOpen: inspectOpen,
+    autoFocus,
+    changesOpen,
+    children,
+    collapsedFieldSets,
+    collapsedPaths,
+    documentId,
+    focusPath,
+    focused,
+    groups,
+    id,
+    onChange,
+    onPathBlur,
+    onPathFocus,
+    onPathOpen,
+    onFieldGroupSelect,
+    onSetPathCollapsed,
+    onSetFieldSetCollapsed,
+    presence,
+    readOnly,
+    schemaType,
+    validation,
+  } = props
+
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+  const {file, image} = useSource().form
+
+  // These hooks may be stored in context as an perf optimization
+  const Input = useInputComponent()
+  const Field = useFieldComponent()
+  const Preview = usePreviewComponent()
+  const Item = useItemComponent()
+  const Block = useBlockComponent()
+  const InlineBlock = useInlineBlockComponent()
+  const Annotation = useAnnotationComponent()
+
+  const renderInput = useCallback(
+    (inputProps: Omit<InputProps, 'renderDefault'>) => <Input {...inputProps} />,
+    [Input],
+  )
+  const renderField = useCallback(
+    (fieldProps: Omit<FieldProps, 'renderDefault'>) => <Field {...fieldProps} />,
+    [Field],
+  )
+  const renderItem = useCallback(
+    (itemProps: Omit<ItemProps, 'renderDefault'>) => (
+      <Item key={itemProps.inputId} {...itemProps} />
+    ),
+    [Item],
+  )
+  const renderPreview = useCallback(
+    (previewProps: RenderPreviewCallbackProps) => (
+      <PreviewLoader component={Preview} {...previewProps} />
+    ),
+    [Preview],
+  )
+  const renderBlock = useCallback(
+    (blockProps: Omit<BlockProps, 'renderDefault'>) => <Block {...blockProps} />,
+    [Block],
+  )
+  const renderInlineBlock = useCallback(
+    (blockProps: Omit<BlockProps, 'renderDefault'>) => <InlineBlock {...blockProps} />,
+    [InlineBlock],
+  )
+  const renderAnnotation = useCallback(
+    (annotationProps: Omit<BlockAnnotationProps, 'renderDefault'>) => (
+      <Annotation {...annotationProps} />
+    ),
+    [Annotation],
+  )
+
+  return (
+    <FormBuilderProvider
+      __internal_fieldActions={fieldActions}
+      __internal_patchChannel={patchChannel}
+      __internal_inspectOpen={inspectOpen}
+      autoFocus={autoFocus}
+      changesOpen={changesOpen}
+      collapsedFieldSets={collapsedFieldSets}
+      collapsedPaths={collapsedPaths}
+      documentId={documentId}
+      file={file}
+      focusPath={focusPath}
+      focused={focused}
+      groups={groups}
+      id={id}
+      image={image}
+      onChange={onChange}
+      onPathBlur={onPathBlur}
+      onPathFocus={onPathFocus}
+      onPathOpen={onPathOpen}
+      onFieldGroupSelect={onFieldGroupSelect}
+      onSetPathCollapsed={onSetPathCollapsed}
+      onSetFieldSetCollapsed={onSetFieldSetCollapsed}
+      presence={presence}
+      readOnly={readOnly}
+      renderAnnotation={renderAnnotation}
+      renderBlock={renderBlock}
+      renderField={renderField}
+      renderInlineBlock={renderInlineBlock}
+      renderInput={renderInput}
+      renderItem={renderItem}
+      renderPreview={renderPreview}
+      schemaType={schemaType}
+      validation={validation}
+    >
+      {children}
+    </FormBuilderProvider>
+  )
+}

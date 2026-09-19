@@ -1,0 +1,21 @@
+import {type Schema} from '@sanity/types'
+
+import {useSource} from '../studio/source'
+
+/**
+ * React hook that returns the schema registry for the current project
+ *
+ * @public
+ * @returns The schema registry for the current project
+ * @example Using the `useSchema` hook
+ * ```ts
+ * function MyComponent() {
+ *   const schema = useSchema()
+ *   // ... do something with the schema ...
+ * }
+ * ```
+ */
+export function useSchema(): Schema {
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+  return useSource().schema
+}

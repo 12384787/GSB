@@ -1,0 +1,14 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Variables in memory after executing assembly_mixed_units_cubes.kcl
+---
+{
+  "__mod_cubeIn": {
+    "type": "Module",
+    "value": 1
+  },
+  "__mod_cubeMm": {
+    "type": "Module",
+    "value": 2
+  }
+}

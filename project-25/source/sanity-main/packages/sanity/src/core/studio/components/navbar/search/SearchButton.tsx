@@ -1,0 +1,33 @@
+import {SearchIcon} from '@sanity/icons/Search'
+import {type RefAttributes} from 'react'
+
+import {Button} from '../../../../../ui-components/button/Button'
+import {useTranslation} from '../../../../i18n/hooks/useTranslation'
+import {GLOBAL_SEARCH_KEY, GLOBAL_SEARCH_KEY_MODIFIER} from './constants'
+
+interface SearchButtonProps {
+  onClick: () => void
+}
+
+/**
+ * @internal
+ */
+export function SearchButton({ref, onClick}: SearchButtonProps & RefAttributes<HTMLButtonElement>) {
+  const {t} = useTranslation()
+
+  return (
+    <Button
+      aria-label={t('search.action-open-aria-label')}
+      data-testid="studio-search"
+      icon={SearchIcon}
+      tooltipProps={{
+        content: t('search.button.tooltip'),
+        hotkeys: [GLOBAL_SEARCH_KEY_MODIFIER, GLOBAL_SEARCH_KEY.toUpperCase()],
+        portal: true,
+      }}
+      onClick={onClick}
+      mode="bleed"
+      ref={ref}
+    />
+  )
+}

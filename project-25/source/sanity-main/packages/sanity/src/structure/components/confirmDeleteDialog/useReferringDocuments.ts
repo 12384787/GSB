@@ -1,0 +1,315 @@
+import {type ClientError, type SanityClient} from '@sanity/client'
+import {dequal} from 'dequal/lite'
+import {useMemo} from 'react'
+import {useObservable} from 'react-rx'
+import {combineLatest, concat, EMPTY, fromEvent, type Observable, of, timer} from 'rxjs'
+import {
+  catchError,
+  distinctUntilChanged,
+  map,
+  shareReplay,
+  startWith,
+  switchMap,
+} from 'rxjs/operators'
+import {
+  type AvailabilityResponse,
+  DEFAULT_STUDIO_CLIENT_OPTIONS,
+  type DocumentStore,
+  getDraftId,
+  getPublishedId,
+  useClient,
+  useDocumentStore,
+} from 'sanity'
+
+// this is used in place of `instanceof` so the matching can be more robust and
+// won't have any issues with dual packages etc
+// https://nodejs.org/api/packages.html#dual-package-hazard
+function isClientError(e: unknown): e is ClientError {
+  if (typeof e !== 'object') return false
+  if (!e) return false
+  return 'statusCode' in e && 'response' in e
+}
+
+const POLL_INTERVAL = 5000
+
+// only fetches when the document is visible
+let visiblePoll$: Observable<number>
+const getVisiblePoll$ = () => {
+  if (!visiblePoll$) {
+    visiblePoll$ = fromEvent(document, 'visibilitychange').pipe(
+      // add empty emission to have this fire on creation
+      startWith(null),
+      map(() => document.visibilityState === 'visible'),
+      distinctUntilChanged(),
+      switchMap((visible) =>
+        visible
+          ? // using timer instead of interval since timer will emit on creation
+            timer(0, POLL_INTERVAL)
+          : EMPTY,
+      ),
+      shareReplay({refCount: true, bufferSize: 1}),
+    )
+  }
+  return visiblePoll$
+}
+
+export type ReferringDocuments = {
+  isLoading: boolean
+  totalCount: number
+  projectIds: string[]
+  datasetNames: string[]
+  hasUnknownDatasetNames: boolean
+  internalReferences?: {
+    totalCount: number
+    references: Array<{_id: string; _type: string}>
+  }
+  crossDatasetReferences?: {
+    totalCount: number
+    references: Array<{
+      /**
+       * The project ID of the document that is currently referencing the subject
+       * document. Unlike `documentId` and `datasetName`, this should always be
+       * defined.
+       */
+      projectId: string
+      /**
+       * The ID of the document that is currently referencing the subject
+       * document. This will be omitted if there is no access to the current
+       * project and dataset pair (e.g. if no `sanity-project-token` were
+       * configured)
+       */
+      documentId?: string
+      /**
+       * The dataset name that is currently referencing the subject document.
+       * This will be omitted if there is no access to the current project and
+       * dataset pair (e.g. if no `sanity-project-token` were configured)
+       */
+      datasetName?: string
+    }>
+  }
+}
+
+function getDocumentExistence(
+  documentId: string,
+  {versionedClient}: {versionedClient: SanityClient},
+): Observable<string | undefined> {
+  const draftId = getDraftId(documentId)
+  const publishedId = getPublishedId(documentId)
+  const requestOptions = {
+    url: versionedClient.getDataUrl('doc', `${draftId},${publishedId}`),
+    json: true,
+    query: {excludeContent: 'true'},
+    tag: 'use-referring-documents.document-existence',
+  }
+  return versionedClient.observable.request<AvailabilityResponse>(requestOptions).pipe(
+    map(({omitted}) => {
+      const nonExistant = omitted.filter((doc) => doc.reason === 'existence')
+      if (nonExistant.length === 2) {
+        // None of the documents exist
+        return undefined
+      }
+
+      if (nonExistant.length === 0) {
+        // Both exist, so use the published one
+        return publishedId
+      }
+
+      // If the draft does not exist, use the published ID, and vice versa
+      return nonExistant.some((doc) => doc.id === draftId) ? publishedId : draftId
+    }),
+  )
+}
+
+/**
+ * fetches the cross-dataset references using the client observable.request
+ * method (for that requests can be automatically cancelled)
+ */
+export function fetchCrossDatasetReferences(
+  documentId: string,
+  context: {versionedClient: SanityClient},
+): Observable<ReferringDocuments['crossDatasetReferences']> {
+  const {versionedClient} = context
+
+  return getVisiblePoll$().pipe(
+    switchMap(() => getDocumentExistence(documentId, context)),
+    switchMap((checkDocumentId) => {
+      if (!checkDocumentId) {
+        return of({totalCount: 0, references: []})
+      }
+
+      const currentDataset = versionedClient.config().dataset
+
+      return versionedClient.observable
+        .request({
+          url: `/data/references/${currentDataset}/documents/${checkDocumentId}/to?excludeInternalReferences=true&excludePaths=true`,
+          tag: 'use-referring-documents.external',
+        })
+        .pipe(
+          catchError((e) => {
+            // it's possible that referencing document doesn't exist yet so the
+            // API will return a 404. In those cases, we want to catch and return
+            // a response with no references
+            if (isClientError(e) && e.statusCode === 404) {
+              return of({totalCount: 0, references: []})
+            }
+
+            throw e
+          }),
+        )
+    }),
+    distinctUntilChanged(dequal),
+  )
+}
+
+/**
+ * @internal
+ */
+export interface ReferringDocumentsOptions {
+  documentId: string
+  versionedClient: SanityClient
+  documentStore: DocumentStore
+}
+
+/**
+ * Returns an observable describing the documents that refer to the given
+ * document, both within the same dataset (internal references) and across
+ * datasets (cross-dataset references). The observable keeps emitting as the
+ * underlying queries poll/listen for changes.
+ *
+ * @internal
+ */
+export function referringDocuments({
+  documentId,
+  versionedClient,
+  documentStore,
+}: ReferringDocumentsOptions): Observable<ReferringDocuments> {
+  const publishedId = getPublishedId(documentId)
+
+  const internalReferences$ = withLoadingState(fetchInternalReferences(publishedId, documentStore))
+
+  const crossDatasetReferences$ = withLoadingState(
+    getVisiblePoll$().pipe(
+      switchMap(() => fetchCrossDatasetReferences(publishedId, {versionedClient})),
+    ),
+  )
+
+  return combineLatest([internalReferences$, crossDatasetReferences$]).pipe(
+    map(
+      ([
+        [internalReferences, isInternalReferencesLoading],
+        [crossDatasetReferences, isCrossDatasetReferencesLoading],
+      ]): ReferringDocuments => {
+        const projectIds = Array.from(
+          new Set(
+            crossDatasetReferences?.references
+              .map((crossDatasetReference) => crossDatasetReference.projectId)
+              .filter(Boolean),
+          ),
+        ).sort()
+
+        const datasetNames = Array.from(
+          new Set<string>(
+            crossDatasetReferences?.references
+              .map((crossDatasetReference) => crossDatasetReference?.datasetName || '')
+              .filter((datasetName) => Boolean(datasetName) && datasetName !== ''),
+          ),
+        ).sort()
+
+        const hasUnknownDatasetNames = Boolean(
+          crossDatasetReferences?.references.some(
+            (crossDatasetReference) => typeof crossDatasetReference.datasetName !== 'string',
+          ),
+        )
+
+        return {
+          totalCount:
+            (internalReferences?.totalCount || 0) + (crossDatasetReferences?.totalCount || 0),
+          projectIds,
+          datasetNames,
+          hasUnknownDatasetNames,
+          internalReferences,
+          crossDatasetReferences,
+          isLoading: isInternalReferencesLoading || isCrossDatasetReferencesLoading,
+        }
+      },
+    ),
+  )
+}
+
+const INITIAL_STATE: ReferringDocuments = {
+  isLoading: true,
+  totalCount: 0,
+  projectIds: [],
+  datasetNames: [],
+  hasUnknownDatasetNames: false,
+  internalReferences: undefined,
+  crossDatasetReferences: undefined,
+}
+
+const EMPTY_READY_STATE: ReferringDocuments = {
+  isLoading: false,
+  totalCount: 0,
+  projectIds: [],
+  datasetNames: [],
+  hasUnknownDatasetNames: false,
+  internalReferences: {totalCount: 0, references: []},
+  crossDatasetReferences: {totalCount: 0, references: []},
+}
+
+/**
+ * @internal
+ */
+export interface UseReferringDocumentsOptions {
+  /**
+   * When `false`, skips fetching incoming references and returns an empty ready
+   * state
+   */
+  enabled?: boolean
+}
+
+export function useReferringDocuments(
+  documentId: string,
+  options?: UseReferringDocumentsOptions,
+): ReferringDocuments {
+  const enabled = options?.enabled ?? true
+  const versionedClient = useClient(DEFAULT_STUDIO_CLIENT_OPTIONS)
+  const documentStore = useDocumentStore()
+
+  const referringDocuments$ = useMemo(() => {
+    if (!enabled) {
+      return of(EMPTY_READY_STATE)
+    }
+    return referringDocuments({documentId, versionedClient, documentStore})
+  }, [documentId, documentStore, enabled, versionedClient])
+
+  return useObservable(referringDocuments$, enabled ? INITIAL_STATE : EMPTY_READY_STATE)
+}
+
+/**
+ * Fetches the documents within the same dataset that reference the subject
+ * document using the document store's `listenQuery`
+ */
+function fetchInternalReferences(
+  documentId: string,
+  documentStore: DocumentStore,
+): Observable<ReferringDocuments['internalReferences']> {
+  // Documents now self reference themselves, within the _system.group field. We need to exclude them from the references query.
+  const referencesQuery = `*[references($documentId) && _system.group._ref != $documentId]`
+  const referencesClause = `${referencesQuery}[0...100]{_id,_type}`
+  const totalClause = `count(${referencesQuery})`
+  const fetchQuery = `{"references":${referencesClause},"totalCount":${totalClause}}`
+  const listenQuery = referencesQuery
+
+  return documentStore.listenQuery(
+    {fetch: fetchQuery, listen: listenQuery},
+    {documentId},
+    {tag: 'use-referring-documents', transitions: ['appear', 'disappear'], throttleTime: 5000},
+  ) as Observable<ReferringDocuments['internalReferences']>
+}
+
+function withLoadingState<Type>(source: Observable<Type>): Observable<[Type | undefined, boolean]> {
+  return concat(
+    of<[Type | undefined, boolean]>([undefined, true]),
+    source.pipe(map((value): [Type | undefined, boolean] => [value, false])),
+  )
+}

@@ -1,0 +1,77 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Variables in memory after executing index_of_array.kcl
+---
+{
+  "arr": {
+    "type": "HomArray",
+    "value": [
+      {
+        "type": "Number",
+        "value": 90.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 91.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 92.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      }
+    ]
+  },
+  "i": {
+    "type": "Number",
+    "value": 1.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "result0": {
+    "type": "Number",
+    "value": 91.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "result1": {
+    "type": "Number",
+    "value": 91.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  }
+}

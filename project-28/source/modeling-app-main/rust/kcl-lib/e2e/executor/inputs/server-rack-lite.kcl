@@ -1,0 +1,1060 @@
+bendRad = 0.05
+thickness = 0.1046
+railHeight = 45 // u
+originStart = [4, 1, 5.114]
+depth = 48
+serverDepth = 31
+width = 21.53
+
+// simple caster model at each corner
+fn caster(@originStart) {
+  plane001c = {
+      origin = [
+        -(3.543 - 2.756) / 2 + originStart[0],
+        -(3.543 - 2.756) / 2 + originStart[1],
+        4.114
+      ],
+      x_axis = [1.0, 0.0, 0.0],
+      y_axis = [0.0, 1.0, 0.0],
+      z_axis = [0.0, 0.0, 1.0]
+  }
+
+  sketch001c = startSketchOn(plane001c)
+    |> startProfile(at = [0, 0])
+    |> xLine(length = 3.543)
+    |> yLine(length = 3.543)
+    |> xLine(length = -3.543)
+    |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+    |> close()
+    |> subtract2d(tool = circle(center = [
+         (3.543 - 2.756) / 2,
+         (3.543 - 2.756) / 2
+       ], radius= 8.8 / 2 / 25.4))
+    |> subtract2d(tool = circle(center = [
+         (3.543 - 2.756) / 2 + 2.756,
+         (3.543 - 2.756) / 2
+       ], radius= 8.8 / 2 / 25.4))
+    |> subtract2d(tool = circle(center = [
+         (3.543 - 2.756) / 2,
+         (3.543 - 2.756) / 2 + 2.756
+       ], radius= 8.8 / 2 / 25.4))
+    |> subtract2d(tool = circle(center = [
+         (3.543 - 2.756) / 2 + 2.756,
+         (3.543 - 2.756) / 2 + 2.756
+       ], radius= 8.8 / 2 / 25.4))
+    |> extrude(length = -.25)
+
+  sketch002c = startSketchOn(sketch001c, face = START)
+    |> startProfile(at = [-originStart[0], 2.2 + originStart[1]])
+    |> arc(
+         angle_start = 30,
+         angle_end = 330,
+         radius = 3.2 / 2
+       )
+    |> close()
+    |> extrude(length = 3.1)
+
+  plane002c = {
+      origin = [
+        0 + originStart[0],
+        0.8 + originStart[1],
+        0
+      ],
+      x_axis = [1, 0, 0],
+      y_axis = [0, 0, 1],
+      z_axis = [1, 0, 0]
+  }
+  sketch003c = startSketchOn(plane002c)
+    |> circle(center = [0, 1.2], radius = 2.48 / 2)
+  examplec = extrude(sketch003c, length = -1 - (3 / 16))
+  return examplec
+}
+
+// generate 4 casters
+caster([
+  (3.543 - 2.756) / 2,
+  (3.543 - 2.756) / 2 + 2.75
+])
+caster([
+  -(3.543 - 2.756) / 2 + width - 2.756,
+  (3.543 - 2.756) / 2 + .4
+])
+caster([
+  (3.543 - 2.756) / 2,
+  serverDepth + 5 - ((3.543 - 2.756) / 2) - 2.2
+])
+caster([
+  -(3.543 - 2.756) / 2 + width - 2.756,
+  depth - ((3.543 - 2.756) / 2) - 2.756 - 1.7
+])
+
+// left wall
+plane001 = {
+    origin = [
+      originStart[0] - 4,
+      originStart[1] + 2,
+      4.114
+    ],
+    x_axis = [0, 1, 0],
+    y_axis = [0, 0, 1],
+    z_axis = [1, 0, 0]
+}
+
+sketch001l = startSketchOn(plane001)
+  |> startProfile(at = [0, 0])
+  |> xLine(length = serverDepth + .8)
+  |> angledLine(angle = -45, endAbsoluteY = 1)
+  |> xLine(length = -serverDepth + 2 - .8, tag = $seg01)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude001l = extrude(sketch001l, length = 1)
+
+sketch002l = startSketchOn(plane001)
+  |> startProfile(at = [serverDepth + .8, 0])
+  |> yLine(length = railHeight * 1.75 + 2)
+  |> angledLine(angle = -135, endAbsoluteX = serverDepth - 1 + .8)
+  |> yLine(length = -railHeight * 1.75)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude002l = extrude(sketch002l, length = 1)
+
+sketch003l = startSketchOn(plane001)
+  |> startProfile(at = [serverDepth + .8, railHeight * 1.75 + 2])
+  |> xLine(length = -serverDepth - .8, tag = $seg02)
+  |> angledLine(angle = -45, endAbsoluteY = railHeight * 1.75 - 1 + 2)
+  |> xLine(length = serverDepth - 2 + .8)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude003l = extrude(sketch003l, length = 1)
+
+sketch004l = startSketchOn(plane001)
+  |> startProfile(at = [0, 0])
+  |> yLine(length = railHeight * 1.75 + 2)
+  |> angledLine(angle = 135, endAbsoluteY = railHeight * 1.75 + 2 - 1)
+  |> yLine(length = -railHeight * 1.75)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude004l = extrude(sketch004l, length = 1)
+
+sketch005l = startSketchOn(plane001)
+  |> startProfile(at = [serverDepth - 1.25, 1])
+  |> line(end = [-serverDepth + 2.25, railHeight * 1.75], tag = $lineToIntersect4)
+  |> xLine(length = 1)
+  |> line(end = [serverDepth - 2.25, -railHeight * 1.75], tag = $lineToIntersect5)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude005l = extrude(sketch005l, length = 1)
+
+sketch006l = startSketchOn(plane001)
+  |> startProfile(at = [1, 1])
+  |> angledLineThatIntersects(angle = 70, intersectTag = lineToIntersect4, offset = 0)
+  |> angledLine(angle = -70, length = 1.414 )
+  |> angledLine(angle = 70 + 180, endAbsoluteY = 2 - 1)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude006l = extrude(sketch006l, length = 1)
+
+sketch007l = startSketchOn(plane001)
+  |> startProfile(at = [serverDepth - 1.2, railHeight * 1.75 + 1])
+  |> angledLineThatIntersects(angle = 70, intersectTag = lineToIntersect5, offset = 0)
+  |> angledLine(angle = -70, length = 1.414 )
+  |> angledLine(angle = 70 + 180, endAbsoluteY = railHeight * 1.75 + 1)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude007l = extrude(sketch007l, length = 1)
+
+// right wall
+plane002 = {
+    origin = [
+      originStart[0] - 4 + width - 1,
+      originStart[1] - 1,
+      4.114
+    ],
+    x_axis = [0, 1, 0],
+    y_axis = [0, 0, 1],
+    z_axis = [1, 0, 0]
+}
+
+sketch001w = startSketchOn(plane002)
+  |> startProfile(at = [0, 0])
+  |> xLine(length = depth)
+  |> angledLine(angle = -45, endAbsoluteY = 1)
+  |> xLine(length = -depth + 2, tag = $seg01w)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude001w = extrude(sketch001w, length = 1)
+
+sketch002w = startSketchOn(plane002)
+  |> startProfile(at = [depth, 0])
+  |> yLine(length = railHeight * 1.75 + 2)
+  |> angledLine(angle = -135, endAbsoluteX = depth - 1)
+  |> yLine(length = -railHeight * 1.75)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude002w = extrude(sketch002w, length = 1)
+
+sketch003w = startSketchOn(plane002)
+  |> startProfile(at = [depth, railHeight * 1.75 + 2])
+  |> xLine(length = -depth, tag = $seg02w)
+  |> angledLine(angle = -45, endAbsoluteY = railHeight * 1.75 - 1 + 2)
+  |> xLine(length = depth - 2)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude003w = extrude(sketch003w, length = 1)
+
+sketch004w = startSketchOn(plane002)
+  |> startProfile(at = [0, 0])
+  |> yLine(length = railHeight * 1.75 + 2)
+  |> angledLine(angle = 135, endAbsoluteY = railHeight * 1.75 + 2 - 1)
+  |> yLine(length = -railHeight * 1.75)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude004w = extrude(sketch004w, length = 1)
+
+sketch005w = startSketchOn(plane002)
+  |> startProfile(at = [1, 40.6 + 1.75 / 2])
+  |> angledLine(angle = -23, length = 35.5 )
+  |> angledLine(angle = -23 + 90 + 45, length = 1.413 )
+  |> angledLine(angle = -23, endAbsoluteX = 1, tag = $lineToIntersect)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude005w = extrude(sketch005w, length = 1)
+
+sketch006w = startSketchOn(plane002)
+  |> startProfile(at = [1 + 35.5 * cos(23 * pi() / 180), 40.6 - (35.5 * sin(23 * pi() / 180)) + 1.75 / 2])
+  |> angledLine(angle = -23 + 90, endAbsoluteX = depth - 1)
+  |> yLine(length = 2.56)
+  |> angledLineThatIntersects(
+       angle = -23 + 90 + 180,
+       intersectTag = lineToIntersect,
+       offset = 0,
+       tag = $lineToIntersect2,
+     )
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude006w = extrude(sketch006w, length = 1)
+
+sketch007w = startSketchOn(plane002)
+  |> startProfile(at = [depth - 1, 60.65 + 1.75 / 2])
+  |> angledLine(angle = -23 + 180, length = 34.93 , tag = $lineToIntersect3)
+  |> angledLine(angle = 23 - 90, length = 1.414 )
+  |> angledLineThatIntersects(
+       angle = -23 + 180,
+       intersectTag = lineToIntersect2,
+       offset = 0,
+     )
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude007w = extrude(sketch007w, length = 1)
+
+sketch008w = startSketchOn(plane002)
+  |> startProfile(at = [1, 41.7 + 1.75 / 2])
+  |> angledLineThatIntersects(
+       angle = -23 + 90,
+       intersectTag = lineToIntersect3,
+       offset = 0,
+     )
+  |> angledLine(angle = -23 - 45, length = 1.414 )
+  |> angledLineThatIntersects(
+       angle = -23 - 90,
+       intersectTag = lineToIntersect,
+       offset = 0,
+     )
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude008w = extrude(sketch008w, length = 1)
+
+sketch009w = startSketchOn(plane002)
+  |> startProfile(at = [31.2, 33.3 + 1.75 / 2])
+  |> angledLine(angle = -23 - 45, length = 1.414 )
+  |> angledLine(angle = 90 - 23, length = 28 )
+  |> angledLine(angle = -23 + 45, length = -1.414 )
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude009w = extrude(sketch009w, length = 1)
+
+sketch010w = startSketchOn(plane002)
+  |> startProfile(at = [31.2, 33.3 + 1.75 / 2])
+  |> angledLine(angle = -23 - 45, length = 1.414 )
+  |> angledLine(angle = 180 - 23, length = 28 )
+  |> angledLine(angle = -23 + 45, length = 1.414 )
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude010w = extrude(sketch010w, length = 1)
+
+sketch011w = startSketchOn(plane002)
+  |> startProfile(at = [31.2 - ((28 - 2) * cos(23 * pi() / 180)), 33.3 + (28 - 2) * sin(23 * pi() / 180) + 1.75 / 2])
+  |> angledLine(angle = 90 - 23, length = 28 - 2 )
+  |> angledLine(angle = -23 - 45, length = -1.414 )
+  |> angledLine(angle = 90 - 23 + 180, length = 28 )
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude011w = extrude(sketch011w, length = 1)
+
+sketch012w = startSketchOn(plane002)
+  |> startProfile(at = [31.2 + (28 - 2) * sin(23 * pi() / 180), 33.3 + (28 - 2) * cos(23 * pi() / 180) + 1.75 / 2])
+  |> angledLine(angle = 180 - 23, length = 28 - 2 )
+  |> angledLine(angle = -23 - 45, length = -1.414 )
+  |> angledLine(angle = -23, length = 28 )
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude012w = extrude(sketch012w, length = 1)
+
+sketch013w = startSketchOn(plane002)
+  |> startProfile(at = [1 + 4 * cos(23 * pi() / 180), 40.6 - (4 * sin(23 * pi() / 180)) + 1.75 / 2])
+  |> angledLine(angle = -23, length = 1 )
+  |> angledLine(angle = -23 + 90, endAbsoluteX = 1)
+  |> yLine(length = 2.56)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude013w = extrude(sketch013w, length = 1)
+
+sketch014w = startSketchOn(plane002)
+  |> startProfile(at = [1 + 12 * cos(23 * pi() / 180), 40.6 - (12 * sin(23 * pi() / 180)) + 1.75 / 2])
+  |> angledLine(angle = -23 - 90, length = 36 / 2 )
+  |> angledLine(angle = -23, length = 1 )
+  |> angledLine(angle = -23 - 90, length = -36 / 2 )
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude014w = extrude(sketch014w, length = 1)
+
+sketch015w = startSketchOn(plane002)
+  |> startProfile(at = [1 + (36 - 5.55 - 8) * cos(23 * pi() / 180), 40.6 - ((36 - 5.55 - 8) * sin(23 * pi() / 180)) + 1.75 / 2])
+  |> angledLine(angle = -23 - 90, length = 36 / 2 )
+  |> angledLine(angle = -23, length = 1 )
+  |> angledLine(angle = -23 - 90, length = -36 / 2 )
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude015w = extrude(sketch015w, length = 1)
+
+sketch016w = startSketchOn(plane002)
+  |> startProfile(at = [1 + (36 - 5.5) * cos(23 * pi() / 180), 40.6 - ((36 - 5.5) * sin(23 * pi() / 180)) + 1.75 / 2])
+  |> angledLine(angle = -23 - 90, length = 36 / 2 )
+  |> angledLine(angle = -23, length = 1 )
+  |> angledLine(angle = -23 - 90, length = -36 / 2 )
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude016w = extrude(sketch016w, length = 1)
+
+sketch017w = startSketchOn(plane002)
+  |> startProfile(at = [depth - 1 - (3.7 * cos(23 * pi() / 180)), 60.65 + 3.7 * sin(23 * pi() / 180) + 1.75 / 2])
+  |> arc(angleStart = -23, angleEnd = 180 - 23, radius = 7 / 2 + 2)
+  |> angledLine(angle = -23 + 180, length = -1 )
+  |> arc(angleStart = 180 - 23, angleEnd = -23, radius = 7 / 2 + 1)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude017w = extrude(sketch017w, length = 1)
+
+sketch018w = startSketchOn(plane002)
+  |> startProfile(at = [depth - 1 - (19.3 * cos(23 * pi() / 180)), 60.65 + 19.3 * sin(23 * pi() / 180) + 1.75 / 2])
+  |> arc(angleStart = -23, angleEnd = 180 - 23, radius = 7 / 2 + 2)
+  |> angledLine(angle = -23 + 180, length = -1 )
+  |> arc(angleStart = 180 - 23, angleEnd = -23, radius = 7 / 2 + 1)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude018w = extrude(sketch018w, length = 1)
+
+sketch019w = startSketchOn(plane002)
+  |> startProfile(at = [1, 27.8 + 1.75 / 2])
+  |> angledLine(angle = -23, length = 7 )
+  |> angledLine(angle = -23 + 90, length = -1 )
+  |> angledLine(angle = -23, endAbsoluteX = 1)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude019w = extrude(sketch019w, length = 1)
+
+sketch020w = startSketchOn(plane002)
+  |> startProfile(at = [1 + (36 - 5.53 - 12) * cos(23 * pi() / 180), 27.8 + 1.75 / 2 - ((36 - 5.53 - 12) * sin(23 * pi() / 180))])
+  |> angledLine(angle = -23, length = 7 )
+  |> angledLine(angle = -23 + 90, length = -1 )
+  |> angledLine(angle = -23 + 180, length = 7 )
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude020w = extrude(sketch020w, length = 1)
+
+sketch021w = startSketchOn(plane002)
+  |> startProfile(at = [1, 21.9])
+  |> angledLine(angle = -23, endAbsoluteX = depth - 1)
+  |> yLine(length = -1.1)
+  |> angledLine(angle = -23, endAbsoluteX = 1)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude021w = extrude(sketch021w, length = 1)
+
+sketch022w = startSketchOn(plane002)
+  |> startProfile(at = [depth - 1, 74.1])
+  |> angledLine(angle = 180 - 23, endAbsoluteY = railHeight * 1.75 + 1)
+  |> xLine(length = -2.56)
+  |> angledLine(angle = -23, endAbsoluteX = depth - 1)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude022w = extrude(sketch022w, length = 1)
+
+sketch023w = startSketchOn(plane002)
+  |> startProfile(at = [1, 69.53 + 1.75])
+  |> angledLine(angle = 90 - 23, endAbsoluteY = railHeight * 1.75 + 1)
+  |> xLine(length = 1.086)
+  |> angledLine(angle = 90 - 23, endAbsoluteX = 1)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude023w = extrude(sketch023w, length = 1)
+
+sketch024w = startSketchOn(plane002)
+  |> startProfile(at = [1, 16.5])
+  |> angledLine(angle = -23, endAbsoluteY = 1)
+  |> xLine(length = -2.56)
+  |> angledLine(angle = -23, endAbsoluteX = 1)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude024w = extrude(sketch024w, length = 1)
+
+sketch025w = startSketchOn(plane002)
+  |> startProfile(at = [1, 4])
+  |> angledLine(angle = -23, endAbsoluteY = 1)
+  |> xLine(length = -2.56)
+  |> angledLine(angle = -23, endAbsoluteX = 1)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude025w = extrude(sketch025w, length = 1)
+
+// Base plane of rack
+plane003 = {
+    origin = [0, 0, 4.114],
+    x_axis = [1, 0, 0],
+    y_axis = [0, 1, 0],
+    z_axis = [0, 0, 1]
+}
+
+sketch005 = startSketchOn(plane003)
+  |> startProfile(at = [width - 1, 0])
+  |> line(end = [-width + 2, 3])
+  |> line(end = [0, 1])
+  |> line(end = [width - 2, -3])
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+
+extrude005 = extrude(sketch005, length = 1)
+
+sketch006 = startSketchOn(plane003)
+  |> startProfile(at = [width - 1, 0 + 2.756])
+  |> line(end = [-width + 2, 3])
+  |> line(end = [0, 1])
+  |> line(end = [width - 2, -3])
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+
+extrude006 = extrude(sketch006, length = 1)
+
+sketch007 = startSketchOn(plane003)
+  |> startProfile(at = [width - 1, depth])
+  |> line(end = [-width + 1, -depth + serverDepth + 3.8])
+  |> line(end = [1, 0])
+  |> line(end = [0, -.75])
+  |> line(end = [
+       width - 2,
+       depth - serverDepth - 5 + .6
+     ])
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude007 = extrude(sketch007, length = 1)
+
+sketch008 = startSketchOn(plane003)
+  |> startProfile(at = [width - 1, depth - 2.8])
+  |> line(end = [-width + 2, -depth + serverDepth + 4.4])
+  |> line(end = [0, -1.32])
+  |> line(end = [width - 2, depth - serverDepth - 4.4])
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+
+extrude008 = extrude(sketch008, length = 1)
+
+// Top Plane
+plane004 = {
+    origin = [0, 0, 4.114 + railHeight * 1.75 + 2],
+    x_axis = [1, 0, 0],
+    y_axis = [0, 1, 0],
+    z_axis = [0, 0, 1]
+}
+
+sketch005t = startSketchOn(plane004)
+  |> startProfile(at = [width - 1, 0])
+  |> line(end = [-width + 2, 3])
+  |> line(end = [0, 1])
+  |> line(end = [width - 2, -3])
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+
+extrude005t = extrude(sketch005t, length = -1)
+
+sketch007t = startSketchOn(plane004)
+  |> startProfile(at = [width - 1, depth])
+  |> line(end = [-width + 1, -depth + serverDepth + 3.8])
+  |> line(end = [1, 0])
+  |> line(end = [0, -.75])
+  |> line(end = [
+       width - 2,
+       depth - serverDepth - 5 + .6
+     ])
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude007t = extrude(sketch007t, length = -1)
+
+sketch008t = startSketchOn(plane004)
+  |> startProfile(at = [width - 1, 0 + 2.756])
+  |> line(end = [-width + 2, 3])
+  |> line(end = [0, 1])
+  |> line(end = [width - 2, -3])
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude008t = extrude(sketch008t, length = -1)
+
+sketch009t = startSketchOn(plane004)
+  |> startProfile(at = [width - 1, depth - 2.8])
+  |> line(end = [-width + 2, -depth + serverDepth + 4.4])
+  |> line(end = [0, -1.32])
+  |> line(end = [width - 2, depth - serverDepth - 4.4])
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+
+extrude009t = extrude(sketch009t, length = -1)
+
+// front left vertical rail
+// Define planes so the rail can be moved
+planeXYfl = {
+    origin = [0, 0, originStart[2]],
+    xAxis = [1.0, 0.0, 0.0],
+    yAxis = [0.0, 1.0, 0.0],
+    zAxis = [0.0, 0.0, 1.0]
+}
+
+planeXZfl = {
+    origin = [
+      originStart[1],
+      originStart[0],
+      originStart[2]
+    ],
+    xAxis = [0, 1, 0],
+    yAxis = [0, 0, 1],
+    zAxis = [1, 0, 0]
+}
+
+planeYZfl = {
+    origin = [
+      originStart[1],
+      originStart[0],
+      originStart[2]
+    ],
+    xAxis = [-1, 0, 0],
+    yAxis = [0, 0, 1],
+    zAxis = [1, 0, 0]
+}
+
+// Base flange
+sketch001fl = startSketchOn(planeXZfl)
+  |> startProfile(at = [bendRad + thickness, 0])
+  |> angledLine(angle = 0, length = 2 - bendRad - thickness, tag = $rectangleSegmentA001fl)
+  |> angledLine(angle = segAng(rectangleSegmentA001fl) + 90, length = railHeight * 1.75, tag = $rectangleSegmentB001fl)
+  |> angledLine(angle = segAng(rectangleSegmentA001fl), length = -segLen(rectangleSegmentA001fl), tag = $rectangleSegmentC001fl)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude001fl = extrude(sketch001fl, length = thickness)
+
+// First flange
+sketch002fl = startSketchOn(planeYZfl)
+  |> startProfile(at = [-bendRad - thickness, 0])
+  |> angledLine(angle = 180, length = 0.89 - bendRad - thickness, tag = $rectangleSegmentA002fl)
+  |> angledLine(angle = segAng(rectangleSegmentA002fl) - 90, length = railHeight * 1.75, tag = $rectangleSegmentB002fl)
+  |> angledLine(angle = segAng(rectangleSegmentA002fl), length = -segLen(rectangleSegmentA002fl), tag = $rectangleSegmentC002fl)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+
+extrude002fl = extrude(sketch002fl, length = thickness)
+
+// Bend
+sketch003fl = startSketchOn(planeXYfl)
+  |> startProfile(at = [0 + thickness + bendRad + originStart[1], originStart[0]])
+  |> arc(angleStart = 270, angleEnd = 180, radius = bendRad + thickness)
+  |> xLine(length = thickness)
+  |> arc(angleStart = 180, angleEnd = 270, radius = bendRad)
+  |> yLine(length = -thickness)
+  |> close()
+
+extrude003fl = extrude(sketch003fl, length = railHeight * 1.75)
+
+// define slots
+sketch010fl = startSketchOn(extrude001fl, face = START)
+  |> startProfile(at = [-1.12 + (.75 - .438) / 2 - originStart[0], originStart[2] + .81 - (.438 / 2)])
+  |> xLine(length = 0.75 - .438)
+  |> tangentialArc(endAbsolute = [
+       -0.66 - originStart[0],
+       originStart[2] + .81 + .438 / 2
+     ])
+  |> xLine(length = -0.75 + .438)
+  |> tangentialArc(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+  |> patternLinear2d(
+       axis = [0, 1],
+       instances = 2,
+       distance = 1.22
+     )
+extrude010fl = extrude(sketch010fl, length = -thickness)
+
+// define slots
+sketch011fl = startSketchOn(extrude001fl, face = START)
+  |> startProfile(at = [-1.12 + (.75 - .438) / 2 - originStart[0], originStart[2] + railHeight * 1.75 / 2 + .438 / 2])
+  |> xLine(length = 0.75 - .438)
+  |> tangentialArc(endAbsolute = [
+       -0.66 - originStart[0],
+       originStart[2] + railHeight * 1.75 / 2 - (.438 / 2)
+     ])
+  |> xLine(length = -0.75 + .438)
+  |> tangentialArc(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+
+extrude011fl = extrude(sketch011fl, length = -thickness)
+
+// define slots
+sketch012fl = startSketchOn(extrude001fl, face = START)
+  |> startProfile(at = [-1.12 + (.75 - .438) / 2 - originStart[0], originStart[2] + railHeight * 1.75 - .81 + .438 / 2])
+  |> xLine(length = 0.75 - .438)
+  |> tangentialArc(endAbsolute = [
+       -0.66 - originStart[0],
+       originStart[2] + railHeight * 1.75 - .81 - (.438 / 2)
+     ])
+  |> xLine(length = -0.75 + .438)
+  |> tangentialArc(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+  |> patternLinear2d(
+       axis = [0, -1],
+       instances = 2,
+       distance = 1.22
+     )
+extrude012fl = extrude(sketch012fl, length = -thickness)
+
+// FRONT RIGHT VERTICAL RAIL
+// Define planes so the rail can be moved
+planeXYfr = {
+    origin = [0, 0, originStart[2]],
+    xAxis = [1.0, 0.0, 0.0],
+    yAxis = [0.0, 1.0, 0.0],
+    zAxis = [0.0, 0.0, 1.0]
+}
+
+planeXZfr = {
+    origin = [
+      originStart[1] + width - thickness - 2,
+      originStart[0],
+      originStart[2]
+    ],
+    xAxis = [0, 1, 0],
+    yAxis = [0, 0, 1],
+    zAxis = [1, 0, 0]
+}
+
+planeYZfr = {
+    origin = [
+      originStart[1] + width - 2,
+      originStart[0],
+      originStart[2]
+    ],
+    xAxis = [-1, 0, 0],
+    yAxis = [0, 0, 1],
+    zAxis = [1, 0, 0]
+}
+
+// Base flange
+sketch001fr = startSketchOn(planeXZfr)
+  |> startProfile(at = [bendRad + thickness, 0])
+  |> angledLine(angle = 0, length = 2 - bendRad - thickness, tag = $rectangleSegmentA001fr)
+  |> angledLine(angle = segAng(rectangleSegmentA001fr) + 90, length = railHeight * 1.75, tag = $rectangleSegmentB001fr)
+  |> angledLine(angle = segAng(rectangleSegmentA001fr), length = -segLen(rectangleSegmentA001fr), tag = $rectangleSegmentC001fr)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude001fr = extrude(sketch001fr, length = thickness)
+
+// First flange
+sketch002fr = startSketchOn(planeYZfr)
+  |> startProfile(at = [0.89, 0])
+  |> angledLine(angle = 180, length = 0.89 - bendRad - thickness, tag = $rectangleSegmentA002fr)
+  |> angledLine(angle = segAng(rectangleSegmentA002fr) - 90, length = railHeight * 1.75, tag = $rectangleSegmentB002fr)
+  |> angledLine(angle = segAng(rectangleSegmentA002fr), length = -segLen(rectangleSegmentA002fr), tag = $rectangleSegmentC002fr)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+
+extrude002fr = extrude(sketch002fr, length = thickness)
+
+// Bend
+sketch003fr = startSketchOn(planeXYfr)
+  |> startProfile(at = [bendRad + originStart[1] + width - 2 - thickness - bendRad, originStart[0] + bendRad + thickness])
+  |> arc(angleStart = 0, angleEnd = -90, radius = bendRad)
+  |> yLine(length = -thickness)
+  |> arc(angleStart = -90, angleEnd = 0, radius = bendRad + thickness)
+  |> close()
+
+extrude003fr = extrude(sketch003fr, length = railHeight * 1.75)
+
+// define slots
+sketch010fr = startSketchOn(extrude001fr, face = START)
+  |> startProfile(at = [-1.12 + (.75 - .438) / 2 - originStart[0], originStart[2] + .81 - (.438 / 2)])
+  |> xLine(length = 0.75 - .438)
+  |> tangentialArc(endAbsolute = [
+       -0.66 - originStart[0],
+       originStart[2] + .81 + .438 / 2
+     ])
+  |> xLine(length = -0.75 + .438)
+  |> tangentialArc(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+  |> patternLinear2d(
+       axis = [0, 1],
+       instances = 2,
+       distance = 1.22
+     )
+extrude010fr = extrude(sketch010fr, length = -thickness)
+
+// define slots
+sketch011fr = startSketchOn(extrude001fr, face = START)
+  |> startProfile(at = [-1.12 + (.75 - .438) / 2 - originStart[0], originStart[2] + railHeight * 1.75 / 2 + .438 / 2])
+  |> xLine(length = 0.75 - .438)
+  |> tangentialArc(endAbsolute = [
+       -0.66 - originStart[0],
+       originStart[2] + railHeight * 1.75 / 2 - (.438 / 2)
+     ])
+  |> xLine(length = -0.75 + .438)
+  |> tangentialArc(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+
+extrude011fr = extrude(sketch011fr, length = -thickness)
+
+// define slots
+sketch012fr = startSketchOn(extrude001fr, face = START)
+  |> startProfile(at = [-1.12 + (.75 - .438) / 2 - originStart[0], originStart[2] + railHeight * 1.75 - .81 + .438 / 2])
+  |> xLine(length = 0.75 - .438)
+  |> tangentialArc(endAbsolute = [
+       -0.66 - originStart[0],
+       originStart[2] + railHeight * 1.75 - .81 - (.438 / 2)
+     ])
+  |> xLine(length = -0.75 + .438)
+  |> tangentialArc(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+  |> patternLinear2d(
+       axis = [0, -1],
+       instances = 2,
+       distance = 1.22
+     )
+extrude012fr = extrude(sketch012fr, length = -thickness)
+
+// RIGHT REAR VERTICAL RAIL
+// Define planes so the rail can be moved
+planeXYrr = {
+    origin = [0, serverDepth, originStart[2]],
+    xAxis = [1.0, 0.0, 0.0],
+    yAxis = [0.0, 1.0, 0.0],
+    zAxis = [0.0, 0.0, 1.0]
+}
+
+planeXZrr = {
+    origin = [
+      originStart[1] + width - thickness - 2,
+      originStart[0] + serverDepth - 2 - bendRad,
+      originStart[2]
+    ],
+    xAxis = [0, 1, 0],
+    yAxis = [0, 0, 1],
+    zAxis = [1, 0, 0]
+}
+
+planeYZrr = {
+    origin = [
+      originStart[1] + width - 2,
+      originStart[0] + serverDepth,
+      originStart[2]
+    ],
+    xAxis = [-1, 0, 0],
+    yAxis = [0, 0, 1],
+    zAxis = [1, 0, 0]
+}
+
+// Base flange
+sketch001rr = startSketchOn(planeXZrr)
+  |> startProfile(at = [bendRad + thickness, 0])
+  |> angledLine(angle = 0, length = 2 - bendRad - thickness, tag = $rectangleSegmentA001rr)
+  |> angledLine(angle = segAng(rectangleSegmentA001rr) + 90, length = railHeight * 1.75, tag = $rectangleSegmentB001rr)
+  |> angledLine(angle = segAng(rectangleSegmentA001rr), length = -segLen(rectangleSegmentA001rr), tag = $rectangleSegmentC001rr)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude001rr = extrude(sketch001rr, length = thickness)
+
+// First flange
+sketch002rr = startSketchOn(planeYZrr)
+  |> startProfile(at = [0.89, 0])
+  |> angledLine(angle = 180, length = 0.89 - bendRad - thickness, tag = $rectangleSegmentA002rr)
+  |> angledLine(angle = segAng(rectangleSegmentA002rr) - 90, length = railHeight * 1.75, tag = $rectangleSegmentB002rr)
+  |> angledLine(angle = segAng(rectangleSegmentA002rr), length = -segLen(rectangleSegmentA002rr), tag = $rectangleSegmentC002rr)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+
+extrude002rr = extrude(sketch002rr, length = thickness)
+
+// Bend
+sketch003rr = startSketchOn(planeXYrr)
+  |> startProfile(at = [bendRad + originStart[1] + width - 2 - bendRad, originStart[0] - bendRad])
+  |> arc(angleStart = 0, angleEnd = 90, radius = bendRad + thickness)
+  |> yLine(length = -thickness)
+  |> arc(angleStart = 90, angleEnd = 0, radius = bendRad)
+  |> close()
+
+extrude003rr = extrude(sketch003rr, length = railHeight * 1.75)
+
+// define slots
+sketch010rr = startSketchOn(extrude001rr, face = START)
+  |> startProfile(at = [-1.12 + (.75 - .438) / 2 - originStart[0] + 1.5 - serverDepth, originStart[2] + .81 - (.438 / 2)])
+  |> xLine(length = 0.75 - .438)
+  |> tangentialArc(endAbsolute = [
+       -0.66 - originStart[0] + 1.5 - serverDepth,
+       originStart[2] + .81 + .438 / 2
+     ])
+  |> xLine(length = -0.75 + .438)
+  |> tangentialArc(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+  |> patternLinear2d(
+       axis = [0, 1],
+       instances = 2,
+       distance = 1.22
+     )
+extrude010rr = extrude(sketch010rr, length = -thickness)
+
+// define slots
+sketch011rr = startSketchOn(extrude001rr, face = START)
+  |> startProfile(at = [-1.12 + (.75 - .438) / 2 - originStart[0] + 1.5 - serverDepth, originStart[2] + railHeight * 1.75 / 2 + .438 / 2])
+  |> xLine(length = 0.75 - .438)
+  |> tangentialArc(endAbsolute = [
+       -0.66 - originStart[0] + 1.5 - serverDepth,
+       originStart[2] + railHeight * 1.75 / 2 - (.438 / 2)
+     ])
+  |> xLine(length = -0.75 + .438)
+  |> tangentialArc(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+
+extrude011rr = extrude(sketch011rr, length = -thickness)
+
+// define slots
+sketch012rr = startSketchOn(extrude001rr, face = START)
+  |> startProfile(at = [-1.12 + (.75 - .438) / 2 - originStart[0] + 1.5 - serverDepth, originStart[2] + railHeight * 1.75 - .81 + .438 / 2])
+  |> xLine(length = 0.75 - .438)
+  |> tangentialArc(endAbsolute = [
+       -0.66 - originStart[0] + 1.5 - serverDepth,
+       originStart[2] + railHeight * 1.75 - .81 - (.438 / 2)
+     ])
+  |> xLine(length = -0.75 + .438)
+  |> tangentialArc(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+  |> patternLinear2d(
+       axis = [0, -1],
+       instances = 2,
+       distance = 1.22
+     )
+extrude012rr = extrude(sketch012rr, length = -thickness)
+
+// REAR LEFT VETCIAL RAIL
+// Define planes so the rail can be moved
+planeXYrl = {
+    origin = [0, serverDepth, originStart[2]],
+    xAxis = [1.0, 0.0, 0.0],
+    yAxis = [0.0, 1.0, 0.0],
+    zAxis = [0.0, 0.0, 1.0]
+}
+
+planeXZrl = {
+    origin = [
+      originStart[1],
+      originStart[0] + serverDepth - 2 - bendRad,
+      originStart[2]
+    ],
+    xAxis = [0, 1, 0],
+    yAxis = [0, 0, 1],
+    zAxis = [1, 0, 0]
+}
+
+planeYZrl = {
+    origin = [
+      originStart[1],
+      originStart[0] + serverDepth,
+      originStart[2]
+    ],
+    xAxis = [-1, 0, 0],
+    yAxis = [0, 0, 1],
+    zAxis = [1, 0, 0]
+}
+// Base flange
+sketch001rl = startSketchOn(planeXZrl)
+  |> startProfile(at = [bendRad + thickness, 0])
+  |> angledLine(angle = 0, length = 2 - bendRad - thickness, tag = $rectangleSegmentA001rl)
+  |> angledLine(angle = segAng(rectangleSegmentA001rl) + 90, length = railHeight * 1.75, tag = $rectangleSegmentB001rl)
+  |> angledLine(angle = segAng(rectangleSegmentA001rl), length = -segLen(rectangleSegmentA001rl), tag = $rectangleSegmentC001rl)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+extrude001rl = extrude(sketch001rl, length = thickness)
+
+// First flange
+sketch002rl = startSketchOn(planeYZrl)
+  |> startProfile(at = [-bendRad - thickness, 0])
+  |> angledLine(angle = 180, length = 0.89 - bendRad - thickness, tag = $rectangleSegmentA002rl)
+  |> angledLine(angle = segAng(rectangleSegmentA002rl) - 90, length = railHeight * 1.75, tag = $rectangleSegmentB002rl)
+  |> angledLine(angle = segAng(rectangleSegmentA002rl), length = -segLen(rectangleSegmentA002rl), tag = $rectangleSegmentC002rl)
+  |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+
+extrude002rl = extrude(sketch002rl, length = thickness)
+
+// Bend
+sketch003rl = startSketchOn(planeXYrl)
+  |> startProfile(at = [bendRad + originStart[1] + thickness, originStart[0]])
+  |> arc(angleStart = 90, angleEnd = 180, radius = bendRad)
+  |> xLine(length = -thickness)
+  |> arc(angleStart = 180, angleEnd = 90, radius = bendRad + thickness)
+  |> close()
+
+extrude003rl = extrude(sketch003rl, length = railHeight * 1.75)
+
+// define slots
+sketch010rl = startSketchOn(extrude001rl, face = START)
+  |> startProfile(at = [-1.12 + (.75 - .438) / 2 - originStart[0] - serverDepth + 1.5, originStart[2] + .81 - (.438 / 2)])
+  |> xLine(length = 0.75 - .438)
+  |> tangentialArc(endAbsolute = [
+       -0.66 - originStart[0] - serverDepth + 1.5,
+       originStart[2] + .81 + .438 / 2
+     ])
+  |> xLine(length = -0.75 + .438)
+  |> tangentialArc(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+  |> patternLinear2d(
+       axis = [0, 1],
+       instances = 2,
+       distance = 1.22
+     )
+extrude010rl = extrude(sketch010rl, length = -thickness)
+
+// define slots
+sketch011rl = startSketchOn(extrude001rl, face = START)
+  |> startProfile(at = [-1.12 + (.75 - .438) / 2 - originStart[0] - serverDepth + 1.5, originStart[2] + railHeight * 1.75 / 2 + .438 / 2])
+  |> xLine(length = 0.75 - .438)
+  |> tangentialArc(endAbsolute = [
+       -0.66 - originStart[0] - serverDepth + 1.5,
+       originStart[2] + railHeight * 1.75 / 2 - (.438 / 2)
+     ])
+  |> xLine(length = -0.75 + .438)
+  |> tangentialArc(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+
+extrude011rl = extrude(sketch011rl, length = -thickness)
+
+// define slots
+sketch012rl = startSketchOn(extrude001rl, face = START)
+  |> startProfile(at = [-1.12 + (.75 - .438) / 2 - originStart[0] - serverDepth + 1.5, originStart[2] + railHeight * 1.75 - .81 + .438 / 2])
+  |> xLine(length = 0.75 - .438)
+  |> tangentialArc(endAbsolute = [
+       -0.66 - originStart[0] - serverDepth + 1.5,
+       originStart[2] + railHeight * 1.75 - .81 - (.438 / 2)
+     ])
+  |> xLine(length = -0.75 + .438)
+  |> tangentialArc(endAbsolute = [profileStartX(%), profileStartY(%)])
+  |> close()
+  |> patternLinear2d(
+       axis = [0, -1],
+       instances = 2,
+       distance = 1.22
+     )
+extrude012rl = extrude(sketch012rl, length = -thickness)
+
+// Define planes so the server can be moved
+fn streamServer(@serverPos) {
+  planeXYs = {
+      origin = [0, 0 + 2, 4.114 + 1 + serverPos * 1.75],
+      xAxis = [1.0, 0.0, 0.0],
+      yAxis = [0.0, 1.0, 0.0],
+      zAxis = [0.0, 0.0, 1.0]
+  }
+
+  planeXZs = {
+      origin = [0 + 1.2 + .1, 0 + 2, 0],
+      xAxis = [0, -1, 0],
+      yAxis = [0, 0, 1],
+      zAxis = [1, 0, 0]
+  }
+  planeXZs2 = {
+      origin = [18 + 1.4, 0 + 2, 0],
+      xAxis = [0, -1, 0],
+      yAxis = [0, 0, 1],
+      zAxis = [1, 0, 0]
+  }
+
+  sketch001s = startSketchOn(planeXYs)
+    |> startProfile(at = [1 + 1.2, 1])
+    |> angledLine(angle = 0, length = 17.2, tag = $rectangleSegmentA001)
+    |> angledLine(angle = segAng(rectangleSegmentA001) + 90, length = 29, tag = $rectangleSegmentB001)
+    |> angledLine(angle = segAng(rectangleSegmentA001), length = -segLen(rectangleSegmentA001), tag = $rectangleSegmentC001)
+    |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+    |> close()
+  extrude001s = extrude(sketch001s, length = 7)
+
+  sketch002s = startSketchOn(planeXZs)
+    |> startProfile(at = [-1, 4.114 + 1 + serverPos * 1.75])
+    |> yLine(length = 6.98)
+    |> xLine(length = 0.2)
+    |> yLine(length = -0.36)
+    |> xLine(length = 0.5)
+    |> tangentialArc(endAbsolute = [
+         0.3,
+         17.15 + 4.114 + 1 + serverPos * 1.75 - 11.114
+       ])
+    |> yLine(length = -1.77)
+    |> tangentialArc(endAbsolute = [
+         -0.13,
+         14.89 + 4.114 + 1 + serverPos * 1.75 - 11.114
+       ])
+    |> xLine(length = -0.52)
+    |> yLine(length = -0.42)
+    |> line(end = [0.34, -0.15])
+    |> yLine(length = -2.97)
+    |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+    |> close()
+
+  extrude002s = extrude(sketch002s, length = 1.8 / 2)
+
+  sketch003s = startSketchOn(planeXZs2)
+    |> startProfile(at = [-1, 4.114 + 1 + serverPos * 1.75])
+    |> yLine(length = 6.98)
+    |> xLine(length = 0.2)
+    |> yLine(length = -0.36)
+    |> xLine(length = 0.5)
+    |> tangentialArc(endAbsolute = [
+         0.3,
+         17.15 + 4.114 + 1 + serverPos * 1.75 - 11.114
+       ])
+    |> yLine(length = -1.77)
+    |> tangentialArc(endAbsolute = [
+         -0.13,
+         14.89 + 4.114 + 1 + serverPos * 1.75 - 11.114
+       ])
+    |> xLine(length = -0.52)
+    |> yLine(length = -0.42)
+    |> line(end = [0.34, -0.15])
+    |> yLine(length = -2.97)
+    |> line(endAbsolute = [profileStartX(%), profileStartY(%)])
+    |> close()
+
+  extrude003s = extrude(sketch003s, length = 1.8 / 2)
+  return extrude003s
+}
+
+// generate servers at Z height in U's
+// streamServer(4)
+// streamServer(8)
+// streamServer(12)
+// streamServer(16)
+// streamServer(20)
+
+
+// streamServer(29)
+// streamServer(33)
+// streamServer(37)

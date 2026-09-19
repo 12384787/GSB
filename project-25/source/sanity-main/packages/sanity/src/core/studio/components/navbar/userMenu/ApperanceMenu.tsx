@@ -1,0 +1,37 @@
+import {CheckmarkIcon} from '@sanity/icons/Checkmark'
+import {MenuDivider} from '@sanity/ui/menu'
+
+import {MenuItem} from '../../../../../ui-components/menuItem/MenuItem'
+import {useTranslation} from '../../../../i18n/hooks/useTranslation'
+import {type StudioThemeColorSchemeKey} from '../../../../theme'
+import {useColorSchemeOptions} from '../../../colorScheme'
+
+export function AppearanceMenu({
+  setScheme,
+}: {
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+  setScheme: (nextScheme: StudioThemeColorSchemeKey) => void
+}) {
+  const {t} = useTranslation()
+  // Subscribe to just what we need, if the menu isn't shown then we're not subscribed to these contexts
+  const options = useColorSchemeOptions(setScheme, t)
+
+  return (
+    <>
+      <MenuDivider />
+
+      {options.map(({icon, label, name, onSelect, selected, title}) => (
+        <MenuItem
+          key={name}
+          aria-label={label}
+          icon={icon}
+          onClick={onSelect}
+          pressed={selected}
+          text={title}
+          iconRight={selected && <CheckmarkIcon />}
+          data-testid={`color-scheme-${name}`}
+        />
+      ))}
+    </>
+  )
+}

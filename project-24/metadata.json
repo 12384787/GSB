@@ -1,0 +1,25 @@
+{
+  "number": 24,
+  "repository": "encode/httpx",
+  "url": "https://github.com/encode/httpx",
+  "description": "A next generation HTTP client for Python. 🦋",
+  "language": "Python",
+  "stars": 15501,
+  "default_branch": "master",
+  "source_zip_url": "https://github.com/encode/httpx/archive/refs/heads/master.zip",
+  "source_root": "source/httpx-master",
+  "top_level_entries": [
+    ".github",
+    ".gitignore",
+    "CHANGELOG.md",
+    "LICENSE.md",
+    "README.md",
+    "docs",
+    "httpx",
+    "mkdocs.yml",
+    "pyproject.toml",
+    "requirements.txt",
+    "scripts",
+    "tests"
+  ]
+}

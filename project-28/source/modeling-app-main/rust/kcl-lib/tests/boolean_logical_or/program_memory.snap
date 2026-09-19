@@ -1,0 +1,66 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Variables in memory after executing boolean_logical_or.kcl
+---
+{
+  "a": {
+    "type": "Number",
+    "value": 1.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "aa": {
+    "type": "Bool",
+    "value": true
+  },
+  "b": {
+    "type": "Number",
+    "value": 1.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "bb": {
+    "type": "Bool",
+    "value": true
+  },
+  "c": {
+    "type": "Number",
+    "value": 1.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "cc": {
+    "type": "Bool",
+    "value": true
+  },
+  "d": {
+    "type": "Number",
+    "value": 2.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "dd": {
+    "type": "Bool",
+    "value": false
+  }
+}

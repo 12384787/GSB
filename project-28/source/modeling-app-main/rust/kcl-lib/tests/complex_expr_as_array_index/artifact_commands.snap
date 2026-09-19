@@ -1,0 +1,5 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Artifact commands complex_expr_as_array_index.kcl
+---
+{}

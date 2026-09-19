@@ -1,0 +1,13 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Error from executing array_range_mismatch_units.kcl
+---
+KCL Semantic error
+
+  × semantic: Range start and range end have incompatible units: mm and cm
+   ╭─[1:5]
+ 1 │ a = [1mm..3cm]
+   ·     ─────┬────
+   ·          ╰── tests/array_range_mismatch_units/input.kcl
+ 2 │ assertIs(false, error = "shouldn't make it here")
+   ╰────

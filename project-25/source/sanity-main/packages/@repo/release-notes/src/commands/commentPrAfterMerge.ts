@@ -1,0 +1,174 @@
+import {type Octokit, type RestEndpointMethodTypes} from '@octokit/rest'
+
+import {REPO} from '../constants'
+import {getOctokit} from '../octokit'
+import {getMergedPRForCommit} from '../utils/github'
+import {getSanityDocumentIdsForBaseVersion} from '../utils/ids'
+import {markdownToPortableText} from '../utils/portabletext-markdown/markdownToPortableText'
+import {extractReleaseNotes, shouldExcludeReleaseNotes} from '../utils/pullRequestReleaseNotes'
+
+const INTERNAL_ASSOCIATIONS = ['MEMBER', 'OWNER']
+
+export async function commentPrAfterMerge(options: {
+  commit: string
+  baseVersion: string
+  adminStudioBaseUrl: string
+}) {
+  const octokit = getOctokit()
+  const pr = await getMergedPRForCommit('sanity-io', 'sanity', options.commit)
+  if (!pr) {
+    // GitHub's commit→PR association index is best-effort and occasionally
+    // misses associations. Skip posting the reminder rather than failing the
+    // workflow.
+    console.warn(
+      `⚠️  WARNING: GitHub returned no PR association for commit ${options.commit}. ` +
+        `Skipping release-notes reminder comment.`,
+    )
+    return
+  }
+
+  console.log(`Found PR #${pr.number}`)
+
+  // Get PR details including reviewers
+  const {data: pullRequest} = await octokit.rest.pulls.get({
+    ...REPO,
+    pull_number: pr.number,
+  })
+  if (!pullRequest) {
+    return
+  }
+
+  // skip the reminder comment if the PR description explicitly states "no release notes needed"
+  const skipReminder = pullRequest.body
+    ? shouldExcludeReleaseNotes(extractReleaseNotes(markdownToPortableText(pullRequest.body)))
+    : false
+
+  if (skipReminder) {
+    console.log(`PR #${pr.number} explicitly states no notes for release is required, skipping.`)
+    return
+  }
+
+  const collaborators = await getCollaborators(octokit, pullRequest)
+
+  const {releaseId, changelogDocumentId} = getSanityDocumentIdsForBaseVersion(options.baseVersion)
+
+  const entryKey = options.commit.slice(0, 8)
+  const entryPath = encodeURIComponent(`changelog[_key=="${entryKey}"]`)
+  const changelogEntryUrl = `${options.adminStudioBaseUrl}/intent/edit/id=${changelogDocumentId.published};path=${entryPath}/?perspective=${releaseId}`
+
+  const authorIsBot = collaborators.author.type === 'Bot'
+
+  // Create comment
+  const commentBody = `A **[:scroll: Release note](${changelogEntryUrl})** has been created for this PR.
+
+${
+  collaborators.isExternalContribution || authorIsBot
+    ? `${collaborators.approvers.map((approver) => mention(approver)).join(', ')} as reviewer${collaborators.approvers.length > 1 ? 's' : ''} of this PR, please take a look and make sure it includes all the relevant details.`
+    : `Please take a look and make sure it includes all the relevant details.`
+}
+
+
+${authorIsBot ? '`*beep boop*`' : `Thanks for your contribution, ${mention(collaborators.author)}! 🎉`}`
+
+  await createOrUpdateComment(octokit, {commit: options.commit, pr: pr.number, body: commentBody})
+}
+
+async function createOrUpdateComment(
+  octokit: Octokit,
+  options: {commit: string; pr: number; body: string},
+) {
+  const idempotencyMarker = `[idempotency-key]:#release-notes-reminder\n`
+
+  const {data: existingComments} = await octokit.rest.issues.listComments({
+    ...REPO,
+    issue_number: options.pr,
+    per_page: 100,
+    order: 'created',
+    direction: 'desc',
+  })
+
+  const existingComment = existingComments.find(
+    (comment) => comment.body && comment.body?.includes(idempotencyMarker),
+  )
+
+  if (existingComment && existingComment.body) {
+    // check if there are any changes
+    const withoutMarker = existingComment.body.replace(idempotencyMarker, '')
+    if (withoutMarker === options.body) {
+      console.log('Comment is unchanged. Nothing to do')
+      return Promise.resolve()
+    }
+    return octokit.rest.issues.updateComment({
+      ...REPO,
+      comment_id: existingComment.id,
+      body: idempotencyMarker + options.body,
+    })
+  }
+
+  return octokit.rest.issues.createComment({
+    ...REPO,
+    issue_number: options.pr,
+    body: idempotencyMarker + options.body,
+  })
+}
+
+type PullRequest = RestEndpointMethodTypes['pulls']['get']['response']['data']
+/**
+ * Retrieves information about collaborators involved in a pull request.
+ *
+ * @param pullRequest - The pull request object containing details about the PR.
+ * @returns An object containing:
+ * - author: The user who created the pull request.
+ * - external: A boolean indicating if the author is external to the organization.
+ * - approvers: An array of users who have approved the pull request and belong to the internal associations.
+ */
+async function getCollaborators(octokit: Octokit, pullRequest: PullRequest) {
+  const author = pullRequest.user
+  const isExternalContribution = !INTERNAL_ASSOCIATIONS.includes(pullRequest.author_association)
+
+  // Get reviews to find reviewers
+  const {data: reviews} = await octokit.rest.pulls.listReviews({
+    ...REPO,
+    pull_number: pullRequest.number,
+  })
+  const approvers = reviews
+    .filter((review) => {
+      return (
+        review.state === 'APPROVED' &&
+        INTERNAL_ASSOCIATIONS.includes(review.author_association) &&
+        review.user?.type === 'User'
+      )
+    })
+    .map((review) => review.user)
+    .filter((approver) => !!approver)
+
+  return {
+    isExternalContribution,
+    author,
+    approvers: uniqueBy(approvers, (approver) => approver.login),
+  }
+}
+/**
+ * Returns a new array with unique items, keyed by `keyFn`.
+ * Keeps the FIRST item encountered for each key and preserves input order.
+ */
+function uniqueBy<T, K>(items: readonly T[], keyFn: (item: T) => K): T[] {
+  const seen = new Set<K>()
+  const out: T[] = []
+  for (const item of items) {
+    const key = keyFn(item)
+    if (!seen.has(key)) {
+      seen.add(key)
+      out.push(item)
+    }
+  }
+
+  return out
+}
+
+function mention(user: PullRequest['user']) {
+  if (user.type !== 'Bot') {
+    return `@${user.login}`
+  }
+  return user.login
+}

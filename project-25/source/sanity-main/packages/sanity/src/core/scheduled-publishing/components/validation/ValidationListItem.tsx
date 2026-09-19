@@ -1,0 +1,76 @@
+import {ErrorOutlineIcon} from '@sanity/icons/ErrorOutline'
+import {InfoOutlineIcon} from '@sanity/icons/InfoOutline'
+import {WarningOutlineIcon} from '@sanity/icons/WarningOutline'
+import {type Path, type ValidationMarker} from '@sanity/types'
+import {type ButtonTone, Text} from '@sanity/ui'
+// oxlint-disable-next-line no-restricted-imports
+import {MenuItem} from '@sanity/ui/menu'
+import {useCallback} from 'react'
+import {styled} from 'styled-components'
+import {Box, Flex} from 'ui5'
+
+const StyledText = styled(Text)`
+  white-space: initial;
+`
+
+const MENU_ITEM_TONES: Record<'error' | 'warning' | 'info', ButtonTone> = {
+  error: 'critical',
+  warning: 'caution',
+  info: 'primary',
+}
+
+/**
+ * @internal
+ */
+export interface ValidationListItemProps {
+  marker: ValidationMarker
+  onClick?: (path?: Path) => void
+  path: string
+  truncate?: boolean
+}
+
+/**
+ * @internal
+ */
+export function ValidationListItem(props: ValidationListItemProps) {
+  const {marker, onClick, path, truncate} = props
+
+  const handleClick = useCallback(() => {
+    if (onClick) {
+      onClick(marker.path)
+    }
+  }, [marker.path, onClick])
+
+  const menuItemTone = MENU_ITEM_TONES[marker?.level] || undefined
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+  const message = marker.message ?? marker.item?.message
+  const children = (
+    <Flex>
+      <Box>
+        <Text size={1}>
+          {marker.level === 'error' && <ErrorOutlineIcon />}
+          {marker.level === 'warning' && <WarningOutlineIcon />}
+          {marker.level === 'info' && <InfoOutlineIcon />}
+        </Text>
+      </Box>
+
+      <Flex gap={2} flexBasis="0%" flexGrow={1} paddingLeft={3} flexDirection="column">
+        {path && (
+          <StyledText size={1} weight="semibold">
+            {path}
+          </StyledText>
+        )}
+        {message && (
+          <StyledText muted size={1} textOverflow={truncate ? 'ellipsis' : undefined}>
+            {message}
+          </StyledText>
+        )}
+      </Flex>
+    </Flex>
+  )
+  return (
+    <MenuItem padding={1} onClick={handleClick} radius={2} tone={menuItemTone}>
+      <Box padding={2}>{children}</Box>
+    </MenuItem>
+  )
+}

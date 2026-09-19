@@ -1,0 +1,28 @@
+import {type ButtonTone} from '@sanity/ui'
+import {type ComponentType, type ReactNode} from 'react'
+import {Flex} from 'ui5'
+
+import {Button} from '../../../../ui-components/button/Button'
+
+interface Props {
+  buttonText?: string
+  disabled?: boolean
+  icon?: ComponentType | ReactNode
+  onAction?: () => void
+  onComplete?: () => void
+  tone?: ButtonTone
+}
+
+const DialogFooter = (props: Props) => {
+  const {buttonText = 'Action', disabled, icon, onAction, onComplete, tone = 'positive'} = props
+  return (
+    <Flex gap={3} justifyContent="flex-end">
+      <Button mode="bleed" onClick={onComplete} text="Cancel" />
+      {onAction && (
+        <Button disabled={disabled} icon={icon} onClick={onAction} text={buttonText} tone={tone} />
+      )}
+    </Flex>
+  )
+}
+
+export default DialogFooter

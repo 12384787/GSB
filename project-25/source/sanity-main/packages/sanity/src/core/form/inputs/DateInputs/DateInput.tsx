@@ -1,0 +1,67 @@
+import {DEFAULT_DATE_FORMAT, format, parse} from '@sanity/util/legacyDateFormat'
+import {useCallback, useMemo, useState} from 'react'
+
+import {type CalendarLabels} from '../../../components/inputs/DateInputs/calendar/types'
+import {type TimeZoneScope} from '../../../hooks/useTimeZone'
+import {useTranslation} from '../../../i18n/hooks/useTranslation'
+import {set, unset} from '../../patch/patch'
+import {useReportParseError} from '../../studio/contexts/ParseErrors'
+import {type StringInputProps} from '../../types/inputProps'
+import {CommonDateTimeInput} from './CommonDateTimeInput'
+import {getCalendarLabels} from './utils'
+
+/**
+ * @hidden
+ * @beta */
+export type DateInputProps = StringInputProps
+
+const deserialize = (value: string) => parse(value, DEFAULT_DATE_FORMAT)
+const serialize = (date: Date) => format(date, DEFAULT_DATE_FORMAT)
+
+/**
+ * @hidden
+ * @beta */
+export function DateInput(props: DateInputProps) {
+  const {readOnly, onChange, schemaType, elementProps, value, id, path, validationError} = props
+  const dateFormat = schemaType.options?.dateFormat || DEFAULT_DATE_FORMAT
+  const {t} = useTranslation()
+  const timeZoneScope: TimeZoneScope = {type: 'input', id}
+
+  const [parseError, setParseError] = useState<string | null>(null)
+  useReportParseError(path, parseError)
+
+  const handleChange = useCallback(
+    (nextDate: string | null) => {
+      onChange(nextDate === null ? unset() : set(nextDate))
+    },
+    [onChange],
+  )
+
+  const formatInputValue = useCallback((date: Date) => format(date, dateFormat), [dateFormat])
+
+  const parseInputValue = useCallback(
+    (inputValue: string) => parse(inputValue, dateFormat),
+    [dateFormat],
+  )
+
+  const calendarLabels: CalendarLabels = useMemo(() => getCalendarLabels(t), [t])
+  return (
+    <CommonDateTimeInput
+      {...elementProps}
+      deserialize={deserialize}
+      formatInputValue={formatInputValue}
+      onChange={handleChange}
+      onParseError={setParseError}
+      parseInputValue={parseInputValue}
+      // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+      placeholder={schemaType.placeholder}
+      calendarLabels={calendarLabels}
+      readOnly={readOnly}
+      selectTime={false}
+      serialize={serialize}
+      value={value}
+      timeZoneScope={timeZoneScope}
+      validationError={validationError}
+    />
+  )
+}

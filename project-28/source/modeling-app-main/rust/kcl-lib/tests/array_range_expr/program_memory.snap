@@ -1,0 +1,279 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Variables in memory after executing array_range_expr.kcl
+---
+{
+  "five": {
+    "type": "Number",
+    "value": 5.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "four": {
+    "type": "Number",
+    "value": 4.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "r1": {
+    "type": "HomArray",
+    "value": [
+      {
+        "type": "Number",
+        "value": 0.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 1.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 2.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 3.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 4.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      }
+    ]
+  },
+  "r2": {
+    "type": "HomArray",
+    "value": [
+      {
+        "type": "Number",
+        "value": 0.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 1.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 2.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 3.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 4.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      }
+    ]
+  },
+  "r3": {
+    "type": "HomArray",
+    "value": [
+      {
+        "type": "Number",
+        "value": 0.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 1.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 2.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 3.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 4.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 5.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      }
+    ]
+  },
+  "r4": {
+    "type": "HomArray",
+    "value": [
+      {
+        "type": "Number",
+        "value": 1.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 2.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 3.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      },
+      {
+        "type": "Number",
+        "value": 4.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "mm",
+            "angle": "degrees"
+          }
+        }
+      }
+    ]
+  },
+  "zero": {
+    "type": "Number",
+    "value": 0.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  }
+}

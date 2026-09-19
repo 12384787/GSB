@@ -1,0 +1,58 @@
+import {type FieldDefinition, type StringSchemaType} from '@sanity/types'
+
+import {prepareDiffProps} from '../../src/core/form/store/formState'
+import {
+  type PrimitiveInputElementProps,
+  type StringInputProps,
+} from '../../src/core/form/types/inputProps'
+import {renderInput, type TestRenderInputContext, type TestRenderInputProps} from './renderInput'
+import {type TestRenderProps} from './types'
+
+const noopRenderDefault = () => <></>
+
+export type TestRenderStringInputCallback = (
+  inputProps: StringInputProps,
+  context: TestRenderInputContext,
+) => React.JSX.Element
+
+export async function renderStringInput(options: {
+  fieldDefinition: FieldDefinition<'date' | 'datetime' | 'string' | 'url'>
+  props?: TestRenderProps
+  render: TestRenderStringInputCallback
+}) {
+  const {fieldDefinition, props, render} = options
+
+  function transformProps(
+    inputProps: TestRenderInputProps<PrimitiveInputElementProps>,
+  ): StringInputProps {
+    const {schemaType, value, elementProps, ...restProps} = inputProps
+
+    // @ts-expect-error -- pre-existing, fix later
+    return {
+      ...restProps,
+      elementProps: {
+        ...elementProps,
+        value: value as string,
+      },
+      schemaType: schemaType as StringSchemaType,
+      value: value as string,
+      renderDefault: noopRenderDefault,
+      ...prepareDiffProps({
+        schemaType,
+        comparisonValue: value,
+        hasUpstreamVersion: false,
+        hasBaseVariant: false,
+      }),
+      changed: false,
+      changedFromBaseVariant: false,
+    }
+  }
+
+  const result = await renderInput<PrimitiveInputElementProps>({
+    fieldDefinition,
+    props,
+    render: (inputProps, context) => render(transformProps(inputProps), context),
+  })
+
+  return result
+}

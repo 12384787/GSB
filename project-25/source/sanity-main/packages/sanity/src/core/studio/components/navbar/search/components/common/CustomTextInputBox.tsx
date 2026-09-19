@@ -1,0 +1,27 @@
+import {css, styled} from 'styled-components'
+import {Box} from 'ui5'
+
+export const CustomTextInputBox = styled(Box)<{
+  $background?: boolean
+  $smallClearButton?: boolean
+}>(({$background, $smallClearButton}) => {
+  return css`
+    width: 100%;
+
+    input + span {
+      background: ${({theme}) =>
+        // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+        $background ? theme.sanity.color.card.disabled.bg2 : 'transparent'};
+    }
+
+    [data-qa='clear-button'] {
+      background: none;
+      box-shadow: none;
+      display: flex; /* TODO: hack, currently used to vertically center <TextInput>'s clearButton */
+      transform: ${$smallClearButton ? 'scale(0.8)' : 'scale(1)'};
+      &:hover {
+        opacity: 0.5;
+      }
+    }
+  `
+})

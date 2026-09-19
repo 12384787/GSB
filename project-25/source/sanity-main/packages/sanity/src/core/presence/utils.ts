@@ -1,0 +1,12 @@
+import {AVATAR_DISTANCE, AVATAR_SIZE} from './constants'
+
+export const splitRight = <T>(array: T[], max: number): [T[], T[]] => {
+  const indexFromMax = array.length > max ? max - 1 : max
+  const idx = Math.max(0, array.length - indexFromMax)
+  return [array.slice(0, idx), array.slice(idx)]
+}
+
+/** @internal */
+export function calcAvatarStackWidth(len: number): number {
+  return -AVATAR_DISTANCE + (AVATAR_SIZE + AVATAR_DISTANCE) * len
+}

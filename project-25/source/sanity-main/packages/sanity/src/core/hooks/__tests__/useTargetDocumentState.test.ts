@@ -1,0 +1,746 @@
+import {describe, expect, it} from 'vitest'
+
+import {type VersionInfoDocumentStub} from '../../releases/store/types'
+import {
+  variantAlphaAudience,
+  variantNorwegianMarket,
+} from '../../variants/__fixtures__/variants.fixture'
+import {
+  getCreatableVariantTarget,
+  getPairTarget,
+  getTargetDocumentState,
+  getTargetScopeId,
+  getTargetSiblings,
+  type TargetDocumentSiblings,
+} from '../useTargetDocumentState'
+
+const PUBLISHED_ID = 'article-1'
+const RELEASE_ID = 'rSummer'
+const RELEASE_2_ID = 'rWinter'
+const MISSING_RELEASE_ID = 'rAutumn'
+const AGENT_BUNDLE_ID = 'agent-run-1'
+const groupRef = {_type: 'reference', _ref: PUBLISHED_ID, _weak: true} as const
+const variantRef = (variantId: string) =>
+  ({_type: 'reference', _ref: variantId, _weak: true}) as const
+
+const versionStub = (
+  stub: Pick<VersionInfoDocumentStub, '_id' | '_system'>,
+): VersionInfoDocumentStub => ({
+  _rev: '',
+  _createdAt: '',
+  _updatedAt: '',
+  _type: 'article',
+  ...stub,
+})
+
+const publishedBase = versionStub({
+  _id: PUBLISHED_ID,
+  _system: {group: groupRef},
+})
+const draftBase = versionStub({
+  _id: `drafts.${PUBLISHED_ID}`,
+  _system: {bundleId: 'drafts', group: groupRef},
+})
+const releaseVersion = versionStub({
+  _id: `versions.${RELEASE_ID}.${PUBLISHED_ID}`,
+  _system: {
+    bundleId: RELEASE_ID,
+    release: {_ref: `_.releases.${RELEASE_ID}`, _weak: true},
+    group: groupRef,
+    scopeId: RELEASE_ID,
+  },
+})
+const release2Version = versionStub({
+  _id: `versions.${RELEASE_2_ID}.${PUBLISHED_ID}`,
+  _system: {
+    bundleId: RELEASE_2_ID,
+    release: {_ref: `_.releases.${RELEASE_2_ID}`, _weak: true},
+    group: groupRef,
+    scopeId: RELEASE_2_ID,
+  },
+})
+const agentBundleVersion = versionStub({
+  _id: `versions.${AGENT_BUNDLE_ID}.${PUBLISHED_ID}`,
+  _system: {
+    bundleId: AGENT_BUNDLE_ID,
+    group: groupRef,
+    scopeId: AGENT_BUNDLE_ID,
+  },
+})
+const draftAlphaVariant = versionStub({
+  _id: `versions.varscope.${PUBLISHED_ID}`,
+  _system: {
+    bundleId: 'drafts',
+    variant: variantRef(variantAlphaAudience._id),
+    group: groupRef,
+    scopeId: 'varscope',
+  },
+})
+// The variant-of-published sibling: same variant, no bundleId.
+const publishedAlphaVariant = versionStub({
+  _id: `versions.varscopePub.${PUBLISHED_ID}`,
+  _system: {
+    variant: variantRef(variantAlphaAudience._id),
+    group: groupRef,
+    scopeId: 'varscopePub',
+  },
+})
+const publishedBetaVariant = versionStub({
+  _id: `versions.varscopeBetaPub.${PUBLISHED_ID}`,
+  _system: {
+    variant: variantRef(variantNorwegianMarket._id),
+    group: groupRef,
+    scopeId: 'varscopeBetaPub',
+  },
+})
+// A variant-of-published sibling advertising the (stable, server-generated) id its drafts-bundle
+// sibling will occupy — the enabler for creating the draft variant by typing.
+const DRAFT_SIBLING_ID = `versions.varscopeDraft.${PUBLISHED_ID}`
+const publishedAlphaVariantAdvertisingDraft = versionStub({
+  _id: `versions.varscopePub.${PUBLISHED_ID}`,
+  _system: {
+    variant: variantRef(variantAlphaAudience._id),
+    group: groupRef,
+    scopeId: 'varscopePub',
+    draft: {_ref: DRAFT_SIBLING_ID, _weak: true},
+  },
+})
+
+const baseOptions = {
+  bundle: 'drafts' as const,
+  selectedVariant: undefined,
+  selectedVariantName: undefined,
+  variantsLoading: false,
+  versions: [publishedBase, draftBase, releaseVersion, draftAlphaVariant],
+  versionsLoading: false,
+}
+
+const variantOptions = {
+  ...baseOptions,
+  selectedVariant: variantAlphaAudience,
+  selectedVariantName: 'alpha-audience',
+}
+
+function siblings(partial: Partial<TargetDocumentSiblings> = {}): TargetDocumentSiblings {
+  return {
+    published: undefined,
+    draft: undefined,
+    version: undefined,
+    ...partial,
+  }
+}
+
+describe('getTargetDocumentState', () => {
+  describe('without a requested variant', () => {
+    it('resolves while version stubs are loading', () => {
+      expect(getTargetDocumentState({...baseOptions, versionsLoading: true})).toEqual({
+        status: 'resolving',
+      })
+    })
+
+    it('is ready with the base draft stub (no scopeId) on the drafts bundle', () => {
+      expect(getTargetDocumentState(baseOptions)).toEqual({
+        status: 'ready',
+        targetDocument: draftBase,
+        scopeId: undefined,
+        variant: undefined,
+        siblings: siblings({published: publishedBase, draft: draftBase}),
+      })
+    })
+
+    it('is ready with the release stub and release scopeId on a release bundle', () => {
+      expect(getTargetDocumentState({...baseOptions, bundle: RELEASE_ID})).toEqual({
+        status: 'ready',
+        targetDocument: releaseVersion,
+        scopeId: RELEASE_ID,
+        variant: undefined,
+        siblings: siblings({
+          published: publishedBase,
+          draft: draftBase,
+          version: releaseVersion,
+        }),
+      })
+    })
+
+    it('is ready with no target document when nothing exists for the bundle', () => {
+      expect(
+        getTargetDocumentState({...baseOptions, versions: [publishedBase], bundle: 'drafts'}),
+      ).toEqual({
+        status: 'ready',
+        targetDocument: undefined,
+        scopeId: undefined,
+        variant: undefined,
+        siblings: siblings({published: publishedBase}),
+      })
+    })
+  })
+
+  describe('with a requested variant', () => {
+    it('resolves while variant definitions are loading, before consulting version stubs', () => {
+      expect(
+        getTargetDocumentState({
+          ...variantOptions,
+          selectedVariant: undefined,
+          variantsLoading: true,
+        }),
+      ).toEqual({status: 'resolving'})
+    })
+
+    it('resolves while version stubs are loading', () => {
+      expect(getTargetDocumentState({...variantOptions, versionsLoading: true})).toEqual({
+        status: 'resolving',
+      })
+    })
+
+    it('surfaces a missing variant definition instead of falling back to no-variant', () => {
+      expect(getTargetDocumentState({...variantOptions, selectedVariant: undefined})).toEqual({
+        status: 'variant-definition-document-not-found',
+        requestedVariantName: 'alpha-audience',
+      })
+    })
+
+    it('is ready with the variant stub and its scopeId when the target exists', () => {
+      expect(getTargetDocumentState(variantOptions)).toEqual({
+        status: 'ready',
+        targetDocument: draftAlphaVariant,
+        scopeId: 'varscope',
+        variant: variantAlphaAudience,
+        siblings: siblings({draft: draftAlphaVariant}),
+      })
+    })
+
+    it('is variant-missing when no variant-scoped version exists for the bundle', () => {
+      // The variant document exists in the drafts bundle only; the published bundle has no target.
+      expect(getTargetDocumentState({...variantOptions, bundle: 'published'})).toEqual({
+        status: 'variant-missing',
+        variant: variantAlphaAudience,
+        bundle: 'published',
+        siblings: siblings({draft: draftAlphaVariant}),
+      })
+    })
+
+    it('exposes the variant-of-published sibling when the variant is published', () => {
+      const versions = [...variantOptions.versions, publishedAlphaVariant]
+
+      // Drafts-scoped target: the sibling rides along for publish-state gating.
+      expect(getTargetDocumentState({...variantOptions, versions})).toEqual({
+        status: 'ready',
+        targetDocument: draftAlphaVariant,
+        scopeId: 'varscope',
+        variant: variantAlphaAudience,
+        siblings: siblings({published: publishedAlphaVariant, draft: draftAlphaVariant}),
+      })
+
+      // Published bundle: the target IS the sibling.
+      expect(getTargetDocumentState({...variantOptions, versions, bundle: 'published'})).toEqual({
+        status: 'ready',
+        targetDocument: publishedAlphaVariant,
+        scopeId: 'varscopePub',
+        variant: variantAlphaAudience,
+        siblings: siblings({published: publishedAlphaVariant, draft: draftAlphaVariant}),
+      })
+    })
+
+    it('reports the release-scoped variant as siblings.version', () => {
+      const releaseAlphaVariant = versionStub({
+        _id: `versions.varscopeRel.${PUBLISHED_ID}`,
+        _system: {
+          bundleId: RELEASE_ID,
+          variant: variantRef(variantAlphaAudience._id),
+          group: groupRef,
+          scopeId: 'varscopeRel',
+        },
+      })
+      const versions = [
+        publishedBase,
+        draftBase,
+        publishedAlphaVariant,
+        draftAlphaVariant,
+        releaseAlphaVariant,
+      ]
+
+      expect(getTargetDocumentState({...variantOptions, versions, bundle: RELEASE_ID})).toEqual({
+        status: 'ready',
+        targetDocument: releaseAlphaVariant,
+        scopeId: 'varscopeRel',
+        variant: variantAlphaAudience,
+        siblings: siblings({
+          published: publishedAlphaVariant,
+          draft: draftAlphaVariant,
+          version: releaseAlphaVariant,
+        }),
+      })
+    })
+
+    it('exposes the sibling on variant-missing so consumers can tell published-elsewhere from never-existed', () => {
+      // No drafts-scoped variant, but the published variant exists.
+      const versions = [publishedBase, draftBase, publishedAlphaVariant]
+
+      expect(getTargetDocumentState({...variantOptions, versions})).toEqual({
+        status: 'variant-missing',
+        variant: variantAlphaAudience,
+        bundle: 'drafts',
+        siblings: siblings({published: publishedAlphaVariant}),
+      })
+    })
+
+    describe('creatable target (advertised draft sibling id)', () => {
+      // No drafts-scoped variant; the published variant advertises its draft sibling id.
+      const versions = [publishedBase, draftBase, publishedAlphaVariantAdvertisingDraft]
+
+      it('resolves the creatable target on the drafts bundle', () => {
+        expect(getTargetDocumentState({...variantOptions, versions})).toEqual({
+          status: 'variant-missing',
+          variant: variantAlphaAudience,
+          bundle: 'drafts',
+          siblings: siblings({published: publishedAlphaVariantAdvertisingDraft}),
+          creatableTarget: {id: DRAFT_SIBLING_ID, scopeId: 'varscopeDraft'},
+        })
+      })
+
+      it('does not resolve a creatable target for non-drafts bundles', () => {
+        const releaseState = getTargetDocumentState({
+          ...variantOptions,
+          versions,
+          bundle: RELEASE_ID,
+        })
+        expect(releaseState.status).toBe('variant-missing')
+        expect(
+          releaseState.status === 'variant-missing' && releaseState.creatableTarget,
+        ).toBeUndefined()
+      })
+
+      it('does not resolve a creatable target when the sibling advertises no draft id', () => {
+        const state = getTargetDocumentState({
+          ...variantOptions,
+          versions: [publishedBase, draftBase, publishedAlphaVariant],
+        })
+        expect(state.status === 'variant-missing' && state.creatableTarget).toBeUndefined()
+      })
+
+      it('is not creatable once the draft variant exists (regular ready target)', () => {
+        expect(
+          getTargetDocumentState({
+            ...variantOptions,
+            versions: [...versions, draftAlphaVariant],
+          }),
+        ).toEqual({
+          status: 'ready',
+          targetDocument: draftAlphaVariant,
+          scopeId: 'varscope',
+          variant: variantAlphaAudience,
+          siblings: siblings({
+            published: publishedAlphaVariantAdvertisingDraft,
+            draft: draftAlphaVariant,
+          }),
+        })
+      })
+    })
+
+    describe('live-edit', () => {
+      it('resolves the published variant instead of a creatable draft', () => {
+        const versions = [publishedBase, draftBase, publishedAlphaVariantAdvertisingDraft]
+
+        expect(getTargetDocumentState({...variantOptions, versions, liveEdit: true})).toEqual({
+          status: 'ready',
+          targetDocument: publishedAlphaVariantAdvertisingDraft,
+          scopeId: 'varscopePub',
+          variant: variantAlphaAudience,
+          siblings: siblings({published: publishedAlphaVariantAdvertisingDraft}),
+        })
+      })
+
+      it('keeps the leftover draft as the target so obsolete-draft handling can address it', () => {
+        const versions = [
+          publishedBase,
+          draftBase,
+          publishedAlphaVariantAdvertisingDraft,
+          draftAlphaVariant,
+        ]
+
+        expect(getTargetDocumentState({...variantOptions, versions, liveEdit: true})).toEqual({
+          status: 'ready',
+          targetDocument: draftAlphaVariant,
+          scopeId: 'varscope',
+          variant: variantAlphaAudience,
+          siblings: siblings({
+            published: publishedAlphaVariantAdvertisingDraft,
+            draft: draftAlphaVariant,
+          }),
+        })
+      })
+
+      it('keeps the leftover draft when the published variant is missing', () => {
+        expect(
+          getTargetDocumentState({
+            ...variantOptions,
+            versions: [publishedBase, draftBase, draftAlphaVariant],
+            liveEdit: true,
+          }),
+        ).toEqual({
+          status: 'ready',
+          targetDocument: draftAlphaVariant,
+          scopeId: 'varscope',
+          variant: variantAlphaAudience,
+          siblings: siblings({draft: draftAlphaVariant}),
+        })
+      })
+
+      it('does not offer a creatable draft when the published variant is missing', () => {
+        const state = getTargetDocumentState({
+          ...variantOptions,
+          versions: [publishedBase, draftBase],
+          liveEdit: true,
+        })
+
+        expect(state).toEqual({
+          status: 'variant-missing',
+          variant: variantAlphaAudience,
+          bundle: 'drafts',
+          siblings: siblings(),
+        })
+        expect(state.status === 'variant-missing' && state.creatableTarget).toBeUndefined()
+      })
+
+      it('does not remap a release bundle', () => {
+        const releaseAlphaVariant = versionStub({
+          _id: `versions.varscopeRel.${PUBLISHED_ID}`,
+          _system: {
+            bundleId: RELEASE_ID,
+            variant: variantRef(variantAlphaAudience._id),
+            group: groupRef,
+            scopeId: 'varscopeRel',
+          },
+        })
+
+        expect(
+          getTargetDocumentState({
+            ...variantOptions,
+            versions: [publishedBase, draftBase, publishedAlphaVariant, releaseAlphaVariant],
+            bundle: RELEASE_ID,
+            liveEdit: true,
+          }),
+        ).toEqual({
+          status: 'ready',
+          targetDocument: releaseAlphaVariant,
+          scopeId: 'varscopeRel',
+          variant: variantAlphaAudience,
+          siblings: siblings({
+            published: publishedAlphaVariant,
+            version: releaseAlphaVariant,
+          }),
+        })
+      })
+    })
+  })
+
+  describe('sibling isolation across a mixed inventory', () => {
+    // No published default: a published variant must never occupy the default published slot.
+    // No release-scoped variant A: looking at A in release 1 must leave version empty.
+    const mixedVersions = [
+      draftBase,
+      releaseVersion,
+      release2Version,
+      agentBundleVersion,
+      publishedAlphaVariant,
+      draftAlphaVariant,
+      publishedBetaVariant,
+    ]
+    const mixedOptions = {...baseOptions, versions: mixedVersions}
+
+    it.each([
+      {
+        name: 'default / drafts reports only the default draft',
+        bundle: 'drafts' as const,
+        selectedVariant: undefined,
+        selectedVariantName: undefined,
+        expected: {
+          status: 'ready' as const,
+          targetDocument: draftBase,
+          scopeId: undefined,
+          variant: undefined,
+          siblings: siblings({draft: draftBase}),
+        },
+      },
+      {
+        name: 'default / published does not treat a published variant as the default published',
+        bundle: 'published' as const,
+        selectedVariant: undefined,
+        selectedVariantName: undefined,
+        expected: {
+          status: 'ready' as const,
+          targetDocument: undefined,
+          scopeId: undefined,
+          variant: undefined,
+          siblings: siblings({draft: draftBase}),
+        },
+      },
+      {
+        name: 'default / release 1 reports the release in version and keeps the default draft',
+        bundle: RELEASE_ID,
+        selectedVariant: undefined,
+        selectedVariantName: undefined,
+        expected: {
+          status: 'ready' as const,
+          targetDocument: releaseVersion,
+          scopeId: RELEASE_ID,
+          variant: undefined,
+          siblings: siblings({draft: draftBase, version: releaseVersion}),
+        },
+      },
+      {
+        name: 'default / release 3 leaves version empty when that release has no document',
+        bundle: MISSING_RELEASE_ID,
+        selectedVariant: undefined,
+        selectedVariantName: undefined,
+        expected: {
+          status: 'ready' as const,
+          targetDocument: undefined,
+          scopeId: undefined,
+          variant: undefined,
+          siblings: siblings({draft: draftBase}),
+        },
+      },
+      {
+        name: 'default / agent bundle reports the agent document in version',
+        bundle: AGENT_BUNDLE_ID,
+        selectedVariant: undefined,
+        selectedVariantName: undefined,
+        expected: {
+          status: 'ready' as const,
+          targetDocument: agentBundleVersion,
+          scopeId: AGENT_BUNDLE_ID,
+          variant: undefined,
+          siblings: siblings({draft: draftBase, version: agentBundleVersion}),
+        },
+      },
+      {
+        name: 'variant A / drafts reports only A published and draft, never the default draft',
+        bundle: 'drafts' as const,
+        selectedVariant: variantAlphaAudience,
+        selectedVariantName: 'alpha-audience',
+        expected: {
+          status: 'ready' as const,
+          targetDocument: draftAlphaVariant,
+          scopeId: 'varscope',
+          variant: variantAlphaAudience,
+          siblings: siblings({published: publishedAlphaVariant, draft: draftAlphaVariant}),
+        },
+      },
+      {
+        name: 'variant B / drafts reports only B published, with no draft',
+        bundle: 'drafts' as const,
+        selectedVariant: variantNorwegianMarket,
+        selectedVariantName: 'norwegian-market',
+        expected: {
+          status: 'variant-missing' as const,
+          variant: variantNorwegianMarket,
+          bundle: 'drafts' as const,
+          siblings: siblings({published: publishedBetaVariant}),
+        },
+      },
+      {
+        name: 'variant A / release 1 leaves version empty when A has no release-scoped document',
+        bundle: RELEASE_ID,
+        selectedVariant: variantAlphaAudience,
+        selectedVariantName: 'alpha-audience',
+        expected: {
+          status: 'variant-missing' as const,
+          variant: variantAlphaAudience,
+          bundle: RELEASE_ID,
+          siblings: siblings({published: publishedAlphaVariant, draft: draftAlphaVariant}),
+        },
+      },
+    ])('$name', ({bundle, selectedVariant, selectedVariantName, expected}) => {
+      expect(
+        getTargetDocumentState({
+          ...mixedOptions,
+          bundle,
+          selectedVariant,
+          selectedVariantName,
+        }),
+      ).toEqual(expected)
+    })
+  })
+})
+
+describe('getTargetScopeId', () => {
+  it('returns the scopeId only for ready states', () => {
+    expect(getTargetScopeId(getTargetDocumentState(variantOptions))).toBe('varscope')
+    expect(getTargetScopeId(getTargetDocumentState(baseOptions))).toBeUndefined()
+    expect(
+      getTargetScopeId(getTargetDocumentState({...variantOptions, versionsLoading: true})),
+    ).toBeUndefined()
+    expect(
+      getTargetScopeId(getTargetDocumentState({...variantOptions, bundle: 'published'})),
+    ).toBeUndefined()
+  })
+
+  it('returns the advertised draft scope for a creatable missing variant', () => {
+    const state = getTargetDocumentState({
+      ...variantOptions,
+      versions: [publishedBase, draftBase, publishedAlphaVariantAdvertisingDraft],
+    })
+    expect(getTargetScopeId(state)).toBe('varscopeDraft')
+  })
+
+  it('returns undefined for a non-creatable missing variant', () => {
+    const state = getTargetDocumentState({
+      ...variantOptions,
+      versions: [publishedBase, draftBase, publishedAlphaVariant],
+    })
+    expect(getTargetScopeId(state)).toBeUndefined()
+  })
+
+  it('returns the leftover draft scope for live-edit when a draft sibling exists', () => {
+    const state = getTargetDocumentState({
+      ...variantOptions,
+      versions: [
+        publishedBase,
+        draftBase,
+        publishedAlphaVariantAdvertisingDraft,
+        draftAlphaVariant,
+      ],
+      liveEdit: true,
+    })
+    expect(getTargetScopeId(state)).toBe('varscope')
+  })
+})
+
+describe('getCreatableVariantTarget', () => {
+  it('returns the creatable target only for a variant-missing state that has one', () => {
+    expect(
+      getCreatableVariantTarget(
+        getTargetDocumentState({
+          ...variantOptions,
+          versions: [publishedBase, draftBase, publishedAlphaVariantAdvertisingDraft],
+        }),
+      ),
+    ).toEqual({id: DRAFT_SIBLING_ID, scopeId: 'varscopeDraft'})
+
+    expect(getCreatableVariantTarget(getTargetDocumentState(variantOptions))).toBeUndefined()
+    expect(getCreatableVariantTarget(getTargetDocumentState(baseOptions))).toBeUndefined()
+    expect(
+      getCreatableVariantTarget(
+        getTargetDocumentState({
+          ...variantOptions,
+          versions: [publishedBase, draftBase, publishedAlphaVariant],
+        }),
+      ),
+    ).toBeUndefined()
+  })
+})
+
+describe('getTargetSiblings', () => {
+  it('returns siblings for ready and variant-missing states', () => {
+    expect(getTargetSiblings(getTargetDocumentState(baseOptions))).toEqual(
+      siblings({published: publishedBase, draft: draftBase}),
+    )
+    expect(getTargetSiblings(getTargetDocumentState(variantOptions))).toEqual(
+      siblings({draft: draftAlphaVariant}),
+    )
+    expect(
+      getTargetSiblings(getTargetDocumentState({...variantOptions, bundle: 'published'})),
+    ).toEqual(siblings({draft: draftAlphaVariant}))
+  })
+
+  it('returns undefined while resolving or when the variant definition is missing', () => {
+    expect(
+      getTargetSiblings(getTargetDocumentState({...baseOptions, versionsLoading: true})),
+    ).toBeUndefined()
+    expect(
+      getTargetSiblings(getTargetDocumentState({...variantOptions, selectedVariant: undefined})),
+    ).toBeUndefined()
+  })
+})
+
+describe('getPairTarget', () => {
+  it('maps resolving to the unresolved guarded target', () => {
+    expect(
+      getPairTarget(getTargetDocumentState({...variantOptions, versionsLoading: true})),
+    ).toEqual({kind: 'unresolved'})
+    expect(getPairTarget(getTargetDocumentState({...baseOptions, versionsLoading: true}))).toEqual({
+      kind: 'unresolved',
+    })
+  })
+
+  it('maps a missing variant target to target-missing with the variant id', () => {
+    expect(getPairTarget(getTargetDocumentState({...variantOptions, bundle: 'published'}))).toEqual(
+      {kind: 'target-missing', variantId: variantAlphaAudience._id},
+    )
+  })
+
+  it('maps an invalid variant selection to target-missing', () => {
+    expect(
+      getPairTarget(getTargetDocumentState({...variantOptions, selectedVariant: undefined})),
+    ).toEqual({kind: 'target-missing'})
+  })
+
+  it('maps a resolved variant target to the variant kind', () => {
+    expect(getPairTarget(getTargetDocumentState(variantOptions))).toEqual({
+      kind: 'variant',
+      scopeId: 'varscope',
+      variantId: variantAlphaAudience._id,
+    })
+  })
+
+  it('maps a creatable missing variant to the variant kind with allowCreate', () => {
+    expect(
+      getPairTarget(
+        getTargetDocumentState({
+          ...variantOptions,
+          versions: [publishedBase, draftBase, publishedAlphaVariantAdvertisingDraft],
+        }),
+      ),
+    ).toEqual({
+      kind: 'variant',
+      scopeId: 'varscopeDraft',
+      variantId: variantAlphaAudience._id,
+      allowCreate: true,
+    })
+  })
+
+  it('maps a live-edit drafts variant to the published sibling without allowCreate', () => {
+    expect(
+      getPairTarget(
+        getTargetDocumentState({
+          ...variantOptions,
+          versions: [publishedBase, draftBase, publishedAlphaVariantAdvertisingDraft],
+          liveEdit: true,
+        }),
+      ),
+    ).toEqual({
+      kind: 'variant',
+      scopeId: 'varscopePub',
+      variantId: variantAlphaAudience._id,
+    })
+  })
+
+  it('maps a live-edit leftover draft to the draft sibling without allowCreate', () => {
+    expect(
+      getPairTarget(
+        getTargetDocumentState({
+          ...variantOptions,
+          versions: [
+            publishedBase,
+            draftBase,
+            publishedAlphaVariantAdvertisingDraft,
+            draftAlphaVariant,
+          ],
+          liveEdit: true,
+        }),
+      ),
+    ).toEqual({
+      kind: 'variant',
+      scopeId: 'varscope',
+      variantId: variantAlphaAudience._id,
+    })
+  })
+
+  it('maps non-variant ready states to the plain scope id', () => {
+    expect(getPairTarget(getTargetDocumentState(baseOptions))).toBeUndefined()
+    expect(getPairTarget(getTargetDocumentState({...baseOptions, bundle: RELEASE_ID}))).toBe(
+      RELEASE_ID,
+    )
+  })
+})

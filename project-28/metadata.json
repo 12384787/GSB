@@ -1,0 +1,10 @@
+{
+  "number": 28,
+  "repository": "KittyCAD/modeling-app",
+  "url": "https://github.com/KittyCAD/modeling-app",
+  "description": "The Zoo Design Studio app.",
+  "language": "TypeScript",
+  "stars": 1300,
+  "default_branch": "main",
+  "source_zip_url": "https://github.com/KittyCAD/modeling-app/archive/refs/heads/main.zip"
+}

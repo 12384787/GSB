@@ -1,0 +1,100 @@
+import {type OnPasteFn, type PortableTextBlock} from '@portabletext/editor'
+import {htmlToPortableText} from '@portabletext/html'
+import {useCallback, useMemo} from 'react'
+import {PortableTextInput, type PortableTextInputProps, type PortableTextMarker} from 'sanity'
+
+import {renderBlockActions} from './blockActions'
+import {renderCustomMarkers} from './customMarkers'
+
+export function CustomContentInput(inputProps: PortableTextInputProps) {
+  const {value} = inputProps
+
+  // @ts-expect-error -- pre-existing, fix later
+  const handlePaste: OnPasteFn = useCallback((input) => {
+    const {event, schemaTypes, path} = input
+    const html = event.clipboardData.getData('text/html')
+    // check if schema has the code type
+    const hasCodeType = schemaTypes.blockObjects.map(({name}) => name).includes('code')
+    if (!hasCodeType) {
+      console.log('Run `sanity install @sanity/code-input, and add `type: "code"` to your schema.')
+    }
+    if (html && hasCodeType) {
+      const blocks = htmlToPortableText(html, {
+        schema: schemaTypes,
+        rules: [
+          {
+            deserialize(el, next, block) {
+              if (
+                !(el instanceof HTMLElement) ||
+                (el.tagName && el.tagName.toLowerCase() !== 'pre')
+              ) {
+                return undefined
+              }
+              const code = el.children[0]
+              const childNodes =
+                code && code.tagName.toLowerCase() === 'code' ? code.childNodes : el.childNodes
+              let text = ''
+              childNodes.forEach((node) => {
+                text += node.textContent
+              })
+              /**
+               * Return this as an own block (via block helper function),
+               * instead of appending it to a default block's children
+               */
+              return block({
+                _type: 'code',
+                code: text,
+              })
+            },
+          },
+        ],
+      }) as PortableTextBlock[]
+      // Only paste this if it contains a single code block
+      if (blocks.length === 1 && blocks[0]._type !== 'code') {
+        return undefined
+      }
+      // return an insert patch
+      return {insert: blocks, path}
+    }
+    return undefined
+  }, [])
+
+  // Extract markers from content
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+  const markers: PortableTextMarker[] = useMemo(() => {
+    // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+    const ret: PortableTextMarker[] = []
+
+    if (!value) return ret
+
+    for (const block of value) {
+      // @ts-expect-error -- pre-existing, fix later
+      if (block.comments) {
+        // @ts-expect-error -- pre-existing, fix later
+        for (const comment of block.comments) {
+          ret.push({
+            type: 'comment',
+            data: comment,
+            path: [{_key: block._key}],
+          })
+        }
+      }
+    }
+
+    return ret
+  }, [value])
+
+  return (
+    <PortableTextInput
+      {...inputProps}
+      // @ts-expect-error -- pre-existing, fix later
+      onPaste={handlePaste}
+      // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+      markers={markers}
+      // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+      renderBlockActions={renderBlockActions}
+      // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+      renderCustomMarkers={renderCustomMarkers}
+    />
+  )
+}

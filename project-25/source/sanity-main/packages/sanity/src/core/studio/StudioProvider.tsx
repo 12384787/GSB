@@ -1,0 +1,174 @@
+import {DeferredTelemetryProvider} from '@sanity/telemetry/react'
+import {ToastProvider} from '@sanity/ui/toast'
+import {type ReactNode, useEffect, useMemo} from 'react'
+
+import {LoadingBlock} from '../components/loadingBlock/LoadingBlock'
+import {errorReporter} from '../error/errorReporter'
+import {LocaleProvider} from '../i18n/components/LocaleProvider'
+import {AssetLimitUpsellProvider} from '../limits/context/assets/AssetLimitUpsellProvider'
+import {DocumentLimitUpsellProvider} from '../limits/context/documents/DocumentLimitUpsellProvider'
+import {GlobalPerspectiveProvider} from '../perspective/GlobalPerspectiveProvider'
+import {ResourceCacheProvider} from '../store/ResourceCacheProvider'
+import {AppIdCacheProvider} from '../store/studio-app/AppIdCacheProvider'
+import {UserApplicationCacheProvider} from '../store/userApplications'
+import {UserColorManagerProvider} from '../user-color/provider'
+import {ActiveWorkspaceMatcher} from './activeWorkspaceMatcher/ActiveWorkspaceMatcher'
+import {AuthBoundary} from './AuthBoundary'
+import {ColorSchemeProvider} from './colorScheme'
+import {ComlinkRouteHandler} from './components/ComlinkRouteHandler'
+import {Z_OFFSET} from './constants'
+import {LiveUserApplicationProvider} from './liveUserApplication/LiveUserApplicationProvider'
+import {LiveManifestRegisterProvider} from './manifest'
+import {PackageVersionStatusProvider} from './packageVersionStatus/PackageVersionStatusProvider'
+import {AuthenticateScreen} from './screens/AuthenticateScreen'
+import {ConfigErrorsScreen} from './screens/ConfigErrorsScreen'
+import {NotAuthenticatedScreen} from './screens/NotAuthenticatedScreen'
+import {NotFoundScreen} from './screens/NotFoundScreen'
+import {type StudioProps} from './Studio'
+import {StudioAnnouncementsProvider} from './studioAnnouncements/StudioAnnouncementsProvider'
+import {StudioErrorBoundary} from './StudioErrorBoundary'
+import {StudioRootErrorHandler} from './StudioRootErrorHandler'
+import {StudioThemeProvider} from './StudioThemeProvider'
+import {StudioTelemetryProvider} from './telemetry/StudioTelemetryProvider'
+import {UnclaimedProjectProvider} from './unclaimedProject/UnclaimedProjectProvider'
+import {WorkspaceLoader} from './workspaceLoader/WorkspaceLoader'
+import {ConfigErrorGate} from './workspaces/ConfigErrorGate'
+import {VisibleWorkspacesProvider} from './workspaces/VisibleWorkspacesProvider'
+import {WorkspacesProvider} from './workspaces/WorkspacesProvider'
+
+/**
+ * @hidden
+ * @beta */
+export interface StudioProviderProps extends StudioProps {
+  children: ReactNode
+}
+
+/**
+ * @hidden
+ * @beta */
+export function StudioProvider({
+  children,
+  config,
+  basePath,
+  onSchemeChange,
+  scheme,
+  unstable_history: history,
+  unstable_noAuthBoundary: noAuthBoundary,
+}: StudioProviderProps) {
+  // Run in an effect to keep render pure; both calls are idempotent and buffer/guard
+  // their own work, so StrictMode's double mount is safe.
+  useEffect(() => {
+    errorReporter.initialize()
+    ensureRefractorLanguages()
+  }, [])
+
+  // First workspace's projectId — used by CorsOriginErrorScreen to decide
+  // whether to surface the "Register studio" option (only valid when the
+  // failing project matches the studio's primary project).
+  const primaryProjectId = useMemo(() => {
+    const first = Array.isArray(config) ? config[0] : config
+    return first?.projectId
+  }, [config])
+
+  const _children = useMemo(
+    () => (
+      <UserApplicationCacheProvider>
+        <LiveUserApplicationProvider>
+          <LiveManifestRegisterProvider />
+          <WorkspaceLoader
+            LoadingComponent={LoadingBlock}
+            ConfigErrorsComponent={ConfigErrorsScreen}
+          >
+            <LocaleProvider>
+              <PackageVersionStatusProvider>
+                <ResourceCacheProvider>
+                  <StudioTelemetryProvider>
+                    <AppIdCacheProvider>
+                      <ComlinkRouteHandler />
+                      <StudioAnnouncementsProvider>
+                        <GlobalPerspectiveProvider>
+                          <DocumentLimitUpsellProvider>
+                            <AssetLimitUpsellProvider>
+                              <UnclaimedProjectProvider>{children}</UnclaimedProjectProvider>
+                            </AssetLimitUpsellProvider>
+                          </DocumentLimitUpsellProvider>
+                        </GlobalPerspectiveProvider>
+                      </StudioAnnouncementsProvider>
+                    </AppIdCacheProvider>
+                  </StudioTelemetryProvider>
+                </ResourceCacheProvider>
+              </PackageVersionStatusProvider>
+            </LocaleProvider>
+          </WorkspaceLoader>
+        </LiveUserApplicationProvider>
+      </UserApplicationCacheProvider>
+    ),
+    [children],
+  )
+
+  return (
+    <DeferredTelemetryProvider>
+      <ColorSchemeProvider onSchemeChange={onSchemeChange} scheme={scheme}>
+        <ToastProvider paddingY={7} zOffset={Z_OFFSET.toast}>
+          <StudioErrorBoundary>
+            <StudioRootErrorHandler>
+              <WorkspacesProvider
+                config={config}
+                basePath={basePath}
+                LoadingComponent={LoadingBlock}
+                primaryProjectId={primaryProjectId}
+              >
+                <VisibleWorkspacesProvider>
+                  <ActiveWorkspaceMatcher
+                    unstable_history={history}
+                    NotFoundComponent={NotFoundScreen}
+                    LoadingComponent={LoadingBlock}
+                  >
+                    <StudioThemeProvider>
+                      <UserColorManagerProvider>
+                        <ConfigErrorGate>
+                          {noAuthBoundary ? (
+                            _children
+                          ) : (
+                            <AuthBoundary
+                              LoadingComponent={LoadingBlock}
+                              AuthenticateComponent={AuthenticateScreen}
+                              NotAuthenticatedComponent={NotAuthenticatedScreen}
+                            >
+                              {_children}
+                            </AuthBoundary>
+                          )}
+                        </ConfigErrorGate>
+                      </UserColorManagerProvider>
+                    </StudioThemeProvider>
+                  </ActiveWorkspaceMatcher>
+                </VisibleWorkspacesProvider>
+              </WorkspacesProvider>
+            </StudioRootErrorHandler>
+          </StudioErrorBoundary>
+        </ToastProvider>
+      </ColorSchemeProvider>
+    </DeferredTelemetryProvider>
+  )
+}
+
+let _refractorRegistered = false
+
+function ensureRefractorLanguages() {
+  if (_refractorRegistered) return
+  _refractorRegistered = true
+  void import('react-refractor').then(({registerLanguage}) =>
+    Promise.all([
+      import('refractor/bash'),
+      import('refractor/javascript'),
+      import('refractor/json'),
+      import('refractor/jsx'),
+      import('refractor/typescript'),
+      import('@sanity/prism-groq').then((m) => ({default: m.refractorGroq})),
+    ])
+      .then((languages) => languages.forEach((lang) => registerLanguage(lang.default)))
+      .catch((error) =>
+        console.warn('Failed to load syntax highlighting languages for code blocks', error),
+      ),
+  )
+}

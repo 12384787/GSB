@@ -1,0 +1,82 @@
+import {type PreviewValue} from '@sanity/types'
+import {type ElementType, type ReactNode, useMemo} from 'react'
+import {useObservable} from 'react-rx'
+import {of} from 'rxjs'
+
+import {useSchema} from '../../hooks/useSchema'
+import {usePerspective} from '../../perspective/usePerspective'
+import {getPreviewStateObservable} from '../../preview/utils/getPreviewStateObservable'
+import {useDocumentPreviewStore} from '../../store/datastores'
+
+interface PreviewHookOptions {
+  documentId: string
+  documentType: string
+  // to make sure that you can get the preview values for a document in a specific perspective stack
+  perspectiveStack: string[]
+  /**
+   * The variant to resolve the preview values in, as a bare variant id. Like `perspectiveStack`,
+   * this is explicit: callers that want the variant currently selected in the studio pass
+   * `usePerspective().selectedVariantName`.
+   */
+  variant?: string
+}
+
+interface PreviewHookValue {
+  isLoading: boolean
+  value: Partial<PreviewValue> | null
+}
+
+/** @internal */
+export function useDocumentPreviewValues(options: PreviewHookOptions): PreviewHookValue {
+  const {
+    documentId,
+    documentType,
+    perspectiveStack: perspectiveStackFromOptions,
+    variant,
+  } = options || {}
+  const schemaType = useSchema().get(documentType)
+
+  const documentPreviewStore = useDocumentPreviewStore()
+  // keeping it for now as to make sure that we can safely remove it later
+  // the reason to not remove it now is that it would cause a breaking change
+  // during run time and we want to avoid that for now (so we left the perspectiveStack in the props as mandatory)
+  // @TODO remove
+  const {perspectiveStack} = usePerspective()
+  const previewStateObservable = useMemo(() => {
+    if (!documentId || !schemaType) return of(null)
+    return getPreviewStateObservable(
+      documentPreviewStore,
+      schemaType,
+      documentId,
+      perspectiveStackFromOptions ?? perspectiveStack,
+      undefined,
+      variant,
+    )
+  }, [
+    documentId,
+    documentPreviewStore,
+    schemaType,
+    perspectiveStackFromOptions,
+    perspectiveStack,
+    variant,
+  ])
+  const previewState = useObservable(previewStateObservable, undefined)
+
+  const isLoading = previewState?.isLoading ?? true
+
+  const {snapshot} = previewState || {}
+  const documentTitle = snapshot?.title as string | undefined
+  const subtitle = snapshot?.subtitle as string | undefined
+  const description = snapshot?.description as string | undefined
+  const media = snapshot?.media as ReactNode | ElementType | undefined
+
+  return {
+    isLoading,
+    value: {
+      title: documentTitle,
+      subtitle,
+      media,
+      description,
+    },
+  }
+}

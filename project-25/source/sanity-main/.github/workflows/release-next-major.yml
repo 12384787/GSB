@@ -1,0 +1,96 @@
+name: Release @next-major
+
+on:
+  push:
+    branches:
+      - next-major
+
+permissions:
+  contents: read # for checkout
+
+jobs:
+  release-next-major:
+    concurrency:
+      group: release_next_major
+
+    permissions:
+      id-token: write # to enable use of OIDC for npm provenance
+    runs-on: ubuntu-latest
+    env:
+      TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+      TURBO_TEAM: ${{ vars.TURBO_TEAM }}
+      EXPECTED_NPM_USER: sanity-svc.npm
+    steps:
+      - uses: actions/create-github-app-token@v3
+        id: generate-token
+        with:
+          app-id: ${{ secrets.ECOSPARK_APP_ID }}
+          private-key: ${{ secrets.ECOSPARK_APP_PRIVATE_KEY }}
+
+      # Publish packages to npm under the `next-major` tag on new commits to the next-major branch.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup
+
+      - name: Bump next-major versions
+        run: pnpm --silent release-notes bump --preid=next-major
+
+      - name: Build
+        run: pnpm build --output-logs=full --log-order=grouped
+
+      - name: Set publishing config
+        run: pnpm config set '//registry.npmjs.org/:_authToken' "${NPM_PUBLISH_TOKEN}"
+        env:
+          NPM_PUBLISH_TOKEN: ${{secrets.NPM_PUBLISH_TOKEN}}
+
+      - name: Check valid token
+        run: |
+          WHOAMI_RESULT=$(pnpm --silent whoami)
+          echo "pnpm whoami result: $WHOAMI_RESULT"
+          if [ "$WHOAMI_RESULT" != "$EXPECTED_NPM_USER" ]; then
+            echo "Error: pnpm whoami returned '$WHOAMI_RESULT', expected '$EXPECTED_NPM_USER'"
+            exit 1
+          fi
+          echo "✅ npm authentication validated - using $EXPECTED_NPM_USER account"
+
+      - name: Publish packages to npm
+        run: pnpm -r publish --tag next-major --no-git-checks --provenance
+
+      - name: Build bundles for staging
+        env:
+          SANITY_INTERNAL_ENV: "staging" # sets the __SANITY_STAGING__ global variable to true in built bundles
+        run: pnpm run build:bundle
+
+      - name: Upload bundles to staging bucket
+        env:
+          GOOGLE_PROJECT_ID: ${{ secrets.GCS_STAGING_PROJECT_ID }}
+          GCLOUD_SERVICE_KEY: ${{ secrets.GCS_STAGING_SERVICE_KEY }}
+          GCLOUD_BUCKET: ${{ secrets.GCS_STAGING_BUCKET }}
+        run: pnpm bundle-manager publish --tag=next-major
+
+      - name: Build bundles for production
+        run: pnpm run build:bundle
+
+      - name: Upload bundles to production bucket
+        env:
+          GOOGLE_PROJECT_ID: ${{ secrets.GCS_PRODUCTION_PROJECT_ID }}
+          GCLOUD_SERVICE_KEY: ${{ secrets.GCS_PRODUCTION_SERVICE_KEY }}
+          GCLOUD_BUCKET: ${{ secrets.GCS_PRODUCTION_BUCKET }}
+        run: pnpm bundle-manager publish --tag=next-major
+
+  notify-on-failure:
+    needs: [release-next-major]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@0d95c9a7becc1e6e297d76df9bc735c44f4cbcbc # v3.0.5
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL_CI_ALERTS }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": ":alert-dot: The workflow \"${{github.workflow}}\" on <${{ github.server_url }}/${{ github.repository }}|${{github.repository}}> failed in branch <${{ github.server_url }}/${{ github.repository }}/tree/${{github.ref_name}}|${{github.ref_name}}> (<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run >)"
+            }

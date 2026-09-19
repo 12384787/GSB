@@ -1,0 +1,22 @@
+name: Test exports works in native node ESM and CJS and TypeScript DTS
+on:
+  push:
+jobs:
+  testExports:
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    env:
+      TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+      TURBO_TEAM: ${{ vars.TURBO_TEAM }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/detect-code-changes
+        id: changes
+
+      - uses: ./.github/actions/setup
+        if: steps.changes.outputs.has_changes == 'true'
+
+      - name: Check export conditions in native node ESM and CJS, and TypeScript DTS
+        if: steps.changes.outputs.has_changes == 'true'
+        run: pnpm test:exports

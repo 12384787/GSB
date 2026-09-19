@@ -1,0 +1,196 @@
+import {UploadIcon} from '@sanity/icons/Upload'
+import {type AssetSource, type SchemaType} from '@sanity/types'
+import {useElementSize} from '@sanity/ui'
+import get from 'lodash-es/get.js'
+import {memo, type ReactNode, useCallback, useMemo, useState} from 'react'
+import {Flex} from 'ui5'
+
+import {Button} from '../../../../../ui-components/button/Button'
+import {useClient} from '../../../../hooks/useClient'
+import {useTranslation} from '../../../../i18n/hooks/useTranslation'
+import {useSource} from '../../../../studio/source'
+import {DEFAULT_STUDIO_CLIENT_OPTIONS} from '../../../../studioClient'
+import {
+  createDatasetFileAssetSource,
+  createDatasetImageAssetSource,
+} from '../../../studio/assetSourceDataset'
+import {type FileLike} from '../../../studio/uploads/types'
+import {getAssetSourcesWithUpload, isComponentModeAssetSource} from './assetSourceUtils'
+import {FileInputButton} from './FileInputButton/FileInputButton'
+import {PlaceholderText} from './PlaceholderText'
+import {UploadDropDownMenu} from './UploadDropDownMenu'
+
+interface UploadPlaceholderProps {
+  assetSources: AssetSource[]
+  browse?: ReactNode
+  directUploads?: boolean
+  hoveringFiles?: FileLike[]
+  onUpload?: (assetSource: AssetSource, files: File[]) => void
+  /**
+   * Called when an asset source with `uploadMode: 'component'` is selected.
+   * The source should be rendered directly to handle file selection and upload internally.
+   */
+  onOpenSourceForUpload?: (assetSource: AssetSource) => void
+  readOnly?: boolean
+  schemaType: SchemaType
+  type: string
+}
+
+function UploadPlaceholderComponent(props: UploadPlaceholderProps) {
+  const {
+    assetSources,
+    browse,
+    directUploads,
+    hoveringFiles,
+    onOpenSourceForUpload,
+    onUpload,
+    readOnly,
+    schemaType,
+    type,
+  } = props
+
+  const [rootElement, setRootElement] = useState<HTMLDivElement | null>(null)
+  const rect = useElementSize(rootElement)
+
+  // Adjust the layout in narrow containers
+  const collapsed = rect?.border && rect.border.width < 440
+  const {t} = useTranslation()
+  const client = useClient(DEFAULT_STUDIO_CLIENT_OPTIONS)
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+  const source = useSource()
+  const disableNew = schemaType.options?.disableNew === true
+
+  const assetSourcesWithUpload = useMemo(() => {
+    const result = getAssetSourcesWithUpload(assetSources)
+    // If no asset sources are available, we create a default one to upload to the dataset
+    if (result.length === 0) {
+      const options = {
+        client,
+        title: source.title || source.name,
+      }
+      const isFileType = type === 'file'
+      result.push(
+        isFileType ? createDatasetFileAssetSource(options) : createDatasetImageAssetSource(options),
+      )
+    }
+    return result
+  }, [assetSources, client, source, type])
+
+  const handleSelectFiles = useCallback(
+    (assetSource: AssetSource, files: File[]) => {
+      if (onUpload) {
+        onUpload(assetSource, files)
+      }
+    },
+    [onUpload],
+  )
+
+  const accept = get(
+    schemaType,
+    'options.accept',
+    schemaType.name === 'sanity.video' ? 'video/*' : '',
+  )
+
+  const uploadButton = useMemo(() => {
+    if (disableNew) {
+      return null
+    }
+
+    switch (assetSourcesWithUpload.length) {
+      case 0:
+        return null
+      case 1: {
+        const singleSource = assetSourcesWithUpload[0]
+        // For component mode, render a button that opens the source directly
+        if (isComponentModeAssetSource(singleSource)) {
+          return (
+            <Button
+              data-testid={`file-input-upload-button-${singleSource.name}`}
+              disabled={readOnly || directUploads === false}
+              icon={UploadIcon}
+              mode="bleed"
+              onClick={() => {
+                if (onOpenSourceForUpload) {
+                  onOpenSourceForUpload(singleSource)
+                }
+              }}
+              text={t('input.files.common.upload-placeholder.file-input-button.text')}
+            />
+          )
+        }
+        // For picker mode, use the file input button
+        return (
+          <FileInputButton
+            accept={accept}
+            data-testid={`file-input-upload-button-${singleSource.name}`}
+            disabled={readOnly || directUploads === false}
+            icon={UploadIcon}
+            mode="bleed"
+            onSelect={(files) => {
+              if (onUpload) {
+                onUpload(singleSource, files)
+              }
+            }}
+            text={t('input.files.common.upload-placeholder.file-input-button.text')}
+          />
+        )
+      }
+      default:
+        return (
+          <UploadDropDownMenu
+            accept={accept}
+            assetSources={assetSourcesWithUpload}
+            directUploads={directUploads}
+            onSelectFiles={handleSelectFiles}
+            onOpenSourceForUpload={onOpenSourceForUpload}
+            readOnly={readOnly}
+          />
+        )
+    }
+  }, [
+    accept,
+    assetSourcesWithUpload,
+    directUploads,
+    disableNew,
+    handleSelectFiles,
+    onOpenSourceForUpload,
+    onUpload,
+    readOnly,
+    t,
+  ])
+
+  if (disableNew) {
+    return browse ? (
+      <Flex alignItems="center" justifyContent="flex-end" ref={setRootElement}>
+        {browse}
+      </Flex>
+    ) : null
+  }
+
+  return assetSourcesWithUpload.length === 0 ? null : (
+    <Flex
+      alignItems={collapsed ? undefined : 'center'}
+      flexDirection={collapsed ? 'column' : 'row'}
+      gap={4}
+      justifyContent="space-between"
+      paddingY={collapsed ? 1 : undefined}
+      ref={setRootElement}
+    >
+      <Flex flexBasis="0%" flexGrow={1}>
+        <PlaceholderText
+          directUploads={directUploads}
+          hoveringFiles={hoveringFiles}
+          readOnly={readOnly}
+          type={type}
+        />
+      </Flex>
+
+      <Flex alignItems="center" gap={1} justifyContent="center" flexWrap="wrap">
+        {uploadButton}
+        {browse}
+      </Flex>
+    </Flex>
+  )
+}
+
+export const UploadPlaceholder = memo(UploadPlaceholderComponent)

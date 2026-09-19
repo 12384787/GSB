@@ -1,0 +1,198 @@
+import {ChevronRightIcon} from '@sanity/icons/ChevronRight'
+import {DocumentIcon} from '@sanity/icons/Document'
+import {FolderIcon} from '@sanity/icons/Folder'
+import {
+  isSanityDocument,
+  type PreviewValue,
+  type SanityDocument,
+  type SchemaType,
+  type SortOrdering,
+} from '@sanity/types'
+import {type CardProps, Text} from '@sanity/ui'
+import {
+  type ComponentType,
+  type MouseEvent,
+  startTransition,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import {
+  type FIXME,
+  type GeneralPreviewLayoutKey,
+  getPublishedId,
+  PreviewCard,
+  SanityDefaultPreview,
+  useDocumentPresence,
+  useDocumentPreviewStore,
+  useEditState,
+  useSchema,
+} from 'sanity'
+import {Box} from 'ui5'
+
+import {MissingSchemaType} from '../MissingSchemaType'
+import {usePaneRouter} from '../paneRouter/usePaneRouter'
+import {PaneItemPreview} from './PaneItemPreview'
+
+interface PaneItemProps {
+  id: string
+  layout?: GeneralPreviewLayoutKey
+  icon?: ComponentType<any> | false
+  pressed?: boolean
+  selected?: boolean
+  sortOrder?: Pick<SortOrdering, 'by'>
+  title?: string
+  value?: PreviewValue | SanityDocument
+  schemaType?: SchemaType
+  margin?: CardProps['margin']
+  marginBottom?: CardProps['marginBottom']
+  marginTop?: CardProps['marginTop']
+}
+
+/**
+ * Return `false` if we explicitly disable the icon.
+ * Otherwise return the passed icon or the schema type icon as a backup.
+ */
+function getIconWithFallback(
+  icon: ComponentType<any> | false | undefined,
+  schemaType: SchemaType | undefined,
+  defaultIcon: ComponentType<any>,
+): ComponentType<any> | false {
+  if (icon === false) {
+    return false
+  }
+
+  return icon || (schemaType && schemaType.icon) || defaultIcon || false
+}
+
+export function PaneItem(props: PaneItemProps) {
+  const {
+    icon,
+    id,
+    layout = 'default',
+    pressed,
+    schemaType,
+    selected,
+    sortOrder,
+    title,
+    value,
+    margin,
+    marginBottom,
+    marginTop,
+  } = props
+  const schema = useSchema()
+  const documentPreviewStore = useDocumentPreviewStore()
+  const {ChildLink} = usePaneRouter()
+  const documentPresence = useDocumentPresence(id)
+  const hasSchemaType = Boolean(schemaType && schemaType.name && schema.get(schemaType.name))
+  const [clicked, setClicked] = useState<boolean>(false)
+
+  const preview = useMemo(() => {
+    if (value && isSanityDocument(value)) {
+      if (!schemaType || !hasSchemaType) {
+        return <MissingSchemaType value={value} />
+      }
+
+      return (
+        <PaneItemPreview
+          documentPreviewStore={documentPreviewStore}
+          icon={getIconWithFallback(icon, schemaType, DocumentIcon)}
+          layout={layout}
+          schemaType={schemaType}
+          sortOrder={sortOrder}
+          value={value}
+          presence={documentPresence}
+        />
+      )
+    }
+
+    // Always render non-document values as compact previews
+    return (
+      <SanityDefaultPreview
+        status={
+          <Box style={{opacity: 0.5}}>
+            <Text muted size={1}>
+              <ChevronRightIcon />
+            </Text>
+          </Box>
+        }
+        icon={getIconWithFallback(icon, schemaType, FolderIcon)}
+        layout="compact"
+        title={title}
+      />
+    )
+  }, [
+    documentPreviewStore,
+    hasSchemaType,
+    icon,
+    layout,
+    schemaType,
+    sortOrder,
+    title,
+    value,
+    documentPresence,
+  ])
+
+  const handleClick = useCallback((e: MouseEvent<HTMLElement>) => {
+    if (e.metaKey) {
+      setClicked(false)
+      return
+    }
+
+    setClicked(true)
+  }, [])
+
+  // Reset `clicked` state when `selected` prop changes
+  // oxlint-disable-next-line react/exhaustive-effect-dependencies, react/set-state-in-effect -- pre-existing violation, to be fixed in a follow-up
+  useEffect(() => setClicked(false), [selected])
+
+  // Preloads the edit state on hover, using concurrent rendering with `startTransition` so preloads can be interrupted and not block rendering
+  const [preloading, setPreload] = useState(false)
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const handleMouseEnter = useCallback(() => {
+    timeoutRef.current = setTimeout(() => startTransition(() => setPreload(true)), 400)
+  }, [])
+  const handleMouseLeave = useCallback(() => {
+    if (timeoutRef.current) clearTimeout(timeoutRef.current)
+    startTransition(() => setPreload(false))
+  }, [])
+
+  return (
+    <PreviewCard
+      data-testid={`pane-item-${title}`}
+      __unstable_focusRing
+      as={ChildLink as FIXME}
+      childId={id}
+      data-as="a"
+      margin={margin}
+      marginBottom={marginBottom}
+      marginTop={marginTop}
+      onClick={handleClick}
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
+      pressed={pressed}
+      radius={2}
+      selected={selected || clicked}
+      sizing="border"
+      tabIndex={-1}
+      tone="inherit"
+    >
+      {preview}
+      {preloading && schemaType?.name && value && isSanityDocument(value) && (
+        <PreloadDocumentPane documentId={id} documentType={schemaType.name} />
+      )}
+    </PreviewCard>
+  )
+}
+
+function PreloadDocumentPane(props: {documentId: string; documentType: string}) {
+  const {documentId, documentType} = props
+  // Preload the edit state for the document, and keep it alive until mouse leave.
+  // No `getTargetScopeId(useTargetDocumentState())` here: this is a best-effort preload of the draft/published
+  // pair, so no version scope applies.
+  useEditState(getPublishedId(documentId), documentType)
+
+  return null
+}

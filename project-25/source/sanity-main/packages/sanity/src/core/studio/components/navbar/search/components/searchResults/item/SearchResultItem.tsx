@@ -1,0 +1,149 @@
+import {type StackablePerspective} from '@sanity/client'
+import {type SanityDocumentLike} from '@sanity/types'
+import {type MouseEvent, useCallback, useMemo} from 'react'
+import {useSyncObservable} from 'react-rx'
+import {of} from 'rxjs'
+import {useIntentLink} from 'sanity/router'
+import {Box, type MarginProps, type PaddingProps} from 'ui5'
+
+import {Tooltip} from '../../../../../../../../ui-components/tooltip/Tooltip'
+import {PreviewCard} from '../../../../../../../components/previewCard/PreviewCard'
+import {type GeneralPreviewLayoutKey} from '../../../../../../../components/previews/types'
+import {useSchema} from '../../../../../../../hooks/useSchema'
+import {useTranslation} from '../../../../../../../i18n/hooks/useTranslation'
+import {useValuePreview} from '../../../../../../../preview/useValuePreview'
+import {useGrantsStore} from '../../../../../../../store/datastores'
+import {useDocumentPresence} from '../../../../../../../store/presence/useDocumentPresence'
+import {getPublishedId} from '../../../../../../../util/draftUtils'
+import {useSearchState} from '../../../contexts/search/useSearchState'
+import {SearchResultItemPreview} from './SearchResultItemPreview'
+
+export type ItemSelectHandler = (item: Pick<SanityDocumentLike, '_id' | '_type' | 'title'>) => void
+
+interface SearchResultItemProps extends MarginProps, PaddingProps {
+  disableIntentLink?: boolean
+  documentId: string
+  documentType: string
+  layout?: GeneralPreviewLayoutKey
+  onClick?: (e: MouseEvent<HTMLElement>) => void
+  onItemSelect?: ItemSelectHandler
+  previewPerspective?: StackablePerspective[]
+  /**
+   * The variant the result previews are resolved in, as a bare variant id.
+   */
+  previewVariant?: string
+}
+
+export function SearchResultItem({
+  disableIntentLink,
+  documentId,
+  documentType,
+  layout,
+  onClick,
+  onItemSelect,
+  previewPerspective,
+  previewVariant,
+  ...rest
+}: SearchResultItemProps) {
+  const schema = useSchema()
+  const type = schema.get(documentType)
+  const documentPresence = useDocumentPresence(documentId)
+  const params = useMemo(
+    () => ({id: getPublishedId(documentId), type: type?.name}),
+    [documentId, type?.name],
+  )
+
+  const {onClick: onIntentClick, href} = useIntentLink({
+    intent: 'edit',
+    params,
+  })
+  const {state} = useSearchState()
+  const {t} = useTranslation()
+  const grantsStore = useGrantsStore()
+
+  const createPermission$ = useMemo(
+    () =>
+      state.canDisableAction
+        ? grantsStore.checkDocumentPermission('create', {_id: documentId, _type: documentType})
+        : of(null),
+    [documentId, documentType, grantsStore, state.canDisableAction],
+  )
+  // Kept synchronous: this gates `disabledAction` together with the live
+  // `documentId` release-membership check, so a deferred snapshot on a
+  // recycled row could leave the new document actionable with the previous
+  // row's granted permission.
+  const createPermission = useSyncObservable(createPermission$, null)
+  const hasCreatePermission = createPermission?.granted
+
+  // the current search result exists in the release provided by the search provider
+  const existsInRelease = state.disabledDocumentIds?.some((id) =>
+    id.includes(getPublishedId(documentId)),
+  )
+  // should the search items be disasabled
+  const disabledAction = (!hasCreatePermission && state.canDisableAction) || existsInRelease
+
+  const documentStub = useMemo(
+    () => ({_id: documentId, _type: documentType}),
+    [documentId, documentType],
+  )
+  const preview = useValuePreview({
+    enabled: true,
+    schemaType: type,
+    value: documentStub,
+    perspectiveStack: previewPerspective,
+    variant: previewVariant,
+  })
+
+  const handleClick = useCallback(
+    (e: MouseEvent<HTMLElement>) => {
+      onItemSelect?.({_id: documentId, _type: documentType, title: preview.value?.title})
+      if (!disableIntentLink) {
+        onIntentClick(e)
+      }
+      onClick?.(e)
+    },
+    [preview, onItemSelect, documentId, documentType, disableIntentLink, onClick, onIntentClick],
+  )
+
+  if (!type) return null
+
+  const content = (
+    <Box {...rest}>
+      <PreviewCard
+        as={disabledAction ? undefined : 'a'}
+        data-as="a"
+        flex={1}
+        href={disabledAction || disableIntentLink ? undefined : href}
+        onClick={handleClick}
+        radius={2}
+        tabIndex={-1}
+        style={{
+          pointerEvents: disabledAction ? 'none' : undefined,
+          opacity: disabledAction ? 0.5 : 1,
+        }}
+      >
+        <SearchResultItemPreview
+          documentId={documentId}
+          documentType={documentType}
+          layout={layout}
+          perspective={previewPerspective}
+          variant={previewVariant}
+          presence={documentPresence}
+          schemaType={type}
+        />
+      </PreviewCard>
+    </Box>
+  )
+
+  const tooltipContent = existsInRelease
+    ? t('release.action.already-exists-in-release')
+    : t('release.action.permission.error')
+
+  return disabledAction ? (
+    <Tooltip content={tooltipContent} placement="top">
+      {content}
+    </Tooltip>
+  ) : (
+    content
+  )
+}

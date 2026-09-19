@@ -1,0 +1,1907 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Operations executed socket-head-cap-screw.kcl
+---
+{
+  "public/kcl-samples/socket-head-cap-screw/main.kcl": [
+    {
+      "type": "VariableDeclaration",
+      "name": "boltDiameter",
+      "value": {
+        "type": "Number",
+        "value": 0.19,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "in",
+            "angle": "degrees"
+          }
+        }
+      },
+      "visibility": "default",
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 0
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "VariableDeclaration",
+      "name": "boltLength",
+      "value": {
+        "type": "Number",
+        "value": 1.0,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "in",
+            "angle": "degrees"
+          }
+        }
+      },
+      "visibility": "default",
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 1
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "VariableDeclaration",
+      "name": "boltHeadLength",
+      "value": {
+        "type": "Number",
+        "value": 0.19,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "in",
+            "angle": "degrees"
+          }
+        }
+      },
+      "visibility": "default",
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 2
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "VariableDeclaration",
+      "name": "boltHeadDiameter",
+      "value": {
+        "type": "Number",
+        "value": 0.313,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "in",
+            "angle": "degrees"
+          }
+        }
+      },
+      "visibility": "default",
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 3
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "VariableDeclaration",
+      "name": "boltHexDrive",
+      "value": {
+        "type": "Number",
+        "value": 0.15625,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "in",
+            "angle": "degrees"
+          }
+        }
+      },
+      "visibility": "default",
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 4
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "VariableDeclaration",
+      "name": "boltHexFlatLength",
+      "value": {
+        "type": "Number",
+        "value": 0.09021097956087902,
+        "ty": {
+          "type": "Default",
+          "value": {
+            "len": "in",
+            "angle": "degrees"
+          }
+        }
+      },
+      "visibility": "default",
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 5
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "GroupBegin",
+      "group": {
+        "type": "SketchBlock",
+        "sketchId": 1
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 6
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "StdLibCall",
+      "name": "circle",
+      "unlabeledArg": null,
+      "labeledArgs": {
+        "center": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "SketchVar",
+                "value": 0.0,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              },
+              {
+                "type": "SketchVar",
+                "value": 0.0,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              }
+            ]
+          },
+          "sourceRange": []
+        },
+        "start": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "SketchVar",
+                "value": 0.16,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              },
+              {
+                "type": "SketchVar",
+                "value": 0.0,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              }
+            ]
+          },
+          "sourceRange": []
+        }
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 6
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          },
+          {
+            "type": "SketchBlockBody"
+          },
+          {
+            "type": "SketchBlockBodyItem",
+            "index": 0
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "GroupEnd"
+    },
+    {
+      "type": "StdLibCall",
+      "name": "region",
+      "unlabeledArg": null,
+      "labeledArgs": {
+        "segments": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "Segment",
+                "artifact_id": "[uuid]"
+              }
+            ]
+          },
+          "sourceRange": []
+        }
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 7
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "StdLibCall",
+      "name": "extrude",
+      "unlabeledArg": {
+        "value": {
+          "type": "Sketch",
+          "value": {
+            "artifactId": "[uuid]"
+          }
+        },
+        "sourceRange": []
+      },
+      "labeledArgs": {
+        "length": {
+          "value": {
+            "type": "Number",
+            "value": -0.19,
+            "ty": {
+              "type": "Default",
+              "value": {
+                "len": "in",
+                "angle": "degrees"
+              }
+            }
+          },
+          "sourceRange": []
+        },
+        "tagStart": {
+          "value": {
+            "type": "TagDeclarator",
+            "name": "capStart001"
+          },
+          "sourceRange": []
+        }
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 8
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          },
+          {
+            "type": "PipeBodyItem",
+            "index": 0
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "StdLibCall",
+      "name": "fillet",
+      "unlabeledArg": {
+        "value": {
+          "type": "Solid",
+          "value": {
+            "artifactId": "[uuid]"
+          }
+        },
+        "sourceRange": []
+      },
+      "labeledArgs": {
+        "radius": {
+          "value": {
+            "type": "Number",
+            "value": 0.02,
+            "ty": {
+              "type": "Default",
+              "value": {
+                "len": "in",
+                "angle": "degrees"
+              }
+            }
+          },
+          "sourceRange": []
+        },
+        "tags": {
+          "value": {
+            "type": "Uuid",
+            "value": "[uuid]"
+          },
+          "sourceRange": []
+        }
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 8
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          },
+          {
+            "type": "PipeBodyItem",
+            "index": 1
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "GroupBegin",
+      "group": {
+        "type": "SketchBlock",
+        "sketchId": 6
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 9
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "StdLibCall",
+      "name": "line",
+      "unlabeledArg": null,
+      "labeledArgs": {
+        "end": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "SketchVar",
+                "value": 0.08,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              },
+              {
+                "type": "SketchVar",
+                "value": -0.05,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              }
+            ]
+          },
+          "sourceRange": []
+        },
+        "start": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "SketchVar",
+                "value": 0.08,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              },
+              {
+                "type": "SketchVar",
+                "value": 0.05,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              }
+            ]
+          },
+          "sourceRange": []
+        }
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 9
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          },
+          {
+            "type": "SketchBlockBody"
+          },
+          {
+            "type": "SketchBlockBodyItem",
+            "index": 0
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "StdLibCall",
+      "name": "line",
+      "unlabeledArg": null,
+      "labeledArgs": {
+        "end": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "SketchVar",
+                "value": 0.0,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              },
+              {
+                "type": "SketchVar",
+                "value": -0.09,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              }
+            ]
+          },
+          "sourceRange": []
+        },
+        "start": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "SketchVar",
+                "value": 0.08,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              },
+              {
+                "type": "SketchVar",
+                "value": -0.05,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              }
+            ]
+          },
+          "sourceRange": []
+        }
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 9
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          },
+          {
+            "type": "SketchBlockBody"
+          },
+          {
+            "type": "SketchBlockBodyItem",
+            "index": 1
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "StdLibCall",
+      "name": "coincident",
+      "unlabeledArg": {
+        "value": {
+          "type": "Array",
+          "value": [
+            {
+              "type": "KclNone"
+            },
+            {
+              "type": "KclNone"
+            }
+          ]
+        },
+        "sourceRange": []
+      },
+      "labeledArgs": {},
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 9
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          },
+          {
+            "type": "SketchBlockBody"
+          },
+          {
+            "type": "SketchBlockBodyItem",
+            "index": 2
+          },
+          {
+            "type": "ExpressionStatementExpr"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "StdLibCall",
+      "name": "line",
+      "unlabeledArg": null,
+      "labeledArgs": {
+        "end": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "SketchVar",
+                "value": -0.08,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              },
+              {
+                "type": "SketchVar",
+                "value": -0.05,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              }
+            ]
+          },
+          "sourceRange": []
+        },
+        "start": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "SketchVar",
+                "value": 0.0,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              },
+              {
+                "type": "SketchVar",
+                "value": -0.09,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              }
+            ]
+          },
+          "sourceRange": []
+        }
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 9
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          },
+          {
+            "type": "SketchBlockBody"
+          },
+          {
+            "type": "SketchBlockBodyItem",
+            "index": 3
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "StdLibCall",
+      "name": "coincident",
+      "unlabeledArg": {
+        "value": {
+          "type": "Array",
+          "value": [
+            {
+              "type": "KclNone"
+            },
+            {
+              "type": "KclNone"
+            }
+          ]
+        },
+        "sourceRange": []
+      },
+      "labeledArgs": {},
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 9
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          },
+          {
+            "type": "SketchBlockBody"
+          },
+          {
+            "type": "SketchBlockBodyItem",
+            "index": 4
+          },
+          {
+            "type": "ExpressionStatementExpr"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "StdLibCall",
+      "name": "line",
+      "unlabeledArg": null,
+      "labeledArgs": {
+        "end": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "SketchVar",
+                "value": -0.08,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              },
+              {
+                "type": "SketchVar",
+                "value": 0.05,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              }
+            ]
+          },
+          "sourceRange": []
+        },
+        "start": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "SketchVar",
+                "value": -0.08,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              },
+              {
+                "type": "SketchVar",
+                "value": -0.05,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              }
+            ]
+          },
+          "sourceRange": []
+        }
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 9
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          },
+          {
+            "type": "SketchBlockBody"
+          },
+          {
+            "type": "SketchBlockBodyItem",
+            "index": 5
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "StdLibCall",
+      "name": "coincident",
+      "unlabeledArg": {
+        "value": {
+          "type": "Array",
+          "value": [
+            {
+              "type": "KclNone"
+            },
+            {
+              "type": "KclNone"
+            }
+          ]
+        },
+        "sourceRange": []
+      },
+      "labeledArgs": {},
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 9
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          },
+          {
+            "type": "SketchBlockBody"
+          },
+          {
+            "type": "SketchBlockBodyItem",
+            "index": 6
+          },
+          {
+            "type": "ExpressionStatementExpr"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "StdLibCall",
+      "name": "line",
+      "unlabeledArg": null,
+      "labeledArgs": {
+        "end": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "SketchVar",
+                "value": 0.0,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              },
+              {
+                "type": "SketchVar",
+                "value": 0.09,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              }
+            ]
+          },
+          "sourceRange": []
+        },
+        "start": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "SketchVar",
+                "value": -0.08,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              },
+              {
+                "type": "SketchVar",
+                "value": 0.05,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              }
+            ]
+          },
+          "sourceRange": []
+        }
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 9
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          },
+          {
+            "type": "SketchBlockBody"
+          },
+          {
+            "type": "SketchBlockBodyItem",
+            "index": 7
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "StdLibCall",
+      "name": "coincident",
+      "unlabeledArg": {
+        "value": {
+          "type": "Array",
+          "value": [
+            {
+              "type": "KclNone"
+            },
+            {
+              "type": "KclNone"
+            }
+          ]
+        },
+        "sourceRange": []
+      },
+      "labeledArgs": {},
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 9
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          },
+          {
+            "type": "SketchBlockBody"
+          },
+          {
+            "type": "SketchBlockBodyItem",
+            "index": 8
+          },
+          {
+            "type": "ExpressionStatementExpr"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "StdLibCall",
+      "name": "line",
+      "unlabeledArg": null,
+      "labeledArgs": {
+        "end": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "SketchVar",
+                "value": 0.08,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              },
+              {
+                "type": "SketchVar",
+                "value": 0.05,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              }
+            ]
+          },
+          "sourceRange": []
+        },
+        "start": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "SketchVar",
+                "value": 0.0,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              },
+              {
+                "type": "SketchVar",
+                "value": 0.09,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              }
+            ]
+          },
+          "sourceRange": []
+        }
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 9
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          },
+          {
+            "type": "SketchBlockBody"
+          },
+          {
+            "type": "SketchBlockBodyItem",
+            "index": 9
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "StdLibCall",
+      "name": "coincident",
+      "unlabeledArg": {
+        "value": {
+          "type": "Array",
+          "value": [
+            {
+              "type": "KclNone"
+            },
+            {
+              "type": "KclNone"
+            }
+          ]
+        },
+        "sourceRange": []
+      },
+      "labeledArgs": {},
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 9
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          },
+          {
+            "type": "SketchBlockBody"
+          },
+          {
+            "type": "SketchBlockBodyItem",
+            "index": 10
+          },
+          {
+            "type": "ExpressionStatementExpr"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "GroupEnd"
+    },
+    {
+      "type": "StdLibCall",
+      "name": "region",
+      "unlabeledArg": null,
+      "labeledArgs": {
+        "segments": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "Segment",
+                "artifact_id": "[uuid]"
+              },
+              {
+                "type": "Segment",
+                "artifact_id": "[uuid]"
+              }
+            ]
+          },
+          "sourceRange": []
+        }
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 10
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "StdLibCall",
+      "name": "extrude",
+      "unlabeledArg": {
+        "value": {
+          "type": "Sketch",
+          "value": {
+            "artifactId": "[uuid]"
+          }
+        },
+        "sourceRange": []
+      },
+      "labeledArgs": {
+        "length": {
+          "value": {
+            "type": "Number",
+            "value": -0.14250000000000002,
+            "ty": {
+              "type": "Default",
+              "value": {
+                "len": "in",
+                "angle": "degrees"
+              }
+            }
+          },
+          "sourceRange": []
+        }
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 11
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "GroupBegin",
+      "group": {
+        "type": "SketchBlock",
+        "sketchId": 31
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 12
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "StdLibCall",
+      "name": "circle",
+      "unlabeledArg": null,
+      "labeledArgs": {
+        "center": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "SketchVar",
+                "value": 0.0,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              },
+              {
+                "type": "SketchVar",
+                "value": 0.0,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              }
+            ]
+          },
+          "sourceRange": []
+        },
+        "start": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "SketchVar",
+                "value": 0.1,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              },
+              {
+                "type": "SketchVar",
+                "value": 0.0,
+                "ty": {
+                  "type": "Known",
+                  "value": {
+                    "type": "Length",
+                    "value": "in"
+                  }
+                }
+              }
+            ]
+          },
+          "sourceRange": []
+        }
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 12
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          },
+          {
+            "type": "SketchBlockBody"
+          },
+          {
+            "type": "SketchBlockBodyItem",
+            "index": 0
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "GroupEnd"
+    },
+    {
+      "type": "StdLibCall",
+      "name": "region",
+      "unlabeledArg": null,
+      "labeledArgs": {
+        "segments": {
+          "value": {
+            "type": "Array",
+            "value": [
+              {
+                "type": "Segment",
+                "artifact_id": "[uuid]"
+              }
+            ]
+          },
+          "sourceRange": []
+        }
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 13
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "StdLibCall",
+      "name": "extrude",
+      "unlabeledArg": {
+        "value": {
+          "type": "Sketch",
+          "value": {
+            "artifactId": "[uuid]"
+          }
+        },
+        "sourceRange": []
+      },
+      "labeledArgs": {
+        "length": {
+          "value": {
+            "type": "Number",
+            "value": 1.0,
+            "ty": {
+              "type": "Default",
+              "value": {
+                "len": "in",
+                "angle": "degrees"
+              }
+            }
+          },
+          "sourceRange": []
+        }
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 14
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          },
+          {
+            "type": "PipeBodyItem",
+            "index": 0
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "StdLibCall",
+      "name": "appearance",
+      "unlabeledArg": {
+        "value": {
+          "type": "Solid",
+          "value": {
+            "artifactId": "[uuid]"
+          }
+        },
+        "sourceRange": []
+      },
+      "labeledArgs": {
+        "color": {
+          "value": {
+            "type": "String",
+            "value": "#4dd043"
+          },
+          "sourceRange": []
+        },
+        "metalness": {
+          "value": {
+            "type": "Number",
+            "value": 90.0,
+            "ty": {
+              "type": "Known",
+              "value": {
+                "type": "Count"
+              }
+            }
+          },
+          "sourceRange": []
+        },
+        "roughness": {
+          "value": {
+            "type": "Number",
+            "value": 90.0,
+            "ty": {
+              "type": "Known",
+              "value": {
+                "type": "Count"
+              }
+            }
+          },
+          "sourceRange": []
+        }
+      },
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 14
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          },
+          {
+            "type": "PipeBodyItem",
+            "index": 1
+          }
+        ]
+      },
+      "sourceRange": []
+    }
+  ],
+  "std::math": [
+    {
+      "type": "VariableDeclaration",
+      "name": "PI",
+      "value": {
+        "type": "Number",
+        "value": 3.141592653589793,
+        "ty": {
+          "type": "Unknown"
+        }
+      },
+      "visibility": "export",
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 1
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "VariableDeclaration",
+      "name": "E",
+      "value": {
+        "type": "Number",
+        "value": 2.718281828459045,
+        "ty": {
+          "type": "Known",
+          "value": {
+            "type": "Count"
+          }
+        }
+      },
+      "visibility": "export",
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 2
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "VariableDeclaration",
+      "name": "TAU",
+      "value": {
+        "type": "Number",
+        "value": 6.283185307179586,
+        "ty": {
+          "type": "Known",
+          "value": {
+            "type": "Count"
+          }
+        }
+      },
+      "visibility": "export",
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 3
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    }
+  ],
+  "std::prelude": [
+    {
+      "type": "VariableDeclaration",
+      "name": "START",
+      "value": {
+        "type": "String",
+        "value": "start"
+      },
+      "visibility": "export",
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 24
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "VariableDeclaration",
+      "name": "END",
+      "value": {
+        "type": "String",
+        "value": "end"
+      },
+      "visibility": "export",
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 25
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "VariableDeclaration",
+      "name": "NEW",
+      "value": {
+        "type": "String",
+        "value": "new"
+      },
+      "visibility": "export",
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 26
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "VariableDeclaration",
+      "name": "MERGE",
+      "value": {
+        "type": "String",
+        "value": "merge"
+      },
+      "visibility": "export",
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 27
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "VariableDeclaration",
+      "name": "SOLID",
+      "value": {
+        "type": "String",
+        "value": "solid"
+      },
+      "visibility": "export",
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 28
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "VariableDeclaration",
+      "name": "SURFACE",
+      "value": {
+        "type": "String",
+        "value": "surface"
+      },
+      "visibility": "export",
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 29
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "VariableDeclaration",
+      "name": "CCW",
+      "value": {
+        "type": "String",
+        "value": "ccw"
+      },
+      "visibility": "export",
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 30
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    },
+    {
+      "type": "VariableDeclaration",
+      "name": "CW",
+      "value": {
+        "type": "String",
+        "value": "cw"
+      },
+      "visibility": "export",
+      "nodePath": {
+        "steps": [
+          {
+            "type": "ProgramBodyItem",
+            "index": 31
+          },
+          {
+            "type": "VariableDeclarationDeclaration"
+          },
+          {
+            "type": "VariableDeclarationInit"
+          }
+        ]
+      },
+      "sourceRange": []
+    }
+  ]
+}

@@ -1,0 +1,85 @@
+import {CopyIcon} from '@sanity/icons/Copy'
+import {DownloadIcon} from '@sanity/icons/Download'
+import {LaunchIcon} from '@sanity/icons/Launch'
+import {ResetIcon} from '@sanity/icons/Reset'
+import {MenuDivider} from '@sanity/ui/menu'
+import {useToast} from '@sanity/ui/toast'
+import {type MouseEventHandler, type ReactNode, useCallback} from 'react'
+
+import {MenuItem} from '../../../../../ui-components/menuItem/MenuItem'
+import {useTranslation} from '../../../../i18n/hooks/useTranslation'
+
+interface Props {
+  browse: ReactNode
+  readOnly?: boolean
+  onReset: MouseEventHandler<HTMLButtonElement>
+  downloadUrl?: string
+  copyUrl?: string
+  openInSource?: () => void
+  openInSourceName?: string
+  upload: ReactNode
+}
+
+export function ActionsMenu(props: Props) {
+  const {onReset, readOnly, browse, downloadUrl, copyUrl, openInSource, openInSourceName, upload} =
+    props
+
+  const {push: pushToast} = useToast()
+  const {t} = useTranslation()
+
+  const handleCopyURL = useCallback(() => {
+    void navigator.clipboard.writeText(copyUrl || '')
+    pushToast({
+      closable: true,
+      status: 'success',
+      title: t('inputs.files.common.actions-menu.notification.url-copied'),
+    })
+  }, [copyUrl, pushToast, t])
+
+  return (
+    <>
+      {upload}
+      {upload && browse && <MenuDivider />}
+      {browse}
+
+      {(downloadUrl || copyUrl || openInSource) && <MenuDivider />}
+      {downloadUrl && (
+        <MenuItem
+          as="a"
+          icon={DownloadIcon}
+          text={t('inputs.files.common.actions-menu.download.label')}
+          href={downloadUrl}
+          target="_blank"
+        />
+      )}
+      {copyUrl && (
+        <MenuItem
+          icon={CopyIcon}
+          text={t('inputs.files.common.actions-menu.copy-url.label')}
+          onClick={handleCopyURL}
+        />
+      )}
+
+      {openInSource && (
+        <MenuItem
+          icon={LaunchIcon}
+          text={t('inputs.files.common.actions-menu.open-in-source.label', {
+            sourceName: openInSourceName || 'source',
+          })}
+          onClick={openInSource}
+          data-testid="file-input-open-in-source"
+        />
+      )}
+
+      <MenuDivider />
+      <MenuItem
+        tone="critical"
+        icon={ResetIcon}
+        text={t('inputs.files.common.actions-menu.clear-field.label')}
+        onClick={onReset}
+        disabled={readOnly}
+        data-testid="file-input-clear"
+      />
+    </>
+  )
+}

@@ -1,0 +1,10 @@
+{
+  "number": 25,
+  "repository": "sanity-io/sanity",
+  "url": "https://github.com/sanity-io/sanity",
+  "description": "Sanity Studio – Rapidly configure content workspaces powered by structured content",
+  "language": "TypeScript",
+  "stars": 6323,
+  "default_branch": "main",
+  "source_zip_url": "https://github.com/sanity-io/sanity/archive/refs/heads/main.zip"
+}

@@ -1,0 +1,262 @@
+import {type HotspotPreview, type Image, type ImageSchemaType} from '@sanity/types'
+import {Card, Heading, Stack, Text} from '@sanity/ui'
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import {styled} from 'styled-components'
+import {Grid, Flex, Box} from 'ui5'
+
+import {ChangeIndicator} from '../../../../changeIndicators/ChangeIndicator'
+import {LoadingBlock} from '../../../../components/loadingBlock/LoadingBlock'
+import {useTranslation} from '../../../../i18n/hooks/useTranslation'
+import {Translate} from '../../../../i18n/Translate'
+import {EMPTY_ARRAY} from '../../../../util/empty'
+import {Details} from '../../../components/Details'
+import {FormField} from '../../../components/formField/FormField'
+import {useDidUpdate} from '../../../hooks/useDidUpdate'
+import {set} from '../../../patch/patch'
+import {type ObjectInputProps} from '../../../types/inputProps'
+import {RatioBox} from '../common/RatioBox'
+import {DEFAULT_CROP, DEFAULT_HOTSPOT} from './imagetool/constants'
+import {HotspotImage} from './imagetool/HotspotImage'
+import {ImageTool} from './imagetool/ImageTool'
+import {useLoadImage} from './useLoadImage'
+
+export interface ImageToolInputProps extends Omit<
+  ObjectInputProps<Image, ImageSchemaType>,
+  'markers' | 'renderDefault'
+> {
+  imageUrl: string
+}
+
+function ImageUrlDocumentationLink({children}: {children?: ReactNode}) {
+  return <a href="https://www.sanity.io/docs/image-urls#fm-048ba39d9e88">{children}</a>
+}
+
+function ImageUrlPackageDocumentationLink({children}: {children?: ReactNode}) {
+  return (
+    <a href="https://www.sanity.io/docs/image-urls#fm-048ba39d9e88">
+      <code>{children}</code>
+    </a>
+  )
+}
+
+const HOTSPOT_PATH = ['hotspot']
+
+const DEFAULT_PREVIEWS: HotspotPreview[] = [
+  {title: '3:4', aspectRatio: 3 / 4},
+  {title: 'Square', aspectRatio: 1 / 1},
+  {title: '16:9', aspectRatio: 16 / 9},
+  {title: 'Panorama', aspectRatio: 4 / 1},
+] as const
+
+const DEFAULT_VALUE: Partial<Image> = {
+  crop: DEFAULT_CROP,
+  hotspot: DEFAULT_HOTSPOT,
+}
+
+const Placeholder = styled.div`
+  min-height: 6em;
+`
+
+function LoadStatus(props: {children: ReactNode}) {
+  return (
+    <Flex
+      alignItems="center"
+      justifyContent="center"
+      padding={4}
+      style={{overflowWrap: 'break-word'}}
+    >
+      {props.children}
+    </Flex>
+  )
+}
+
+export function ImageToolInput(props: ImageToolInputProps) {
+  const {
+    imageUrl,
+    value,
+    changed,
+    level,
+    path,
+    focusPath = EMPTY_ARRAY,
+    presence,
+    onChange,
+    schemaType,
+    onPathFocus,
+    readOnly,
+    elementProps: {ref: forwardRef},
+  } = props
+  const ref = useRef<HTMLDivElement | null>(null)
+  useImperativeHandle(forwardRef, () => ref.current)
+
+  const [localValue, setLocalValue] = useState(value || DEFAULT_VALUE)
+
+  const {image, isLoading: isImageLoading, error: imageLoadError} = useLoadImage(imageUrl)
+
+  const handleFocus = useCallback(() => {
+    onPathFocus(HOTSPOT_PATH)
+  }, [onPathFocus])
+
+  useEffect(() => {
+    // oxlint-disable-next-line react/set-state-in-effect -- pre-existing violation, to be fixed in a follow-up
+    setLocalValue(value || DEFAULT_VALUE)
+  }, [value])
+
+  const hasFocus = focusPath[0] === 'hotspot'
+
+  const hotspotPreviews =
+    (typeof schemaType.options?.hotspot === 'object' && schemaType.options.hotspot.previews) ||
+    DEFAULT_PREVIEWS
+
+  useDidUpdate(hasFocus, (hadFocus) => {
+    if (!hadFocus && hasFocus) {
+      ref.current?.focus()
+    }
+  })
+
+  const handleChangeEnd = useCallback(
+    (finalValue: any) => {
+      if (readOnly) {
+        return
+      }
+      // For backwards compatibility, where hotspot/crop might not have a named type yet
+      const cropField = schemaType.fields.find(
+        (field) => field.name === 'crop' && field.type.name !== 'object',
+      )
+
+      const hotspotField = schemaType.fields.find(
+        (field) => field.type.name !== 'object' && field.name === 'hotspot',
+      )
+
+      // Note: when either hotspot or crop change we fill in the default if the other is missing
+      // (we can't have one without the other)
+      const crop = cropField
+        ? {_type: cropField.type.name, ...(finalValue.crop || DEFAULT_CROP)}
+        : finalValue.crop
+
+      const hotspot = hotspotField
+        ? {_type: hotspotField.type.name, ...(finalValue.hotspot || DEFAULT_HOTSPOT)}
+        : finalValue.hotspot
+
+      onChange([set(crop, ['crop']), set(hotspot, ['hotspot'])])
+    },
+    [onChange, readOnly, schemaType.fields],
+  )
+
+  const isSvg = useMemo(() => value?.asset?._ref?.split('-').at(-1) === 'svg', [value?.asset?._ref])
+
+  const {t} = useTranslation()
+  return (
+    <FormField
+      title={t('inputs.imagetool.title')}
+      level={level}
+      description={t('inputs.imagetool.description')}
+      deprecated={schemaType.deprecated}
+      path={path}
+      __unstable_presence={presence}
+    >
+      {isSvg ? (
+        <>
+          <Card padding={3} marginY={3} tone="caution" radius={2}>
+            <Stack gap={4}>
+              <Text size={1}>{t('inputs.imagetool.vector-warning.title')}</Text>
+              <Details title={t('inputs.imagetool.vector-warning.expand-developer-info')}>
+                <Text size={1}>
+                  <Translate
+                    t={t}
+                    i18nKey="inputs.imagetool.vector-warning.developer-info"
+                    components={{ImageUrlDocumentationLink, ImageUrlPackageDocumentationLink}}
+                  />
+                </Text>
+              </Details>
+            </Stack>
+          </Card>
+        </>
+      ) : null}
+
+      <div>
+        <Card
+          __unstable_checkered
+          __unstable_focusRing
+          tabIndex={0}
+          ref={ref}
+          onFocus={handleFocus}
+          border
+        >
+          <ChangeIndicator
+            path={path.concat(HOTSPOT_PATH)}
+            hasFocus={focusPath[0] === 'hotspot'}
+            isChanged={changed}
+          >
+            <RatioBox $ratio={3 / 2}>
+              {(isImageLoading || imageLoadError) && (
+                <LoadStatus>
+                  {imageLoadError ? (
+                    <Card padding={4} radius={2} tone="critical" border>
+                      <Text>
+                        {t('inputs.imagetool.load-error', {
+                          errorMessage: imageLoadError.message,
+                        })}
+                      </Text>
+                    </Card>
+                  ) : (
+                    <LoadingBlock showText />
+                  )}
+                </LoadStatus>
+              )}
+              {!isImageLoading && image && (
+                <Box>
+                  <ImageTool
+                    value={localValue}
+                    src={image.src}
+                    readOnly={Boolean(readOnly)}
+                    onChangeEnd={handleChangeEnd}
+                    onChange={setLocalValue}
+                  />
+                </Box>
+              )}
+            </RatioBox>
+          </ChangeIndicator>
+        </Card>
+
+        {hotspotPreviews.length > 0 ? (
+          <Box marginTop={2}>
+            <Grid gridTemplateColumns="repeat(4, minmax(0, 1fr))" gap={1}>
+              {hotspotPreviews.map(({title, aspectRatio}) => (
+                <Box key={title} marginTop={2}>
+                  <Heading as="h4" size={0}>
+                    {title}
+                  </Heading>
+                  <Box marginTop={2}>
+                    <RatioBox $ratio={aspectRatio}>
+                      <Card __unstable_checkered border>
+                        {!isImageLoading && image ? (
+                          <HotspotImage
+                            aspectRatio={aspectRatio}
+                            src={image.src}
+                            srcAspectRatio={image.width / image.height}
+                            hotspot={localValue.hotspot || DEFAULT_HOTSPOT}
+                            crop={localValue.crop || DEFAULT_CROP}
+                          />
+                        ) : (
+                          <Placeholder />
+                        )}
+                      </Card>
+                    </RatioBox>
+                  </Box>
+                </Box>
+              ))}
+            </Grid>
+          </Box>
+        ) : null}
+      </div>
+    </FormField>
+  )
+}

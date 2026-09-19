@@ -1,0 +1,21 @@
+import {type LocaleResourceBundle} from '../../i18n/types'
+
+/**
+ * The locale namespace for the releases tool
+ *
+ * @public
+ */
+// api extractor take issues with 'as const' for literals
+// oxlint-disable-next-line prefer-as-const
+export const releasesLocaleNamespace: 'releases' = 'releases'
+
+/**
+ * The default locale release for the releases tool, which is US English.
+ *
+ * @internal
+ */
+export const releasesUsEnglishLocaleBundle: LocaleResourceBundle = {
+  locale: 'en-US',
+  namespace: releasesLocaleNamespace,
+  resources: () => import('./resources'),
+}

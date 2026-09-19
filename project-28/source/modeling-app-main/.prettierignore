@@ -1,0 +1,13 @@
+# Ignore artifacts:
+build
+dist
+coverage
+
+# Ignore Rust projects:
+*.rs
+*.hbs
+target
+
+# XState generated files
+src/machines/**.typegen.ts
+.vscode-test

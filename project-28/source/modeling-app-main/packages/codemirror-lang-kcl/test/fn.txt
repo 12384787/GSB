@@ -1,0 +1,13 @@
+# full
+
+fn two() {
+  return 2
+}
+
+==>
+
+Program(FunctionDeclaration(fn,
+                            VariableDefinition,
+                            ParamList,
+                            Body(ReturnStatement(return,
+                                                 Number))))

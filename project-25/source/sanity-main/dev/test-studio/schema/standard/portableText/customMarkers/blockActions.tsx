@@ -1,0 +1,59 @@
+import {type PortableTextBlock} from '@portabletext/editor'
+import {CommentIcon} from '@sanity/icons/Comment'
+import {Button, Stack, Text, TextArea} from '@sanity/ui'
+import {Popover} from '@sanity/ui/popover'
+import {type ChangeEvent, useCallback, useState} from 'react'
+import {type RenderBlockActionsCallback} from 'sanity'
+import {Box} from 'ui5'
+
+// oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+export const renderBlockActions: RenderBlockActionsCallback = (props) => {
+  const {block, set} = props
+
+  return <CommentButton set={set} value={block} />
+}
+
+function CommentButton(props: {set: (block: PortableTextBlock) => void; value: PortableTextBlock}) {
+  const {set, value} = props
+  const [open, setOpen] = useState(false)
+  const [comment, setComment] = useState('')
+
+  const handleCommentChange = useCallback((event: ChangeEvent<HTMLTextAreaElement>) => {
+    setComment(event.currentTarget.value)
+  }, [])
+
+  const handleSubmit = useCallback(() => {
+    // @ts-expect-error -- pre-existing, fix later
+    const comments = (value.comments || []).concat(comment)
+
+    setOpen(false)
+    setComment('')
+    set({...value, comments})
+  }, [comment, set, value])
+
+  const handleClick = useCallback(() => setOpen(true), [])
+
+  const content = open && (
+    <Box padding={3}>
+      <Stack gap={2}>
+        <Text size={1} weight="semibold">
+          Comment
+        </Text>
+        <TextArea onChange={handleCommentChange} value={comment} />
+        <Button
+          fontSize={1}
+          onClick={handleSubmit}
+          padding={2}
+          text="Post comment"
+          tone="primary"
+        />
+      </Stack>
+    </Box>
+  )
+
+  return (
+    <Popover content={content} open={open} portal="default">
+      <Button icon={CommentIcon} mode="bleed" onClick={handleClick} padding={1} />
+    </Popover>
+  )
+}

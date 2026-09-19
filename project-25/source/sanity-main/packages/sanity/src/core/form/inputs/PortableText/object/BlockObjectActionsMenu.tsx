@@ -1,0 +1,160 @@
+import {EditIcon} from '@sanity/icons/Edit'
+import {EllipsisHorizontalIcon} from '@sanity/icons/EllipsisHorizontal'
+import {EyeOpenIcon} from '@sanity/icons/EyeOpen'
+import {LinkIcon} from '@sanity/icons/Link'
+import {TrashIcon} from '@sanity/icons/Trash'
+import {isReference, type PortableTextBlock} from '@sanity/types'
+import {useGlobalKeyDown} from '@sanity/ui'
+import {Menu} from '@sanity/ui/menu'
+import {
+  type ComponentPropsWithoutRef,
+  type MouseEvent,
+  type PropsWithChildren,
+  type RefAttributes,
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+} from 'react'
+import {IntentLink} from 'sanity/router'
+import {Flex, Box} from 'ui5'
+
+import {Button} from '../../../../../ui-components/button/Button'
+import {MenuButton, type MenuButtonProps} from '../../../../../ui-components/menuButton/MenuButton'
+import {MenuItem} from '../../../../../ui-components/menuItem/MenuItem'
+import {useTranslation} from '../../../../i18n/hooks/useTranslation'
+
+interface BlockObjectActionsMenuProps extends PropsWithChildren {
+  focused: boolean
+  isOpen?: boolean
+  onOpen: () => void
+  onRemove: () => void
+  readOnly?: boolean
+  value: PortableTextBlock
+}
+
+const POPOVER_PROPS: MenuButtonProps['popover'] = {
+  constrainSize: true,
+  placement: 'bottom',
+  portal: 'default',
+  tone: 'default',
+}
+
+export function BlockObjectActionsMenu(props: BlockObjectActionsMenuProps): React.JSX.Element {
+  const {children, focused, isOpen, onOpen, onRemove, readOnly, value} = props
+  const {t} = useTranslation()
+  const menuButtonId = useId()
+  const menuButton = useRef<HTMLButtonElement | null>(null)
+  const isTabbing = useRef<boolean>(false)
+
+  const referenceLink = useMemo(
+    () =>
+      isReference(value)
+        ? function ReferenceLink(
+            linkProps: ComponentPropsWithoutRef<'a'> & RefAttributes<HTMLAnchorElement>,
+          ) {
+            const {ref, ...rest} = linkProps
+            return <IntentLink {...rest} intent="edit" params={{id: value._ref}} ref={ref} />
+          }
+        : undefined,
+    [value],
+  )
+
+  useEffect(() => {
+    if (isOpen) {
+      isTabbing.current = false
+    }
+  }, [isOpen])
+
+  // Go to menu when tabbed to
+  useGlobalKeyDown(
+    useCallback(
+      (event) => {
+        if (!focused) {
+          return
+        }
+        if (event.key === 'Tab') {
+          if (menuButton.current && !isTabbing.current && !isOpen) {
+            event.preventDefault()
+            event.stopPropagation()
+            menuButton.current.focus()
+            isTabbing.current = true
+          }
+        }
+      },
+      [focused, isOpen],
+    ),
+  )
+
+  const handleDelete = useCallback(
+    (event: MouseEvent<HTMLButtonElement>) => {
+      event.preventDefault()
+      event.stopPropagation()
+      onRemove()
+    },
+    [onRemove],
+  )
+
+  return (
+    <Flex>
+      <Box flexBasis="0%" flexGrow={1}>
+        {children}
+      </Box>
+      <Box>
+        <MenuButton
+          button={
+            <Button
+              aria-label={t('inputs.portable-text.block.open-menu-aria-label')}
+              icon={EllipsisHorizontalIcon}
+              mode="bleed"
+              paddingY={3}
+              tabIndex={focused ? 0 : 1}
+              tooltipProps={{content: 'Open menu'}}
+            />
+          }
+          ref={menuButton}
+          id={menuButtonId}
+          menu={
+            <Menu>
+              <>
+                {'_ref' in value && !!value._ref && (
+                  <MenuItem
+                    as={referenceLink}
+                    data-as="a"
+                    icon={LinkIcon}
+                    text={t('inputs.portable-text.block.open-reference')}
+                  />
+                )}
+
+                {readOnly && (
+                  <MenuItem
+                    icon={EyeOpenIcon}
+                    onClick={onOpen}
+                    text={t('inputs.portable-text.block.view')}
+                  />
+                )}
+                {!readOnly && (
+                  <>
+                    <MenuItem
+                      icon={EditIcon}
+                      onClick={onOpen}
+                      text={t('inputs.portable-text.block.edit')}
+                    />
+                    <MenuItem
+                      icon={TrashIcon}
+                      onClick={handleDelete}
+                      text={t('inputs.portable-text.block.remove')}
+                      tone="critical"
+                    />
+                  </>
+                )}
+              </>
+            </Menu>
+          }
+          popover={POPOVER_PROPS}
+        />
+      </Box>
+    </Flex>
+  )
+}

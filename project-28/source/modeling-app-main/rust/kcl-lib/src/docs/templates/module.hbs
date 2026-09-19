@@ -1,0 +1,42 @@
+---
+title: "{{name}}"
+{{#if module}}
+subtitle: "Module in {{module}}"
+{{else}}
+subtitle: "Module"
+{{/if}}
+excerpt: "{{safe_yaml summary}}"
+layout: manual
+---
+
+{{#if experimental}}
+**WARNING:** This module is experimental and may change or be removed.
+
+{{/if}}
+{{{summary}}}
+
+{{{description}}}
+
+{{#if modules}}
+## Modules
+
+{{#each modules}}
+* [`{{name}}`]({{file_name}})
+{{/each}}
+{{/if}}
+
+{{#if functions}}
+## Functions and constants
+
+{{#each functions}}
+* [`{{name}}`]({{file_name}})
+{{/each}}
+{{/if}}
+
+{{#if types}}
+## Types
+
+{{#each types}}
+* [`{{name}}`]({{file_name}})
+{{/each}}
+{{/if}}

@@ -1,0 +1,198 @@
+import {
+  type EditorSelection,
+  type HotkeyOptions,
+  type OnCopyFn,
+  type OnPasteFn,
+  PortableTextEditable,
+  type PortableTextEditableProps,
+  type RangeDecoration,
+} from '@portabletext/editor'
+import {type Path} from '@sanity/types'
+import {BoundaryElementProvider, useBoundaryElement, useGlobalKeyDown, useLayer} from '@sanity/ui'
+import {getTheme_v2} from '@sanity/ui/theme'
+import {type ReactNode, useCallback, useMemo, useState} from 'react'
+import {css, styled} from 'styled-components'
+
+import {TooltipDelayGroupProvider} from '../../../../ui-components/tooltipDelayGroupProvider/TooltipDelayGroupProvider'
+import {useTranslation} from '../../../i18n/hooks/useTranslation'
+import {useFormBuilder} from '../../useFormBuilder'
+import {EditableCard, EditableWrapper, Root, Scroller, ToolbarCard} from './Editor.styles'
+import {useScrollSelectionIntoView} from './hooks/useScrollSelectionIntoView'
+import {useSpellCheck} from './hooks/useSpellCheck'
+import {Toolbar} from './toolbar/Toolbar'
+
+const noOutlineStyle = {outline: 'none'} as const
+
+// The <FormBuilder> id that represents the default (document pane) form layout.
+// This is used to determine whether this editor should apply document pane specific styling.
+const FORM_BUILDER_DEFAULT_ID = 'root'
+
+const PlaceholderWrapper = styled.span((props) => {
+  const {color} = getTheme_v2(props.theme)
+  return css`
+    color: ${color.input.default.enabled.placeholder};
+  `
+})
+
+interface EditorProps {
+  elementRef: React.RefObject<HTMLDivElement | null>
+  hideToolbar?: boolean
+  hotkeys: HotkeyOptions
+  initialSelection?: EditorSelection
+  isActive: boolean
+  isFullscreen: boolean
+  isOneLine: boolean
+  onCopy?: OnCopyFn
+  onItemOpen: (path: Path) => void
+  onPaste?: OnPasteFn
+  onToggleFullscreen: () => void
+  path: Path
+  readOnly?: boolean
+  rangeDecorations?: RangeDecoration[]
+  scrollElement: HTMLElement | null
+  setPortalElement?: (portalElement: HTMLDivElement | null) => void
+  setScrollElement: (scrollElement: HTMLElement | null) => void
+  ariaDescribedBy: string | undefined
+}
+
+/**
+ * @internal
+ */
+export function Editor(props: EditorProps): ReactNode {
+  const {
+    elementRef,
+    hideToolbar,
+    hotkeys,
+    initialSelection,
+    isActive,
+    isFullscreen,
+    isOneLine,
+    onCopy,
+    onItemOpen,
+    onPaste,
+    onToggleFullscreen,
+    path,
+    readOnly,
+    rangeDecorations,
+    scrollElement,
+    setPortalElement,
+    setScrollElement,
+    ariaDescribedBy,
+  } = props
+  const {id} = useFormBuilder()
+  const {t} = useTranslation()
+  const {isTopLayer} = useLayer()
+
+  const {element: boundaryElement} = useBoundaryElement()
+  const [rootElement, setRootElement] = useState<HTMLDivElement | null>(null)
+
+  // Let escape close fullscreen mode
+  useGlobalKeyDown(
+    useCallback(
+      (event: KeyboardEvent) => {
+        if (!isTopLayer || !isFullscreen) {
+          return
+        }
+        if (event.key === 'Escape') {
+          onToggleFullscreen()
+        }
+      },
+      [onToggleFullscreen, isFullscreen, isTopLayer],
+    ),
+  )
+
+  const renderPlaceholder = useCallback(
+    () => (
+      <PlaceholderWrapper data-testid="pt-input-placeholder">
+        {t('inputs.portable-text.empty-placeholder')}
+      </PlaceholderWrapper>
+    ),
+    [t],
+  )
+  const spellCheck = useSpellCheck()
+
+  const scrollSelectionIntoView = useScrollSelectionIntoView(scrollElement)
+
+  const editable = useMemo(() => {
+    const editableProps = {
+      'aria-describedby': ariaDescribedBy,
+      hotkeys,
+      onCopy,
+      onPaste,
+      rangeDecorations,
+      'ref': elementRef,
+      renderPlaceholder,
+      scrollSelectionIntoView,
+      'selection': initialSelection,
+      spellCheck,
+      'style': noOutlineStyle,
+    } satisfies PortableTextEditableProps
+
+    return <PortableTextEditable {...editableProps} />
+  }, [
+    ariaDescribedBy,
+    elementRef,
+    hotkeys,
+    initialSelection,
+    onCopy,
+    onPaste,
+    rangeDecorations,
+    renderPlaceholder,
+    scrollSelectionIntoView,
+    spellCheck,
+  ])
+
+  const handleToolBarOnMemberOpen = useCallback(
+    (relativePath: Path) => {
+      onItemOpen(path.concat(relativePath))
+    },
+    [onItemOpen, path],
+  )
+
+  // Always collapse toolbars at smaller container widths when in 'default' (document pane) FormBuilder instances
+  const collapsibleToolbar = id === FORM_BUILDER_DEFAULT_ID
+
+  return (
+    <Root
+      data-fullscreen={isFullscreen}
+      data-testid="pt-editor"
+      ref={setRootElement}
+      $isOneLine={isOneLine}
+    >
+      {isActive && !hideToolbar && (
+        <BoundaryElementProvider element={isFullscreen ? rootElement : boundaryElement}>
+          <TooltipDelayGroupProvider>
+            <ToolbarCard data-testid="pt-editor__toolbar-card" shadow={1}>
+              <Toolbar
+                collapsible={collapsibleToolbar}
+                hotkeys={hotkeys}
+                isFullscreen={isFullscreen}
+                onMemberOpen={handleToolBarOnMemberOpen}
+                onToggleFullscreen={onToggleFullscreen}
+                readOnly={readOnly}
+              />
+            </ToolbarCard>
+          </TooltipDelayGroupProvider>
+        </BoundaryElementProvider>
+      )}
+
+      <EditableCard flex={1} tone={readOnly ? 'transparent' : 'default'}>
+        <Scroller ref={setScrollElement} data-testid="pt-editor__scroller">
+          <div>
+            <EditableWrapper
+              $isFullscreen={isFullscreen}
+              $isOneLine={isOneLine}
+              tone={readOnly ? 'transparent' : 'default'}
+            >
+              <BoundaryElementProvider element={isFullscreen ? scrollElement : boundaryElement}>
+                {editable}
+              </BoundaryElementProvider>
+            </EditableWrapper>
+          </div>
+        </Scroller>
+
+        <div data-portal="" ref={setPortalElement} />
+      </EditableCard>
+    </Root>
+  )
+}

@@ -1,0 +1,31 @@
+import {type ReactNode} from 'react'
+import {PerspectiveProvider, usePerspective} from 'sanity'
+import {useRouter} from 'sanity/router'
+
+import {usePaneRouter} from '../../components/paneRouter/usePaneRouter'
+
+/**
+ * @internal
+ * Exposes cardinality one releases as selectedPerspective through PerspectiveContext
+ */
+export function DocumentPerspectiveProvider({children}: {children: ReactNode}) {
+  const paneRouter = usePaneRouter()
+  const {excludedPerspectives} = usePerspective()
+  const router = useRouter()
+  const selectedVariantName =
+    typeof router.stickyParams.variant === 'string' ? router.stickyParams.variant : undefined
+
+  const {scheduledDraft} = paneRouter.params as {scheduledDraft?: string}
+  if (scheduledDraft) {
+    return (
+      <PerspectiveProvider
+        selectedPerspectiveName={scheduledDraft}
+        selectedVariantName={selectedVariantName}
+        excludedPerspectives={excludedPerspectives}
+      >
+        {children}
+      </PerspectiveProvider>
+    )
+  }
+  return children
+}

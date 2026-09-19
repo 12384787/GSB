@@ -1,0 +1,28 @@
+{
+  "number": 23,
+  "repository": "pallets/flask",
+  "url": "https://github.com/pallets/flask",
+  "description": "The Python micro framework for building web applications.",
+  "language": "Python",
+  "stars": 74754,
+  "default_branch": "main",
+  "source_zip_url": "https://github.com/pallets/flask/archive/refs/heads/main.zip",
+  "source_root": "source/flask-main",
+  "top_level_entries": [
+    ".devcontainer",
+    ".editorconfig",
+    ".github",
+    ".gitignore",
+    ".pre-commit-config.yaml",
+    ".readthedocs.yaml",
+    "CHANGES.rst",
+    "LICENSE.txt",
+    "README.md",
+    "docs",
+    "examples",
+    "pyproject.toml",
+    "src",
+    "tests",
+    "uv.lock"
+  ]
+}

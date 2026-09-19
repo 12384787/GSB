@@ -1,0 +1,130 @@
+import {useToast} from '@sanity/ui/toast'
+import {memo, useEffect, useMemo, useRef} from 'react'
+import {
+  isDocumentLimitError,
+  Translate,
+  useDocumentLimitsUpsellContext,
+  useDocumentOperationEvent,
+  usePerspective,
+  useTranslation,
+} from 'sanity'
+
+import {usePaneRouter} from '../../components/paneRouter/usePaneRouter'
+import {structureLocaleNamespace} from '../../i18n'
+import {useDocumentPane} from './useDocumentPane'
+import {useDocumentPaneInfo} from './useDocumentPaneInfo'
+import {useDocumentTitle} from './useDocumentTitle'
+
+const IGNORE_OPS = ['patch', 'commit']
+
+/**
+ * The i18n context selecting the success copy for an operation. Publish and unpublish need
+ * version-scoped variants:
+ * - publishing a version whose document also has a draft would report the draft's title, so the
+ *   version copy leaves the title out
+ * - unpublishing inside a release only stages the removal, so the base copy ("a draft has been
+ *   created from the latest published revision") would be wrong. A variant unpublish outside a
+ *   release is a real unpublish, hence the release check rather than `idPair.versionId`.
+ */
+function getSuccessContext(
+  event: {op: string; idPair: {versionId?: string}},
+  selectedReleaseId: string | undefined,
+): string {
+  if (event.op === 'publish' && event.idPair.versionId) return 'publishVersion'
+  if (event.op === 'unpublish' && selectedReleaseId) return 'unpublishVersion'
+  return event.op
+}
+
+export const DocumentOperationResults = memo(function DocumentOperationResults() {
+  const {push: pushToast} = useToast()
+  const {value: documentPaneValue} = useDocumentPane()
+  const {documentId, documentType} = useDocumentPaneInfo()
+  const documentTitleInfo = useDocumentTitle()
+  const titleError = documentTitleInfo.error
+  const event = useDocumentOperationEvent(documentId, documentType)
+  const prevEvent = useRef(event)
+  const paneRouter = usePaneRouter()
+  const {t} = useTranslation(structureLocaleNamespace)
+  const {handleOpenDialog} = useDocumentLimitsUpsellContext()
+  const {selectedReleaseId} = usePerspective()
+
+  const title = useMemo(() => {
+    // If title isn't set from document preview, use the title from the document pane value
+    if (
+      !documentTitleInfo.title &&
+      !titleError &&
+      event &&
+      !IGNORE_OPS.includes(event.op) &&
+      typeof documentPaneValue.title === 'string' &&
+      event?.type === 'success'
+    ) {
+      return documentPaneValue.title
+    }
+    return documentTitleInfo.title
+  }, [documentTitleInfo.title, titleError, event, documentPaneValue.title])
+  //Truncate the document title and add "..." if it is over 25 characters
+  const documentTitleBase = title || t('panes.document-operation-results.operation-undefined-title')
+  const documentTitle =
+    documentTitleBase.length > 25 ? `${documentTitleBase.slice(0, 25)}...` : documentTitleBase
+
+  useEffect(() => {
+    if (!event || event === prevEvent.current) return
+
+    let cleanupId: number | undefined
+
+    if (event.type === 'error') {
+      if (isDocumentLimitError(event.error)) {
+        handleOpenDialog('document_action')
+        return
+      }
+      pushToast({
+        closable: true,
+        duration: 30000, // 30s
+        status: 'error',
+        title: t('panes.document-operation-results.operation-error', {context: event.op}),
+        description: (
+          <details>
+            <summary>{t('panes.document-operation-results.error.summary.title')}</summary>
+            {event.error.message}
+          </details>
+        ),
+      })
+    }
+
+    if (event.type === 'success' && !IGNORE_OPS.includes(event.op)) {
+      pushToast({
+        closable: true,
+        status: 'success',
+        title: (
+          <Translate
+            context={getSuccessContext(event, selectedReleaseId)}
+            i18nKey="panes.document-operation-results.operation-success"
+            t={t}
+            values={{
+              op: event.op,
+              title: documentTitle,
+            }}
+            components={{
+              Strong: 'strong',
+            }}
+          />
+        ),
+      })
+    }
+
+    /**
+     * If the document was deleted successfully, close the pane.
+     */
+    if (event.type === 'success' && event.op === 'delete') {
+      // Wait until next tick to allow deletion toasts to appear first
+      cleanupId = setTimeout(() => paneRouter.closeCurrentAndAfter(), 0) as any as number
+    }
+
+    prevEvent.current = event
+
+    // oxlint-disable-next-line consistent-return
+    return () => clearTimeout(cleanupId)
+  }, [event, paneRouter, pushToast, t, documentTitle, handleOpenDialog, selectedReleaseId])
+
+  return null
+})

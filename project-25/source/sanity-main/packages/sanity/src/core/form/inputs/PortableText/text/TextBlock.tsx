@@ -1,0 +1,410 @@
+import {type EditorSelection, PortableTextEditor, usePortableTextEditor} from '@portabletext/editor'
+import {type ObjectSchemaType, type Path, type PortableTextTextBlock} from '@sanity/types'
+import {Text} from '@sanity/ui'
+import {isEqual} from '@sanity/util/paths'
+import {type ReactNode, useCallback, useEffect, useMemo, useState} from 'react'
+import {Flex, Box, type PaddingProps} from 'ui5'
+
+import {Tooltip} from '../../../../../ui-components/tooltip/Tooltip'
+import {useHoveredChange} from '../../../../changeIndicators/useHoveredChange'
+import {pathToString} from '../../../../field/paths/helpers'
+import {EMPTY_ARRAY} from '../../../../util/empty'
+import {FormNodeDivergenceDetail} from '../../../components/FormNodeDivergenceDetail'
+import {useDocumentDivergences} from '../../../contexts/DivergencesProvider'
+import {useFormCallbacks} from '../../../studio/contexts/FormCallbacks'
+import {useChildPresence} from '../../../studio/contexts/Presence'
+import {
+  type RenderCustomMarkers,
+  type RenderBlockActionsCallback,
+} from '../../../types/_transitional'
+import {type BlockProps} from '../../../types/blockProps'
+import {
+  type RenderAnnotationCallback,
+  type RenderArrayOfObjectsItemCallback,
+  type RenderBlockCallback,
+  type RenderFieldCallback,
+  type RenderInputCallback,
+  type RenderPreviewCallback,
+} from '../../../types/renderCallback'
+import {useFormBuilder} from '../../../useFormBuilder'
+import {ReviewChangesHighlightBlock} from '../_common/ReviewChangesHighlightBlock'
+import {StyledChangeIndicatorWithProvidedFullPath} from '../_common/StyledChangeIndicatorWithProvidedFullPath'
+import {BlockActions} from '../BlockActions'
+import {type SetPortableTextMemberItemElementRef} from '../contexts/PortableTextMemberItemElementRefsProvider'
+import {usePortableTextMemberSchemaTypes} from '../contexts/PortableTextMemberSchemaTypes'
+import {debugRender} from '../debugRender'
+import {useMemberValidation} from '../hooks/useMemberValidation'
+import {usePortableTextMarkers} from '../hooks/usePortableTextMarkers'
+import {usePortableTextMemberItem} from '../hooks/usePortableTextMembers'
+import {TEXT_STYLE_PADDING} from './constants'
+import {
+  BlockActionsInner,
+  BlockActionsOuter,
+  ChangeIndicatorWrapper,
+  ListPrefixWrapper,
+  TextBlockWrapper,
+  TextFlex,
+  TextRoot,
+  TooltipBox,
+} from './TextBlock.styles'
+import {TextContainer} from './textStyles'
+
+export interface TextBlockProps {
+  children: ReactNode
+  floatingBoundary: HTMLElement | null
+  focused: boolean
+  isFullscreen?: boolean
+  /**
+   * The block's `listItem`, only when the schema defines it. The caller
+   * resolves it against the position's sub-schema; an unknown list type
+   * arrives as `undefined` and renders without list decoration.
+   */
+  listItem: string | undefined
+  onItemClose: () => void
+  onItemOpen: (path: Path) => void
+  onItemRemove: (itemKey: string) => void
+  onPathFocus: (path: Path) => void
+  path: Path
+  readOnly?: boolean
+  referenceBoundary: HTMLElement | null
+  renderAnnotation?: RenderAnnotationCallback
+  renderBlock?: RenderBlockCallback
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+  renderBlockActions?: RenderBlockActionsCallback
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+  renderCustomMarkers?: RenderCustomMarkers
+  renderField: RenderFieldCallback
+  renderInlineBlock?: RenderBlockCallback
+  renderInput: RenderInputCallback
+  renderItem: RenderArrayOfObjectsItemCallback
+  renderPreview: RenderPreviewCallback
+  schemaType: ObjectSchemaType
+  selected: boolean
+  setElementRef: SetPortableTextMemberItemElementRef
+  spellCheck?: boolean
+  value: PortableTextTextBlock
+  anchorIdent?: string
+  relativePath: Path
+}
+
+export function TextBlock(props: TextBlockProps) {
+  const {
+    children,
+    floatingBoundary,
+    focused,
+    isFullscreen,
+    listItem,
+    onItemClose,
+    onItemOpen,
+    onPathFocus,
+    path,
+    readOnly,
+    referenceBoundary,
+    renderBlock,
+    renderAnnotation,
+    renderBlockActions,
+    renderCustomMarkers,
+    renderField,
+    renderInlineBlock,
+    renderInput,
+    renderItem,
+    renderPreview,
+    schemaType,
+    selected,
+    setElementRef,
+    spellCheck,
+    value,
+    anchorIdent,
+    relativePath,
+  } = props
+  // A path deeper than the root array means the block is nested in a container.
+  const nested = relativePath.length > 1
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+  const {Markers} = useFormBuilder().__internal.components
+  const markers = usePortableTextMarkers(path)
+  const [divElement, setDivElement] = useState<HTMLDivElement | null>(null)
+  const memberItem = usePortableTextMemberItem(pathToString(path))
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+  const editor = usePortableTextEditor()
+  const schemaTypes = usePortableTextMemberSchemaTypes()
+  const {onChange} = useFormCallbacks()
+  const hoveredChange = useHoveredChange()
+  const divergenceNavigator = useDocumentDivergences()
+
+  /**
+   * Save the last valid memberItem data to prevent DOM mutations during text selection.
+   * When memberItem becomes undefined
+   * (due to the performance optimization that removes unfocused blocks from the context),
+   * we keep the ChangeIndicatorWrapper mounted
+   */
+  const [memberItemRef, setMemberItemRef] = useState(memberItem)
+  useEffect(() => {
+    if (memberItem) {
+      // oxlint-disable-next-line react/set-state-in-effect -- pre-existing violation, to be fixed in a follow-up
+      setMemberItemRef(memberItem)
+    }
+  }, [memberItem])
+
+  const changeHovered =
+    hoveredChange && pathToString(hoveredChange?.path || []) === pathToString(path)
+
+  const isFocusedDivergence =
+    divergenceNavigator.enabled &&
+    divergenceNavigator.state.focusedDivergence === pathToString(path)
+
+  const presence = useChildPresence(path, true)
+  // Include all presence paths pointing either directly to a block, or directly to a block child
+  // (which is where the user most of the time would have the presence in a text block)
+  const textPresence = useMemo(() => {
+    return presence.filter(
+      (p) =>
+        isEqual(p.path, path) ||
+        (p.path.slice(-3)[1] === 'children' && p.path.length - path.length === 2),
+    )
+  }, [path, presence])
+
+  const {validation, hasError, hasWarning, hasInfo} = useMemberValidation(memberItem?.node)
+
+  const hasMarkers = Boolean(renderCustomMarkers) && markers.length > 0
+
+  const tooltipEnabled = hasError || hasWarning || hasMarkers || hasInfo
+
+  const onOpen = useCallback(() => {
+    if (memberItem) {
+      onItemOpen(memberItem.node.path)
+    }
+  }, [onItemOpen, memberItem])
+
+  const onRemove = useCallback(() => {
+    const point = {path: path.slice(-1), offset: 0}
+    const sel: EditorSelection = {
+      focus: point,
+      anchor: point,
+    }
+    // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+    PortableTextEditor.delete(editor, sel, {mode: 'blocks'})
+    // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+    PortableTextEditor.focus(editor)
+  }, [path, editor])
+
+  const text = useMemo(() => {
+    return (
+      <TextFlex alignItems="flex-start" $level={value?.level}>
+        {listItem && (
+          <ListPrefixWrapper contentEditable={false}>
+            <Text data-list-prefix="">
+              <TextContainer />
+            </Text>
+          </ListPrefixWrapper>
+        )}
+        <div data-text="" style={debugRender()}>
+          {children}
+        </div>
+      </TextFlex>
+    )
+  }, [listItem, value.level, children])
+
+  const innerPaddingProps: PaddingProps = useMemo(() => {
+    if (nested) {
+      // A nested block sits inside a container that owns horizontal spacing
+      // (e.g. a table cell's padding), so the root gutter is dropped.
+      return {paddingX: 0}
+    }
+
+    if (isFullscreen && !renderBlockActions) {
+      return {paddingX: 5}
+    }
+
+    if (isFullscreen && renderBlockActions) {
+      return {paddingLeft: 5, paddingRight: 2}
+    }
+
+    if (renderBlockActions) {
+      return {
+        paddingLeft: 3,
+        paddingRight: 2,
+      }
+    }
+
+    return {paddingX: 3}
+  }, [isFullscreen, renderBlockActions, nested])
+
+  const outerPaddingProps: PaddingProps = useMemo(() => {
+    // List markers are schema-resolved through `listItem`, but spacing follows
+    // the raw value so legacy list blocks keep the same document rhythm.
+    if (value.listItem) {
+      return {paddingY: 2}
+    }
+
+    return TEXT_STYLE_PADDING[value.style || 'normal'] || {paddingY: 2}
+  }, [value.listItem, value.style])
+
+  const isOpen = Boolean(memberItem?.member.open)
+  const parentSchemaType = schemaTypes.portableText
+  const referenceElement = divElement
+
+  const componentProps: BlockProps = useMemo(
+    () => ({
+      __unstable_floatingBoundary: floatingBoundary,
+      __unstable_referenceBoundary: referenceBoundary,
+      __unstable_referenceElement: referenceElement,
+      changed: memberItem?.member.item.changed ?? false,
+      children: text,
+      focused,
+      markers,
+      onClose: onItemClose,
+      onOpen,
+      onPathFocus,
+      onRemove,
+      open: isOpen,
+      parentSchemaType,
+      path: memberItem?.node.path || EMPTY_ARRAY,
+      presence: textPresence,
+      readOnly: Boolean(readOnly),
+      renderAnnotation,
+      renderBlock,
+      renderDefault: DefaultComponent,
+      renderField,
+      renderInput,
+      renderInlineBlock,
+      renderItem,
+      renderPreview,
+      schemaType,
+      selected,
+      validation,
+      value,
+    }),
+    [
+      floatingBoundary,
+      focused,
+      isOpen,
+      markers,
+      memberItem?.member.item.changed,
+      memberItem?.node.path,
+      onItemClose,
+      onOpen,
+      onPathFocus,
+      onRemove,
+      parentSchemaType,
+      readOnly,
+      referenceBoundary,
+      referenceElement,
+      renderAnnotation,
+      renderBlock,
+      renderField,
+      renderInlineBlock,
+      renderInput,
+      renderItem,
+      renderPreview,
+      schemaType,
+      selected,
+      text,
+      textPresence,
+      validation,
+      value,
+    ],
+  )
+
+  const toolTipContent = useMemo(
+    () =>
+      (tooltipEnabled && (
+        <TooltipBox>
+          <Markers
+            markers={markers}
+            renderCustomMarkers={renderCustomMarkers}
+            validation={validation}
+          />
+        </TooltipBox>
+      )) ||
+      null,
+    [Markers, markers, renderCustomMarkers, tooltipEnabled, validation],
+  )
+
+  const blockActionsEnabled = renderBlockActions && !readOnly
+
+  const changeIndicatorVisible = isFullscreen && memberItemRef
+
+  const setRef = useCallback(
+    (elm: HTMLDivElement) => {
+      if (memberItem) {
+        setElementRef({key: memberItem.key, elementRef: elm})
+      }
+      setDivElement(elm) // update state here so the reference element is available on first render
+    },
+    [memberItem, setElementRef, setDivElement],
+  )
+
+  return (
+    <Box
+      {...outerPaddingProps}
+      data-testid="text-block"
+      data-fullscreen={isFullscreen}
+      ref={setRef}
+      style={debugRender()}
+    >
+      <TextBlockWrapper data-testid="text-block__wrapper">
+        <FormNodeDivergenceDetail path={path} readOnly={readOnly}>
+          <Flex flexBasis="0%" flexGrow={1} {...innerPaddingProps}>
+            <Box flexBasis="0%" flexGrow={1} style={{anchorName: anchorIdent}}>
+              <Tooltip
+                content={toolTipContent}
+                disabled={!tooltipEnabled}
+                placement="top"
+                portal="editor"
+              >
+                <TextRoot
+                  $level={value.level || 1}
+                  data-error={hasError ? '' : undefined}
+                  data-list-item={listItem}
+                  data-markers={hasMarkers ? '' : undefined}
+                  data-read-only={readOnly}
+                  data-testid="text-block__text"
+                  data-warning={hasWarning ? '' : undefined}
+                  spellCheck={spellCheck}
+                >
+                  {renderBlock && renderBlock(componentProps)}
+                </TextRoot>
+              </Tooltip>
+            </Box>
+
+            {blockActionsEnabled && (
+              <BlockActionsOuter contentEditable={false} marginRight={3}>
+                <BlockActionsInner>
+                  {focused && (
+                    <BlockActions
+                      block={value}
+                      onChange={onChange}
+                      renderBlockActions={renderBlockActions}
+                    />
+                  )}
+                </BlockActionsInner>
+              </BlockActionsOuter>
+            )}
+
+            {changeIndicatorVisible && (
+              <ChangeIndicatorWrapper
+                // Use current memberItem when available for accurate data, fallback to cached for stability
+                $hasChanges={(memberItem ?? memberItemRef).member.item.changed}
+                contentEditable={false}
+              >
+                <StyledChangeIndicatorWithProvidedFullPath
+                  hasFocus={focused}
+                  isChanged={(memberItem ?? memberItemRef).member.item.changed}
+                  path={(memberItem ?? memberItemRef).member.item.path}
+                  withHoverEffect={false}
+                />
+              </ChangeIndicatorWrapper>
+            )}
+            {(changeHovered || isFocusedDivergence) && (
+              <ReviewChangesHighlightBlock $fullScreen={Boolean(isFullscreen)} />
+            )}
+          </Flex>
+        </FormNodeDivergenceDetail>
+      </TextBlockWrapper>
+    </Box>
+  )
+}
+
+export const DefaultComponent = (props: BlockProps) => {
+  return <>{props.children}</>
+}

@@ -1,0 +1,175 @@
+import {type SanityDocument} from '@sanity/client'
+import {RevertIcon} from '@sanity/icons/Revert'
+import {type ObjectSchemaType} from '@sanity/types'
+import {Card} from '@sanity/ui'
+import {startTransition, useCallback, useContext, useMemo, useState} from 'react'
+import {DiffContext} from 'sanity/_singletons'
+import {VStack} from 'ui5'
+
+import {Button} from '../../../../ui-components/button/Button'
+import {useDocumentOperation} from '../../../hooks/useDocumentOperation'
+import {
+  getPairTarget,
+  getTargetScopeId,
+  useTargetDocumentState,
+} from '../../../hooks/useTargetDocumentState'
+import {useTranslation} from '../../../i18n/hooks/useTranslation'
+import {useDocumentPairPermissions} from '../../../store/grants/documentPairPermissions'
+import {useConditionalProperty} from '../../conditional-property/useConditionalProperty'
+import {type ChangeNode, type ObjectDiff} from '../../types'
+import {buildObjectChangeList} from '../changes/buildChangeList'
+import {undoChange} from '../changes/undoChange'
+import {useDocumentChange} from '../hooks/useDocumentChange'
+import {ChangeListWrapper} from './ChangeList.styled'
+import {ChangeResolver} from './ChangeResolver'
+import {NoChanges} from './NoChanges'
+import {RevertChangesConfirmDialog} from './RevertChangesConfirmDialog'
+
+/** @internal */
+export interface ChangeListProps {
+  schemaType: ObjectSchemaType
+  diff: ObjectDiff
+  fields?: string[]
+}
+
+/** @internal */
+export function ChangeList({diff, fields, schemaType}: ChangeListProps): React.JSX.Element | null {
+  const {documentId, isComparingCurrent, value} = useDocumentChange()
+  const targetDocumentState = useTargetDocumentState(documentId)
+  // The scope of the document targeted by the selected perspective (undefined when the target is
+  // still resolving or the draft/published pair applies). While resolving, reverting is disabled
+  // below instead of silently operating on the base pair.
+  const isTargetReady = targetDocumentState.status === 'ready'
+  const scopeId = getTargetScopeId(targetDocumentState)
+  const docOperations = useDocumentOperation(
+    documentId,
+    schemaType.name,
+    getPairTarget(targetDocumentState),
+  )
+  const {path} = useContext(DiffContext)
+  const isRoot = path.length === 0
+  const [confirmRevertAllOpen, setConfirmRevertAllOpen] = useState(false)
+  const [confirmRevertAllHover, setConfirmRevertAllHover] = useState(false)
+  const [buttonElement, _setButtonElement] = useState<HTMLButtonElement | null>(null)
+  const setButtonElement = (element: HTMLButtonElement | null) => {
+    /**
+     * The startTransition wrapper here is to avoid an issue when on React 18 where this error can happen:
+     * \>Maximum update depth exceeded. This can happen when a component repeatedly calls setState inside componentWillUpdate or componentDidUpdate. React limits the number of nested updates to prevent infinite loops.
+     * This doesn't happen on React 19 due to automatic batching of all state updates, the startTransition wrapper here gives a type of batching for 18 users in a way that still works with 19.
+     */
+    startTransition(() => _setButtonElement(element))
+  }
+  const {t} = useTranslation()
+
+  const isReadOnly = useConditionalProperty({
+    document: value as SanityDocument,
+    value: undefined,
+    checkProperty: schemaType.readOnly,
+    checkPropertyKey: 'readOnly',
+    path,
+  })
+
+  if (schemaType.jsonType !== 'object') {
+    throw new Error(`Only object schema types are allowed in ChangeList`)
+  }
+
+  const [permissions, isPermissionsLoading] = useDocumentPairPermissions({
+    id: documentId,
+    type: schemaType.name,
+    version: scopeId,
+    permission: 'update',
+  })
+
+  const allChanges = useMemo(
+    () => buildObjectChangeList(schemaType, diff, path, [], {fieldFilter: fields}),
+    [schemaType, fields, path, diff],
+  )
+
+  const changes = useMemo(
+    () => (fields && fields.length === 0 ? [] : maybeFlatten(allChanges)),
+    [allChanges, fields],
+  )
+
+  const rootChange = allChanges[0]
+
+  const revertAllChanges = useCallback(() => {
+    undoChange(rootChange, diff, docOperations)
+    setConfirmRevertAllOpen(false)
+  }, [rootChange, diff, docOperations])
+
+  const handleRevertAllChangesClick = useCallback(() => {
+    setConfirmRevertAllOpen(true)
+  }, [])
+
+  const handleRevertAllChangesMouseEnter = useCallback(() => {
+    setConfirmRevertAllHover(true)
+  }, [])
+
+  const handleRevertAllChangesMouseLeave = useCallback(() => {
+    setConfirmRevertAllHover(false)
+  }, [])
+
+  const closeRevertAllChangesConfirmDialog = useCallback(() => {
+    setConfirmRevertAllOpen(false)
+  }, [])
+
+  if (changes.length === 0) {
+    return isRoot ? <NoChanges /> : null
+  }
+
+  const showFooter = isRoot && changes.length > 1
+
+  return (
+    <Card>
+      <VStack gap={5}>
+        <VStack as={ChangeListWrapper} gap={5}>
+          {changes.map((change) => (
+            <div key={change.key}>
+              <ChangeResolver
+                key={change.key}
+                change={change}
+                data-revert-all-changes-hover={confirmRevertAllHover ? '' : undefined}
+                readOnly={isReadOnly || change?.readOnly}
+                hidden={change?.hidden}
+                // If the path of the nested change is more than two levels deep, we want to add a wrapper
+                // with the parent path, for the change indicator to be shown.
+                addParentWrapper={change.path.length > 1}
+              />
+            </div>
+          ))}
+        </VStack>
+
+        {showFooter && isComparingCurrent && !isPermissionsLoading && permissions?.granted && (
+          <VStack>
+            <Button
+              tone="critical"
+              mode="ghost"
+              text={t('changes.action.revert-all-confirm')}
+              icon={RevertIcon}
+              onClick={handleRevertAllChangesClick}
+              onMouseEnter={handleRevertAllChangesMouseEnter}
+              onMouseLeave={handleRevertAllChangesMouseLeave}
+              disabled={isReadOnly || !isTargetReady}
+              size="large"
+              ref={setButtonElement}
+            />
+          </VStack>
+        )}
+      </VStack>
+
+      <RevertChangesConfirmDialog
+        open={confirmRevertAllOpen}
+        onConfirm={revertAllChanges}
+        onCancel={closeRevertAllChangesConfirmDialog}
+        changeCount={changes.length}
+        referenceElement={buttonElement}
+      />
+    </Card>
+  )
+}
+
+function maybeFlatten(changes: ChangeNode[]) {
+  return changes.length === 1 && changes[0].type === 'group' && changes[0].path.length === 0
+    ? changes[0].changes
+    : changes
+}

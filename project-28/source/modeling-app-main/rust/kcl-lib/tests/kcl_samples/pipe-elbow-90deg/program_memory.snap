@@ -1,0 +1,4949 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Variables in memory after executing pipe-elbow-90deg.kcl
+---
+{
+  "__sketch_19_on": {
+    "type": "Plane",
+    "value": {
+      "artifactId": "[uuid]",
+      "id": "[uuid]",
+      "kind": "Custom",
+      "origin": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0,
+        "units": "mm"
+      },
+      "xAxis": {
+        "x": 0.0,
+        "y": 1.0,
+        "z": 0.0,
+        "units": null
+      },
+      "yAxis": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 1.0,
+        "units": null
+      },
+      "zAxis": {
+        "x": 1.0,
+        "y": 0.0,
+        "z": 0.0,
+        "units": null
+      }
+    }
+  },
+  "__sketch_1_on": {
+    "type": "Plane",
+    "value": {
+      "artifactId": "[uuid]",
+      "id": "[uuid]",
+      "kind": "Custom",
+      "origin": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0,
+        "units": "mm"
+      },
+      "xAxis": {
+        "x": 1.0,
+        "y": 0.0,
+        "z": 0.0,
+        "units": null
+      },
+      "yAxis": {
+        "x": 0.0,
+        "y": 1.0,
+        "z": 0.0,
+        "units": null
+      },
+      "zAxis": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 1.0,
+        "units": null
+      }
+    }
+  },
+  "__sketch_37_on": {
+    "type": "Plane",
+    "value": {
+      "artifactId": "[uuid]",
+      "id": "[uuid]",
+      "kind": "Custom",
+      "origin": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0,
+        "units": "mm"
+      },
+      "xAxis": {
+        "x": 0.0,
+        "y": 1.0,
+        "z": 0.0,
+        "units": null
+      },
+      "yAxis": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 1.0,
+        "units": null
+      },
+      "zAxis": {
+        "x": 1.0,
+        "y": 0.0,
+        "z": 0.0,
+        "units": null
+      }
+    }
+  },
+  "boltCircleDiameter": {
+    "type": "Number",
+    "value": 112.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "boltHoleBodies": {
+    "type": "HomArray",
+    "value": [
+      {
+        "type": "Solid",
+        "value": {
+          "type": "Solid",
+          "id": "[uuid]",
+          "originalId": "[uuid]",
+          "topologyId": "[uuid]",
+          "artifactId": "[uuid]",
+          "value": [
+            {
+              "faceId": "[uuid]",
+              "id": "[uuid]",
+              "sourceRange": [],
+              "tag": {
+                "commentStart": 2512,
+                "end": 2526,
+                "moduleId": 0,
+                "start": 2512,
+                "type": "TagDeclarator",
+                "value": "boltHoleCircle"
+              },
+              "type": "extrudeArc"
+            }
+          ],
+          "sketch": {
+            "creatorType": "sketch",
+            "type": "Sketch",
+            "id": "[uuid]",
+            "paths": [
+              {
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                },
+                "ccw": true,
+                "center": [
+                  56.00000000200154,
+                  79.99999999432897
+                ],
+                "from": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "radius": 6.000000002405851,
+                "tag": {
+                  "commentStart": 2512,
+                  "end": 2526,
+                  "moduleId": 0,
+                  "start": 2512,
+                  "type": "TagDeclarator",
+                  "value": "boltHoleCircle"
+                },
+                "to": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "type": "Circle",
+                "units": "mm"
+              }
+            ],
+            "on": {
+              "type": "plane",
+              "artifactId": "[uuid]",
+              "id": "[uuid]",
+              "objectId": 36,
+              "kind": "Custom",
+              "origin": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": "mm"
+              },
+              "xAxis": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0,
+                "units": null
+              },
+              "yAxis": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0,
+                "units": null
+              },
+              "zAxis": {
+                "x": 1.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": null
+              }
+            },
+            "start": {
+              "from": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "to": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "units": "mm",
+              "tag": null,
+              "__geoMeta": {
+                "id": "[uuid]",
+                "sourceRange": []
+              }
+            },
+            "tags": {
+              "boltHoleCircle": {
+                "type": "TagIdentifier",
+                "value": "boltHoleCircle"
+              }
+            },
+            "artifactId": "[uuid]",
+            "originalId": "[uuid]",
+            "units": "mm",
+            "isClosed": "explicitly"
+          },
+          "startCapId": "[uuid]",
+          "endCapId": "[uuid]",
+          "units": "mm",
+          "sectional": false
+        }
+      },
+      {
+        "type": "Solid",
+        "value": {
+          "type": "Solid",
+          "id": "[uuid]",
+          "originalId": "[uuid]",
+          "topologyId": "[uuid]",
+          "artifactId": "[uuid]",
+          "value": [
+            {
+              "faceId": "[uuid]",
+              "id": "[uuid]",
+              "sourceRange": [],
+              "tag": {
+                "commentStart": 2512,
+                "end": 2526,
+                "moduleId": 0,
+                "start": 2512,
+                "type": "TagDeclarator",
+                "value": "boltHoleCircle"
+              },
+              "type": "extrudeArc"
+            }
+          ],
+          "sketch": {
+            "creatorType": "sketch",
+            "type": "Sketch",
+            "id": "[uuid]",
+            "paths": [
+              {
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                },
+                "ccw": true,
+                "center": [
+                  56.00000000200154,
+                  79.99999999432897
+                ],
+                "from": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "radius": 6.000000002405851,
+                "tag": {
+                  "commentStart": 2512,
+                  "end": 2526,
+                  "moduleId": 0,
+                  "start": 2512,
+                  "type": "TagDeclarator",
+                  "value": "boltHoleCircle"
+                },
+                "to": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "type": "Circle",
+                "units": "mm"
+              }
+            ],
+            "on": {
+              "type": "plane",
+              "artifactId": "[uuid]",
+              "id": "[uuid]",
+              "objectId": 36,
+              "kind": "Custom",
+              "origin": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": "mm"
+              },
+              "xAxis": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0,
+                "units": null
+              },
+              "yAxis": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0,
+                "units": null
+              },
+              "zAxis": {
+                "x": 1.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": null
+              }
+            },
+            "start": {
+              "from": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "to": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "units": "mm",
+              "tag": null,
+              "__geoMeta": {
+                "id": "[uuid]",
+                "sourceRange": []
+              }
+            },
+            "tags": {
+              "boltHoleCircle": {
+                "type": "TagIdentifier",
+                "value": "boltHoleCircle"
+              }
+            },
+            "artifactId": "[uuid]",
+            "originalId": "[uuid]",
+            "units": "mm",
+            "isClosed": "explicitly"
+          },
+          "startCapId": "[uuid]",
+          "endCapId": "[uuid]",
+          "units": "mm",
+          "sectional": false
+        }
+      },
+      {
+        "type": "Solid",
+        "value": {
+          "type": "Solid",
+          "id": "[uuid]",
+          "originalId": "[uuid]",
+          "topologyId": "[uuid]",
+          "artifactId": "[uuid]",
+          "value": [
+            {
+              "faceId": "[uuid]",
+              "id": "[uuid]",
+              "sourceRange": [],
+              "tag": {
+                "commentStart": 2512,
+                "end": 2526,
+                "moduleId": 0,
+                "start": 2512,
+                "type": "TagDeclarator",
+                "value": "boltHoleCircle"
+              },
+              "type": "extrudeArc"
+            }
+          ],
+          "sketch": {
+            "creatorType": "sketch",
+            "type": "Sketch",
+            "id": "[uuid]",
+            "paths": [
+              {
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                },
+                "ccw": true,
+                "center": [
+                  56.00000000200154,
+                  79.99999999432897
+                ],
+                "from": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "radius": 6.000000002405851,
+                "tag": {
+                  "commentStart": 2512,
+                  "end": 2526,
+                  "moduleId": 0,
+                  "start": 2512,
+                  "type": "TagDeclarator",
+                  "value": "boltHoleCircle"
+                },
+                "to": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "type": "Circle",
+                "units": "mm"
+              }
+            ],
+            "on": {
+              "type": "plane",
+              "artifactId": "[uuid]",
+              "id": "[uuid]",
+              "objectId": 36,
+              "kind": "Custom",
+              "origin": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": "mm"
+              },
+              "xAxis": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0,
+                "units": null
+              },
+              "yAxis": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0,
+                "units": null
+              },
+              "zAxis": {
+                "x": 1.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": null
+              }
+            },
+            "start": {
+              "from": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "to": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "units": "mm",
+              "tag": null,
+              "__geoMeta": {
+                "id": "[uuid]",
+                "sourceRange": []
+              }
+            },
+            "tags": {
+              "boltHoleCircle": {
+                "type": "TagIdentifier",
+                "value": "boltHoleCircle"
+              }
+            },
+            "artifactId": "[uuid]",
+            "originalId": "[uuid]",
+            "units": "mm",
+            "isClosed": "explicitly"
+          },
+          "startCapId": "[uuid]",
+          "endCapId": "[uuid]",
+          "units": "mm",
+          "sectional": false
+        }
+      },
+      {
+        "type": "Solid",
+        "value": {
+          "type": "Solid",
+          "id": "[uuid]",
+          "originalId": "[uuid]",
+          "topologyId": "[uuid]",
+          "artifactId": "[uuid]",
+          "value": [
+            {
+              "faceId": "[uuid]",
+              "id": "[uuid]",
+              "sourceRange": [],
+              "tag": {
+                "commentStart": 2512,
+                "end": 2526,
+                "moduleId": 0,
+                "start": 2512,
+                "type": "TagDeclarator",
+                "value": "boltHoleCircle"
+              },
+              "type": "extrudeArc"
+            }
+          ],
+          "sketch": {
+            "creatorType": "sketch",
+            "type": "Sketch",
+            "id": "[uuid]",
+            "paths": [
+              {
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                },
+                "ccw": true,
+                "center": [
+                  56.00000000200154,
+                  79.99999999432897
+                ],
+                "from": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "radius": 6.000000002405851,
+                "tag": {
+                  "commentStart": 2512,
+                  "end": 2526,
+                  "moduleId": 0,
+                  "start": 2512,
+                  "type": "TagDeclarator",
+                  "value": "boltHoleCircle"
+                },
+                "to": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "type": "Circle",
+                "units": "mm"
+              }
+            ],
+            "on": {
+              "type": "plane",
+              "artifactId": "[uuid]",
+              "id": "[uuid]",
+              "objectId": 36,
+              "kind": "Custom",
+              "origin": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": "mm"
+              },
+              "xAxis": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0,
+                "units": null
+              },
+              "yAxis": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0,
+                "units": null
+              },
+              "zAxis": {
+                "x": 1.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": null
+              }
+            },
+            "start": {
+              "from": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "to": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "units": "mm",
+              "tag": null,
+              "__geoMeta": {
+                "id": "[uuid]",
+                "sourceRange": []
+              }
+            },
+            "tags": {
+              "boltHoleCircle": {
+                "type": "TagIdentifier",
+                "value": "boltHoleCircle"
+              }
+            },
+            "artifactId": "[uuid]",
+            "originalId": "[uuid]",
+            "units": "mm",
+            "isClosed": "explicitly"
+          },
+          "startCapId": "[uuid]",
+          "endCapId": "[uuid]",
+          "units": "mm",
+          "sectional": false
+        }
+      },
+      {
+        "type": "Solid",
+        "value": {
+          "type": "Solid",
+          "id": "[uuid]",
+          "originalId": "[uuid]",
+          "topologyId": "[uuid]",
+          "artifactId": "[uuid]",
+          "value": [
+            {
+              "faceId": "[uuid]",
+              "id": "[uuid]",
+              "sourceRange": [],
+              "tag": {
+                "commentStart": 2512,
+                "end": 2526,
+                "moduleId": 0,
+                "start": 2512,
+                "type": "TagDeclarator",
+                "value": "boltHoleCircle"
+              },
+              "type": "extrudeArc"
+            }
+          ],
+          "sketch": {
+            "creatorType": "sketch",
+            "type": "Sketch",
+            "id": "[uuid]",
+            "paths": [
+              {
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                },
+                "ccw": true,
+                "center": [
+                  56.00000000200154,
+                  79.99999999432897
+                ],
+                "from": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "radius": 6.000000002405851,
+                "tag": {
+                  "commentStart": 2512,
+                  "end": 2526,
+                  "moduleId": 0,
+                  "start": 2512,
+                  "type": "TagDeclarator",
+                  "value": "boltHoleCircle"
+                },
+                "to": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "type": "Circle",
+                "units": "mm"
+              }
+            ],
+            "on": {
+              "type": "plane",
+              "artifactId": "[uuid]",
+              "id": "[uuid]",
+              "objectId": 36,
+              "kind": "Custom",
+              "origin": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": "mm"
+              },
+              "xAxis": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0,
+                "units": null
+              },
+              "yAxis": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0,
+                "units": null
+              },
+              "zAxis": {
+                "x": 1.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": null
+              }
+            },
+            "start": {
+              "from": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "to": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "units": "mm",
+              "tag": null,
+              "__geoMeta": {
+                "id": "[uuid]",
+                "sourceRange": []
+              }
+            },
+            "tags": {
+              "boltHoleCircle": {
+                "type": "TagIdentifier",
+                "value": "boltHoleCircle"
+              }
+            },
+            "artifactId": "[uuid]",
+            "originalId": "[uuid]",
+            "units": "mm",
+            "isClosed": "explicitly"
+          },
+          "startCapId": "[uuid]",
+          "endCapId": "[uuid]",
+          "units": "mm",
+          "sectional": false
+        }
+      },
+      {
+        "type": "Solid",
+        "value": {
+          "type": "Solid",
+          "id": "[uuid]",
+          "originalId": "[uuid]",
+          "topologyId": "[uuid]",
+          "artifactId": "[uuid]",
+          "value": [
+            {
+              "faceId": "[uuid]",
+              "id": "[uuid]",
+              "sourceRange": [],
+              "tag": {
+                "commentStart": 2512,
+                "end": 2526,
+                "moduleId": 0,
+                "start": 2512,
+                "type": "TagDeclarator",
+                "value": "boltHoleCircle"
+              },
+              "type": "extrudeArc"
+            }
+          ],
+          "sketch": {
+            "creatorType": "sketch",
+            "type": "Sketch",
+            "id": "[uuid]",
+            "paths": [
+              {
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                },
+                "ccw": true,
+                "center": [
+                  56.00000000200154,
+                  79.99999999432897
+                ],
+                "from": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "radius": 6.000000002405851,
+                "tag": {
+                  "commentStart": 2512,
+                  "end": 2526,
+                  "moduleId": 0,
+                  "start": 2512,
+                  "type": "TagDeclarator",
+                  "value": "boltHoleCircle"
+                },
+                "to": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "type": "Circle",
+                "units": "mm"
+              }
+            ],
+            "on": {
+              "type": "plane",
+              "artifactId": "[uuid]",
+              "id": "[uuid]",
+              "objectId": 36,
+              "kind": "Custom",
+              "origin": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": "mm"
+              },
+              "xAxis": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0,
+                "units": null
+              },
+              "yAxis": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0,
+                "units": null
+              },
+              "zAxis": {
+                "x": 1.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": null
+              }
+            },
+            "start": {
+              "from": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "to": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "units": "mm",
+              "tag": null,
+              "__geoMeta": {
+                "id": "[uuid]",
+                "sourceRange": []
+              }
+            },
+            "tags": {
+              "boltHoleCircle": {
+                "type": "TagIdentifier",
+                "value": "boltHoleCircle"
+              }
+            },
+            "artifactId": "[uuid]",
+            "originalId": "[uuid]",
+            "units": "mm",
+            "isClosed": "explicitly"
+          },
+          "startCapId": "[uuid]",
+          "endCapId": "[uuid]",
+          "units": "mm",
+          "sectional": false
+        }
+      },
+      {
+        "type": "Solid",
+        "value": {
+          "type": "Solid",
+          "id": "[uuid]",
+          "originalId": "[uuid]",
+          "topologyId": "[uuid]",
+          "artifactId": "[uuid]",
+          "value": [
+            {
+              "faceId": "[uuid]",
+              "id": "[uuid]",
+              "sourceRange": [],
+              "tag": {
+                "commentStart": 2512,
+                "end": 2526,
+                "moduleId": 0,
+                "start": 2512,
+                "type": "TagDeclarator",
+                "value": "boltHoleCircle"
+              },
+              "type": "extrudeArc"
+            }
+          ],
+          "sketch": {
+            "creatorType": "sketch",
+            "type": "Sketch",
+            "id": "[uuid]",
+            "paths": [
+              {
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                },
+                "ccw": true,
+                "center": [
+                  56.00000000200154,
+                  79.99999999432897
+                ],
+                "from": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "radius": 6.000000002405851,
+                "tag": {
+                  "commentStart": 2512,
+                  "end": 2526,
+                  "moduleId": 0,
+                  "start": 2512,
+                  "type": "TagDeclarator",
+                  "value": "boltHoleCircle"
+                },
+                "to": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "type": "Circle",
+                "units": "mm"
+              }
+            ],
+            "on": {
+              "type": "plane",
+              "artifactId": "[uuid]",
+              "id": "[uuid]",
+              "objectId": 36,
+              "kind": "Custom",
+              "origin": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": "mm"
+              },
+              "xAxis": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0,
+                "units": null
+              },
+              "yAxis": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0,
+                "units": null
+              },
+              "zAxis": {
+                "x": 1.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": null
+              }
+            },
+            "start": {
+              "from": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "to": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "units": "mm",
+              "tag": null,
+              "__geoMeta": {
+                "id": "[uuid]",
+                "sourceRange": []
+              }
+            },
+            "tags": {
+              "boltHoleCircle": {
+                "type": "TagIdentifier",
+                "value": "boltHoleCircle"
+              }
+            },
+            "artifactId": "[uuid]",
+            "originalId": "[uuid]",
+            "units": "mm",
+            "isClosed": "explicitly"
+          },
+          "startCapId": "[uuid]",
+          "endCapId": "[uuid]",
+          "units": "mm",
+          "sectional": false
+        }
+      },
+      {
+        "type": "Solid",
+        "value": {
+          "type": "Solid",
+          "id": "[uuid]",
+          "originalId": "[uuid]",
+          "topologyId": "[uuid]",
+          "artifactId": "[uuid]",
+          "value": [
+            {
+              "faceId": "[uuid]",
+              "id": "[uuid]",
+              "sourceRange": [],
+              "tag": {
+                "commentStart": 2512,
+                "end": 2526,
+                "moduleId": 0,
+                "start": 2512,
+                "type": "TagDeclarator",
+                "value": "boltHoleCircle"
+              },
+              "type": "extrudeArc"
+            }
+          ],
+          "sketch": {
+            "creatorType": "sketch",
+            "type": "Sketch",
+            "id": "[uuid]",
+            "paths": [
+              {
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                },
+                "ccw": true,
+                "center": [
+                  56.00000000200154,
+                  79.99999999432897
+                ],
+                "from": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "radius": 6.000000002405851,
+                "tag": {
+                  "commentStart": 2512,
+                  "end": 2526,
+                  "moduleId": 0,
+                  "start": 2512,
+                  "type": "TagDeclarator",
+                  "value": "boltHoleCircle"
+                },
+                "to": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "type": "Circle",
+                "units": "mm"
+              }
+            ],
+            "on": {
+              "type": "plane",
+              "artifactId": "[uuid]",
+              "id": "[uuid]",
+              "objectId": 36,
+              "kind": "Custom",
+              "origin": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": "mm"
+              },
+              "xAxis": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0,
+                "units": null
+              },
+              "yAxis": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0,
+                "units": null
+              },
+              "zAxis": {
+                "x": 1.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": null
+              }
+            },
+            "start": {
+              "from": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "to": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "units": "mm",
+              "tag": null,
+              "__geoMeta": {
+                "id": "[uuid]",
+                "sourceRange": []
+              }
+            },
+            "tags": {
+              "boltHoleCircle": {
+                "type": "TagIdentifier",
+                "value": "boltHoleCircle"
+              }
+            },
+            "artifactId": "[uuid]",
+            "originalId": "[uuid]",
+            "units": "mm",
+            "isClosed": "explicitly"
+          },
+          "startCapId": "[uuid]",
+          "endCapId": "[uuid]",
+          "units": "mm",
+          "sectional": false
+        }
+      },
+      {
+        "type": "Solid",
+        "value": {
+          "type": "Solid",
+          "id": "[uuid]",
+          "originalId": "[uuid]",
+          "topologyId": "[uuid]",
+          "artifactId": "[uuid]",
+          "value": [
+            {
+              "faceId": "[uuid]",
+              "id": "[uuid]",
+              "sourceRange": [],
+              "tag": {
+                "commentStart": 2512,
+                "end": 2526,
+                "moduleId": 0,
+                "start": 2512,
+                "type": "TagDeclarator",
+                "value": "boltHoleCircle"
+              },
+              "type": "extrudeArc"
+            }
+          ],
+          "sketch": {
+            "creatorType": "sketch",
+            "type": "Sketch",
+            "id": "[uuid]",
+            "paths": [
+              {
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                },
+                "ccw": true,
+                "center": [
+                  56.00000000200154,
+                  79.99999999432897
+                ],
+                "from": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "radius": 6.000000002405851,
+                "tag": {
+                  "commentStart": 2512,
+                  "end": 2526,
+                  "moduleId": 0,
+                  "start": 2512,
+                  "type": "TagDeclarator",
+                  "value": "boltHoleCircle"
+                },
+                "to": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "type": "Circle",
+                "units": "mm"
+              }
+            ],
+            "on": {
+              "type": "plane",
+              "artifactId": "[uuid]",
+              "id": "[uuid]",
+              "objectId": 36,
+              "kind": "Custom",
+              "origin": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": "mm"
+              },
+              "xAxis": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0,
+                "units": null
+              },
+              "yAxis": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0,
+                "units": null
+              },
+              "zAxis": {
+                "x": 1.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": null
+              }
+            },
+            "start": {
+              "from": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "to": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "units": "mm",
+              "tag": null,
+              "__geoMeta": {
+                "id": "[uuid]",
+                "sourceRange": []
+              }
+            },
+            "tags": {
+              "boltHoleCircle": {
+                "type": "TagIdentifier",
+                "value": "boltHoleCircle"
+              }
+            },
+            "artifactId": "[uuid]",
+            "originalId": "[uuid]",
+            "units": "mm",
+            "isClosed": "explicitly"
+          },
+          "startCapId": "[uuid]",
+          "endCapId": "[uuid]",
+          "units": "mm",
+          "sectional": false
+        }
+      },
+      {
+        "type": "Solid",
+        "value": {
+          "type": "Solid",
+          "id": "[uuid]",
+          "originalId": "[uuid]",
+          "topologyId": "[uuid]",
+          "artifactId": "[uuid]",
+          "value": [
+            {
+              "faceId": "[uuid]",
+              "id": "[uuid]",
+              "sourceRange": [],
+              "tag": {
+                "commentStart": 2512,
+                "end": 2526,
+                "moduleId": 0,
+                "start": 2512,
+                "type": "TagDeclarator",
+                "value": "boltHoleCircle"
+              },
+              "type": "extrudeArc"
+            }
+          ],
+          "sketch": {
+            "creatorType": "sketch",
+            "type": "Sketch",
+            "id": "[uuid]",
+            "paths": [
+              {
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                },
+                "ccw": true,
+                "center": [
+                  56.00000000200154,
+                  79.99999999432897
+                ],
+                "from": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "radius": 6.000000002405851,
+                "tag": {
+                  "commentStart": 2512,
+                  "end": 2526,
+                  "moduleId": 0,
+                  "start": 2512,
+                  "type": "TagDeclarator",
+                  "value": "boltHoleCircle"
+                },
+                "to": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "type": "Circle",
+                "units": "mm"
+              }
+            ],
+            "on": {
+              "type": "plane",
+              "artifactId": "[uuid]",
+              "id": "[uuid]",
+              "objectId": 36,
+              "kind": "Custom",
+              "origin": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": "mm"
+              },
+              "xAxis": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0,
+                "units": null
+              },
+              "yAxis": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0,
+                "units": null
+              },
+              "zAxis": {
+                "x": 1.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": null
+              }
+            },
+            "start": {
+              "from": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "to": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "units": "mm",
+              "tag": null,
+              "__geoMeta": {
+                "id": "[uuid]",
+                "sourceRange": []
+              }
+            },
+            "tags": {
+              "boltHoleCircle": {
+                "type": "TagIdentifier",
+                "value": "boltHoleCircle"
+              }
+            },
+            "artifactId": "[uuid]",
+            "originalId": "[uuid]",
+            "units": "mm",
+            "isClosed": "explicitly"
+          },
+          "startCapId": "[uuid]",
+          "endCapId": "[uuid]",
+          "units": "mm",
+          "sectional": false
+        }
+      },
+      {
+        "type": "Solid",
+        "value": {
+          "type": "Solid",
+          "id": "[uuid]",
+          "originalId": "[uuid]",
+          "topologyId": "[uuid]",
+          "artifactId": "[uuid]",
+          "value": [
+            {
+              "faceId": "[uuid]",
+              "id": "[uuid]",
+              "sourceRange": [],
+              "tag": {
+                "commentStart": 2512,
+                "end": 2526,
+                "moduleId": 0,
+                "start": 2512,
+                "type": "TagDeclarator",
+                "value": "boltHoleCircle"
+              },
+              "type": "extrudeArc"
+            }
+          ],
+          "sketch": {
+            "creatorType": "sketch",
+            "type": "Sketch",
+            "id": "[uuid]",
+            "paths": [
+              {
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                },
+                "ccw": true,
+                "center": [
+                  56.00000000200154,
+                  79.99999999432897
+                ],
+                "from": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "radius": 6.000000002405851,
+                "tag": {
+                  "commentStart": 2512,
+                  "end": 2526,
+                  "moduleId": 0,
+                  "start": 2512,
+                  "type": "TagDeclarator",
+                  "value": "boltHoleCircle"
+                },
+                "to": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "type": "Circle",
+                "units": "mm"
+              }
+            ],
+            "on": {
+              "type": "plane",
+              "artifactId": "[uuid]",
+              "id": "[uuid]",
+              "objectId": 36,
+              "kind": "Custom",
+              "origin": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": "mm"
+              },
+              "xAxis": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0,
+                "units": null
+              },
+              "yAxis": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0,
+                "units": null
+              },
+              "zAxis": {
+                "x": 1.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": null
+              }
+            },
+            "start": {
+              "from": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "to": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "units": "mm",
+              "tag": null,
+              "__geoMeta": {
+                "id": "[uuid]",
+                "sourceRange": []
+              }
+            },
+            "tags": {
+              "boltHoleCircle": {
+                "type": "TagIdentifier",
+                "value": "boltHoleCircle"
+              }
+            },
+            "artifactId": "[uuid]",
+            "originalId": "[uuid]",
+            "units": "mm",
+            "isClosed": "explicitly"
+          },
+          "startCapId": "[uuid]",
+          "endCapId": "[uuid]",
+          "units": "mm",
+          "sectional": false
+        }
+      },
+      {
+        "type": "Solid",
+        "value": {
+          "type": "Solid",
+          "id": "[uuid]",
+          "originalId": "[uuid]",
+          "topologyId": "[uuid]",
+          "artifactId": "[uuid]",
+          "value": [
+            {
+              "faceId": "[uuid]",
+              "id": "[uuid]",
+              "sourceRange": [],
+              "tag": {
+                "commentStart": 2512,
+                "end": 2526,
+                "moduleId": 0,
+                "start": 2512,
+                "type": "TagDeclarator",
+                "value": "boltHoleCircle"
+              },
+              "type": "extrudeArc"
+            }
+          ],
+          "sketch": {
+            "creatorType": "sketch",
+            "type": "Sketch",
+            "id": "[uuid]",
+            "paths": [
+              {
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                },
+                "ccw": true,
+                "center": [
+                  56.00000000200154,
+                  79.99999999432897
+                ],
+                "from": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "radius": 6.000000002405851,
+                "tag": {
+                  "commentStart": 2512,
+                  "end": 2526,
+                  "moduleId": 0,
+                  "start": 2512,
+                  "type": "TagDeclarator",
+                  "value": "boltHoleCircle"
+                },
+                "to": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "type": "Circle",
+                "units": "mm"
+              }
+            ],
+            "on": {
+              "type": "plane",
+              "artifactId": "[uuid]",
+              "id": "[uuid]",
+              "objectId": 36,
+              "kind": "Custom",
+              "origin": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": "mm"
+              },
+              "xAxis": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0,
+                "units": null
+              },
+              "yAxis": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0,
+                "units": null
+              },
+              "zAxis": {
+                "x": 1.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": null
+              }
+            },
+            "start": {
+              "from": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "to": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "units": "mm",
+              "tag": null,
+              "__geoMeta": {
+                "id": "[uuid]",
+                "sourceRange": []
+              }
+            },
+            "tags": {
+              "boltHoleCircle": {
+                "type": "TagIdentifier",
+                "value": "boltHoleCircle"
+              }
+            },
+            "artifactId": "[uuid]",
+            "originalId": "[uuid]",
+            "units": "mm",
+            "isClosed": "explicitly"
+          },
+          "startCapId": "[uuid]",
+          "endCapId": "[uuid]",
+          "units": "mm",
+          "sectional": false
+        }
+      },
+      {
+        "type": "Solid",
+        "value": {
+          "type": "Solid",
+          "id": "[uuid]",
+          "originalId": "[uuid]",
+          "topologyId": "[uuid]",
+          "artifactId": "[uuid]",
+          "value": [
+            {
+              "faceId": "[uuid]",
+              "id": "[uuid]",
+              "sourceRange": [],
+              "tag": {
+                "commentStart": 2512,
+                "end": 2526,
+                "moduleId": 0,
+                "start": 2512,
+                "type": "TagDeclarator",
+                "value": "boltHoleCircle"
+              },
+              "type": "extrudeArc"
+            }
+          ],
+          "sketch": {
+            "creatorType": "sketch",
+            "type": "Sketch",
+            "id": "[uuid]",
+            "paths": [
+              {
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                },
+                "ccw": true,
+                "center": [
+                  56.00000000200154,
+                  79.99999999432897
+                ],
+                "from": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "radius": 6.000000002405851,
+                "tag": {
+                  "commentStart": 2512,
+                  "end": 2526,
+                  "moduleId": 0,
+                  "start": 2512,
+                  "type": "TagDeclarator",
+                  "value": "boltHoleCircle"
+                },
+                "to": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "type": "Circle",
+                "units": "mm"
+              }
+            ],
+            "on": {
+              "type": "plane",
+              "artifactId": "[uuid]",
+              "id": "[uuid]",
+              "objectId": 36,
+              "kind": "Custom",
+              "origin": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": "mm"
+              },
+              "xAxis": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0,
+                "units": null
+              },
+              "yAxis": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0,
+                "units": null
+              },
+              "zAxis": {
+                "x": 1.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": null
+              }
+            },
+            "start": {
+              "from": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "to": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "units": "mm",
+              "tag": null,
+              "__geoMeta": {
+                "id": "[uuid]",
+                "sourceRange": []
+              }
+            },
+            "tags": {
+              "boltHoleCircle": {
+                "type": "TagIdentifier",
+                "value": "boltHoleCircle"
+              }
+            },
+            "artifactId": "[uuid]",
+            "originalId": "[uuid]",
+            "units": "mm",
+            "isClosed": "explicitly"
+          },
+          "startCapId": "[uuid]",
+          "endCapId": "[uuid]",
+          "units": "mm",
+          "sectional": false
+        }
+      },
+      {
+        "type": "Solid",
+        "value": {
+          "type": "Solid",
+          "id": "[uuid]",
+          "originalId": "[uuid]",
+          "topologyId": "[uuid]",
+          "artifactId": "[uuid]",
+          "value": [
+            {
+              "faceId": "[uuid]",
+              "id": "[uuid]",
+              "sourceRange": [],
+              "tag": {
+                "commentStart": 2512,
+                "end": 2526,
+                "moduleId": 0,
+                "start": 2512,
+                "type": "TagDeclarator",
+                "value": "boltHoleCircle"
+              },
+              "type": "extrudeArc"
+            }
+          ],
+          "sketch": {
+            "creatorType": "sketch",
+            "type": "Sketch",
+            "id": "[uuid]",
+            "paths": [
+              {
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                },
+                "ccw": true,
+                "center": [
+                  56.00000000200154,
+                  79.99999999432897
+                ],
+                "from": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "radius": 6.000000002405851,
+                "tag": {
+                  "commentStart": 2512,
+                  "end": 2526,
+                  "moduleId": 0,
+                  "start": 2512,
+                  "type": "TagDeclarator",
+                  "value": "boltHoleCircle"
+                },
+                "to": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "type": "Circle",
+                "units": "mm"
+              }
+            ],
+            "on": {
+              "type": "plane",
+              "artifactId": "[uuid]",
+              "id": "[uuid]",
+              "objectId": 36,
+              "kind": "Custom",
+              "origin": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": "mm"
+              },
+              "xAxis": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0,
+                "units": null
+              },
+              "yAxis": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0,
+                "units": null
+              },
+              "zAxis": {
+                "x": 1.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": null
+              }
+            },
+            "start": {
+              "from": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "to": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "units": "mm",
+              "tag": null,
+              "__geoMeta": {
+                "id": "[uuid]",
+                "sourceRange": []
+              }
+            },
+            "tags": {
+              "boltHoleCircle": {
+                "type": "TagIdentifier",
+                "value": "boltHoleCircle"
+              }
+            },
+            "artifactId": "[uuid]",
+            "originalId": "[uuid]",
+            "units": "mm",
+            "isClosed": "explicitly"
+          },
+          "startCapId": "[uuid]",
+          "endCapId": "[uuid]",
+          "units": "mm",
+          "sectional": false
+        }
+      },
+      {
+        "type": "Solid",
+        "value": {
+          "type": "Solid",
+          "id": "[uuid]",
+          "originalId": "[uuid]",
+          "topologyId": "[uuid]",
+          "artifactId": "[uuid]",
+          "value": [
+            {
+              "faceId": "[uuid]",
+              "id": "[uuid]",
+              "sourceRange": [],
+              "tag": {
+                "commentStart": 2512,
+                "end": 2526,
+                "moduleId": 0,
+                "start": 2512,
+                "type": "TagDeclarator",
+                "value": "boltHoleCircle"
+              },
+              "type": "extrudeArc"
+            }
+          ],
+          "sketch": {
+            "creatorType": "sketch",
+            "type": "Sketch",
+            "id": "[uuid]",
+            "paths": [
+              {
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                },
+                "ccw": true,
+                "center": [
+                  56.00000000200154,
+                  79.99999999432897
+                ],
+                "from": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "radius": 6.000000002405851,
+                "tag": {
+                  "commentStart": 2512,
+                  "end": 2526,
+                  "moduleId": 0,
+                  "start": 2512,
+                  "type": "TagDeclarator",
+                  "value": "boltHoleCircle"
+                },
+                "to": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "type": "Circle",
+                "units": "mm"
+              }
+            ],
+            "on": {
+              "type": "plane",
+              "artifactId": "[uuid]",
+              "id": "[uuid]",
+              "objectId": 36,
+              "kind": "Custom",
+              "origin": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": "mm"
+              },
+              "xAxis": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0,
+                "units": null
+              },
+              "yAxis": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0,
+                "units": null
+              },
+              "zAxis": {
+                "x": 1.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": null
+              }
+            },
+            "start": {
+              "from": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "to": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "units": "mm",
+              "tag": null,
+              "__geoMeta": {
+                "id": "[uuid]",
+                "sourceRange": []
+              }
+            },
+            "tags": {
+              "boltHoleCircle": {
+                "type": "TagIdentifier",
+                "value": "boltHoleCircle"
+              }
+            },
+            "artifactId": "[uuid]",
+            "originalId": "[uuid]",
+            "units": "mm",
+            "isClosed": "explicitly"
+          },
+          "startCapId": "[uuid]",
+          "endCapId": "[uuid]",
+          "units": "mm",
+          "sectional": false
+        }
+      },
+      {
+        "type": "Solid",
+        "value": {
+          "type": "Solid",
+          "id": "[uuid]",
+          "originalId": "[uuid]",
+          "topologyId": "[uuid]",
+          "artifactId": "[uuid]",
+          "value": [
+            {
+              "faceId": "[uuid]",
+              "id": "[uuid]",
+              "sourceRange": [],
+              "tag": {
+                "commentStart": 2512,
+                "end": 2526,
+                "moduleId": 0,
+                "start": 2512,
+                "type": "TagDeclarator",
+                "value": "boltHoleCircle"
+              },
+              "type": "extrudeArc"
+            }
+          ],
+          "sketch": {
+            "creatorType": "sketch",
+            "type": "Sketch",
+            "id": "[uuid]",
+            "paths": [
+              {
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                },
+                "ccw": true,
+                "center": [
+                  56.00000000200154,
+                  79.99999999432897
+                ],
+                "from": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "radius": 6.000000002405851,
+                "tag": {
+                  "commentStart": 2512,
+                  "end": 2526,
+                  "moduleId": 0,
+                  "start": 2512,
+                  "type": "TagDeclarator",
+                  "value": "boltHoleCircle"
+                },
+                "to": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "type": "Circle",
+                "units": "mm"
+              }
+            ],
+            "on": {
+              "type": "plane",
+              "artifactId": "[uuid]",
+              "id": "[uuid]",
+              "objectId": 36,
+              "kind": "Custom",
+              "origin": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": "mm"
+              },
+              "xAxis": {
+                "x": 0.0,
+                "y": 1.0,
+                "z": 0.0,
+                "units": null
+              },
+              "yAxis": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 1.0,
+                "units": null
+              },
+              "zAxis": {
+                "x": 1.0,
+                "y": 0.0,
+                "z": 0.0,
+                "units": null
+              }
+            },
+            "start": {
+              "from": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "to": [
+                57.99691896872725,
+                74.34205737627413
+              ],
+              "units": "mm",
+              "tag": null,
+              "__geoMeta": {
+                "id": "[uuid]",
+                "sourceRange": []
+              }
+            },
+            "tags": {
+              "boltHoleCircle": {
+                "type": "TagIdentifier",
+                "value": "boltHoleCircle"
+              }
+            },
+            "artifactId": "[uuid]",
+            "originalId": "[uuid]",
+            "units": "mm",
+            "isClosed": "explicitly"
+          },
+          "startCapId": "[uuid]",
+          "endCapId": "[uuid]",
+          "units": "mm",
+          "sectional": false
+        }
+      }
+    ]
+  },
+  "boltHoleBody": {
+    "type": "Solid",
+    "value": {
+      "type": "Solid",
+      "id": "[uuid]",
+      "originalId": "[uuid]",
+      "topologyId": "[uuid]",
+      "artifactId": "[uuid]",
+      "value": [
+        {
+          "faceId": "[uuid]",
+          "id": "[uuid]",
+          "sourceRange": [],
+          "tag": {
+            "commentStart": 2512,
+            "end": 2526,
+            "moduleId": 0,
+            "start": 2512,
+            "type": "TagDeclarator",
+            "value": "boltHoleCircle"
+          },
+          "type": "extrudeArc"
+        }
+      ],
+      "sketch": {
+        "creatorType": "sketch",
+        "type": "Sketch",
+        "id": "[uuid]",
+        "paths": [
+          {
+            "__geoMeta": {
+              "id": "[uuid]",
+              "sourceRange": []
+            },
+            "ccw": true,
+            "center": [
+              56.00000000200154,
+              79.99999999432897
+            ],
+            "from": [
+              57.99691896872725,
+              74.34205737627413
+            ],
+            "radius": 6.000000002405851,
+            "tag": {
+              "commentStart": 2512,
+              "end": 2526,
+              "moduleId": 0,
+              "start": 2512,
+              "type": "TagDeclarator",
+              "value": "boltHoleCircle"
+            },
+            "to": [
+              57.99691896872725,
+              74.34205737627413
+            ],
+            "type": "Circle",
+            "units": "mm"
+          }
+        ],
+        "on": {
+          "type": "plane",
+          "artifactId": "[uuid]",
+          "id": "[uuid]",
+          "objectId": 36,
+          "kind": "Custom",
+          "origin": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "units": "mm"
+          },
+          "xAxis": {
+            "x": 0.0,
+            "y": 1.0,
+            "z": 0.0,
+            "units": null
+          },
+          "yAxis": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 1.0,
+            "units": null
+          },
+          "zAxis": {
+            "x": 1.0,
+            "y": 0.0,
+            "z": 0.0,
+            "units": null
+          }
+        },
+        "start": {
+          "from": [
+            57.99691896872725,
+            74.34205737627413
+          ],
+          "to": [
+            57.99691896872725,
+            74.34205737627413
+          ],
+          "units": "mm",
+          "tag": null,
+          "__geoMeta": {
+            "id": "[uuid]",
+            "sourceRange": []
+          }
+        },
+        "tags": {
+          "boltHoleCircle": {
+            "type": "TagIdentifier",
+            "value": "boltHoleCircle"
+          }
+        },
+        "artifactId": "[uuid]",
+        "originalId": "[uuid]",
+        "units": "mm",
+        "isClosed": "explicitly"
+      },
+      "startCapId": "[uuid]",
+      "endCapId": "[uuid]",
+      "units": "mm",
+      "sectional": false
+    }
+  },
+  "boltHoleCount": {
+    "type": "Number",
+    "value": 16.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "boltHoleDiameter": {
+    "type": "Number",
+    "value": 12.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "boltHoleRegion": {
+    "type": "Sketch",
+    "value": {
+      "type": "Sketch",
+      "id": "[uuid]",
+      "paths": [
+        {
+          "__geoMeta": {
+            "id": "[uuid]",
+            "sourceRange": []
+          },
+          "ccw": true,
+          "center": [
+            56.00000000200154,
+            79.99999999432897
+          ],
+          "from": [
+            57.99691896872725,
+            74.34205737627413
+          ],
+          "radius": 6.000000002405851,
+          "tag": {
+            "commentStart": 2512,
+            "end": 2526,
+            "moduleId": 0,
+            "start": 2512,
+            "type": "TagDeclarator",
+            "value": "boltHoleCircle"
+          },
+          "to": [
+            57.99691896872725,
+            74.34205737627413
+          ],
+          "type": "Circle",
+          "units": "mm"
+        }
+      ],
+      "on": {
+        "type": "plane",
+        "artifactId": "[uuid]",
+        "id": "[uuid]",
+        "objectId": 36,
+        "kind": "Custom",
+        "origin": {
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.0,
+          "units": "mm"
+        },
+        "xAxis": {
+          "x": 0.0,
+          "y": 1.0,
+          "z": 0.0,
+          "units": null
+        },
+        "yAxis": {
+          "x": 0.0,
+          "y": 0.0,
+          "z": 1.0,
+          "units": null
+        },
+        "zAxis": {
+          "x": 1.0,
+          "y": 0.0,
+          "z": 0.0,
+          "units": null
+        }
+      },
+      "start": {
+        "from": [
+          57.99691896872725,
+          74.34205737627413
+        ],
+        "to": [
+          57.99691896872725,
+          74.34205737627413
+        ],
+        "units": "mm",
+        "tag": null,
+        "__geoMeta": {
+          "id": "[uuid]",
+          "sourceRange": []
+        }
+      },
+      "tags": {
+        "boltHoleCircle": {
+          "type": "TagIdentifier",
+          "value": "boltHoleCircle"
+        }
+      },
+      "artifactId": "[uuid]",
+      "originalId": "[uuid]",
+      "units": "mm",
+      "isClosed": "explicitly"
+    }
+  },
+  "boltHoleSketch": {
+    "type": "Object",
+    "value": {
+      "boltHoleCenterGuide": {
+        "type": "Segment",
+        "value": {
+          "repr": {
+            "Solved": {
+              "segment": {
+                "id": "[uuid]",
+                "objectId": 43,
+                "kind": {
+                  "line": {
+                    "start": [
+                      {
+                        "n": 0.000000001200924891952988,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      },
+                      {
+                        "n": 79.99999999659738,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      }
+                    ],
+                    "end": [
+                      {
+                        "n": 56.00000000160124,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      },
+                      {
+                        "n": 79.99999999546318,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      }
+                    ],
+                    "ctor": {
+                      "start": {
+                        "x": {
+                          "type": "Var",
+                          "value": 0.0,
+                          "units": "Mm"
+                        },
+                        "y": {
+                          "type": "Var",
+                          "value": 63.0,
+                          "units": "Mm"
+                        }
+                      },
+                      "end": {
+                        "x": {
+                          "type": "Var",
+                          "value": 53.5,
+                          "units": "Mm"
+                        },
+                        "y": {
+                          "type": "Var",
+                          "value": 63.0,
+                          "units": "Mm"
+                        }
+                      },
+                      "construction": true
+                    },
+                    "start_object_id": 41,
+                    "end_object_id": 42,
+                    "start_freedom": "Fixed",
+                    "end_freedom": "Fixed",
+                    "construction": true
+                  }
+                },
+                "surface": {
+                  "artifactId": "[uuid]",
+                  "id": "[uuid]",
+                  "kind": "Custom",
+                  "objectId": 36,
+                  "origin": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "units": "mm"
+                  },
+                  "type": "plane",
+                  "xAxis": {
+                    "x": 0.0,
+                    "y": 1.0,
+                    "z": 0.0,
+                    "units": null
+                  },
+                  "yAxis": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 1.0,
+                    "units": null
+                  },
+                  "zAxis": {
+                    "x": 1.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "units": null
+                  }
+                },
+                "sketchId": "[uuid]",
+                "tag": {
+                  "type": "TagIdentifier",
+                  "value": "boltHoleCenterGuide"
+                }
+              }
+            }
+          }
+        }
+      },
+      "boltHoleCircle": {
+        "type": "Segment",
+        "value": {
+          "repr": {
+            "Solved": {
+              "segment": {
+                "id": "[uuid]",
+                "objectId": 40,
+                "kind": {
+                  "circle": {
+                    "start": [
+                      {
+                        "n": 57.99691896872725,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      },
+                      {
+                        "n": 74.34205737627413,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      }
+                    ],
+                    "center": [
+                      {
+                        "n": 56.00000000200154,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      },
+                      {
+                        "n": 79.99999999432897,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      }
+                    ],
+                    "ctor": {
+                      "start": {
+                        "x": {
+                          "type": "Var",
+                          "value": 58.5,
+                          "units": "Mm"
+                        },
+                        "y": {
+                          "type": "Var",
+                          "value": 63.0,
+                          "units": "Mm"
+                        }
+                      },
+                      "center": {
+                        "x": {
+                          "type": "Var",
+                          "value": 53.5,
+                          "units": "Mm"
+                        },
+                        "y": {
+                          "type": "Var",
+                          "value": 63.0,
+                          "units": "Mm"
+                        }
+                      }
+                    },
+                    "start_object_id": 38,
+                    "center_object_id": 39,
+                    "start_freedom": "Free",
+                    "center_freedom": "Fixed",
+                    "construction": false
+                  }
+                },
+                "surface": {
+                  "artifactId": "[uuid]",
+                  "id": "[uuid]",
+                  "kind": "Custom",
+                  "objectId": 36,
+                  "origin": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "units": "mm"
+                  },
+                  "type": "plane",
+                  "xAxis": {
+                    "x": 0.0,
+                    "y": 1.0,
+                    "z": 0.0,
+                    "units": null
+                  },
+                  "yAxis": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 1.0,
+                    "units": null
+                  },
+                  "zAxis": {
+                    "x": 1.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "units": null
+                  }
+                },
+                "sketchId": "[uuid]",
+                "tag": {
+                  "type": "TagIdentifier",
+                  "value": "boltHoleCircle"
+                }
+              }
+            }
+          }
+        }
+      },
+      "boltHoleOffsetGuide": {
+        "type": "Segment",
+        "value": {
+          "repr": {
+            "Solved": {
+              "segment": {
+                "id": "[uuid]",
+                "objectId": 46,
+                "kind": {
+                  "line": {
+                    "start": [
+                      {
+                        "n": 0.0000000004003082961309546,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      },
+                      {
+                        "n": -0.000000001134206604994998,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      }
+                    ],
+                    "end": [
+                      {
+                        "n": 0.000000000800616593151939,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      },
+                      {
+                        "n": 79.99999999773159,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      }
+                    ],
+                    "ctor": {
+                      "start": {
+                        "x": {
+                          "type": "Var",
+                          "value": 0.0,
+                          "units": "Mm"
+                        },
+                        "y": {
+                          "type": "Var",
+                          "value": 0.0,
+                          "units": "Mm"
+                        }
+                      },
+                      "end": {
+                        "x": {
+                          "type": "Var",
+                          "value": 0.0,
+                          "units": "Mm"
+                        },
+                        "y": {
+                          "type": "Var",
+                          "value": 63.0,
+                          "units": "Mm"
+                        }
+                      },
+                      "construction": true
+                    },
+                    "start_object_id": 44,
+                    "end_object_id": 45,
+                    "start_freedom": "Fixed",
+                    "end_freedom": "Fixed",
+                    "construction": true
+                  }
+                },
+                "surface": {
+                  "artifactId": "[uuid]",
+                  "id": "[uuid]",
+                  "kind": "Custom",
+                  "objectId": 36,
+                  "origin": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "units": "mm"
+                  },
+                  "type": "plane",
+                  "xAxis": {
+                    "x": 0.0,
+                    "y": 1.0,
+                    "z": 0.0,
+                    "units": null
+                  },
+                  "yAxis": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 1.0,
+                    "units": null
+                  },
+                  "zAxis": {
+                    "x": 1.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "units": null
+                  }
+                },
+                "sketchId": "[uuid]",
+                "tag": {
+                  "type": "TagIdentifier",
+                  "value": "boltHoleOffsetGuide"
+                }
+              }
+            }
+          }
+        }
+      },
+      "meta": {
+        "type": "Object",
+        "value": {
+          "sketch": {
+            "type": "Sketch",
+            "value": {
+              "type": "Sketch",
+              "id": "[uuid]",
+              "paths": [
+                {
+                  "__geoMeta": {
+                    "id": "[uuid]",
+                    "sourceRange": []
+                  },
+                  "ccw": true,
+                  "center": [
+                    56.00000000200154,
+                    79.99999999432897
+                  ],
+                  "from": [
+                    57.99691896872725,
+                    74.34205737627413
+                  ],
+                  "radius": 6.000000002405851,
+                  "tag": {
+                    "commentStart": 2512,
+                    "end": 2526,
+                    "moduleId": 0,
+                    "start": 2512,
+                    "type": "TagDeclarator",
+                    "value": "boltHoleCircle"
+                  },
+                  "to": [
+                    57.99691896872725,
+                    74.34205737627413
+                  ],
+                  "type": "Circle",
+                  "units": "mm"
+                }
+              ],
+              "on": {
+                "type": "plane",
+                "artifactId": "[uuid]",
+                "id": "[uuid]",
+                "objectId": 36,
+                "kind": "Custom",
+                "origin": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "units": "mm"
+                },
+                "xAxis": {
+                  "x": 0.0,
+                  "y": 1.0,
+                  "z": 0.0,
+                  "units": null
+                },
+                "yAxis": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "units": null
+                },
+                "zAxis": {
+                  "x": 1.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "units": null
+                }
+              },
+              "start": {
+                "from": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "to": [
+                  57.99691896872725,
+                  74.34205737627413
+                ],
+                "units": "mm",
+                "tag": null,
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                }
+              },
+              "tags": {
+                "boltHoleCircle": {
+                  "type": "TagIdentifier",
+                  "value": "boltHoleCircle"
+                }
+              },
+              "artifactId": "[uuid]",
+              "originalId": "[uuid]",
+              "units": "mm",
+              "isClosed": "no"
+            }
+          }
+        },
+        "constrainable": false
+      }
+    },
+    "constrainable": false
+  },
+  "elbowBendAngleDegrees": {
+    "type": "Number",
+    "value": 90.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "elbowBody": {
+    "type": "Solid",
+    "value": {
+      "type": "Solid",
+      "id": "[uuid]",
+      "originalId": "[uuid]",
+      "topologyId": "[uuid]",
+      "artifactId": "[uuid]",
+      "value": [
+        {
+          "faceId": "[uuid]",
+          "id": "[uuid]",
+          "sourceRange": [],
+          "tag": {
+            "commentStart": 664,
+            "end": 680,
+            "moduleId": 0,
+            "start": 664,
+            "type": "TagDeclarator",
+            "value": "elbowOuterCircle"
+          },
+          "type": "extrudeArc"
+        },
+        {
+          "faceId": "[uuid]",
+          "id": "[uuid]",
+          "sourceRange": [],
+          "tag": {
+            "commentStart": 1119,
+            "end": 1135,
+            "moduleId": 0,
+            "start": 1119,
+            "type": "TagDeclarator",
+            "value": "elbowInnerCircle"
+          },
+          "type": "extrudeArc"
+        }
+      ],
+      "sketch": {
+        "creatorType": "sketch",
+        "type": "Sketch",
+        "id": "[uuid]",
+        "paths": [
+          {
+            "__geoMeta": {
+              "id": "[uuid]",
+              "sourceRange": []
+            },
+            "ccw": true,
+            "center": [
+              80.00000000032503,
+              0.00000000017316874370371722
+            ],
+            "from": [
+              121.95327133894554,
+              -21.187803661242402
+            ],
+            "radius": 47.000000000070344,
+            "tag": {
+              "commentStart": 664,
+              "end": 680,
+              "moduleId": 0,
+              "start": 664,
+              "type": "TagDeclarator",
+              "value": "elbowOuterCircle"
+            },
+            "to": [
+              121.95327133894554,
+              -21.187803661242402
+            ],
+            "type": "Circle",
+            "units": "mm"
+          },
+          {
+            "__geoMeta": {
+              "id": "[uuid]",
+              "sourceRange": []
+            },
+            "ccw": true,
+            "center": [
+              80.00000000040197,
+              0.00000000024674722101870335
+            ],
+            "from": [
+              105.65717154707032,
+              24.534863933840352
+            ],
+            "radius": 35.500000000212964,
+            "tag": {
+              "commentStart": 1119,
+              "end": 1135,
+              "moduleId": 0,
+              "start": 1119,
+              "type": "TagDeclarator",
+              "value": "elbowInnerCircle"
+            },
+            "to": [
+              105.65717154707032,
+              24.534863933840352
+            ],
+            "type": "Circle",
+            "units": "mm"
+          }
+        ],
+        "on": {
+          "type": "plane",
+          "artifactId": "[uuid]",
+          "id": "[uuid]",
+          "objectId": 0,
+          "kind": "Custom",
+          "origin": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "units": "mm"
+          },
+          "xAxis": {
+            "x": 1.0,
+            "y": 0.0,
+            "z": 0.0,
+            "units": null
+          },
+          "yAxis": {
+            "x": 0.0,
+            "y": 1.0,
+            "z": 0.0,
+            "units": null
+          },
+          "zAxis": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 1.0,
+            "units": null
+          }
+        },
+        "start": {
+          "from": [
+            121.95327133894554,
+            -21.187803661242402
+          ],
+          "to": [
+            121.95327133894554,
+            -21.187803661242402
+          ],
+          "units": "mm",
+          "tag": null,
+          "__geoMeta": {
+            "id": "[uuid]",
+            "sourceRange": []
+          }
+        },
+        "tags": {
+          "elbowInnerCircle": {
+            "type": "TagIdentifier",
+            "value": "elbowInnerCircle"
+          },
+          "elbowOuterCircle": {
+            "type": "TagIdentifier",
+            "value": "elbowOuterCircle"
+          }
+        },
+        "artifactId": "[uuid]",
+        "originalId": "[uuid]",
+        "units": "mm",
+        "isClosed": "explicitly"
+      },
+      "startCapId": "[uuid]",
+      "endCapId": "[uuid]",
+      "units": "mm",
+      "sectional": false
+    }
+  },
+  "elbowCenterlineBendRadius": {
+    "type": "Number",
+    "value": 80.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "elbowInnerCircle": {
+    "type": "TagIdentifier",
+    "value": "elbowInnerCircle"
+  },
+  "elbowOuterCircle": {
+    "type": "TagIdentifier",
+    "value": "elbowOuterCircle"
+  },
+  "elbowSectionRegion": {
+    "type": "Sketch",
+    "value": {
+      "type": "Sketch",
+      "id": "[uuid]",
+      "paths": [
+        {
+          "__geoMeta": {
+            "id": "[uuid]",
+            "sourceRange": []
+          },
+          "ccw": true,
+          "center": [
+            80.00000000032503,
+            0.00000000017316874370371722
+          ],
+          "from": [
+            121.95327133894554,
+            -21.187803661242402
+          ],
+          "radius": 47.000000000070344,
+          "tag": {
+            "commentStart": 664,
+            "end": 680,
+            "moduleId": 0,
+            "start": 664,
+            "type": "TagDeclarator",
+            "value": "elbowOuterCircle"
+          },
+          "to": [
+            121.95327133894554,
+            -21.187803661242402
+          ],
+          "type": "Circle",
+          "units": "mm"
+        },
+        {
+          "__geoMeta": {
+            "id": "[uuid]",
+            "sourceRange": []
+          },
+          "ccw": true,
+          "center": [
+            80.00000000040197,
+            0.00000000024674722101870335
+          ],
+          "from": [
+            105.65717154707032,
+            24.534863933840352
+          ],
+          "radius": 35.500000000212964,
+          "tag": {
+            "commentStart": 1119,
+            "end": 1135,
+            "moduleId": 0,
+            "start": 1119,
+            "type": "TagDeclarator",
+            "value": "elbowInnerCircle"
+          },
+          "to": [
+            105.65717154707032,
+            24.534863933840352
+          ],
+          "type": "Circle",
+          "units": "mm"
+        }
+      ],
+      "on": {
+        "type": "plane",
+        "artifactId": "[uuid]",
+        "id": "[uuid]",
+        "objectId": 0,
+        "kind": "Custom",
+        "origin": {
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.0,
+          "units": "mm"
+        },
+        "xAxis": {
+          "x": 1.0,
+          "y": 0.0,
+          "z": 0.0,
+          "units": null
+        },
+        "yAxis": {
+          "x": 0.0,
+          "y": 1.0,
+          "z": 0.0,
+          "units": null
+        },
+        "zAxis": {
+          "x": 0.0,
+          "y": 0.0,
+          "z": 1.0,
+          "units": null
+        }
+      },
+      "start": {
+        "from": [
+          121.95327133894554,
+          -21.187803661242402
+        ],
+        "to": [
+          121.95327133894554,
+          -21.187803661242402
+        ],
+        "units": "mm",
+        "tag": null,
+        "__geoMeta": {
+          "id": "[uuid]",
+          "sourceRange": []
+        }
+      },
+      "tags": {
+        "elbowInnerCircle": {
+          "type": "TagIdentifier",
+          "value": "elbowInnerCircle"
+        },
+        "elbowOuterCircle": {
+          "type": "TagIdentifier",
+          "value": "elbowOuterCircle"
+        }
+      },
+      "artifactId": "[uuid]",
+      "originalId": "[uuid]",
+      "units": "mm",
+      "isClosed": "explicitly"
+    }
+  },
+  "elbowSectionSketch": {
+    "type": "Object",
+    "value": {
+      "elbowCenterGuide": {
+        "type": "Segment",
+        "value": {
+          "repr": {
+            "Solved": {
+              "segment": {
+                "id": "[uuid]",
+                "objectId": 7,
+                "kind": {
+                  "line": {
+                    "start": [
+                      {
+                        "n": 0.00000000010833940987714105,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      },
+                      {
+                        "n": 0.00000000005772291432230389,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      }
+                    ],
+                    "end": [
+                      {
+                        "n": 80.00000000021669,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      },
+                      {
+                        "n": 0.00000000011544582882880933,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      }
+                    ],
+                    "ctor": {
+                      "start": {
+                        "x": {
+                          "type": "Var",
+                          "value": 0.0,
+                          "units": "Mm"
+                        },
+                        "y": {
+                          "type": "Var",
+                          "value": 0.0,
+                          "units": "Mm"
+                        }
+                      },
+                      "end": {
+                        "x": {
+                          "type": "Var",
+                          "value": 63.0,
+                          "units": "Mm"
+                        },
+                        "y": {
+                          "type": "Var",
+                          "value": 0.0,
+                          "units": "Mm"
+                        }
+                      },
+                      "construction": true
+                    },
+                    "start_object_id": 5,
+                    "end_object_id": 6,
+                    "start_freedom": "Fixed",
+                    "end_freedom": "Fixed",
+                    "construction": true
+                  }
+                },
+                "surface": {
+                  "artifactId": "[uuid]",
+                  "id": "[uuid]",
+                  "kind": "Custom",
+                  "objectId": 0,
+                  "origin": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "units": "mm"
+                  },
+                  "type": "plane",
+                  "xAxis": {
+                    "x": 1.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "units": null
+                  },
+                  "yAxis": {
+                    "x": 0.0,
+                    "y": 1.0,
+                    "z": 0.0,
+                    "units": null
+                  },
+                  "zAxis": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 1.0,
+                    "units": null
+                  }
+                },
+                "sketchId": "[uuid]",
+                "tag": {
+                  "type": "TagIdentifier",
+                  "value": "elbowCenterGuide"
+                }
+              }
+            }
+          }
+        }
+      },
+      "elbowInnerCircle": {
+        "type": "Segment",
+        "value": {
+          "repr": {
+            "Solved": {
+              "segment": {
+                "id": "[uuid]",
+                "objectId": 14,
+                "kind": {
+                  "circle": {
+                    "start": [
+                      {
+                        "n": 105.65717154707032,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      },
+                      {
+                        "n": 24.534863933840352,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      }
+                    ],
+                    "center": [
+                      {
+                        "n": 80.00000000040197,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      },
+                      {
+                        "n": 0.00000000024674722101870335,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      }
+                    ],
+                    "ctor": {
+                      "start": {
+                        "x": {
+                          "type": "Var",
+                          "value": 93.57,
+                          "units": "Mm"
+                        },
+                        "y": {
+                          "type": "Var",
+                          "value": 17.89,
+                          "units": "Mm"
+                        }
+                      },
+                      "center": {
+                        "x": {
+                          "type": "Var",
+                          "value": 62.79,
+                          "units": "Mm"
+                        },
+                        "y": {
+                          "type": "Var",
+                          "value": 0.22,
+                          "units": "Mm"
+                        }
+                      }
+                    },
+                    "start_object_id": 12,
+                    "center_object_id": 13,
+                    "start_freedom": "Free",
+                    "center_freedom": "Fixed",
+                    "construction": false
+                  }
+                },
+                "surface": {
+                  "artifactId": "[uuid]",
+                  "id": "[uuid]",
+                  "kind": "Custom",
+                  "objectId": 0,
+                  "origin": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "units": "mm"
+                  },
+                  "type": "plane",
+                  "xAxis": {
+                    "x": 1.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "units": null
+                  },
+                  "yAxis": {
+                    "x": 0.0,
+                    "y": 1.0,
+                    "z": 0.0,
+                    "units": null
+                  },
+                  "zAxis": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 1.0,
+                    "units": null
+                  }
+                },
+                "sketchId": "[uuid]",
+                "tag": {
+                  "type": "TagIdentifier",
+                  "value": "elbowInnerCircle"
+                }
+              }
+            }
+          }
+        }
+      },
+      "elbowOuterCircle": {
+        "type": "Segment",
+        "value": {
+          "repr": {
+            "Solved": {
+              "segment": {
+                "id": "[uuid]",
+                "objectId": 4,
+                "kind": {
+                  "circle": {
+                    "start": [
+                      {
+                        "n": 121.95327133894554,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      },
+                      {
+                        "n": -21.187803661242402,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      }
+                    ],
+                    "center": [
+                      {
+                        "n": 80.00000000032503,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      },
+                      {
+                        "n": 0.00000000017316874370371722,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      }
+                    ],
+                    "ctor": {
+                      "start": {
+                        "x": {
+                          "type": "Var",
+                          "value": 107.34,
+                          "units": "Mm"
+                        },
+                        "y": {
+                          "type": "Var",
+                          "value": -15.97,
+                          "units": "Mm"
+                        }
+                      },
+                      "center": {
+                        "x": {
+                          "type": "Var",
+                          "value": 63.0,
+                          "units": "Mm"
+                        },
+                        "y": {
+                          "type": "Var",
+                          "value": 0.0,
+                          "units": "Mm"
+                        }
+                      }
+                    },
+                    "start_object_id": 2,
+                    "center_object_id": 3,
+                    "start_freedom": "Free",
+                    "center_freedom": "Fixed",
+                    "construction": false
+                  }
+                },
+                "surface": {
+                  "artifactId": "[uuid]",
+                  "id": "[uuid]",
+                  "kind": "Custom",
+                  "objectId": 0,
+                  "origin": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "units": "mm"
+                  },
+                  "type": "plane",
+                  "xAxis": {
+                    "x": 1.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "units": null
+                  },
+                  "yAxis": {
+                    "x": 0.0,
+                    "y": 1.0,
+                    "z": 0.0,
+                    "units": null
+                  },
+                  "zAxis": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 1.0,
+                    "units": null
+                  }
+                },
+                "sketchId": "[uuid]",
+                "tag": {
+                  "type": "TagIdentifier",
+                  "value": "elbowOuterCircle"
+                }
+              }
+            }
+          }
+        }
+      },
+      "meta": {
+        "type": "Object",
+        "value": {
+          "sketch": {
+            "type": "Sketch",
+            "value": {
+              "type": "Sketch",
+              "id": "[uuid]",
+              "paths": [
+                {
+                  "__geoMeta": {
+                    "id": "[uuid]",
+                    "sourceRange": []
+                  },
+                  "ccw": true,
+                  "center": [
+                    80.00000000032503,
+                    0.00000000017316874370371722
+                  ],
+                  "from": [
+                    121.95327133894554,
+                    -21.187803661242402
+                  ],
+                  "radius": 47.000000000070344,
+                  "tag": {
+                    "commentStart": 664,
+                    "end": 680,
+                    "moduleId": 0,
+                    "start": 664,
+                    "type": "TagDeclarator",
+                    "value": "elbowOuterCircle"
+                  },
+                  "to": [
+                    121.95327133894554,
+                    -21.187803661242402
+                  ],
+                  "type": "Circle",
+                  "units": "mm"
+                },
+                {
+                  "__geoMeta": {
+                    "id": "[uuid]",
+                    "sourceRange": []
+                  },
+                  "from": [
+                    121.95327133894554,
+                    -21.187803661242402
+                  ],
+                  "tag": null,
+                  "to": [
+                    105.65717154707032,
+                    24.534863933840352
+                  ],
+                  "type": "ToPoint",
+                  "units": "mm"
+                },
+                {
+                  "__geoMeta": {
+                    "id": "[uuid]",
+                    "sourceRange": []
+                  },
+                  "ccw": true,
+                  "center": [
+                    80.00000000040197,
+                    0.00000000024674722101870335
+                  ],
+                  "from": [
+                    105.65717154707032,
+                    24.534863933840352
+                  ],
+                  "radius": 35.500000000212964,
+                  "tag": {
+                    "commentStart": 1119,
+                    "end": 1135,
+                    "moduleId": 0,
+                    "start": 1119,
+                    "type": "TagDeclarator",
+                    "value": "elbowInnerCircle"
+                  },
+                  "to": [
+                    105.65717154707032,
+                    24.534863933840352
+                  ],
+                  "type": "Circle",
+                  "units": "mm"
+                }
+              ],
+              "on": {
+                "type": "plane",
+                "artifactId": "[uuid]",
+                "id": "[uuid]",
+                "objectId": 0,
+                "kind": "Custom",
+                "origin": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "units": "mm"
+                },
+                "xAxis": {
+                  "x": 1.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "units": null
+                },
+                "yAxis": {
+                  "x": 0.0,
+                  "y": 1.0,
+                  "z": 0.0,
+                  "units": null
+                },
+                "zAxis": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "units": null
+                }
+              },
+              "start": {
+                "from": [
+                  121.95327133894554,
+                  -21.187803661242402
+                ],
+                "to": [
+                  121.95327133894554,
+                  -21.187803661242402
+                ],
+                "units": "mm",
+                "tag": null,
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                }
+              },
+              "tags": {
+                "elbowInnerCircle": {
+                  "type": "TagIdentifier",
+                  "value": "elbowInnerCircle"
+                },
+                "elbowOuterCircle": {
+                  "type": "TagIdentifier",
+                  "value": "elbowOuterCircle"
+                }
+              },
+              "artifactId": "[uuid]",
+              "originalId": "[uuid]",
+              "units": "mm",
+              "isClosed": "no"
+            }
+          }
+        },
+        "constrainable": false
+      }
+    },
+    "constrainable": false
+  },
+  "flangeBlank": {
+    "type": "Solid",
+    "value": {
+      "type": "Solid",
+      "id": "[uuid]",
+      "originalId": "[uuid]",
+      "topologyId": "[uuid]",
+      "artifactId": "[uuid]",
+      "value": [
+        {
+          "faceId": "[uuid]",
+          "id": "[uuid]",
+          "sourceRange": [],
+          "tag": {
+            "commentStart": 1600,
+            "end": 1617,
+            "moduleId": 0,
+            "start": 1600,
+            "type": "TagDeclarator",
+            "value": "flangeOuterCircle"
+          },
+          "type": "extrudeArc"
+        },
+        {
+          "faceId": "[uuid]",
+          "id": "[uuid]",
+          "sourceRange": [],
+          "tag": {
+            "commentStart": 2056,
+            "end": 2073,
+            "moduleId": 0,
+            "start": 2056,
+            "type": "TagDeclarator",
+            "value": "flangeInnerCircle"
+          },
+          "type": "extrudeArc"
+        }
+      ],
+      "sketch": {
+        "creatorType": "sketch",
+        "type": "Sketch",
+        "id": "[uuid]",
+        "paths": [
+          {
+            "__geoMeta": {
+              "id": "[uuid]",
+              "sourceRange": []
+            },
+            "ccw": true,
+            "center": [
+              0.000000001595658507730511,
+              79.99999999967628
+            ],
+            "from": [
+              59.127884757715854,
+              53.00197702905686
+            ],
+            "radius": 65.00000000042404,
+            "tag": {
+              "commentStart": 1600,
+              "end": 1617,
+              "moduleId": 0,
+              "start": 1600,
+              "type": "TagDeclarator",
+              "value": "flangeOuterCircle"
+            },
+            "to": [
+              59.127884757715854,
+              53.00197702905686
+            ],
+            "type": "Circle",
+            "units": "mm"
+          },
+          {
+            "__geoMeta": {
+              "id": "[uuid]",
+              "sourceRange": []
+            },
+            "ccw": true,
+            "center": [
+              0.000000001934687767885464,
+              79.99999999965644
+            ],
+            "from": [
+              35.439335548127474,
+              77.9255130528234
+            ],
+            "radius": 35.500000000679215,
+            "tag": {
+              "commentStart": 2056,
+              "end": 2073,
+              "moduleId": 0,
+              "start": 2056,
+              "type": "TagDeclarator",
+              "value": "flangeInnerCircle"
+            },
+            "to": [
+              35.439335548127474,
+              77.9255130528234
+            ],
+            "type": "Circle",
+            "units": "mm"
+          }
+        ],
+        "on": {
+          "type": "plane",
+          "artifactId": "[uuid]",
+          "id": "[uuid]",
+          "objectId": 18,
+          "kind": "Custom",
+          "origin": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "units": "mm"
+          },
+          "xAxis": {
+            "x": 0.0,
+            "y": 1.0,
+            "z": 0.0,
+            "units": null
+          },
+          "yAxis": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 1.0,
+            "units": null
+          },
+          "zAxis": {
+            "x": 1.0,
+            "y": 0.0,
+            "z": 0.0,
+            "units": null
+          }
+        },
+        "start": {
+          "from": [
+            59.127884757715854,
+            53.00197702905686
+          ],
+          "to": [
+            59.127884757715854,
+            53.00197702905686
+          ],
+          "units": "mm",
+          "tag": null,
+          "__geoMeta": {
+            "id": "[uuid]",
+            "sourceRange": []
+          }
+        },
+        "tags": {
+          "flangeInnerCircle": {
+            "type": "TagIdentifier",
+            "value": "flangeInnerCircle"
+          },
+          "flangeOuterCircle": {
+            "type": "TagIdentifier",
+            "value": "flangeOuterCircle"
+          }
+        },
+        "artifactId": "[uuid]",
+        "originalId": "[uuid]",
+        "units": "mm",
+        "isClosed": "explicitly"
+      },
+      "startCapId": "[uuid]",
+      "endCapId": "[uuid]",
+      "units": "mm",
+      "sectional": false
+    }
+  },
+  "flangeInnerCircle": {
+    "type": "TagIdentifier",
+    "value": "flangeInnerCircle"
+  },
+  "flangeInsideDiameter": {
+    "type": "Number",
+    "value": 71.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "flangeOuterCircle": {
+    "type": "TagIdentifier",
+    "value": "flangeOuterCircle"
+  },
+  "flangeOutsideDiameter": {
+    "type": "Number",
+    "value": 130.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "flangeRegion": {
+    "type": "Sketch",
+    "value": {
+      "type": "Sketch",
+      "id": "[uuid]",
+      "paths": [
+        {
+          "__geoMeta": {
+            "id": "[uuid]",
+            "sourceRange": []
+          },
+          "ccw": true,
+          "center": [
+            0.000000001595658507730511,
+            79.99999999967628
+          ],
+          "from": [
+            59.127884757715854,
+            53.00197702905686
+          ],
+          "radius": 65.00000000042404,
+          "tag": {
+            "commentStart": 1600,
+            "end": 1617,
+            "moduleId": 0,
+            "start": 1600,
+            "type": "TagDeclarator",
+            "value": "flangeOuterCircle"
+          },
+          "to": [
+            59.127884757715854,
+            53.00197702905686
+          ],
+          "type": "Circle",
+          "units": "mm"
+        },
+        {
+          "__geoMeta": {
+            "id": "[uuid]",
+            "sourceRange": []
+          },
+          "ccw": true,
+          "center": [
+            0.000000001934687767885464,
+            79.99999999965644
+          ],
+          "from": [
+            35.439335548127474,
+            77.9255130528234
+          ],
+          "radius": 35.500000000679215,
+          "tag": {
+            "commentStart": 2056,
+            "end": 2073,
+            "moduleId": 0,
+            "start": 2056,
+            "type": "TagDeclarator",
+            "value": "flangeInnerCircle"
+          },
+          "to": [
+            35.439335548127474,
+            77.9255130528234
+          ],
+          "type": "Circle",
+          "units": "mm"
+        }
+      ],
+      "on": {
+        "type": "plane",
+        "artifactId": "[uuid]",
+        "id": "[uuid]",
+        "objectId": 18,
+        "kind": "Custom",
+        "origin": {
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.0,
+          "units": "mm"
+        },
+        "xAxis": {
+          "x": 0.0,
+          "y": 1.0,
+          "z": 0.0,
+          "units": null
+        },
+        "yAxis": {
+          "x": 0.0,
+          "y": 0.0,
+          "z": 1.0,
+          "units": null
+        },
+        "zAxis": {
+          "x": 1.0,
+          "y": 0.0,
+          "z": 0.0,
+          "units": null
+        }
+      },
+      "start": {
+        "from": [
+          59.127884757715854,
+          53.00197702905686
+        ],
+        "to": [
+          59.127884757715854,
+          53.00197702905686
+        ],
+        "units": "mm",
+        "tag": null,
+        "__geoMeta": {
+          "id": "[uuid]",
+          "sourceRange": []
+        }
+      },
+      "tags": {
+        "flangeInnerCircle": {
+          "type": "TagIdentifier",
+          "value": "flangeInnerCircle"
+        },
+        "flangeOuterCircle": {
+          "type": "TagIdentifier",
+          "value": "flangeOuterCircle"
+        }
+      },
+      "artifactId": "[uuid]",
+      "originalId": "[uuid]",
+      "units": "mm",
+      "isClosed": "explicitly"
+    }
+  },
+  "flangeSketch": {
+    "type": "Object",
+    "value": {
+      "flangeCenterGuide": {
+        "type": "Segment",
+        "value": {
+          "repr": {
+            "Solved": {
+              "segment": {
+                "id": "[uuid]",
+                "objectId": 25,
+                "kind": {
+                  "line": {
+                    "start": [
+                      {
+                        "n": 0.0000000005318861697304429,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      },
+                      {
+                        "n": -0.00000000010790477445128217,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      }
+                    ],
+                    "end": [
+                      {
+                        "n": 0.0000000010637723390956807,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      },
+                      {
+                        "n": 79.99999999978418,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      }
+                    ],
+                    "ctor": {
+                      "start": {
+                        "x": {
+                          "type": "Var",
+                          "value": 0.0,
+                          "units": "Mm"
+                        },
+                        "y": {
+                          "type": "Var",
+                          "value": 0.0,
+                          "units": "Mm"
+                        }
+                      },
+                      "end": {
+                        "x": {
+                          "type": "Var",
+                          "value": 0.0,
+                          "units": "Mm"
+                        },
+                        "y": {
+                          "type": "Var",
+                          "value": 63.0,
+                          "units": "Mm"
+                        }
+                      },
+                      "construction": true
+                    },
+                    "start_object_id": 23,
+                    "end_object_id": 24,
+                    "start_freedom": "Fixed",
+                    "end_freedom": "Fixed",
+                    "construction": true
+                  }
+                },
+                "surface": {
+                  "artifactId": "[uuid]",
+                  "id": "[uuid]",
+                  "kind": "Custom",
+                  "objectId": 18,
+                  "origin": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "units": "mm"
+                  },
+                  "type": "plane",
+                  "xAxis": {
+                    "x": 0.0,
+                    "y": 1.0,
+                    "z": 0.0,
+                    "units": null
+                  },
+                  "yAxis": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 1.0,
+                    "units": null
+                  },
+                  "zAxis": {
+                    "x": 1.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "units": null
+                  }
+                },
+                "sketchId": "[uuid]",
+                "tag": {
+                  "type": "TagIdentifier",
+                  "value": "flangeCenterGuide"
+                }
+              }
+            }
+          }
+        }
+      },
+      "flangeInnerCircle": {
+        "type": "Segment",
+        "value": {
+          "repr": {
+            "Solved": {
+              "segment": {
+                "id": "[uuid]",
+                "objectId": 32,
+                "kind": {
+                  "circle": {
+                    "start": [
+                      {
+                        "n": 35.439335548127474,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      },
+                      {
+                        "n": 77.9255130528234,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      }
+                    ],
+                    "center": [
+                      {
+                        "n": 0.000000001934687767885464,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      },
+                      {
+                        "n": 79.99999999965644,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      }
+                    ],
+                    "ctor": {
+                      "start": {
+                        "x": {
+                          "type": "Var",
+                          "value": 37.73,
+                          "units": "Mm"
+                        },
+                        "y": {
+                          "type": "Var",
+                          "value": 77.31,
+                          "units": "Mm"
+                        }
+                      },
+                      "center": {
+                        "x": {
+                          "type": "Var",
+                          "value": 0.0,
+                          "units": "Mm"
+                        },
+                        "y": {
+                          "type": "Var",
+                          "value": 63.0,
+                          "units": "Mm"
+                        }
+                      }
+                    },
+                    "start_object_id": 30,
+                    "center_object_id": 31,
+                    "start_freedom": "Free",
+                    "center_freedom": "Fixed",
+                    "construction": false
+                  }
+                },
+                "surface": {
+                  "artifactId": "[uuid]",
+                  "id": "[uuid]",
+                  "kind": "Custom",
+                  "objectId": 18,
+                  "origin": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "units": "mm"
+                  },
+                  "type": "plane",
+                  "xAxis": {
+                    "x": 0.0,
+                    "y": 1.0,
+                    "z": 0.0,
+                    "units": null
+                  },
+                  "yAxis": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 1.0,
+                    "units": null
+                  },
+                  "zAxis": {
+                    "x": 1.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "units": null
+                  }
+                },
+                "sketchId": "[uuid]",
+                "tag": {
+                  "type": "TagIdentifier",
+                  "value": "flangeInnerCircle"
+                }
+              }
+            }
+          }
+        }
+      },
+      "flangeOuterCircle": {
+        "type": "Segment",
+        "value": {
+          "repr": {
+            "Solved": {
+              "segment": {
+                "id": "[uuid]",
+                "objectId": 22,
+                "kind": {
+                  "circle": {
+                    "start": [
+                      {
+                        "n": 59.127884757715854,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      },
+                      {
+                        "n": 53.00197702905686,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      }
+                    ],
+                    "center": [
+                      {
+                        "n": 0.000000001595658507730511,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      },
+                      {
+                        "n": 79.99999999967628,
+                        "ty": {
+                          "type": "Known",
+                          "value": {
+                            "type": "Length",
+                            "value": "mm"
+                          }
+                        }
+                      }
+                    ],
+                    "ctor": {
+                      "start": {
+                        "x": {
+                          "type": "Var",
+                          "value": 66.34,
+                          "units": "Mm"
+                        },
+                        "y": {
+                          "type": "Var",
+                          "value": 51.18,
+                          "units": "Mm"
+                        }
+                      },
+                      "center": {
+                        "x": {
+                          "type": "Var",
+                          "value": 0.0,
+                          "units": "Mm"
+                        },
+                        "y": {
+                          "type": "Var",
+                          "value": 63.0,
+                          "units": "Mm"
+                        }
+                      }
+                    },
+                    "start_object_id": 20,
+                    "center_object_id": 21,
+                    "start_freedom": "Free",
+                    "center_freedom": "Fixed",
+                    "construction": false
+                  }
+                },
+                "surface": {
+                  "artifactId": "[uuid]",
+                  "id": "[uuid]",
+                  "kind": "Custom",
+                  "objectId": 18,
+                  "origin": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "units": "mm"
+                  },
+                  "type": "plane",
+                  "xAxis": {
+                    "x": 0.0,
+                    "y": 1.0,
+                    "z": 0.0,
+                    "units": null
+                  },
+                  "yAxis": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 1.0,
+                    "units": null
+                  },
+                  "zAxis": {
+                    "x": 1.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "units": null
+                  }
+                },
+                "sketchId": "[uuid]",
+                "tag": {
+                  "type": "TagIdentifier",
+                  "value": "flangeOuterCircle"
+                }
+              }
+            }
+          }
+        }
+      },
+      "meta": {
+        "type": "Object",
+        "value": {
+          "sketch": {
+            "type": "Sketch",
+            "value": {
+              "type": "Sketch",
+              "id": "[uuid]",
+              "paths": [
+                {
+                  "__geoMeta": {
+                    "id": "[uuid]",
+                    "sourceRange": []
+                  },
+                  "ccw": true,
+                  "center": [
+                    0.000000001595658507730511,
+                    79.99999999967628
+                  ],
+                  "from": [
+                    59.127884757715854,
+                    53.00197702905686
+                  ],
+                  "radius": 65.00000000042404,
+                  "tag": {
+                    "commentStart": 1600,
+                    "end": 1617,
+                    "moduleId": 0,
+                    "start": 1600,
+                    "type": "TagDeclarator",
+                    "value": "flangeOuterCircle"
+                  },
+                  "to": [
+                    59.127884757715854,
+                    53.00197702905686
+                  ],
+                  "type": "Circle",
+                  "units": "mm"
+                },
+                {
+                  "__geoMeta": {
+                    "id": "[uuid]",
+                    "sourceRange": []
+                  },
+                  "from": [
+                    59.127884757715854,
+                    53.00197702905686
+                  ],
+                  "tag": null,
+                  "to": [
+                    35.439335548127474,
+                    77.9255130528234
+                  ],
+                  "type": "ToPoint",
+                  "units": "mm"
+                },
+                {
+                  "__geoMeta": {
+                    "id": "[uuid]",
+                    "sourceRange": []
+                  },
+                  "ccw": true,
+                  "center": [
+                    0.000000001934687767885464,
+                    79.99999999965644
+                  ],
+                  "from": [
+                    35.439335548127474,
+                    77.9255130528234
+                  ],
+                  "radius": 35.500000000679215,
+                  "tag": {
+                    "commentStart": 2056,
+                    "end": 2073,
+                    "moduleId": 0,
+                    "start": 2056,
+                    "type": "TagDeclarator",
+                    "value": "flangeInnerCircle"
+                  },
+                  "to": [
+                    35.439335548127474,
+                    77.9255130528234
+                  ],
+                  "type": "Circle",
+                  "units": "mm"
+                }
+              ],
+              "on": {
+                "type": "plane",
+                "artifactId": "[uuid]",
+                "id": "[uuid]",
+                "objectId": 18,
+                "kind": "Custom",
+                "origin": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "units": "mm"
+                },
+                "xAxis": {
+                  "x": 0.0,
+                  "y": 1.0,
+                  "z": 0.0,
+                  "units": null
+                },
+                "yAxis": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "z": 1.0,
+                  "units": null
+                },
+                "zAxis": {
+                  "x": 1.0,
+                  "y": 0.0,
+                  "z": 0.0,
+                  "units": null
+                }
+              },
+              "start": {
+                "from": [
+                  59.127884757715854,
+                  53.00197702905686
+                ],
+                "to": [
+                  59.127884757715854,
+                  53.00197702905686
+                ],
+                "units": "mm",
+                "tag": null,
+                "__geoMeta": {
+                  "id": "[uuid]",
+                  "sourceRange": []
+                }
+              },
+              "tags": {
+                "flangeInnerCircle": {
+                  "type": "TagIdentifier",
+                  "value": "flangeInnerCircle"
+                },
+                "flangeOuterCircle": {
+                  "type": "TagIdentifier",
+                  "value": "flangeOuterCircle"
+                }
+              },
+              "artifactId": "[uuid]",
+              "originalId": "[uuid]",
+              "units": "mm",
+              "isClosed": "no"
+            }
+          }
+        },
+        "constrainable": false
+      }
+    },
+    "constrainable": false
+  },
+  "flangeThickness": {
+    "type": "Number",
+    "value": 20.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "horizontalFlange": {
+    "type": "Solid",
+    "value": {
+      "type": "Solid",
+      "id": "[uuid]",
+      "originalId": "[uuid]",
+      "topologyId": "[uuid]",
+      "artifactId": "[uuid]",
+      "value": [],
+      "sketch": {
+        "creatorType": "sketch",
+        "type": "Sketch",
+        "id": "[uuid]",
+        "paths": [
+          {
+            "__geoMeta": {
+              "id": "[uuid]",
+              "sourceRange": []
+            },
+            "ccw": true,
+            "center": [
+              0.000000001595658507730511,
+              79.99999999967628
+            ],
+            "from": [
+              59.127884757715854,
+              53.00197702905686
+            ],
+            "radius": 65.00000000042404,
+            "tag": {
+              "commentStart": 1600,
+              "end": 1617,
+              "moduleId": 0,
+              "start": 1600,
+              "type": "TagDeclarator",
+              "value": "flangeOuterCircle"
+            },
+            "to": [
+              59.127884757715854,
+              53.00197702905686
+            ],
+            "type": "Circle",
+            "units": "mm"
+          },
+          {
+            "__geoMeta": {
+              "id": "[uuid]",
+              "sourceRange": []
+            },
+            "ccw": true,
+            "center": [
+              0.000000001934687767885464,
+              79.99999999965644
+            ],
+            "from": [
+              35.439335548127474,
+              77.9255130528234
+            ],
+            "radius": 35.500000000679215,
+            "tag": {
+              "commentStart": 2056,
+              "end": 2073,
+              "moduleId": 0,
+              "start": 2056,
+              "type": "TagDeclarator",
+              "value": "flangeInnerCircle"
+            },
+            "to": [
+              35.439335548127474,
+              77.9255130528234
+            ],
+            "type": "Circle",
+            "units": "mm"
+          }
+        ],
+        "on": {
+          "type": "plane",
+          "artifactId": "[uuid]",
+          "id": "[uuid]",
+          "objectId": 18,
+          "kind": "Custom",
+          "origin": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "units": "mm"
+          },
+          "xAxis": {
+            "x": 0.0,
+            "y": 1.0,
+            "z": 0.0,
+            "units": null
+          },
+          "yAxis": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 1.0,
+            "units": null
+          },
+          "zAxis": {
+            "x": 1.0,
+            "y": 0.0,
+            "z": 0.0,
+            "units": null
+          }
+        },
+        "start": {
+          "from": [
+            59.127884757715854,
+            53.00197702905686
+          ],
+          "to": [
+            59.127884757715854,
+            53.00197702905686
+          ],
+          "units": "mm",
+          "tag": null,
+          "__geoMeta": {
+            "id": "[uuid]",
+            "sourceRange": []
+          }
+        },
+        "tags": {
+          "flangeInnerCircle": {
+            "type": "TagIdentifier",
+            "value": "flangeInnerCircle"
+          },
+          "flangeOuterCircle": {
+            "type": "TagIdentifier",
+            "value": "flangeOuterCircle"
+          }
+        },
+        "artifactId": "[uuid]",
+        "originalId": "[uuid]",
+        "units": "mm",
+        "isClosed": "explicitly"
+      },
+      "startCapId": null,
+      "endCapId": null,
+      "units": "mm",
+      "sectional": false
+    }
+  },
+  "pipeInsideDiameter": {
+    "type": "Number",
+    "value": 71.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "pipeOutsideDiameter": {
+    "type": "Number",
+    "value": 94.0,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "pipeWallThickness": {
+    "type": "Number",
+    "value": 11.5,
+    "ty": {
+      "type": "Default",
+      "value": {
+        "len": "mm",
+        "angle": "degrees"
+      }
+    }
+  },
+  "verticalFlange": {
+    "type": "Solid",
+    "value": {
+      "type": "Solid",
+      "id": "[uuid]",
+      "originalId": "[uuid]",
+      "topologyId": "[uuid]",
+      "artifactId": "[uuid]",
+      "value": [
+        {
+          "faceId": "[uuid]",
+          "id": "[uuid]",
+          "sourceRange": [],
+          "tag": {
+            "commentStart": 1600,
+            "end": 1617,
+            "moduleId": 0,
+            "start": 1600,
+            "type": "TagDeclarator",
+            "value": "flangeOuterCircle"
+          },
+          "type": "extrudeArc"
+        },
+        {
+          "faceId": "[uuid]",
+          "id": "[uuid]",
+          "sourceRange": [],
+          "tag": {
+            "commentStart": 2056,
+            "end": 2073,
+            "moduleId": 0,
+            "start": 2056,
+            "type": "TagDeclarator",
+            "value": "flangeInnerCircle"
+          },
+          "type": "extrudeArc"
+        }
+      ],
+      "sketch": {
+        "creatorType": "sketch",
+        "type": "Sketch",
+        "id": "[uuid]",
+        "paths": [
+          {
+            "__geoMeta": {
+              "id": "[uuid]",
+              "sourceRange": []
+            },
+            "ccw": true,
+            "center": [
+              0.000000001595658507730511,
+              79.99999999967628
+            ],
+            "from": [
+              59.127884757715854,
+              53.00197702905686
+            ],
+            "radius": 65.00000000042404,
+            "tag": {
+              "commentStart": 1600,
+              "end": 1617,
+              "moduleId": 0,
+              "start": 1600,
+              "type": "TagDeclarator",
+              "value": "flangeOuterCircle"
+            },
+            "to": [
+              59.127884757715854,
+              53.00197702905686
+            ],
+            "type": "Circle",
+            "units": "mm"
+          },
+          {
+            "__geoMeta": {
+              "id": "[uuid]",
+              "sourceRange": []
+            },
+            "ccw": true,
+            "center": [
+              0.000000001934687767885464,
+              79.99999999965644
+            ],
+            "from": [
+              35.439335548127474,
+              77.9255130528234
+            ],
+            "radius": 35.500000000679215,
+            "tag": {
+              "commentStart": 2056,
+              "end": 2073,
+              "moduleId": 0,
+              "start": 2056,
+              "type": "TagDeclarator",
+              "value": "flangeInnerCircle"
+            },
+            "to": [
+              35.439335548127474,
+              77.9255130528234
+            ],
+            "type": "Circle",
+            "units": "mm"
+          }
+        ],
+        "on": {
+          "type": "plane",
+          "artifactId": "[uuid]",
+          "id": "[uuid]",
+          "objectId": 18,
+          "kind": "Custom",
+          "origin": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "units": "mm"
+          },
+          "xAxis": {
+            "x": 0.0,
+            "y": 1.0,
+            "z": 0.0,
+            "units": null
+          },
+          "yAxis": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 1.0,
+            "units": null
+          },
+          "zAxis": {
+            "x": 1.0,
+            "y": 0.0,
+            "z": 0.0,
+            "units": null
+          }
+        },
+        "start": {
+          "from": [
+            59.127884757715854,
+            53.00197702905686
+          ],
+          "to": [
+            59.127884757715854,
+            53.00197702905686
+          ],
+          "units": "mm",
+          "tag": null,
+          "__geoMeta": {
+            "id": "[uuid]",
+            "sourceRange": []
+          }
+        },
+        "tags": {
+          "flangeInnerCircle": {
+            "type": "TagIdentifier",
+            "value": "flangeInnerCircle"
+          },
+          "flangeOuterCircle": {
+            "type": "TagIdentifier",
+            "value": "flangeOuterCircle"
+          }
+        },
+        "artifactId": "[uuid]",
+        "originalId": "[uuid]",
+        "units": "mm",
+        "isClosed": "explicitly"
+      },
+      "startCapId": "[uuid]",
+      "endCapId": "[uuid]",
+      "units": "mm",
+      "sectional": false
+    }
+  }
+}

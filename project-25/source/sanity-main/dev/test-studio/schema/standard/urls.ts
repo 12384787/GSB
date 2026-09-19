@@ -1,0 +1,44 @@
+import {LinkIcon} from '@sanity/icons/Link'
+import {defineType} from 'sanity'
+
+export default defineType({
+  name: 'urlsTest',
+  type: 'document',
+  title: 'URLs test',
+  icon: LinkIcon,
+  fields: [
+    {
+      name: 'title',
+      type: 'string',
+      title: 'Title',
+    },
+    {
+      name: 'myUrlField',
+      type: 'url',
+      title: 'Plain url',
+      description: 'A plain URL field',
+      validation: (Rule) => Rule.uri({scheme: ['http', 'https', 'mailto', 'tel']}),
+    },
+    {
+      name: 'relativeUri',
+      type: 'url',
+      title: 'Relative url',
+      description: 'A relative URL field',
+      validation: (Rule) => Rule.uri({allowRelative: true}),
+    },
+    {
+      name: 'httpsOnlyRelative',
+      type: 'url',
+      title: 'HTTPS-only, relative allowed',
+      description: 'Accepts https URLs and relative paths like /example',
+      validation: (Rule) => Rule.uri({scheme: ['https'], allowRelative: true}),
+    },
+    {
+      name: 'httpAndHttpsRelative',
+      type: 'url',
+      title: 'HTTP/HTTPS, relative allowed',
+      description: 'Accepts http and https URLs and relative paths',
+      validation: (Rule) => Rule.uri({scheme: ['http', 'https'], allowRelative: true}),
+    },
+  ],
+})

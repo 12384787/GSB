@@ -1,0 +1,32 @@
+import {type ReleaseDocument} from '@sanity/client'
+import {useMemo} from 'react'
+
+import {type ReleaseActionComponent} from '../../config/releases/actions'
+import {useSource} from '../../studio/source'
+import {type DocumentInRelease} from '../tool/detail/types'
+
+/**
+ * Hook to get custom/configured release actions for a release
+ *
+ * @internal
+ */
+export function useCustomReleaseActions(
+  release: ReleaseDocument,
+  documents: DocumentInRelease[] = [],
+): ReleaseActionComponent[] {
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+  const source = useSource()
+
+  const customReleaseActions = useMemo(() => {
+    if (!source.releases?.actions) {
+      return []
+    }
+
+    return source.releases.actions({
+      release,
+      documents,
+    })
+  }, [source, release, documents])
+
+  return customReleaseActions
+}

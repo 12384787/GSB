@@ -1,0 +1,81 @@
+import os from 'os'
+import { defineConfig, devices } from '@playwright/test'
+
+const platform = os.platform() // 'linux' (Ubuntu), 'darwin' (macOS), 'win32' (Windows)
+
+let workers: number | string
+
+if (process.env.E2E_WORKERS) {
+  workers = process.env.E2E_WORKERS.includes('%')
+    ? process.env.E2E_WORKERS
+    : parseInt(process.env.E2E_WORKERS)
+} else if (!process.env.CI) {
+  workers = 1 // Local dev: keep things simple and deterministic by default
+} else {
+  // On CI: adjust based on OS
+  switch (platform) {
+    case 'linux':
+      workers = '50%' // CI Linux runners are generally beefier
+      break
+    case 'darwin':
+    case 'win32':
+    default:
+      workers = '40%' // Lower concurrency for heavier Electron processes
+      break
+  }
+}
+
+/**
+ * See https://playwright.dev/docs/test-configuration.
+ */
+export default defineConfig({
+  timeout: 120_000, // override the default 30s timeout
+  testDir: './e2e/playwright',
+  testIgnore: '*.test.ts', // ignore unit tests
+  /* Share snapshots across all platforms */
+  snapshotPathTemplate: '{testDir}/{testFileName}-snapshots/{arg}{ext}',
+  /* Run tests in files in parallel */
+  fullyParallel: true,
+  /* Fail the build on CI if you accidentally left test.only in the source code. */
+  forbidOnly: Boolean(process.env.CI),
+  /* Do not retry using Playwright's built-in retry mechanism */
+  retries: 0,
+  /* Use all available CPU cores */
+  workers: workers,
+  /* Reporter to use. See https://playwright.dev/docs/test-reporters */
+  reporter: [
+    ['list'],
+    ['json', { outputFile: './test-results/report.json' }],
+    ['html'],
+    ['./e2e/playwright/lib/api-reporter.ts'],
+  ],
+  /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
+  use: {
+    /* Base URL to use in actions like `await page.goto('/')`. */
+    baseURL: 'http://localhost:3000',
+
+    /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
+    trace: 'retain-on-failure',
+    actionTimeout: 15_000,
+    screenshot: 'only-on-failure',
+  },
+  projects: [
+    {
+      name: 'chromium',
+      use: {
+        ...devices['Desktop Chrome'],
+        contextOptions: {
+          /* Chromium is the only one with these permission types */
+          permissions: ['clipboard-write', 'clipboard-read'],
+        },
+        launchOptions: {
+          ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
+            ? {
+                executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
+              }
+            : {}),
+        },
+      }, // or 'chrome-beta'
+    },
+  ],
+})

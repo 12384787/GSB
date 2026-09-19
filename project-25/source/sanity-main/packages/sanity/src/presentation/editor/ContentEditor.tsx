@@ -1,0 +1,162 @@
+import {WarningOutlineIcon} from '@sanity/icons/WarningOutline'
+import {Card, Flex, Text} from '@sanity/ui'
+import {type HTMLProps, useCallback, useMemo} from 'react'
+import {
+  getPreviewValueWithFallback,
+  PreviewCard,
+  SanityDefaultPreview,
+  Translate,
+  useSchema,
+  useTranslation,
+} from 'sanity'
+import {StateLink} from 'sanity/router'
+import {Box} from 'ui5'
+
+import {presentationLocaleNamespace} from '../i18n'
+import {
+  type MainDocumentState,
+  type PresentationNavigate,
+  type PresentationSearchParams,
+  type PresentationStateParams,
+  type StructureDocumentPaneParams,
+} from '../types'
+import {DocumentListPane} from './DocumentListPane'
+import {DocumentPanel} from './DocumentPanel'
+import usePreviewState from './usePreviewState'
+
+export function ContentEditor(props: {
+  documentId?: string
+  documentType?: string
+  mainDocumentState?: MainDocumentState
+  onEditReference: PresentationNavigate
+  onFocusPath: (state: Required<PresentationStateParams>) => void
+  onStructureParams: (params: StructureDocumentPaneParams) => void
+  refs: {_id: string; _type: string}[]
+  visualOrderPublishedIds: string[]
+  structureParams: StructureDocumentPaneParams
+  searchParams: PresentationSearchParams
+}): React.JSX.Element {
+  const {
+    documentId,
+    documentType,
+    mainDocumentState,
+    onEditReference,
+    onFocusPath,
+    onStructureParams,
+    refs,
+    visualOrderPublishedIds,
+    searchParams,
+    structureParams,
+  } = props
+
+  const {t} = useTranslation(presentationLocaleNamespace)
+  const schema = useSchema()
+
+  const MainDocumentLink = useCallback(
+    (props: HTMLProps<HTMLAnchorElement>) => {
+      return (
+        <StateLink
+          {...props}
+          state={{
+            id: mainDocumentState?.document?._id,
+            type: mainDocumentState?.document?._type,
+            _searchParams: Object.entries(searchParams),
+          }}
+        />
+      )
+    },
+    [mainDocumentState, searchParams],
+  )
+
+  const schemaType = useMemo(
+    () => schema.get(mainDocumentState?.document?._type || 'shoe')!,
+    [mainDocumentState, schema],
+  )
+
+  const previewState = usePreviewState(mainDocumentState?.document?._id || '', schemaType)
+
+  const preview = useMemo(() => {
+    if (!mainDocumentState?.document) return null
+
+    return (
+      <SanityDefaultPreview
+        {...getPreviewValueWithFallback({
+          snapshot: previewState.snapshot,
+          fallback: mainDocumentState.document,
+        })}
+        schemaType={schemaType}
+        status={
+          <Card padding={1} radius={2} shadow={1}>
+            <Text muted size={0} weight="medium">
+              {t('main-document.label')}
+            </Text>
+          </Card>
+        }
+      />
+    )
+  }, [mainDocumentState, schemaType, t, previewState])
+
+  if (documentId && documentType) {
+    return (
+      <DocumentPanel
+        documentId={documentId}
+        documentType={documentType}
+        onEditReference={onEditReference}
+        onFocusPath={onFocusPath}
+        onStructureParams={onStructureParams}
+        searchParams={searchParams}
+        structureParams={structureParams}
+      />
+    )
+  }
+
+  return (
+    <Flex direction="column" flex={1} height="fill">
+      {mainDocumentState && (
+        <Card padding={3} tone={mainDocumentState.document ? 'inherit' : 'caution'}>
+          {mainDocumentState.document ? (
+            <PreviewCard
+              __unstable_focusRing
+              as={MainDocumentLink}
+              data-as="a"
+              radius={2}
+              sizing="border"
+              tone="inherit"
+            >
+              {preview}
+            </PreviewCard>
+          ) : (
+            <Card padding={2} radius={2} tone="inherit">
+              <Flex gap={3}>
+                <Box flexBasis="auto" flexGrow={0} flexShrink={0}>
+                  <Text size={1}>
+                    <WarningOutlineIcon />
+                  </Text>
+                </Box>
+                <Box flexBasis="0%" flexGrow={1}>
+                  <Text size={1}>
+                    <Translate
+                      t={t}
+                      i18nKey="main-document.missing.text"
+                      components={{Code: 'code'}}
+                      values={{path: mainDocumentState.path}}
+                    />
+                  </Text>
+                </Box>
+              </Flex>
+            </Card>
+          )}
+        </Card>
+      )}
+
+      <DocumentListPane
+        mainDocumentState={mainDocumentState}
+        onEditReference={onEditReference}
+        onStructureParams={onStructureParams}
+        searchParams={searchParams}
+        refs={refs}
+        visualOrderPublishedIds={visualOrderPublishedIds}
+      />
+    </Flex>
+  )
+}

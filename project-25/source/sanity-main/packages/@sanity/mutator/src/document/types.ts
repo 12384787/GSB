@@ -1,0 +1,36 @@
+import {
+  type CreateIfNotExistsMutation,
+  type CreateMutation,
+  type CreateOrReplaceMutation,
+  type DeleteMutation,
+  type PatchMutation,
+} from '@sanity/types'
+
+/**
+ * Sanity document with a guaranteed `_id` and `_type`
+ *
+ * @internal
+ */
+export interface Doc {
+  _id: string
+  _type: string
+  _rev?: string
+  _updatedAt?: string
+  _createdAt?: string
+  [attribute: string]: unknown
+}
+
+/**
+ * Internal mutation body representation - note that theoretically a
+ * mutation can only hold one of these operations each, but for sake
+ * of simpler code it is bundled together as one here
+ *
+ * @internal
+ */
+export interface Mut {
+  create?: CreateMutation['create']
+  createIfNotExists?: CreateIfNotExistsMutation['createIfNotExists']
+  createOrReplace?: CreateOrReplaceMutation['createOrReplace']
+  delete?: DeleteMutation['delete']
+  patch?: PatchMutation['patch']
+}

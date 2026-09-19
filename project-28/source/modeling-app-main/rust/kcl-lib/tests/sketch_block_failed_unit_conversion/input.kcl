@@ -1,0 +1,5 @@
+sketch(on = XY) {
+  // This should be an error since degrees can't be converted to the module
+  // units (millimeters).
+  len = var 1deg
+}

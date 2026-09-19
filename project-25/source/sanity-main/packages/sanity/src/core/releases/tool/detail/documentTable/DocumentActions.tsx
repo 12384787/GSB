@@ -1,0 +1,187 @@
+import {CloseIcon} from '@sanity/icons/Close'
+import {UnpublishIcon} from '@sanity/icons/Unpublish'
+import {Card, Label} from '@sanity/ui'
+import {Menu, MenuDivider} from '@sanity/ui/menu'
+import {memo, useMemo, useState} from 'react'
+import {Box} from 'ui5'
+
+import {MenuButton} from '../../../../../ui-components/menuButton/MenuButton'
+import {MenuItem} from '../../../../../ui-components/menuItem/MenuItem'
+import {ContextMenuButton} from '../../../../components/contextMenuButton/ContextMenuButton'
+import {useConfiguredDocumentActionIds} from '../../../../config/document/useConfiguredDocumentActionIds'
+import {type DocumentActionsVersionType} from '../../../../config/types'
+import {useSchema} from '../../../../hooks/useSchema'
+import {useTranslation} from '../../../../i18n/hooks/useTranslation'
+import {useDocumentPairPermissions} from '../../../../store/grants/documentPairPermissions'
+import {getPublishedId, getVersionFromId} from '../../../../util/draftUtils'
+import {DiscardVersionDialog} from '../../../components/dialog/DiscardVersionDialog'
+import {UnpublishVersionDialog} from '../../../components/dialog/UnpublishVersionDialog'
+import {releasesLocaleNamespace} from '../../../i18n'
+import {isGoingToUnpublish} from '../../../util/isGoingToUnpublish'
+import {type BundleDocumentRow} from '../ReleaseSummary'
+
+const DocumentActionsInner = memo(
+  function DocumentActionsInner({
+    document,
+    releaseId,
+    releaseTitle,
+    versionType,
+  }: {
+    document: BundleDocumentRow
+    releaseId: string
+    releaseTitle: string | undefined
+    versionType: DocumentActionsVersionType
+  }) {
+    const [showDiscardDialog, setShowDiscardDialog] = useState(false)
+    const [showUnpublishDialog, setShowUnpublishDialog] = useState(false)
+    const {t: coreT} = useTranslation()
+    const {t} = useTranslation(releasesLocaleNamespace)
+    const isAlreadyUnpublished = isGoingToUnpublish(document.document)
+
+    const publishedId = getPublishedId(document.document._id)
+    const type = document.document._type
+    // Permission checks address the row's own version, keyed by the scope segment of its id.
+    const version = getVersionFromId(document.document._id)
+
+    const [discardVersionPermission, isDiscardVersionPermissionsLoading] =
+      useDocumentPairPermissions({
+        id: publishedId,
+        type,
+        version,
+        permission: 'discardVersion',
+      })
+    const [unpublishPermission, isUnpublishPermissionsLoading] = useDocumentPairPermissions({
+      id: publishedId,
+      type,
+      version,
+      permission: 'unpublish',
+    })
+
+    const isDiscardVersionActionDisabled =
+      !discardVersionPermission?.granted || isDiscardVersionPermissionsLoading
+    const noPermissionToUnpublish = !unpublishPermission?.granted || isUnpublishPermissionsLoading
+
+    const unPublishTooltipContent = useMemo(() => {
+      if (noPermissionToUnpublish) {
+        return t('permissions.error.unpublish')
+      }
+      if (!document.document.publishedDocumentExists) {
+        return t('unpublish.no-published-version')
+      }
+      if (isAlreadyUnpublished) {
+        return t('unpublish.already-unpublished')
+      }
+
+      return null
+    }, [
+      document.document.publishedDocumentExists,
+      isAlreadyUnpublished,
+      noPermissionToUnpublish,
+      t,
+    ])
+
+    const isUnpublishActionDisabled =
+      noPermissionToUnpublish || !document.document.publishedDocumentExists || isAlreadyUnpublished
+
+    const configuredActionIds = useConfiguredDocumentActionIds({
+      schemaType: type,
+      documentId: publishedId,
+      versionType,
+      releaseId,
+    })
+    const showDiscardVersion = configuredActionIds.has('discardVersion')
+    const showUnpublish = configuredActionIds.has('unpublishVersion')
+    const hasConfiguredMenuItems = showDiscardVersion || showUnpublish
+
+    if (!hasConfiguredMenuItems) return null
+
+    return (
+      <>
+        <Card tone="default" display="flex">
+          <MenuButton
+            id="document-actions"
+            button={<ContextMenuButton />}
+            menu={
+              <Menu>
+                {showDiscardVersion && (
+                  <MenuItem
+                    text={coreT('release.action.discard-version')}
+                    icon={CloseIcon}
+                    onClick={() => setShowDiscardDialog(true)}
+                    disabled={isDiscardVersionActionDisabled}
+                    tooltipProps={{
+                      disabled: !isDiscardVersionActionDisabled,
+                      content: t('permissions.error.discard-version'),
+                    }}
+                  />
+                )}
+                {showUnpublish && (
+                  <>
+                    {showDiscardVersion && <MenuDivider />}
+                    <Box padding={3} paddingBottom={2}>
+                      <Label size={1}>{t('menu.group.when-releasing')}</Label>
+                    </Box>
+                    <MenuItem
+                      text={t('action.unpublish')}
+                      icon={UnpublishIcon}
+                      disabled={isUnpublishActionDisabled}
+                      tooltipProps={{
+                        disabled: !isUnpublishActionDisabled,
+                        content: unPublishTooltipContent,
+                      }}
+                      onClick={() => setShowUnpublishDialog(true)}
+                    />
+                  </>
+                )}
+              </Menu>
+            }
+          />
+        </Card>
+        {showDiscardDialog && (
+          <DiscardVersionDialog
+            isGoingToUnpublish={isGoingToUnpublish(document.document)}
+            onClose={() => setShowDiscardDialog(false)}
+            versionId={document.document._id}
+            documentType={document.document._type}
+            fromPerspective={releaseTitle || t('release-placeholder.title')}
+          />
+        )}
+        {showUnpublishDialog && (
+          <UnpublishVersionDialog
+            onClose={() => setShowUnpublishDialog(false)}
+            documentVersionId={document.document._id}
+            documentType={document.document._type}
+          />
+        )}
+      </>
+    )
+  },
+  (prev, next) =>
+    prev.document.memoKey === next.document.memoKey &&
+    prev.versionType === next.versionType &&
+    prev.releaseId === next.releaseId &&
+    prev.releaseTitle === next.releaseTitle,
+)
+
+export const DocumentActions = memo(function GuardedDocumentActions(props: {
+  document: BundleDocumentRow
+  releaseId: string
+  releaseTitle: string | undefined
+  versionType: DocumentActionsVersionType
+}) {
+  const schema = useSchema()
+  const type = schema.get(props.document.document._type)
+  const {t} = useTranslation()
+  if (!type) {
+    return (
+      <ContextMenuButton
+        disabled
+        tooltipProps={{
+          content: t('document.type.not-found', {type: props.document.document._type}),
+        }}
+      />
+    )
+  }
+
+  return <DocumentActionsInner {...props} />
+})

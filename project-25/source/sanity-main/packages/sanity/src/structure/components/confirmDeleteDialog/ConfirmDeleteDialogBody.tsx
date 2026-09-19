@@ -1,0 +1,322 @@
+import {ChevronDownIcon} from '@sanity/icons/ChevronDown'
+import {CopyIcon} from '@sanity/icons/Copy'
+import {DocumentsIcon} from '@sanity/icons/Documents'
+import {UnknownIcon} from '@sanity/icons/Unknown'
+import {WarningOutlineIcon} from '@sanity/icons/WarningOutline'
+import {Card, Stack, Text} from '@sanity/ui'
+import {useToast} from '@sanity/ui/toast'
+import {useCallback} from 'react'
+import {SanityDefaultPreview, Translate, useSchema, useTranslation} from 'sanity'
+import {Flex, Box} from 'ui5'
+
+import {Button} from '../../../ui-components/button/Button'
+import {structureLocaleNamespace} from '../../i18n'
+import {
+  ChevronWrapper,
+  CrossDatasetReferencesDetails,
+  CrossDatasetReferencesSummary,
+  DocumentIdFlex,
+  OtherReferenceCount,
+  Table,
+} from './ConfirmDeleteDialogBody.styles'
+import {ReferencePreviewLink} from './ReferencePreviewLink'
+import {type ReferringDocuments} from './useReferringDocuments'
+import {VersionsPreviewList} from './VersionsPreviewList'
+
+type DeletionConfirmationDialogBodyProps = Required<ReferringDocuments> & {
+  documentTitle: React.ReactNode
+  action: 'unpublish' | 'delete'
+  onReferenceLinkClick?: () => void
+  documentId: string
+  documentType: string
+  documentVersions: string[]
+}
+
+function DocumentTitle({
+  documentTitle,
+}: {
+  children?: React.ReactNode
+  documentTitle?: React.ReactNode
+}) {
+  return documentTitle
+}
+
+function StrongDocumentTitle({
+  documentTitle,
+}: {
+  children?: React.ReactNode
+  documentTitle?: React.ReactNode
+}) {
+  return <strong>{documentTitle}</strong>
+}
+
+/**
+ * The inner part of the `ConfirmDeleteDialog`. This is ran when both the
+ * `crossDatasetReferences` and `internalReferences` are loaded.
+ */
+export function ConfirmDeleteDialogBody({
+  crossDatasetReferences,
+  internalReferences,
+  documentTitle,
+  totalCount,
+  action,
+  datasetNames,
+  hasUnknownDatasetNames,
+  documentId,
+  documentType,
+  onReferenceLinkClick,
+  documentVersions,
+}: DeletionConfirmationDialogBodyProps) {
+  const schema = useSchema()
+  const toast = useToast()
+  const {t} = useTranslation(structureLocaleNamespace)
+
+  const renderPreviewItem = useCallback(
+    (item: {_id: string; _type: string}) => {
+      const type = schema.get(item._type)
+      if (type) {
+        return <ReferencePreviewLink type={type} value={item} onClick={onReferenceLinkClick} />
+      }
+
+      return (
+        // Padding added to match the ReferencePreviewLink styling
+        <Box padding={2}>
+          <SanityDefaultPreview
+            icon={UnknownIcon}
+            title={t('confirm-delete-dialog.preview-item.preview-unavailable.title')}
+            subtitle={t('confirm-delete-dialog.preview-item.preview-unavailable.subtitle', {
+              documentId: item._id,
+            })}
+            layout="default"
+          />
+        </Box>
+      )
+    },
+    [schema, t, onReferenceLinkClick],
+  )
+  const confirmationMessage = useCallback(
+    () => (
+      <Stack gap={4}>
+        <Text as="p" size={1}>
+          <Translate
+            t={t}
+            i18nKey="confirm-delete-dialog.confirmation.text"
+            context={action}
+            values={{count: documentVersions.length}}
+            components={{DocumentTitle: StrongDocumentTitle}}
+            componentProps={{documentTitle}}
+          />
+        </Text>
+        {action === 'delete' && (
+          <VersionsPreviewList documentType={documentType} documentVersions={documentVersions} />
+        )}
+      </Stack>
+    ),
+    [t, action, documentTitle, documentType, documentVersions],
+  )
+
+  if (internalReferences?.totalCount === 0 && crossDatasetReferences?.totalCount === 0) {
+    return confirmationMessage()
+  }
+
+  // We do some extra checks to handle cases where you have unavailable dataset
+  // name(s) due to permissions, both alone and in combination with known datasets
+
+  // This normalizes one or more undefined dataset names to the catch-all `unavailable`
+  const normalizedDatasetNames = [
+    ...datasetNames,
+    ...(hasUnknownDatasetNames ? ['unavailable'] : []),
+  ]
+
+  const datasetSubtitle = t('confirm-delete-dialog.cdr-summary.subtitle', {
+    count: normalizedDatasetNames.length,
+    datasets: normalizedDatasetNames.join(', '),
+    context: hasUnknownDatasetNames && normalizedDatasetNames.length ? 'unavailable' : '',
+  })
+
+  return (
+    <Flex flexDirection="column" gap={4}>
+      {confirmationMessage()}
+      <div>
+        <Card borderTop padding={1} />
+        <Card padding={3} radius={2} tone="caution" flex="none">
+          <Flex>
+            <Text aria-hidden="true" size={1}>
+              <WarningOutlineIcon />
+            </Text>
+            <Box flexBasis="0%" flexGrow={1} marginLeft={3}>
+              <Text size={1}>
+                <Translate
+                  i18nKey="confirm-delete-dialog.referring-document-count.text"
+                  components={{DocumentTitle}}
+                  componentProps={{documentTitle}}
+                  t={t}
+                  values={{count: totalCount}}
+                />
+              </Text>
+            </Box>
+          </Flex>
+        </Card>
+      </div>
+
+      <Box flexBasis="auto" flexGrow={0} flexShrink={0}>
+        <Text size={1}>
+          <Translate
+            i18nKey="confirm-delete-dialog.referring-documents-descriptor.text"
+            t={t}
+            context={action}
+            components={{DocumentTitle}}
+            componentProps={{documentTitle}}
+          />
+        </Text>
+      </Box>
+      <Card radius={2} shadow={1} flex="auto" padding={1}>
+        <Flex flexDirection="column">
+          {internalReferences.totalCount > 0 && (
+            <Stack as="ul" gap={2} data-testid="internal-references">
+              {internalReferences?.references.map((item) => (
+                <Box key={item._id} as="li">
+                  {renderPreviewItem(item)}
+                </Box>
+              ))}
+
+              {internalReferences.totalCount > internalReferences.references.length && (
+                <Box as="li" padding={3}>
+                  <OtherReferenceCount {...internalReferences} />
+                </Box>
+              )}
+            </Stack>
+          )}
+
+          {crossDatasetReferences.totalCount > 0 && (
+            <CrossDatasetReferencesDetails
+              data-testid="cross-dataset-references"
+              style={{
+                // only add the border if needed
+                borderTop:
+                  internalReferences.totalCount > 0
+                    ? '1px solid var(--card-shadow-outline-color)'
+                    : undefined,
+              }}
+            >
+              <CrossDatasetReferencesSummary>
+                <Card
+                  as="a"
+                  marginTop={internalReferences.totalCount > 0 ? 2 : 0}
+                  radius={2}
+                  shadow={1}
+                  paddingY={1}
+                >
+                  <Flex alignItems="center" gap={3} paddingX={3} paddingY={1}>
+                    <Text size={1}>
+                      <DocumentsIcon />
+                    </Text>
+                    <Stack gap={2}>
+                      <Text textOverflow="ellipsis" size={1}>
+                        {t('confirm-delete-dialog.cdr-summary.title', {
+                          count: normalizedDatasetNames.length,
+                          documentCount: t('confirm-delete-dialog.cdr-summary.document-count', {
+                            count: crossDatasetReferences.totalCount,
+                          }),
+                        })}
+                      </Text>
+                      <Text title={datasetSubtitle} textOverflow="ellipsis" size={1} muted>
+                        {datasetSubtitle}
+                      </Text>
+                    </Stack>
+                    <ChevronWrapper>
+                      <Text muted size={1}>
+                        <ChevronDownIcon />
+                      </Text>
+                    </ChevronWrapper>
+                  </Flex>
+                </Card>
+              </CrossDatasetReferencesSummary>
+
+              <Box overflow="auto" paddingTop={2}>
+                <Table>
+                  <thead>
+                    <tr>
+                      <th>
+                        <Text muted size={1} style={{minWidth: '5rem'}} weight="medium">
+                          {t('confirm-delete-dialog.cdr-table.project-id.label')}
+                        </Text>
+                      </th>
+                      <th>
+                        <Text muted size={1} weight="medium">
+                          {t('confirm-delete-dialog.cdr-table.dataset.label')}
+                        </Text>
+                      </th>
+                      <th>
+                        <Text muted size={1} weight="medium">
+                          {t('confirm-delete-dialog.cdr-table.document-id.label')}
+                        </Text>
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {crossDatasetReferences.references
+                      .filter((reference): reference is Required<typeof reference> => {
+                        return 'projectId' in reference
+                      })
+                      .map(({projectId, datasetName, documentId: referenceId}, index) => (
+                        <tr key={`${documentId}-${index}`}>
+                          <td>
+                            <Text size={1}>{projectId}</Text>
+                          </td>
+                          <td>
+                            <Text size={1}>{datasetName || 'unavailable'}</Text>
+                          </td>
+                          <td>
+                            <DocumentIdFlex alignItems="center" gap={2} justifyContent="flex-end">
+                              <Text textOverflow="ellipsis" size={1}>
+                                {referenceId || 'unavailable'}
+                              </Text>
+                              {referenceId && (
+                                <Button
+                                  mode="bleed"
+                                  icon={CopyIcon}
+                                  tooltipProps={{
+                                    content: t(
+                                      'confirm-delete-dialog.cdr-table.copy-id-button.tooltip',
+                                    ),
+                                  }}
+                                  onClick={() => {
+                                    navigator.clipboard.writeText(referenceId).catch(() => {
+                                      toast.push({
+                                        status: 'error',
+                                        title: t(
+                                          'confirm-delete-dialog.cdr-table.id-copied-toast.title-failed',
+                                        ),
+                                      })
+                                    })
+                                  }}
+                                />
+                              )}
+                            </DocumentIdFlex>
+                          </td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </Table>
+
+                <OtherReferenceCount {...crossDatasetReferences} />
+              </Box>
+            </CrossDatasetReferencesDetails>
+          )}
+        </Flex>
+      </Card>
+      <Box flexBasis="auto" flexGrow={0} flexShrink={0}>
+        <Text size={1}>
+          <Translate
+            i18nKey="confirm-delete-dialog.referential-integrity-disclaimer.text"
+            t={t}
+            context={action}
+            components={{DocumentTitle}}
+            componentProps={{documentTitle}}
+          />
+        </Text>
+      </Box>
+    </Flex>
+  )
+}

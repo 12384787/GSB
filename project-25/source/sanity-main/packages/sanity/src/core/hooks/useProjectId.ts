@@ -1,0 +1,19 @@
+import {useSource} from '../studio/source'
+
+/**
+ * React hook that returns the current project id
+ *
+ * @public
+ * @returns The current project id
+ * @example Using the `useProjectId` hook
+ * ```ts
+ * function MyComponent() {
+ *   const projectId = useProjectId()
+ *   // ... do something with the project id ...
+ * }
+ * ```
+ */
+export function useProjectId(): string {
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+  return useSource().projectId
+}

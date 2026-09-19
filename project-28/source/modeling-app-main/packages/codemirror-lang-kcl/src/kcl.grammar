@@ -1,0 +1,155 @@
+@precedence {
+  annotation
+  member
+  call
+  exp @left
+  mult @left
+  add @left
+  comp @left
+  logic @left
+  pipe @left
+  range
+  enumBody
+}
+
+@top Program {
+  Shebang?
+  statement*
+}
+
+statement[@isGroup=Statement] {
+  ImportStatement { kw<"import"> ImportItems ImportFrom String } |
+  FunctionDeclaration { kw<"export">? kw<"fn"> VariableDefinition ParamList Body } |
+  VariableDeclaration { kw<"export">? VariableDefinition Equals expression } |
+  TypeDeclaration { kw<"export">? kw<"type"> identifier ("=" type | !enumBody EnumBody)? } |
+  ReturnStatement { kw<"return"> expression } |
+  ExpressionStatement { expression } |
+  Annotation { AnnotationName AnnotationList? }
+}
+
+AnnotationList { !annotation "(" commaSep<AnnotationProperty> ")" }
+
+ParamList { "(" commaSep<Parameter { VariableDefinition "?"? (":" type)? }> ")" }
+
+Body { "{" statement* "}" }
+
+// An enum type declaration's body. Every variant arm begins with `|`; the
+// standalone `|` of an empty enum classifies the body as a nominal sum.
+// The `|` here is a distinct token from LogicOp, so `&` is not an arm marker.
+EnumBody { "{" "|" (EnumVariant ("|" EnumVariant)*)? "}" }
+
+EnumVariant { identifier }
+
+ImportItems { commaSep1NoTrailingComma<ImportItem> }
+ImportItem { identifier (ImportItemAs identifier)? }
+
+expression[@isGroup=Expression] {
+  String |
+  Number |
+  SketchVar { kw<"var"> AddOp? Number } |
+  VariableName |
+  TagDeclarator |
+  kw<"true"> | kw<"false"> | kw<"nil"> |
+  PipeSubstitution |
+  BinaryExpression {
+    expression !add AddOp expression |
+    expression !mult MultOp expression |
+    expression !exp ExpOp expression |
+    expression !comp CompOp expression |
+    expression !logic LogicOp expression
+  } |
+  UnaryExpression { UnaryOp expression } |
+  ParenthesizedExpression { "(" expression ")" } |
+  IfExpression { kw<"if"> expression Body kw<"else"> Body } |
+  SketchBlockExpression { kw<"sketch"> ArgumentList Body } |
+  CallExpression { expression !call ArgumentList } |
+  ArrayExpression { "[" commaSep<expression | IntegerRange { expression !range ".." expression }> "]" } |
+  ObjectExpression { "{" commaSep<ObjectProperty> "}" } |
+  MemberExpression { expression !member "." PropertyName } |
+  SubscriptExpression { expression !member "[" expression "]" } |
+  PipeExpression { expression (!pipe PipeOperator expression)+ }
+}
+
+UnaryOp { AddOp | BangOp }
+
+ObjectProperty { PropertyName (":" | Equals) expression }
+
+AnnotationProperty {
+  PropertyName
+  ( AddOp | MultOp | ExpOp | LogicOp | BangOp | CompOp | Equals | PipeOperator | PipeSubstitution )
+  expression
+}
+
+LabeledArgument { ArgumentLabel Equals expression }
+
+ArgumentList { "(" commaSep<LabeledArgument | expression> ")" }
+
+type[@isGroup=Type] {
+  TypeName { "::"? identifier ("::" identifier)* } |
+  ArrayType { "[" type !member (";" Number "+"?)? "]" } |
+  ObjectType { "{" commaSep<ObjectProperty { PropertyName ":" type }> "}" }
+}
+
+VariableDefinition { identifier }
+
+VariableName { identifier ("::" identifier)*}
+
+ArgumentLabel { identifier }
+
+@skip { whitespace | LineComment | BlockComment }
+
+kw<term> { @specialize[@name={term}]<identifier, term> }
+
+commaSep<term> { (term ("," term)*)? ","? }
+
+commaSep1NoTrailingComma<term> { term ("," term)* }
+
+@tokens {
+  String[isolate] { "'" ("\\" _ | !['\\])* "'" | '"' ("\\" _ | !["\\])* '"' }
+
+  Number {
+    ("." @digit+ | @digit+ ("." @digit+)?)
+    ("inch" | "mm" | "cm" | "m" | "in" | "ft" | "yd" | "deg" | "rad" | "_" | "?")?
+  }
+  @precedence { Number, "." }
+
+  AddOp { "+" | "-" }
+  MultOp { "/" | "*" | "\\" }
+  ExpOp { "^" }
+  LogicOp { "|" | "&" }
+  BangOp { "!" }
+  CompOp { "==" | "!=" | "<=" | ">=" | "<" | ">" }
+  Equals { "=" }
+  PipeOperator { "|>" }
+
+  PipeSubstitution { "%" }
+
+  // Includes non-whitespace unicode characters.
+  identifier { $[a-zA-Z_\u{a1}-\u{167f}\u{1681}-\u{1fff}\u{200e}-\u{2027}\u{202a}-\u{202e}\u{2030}-\u{205e}\u{2061}-\u{2fff}\u{3001}-\u{fefe}\u{ff00}-\u{10ffff}] $[a-zA-Z0-9_\u{a1}-\u{167f}\u{1681}-\u{1fff}\u{200e}-\u{2027}\u{202a}-\u{202e}\u{2030}-\u{205e}\u{2061}-\u{2fff}\u{3001}-\u{fefe}\u{ff00}-\u{10ffff}]* }
+  AnnotationName { "@" identifier? }
+  PropertyName { identifier }
+  TagDeclarator { "$" identifier }
+
+  whitespace { @whitespace+ }
+
+  LineComment[isolate] { "//" ![\n]* }
+  BlockComment[isolate] { "/*" blockCommentRest }
+  blockCommentRest { @eof | ![*] blockCommentRest | "*" blockCommentStar }
+  blockCommentStar { @eof | "/" | ![/] blockCommentRest | "*" blockCommentStar }
+
+  @precedence { LineComment, BlockComment, MultOp }
+
+  Shebang { "#!" ![\n]* }
+
+  ImportItemAs { "as" }
+  ImportFrom { "from" }
+
+  "(" ")"
+  "{" "}"
+  "[" "]"
+  "," "?" ":" "." ".." ";" "::"
+}
+
+@external propSource kclHighlight from "./highlight"
+
+@detectDelim

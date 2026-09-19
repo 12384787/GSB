@@ -1,0 +1,92 @@
+import {Schema} from '@sanity/schema'
+import {renderHook} from '@testing-library/react'
+import {defer, lastValueFrom, of} from 'rxjs'
+import {beforeEach, describe, expect, it, type Mock, vi} from 'vitest'
+
+import {useClient} from '../../hooks/useClient'
+import {getSearchableTypes} from '../common/getSearchableTypes'
+import {type SearchTerms} from '../common/types'
+import {createWeightedSearch} from './createWeightedSearch'
+
+// Mock client
+vi.mock('../../hooks/useClient', () => ({
+  useClient: () => ({
+    observable: {
+      fetch: vi.fn(),
+    },
+    withConfig: vi.fn().mockReturnValue({observable: {fetch: vi.fn().mockReturnValue(searchHits)}}),
+  }),
+}))
+
+const mockSchema = Schema.compile({
+  name: 'default',
+  types: [
+    {name: 'book', title: 'Book', type: 'document', fields: [{name: 'title', type: 'string'}]},
+  ],
+})
+
+const searchHits = defer(() =>
+  of([
+    {_id: 'id0', _type: 'book', w0: 'id0', w1: 'book', w2: 'Harry Potter'},
+    {_id: 'id1', _type: 'book', w0: 'id1', w1: 'book', w2: 'Harry'},
+  ]),
+)
+
+const {
+  result: {current: client},
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+} = renderHook(() => useClient())
+const search = createWeightedSearch(getSearchableTypes(mockSchema), client, {unique: true})
+
+beforeEach(() => {
+  ;(client.observable.fetch as Mock).mockReset()
+  ;(client.observable.fetch as Mock).mockReturnValue(searchHits)
+})
+
+describe('createWeightedSearch', () => {
+  it('overrides to use vX api version', async () => {
+    await lastValueFrom(
+      search({query: 'harry', types: []} as SearchTerms, {perspective: ['r123', 'drafts']}),
+    )
+
+    expect(client.withConfig).toHaveBeenCalledWith({apiVersion: 'v2025-02-19'})
+  })
+
+  it('overrides to use the variants api version and passes the variant when searching a variant', async () => {
+    await lastValueFrom(
+      search({query: 'harry', types: []} as SearchTerms, {
+        perspective: ['r123', 'drafts'],
+        variant: 'alpha-audience',
+      }),
+    )
+
+    expect(client.withConfig).toHaveBeenCalledWith({apiVersion: 'X'})
+
+    const versionedClient = (client.withConfig as Mock).mock.results.at(-1)?.value as {
+      observable: {fetch: Mock}
+    }
+    expect(versionedClient.observable.fetch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Object),
+      expect.objectContaining({variant: 'alpha-audience', perspective: ['r123', 'drafts']}),
+    )
+  })
+
+  it('should order hits by score by default', async () => {
+    const result = await lastValueFrom(search({query: 'harry', types: []} as SearchTerms))
+
+    expect(result.hits[0].score).toEqual(10)
+    expect(result.hits[1].score).toEqual(2.5)
+  })
+
+  it('should not order hits by score if skipSortByScore is enabled', async () => {
+    const result = await lastValueFrom(
+      search({query: 'harry', types: []} as SearchTerms, {
+        skipSortByScore: true,
+      }),
+    )
+
+    expect(result.hits[0].score).toEqual(2.5)
+    expect(result.hits[1].score).toEqual(10)
+  })
+})

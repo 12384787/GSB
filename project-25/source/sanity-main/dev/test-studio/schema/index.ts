@@ -1,0 +1,376 @@
+import {allTypes} from './allTypes'
+import author from './author'
+import book from './book'
+import {commentsCI} from './ci/comments'
+import conditionalFieldset from './ci/conditionalFieldset'
+import validationTest from './ci/validationCI'
+import actions from './debug/actions'
+import {allFieldsGroupHidden} from './debug/allFieldsGroupHidden'
+import {allNativeInputComponents} from './debug/allNativeInputComponents'
+import {
+  annotationCustomTypeTest,
+  ctaType,
+  tooltipAnnotationType,
+} from './debug/annotationCustomTypeTest'
+import {arrayCapabilities} from './debug/arrayCapabilities'
+import {arrayModalWidthRepro} from './debug/arrayModalWidthRepro'
+import {arrayOfStringsGridCustomInput} from './debug/arrayOfStringsGridCustomInput'
+import button from './debug/button'
+import {circularCrossDatasetReferenceTest} from './debug/circularCrossDatasetReference'
+import {collapsibleColumnsBug} from './debug/collapsibleColumnsBug'
+import {collapsibleObjects} from './debug/collapsibleObjects'
+import {commentsDebug} from './debug/comments'
+import conditionalFields from './debug/conditionalFields'
+import conditionalFieldsWithPath, {
+  conditionallyHiddenField,
+} from './debug/conditionalFieldsWithPath'
+import customInputs from './debug/customInputs'
+import customInputsWithPatches from './debug/customInputsWithPatches'
+import customNumber from './debug/customNumber'
+import dateTimeValidation from './debug/dateTimeValidation'
+import dateValidation from './debug/dateValidation'
+import {decorations} from './debug/decorations'
+import {
+  deepNestedAccordion,
+  deepNestedBody,
+  deepNestedContent,
+  deepNestedRichContent,
+  deepNestedRow,
+} from './debug/deeplyNestedArrayPreview'
+import {deprecatedDocument} from './debug/deprecatedDocument'
+import {
+  deprecatedFields,
+  namedDeprecatedArray,
+  namedDeprecatedObject,
+} from './debug/deprecatedFields'
+import documentActions from './debug/documentActions'
+import {domAttrsAsFieldNames} from './debug/domAttrsAsFieldNames'
+import empty from './debug/empty'
+import experiment from './debug/experiment'
+import {fieldActionsTest} from './debug/fieldActionsTest'
+import fieldComponentsTest from './debug/fieldComponentsTest'
+import fieldGroups from './debug/fieldGroups'
+import fieldGroupsDefault from './debug/fieldGroupsDefault'
+import fieldGroupsMany from './debug/fieldGroupsMany'
+import fieldGroupsWithFieldsets from './debug/fieldGroupsWithFieldsets'
+import fieldGroupsWithFieldsetsAndValidation from './debug/fieldGroupsWithFieldsetsAndValidation'
+import fieldGroupsWithFieldsetsHidden from './debug/fieldGroupsWithFieldsetsHidden'
+import fieldGroupsWithI18n from './debug/fieldGroupsWithI18n'
+import fieldGroupsWithValidation from './debug/fieldGroupsWithValidation'
+import fieldsets from './debug/fieldsets'
+import {
+  fieldValidationInferReproDoc,
+  fieldValidationInferReproSharedObject,
+} from './debug/fieldValidationInferRepro'
+import focus from './debug/focus'
+import {formInputDebug} from './debug/formInputDebug'
+import gallery from './debug/gallery'
+import {hiddenCurrentUserTest} from './debug/hiddenCurrentUserTest'
+import {hiddenFieldValidationTypes} from './debug/hiddenFieldValidation'
+import {customBlock, hoistedPt, hoistedPtDocument} from './debug/hoistedPt'
+import {initialValuesTest, superlatives} from './debug/initialValuesTest'
+import {inspectorsTestType} from './debug/inspectors'
+import invalidPreviews from './debug/invalidPreviews'
+import {issue4516AddFilterIntentLink} from './debug/issue4516AddFilterIntentLink'
+import {issue13494I18nTitleKeyStylesLists} from './debug/issue13494I18nTitleKeyStylesLists'
+import {languageFilterDebugType, localeBlockContentType} from './debug/languageFilter'
+import lazyComponents from './debug/lazyComponents'
+import liveEdit from './debug/liveEdit'
+import localeString from './debug/localeString'
+import {locationResolverTest} from './debug/locationResolverTest'
+import {longValidationTestType} from './debug/longValidation'
+import manyFieldsTest from './debug/manyFieldsTest'
+import {manyViewsType} from './debug/manyViews'
+import {nestedArrayInsertMenuRepro} from './debug/nestedArrayInsertMenuRepro'
+import notitle from './debug/notitle'
+import {objectsDebug} from './debug/objectsDebug'
+import {patchOnMountDebug} from './debug/patchOnMount'
+import poppers from './debug/poppers'
+import presence, {objectWithNestedArray} from './debug/presence'
+import previewImageUrlTest from './debug/previewImageUrlTest'
+import previewMediaTest from './debug/previewMediaTest'
+import {previewSelectBugRepro} from './debug/previewSelectBugRepro'
+import ptReference from './debug/ptReference'
+import radio from './debug/radio'
+import readOnly from './debug/readOnly'
+import recursive from './debug/recursive'
+import recursiveArray from './debug/recursiveArray'
+import recursiveObjectTest, {recursiveObject} from './debug/recursiveObject'
+import recursivePopover from './debug/recursivePopover'
+import {pageDocRepro, sectionDocRepro} from './debug/referenceCreateButtonRepro'
+import removeRestoreAction from './debug/removeRestoreAction'
+import reservedFieldNames from './debug/reservedFieldNames'
+import restrictedVersionActions from './debug/restrictedVersionActions'
+import review from './debug/review'
+import * as scrollBugTypes from './debug/scrollBug'
+import select from './debug/select'
+import {navbarSettingsDialogRepro} from './debug/settingsV2DialogRepro'
+import {simpleArrayOfObjects} from './debug/simpleArrayOfObjects'
+import {simpleReferences} from './debug/simpleReferences'
+import {twoArgValidationRepro} from './debug/twoArgValidationRepro'
+import typeWithNoToplevelStrings from './debug/typeWithNoToplevelStrings'
+import uploads from './debug/uploads'
+import validation, {validationArraySuperType} from './debug/validation'
+import {virtualizationDebug} from './debug/virtualizationDebug'
+import {virtualizationInObject} from './debug/virtualizationInObject'
+import {v3docs} from './docs/v3'
+import {documentInternationalizationTest} from './externalPlugins/documentInternationalization'
+import internationalizedArray from './externalPlugins/internationalizedArray'
+import house from './house'
+import playlist from './playlist'
+import playlistTrack from './playlistTrack'
+import code from './plugins/code'
+import geopoint from './plugins/geopoint'
+import species from './species'
+import arrays, {topLevelArrayType, topLevelPrimitiveArrayType} from './standard/arrays'
+import booleans from './standard/booleans'
+import crossDatasetReference, {crossDatasetSubtype} from './standard/crossDatasetReference'
+import date from './standard/date'
+import datetime from './standard/datetime'
+import emails from './standard/emails'
+import files from './standard/files'
+import globalDocumentReference, {
+  createGlobalDocumentReferenceSubtype,
+} from './standard/globalDocumentReference'
+import images, {myImage} from './standard/images'
+import {initialFullScreenPTEType} from './standard/initialFullScreenPTE'
+import numbers from './standard/numbers'
+import objects, {myObject} from './standard/objects'
+import {ptAllTheBellsAndWhistlesType} from './standard/portableText/allTheBellsAndWhistles'
+import blocks from './standard/portableText/blocks'
+import {ptCustomBlockEditors} from './standard/portableText/customBlockEditors'
+import {ptCustomMarkersTestType} from './standard/portableText/customMarkers/schemaTypes'
+import {customPlugins} from './standard/portableText/customPlugins'
+import {ptCustomWithDefaultsType} from './standard/portableText/customWithDefaults'
+import manyEditors from './standard/portableText/manyEditors'
+import richTextObject from './standard/portableText/richTextObject'
+import simpleBlock from './standard/portableText/simpleBlock'
+import simpleBlockNote from './standard/portableText/simpleBlockNote'
+import simpleBlockNoteBody from './standard/portableText/simpleBlockNoteBody'
+import simpleBlockNoteUrl from './standard/portableText/simpleBlockNoteUrl'
+import spotifyEmbed from './standard/portableText/spotifyEmbed'
+import references, {referenceAlias} from './standard/references'
+import slugs, {slugAlias} from './standard/slugs'
+import strings from './standard/strings'
+import texts from './standard/texts'
+import urls from './standard/urls'
+import videos from './standard/videos'
+import withObjectFieldsOrder from './standard/withObjectFieldsOrder'
+
+// @todo temporary, until code input is v3 compatible
+const codeInputType = {
+  name: 'code',
+  type: 'object',
+  fields: [
+    {
+      name: 'language',
+      title: 'Language',
+      type: 'string',
+    },
+    {
+      name: 'filename',
+      title: 'Filename',
+      type: 'string',
+    },
+    {
+      title: 'Code',
+      name: 'code',
+      type: 'text',
+    },
+    {
+      title: 'Highlighted lines',
+      name: 'highlightedLines',
+      type: 'array',
+      of: [
+        {
+          type: 'number',
+          title: 'Highlighted line',
+        },
+      ],
+    },
+  ],
+}
+
+export function createSchemaTypes(projectId: string) {
+  return [
+    // Test documents with standard inputs
+    arrays,
+    topLevelArrayType,
+    topLevelPrimitiveArrayType,
+    booleans,
+    date,
+    datetime,
+    emails,
+    files,
+    images,
+    videos,
+    numbers,
+    objects,
+    ptAllTheBellsAndWhistlesType,
+    initialFullScreenPTEType,
+    blocks,
+    ptCustomBlockEditors,
+    ptCustomMarkersTestType,
+    ptCustomWithDefaultsType,
+    richTextObject,
+    ...Object.values(scrollBugTypes),
+    customPlugins,
+    simpleBlock,
+    manyEditors,
+    simpleBlockNote,
+    simpleBlockNoteBody,
+    simpleBlockNoteUrl,
+    spotifyEmbed,
+    references,
+    referenceAlias,
+    slugs,
+    slugAlias,
+    strings,
+    texts,
+    urls,
+    withObjectFieldsOrder,
+
+    // Test documents for debugging
+    actions,
+    annotationCustomTypeTest,
+    ctaType,
+    tooltipAnnotationType,
+    arrayModalWidthRepro,
+    nestedArrayInsertMenuRepro,
+    arrayOfStringsGridCustomInput,
+    button,
+    collapsibleColumnsBug,
+    collapsibleObjects,
+    domAttrsAsFieldNames,
+    commentsDebug,
+    conditionalFields,
+    conditionalFieldsWithPath,
+    conditionallyHiddenField,
+    customInputs,
+    customInputsWithPatches,
+    customNumber,
+    dateTimeValidation,
+    dateValidation,
+    deprecatedDocument,
+    deprecatedFields,
+    decorations,
+    documentActions,
+    empty,
+    experiment,
+    fieldActionsTest,
+    fieldComponentsTest,
+    hiddenCurrentUserTest,
+    ...hiddenFieldValidationTypes,
+    fieldsets,
+    removeRestoreAction,
+    restrictedVersionActions,
+
+    fieldValidationInferReproSharedObject,
+    fieldValidationInferReproDoc,
+
+    focus,
+    gallery,
+    hoistedPt,
+    hoistedPtDocument,
+    customBlock,
+    initialValuesTest,
+    superlatives,
+    inspectorsTestType,
+    invalidPreviews,
+    issue4516AddFilterIntentLink,
+    issue13494I18nTitleKeyStylesLists,
+    languageFilterDebugType,
+    localeBlockContentType,
+    lazyComponents,
+    locationResolverTest,
+    liveEdit,
+    localeString,
+    manyFieldsTest,
+    manyViewsType,
+    myImage,
+    myObject,
+    namedDeprecatedObject,
+    namedDeprecatedArray,
+    notitle,
+    objectsDebug,
+    pageDocRepro,
+    sectionDocRepro,
+    longValidationTestType,
+    poppers,
+    presence,
+    objectWithNestedArray,
+    previewImageUrlTest,
+    formInputDebug,
+    previewMediaTest,
+    previewSelectBugRepro,
+    radio,
+    readOnly,
+    recursive,
+    recursiveArray,
+    recursiveObjectTest,
+    recursiveObject,
+    recursivePopover,
+    patchOnMountDebug,
+    simpleArrayOfObjects,
+    arrayCapabilities,
+    deepNestedAccordion,
+    deepNestedBody,
+    deepNestedContent,
+    deepNestedRichContent,
+    deepNestedRow,
+    allFieldsGroupHidden,
+    simpleReferences,
+    reservedFieldNames,
+    review,
+    navbarSettingsDialogRepro,
+    twoArgValidationRepro,
+    select,
+    typeWithNoToplevelStrings,
+    uploads,
+    validation,
+    validationArraySuperType,
+    fieldGroups,
+    fieldGroupsDefault,
+    fieldGroupsMany,
+    fieldGroupsWithI18n,
+    fieldGroupsWithValidation,
+    fieldGroupsWithFieldsetsAndValidation,
+    fieldGroupsWithFieldsetsHidden,
+    virtualizationInObject,
+    virtualizationDebug,
+
+    // Test documents with official plugin inputs
+    code,
+    // @todo temporary, until code input is v3 compatible
+    codeInputType,
+    geopoint,
+
+    // Test documents with 3rd party plugin inputs
+    internationalizedArray,
+    documentInternationalizationTest,
+    // Other documents
+    author,
+    book,
+    species,
+    house,
+    playlist,
+    playlistTrack,
+
+    // CI documents
+    allNativeInputComponents,
+    allTypes,
+    circularCrossDatasetReferenceTest,
+    commentsCI,
+    conditionalFieldset,
+    crossDatasetReference,
+    crossDatasetSubtype,
+    globalDocumentReference(projectId),
+    createGlobalDocumentReferenceSubtype(projectId),
+    fieldGroupsWithFieldsets,
+    ptReference,
+    validationTest,
+
+    // Test documents for docs
+    ...v3docs.types,
+  ]
+}

@@ -1,0 +1,165 @@
+import {CloseIcon} from '@sanity/icons/Close'
+import {BoundaryElementProvider, Text, useClickOutsideEvent, useGlobalKeyDown} from '@sanity/ui'
+import {type ComponentProps, type ReactNode, useCallback, useEffect, useRef, useState} from 'react'
+import FocusLock from 'react-focus-lock'
+import {type PortableTextEditorElement} from 'sanity/_singletons'
+import {Flex, Box} from 'ui5'
+
+import {Button} from '../../../../../../ui-components/button/Button'
+import {type PopoverProps} from '../../../../../../ui-components/popover/Popover'
+import {PresenceOverlay} from '../../../../../presence/overlay/PresenceOverlay'
+import {VirtualizerScrollInstanceProvider} from '../../../arrays/ArrayOfObjectsInput/List/VirtualizerScrollInstanceProvider'
+import {ContentHeaderBox, ContentScrollerBox, RootPopover} from './PopoverModal.styles'
+import {type ModalWidth} from './types'
+
+interface PopoverEditDialogProps {
+  autoFocus?: boolean
+  children: ReactNode
+  floatingBoundary: HTMLElement | null
+  onClose: () => void
+  referenceBoundary: HTMLElement | null
+  referenceElement: PortableTextEditorElement | null
+  title: string | ReactNode
+  width?: ModalWidth
+}
+
+/**
+ * Wrapper for focus lock that maintains scroll on the popover
+ * Unlike Fragment (on some react versions) this does not absorb the ref prop
+ */
+const NoopContainer = ({children, ...props}: ComponentProps<'div'>) => (
+  <div
+    {...props}
+    // Makes the div focusable so clicking on the popover will move the focus away from the input once focus lock is active
+    // Solves an issue when scrolling the popover and then clicking outside of the input will scroll back the popover to the input.
+    tabIndex={-1}
+  >
+    {children}
+  </div>
+)
+
+const POPOVER_FALLBACK_PLACEMENTS: PopoverProps['fallbackPlacements'] = ['top', 'bottom']
+
+export function PopoverEditDialog(props: PopoverEditDialogProps): ReactNode {
+  const {floatingBoundary, referenceBoundary, referenceElement, width = 1} = props
+  return (
+    <RootPopover
+      content={<Content {...props} />}
+      constrainSize
+      data-testid="popover-edit-dialog"
+      data-ui="PopoverEditDialog"
+      fallbackPlacements={POPOVER_FALLBACK_PLACEMENTS}
+      floatingBoundary={floatingBoundary}
+      open
+      overflow="auto"
+      placement="bottom"
+      portal="default"
+      preventOverflow
+      referenceBoundary={referenceBoundary}
+      referenceElement={referenceElement}
+      width={width}
+      autoFocus
+    />
+  )
+}
+
+function Content(props: PopoverEditDialogProps) {
+  const {onClose, referenceBoundary, referenceElement, title} = props
+  const isClosedRef = useRef(false)
+
+  const handleClose = useCallback(() => {
+    isClosedRef.current = true
+    onClose()
+  }, [onClose])
+
+  useGlobalKeyDown(
+    useCallback(
+      (event: KeyboardEvent) => {
+        if (event.key === 'Escape') {
+          event.preventDefault()
+          event.stopPropagation()
+          event.stopImmediatePropagation()
+          handleClose()
+        }
+      },
+      [handleClose],
+    ),
+    {
+      /**
+       * We need to capture the event to prevent it from being propagated to the parent
+       * This is needed when, for example, in order for the fullscreen mode to be closed
+       * Last over existing popovers
+       */
+      capture: true,
+    },
+  )
+
+  useClickOutsideEvent(
+    handleClose,
+    () => [referenceElement],
+    () => referenceBoundary,
+  )
+
+  // This seems to work with regular refs as well, but it might be safer to use state.
+  const [contentElement, setContentElement] = useState<HTMLDivElement | null>(null)
+  const [boundaryElement, setBoundaryElement] = useState<HTMLElement | null>(null)
+  const containerElement = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    if (!contentElement) {
+      // oxlint-disable-next-line react/set-state-in-effect -- pre-existing violation, to be fixed in a follow-up
+      setBoundaryElement(null)
+      return
+    }
+    setBoundaryElement(contentElement.closest<HTMLElement>('[data-ui="Popover__wrapper"]'))
+  }, [contentElement])
+
+  // react-focus-lock reclaims focus *toward* whitelisted elements, so whitelist only this
+  // popover's own wrapper: a menu opened over it (in a sibling portal) then keeps focus
+  // instead of being stolen back and closed. While closing, whitelist nothing so focus
+  // returns to the editor.
+  const handleFocusLockWhiteList = useCallback(
+    (element: HTMLElement) => {
+      if (isClosedRef.current) return false
+      return !boundaryElement || boundaryElement.contains(element)
+    },
+    [boundaryElement],
+  )
+
+  return (
+    <VirtualizerScrollInstanceProvider
+      scrollElement={contentElement}
+      containerElement={containerElement}
+    >
+      <BoundaryElementProvider element={boundaryElement}>
+        <FocusLock autoFocus whiteList={handleFocusLockWhiteList}>
+          <Flex as={NoopContainer} ref={containerElement} flexDirection="column" height="100%">
+            <ContentHeaderBox flexBasis="auto" flexGrow={0} flexShrink={0} padding={1}>
+              <Flex alignItems="center">
+                <Box flexBasis="0%" flexGrow={1} padding={2}>
+                  <Text weight="medium">{title}</Text>
+                </Box>
+
+                <Button
+                  autoFocus
+                  icon={CloseIcon}
+                  mode="bleed"
+                  onClick={handleClose}
+                  tooltipProps={{content: 'Close'}}
+                  data-testid="close-popover-edit-dialog-button"
+                />
+              </Flex>
+            </ContentHeaderBox>
+            <ContentScrollerBox flexBasis="0%" flexGrow={1}>
+              <PresenceOverlay margins={[0, 0, 1, 0]}>
+                <Box padding={3} ref={setContentElement}>
+                  {props.children}
+                </Box>
+              </PresenceOverlay>
+            </ContentScrollerBox>
+          </Flex>
+        </FocusLock>
+      </BoundaryElementProvider>
+    </VirtualizerScrollInstanceProvider>
+  )
+}

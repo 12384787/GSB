@@ -1,0 +1,118 @@
+/** @public */
+export interface SanityDocument {
+  _id: string
+  _type: string
+  _createdAt: string
+  _updatedAt: string
+  _rev: string
+  /**
+   * System-managed attributes. Which fields are present depends on the document (e.g.
+   * `variant`/`scopeId` only exist on version documents, and documents predating the `_system`
+   * migration may carry only some of them), hence the partial shape.
+   */
+  _system?: Partial<DocumentSystem>
+  [key: string]: unknown
+}
+
+/**
+ * Similar to `SanityDocument` but only requires the `_id` and `_type`
+ *
+ * @see SanityDocument
+ *
+ * @public
+ */
+export interface SanityDocumentLike {
+  _id: string
+  _type: string
+  _createdAt?: string
+  _updatedAt?: string
+  _rev?: string
+  /**
+   * System-managed attributes. Which fields are present depends on the document (e.g.
+   * `variant`/`scopeId` only exist on version documents, and documents predating the `_system`
+   * migration may carry only some of them), hence the partial shape.
+   */
+  _system?: Partial<DocumentSystem>
+  [key: string]: unknown
+}
+
+/** @public */
+export interface TypedObject {
+  [key: string]: unknown
+  _type: string
+}
+
+/** @public */
+export interface KeyedObject {
+  [key: string]: unknown
+  _key: string
+}
+
+/**
+ * @internal
+ */
+export interface DocumentSystemRef {
+  _ref: string
+  _weak: true
+}
+
+/**
+ * @internal
+ */
+export interface DocumentSystem {
+  /**
+   * It will be empty for the group document (aka published document)
+   */
+  bundleId?: 'drafts' | (string & {})
+  /**
+   * A weak reference to the release document that the version belongs to.
+   */
+  release?: DocumentSystemRef
+  /**
+   * A weak reference to the variant document that the version belongs to.
+   */
+  variant?: DocumentSystemRef
+  /**
+   * A weak reference to the group document (aka published document).
+   */
+  group: DocumentSystemRef
+  /**
+   * Available only for version documents.
+   */
+  scopeId?: string
+  /**
+   * Set when the document is marked for unpublishing inside a release.
+   */
+  delete?: boolean
+  /**
+   * Only on variant-of-published documents: a weak reference to the (stable, server-generated)
+   * id the drafts-bundle sibling of this variant occupies — `versions.<scopeId>.<groupId>` —
+   * whether or not that document currently exists. Lets clients check out and create the draft
+   * variant without computing scope ids client-side. Not populated for normal published docs or
+   * variants of releases.
+   */
+  draft?: DocumentSystemRef
+}
+
+/**
+ * @internal
+ */
+export interface StrictVersionLayeringOptions {
+  /**
+   * By default, version layering includes all document versions, regardless of their expected
+   * publication time—or lack thereof. For example, it includes all ASAP and undecided versions,
+   * despite ASAP and undecided versions having no fixed chronology. There is no way to determine
+   * which ASAP or undecided version is expected to be published before another.
+   *
+   * It also includes any existing draft, which has no fixed chronology, either.
+   *
+   * This functionality is useful for listing all document versions in a deterministic order, but
+   * doesn't accurately portray the upstream and downstream versions based on expected publication
+   * time.
+   *
+   * In strict mode, version layering instead only includes versions that have a fixed chronology.
+   * **Cross-version layering is only effective for scheduled versions, with all other
+   * versions being layered directly onto the published version (if it exists).**
+   */
+  strict?: boolean
+}

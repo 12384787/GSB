@@ -1,0 +1,521 @@
+import {renderHook, waitFor} from '@testing-library/react'
+import {defineConfig, prepareForPreview, type SanityClient, useValuePreview} from 'sanity'
+import {beforeEach, describe, expect, it, type MockedFunction, vi} from 'vitest'
+
+import {createMockSanityClient} from '../../../../../test/mocks/mockSanityClient'
+import {createTestProvider} from '../../../../../test/testUtils/TestProvider'
+import {structureUsEnglishLocaleBundle} from '../../../i18n'
+import {type DocumentPaneContextValue} from '../DocumentPaneContext'
+import {useDocumentPane} from '../useDocumentPane'
+import {useDocumentTitle} from '../useDocumentTitle'
+
+vi.mock('react-i18next', async (importOriginal) => ({
+  ...(await importOriginal()),
+  useTranslation: () => ({
+    t: (key: string, opts?: Record<string, string>) => {
+      if (key === 'panes.document-header-title.new.text' && opts?.schemaType) {
+        return `New ${opts.schemaType}`
+      }
+      if (key === 'panes.document-list-pane.error.text') {
+        return 'Encountered an error while fetching documents.'
+      }
+      return key
+    },
+  }),
+}))
+
+// Mock the useDocumentPane hook
+vi.mock('../useDocumentPane')
+
+// Mock the useValuePreview, useTranslation, and usePerspective hooks
+vi.mock('sanity', async (importOriginal) => {
+  const original = (await importOriginal()) as any
+  const {usePerspectiveMockReturn} = await import('../../../__mocks__/usePerspective.mock')
+  return {
+    ...original,
+    useValuePreview: vi.fn(),
+    prepareForPreview: vi.fn(),
+    usePerspective: vi.fn(() => usePerspectiveMockReturn),
+  }
+})
+
+const mockUseDocumentPane = useDocumentPane as MockedFunction<typeof useDocumentPane>
+const mockUseValuePreview = useValuePreview as MockedFunction<typeof useValuePreview>
+const mockPrepareForPreview = prepareForPreview as MockedFunction<typeof prepareForPreview>
+
+function createWrapperComponent(client: SanityClient) {
+  const config = defineConfig({
+    projectId: 'test',
+    dataset: 'test',
+  })
+
+  return createTestProvider({
+    client,
+    config,
+    resources: [structureUsEnglishLocaleBundle],
+  })
+}
+
+describe('useDocumentTitle', () => {
+  const baseValue = {
+    _id: 'test-id',
+    _type: 'testSchema',
+  }
+
+  const defaultDocumentValue = {
+    ...baseValue,
+    _createdAt: '2023-01-01T00:00:00Z',
+    _updatedAt: '2023-01-01T00:00:00Z',
+    _rev: 'rev1',
+    title: 'Test Document',
+  }
+
+  const defaultDocumentPaneValue = {
+    connectionState: 'connected' as const,
+    schemaType: {title: 'Test Schema', name: 'testSchema', jsonType: 'object', fields: []},
+    value: defaultDocumentValue,
+    editState: {
+      id: 'test-id',
+      type: 'testSchema',
+      transactionSyncLock: {enabled: false},
+      liveEdit: {enabled: false},
+      draft: {
+        _id: 'test-id',
+        _type: 'testSchema',
+        _createdAt: '2023-01-01T00:00:00Z',
+        _updatedAt: '2023-01-01T00:00:00Z',
+        _rev: 'rev1',
+        title: 'Test Document',
+      },
+      published: {
+        _id: 'test-id',
+        _type: 'testSchema',
+        _createdAt: '2023-01-01T00:00:00Z',
+        _updatedAt: '2023-01-01T00:00:00Z',
+        _rev: 'rev1',
+        title: 'Test Document',
+      },
+      version: undefined,
+      patches: [],
+      historyController: {} as any,
+    },
+  } as unknown as DocumentPaneContextValue
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockUseDocumentPane.mockReturnValue(defaultDocumentPaneValue as DocumentPaneContextValue)
+    mockUseValuePreview.mockReturnValue({
+      error: undefined,
+      value: {title: 'Test Document'},
+      isLoading: false,
+    })
+  })
+
+  it('should return title when document value exists and preview is successful', async () => {
+    const {result} = renderHook(() => useDocumentTitle())
+
+    await waitFor(() => {
+      expect(result.current).toEqual({
+        error: undefined,
+        title: 'Test Document',
+      })
+    })
+  })
+
+  it('should return "New {schemaType.title}" when preview has no title for base value', async () => {
+    mockUseDocumentPane.mockReturnValue({
+      ...defaultDocumentPaneValue,
+      value: baseValue,
+      editState: null,
+    } as DocumentPaneContextValue)
+
+    mockUseValuePreview.mockReturnValue({
+      error: undefined,
+      value: undefined,
+      isLoading: false,
+    })
+
+    const client = createMockSanityClient()
+    const wrapper = await createWrapperComponent(client as any)
+
+    const {result} = renderHook(() => useDocumentTitle(), {wrapper})
+
+    await waitFor(() => {
+      expect(result.current).toEqual({
+        error: undefined,
+        title: 'New Test Schema',
+      })
+    })
+  })
+
+  it('should return "New {schemaType.name}" when schemaType has no title', async () => {
+    mockUseDocumentPane.mockReturnValue({
+      ...defaultDocumentPaneValue,
+      schemaType: {name: 'testSchema'}, // No title
+      value: baseValue,
+      editState: null,
+    } as DocumentPaneContextValue)
+
+    mockUseValuePreview.mockReturnValue({
+      error: undefined,
+      value: undefined,
+      isLoading: false,
+    })
+
+    const client = createMockSanityClient()
+    const wrapper = await createWrapperComponent(client as any)
+    const {result} = renderHook(() => useDocumentTitle(), {wrapper})
+
+    await waitFor(() => {
+      expect(result.current).toEqual({
+        error: undefined,
+        title: 'New testSchema',
+      })
+    })
+  })
+
+  it('should return error when preview fails', async () => {
+    mockUseValuePreview.mockReturnValue({
+      error: new Error('Preview failed'),
+      value: {
+        _id: 'drafts.test-id',
+        title: 'Test Document',
+        _createdAt: '2023-01-01T00:00:00Z',
+        _updatedAt: '2023-01-01T00:00:00Z',
+      },
+      isLoading: false,
+    })
+
+    const client = createMockSanityClient()
+    const wrapper = await createWrapperComponent(client as any)
+    const {result} = renderHook(() => useDocumentTitle(), {wrapper})
+
+    await waitFor(() => {
+      expect(result.current).toEqual({
+        error: 'Encountered an error while fetching documents.',
+        title: undefined,
+      })
+    })
+  })
+
+  it('should return undefined title when connecting and not subscribed', async () => {
+    mockUseDocumentPane.mockReturnValue({
+      ...defaultDocumentPaneValue,
+      connectionState: 'connecting',
+      isDeleted: true,
+      value: baseValue,
+      editState: null,
+    } as DocumentPaneContextValue)
+
+    const {result} = renderHook(() => useDocumentTitle())
+
+    await waitFor(() => {
+      expect(result.current).toEqual({
+        error: undefined,
+        title: undefined,
+      })
+    })
+  })
+
+  it('should use document pane value for preview', async () => {
+    const versionDocument = {
+      _id: 'versions.release1.test-id',
+      _type: 'testSchema',
+      _createdAt: '2023-01-01T00:00:00Z',
+      _updatedAt: '2023-01-01T00:00:00Z',
+      _rev: 'rev1',
+      title: 'Version Title',
+    }
+
+    mockUseDocumentPane.mockReturnValue({
+      ...defaultDocumentPaneValue,
+      value: versionDocument,
+    } as unknown as DocumentPaneContextValue)
+
+    mockUseValuePreview.mockReturnValue({
+      error: undefined,
+      value: {title: 'Version Title'},
+      isLoading: false,
+    })
+
+    const {result} = renderHook(() => useDocumentTitle())
+
+    await waitFor(() => {
+      expect(result.current).toEqual({
+        error: undefined,
+        title: 'Version Title',
+      })
+    })
+
+    // Verify that useValuePreview was called with the document pane value
+    expect(mockUseValuePreview).toHaveBeenCalledWith({
+      enabled: true,
+      schemaType: {title: 'Test Schema', fields: [], jsonType: 'object', name: 'testSchema'},
+      value: versionDocument,
+      perspectiveStack: undefined,
+    })
+  })
+
+  it('should pass an empty perspectiveStack when the version is going to unpublish', async () => {
+    const versionDocument = {
+      _id: 'versions.release1.test-id',
+      _type: 'testSchema',
+      _createdAt: '2023-01-01T00:00:00Z',
+      _updatedAt: '2023-01-01T00:00:00Z',
+      _rev: 'rev1',
+      title: 'Version Title',
+      _system: {delete: true},
+    }
+
+    mockUseDocumentPane.mockReturnValue({
+      ...defaultDocumentPaneValue,
+      value: versionDocument,
+      editState: {
+        ...defaultDocumentPaneValue.editState,
+        version: versionDocument,
+      },
+    } as unknown as DocumentPaneContextValue)
+
+    mockUseValuePreview.mockReturnValue({
+      error: undefined,
+      value: {title: 'Published Title'},
+      isLoading: false,
+    })
+
+    const {result} = renderHook(() => useDocumentTitle())
+
+    await waitFor(() => {
+      expect(result.current).toEqual({
+        error: undefined,
+        title: 'Published Title',
+      })
+    })
+
+    expect(mockUseValuePreview).toHaveBeenCalledWith({
+      enabled: true,
+      schemaType: {title: 'Test Schema', fields: [], jsonType: 'object', name: 'testSchema'},
+      value: versionDocument,
+      perspectiveStack: [],
+    })
+  })
+
+  it('should not override perspectiveStack when the version is not going to unpublish', async () => {
+    const versionDocument = {
+      _id: 'versions.release1.test-id',
+      _type: 'testSchema',
+      _createdAt: '2023-01-01T00:00:00Z',
+      _updatedAt: '2023-01-01T00:00:00Z',
+      _rev: 'rev1',
+      title: 'Version Title',
+    }
+
+    mockUseDocumentPane.mockReturnValue({
+      ...defaultDocumentPaneValue,
+      value: versionDocument,
+      editState: {
+        ...defaultDocumentPaneValue.editState,
+        version: versionDocument,
+      },
+    } as unknown as DocumentPaneContextValue)
+
+    mockUseValuePreview.mockReturnValue({
+      error: undefined,
+      value: {title: 'Version Title'},
+      isLoading: false,
+    })
+
+    renderHook(() => useDocumentTitle())
+
+    expect(mockUseValuePreview).toHaveBeenCalledWith({
+      enabled: true,
+      schemaType: {title: 'Test Schema', fields: [], jsonType: 'object', name: 'testSchema'},
+      value: versionDocument,
+      perspectiveStack: undefined,
+    })
+  })
+
+  it('should use draft document pane value for preview', async () => {
+    const draftDocument = {
+      _id: 'drafts.test-id',
+      _type: 'testSchema',
+      _createdAt: '2023-01-01T00:00:00Z',
+      _updatedAt: '2023-01-01T00:00:00Z',
+      _rev: 'rev1',
+      title: 'Draft Title',
+    }
+
+    mockUseDocumentPane.mockReturnValue({
+      ...defaultDocumentPaneValue,
+      value: draftDocument,
+    } as unknown as DocumentPaneContextValue)
+
+    mockUseValuePreview.mockReturnValue({
+      error: undefined,
+      value: {title: 'Draft Title'},
+      isLoading: false,
+    })
+
+    const {result} = renderHook(() => useDocumentTitle())
+
+    await waitFor(() => {
+      expect(result.current).toEqual({
+        error: undefined,
+        title: 'Draft Title',
+      })
+    })
+
+    // Verify that useValuePreview was called with the draft value
+    expect(mockUseValuePreview).toHaveBeenCalledWith({
+      enabled: true,
+      schemaType: {title: 'Test Schema', name: 'testSchema', fields: [], jsonType: 'object'},
+      value: draftDocument,
+      perspectiveStack: undefined,
+    })
+  })
+
+  it('should use published document pane value for preview', async () => {
+    const publishedDocument = {
+      _id: 'test-id',
+      _type: 'testSchema',
+      _createdAt: '2023-01-01T00:00:00Z',
+      _updatedAt: '2023-01-01T00:00:00Z',
+      _rev: 'rev1',
+      title: 'Published Title',
+    }
+
+    mockUseDocumentPane.mockReturnValue({
+      ...defaultDocumentPaneValue,
+      value: publishedDocument,
+    } as unknown as DocumentPaneContextValue)
+
+    mockUseValuePreview.mockReturnValue({
+      error: undefined,
+      value: {title: 'Published Title'},
+      isLoading: false,
+    })
+
+    const {result} = renderHook(() => useDocumentTitle())
+
+    await waitFor(() => {
+      expect(result.current).toEqual({
+        error: undefined,
+        title: 'Published Title',
+      })
+    })
+
+    // Verify that useValuePreview was called with the published value
+    expect(mockUseValuePreview).toHaveBeenCalledWith({
+      enabled: true,
+      schemaType: {title: 'Test Schema', name: 'testSchema', fields: [], jsonType: 'object'},
+      value: publishedDocument,
+      perspectiveStack: undefined,
+    })
+  })
+
+  it('should enable preview with base value for new documents', async () => {
+    mockUseDocumentPane.mockReturnValue({
+      ...defaultDocumentPaneValue,
+      value: baseValue,
+      editState: null,
+    } as DocumentPaneContextValue)
+
+    renderHook(() => useDocumentTitle())
+
+    await waitFor(() => {
+      expect(mockUseValuePreview).toHaveBeenCalledWith({
+        enabled: true,
+        schemaType: {title: 'Test Schema', name: 'testSchema', fields: [], jsonType: 'object'},
+        value: baseValue,
+        perspectiveStack: undefined,
+      })
+    })
+  })
+
+  it('should enable preview when document value is available', async () => {
+    renderHook(() => useDocumentTitle())
+
+    await waitFor(() => {
+      expect(mockUseValuePreview).toHaveBeenCalledWith({
+        enabled: true,
+        schemaType: {title: 'Test Schema', name: 'testSchema', fields: [], jsonType: 'object'},
+        value: defaultDocumentValue,
+        perspectiveStack: undefined,
+      })
+    })
+  })
+
+  it('should handle reconnecting state with document value', async () => {
+    mockUseDocumentPane.mockReturnValue({
+      ...defaultDocumentPaneValue,
+      connectionState: 'reconnecting',
+    } as DocumentPaneContextValue)
+
+    const {result} = renderHook(() => useDocumentTitle())
+
+    await waitFor(() => {
+      expect(result.current).toEqual({
+        error: undefined,
+        title: 'Test Document',
+      })
+    })
+  })
+
+  it('should handle deleted documents by using prepareForPreview directly', async () => {
+    const lastRevisionDocument = {
+      _id: 'test-id',
+      _type: 'testSchema',
+      _createdAt: '2023-01-01T00:00:00Z',
+      _updatedAt: '2023-01-01T00:00:00Z',
+      _rev: 'rev1',
+      title: 'Deleted Document Title',
+    }
+
+    mockUseDocumentPane.mockReturnValue({
+      ...defaultDocumentPaneValue,
+      isDeleted: true,
+      lastRevisionDocument,
+      value: baseValue,
+      editState: null, // No edit state for deleted documents
+    } as DocumentPaneContextValue)
+
+    // Mock prepareForPreview to return the expected title
+    mockPrepareForPreview.mockReturnValue({
+      title: 'Deleted Document Title',
+    })
+
+    // useValuePreview should not be called for deleted documents
+    mockUseValuePreview.mockReturnValue({
+      error: undefined,
+      value: undefined,
+      isLoading: false,
+    })
+
+    const client = createMockSanityClient()
+    const wrapper = await createWrapperComponent(client as any)
+
+    const {result} = renderHook(() => useDocumentTitle(), {wrapper})
+
+    await waitFor(() => {
+      expect(result.current).toEqual({
+        error: undefined,
+        title: 'Deleted Document Title',
+      })
+    })
+
+    // Verify that prepareForPreview was called with the lastRevisionDocument
+    expect(mockPrepareForPreview).toHaveBeenCalledWith(lastRevisionDocument, {
+      title: 'Test Schema',
+      name: 'testSchema',
+      jsonType: 'object',
+      fields: [],
+    })
+
+    // Verify that useValuePreview was called with enabled: false for deleted documents
+    expect(mockUseValuePreview).toHaveBeenCalledWith({
+      enabled: false,
+      schemaType: {title: 'Test Schema', name: 'testSchema', fields: [], jsonType: 'object'},
+      value: lastRevisionDocument,
+      perspectiveStack: undefined,
+    })
+  })
+})

@@ -1,0 +1,5 @@
+任务类型：Feature 迭代
+任务难度：地狱
+语言/框架：Kotlin
+
+请在已有的 ankidroid/Anki-Android 项目上迭代核心能力，不要重写项目。项目定位为：AnkiDroid: Anki flashcards on Android. Your secret trick to achieve superhuman information retention.。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。

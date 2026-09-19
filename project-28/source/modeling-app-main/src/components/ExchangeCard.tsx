@@ -1,0 +1,638 @@
+import type { AttachmentRef, MlCopilotServerMessage } from '@kittycad/lib'
+import { CustomIcon } from '@src/components/CustomIcon'
+import { MarkdownText } from '@src/components/MarkdownText'
+import { PlaceholderLine } from '@src/components/PlaceholderLine'
+import {
+  ExportDownloadFiles,
+  isExportDownloadFile,
+  Thinking,
+} from '@src/components/Thinking'
+import Tooltip from '@src/components/Tooltip'
+import {
+  type Exchange,
+  getZookeeperAttachmentKey,
+  isMlCopilotUserRequest,
+  type ZookeeperAttachmentFetchState,
+} from '@src/lib/zookeeper/zookeeperManagerMachine'
+import ms from 'ms'
+import {
+  type ComponentProps,
+  type ReactNode,
+  useEffect,
+  useMemo,
+  useState,
+} from 'react'
+import toast from 'react-hot-toast'
+
+export type ExchangeCardProps = Exchange & {
+  userAvatar?: string
+  onClickClearChat: () => void
+  isLastResponse: boolean
+  attachmentFetches?: Record<string, ZookeeperAttachmentFetchState>
+  onFetchAttachment?: (attachmentRef: AttachmentRef) => void
+}
+
+type MlCopilotServerMessageError = Extract<
+  MlCopilotServerMessage,
+  { error: unknown }
+>
+
+type MlCopilotServerMessageEndOfStream = Extract<
+  MlCopilotServerMessage,
+  { end_of_stream: unknown }
+>
+
+const TRANSIENT_RETRY_STATUS_TEXT =
+  'Temporary connection issue. Retrying automatically…'
+
+const NON_TERMINAL_INFO_TEXTS = [
+  'Manual edits detected since the last Zookeeper state.',
+  TRANSIENT_RETRY_STATUS_TEXT,
+]
+
+const getEndOfStreamResponse = (
+  responses?: MlCopilotServerMessage[]
+): MlCopilotServerMessageEndOfStream | undefined =>
+  responses?.findLast(
+    (response): response is MlCopilotServerMessageEndOfStream =>
+      'end_of_stream' in response
+  )
+
+const isNonTerminalInfoResponse = (response: MlCopilotServerMessage): boolean =>
+  'info' in response &&
+  NON_TERMINAL_INFO_TEXTS.some((infoText) =>
+    response.info.text.startsWith(infoText)
+  )
+
+const isTransientRetryInfoResponse = (
+  response: MlCopilotServerMessage
+): boolean =>
+  'info' in response &&
+  response.info.text.startsWith(TRANSIENT_RETRY_STATUS_TEXT)
+
+const isExchangeComplete = (responses?: MlCopilotServerMessage[]): boolean =>
+  responses?.some(
+    (response) =>
+      'end_of_stream' in response ||
+      'error' in response ||
+      ('info' in response && !isNonTerminalInfoResponse(response))
+  ) ?? false
+
+export interface IButtonCopyProps {
+  content: string
+}
+
+export const ButtonCopy = (props: IButtonCopyProps) => (
+  <button
+    type="button"
+    onClick={() => {
+      if (!props.content) {
+        return
+      }
+      navigator.clipboard.writeText(props.content).then(
+        () => {
+          toast.success('Copied response to clipboard.')
+        },
+        () => {
+          toast.error('Failed to copy response to clipboard.')
+        }
+      )
+    }}
+    className="pt-1 pb-1"
+  >
+    <CustomIcon name="clipboard" className="w-4 h-4" />
+    <Tooltip
+      position="right"
+      hoverOnly={true}
+      contentClassName="text-sm max-w-none flex items-center gap-5"
+    >
+      <span>Copy to clipboard</span>
+    </Tooltip>
+  </button>
+)
+
+export const ButtonClearChat = (props: ComponentProps<'button'>) => (
+  <button {...props} className="pt-1 pb-1">
+    <span className="flex flex-row gap-1">
+      <CustomIcon name="trash" className="w-4 h-4" />
+      <span>Clear chat</span>
+    </span>
+  </button>
+)
+
+export const ResponseCardToolBar = (props: {
+  responses?: MlCopilotServerMessage[]
+  onClickClearChat: () => void
+  isLastResponse: boolean
+}) => {
+  const isEndOfStream = isExchangeComplete(props.responses)
+
+  let contentForClipboard: string | undefined = ''
+
+  if (isEndOfStream) {
+    contentForClipboard = getEndOfStreamResponse(props.responses)?.end_of_stream
+      .whole_response
+  }
+
+  return (
+    <div className="pl-9 flex flex-row justify-between">
+      {isEndOfStream ? (
+        <ButtonCopy content={contentForClipboard ?? ''} />
+      ) : (
+        <div></div>
+      )}
+      {props.isLastResponse && (
+        <ButtonClearChat onClick={props.onClickClearChat} />
+      )}
+    </div>
+  )
+}
+
+export const ExchangeCardStatus = (props: {
+  responses?: MlCopilotServerMessage[]
+  attachmentFetches?: Record<string, ZookeeperAttachmentFetchState>
+  onFetchAttachment?: (attachmentRef: AttachmentRef) => void
+  onlyShowImmediateThought: boolean
+  startedAt: Date
+  updatedAt?: Date
+  maybeError?: MlCopilotServerMessageError
+}) => {
+  const [triggerRender, setTriggerRender] = useState<number>(0)
+  const thinker = (
+    <Thinking
+      thoughts={props.responses}
+      isDone={props.responses?.some((m) => 'delta' in m) || false}
+      attachmentFetches={props.attachmentFetches}
+      onFetchAttachment={props.onFetchAttachment}
+      onlyShowImmediateThought={props.onlyShowImmediateThought}
+    />
+  )
+
+  // Error and info also signals the end of a stream, because we'll never
+  // see an end_of_stream from them.
+  const isEndOfStream = isExchangeComplete(props.responses)
+
+  useEffect(() => {
+    const i = setInterval(() => {
+      setTriggerRender(triggerRender + 1)
+    }, 500)
+
+    if (isEndOfStream) {
+      clearInterval(i)
+    }
+
+    return () => {
+      clearInterval(i)
+    }
+  }, [triggerRender, isEndOfStream])
+
+  let timeReasonedFor = 0
+  if (isEndOfStream) {
+    const endOfStreamResponse = getEndOfStreamResponse(props.responses)
+    if (endOfStreamResponse !== undefined) {
+      timeReasonedFor =
+        new Date(
+          endOfStreamResponse.end_of_stream.completed_at ?? 0
+        ).getTime() -
+        new Date(endOfStreamResponse.end_of_stream.started_at ?? 0).getTime()
+    }
+  } else {
+    timeReasonedFor =
+      (props.updatedAt ?? new Date()).getTime() - props.startedAt.getTime()
+  }
+
+  return props.onlyShowImmediateThought ? (
+    <div className="text-sm text-chalkboard-70">
+      {isEndOfStream && <MaybeError />}
+      {!isEndOfStream && thinker}
+    </div>
+  ) : (
+    <div className="relative">
+      {thinker}
+      {props.updatedAt && (
+        <div className="text-chalkboard-70 p-2 pb-0">
+          {timeReasonedFor ? (
+            <>Reasoned for {ms(timeReasonedFor, { long: true })}</>
+          ) : null}
+        </div>
+      )}
+    </div>
+  )
+}
+
+export const AvatarUser = (props: { src?: string }) => {
+  return (
+    <div className="avatar h-7 w-7">
+      {props.src ? (
+        <img
+          src={props.src || ''}
+          className="h-7 w-7 rounded-sm"
+          referrerPolicy="no-referrer"
+          alt="user avatar"
+        />
+      ) : (
+        <CustomIcon
+          name="person"
+          className="w-7 h-7 text-chalkboard-70 dark:text-chalkboard-40 bg-chalkboard-20 dark:bg-chalkboard-80"
+        />
+      )}
+    </div>
+  )
+}
+
+type RequestCardProps = Exchange['request'] & {
+  userAvatar?: ReactNode
+  attachmentFetches?: Record<string, ZookeeperAttachmentFetchState>
+  onFetchAttachment?: (attachmentRef: AttachmentRef) => void
+}
+
+const MAX_VISIBLE_ATTACHMENTS = 2
+
+const hasVisibleChildren = (children: ReactNode) => {
+  return (
+    (children instanceof Array && children.length > 0) ||
+    (typeof children === 'string' && children !== '')
+  )
+}
+
+export const ChatBubble = (props: {
+  side: 'left' | 'right'
+  userAvatar?: ReactNode
+  wfull?: true
+  children: ReactNode
+  dataTestId?: string
+  placeholderTestId?: string
+  className?: string
+}) => {
+  const cssRequest =
+    `${props.wfull ? 'w-full ' : ''} select-text whitespace-pre-line hyphens-auto shadow-sm ${props.side === 'left' ? '' : 'border b-4'} bg-2 text-default rounded-t-md pl-4 pr-4 ${props.className} ` +
+    (props.side === 'left' ? 'rounded-br-md' : 'rounded-bl-md')
+
+  return (
+    <div
+      className={`flex justify-end items-end gap-2 w-full ${props.side === 'right' ? 'flex-row' : 'flex-row-reverse'}`}
+      data-testid={props.dataTestId}
+    >
+      <div className="flex flex-col items-end gap-2 w-full">
+        <div style={{ wordBreak: 'break-word' }} className={cssRequest}>
+          {hasVisibleChildren(props.children) ? (
+            props.children
+          ) : (
+            <PlaceholderLine data-testid={props.placeholderTestId} />
+          )}
+        </div>
+      </div>
+      <div className="w-fit-content">{props.userAvatar}</div>
+    </div>
+  )
+}
+
+export const RequestCard = (props: RequestCardProps) => {
+  const [showAllAttachments, setShowAllAttachments] = useState(false)
+
+  if (!isMlCopilotUserRequest(props)) {
+    return null
+  }
+
+  const additionalFiles = props.additional_files ?? []
+  const hasHiddenAttachments = additionalFiles.length > MAX_VISIBLE_ATTACHMENTS
+  const visibleAttachments = showAllAttachments
+    ? additionalFiles
+    : additionalFiles.slice(0, MAX_VISIBLE_ATTACHMENTS)
+
+  return (
+    <>
+      <ChatBubble
+        side={'right'}
+        userAvatar={props.userAvatar}
+        dataTestId="ml-request-chat-bubble"
+        className="pt-2 pb-2"
+      >
+        {props.content}
+      </ChatBubble>
+      {additionalFiles.length > 0 && (
+        <div className="flex justify-end pr-9">
+          <div
+            className="flex flex-col items-end gap-1"
+            data-testid="ml-request-chat-bubble-attachments"
+          >
+            <div className="w-full text-right text-xs font-medium text-chalkboard-70 dark:text-chalkboard-40">
+              Attachments
+            </div>
+            {visibleAttachments.map((file, index) => {
+              const attachmentRef = file.attachment_ref
+              const fetchState = attachmentRef
+                ? props.attachmentFetches?.[
+                    getZookeeperAttachmentKey(attachmentRef)
+                  ]
+                : undefined
+              const canFetch =
+                file.data.length === 0 &&
+                attachmentRef !== undefined &&
+                props.onFetchAttachment !== undefined &&
+                fetchState?.status !== 'loaded'
+
+              const contents = (
+                <>
+                  <CustomIcon name="paperclip" className="w-3 h-3 shrink-0" />
+                  <span className="min-w-0 truncate">{file.name}</span>
+                  {fetchState?.status === 'loading' && (
+                    <span className="text-chalkboard-70 dark:text-chalkboard-40">
+                      Loading…
+                    </span>
+                  )}
+                  {fetchState?.status === 'loaded' && (
+                    <span className="text-chalkboard-70 dark:text-chalkboard-40">
+                      Loaded
+                    </span>
+                  )}
+                </>
+              )
+              const className =
+                'flex items-center gap-1 rounded-sm border border-chalkboard-30 dark:border-chalkboard-70 px-2 py-1 text-xs'
+
+              return canFetch ? (
+                <button
+                  type="button"
+                  key={`${file.name}-${index}`}
+                  className={className}
+                  disabled={fetchState?.status === 'loading'}
+                  onClick={() => props.onFetchAttachment?.(attachmentRef)}
+                >
+                  {contents}
+                </button>
+              ) : (
+                <div key={`${file.name}-${index}`} className={className}>
+                  {contents}
+                </div>
+              )
+            })}
+            {hasHiddenAttachments && (
+              <button
+                type="button"
+                onClick={() => setShowAllAttachments(!showAllAttachments)}
+                className="pt-1 pb-1 text-xs"
+                aria-expanded={showAllAttachments}
+              >
+                {showAllAttachments ? '- collapse' : '+ more'}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </>
+  )
+}
+
+export const Delta = (props: { children: ReactNode }) => {
+  return (
+    <span className="animate-delta-in" style={{ opacity: 0 }}>
+      {props.children}
+    </span>
+  )
+}
+
+type ResponsesCardProp = {
+  items: Exchange['responses']
+  deltasAggregated: Exchange['deltasAggregated']
+  isLastResponse: boolean
+  onClickClearChat: () => void
+  attachmentFetches?: Record<string, ZookeeperAttachmentFetchState>
+  onFetchAttachment?: (attachmentRef: AttachmentRef) => void
+}
+
+const MaybeError = (props: { maybeError?: MlCopilotServerMessageError }) =>
+  props.maybeError ? (
+    <div className="text-rose-400 flex flex-row gap-1 items-start">
+      <CustomIcon
+        name="triangleExclamation"
+        className="w-4 h-4 inline valign"
+      />
+      <MarkdownText text={props.maybeError?.error.detail} />
+    </div>
+  ) : null
+
+// This can be used to show `delta` or `tool_output`
+export const ResponsesCard = (props: ResponsesCardProp) => {
+  const hasTransientRetry = props.items.some((response) =>
+    isTransientRetryInfoResponse(response)
+  )
+
+  const infoItems = props.items.map(
+    (response: MlCopilotServerMessage, index: number) => {
+      // This is INTENTIONALLY left here for documentation.
+      // We aggregate `delta` responses into `Exchange.responseAggregated`
+      // as an optimization. Originally we'd have 1000s of React components,
+      // causing problems like slowness and exceeding stack depth.
+      // if ('delta' in response) {
+      //   return response.delta.delta
+      // }
+      if ('info' in response && !isTransientRetryInfoResponse(response)) {
+        return <Delta key={index}>{response.info.text}</Delta>
+      }
+      return null
+    }
+  )
+
+  const infoItemsFilteredNulls = infoItems.filter(
+    (x: ReactNode | null) => x !== null
+  )
+
+  const maybeError = props.items.filter((r) => 'error' in r)[0]
+  const isComplete = isExchangeComplete(props.items)
+
+  const deltasAggregatedMarkdown = useMemo(() => {
+    return props.deltasAggregated !== '' ? (
+      <MarkdownText
+        key="response"
+        text={props.deltasAggregated}
+        className="whitespace-normal"
+      />
+    ) : null
+  }, [props.deltasAggregated])
+
+  const exportDownloadFiles = props.items.flatMap((response) =>
+    'files' in response ? response.files.files.filter(isExportDownloadFile) : []
+  )
+
+  const children = [
+    maybeError ? <MaybeError key="error" maybeError={maybeError} /> : null,
+    deltasAggregatedMarkdown,
+    exportDownloadFiles.length > 0 ? (
+      <ExportDownloadFiles
+        key="downloads"
+        files={exportDownloadFiles}
+        attachmentFetches={props.attachmentFetches}
+        onFetchAttachment={props.onFetchAttachment}
+      />
+    ) : null,
+  ].filter((x: ReactNode) => x !== null)
+
+  const shouldShowResponseBubble =
+    hasVisibleChildren(children) || (props.isLastResponse && !isComplete)
+
+  return hasTransientRetry ||
+    infoItemsFilteredNulls.length > 0 ||
+    shouldShowResponseBubble ? (
+    <>
+      {hasTransientRetry && (
+        <p
+          className="text-xs text-chalkboard-70 dark:text-chalkboard-30"
+          data-testid="ml-response-retry-status"
+        >
+          {TRANSIENT_RETRY_STATUS_TEXT}
+        </p>
+      )}
+      {infoItemsFilteredNulls.length > 0 && (
+        <ChatBubble
+          side={'left'}
+          wfull={true}
+          userAvatar={<div className="h-7 w-7 avatar bg-img-mel" />}
+          dataTestId="ml-response-info-chat-bubble"
+          className="py-4"
+        >
+          {infoItemsFilteredNulls}
+        </ChatBubble>
+      )}
+      {shouldShowResponseBubble && (
+        <ChatBubble
+          side={'left'}
+          wfull={true}
+          userAvatar={<div className="h-7 w-7 avatar bg-img-mel" />}
+          dataTestId="ml-response-chat-bubble"
+          placeholderTestId="ml-response-chat-bubble-thinking"
+          className="py-4"
+        >
+          {children}
+        </ChatBubble>
+      )}
+      <ResponseCardToolBar
+        responses={props.items}
+        isLastResponse={props.isLastResponse}
+        onClickClearChat={props.onClickClearChat}
+      />
+    </>
+  ) : null
+}
+
+export const ExchangeCard = (props: ExchangeCardProps) => {
+  let [startedAt] = useState<Date>(props.startedAt ?? new Date())
+  const [updatedAt, setUpdatedAt] = useState<Date | undefined>(undefined)
+
+  const [showFullReasoning, setShowFullReasoning] = useState<boolean>(true)
+
+  const cssCard = `flex flex-col px-4 py-2 gap-2 justify-between
+    transition-height duration-500 overflow-hidden text-sm
+  `
+
+  const onSeeReasoning = () => {
+    setShowFullReasoning(!showFullReasoning)
+  }
+
+  useEffect(() => {
+    setUpdatedAt(new Date())
+  }, [props.responses.length])
+
+  const isEndOfStream = isExchangeComplete(props.responses)
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (isEndOfStream) {
+        clearInterval(id)
+      }
+      setUpdatedAt(new Date())
+    }, 1000)
+    return () => {
+      clearInterval(id)
+    }
+  }, [isEndOfStream])
+
+  if (isEndOfStream) {
+    const endOfStreamResponse = getEndOfStreamResponse(props.responses)
+    if (endOfStreamResponse !== undefined) {
+      startedAt = new Date(endOfStreamResponse.end_of_stream.started_at ?? 0)
+    }
+  }
+
+  useEffect(() => {
+    if (isEndOfStream) {
+      setShowFullReasoning(false)
+    }
+  }, [isEndOfStream])
+
+  const maybeError = props.responses.filter((r) => 'error' in r)[0]
+
+  const hasReasoningContent = props.responses.some(
+    (response) =>
+      'reasoning' in response ||
+      ('files' in response &&
+        response.files.files.some((file) => !isExportDownloadFile(file)))
+  )
+
+  return (
+    <div className={cssCard}>
+      <div className="p-7 text-chalkboard-70 text-center">
+        {ms(Date.now() - startedAt.getTime(), { long: true })} ago
+      </div>
+      {isMlCopilotUserRequest(props.request) && (
+        <RequestCard
+          {...props.request}
+          userAvatar={<AvatarUser src={props.userAvatar} />}
+          attachmentFetches={props.attachmentFetches}
+          onFetchAttachment={props.onFetchAttachment}
+        />
+      )}
+      {showFullReasoning && hasReasoningContent && (
+        <div>
+          <ExchangeCardStatus
+            responses={props.responses}
+            attachmentFetches={props.attachmentFetches}
+            onFetchAttachment={props.onFetchAttachment}
+            onlyShowImmediateThought={false}
+            startedAt={startedAt}
+            updatedAt={updatedAt}
+          />
+        </div>
+      )}
+      {hasReasoningContent && (
+        <div
+          tabIndex={0}
+          role="button"
+          className="pl-8 flex flex-row items-center cursor-pointer justify-start gap-2"
+          onClick={() => onSeeReasoning()}
+        >
+          <div>
+            <button className="flex justify-center items-center flex-none pt-1 pb-1">
+              {showFullReasoning ? (
+                <>
+                  Collapse <CustomIcon name="collapse" className="w-5 h-5" />
+                </>
+              ) : (
+                <>See reasoning</>
+              )}
+            </button>
+          </div>
+          {props.isLastResponse && (
+            <ExchangeCardStatus
+              maybeError={maybeError}
+              responses={props.responses}
+              attachmentFetches={props.attachmentFetches}
+              onFetchAttachment={props.onFetchAttachment}
+              onlyShowImmediateThought={true}
+              startedAt={startedAt}
+              updatedAt={updatedAt}
+            />
+          )}
+        </div>
+      )}
+      <ResponsesCard
+        items={props.responses}
+        deltasAggregated={props.deltasAggregated}
+        isLastResponse={props.isLastResponse}
+        onClickClearChat={props.onClickClearChat}
+        attachmentFetches={props.attachmentFetches}
+        onFetchAttachment={props.onFetchAttachment}
+      />
+    </div>
+  )
+}

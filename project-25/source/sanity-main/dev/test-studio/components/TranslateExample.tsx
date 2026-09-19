@@ -1,0 +1,89 @@
+import {InfoFilledIcon} from '@sanity/icons/InfoFilled'
+import {Card, Stack, Text} from '@sanity/ui'
+import {type ReactNode} from 'react'
+import {Translate, useTranslation} from 'sanity'
+
+export function TranslateExample() {
+  const {t} = useTranslation('testStudio')
+  return (
+    <Card padding={4}>
+      <Stack gap={4}>
+        <Text>{t('use-translation.with-html')}</Text>
+        <Text>
+          {t('use-translation.interpolation-example', {
+            spaces: 'spaces',
+            doesNot: 'does not have spaces',
+          })}
+        </Text>
+        <Text>
+          {t('translate.with-formatter', {
+            countries: ['Norway', 'Denmark', 'Sweden'],
+          })}
+        </Text>
+        <Text>
+          <Translate t={t} i18nKey="use-translation.with-html" />
+        </Text>
+        <Text>
+          <Translate
+            t={t}
+            i18nKey="translate.example"
+            components={{Icon: InfoFilledIcon, Red, Bold}}
+            values={{
+              keyword: 'something',
+              duration: '30',
+            }}
+          />
+        </Text>
+        <Text>
+          <Translate
+            t={t}
+            i18nKey="translate.with-xml-in-value"
+            values={{
+              value: '<svg>hello</svg>',
+            }}
+          />
+        </Text>
+
+        <Text>
+          <Translate
+            t={t}
+            i18nKey="use-translation.interpolation-example"
+            values={{
+              spaces: 'spaces',
+              doesNot: 'does not have spaces',
+            }}
+          />
+        </Text>
+
+        <Text weight="bold">Broken translations (should fall back gracefully, not crash):</Text>
+
+        <Text>
+          Missing self-closing:{' '}
+          <Translate t={t} i18nKey="translate.missing-self-closing" components={{}} />
+        </Text>
+        <Text>
+          Missing wrapping: <Translate t={t} i18nKey="translate.missing-wrapping" components={{}} />
+        </Text>
+        <Text>
+          Mismatched component (issue #12617):{' '}
+          <Translate
+            t={t}
+            i18nKey="translate.mismatched-component"
+            components={{VersionBadge}}
+            values={{title: 'My Release'}}
+          />
+        </Text>
+      </Stack>
+    </Card>
+  )
+}
+
+function VersionBadge({children}: {children?: ReactNode}) {
+  return <span style={{fontWeight: 'bold'}}>{children}</span>
+}
+function Red({children}: {children?: ReactNode}) {
+  return <span style={{color: 'red'}}>{children}</span>
+}
+function Bold({children}: {children?: ReactNode}) {
+  return <b>{children}</b>
+}

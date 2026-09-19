@@ -1,0 +1,219 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Result of parsing kw_fn_unlabeled_but_has_label.kcl
+---
+{
+  "Ok": {
+    "body": [
+      {
+        "commentStart": 0,
+        "declaration": {
+          "commentStart": 0,
+          "end": 0,
+          "id": {
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "name": "add",
+            "start": 0,
+            "type": "Identifier"
+          },
+          "init": {
+            "body": {
+              "body": [
+                {
+                  "argument": {
+                    "commentStart": 0,
+                    "end": 0,
+                    "left": {
+                      "abs_path": false,
+                      "commentStart": 0,
+                      "end": 0,
+                      "moduleId": 0,
+                      "name": {
+                        "commentStart": 0,
+                        "end": 0,
+                        "moduleId": 0,
+                        "name": "x",
+                        "start": 0,
+                        "type": "Identifier"
+                      },
+                      "path": [],
+                      "start": 0,
+                      "type": "Name",
+                      "type": "Name"
+                    },
+                    "moduleId": 0,
+                    "operator": "+",
+                    "right": {
+                      "commentStart": 0,
+                      "end": 0,
+                      "moduleId": 0,
+                      "raw": "1",
+                      "start": 0,
+                      "type": "Literal",
+                      "type": "Literal",
+                      "value": {
+                        "value": 1.0,
+                        "suffix": "None"
+                      }
+                    },
+                    "start": 0,
+                    "type": "BinaryExpression",
+                    "type": "BinaryExpression"
+                  },
+                  "commentStart": 0,
+                  "end": 0,
+                  "moduleId": 0,
+                  "start": 0,
+                  "type": "ReturnStatement",
+                  "type": "ReturnStatement"
+                }
+              ],
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "start": 0,
+              "type": "Program"
+            },
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "name": {
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "name": "add",
+              "start": 0,
+              "type": "Identifier"
+            },
+            "params": [
+              {
+                "type": "Parameter",
+                "identifier": {
+                  "commentStart": 0,
+                  "end": 0,
+                  "moduleId": 0,
+                  "name": "x",
+                  "start": 0,
+                  "type": "Identifier"
+                },
+                "labeled": false
+              }
+            ],
+            "start": 0,
+            "type": "FunctionExpression",
+            "type": "FunctionExpression"
+          },
+          "moduleId": 0,
+          "start": 0,
+          "type": "VariableDeclarator"
+        },
+        "end": 0,
+        "kind": "fn",
+        "moduleId": 0,
+        "start": 0,
+        "type": "VariableDeclaration",
+        "type": "VariableDeclaration"
+      },
+      {
+        "commentStart": 0,
+        "declaration": {
+          "commentStart": 0,
+          "end": 0,
+          "id": {
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "name": "two",
+            "start": 0,
+            "type": "Identifier"
+          },
+          "init": {
+            "arguments": [
+              {
+                "type": "LabeledArg",
+                "label": {
+                  "commentStart": 0,
+                  "end": 0,
+                  "moduleId": 0,
+                  "name": "x",
+                  "start": 0,
+                  "type": "Identifier"
+                },
+                "arg": {
+                  "commentStart": 0,
+                  "end": 0,
+                  "moduleId": 0,
+                  "raw": "1",
+                  "start": 0,
+                  "type": "Literal",
+                  "type": "Literal",
+                  "value": {
+                    "value": 1.0,
+                    "suffix": "None"
+                  }
+                }
+              }
+            ],
+            "callee": {
+              "abs_path": false,
+              "commentStart": 0,
+              "end": 0,
+              "moduleId": 0,
+              "name": {
+                "commentStart": 0,
+                "end": 0,
+                "moduleId": 0,
+                "name": "add",
+                "start": 0,
+                "type": "Identifier"
+              },
+              "path": [],
+              "start": 0,
+              "type": "Name"
+            },
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "start": 0,
+            "type": "CallExpressionKw",
+            "type": "CallExpressionKw",
+            "unlabeled": null
+          },
+          "moduleId": 0,
+          "start": 0,
+          "type": "VariableDeclarator"
+        },
+        "end": 0,
+        "kind": "const",
+        "moduleId": 0,
+        "start": 0,
+        "type": "VariableDeclaration",
+        "type": "VariableDeclaration"
+      }
+    ],
+    "commentStart": 0,
+    "end": 0,
+    "moduleId": 0,
+    "nonCodeMeta": {
+      "nonCodeNodes": {
+        "0": [
+          {
+            "commentStart": 0,
+            "end": 0,
+            "moduleId": 0,
+            "start": 0,
+            "type": "NonCodeNode",
+            "value": {
+              "type": "newLine"
+            }
+          }
+        ]
+      },
+      "startNodes": []
+    },
+    "start": 0,
+    "type": "Program"
+  }
+}

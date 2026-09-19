@@ -1,0 +1,57 @@
+import {Card, rem} from '@sanity/ui'
+import {useStateLink} from 'sanity/router'
+import {styled} from 'styled-components'
+import {Flex} from 'ui5'
+
+import {focusRingStyle} from '../../../../form/components/withFocusRing/helpers'
+import {useActiveWorkspace} from '../../../activeWorkspaceMatcher/useActiveWorkspace'
+import {WorkspacePreviewIcon} from '../workspace/WorkspacePreview'
+
+const LOGO_MARK_SIZE = 25 // width and height, px
+const RADIUS = 2
+
+const LogoMarkContainer = styled(Card).attrs({
+  overflow: 'hidden',
+  radius: RADIUS,
+})`
+  height: ${LOGO_MARK_SIZE}px;
+  width: ${LOGO_MARK_SIZE}px;
+`
+
+const StyledCard = styled(Card)`
+  border-radius: ${({theme}) => rem(theme.sanity.radius[RADIUS]) /* oxlint-disable-line no-deprecated -- will fix in follow up PR */};
+  display: flex;
+  outline: none;
+  text-decoration: none;
+  &:focus-visible {
+    box-shadow: ${({theme}) =>
+      focusRingStyle({
+        // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+        base: theme.sanity.color.base,
+        // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+        focusRing: {...theme.sanity.focusRing, offset: 1},
+      })};
+  }
+`
+
+/**
+ * Home button in the main navbar.
+ *
+ * - Displays the workspace icon only.
+ */
+export function HomeButton() {
+  const {activeWorkspace} = useActiveWorkspace()
+  const {href: rootHref, onClick: handleRootClick} = useStateLink({state: {}})
+
+  return (
+    <StyledCard as="a" href={rootHref} onClick={handleRootClick}>
+      <Flex alignItems="center">
+        <LogoMarkContainer>
+          <Flex alignItems="center" height="100%" justifyContent="center">
+            <WorkspacePreviewIcon icon={activeWorkspace.icon} size="small" />
+          </Flex>
+        </LogoMarkContainer>
+      </Flex>
+    </StyledCard>
+  )
+}

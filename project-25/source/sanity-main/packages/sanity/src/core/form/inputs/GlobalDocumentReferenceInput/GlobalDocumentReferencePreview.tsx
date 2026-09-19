@@ -1,0 +1,156 @@
+import {isImageSource} from '@sanity/asset-utils'
+import {AccessDeniedIcon} from '@sanity/icons/AccessDenied'
+import {HelpCircleIcon} from '@sanity/icons/HelpCircle'
+import {LaunchIcon} from '@sanity/icons/Launch'
+import {createImageUrlBuilder} from '@sanity/image-url'
+import {type GlobalDocumentReferenceType, type PreviewValue} from '@sanity/types'
+import {Badge, Inline, Text} from '@sanity/ui'
+import {isValidElement as reactIsValidElement, useMemo} from 'react'
+import {Flex, Box} from 'ui5'
+
+import {Tooltip} from '../../../../ui-components/tooltip/Tooltip'
+import {DefaultPreview} from '../../../components/previews/general/DefaultPreview'
+import {type PreviewMediaDimensions} from '../../../components/previews/types'
+import {TextWithTone} from '../../../components/textWithTone/TextWithTone'
+import {type FIXME} from '../../../FIXME'
+import {useTranslation} from '../../../i18n/hooks/useTranslation'
+import {type DocumentAvailability} from '../../../preview/types'
+import {StyledPreviewFlex} from './GlobalDocumentReferencePreview.styled'
+import {resolveProjectDataset} from './utils/resolveProjectDataset'
+
+/**
+ * Used to preview a referenced type
+ * Takes the reference type as props
+ *
+ * @internal
+ */
+export function GlobalDocumentReferencePreview(props: {
+  availability: DocumentAvailability | null
+  id: string
+  hasStudioUrl?: boolean
+  showStudioUrlIcon?: boolean
+  preview: {published: PreviewValue | undefined}
+  resourceType: string
+  resourceId: string
+  refType?: GlobalDocumentReferenceType
+  showTypeLabel: boolean
+}): React.JSX.Element {
+  const {
+    refType,
+    showStudioUrlIcon,
+    hasStudioUrl,
+    showTypeLabel,
+    availability,
+    preview,
+    id,
+    resourceType,
+    resourceId,
+  } = props
+  const notFound = availability?.reason === 'NOT_FOUND'
+  const insufficientPermissions = availability?.reason === 'PERMISSION_DENIED'
+
+  const previewMedia = preview.published?.media
+  const {t} = useTranslation()
+
+  const media = useMemo(() => {
+    if (previewMedia) {
+      const isValidImageAsset =
+        typeof (previewMedia as FIXME)?.asset !== 'undefined' && isImageSource(previewMedia)
+      const isValidElement = reactIsValidElement(previewMedia)
+
+      if (!isValidImageAsset && !isValidElement) {
+        return null
+      }
+
+      return function MediaPreview({dimensions}: {dimensions: PreviewMediaDimensions}) {
+        const projectDataset = resolveProjectDataset(resourceType, resourceId)
+        if (!projectDataset) return null
+
+        return isValidElement ? (
+          previewMedia
+        ) : (
+          <img
+            src={createImageUrlBuilder(projectDataset)
+              .image(previewMedia as FIXME)
+              .withOptions(dimensions)
+              .url()}
+            alt={t('inputs.reference.image-preview-alt-text')}
+            referrerPolicy="strict-origin-when-cross-origin"
+          />
+        )
+      }
+    }
+    if (!refType?.icon) return null
+    const Icon = refType.icon
+    return <Icon />
+  }, [previewMedia, resourceType, resourceId, refType?.icon, t])
+
+  return (
+    <StyledPreviewFlex
+      alignItems="center"
+      justifyContent="center"
+      flexBasis="0%"
+      flexGrow={1}
+      data-testid="preview"
+    >
+      {availability?.available ? (
+        <Box flexBasis="0%" flexGrow={1}>
+          <DefaultPreview
+            title={preview.published?.title}
+            subtitle={preview.published?.subtitle}
+            media={media || false}
+          />
+        </Box>
+      ) : (
+        <Box flexBasis="0%" flexGrow={1}>
+          <Flex alignItems="center">
+            <Box flexBasis="0%" flexGrow={1} paddingY={2}>
+              <Text muted>{t('inputs.reference.error.document-unavailable-title')}</Text>
+            </Box>
+          </Flex>
+        </Box>
+      )}
+
+      <Box paddingLeft={3}>
+        <Inline gap={4}>
+          {refType && showTypeLabel && <Badge>{refType.title || refType.type}</Badge>}
+
+          {(insufficientPermissions || notFound) && (
+            <Box>
+              <Tooltip
+                portal
+                content={t(
+                  notFound
+                    ? 'inputs.reference.referenced-document-does-not-exist'
+                    : 'inputs.reference.referenced-document-insufficient-permissions',
+                  {documentId: id},
+                )}
+              >
+                <TextWithTone tone="default">
+                  {insufficientPermissions ? <AccessDeniedIcon /> : <HelpCircleIcon />}
+                </TextWithTone>
+              </Tooltip>
+            </Box>
+          )}
+
+          {!(notFound || insufficientPermissions) && showStudioUrlIcon && (
+            <Box>
+              <Tooltip
+                portal
+                content={t(
+                  hasStudioUrl
+                    ? 'inputs.reference.document-opens-in-new-tab'
+                    : 'input.reference.document-cannot-be-opened.failed-to-resolve-url',
+                )}
+              >
+                <TextWithTone size={1} tone="default" muted={!hasStudioUrl}>
+                  <LaunchIcon />
+                </TextWithTone>
+              </Tooltip>
+            </Box>
+          )}
+        </Inline>
+      </Box>
+    </StyledPreviewFlex>
+  )
+}

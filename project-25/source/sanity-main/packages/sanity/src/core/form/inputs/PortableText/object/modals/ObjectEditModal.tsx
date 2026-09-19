@@ -1,0 +1,92 @@
+import {type ObjectSchemaType} from '@sanity/types'
+import {type ReactNode, useCallback, useMemo} from 'react'
+
+import {useTranslation} from '../../../../../i18n/hooks/useTranslation'
+import {EnhancedObjectDialog} from '../../../../components/EnhancedObjectDialog'
+import {useEnhancedObjectDialog} from '../../../../studio/tree-editing/context/enabled/useEnhancedObjectDialog'
+import {_getModalOption} from '../helpers'
+import {DefaultEditDialog} from './DialogModal'
+import {PopoverEditDialog} from './PopoverModal'
+
+export function ObjectEditModal(props: {
+  autoFocus?: boolean
+  children: ReactNode
+  defaultType: 'dialog' | 'popover'
+  floatingBoundary: HTMLElement | null
+  onClose: () => void
+  referenceBoundary: HTMLElement | null
+  referenceElement: HTMLElement | null
+  schemaType: ObjectSchemaType & {i18nTitleKey?: string}
+}) {
+  const {
+    autoFocus,
+    defaultType,
+    floatingBoundary,
+    onClose,
+    referenceBoundary,
+    referenceElement,
+    schemaType,
+  } = props
+
+  const {t} = useTranslation()
+  const schemaModalOption = useMemo(() => _getModalOption(schemaType), [schemaType])
+  const modalType = schemaModalOption?.type || defaultType
+
+  // oxlint-disable-next-line no-deprecated -- will fix in follow up PR
+  const {enabled: nestedObjectNavigationEnabled} = useEnhancedObjectDialog()
+
+  const schemaTypeTitle = schemaType.i18nTitleKey
+    ? t(schemaType.i18nTitleKey)
+    : schemaType.title || schemaType.name
+
+  const modalTitle = t('inputs.portable-text.annotation-editor.title', {
+    schemaType: schemaTypeTitle,
+  })
+
+  const handleClose = useCallback(() => {
+    onClose()
+  }, [onClose])
+
+  // Treat an empty width array as "unset" so the edit dialog components apply
+  // their own width defaults instead of collapsing to content/auto width.
+  const rawModalWidth = schemaModalOption?.width
+  const modalWidth = rawModalWidth && rawModalWidth.length > 0 ? rawModalWidth : undefined
+
+  if (modalType === 'popover') {
+    return (
+      <PopoverEditDialog
+        autoFocus={autoFocus}
+        floatingBoundary={floatingBoundary}
+        onClose={handleClose}
+        referenceBoundary={referenceBoundary}
+        referenceElement={referenceElement}
+        title={<>{modalTitle}</>}
+        width={modalWidth ?? 1}
+        data-testid="popover-edit-dialog"
+      >
+        {props.children}
+      </PopoverEditDialog>
+    )
+  }
+
+  return nestedObjectNavigationEnabled ? (
+    <EnhancedObjectDialog
+      type="dialog"
+      onClose={onClose}
+      header={modalTitle}
+      width={modalWidth ?? 1}
+      autofocus={autoFocus}
+    >
+      {props.children}
+    </EnhancedObjectDialog>
+  ) : (
+    <DefaultEditDialog
+      onClose={handleClose}
+      title={modalTitle}
+      width={modalWidth}
+      autoFocus={autoFocus}
+    >
+      {props.children}
+    </DefaultEditDialog>
+  )
+}

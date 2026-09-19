@@ -1,0 +1,95 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+node_modules
+/.pnp
+.pnp.js
+
+# testing
+/coverage
+
+# production
+build
+*.log
+
+# misc
+.DS_Store
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.direnv
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+.idea
+.vscode
+.helix
+result
+
+# rust
+/target
+/public/kcl_wasm_lib_bg.wasm
+
+# playwright
+trace.zip
+test-results/
+playwright-report/
+playwright/.cache/
+temp*.png
+
+# samples
+/public/kcl-samples.zip
+/public/kcl-samples/.github
+/public/kcl-samples/screenshots/main.kcl
+/public/kcl-samples/step/main.kcl
+/public/kcl-samples/internal
+/rust/kcl-lib/tests/kcl_samples/internal
+/src/lang/std/artifactMapCache
+
+## generated files
+src/**/*.typegen.ts
+
+Mac_App_Distribution.provisionprofile
+
+*.tsbuildinfo
+
+.eslintcache
+.vite/
+
+# electron
+out/
+
+# python
+__pycache__/
+uv.lock
+dist
+venv
+
+.vscode-test
+.biome/
+.million
+.cursor
+
+SPECIFICATION.txt
+
+# OS metadata
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+.AppleDouble
+Thumbs.db
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo

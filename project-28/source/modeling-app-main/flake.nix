@@ -1,0 +1,135 @@
+{
+  description = "zoo.dev modeling-app";
+
+  inputs = {
+    # Keep x86_64-darwin support while using a nixpkgs release with the
+    # identifying User-Agent fix for crates.io downloads.
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
+    rust-overlay.url = "github:oxalica/rust-overlay";
+  };
+
+  outputs = {
+    self,
+    nixpkgs,
+    rust-overlay,
+  }: let
+    overlays = [
+      (import rust-overlay)
+      (self: super: {
+        rustToolchain = super.rust-bin.stable."1.96.0".default.override {
+          targets = ["wasm32-unknown-unknown"];
+          extensions = [
+            "rustfmt"
+            "llvm-tools-preview"
+            "rust-src"
+          ];
+        };
+
+        # stand-alone nightly formatter so we get the fancy unstable flags
+        nightlyRustfmt = super.rust-bin.selectLatestNightlyWith (
+          toolchain:
+            toolchain.default.override {
+              extensions = ["rustfmt"]; # just the formatter
+            }
+        );
+      })
+    ];
+
+    allSystems = [
+      "x86_64-linux"
+      "aarch64-linux"
+      "x86_64-darwin"
+      "aarch64-darwin"
+    ];
+
+    forAllSystems = f:
+      nixpkgs.lib.genAttrs allSystems (
+        system:
+          f {
+            pkgs = import nixpkgs {
+              inherit overlays system;
+            };
+            system = system;
+          }
+      );
+  in {
+    devShells = forAllSystems (
+      {pkgs, ...}: {
+        default = pkgs.mkShell {
+          packages =
+            (with pkgs; [
+              rustToolchain
+              nightlyRustfmt
+              cargo-criterion
+              cargo-nextest
+              cargo-sort
+              just
+              postgresql.lib
+              openssl
+              pkg-config
+              nodejs_22
+              electron
+              playwright-driver.browsers
+              chromedriver
+              wasm-pack
+              python3
+            ])
+            ++ pkgs.lib.optionals pkgs.stdenv.isDarwin (
+              with pkgs; [
+                libiconv
+              ]
+            );
+
+          TARGET_CC = "${pkgs.stdenv.cc}/bin/${pkgs.stdenv.cc.targetPrefix}cc";
+          LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+          ELECTRON_OVERRIDE_DIST_PATH =
+            if pkgs.stdenv.isDarwin
+            then "${pkgs.electron}/Applications/"
+            else "${pkgs.electron}/bin";
+          PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = true;
+          PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH = "${pkgs.playwright-driver.browsers}/chromium-1091/chrome-linux/chrome";
+          PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
+          NODE_ENV = "development";
+          RUSTFMT = "${pkgs.nightlyRustfmt}/bin/rustfmt";
+          CHROMEDRIVER = "${pkgs.chromedriver}/bin/chromedriver";
+          PYO3_PYTHON = "${pkgs.python3}/bin/python3";
+        };
+      }
+    );
+
+    packages = forAllSystems (
+      {
+        pkgs,
+        system,
+      }: let
+        cargoToml = builtins.fromTOML (builtins.readFile ./rust/kcl-language-server/Cargo.toml);
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = pkgs.rustToolchain;
+          rustc = pkgs.rustToolchain;
+        };
+      in {
+        kcl-language-server = rustPlatform.buildRustPackage {
+          pname = "kcl-language-server";
+          version = cargoToml.package.version;
+
+          src = ./rust;
+
+          cargoLock = {
+            lockFile = ./rust/Cargo.lock;
+            outputHashes = {
+            "gltf-1.3.0" = "sha256-V9OwzwqXhGzjZhCmbszGv5jLkSwYUo5lZYg4TQ0xA4A=";
+            };
+          };
+          cargoBuildFlags = [
+            "-p"
+            "kcl-language-server"
+          ];
+          doCheck = false;
+          nativeBuildInputs = [pkgs.pkg-config];
+          buildInputs = [pkgs.openssl];
+        };
+        default = self.packages.${system}.kcl-language-server;
+      }
+    );
+  };
+}

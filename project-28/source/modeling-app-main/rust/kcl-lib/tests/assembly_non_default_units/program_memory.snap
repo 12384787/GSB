@@ -1,0 +1,14 @@
+---
+source: kcl-lib/src/simulation_tests.rs
+description: Variables in memory after executing assembly_non_default_units.kcl
+---
+{
+  "__mod_other1": {
+    "type": "Module",
+    "value": 1
+  },
+  "__mod_other2": {
+    "type": "Module",
+    "value": 3
+  }
+}

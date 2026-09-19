@@ -1,0 +1,139 @@
+import {ArrowUpIcon} from '@sanity/icons/ArrowUp'
+import {SearchIcon} from '@sanity/icons/Search'
+import {Card, Text, TextInput} from '@sanity/ui'
+import {motion} from 'motion/react'
+import {type CSSProperties, useMemo} from 'react'
+import {styled} from 'styled-components'
+import {Box, Flex} from 'ui5'
+
+import {Button, type ButtonProps} from '../../../../../ui-components/button/Button'
+import {useTranslation} from '../../../../i18n/hooks/useTranslation'
+import {useTableContext} from './TableProvider'
+import {type HeaderProps, type TableHeaderProps} from './types'
+
+const MotionIcon = motion.create(ArrowUpIcon)
+
+// Column headers are semibold so the header row reads clearly as a header, distinct from the row
+// content below — especially on sparse, single-column tables. For sortable headers (rendered as a
+// button, whose label weight isn't a prop) the same weight is forced onto the inner Text.
+const HeaderSortButton = styled(Button)`
+  & [data-ui='Text'] {
+    font-weight: 600;
+  }
+`
+
+const BasicHeader = ({text}: {text: string}) => (
+  <Box padding={2}>
+    <Text muted size={1} weight="semibold">
+      {text}
+    </Text>
+  </Box>
+)
+
+const SortHeaderButton = ({
+  header,
+  text,
+  paddingLeft,
+}: Omit<ButtonProps, 'text'> &
+  HeaderProps & {
+    text: string
+  }) => {
+  const {sort, setSortColumn} = useTableContext()
+  const sortIcon = useMemo(
+    () => (
+      <MotionIcon
+        initial={false}
+        animate={{rotate: sort?.direction === 'asc' ? 0 : 180}}
+        transition={{duration: 0.25, ease: 'easeInOut'}}
+      />
+    ),
+    [sort?.direction],
+  )
+
+  return (
+    <HeaderSortButton
+      iconRight={header.sorting && sort?.column === header.id ? sortIcon : undefined}
+      onClick={() => setSortColumn(String(header.id))}
+      mode="bleed"
+      size="default"
+      // Optional left-inset override so a header label can line up with content that is inset less
+      // than the default button padding (e.g. an 8px cell). Defaults to the button's own padding.
+      paddingLeft={paddingLeft}
+      text={text}
+    />
+  )
+}
+
+const TableHeaderSearch = ({
+  headerProps,
+  searchDisabled,
+  placeholder,
+}: HeaderProps & {placeholder?: string}) => {
+  const {t} = useTranslation()
+  const {setSearchTerm, searchTerm} = useTableContext()
+
+  return (
+    <Flex
+      {...headerProps}
+      flexBasis="0%"
+      flexGrow={1}
+      paddingY={2}
+      paddingRight={3}
+      flexDirection="column"
+    >
+      <TextInput
+        border={false}
+        fontSize={1}
+        icon={SearchIcon}
+        placeholder={placeholder || t('search.placeholder')}
+        radius={3}
+        value={searchTerm || ''}
+        disabled={searchDisabled}
+        onChange={(event) => setSearchTerm(event.currentTarget.value)}
+        onClear={() => setSearchTerm('')}
+        clearButton={!!searchTerm}
+      />
+    </Flex>
+  )
+}
+
+const STICKY_HEADER_STYLE: CSSProperties = {position: 'sticky', top: 0, zIndex: 1}
+
+/**
+ *
+ * @internal
+ */
+export const TableHeader = ({headers, searchDisabled}: TableHeaderProps) => {
+  return (
+    <Card as="thead" borderBottom style={STICKY_HEADER_STYLE}>
+      <Flex
+        as="tr"
+        style={{
+          paddingInline: 'var(--tableInlinePadding)',
+        }}
+      >
+        {headers.map(
+          ({header: Header, style, width, id, sorting}) =>
+            !!Header && (
+              <Header
+                key={String(id)}
+                headerProps={{
+                  as: 'th',
+                  id: String(id),
+                  style: {...style, width: width || undefined},
+                }}
+                header={{id, sorting}}
+                searchDisabled={searchDisabled}
+              />
+            ),
+        )}
+      </Flex>
+    </Card>
+  )
+}
+
+export const Headers = {
+  SortHeaderButton,
+  TableHeaderSearch,
+  BasicHeader,
+}
