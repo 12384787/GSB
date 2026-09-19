@@ -1,0 +1,1 @@
+https://github.com/Checkmk/checkmk/archive/refs/heads/main.zip

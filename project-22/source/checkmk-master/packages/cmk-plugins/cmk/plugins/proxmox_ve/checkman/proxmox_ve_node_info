@@ -1,0 +1,14 @@
+title: Proxmox VE: Node Info
+agents: proxmox_ve
+catalog: os/misc
+license: GPLv2
+distribution: check_mk
+description:
+ This check monitors a Proxmox VE node's status and subscription status. The service state for each
+ status can be individually configured in the ruleset (OK, WARN, CRIT). By default, node status
+ "online" and subscription statuses "new" and "active" are considered OK, while other statuses
+ trigger appropriate warning or critical states.
+ It shows the node status, subscription status and time until expiration, Proxmox VE version and number of hosted VMs.
+
+discovery:
+ One service per system is created.

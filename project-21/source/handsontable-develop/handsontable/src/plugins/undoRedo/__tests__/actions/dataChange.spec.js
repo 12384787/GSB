@@ -1,0 +1,72 @@
+describe('UndoRedo -> DataChange action', () => {
+  const id = 'testContainer';
+
+  beforeEach(function() {
+    this.$container = $(`<div id="${id}"></div>`).appendTo('body');
+  });
+
+  afterEach(function() {
+    if (this.$container) {
+      destroy();
+      this.$container.remove();
+    }
+  });
+
+  it('should have defined correct action properties', async() => {
+    const afterUndo = jasmine.createSpy('afterUndo');
+
+    handsontable({
+      data: createSpreadsheetData(5, 5),
+      rowHeaders: true,
+      colHeaders: true,
+      afterUndo,
+    });
+
+    await setDataAtCell(1, 2, 'test');
+
+    getPlugin('undoRedo').undo();
+
+    expect(afterUndo).toHaveBeenCalledWith({
+      actionType: 'change',
+      changes: [[1, 2, 'C2', 'test']],
+      // The physical row of each entry in `changes`. This is what the replay addresses, so that a
+      // filter or a trim applied between the edit and the undo cannot send it to another row.
+      physicalRows: [1],
+      selected: [[1, 2]],
+      countCols: 5,
+      countRows: 5,
+      // The undo measures how far the change grew the dataset against this, not against
+      // `countRows` - that one counts only the rows a filter or a trim leaves visible.
+      countSourceRows: 5,
+      // Merge areas the change destroyed. Empty here: the MergeCells plugin is not enabled, and an
+      // ordinary edit destroys no merge even when it is.
+      mergedCells: [],
+    });
+  });
+
+  it('should undo and redo the change when the async validator is used', async() => {
+    handsontable({
+      data: createSpreadsheetData(5, 5),
+      validator: (value, callback) => {
+        setTimeout(() => {
+          callback(false);
+        }, 5);
+      }
+    });
+
+    await setDataAtCell([[4, 0, 'x'], [5, 0, 'y'], [6, 0, 'z']]);
+    await sleep(64); // wait for async validation
+
+    getPlugin('undoRedo').undo();
+
+    await sleep(64); // wait for async validation
+
+    expect(getDataAtCol(0)).toEqual(['A1', 'A2', 'A3', 'A4', 'A5']);
+
+    getPlugin('undoRedo').redo();
+
+    await sleep(64); // wait for async validation
+
+    expect(getDataAtCol(0)).toEqual(['A1', 'A2', 'A3', 'A4', 'x', 'y', 'z']);
+  });
+});

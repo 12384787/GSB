@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import datetime
+import json
+
+import pytest
+from polyfactory.factories import TypedDictFactory
+
+from cmk.agent_based.v2 import Metric, Result, Service, State
+from cmk.plugins.cisco_meraki.agent_based.cisco_meraki_org_appliance_uplinks import (
+    check_appliance_uplinks,
+    CheckParams,
+    discover_appliance_uplinks,
+    parse_appliance_uplinks,
+)
+from cmk.plugins.cisco_meraki.lib.schema import UplinkStatuses
+
+
+class _UplinkStatusesFactory(TypedDictFactory[UplinkStatuses]):
+    __check_model__ = False
+
+    @classmethod
+    def lastReportedAt(cls) -> str:
+        return datetime.datetime.now().strftime("%Y-%m-%d")
+
+
+def test_discover_appliance_uplinks() -> None:
+    uplinks = _UplinkStatusesFactory.build(uplinks=[{"interface": "wan1"}])
+    string_table = [[f"[{json.dumps(uplinks)}]"]]
+    section = parse_appliance_uplinks(string_table)
+    assert section
+
+    value = list(discover_appliance_uplinks(section))
+    expected = [Service(item="wan1")]
+
+    assert value == expected
+
+
+@pytest.fixture
+def params() -> CheckParams:
+    return CheckParams(
+        status_map={
+            "active": State.OK.value,
+            "ready": State.OK.value,
+            "connecting": State.WARN.value,
+            "not_connected": State.WARN.value,
+            "failed": State.CRIT.value,
+        },
+        show_traffic=False,
+    )
+
+
+def test_check_appliance_uplinks(params: CheckParams) -> None:
+    uplinks = _UplinkStatusesFactory.build(
+        networkName="main",
+        highAvailability={"enabled": "true", "role": "primary"},
+        usageByInterface={"wan1": {"received": 200, "sent": 100}},
+        uplinks=[
+            {
+                "interface": "wan1",
+                "status": "active",
+                "ip": "1.2.3.4",
+                "gateway": "1.2.3.5",
+                "publicIp": "192.0.2.2",
+                "primaryDns": "8.8.8.8",
+                "secondaryDns": "8.8.4.4",
+                "ipAssignedBy": "static",
+            }
+        ],
+    )
+    string_table = [[f"[{json.dumps(uplinks)}]"]]
+    section = parse_appliance_uplinks(string_table)
+    assert section
+
+    value = list(check_appliance_uplinks("wan1", params, section))
+    expected = [
+        Result(state=State.OK, summary="Status: active"),
+        Result(state=State.OK, summary="IP: 1.2.3.4"),
+        Result(state=State.OK, summary="Public IP: 192.0.2.2"),
+        Result(state=State.OK, notice="Network: main"),
+        Result(state=State.OK, notice="H/A enabled: True"),
+        Result(state=State.OK, notice="H/A role: primary"),
+        Result(state=State.OK, notice="Gateway: 1.2.3.5"),
+        Result(state=State.OK, notice="IP assigned by: static"),
+        Result(state=State.OK, notice="Primary DNS: 8.8.8.8"),
+        Result(state=State.OK, notice="Secondary DNS: 8.8.4.4"),
+    ]
+
+    assert value == expected
+
+
+def test_check_appliance_uplinks_not_connected_edge_case(params: CheckParams) -> None:
+    uplinks = _UplinkStatusesFactory.build(
+        uplinks=[{"interface": "wan1", "status": "not connected"}]
+    )
+    string_table = [[f"[{json.dumps(uplinks)}]"]]
+    section = parse_appliance_uplinks(string_table)
+    assert section
+
+    params["status_map"]["not_connected"] = State.OK.value
+    value, *_ = list(check_appliance_uplinks("wan1", params, section))
+    expected = Result(state=State.OK, summary="Status: not connected")
+
+    assert value == expected
+
+
+def test_check_appliance_uplinks_show_traffic_active(params: CheckParams) -> None:
+    params["show_traffic"] = True
+    uplinks = _UplinkStatusesFactory.build(
+        usageByInterface={"wan1": {"received": 200, "sent": 100}},
+        uplinks=[{"interface": "wan1", "status": "active"}],
+    )
+    string_table = [[f"[{json.dumps(uplinks)}]"]]
+    section = parse_appliance_uplinks(string_table)
+    assert section
+
+    value = set(check_appliance_uplinks("wan1", params, section))
+    expected = {
+        Result(state=State.OK, summary="In: 26.7 Bit/s"),
+        Metric("if_in_bps", 26.666666666666668),
+        Result(state=State.OK, summary="Out: 13.3 Bit/s"),
+        Metric("if_out_bps", 13.333333333333334),
+    }
+
+    assert value & expected == expected
+
+
+def test_check_appliance_uplinks_zero_usage(params: CheckParams) -> None:
+    params["show_traffic"] = True
+    uplinks = _UplinkStatusesFactory.build(
+        usageByInterface={"wan1": {"received": 0, "sent": 0}},
+        uplinks=[{"interface": "wan1", "status": "active"}],
+    )
+    string_table = [[f"[{json.dumps(uplinks)}]"]]
+    section = parse_appliance_uplinks(string_table)
+    assert section
+
+    value = set(check_appliance_uplinks("wan1", params, section))
+    expected = {
+        Result(state=State.OK, summary="In: 0.00 Bit/s"),
+        Metric("if_in_bps", 0.0),
+        Result(state=State.OK, summary="Out: 0.00 Bit/s"),
+        Metric("if_out_bps", 0.0),
+    }
+
+    assert expected & value == expected
+
+
+def test_check_appliance_uplinks_bandwidth_works_with_ready_state(params: CheckParams) -> None:
+    params["show_traffic"] = True
+    uplinks = _UplinkStatusesFactory.build(
+        usageByInterface={"wan1": {"received": 0, "sent": 0}},
+        uplinks=[{"interface": "wan1", "status": "ready"}],
+    )
+    string_table = [[f"[{json.dumps(uplinks)}]"]]
+    section = parse_appliance_uplinks(string_table)
+    assert section
+
+    value = set(check_appliance_uplinks("wan1", params, section))
+    expected = {
+        Result(state=State.OK, summary="In: 0.00 Bit/s"),
+        Metric("if_in_bps", 0.0),
+        Result(state=State.OK, summary="Out: 0.00 Bit/s"),
+        Metric("if_out_bps", 0.0),
+    }
+
+    assert expected & value == expected

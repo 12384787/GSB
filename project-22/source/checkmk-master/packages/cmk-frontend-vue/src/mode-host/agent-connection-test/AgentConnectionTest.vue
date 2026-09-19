@@ -1,0 +1,779 @@
+<!--
+Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import { type AgentSlideout } from 'cmk-shared-typing/typescript/agent_slideout'
+import {
+  type ModeHostAgentConnectionMode,
+  type ModeHostServerPerSite,
+  type ModeHostSite
+} from 'cmk-shared-typing/typescript/mode_host'
+import CmkAlertBox from 'cmk-ui-library/components/CmkAlertBox.vue'
+import CmkButton from 'cmk-ui-library/components/CmkButton'
+import CmkIcon from 'cmk-ui-library/components/CmkIcon'
+import CmkLabel from 'cmk-ui-library/components/CmkLabel.vue'
+import CmkSlideInDialog from 'cmk-ui-library/components/CmkSlideInDialog.vue'
+import CmkSpace from 'cmk-ui-library/components/CmkSpace.vue'
+import CmkParagraph from 'cmk-ui-library/components/typography/CmkParagraph.vue'
+import CmkInput from 'cmk-ui-library/components/user-input/CmkInput.vue'
+import {
+  DEFAULT_AGENT_RECEIVER_PORT,
+  fetchAgentReceiverPort as fetchAgentReceiverPortApi
+} from 'cmk-ui-library/lib/agentReceiverPort'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import useId from 'cmk-ui-library/lib/useId'
+import type { Ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
+
+import AgentSlideOutContent from '@/mode-host/agent-connection-test/components/AgentSlideOutContent.vue'
+import { resolveSiteId } from '@/mode-host/lib/site'
+
+defineOptions({
+  inheritAttrs: false
+})
+
+const { _t } = usei18n()
+
+const agentPortId = useId()
+
+interface Props {
+  formElement: HTMLFormElement
+  changeTagAgent: HTMLInputElement
+  tagAgent: HTMLSelectElement
+  tagAgentDefault: HTMLDivElement
+  hostnameInputElement: HTMLInputElement
+  ipv4InputElement: HTMLInputElement
+  ipv4InputButtonElement: HTMLInputElement
+  ipv6InputElement: HTMLInputElement
+  ipv6InputButtonElement: HTMLInputElement
+  siteSelectElement: HTMLSelectElement
+  siteInputElement: HTMLInputElement
+  siteDefaultElement: HTMLDivElement
+  ipAddressFamilySelectElement: HTMLSelectElement
+  ipAddressFamilyInputElement: HTMLInputElement
+  cmkAgentConnectionModeSelectElement: HTMLSelectElement | null
+  relayInputButtonElement: HTMLInputElement | null
+  relaySelectElement: HTMLSelectElement | null
+  relayDefaultElement: HTMLDivElement | null
+  defaultRelayIdHash: string
+  cmkAgentConnectionModeDefaultElement: HTMLDivElement | null
+  cmkAgentConnectionModeInputButtonElement: HTMLInputElement | null
+  sites: Array<ModeHostSite>
+  serverPerSite: Array<ModeHostServerPerSite>
+  agentConnectionModes: Array<ModeHostAgentConnectionMode>
+  agentSlideout: AgentSlideout
+  setupError: boolean
+  isRegistered: boolean
+}
+
+const props = defineProps<Props>()
+
+const slideInOpen = ref(false)
+
+const showTest = ref(true)
+const isPushMode = ref(false)
+
+function checkRelay(): boolean {
+  if (!props.relayInputButtonElement || !props.relaySelectElement || !props.relayDefaultElement) {
+    return false
+  }
+  return (
+    (props.relayInputButtonElement.checked === true &&
+      props.relaySelectElement.value !== props.defaultRelayIdHash) ||
+    (props.relayInputButtonElement.checked === false &&
+      !props.relayDefaultElement.textContent?.includes('No relay'))
+  )
+}
+
+const switchVisibility = () => {
+  showTest.value = true
+
+  if (
+    props.ipAddressFamilyInputElement.checked &&
+    props.ipAddressFamilySelectElement.value === 'ip-v4v6'
+  ) {
+    showTest.value = false
+    return
+  }
+  if (checkRelay()) {
+    showTest.value = false
+    return
+  }
+
+  if (props.ipAddressFamilyInputElement.checked && props.ipAddressFamilySelectElement.value) {
+    isLoading.value = false
+    isSuccess.value = false
+    isError.value = false
+    if (props.setupError) {
+      setupErrorActive.value = false
+    }
+    ipV6.value = ''
+    ipV4.value = ''
+  }
+
+  if (props.changeTagAgent.checked) {
+    showTest.value = props.tagAgent.value === 'all-agents' || props.tagAgent.value === 'cmk-agent'
+    return
+  }
+  /* TODO: Not the best solution but we have no value here */
+  showTest.value = !props.tagAgentDefault.textContent?.includes('no Checkmk agent')
+}
+
+function checkPushMode() {
+  const agentConnectionModeHash = props.cmkAgentConnectionModeSelectElement?.value
+  const agentConnectionMode =
+    props.agentConnectionModes.find((mode) => mode.id_hash === agentConnectionModeHash)?.mode ?? ''
+  if (props.cmkAgentConnectionModeInputButtonElement?.checked) {
+    isPushMode.value = agentConnectionMode === 'push-agent'
+    return
+  }
+  if (props.cmkAgentConnectionModeDefaultElement) {
+    isPushMode.value = props.cmkAgentConnectionModeDefaultElement.textContent?.includes('Push')
+    return
+  }
+  isPushMode.value = agentConnectionMode === 'push-agent'
+}
+
+const hostname = ref(props.hostnameInputElement.value || '')
+const ipV4Selected = ref(false)
+const ipV6Selected = ref(false)
+const siteId = ref(
+  resolveSiteId(
+    props.siteInputElement,
+    props.siteSelectElement,
+    props.siteDefaultElement,
+    props.sites
+  )
+)
+const siteServer = ref(
+  props.serverPerSite.find((item) => item.site_id === siteId.value)?.server ?? ''
+)
+const agentReceiverPort = ref(DEFAULT_AGENT_RECEIVER_PORT)
+const agentReceiverPortFetched = ref(false)
+const agentReceiverPortIsDefault = ref(false)
+
+async function fetchAgentReceiverPort(forSiteId: string) {
+  agentReceiverPortFetched.value = false
+  agentReceiverPortIsDefault.value = false
+  try {
+    const result = await fetchAgentReceiverPortApi(forSiteId)
+    agentReceiverPort.value = result.port
+    agentReceiverPortIsDefault.value = result.isDefault
+  } finally {
+    agentReceiverPortFetched.value = true
+  }
+}
+const ipV4 = ref(props.ipv4InputElement.value || '')
+const ipV6 = ref(props.ipv6InputElement.value || '')
+const targetElement = ref<HTMLElement>(
+  props.changeTagAgent.checked ? (props.tagAgent.parentNode as HTMLElement) : props.tagAgentDefault
+)
+const setupErrorActive = ref(props.setupError)
+
+function updateTargetElement() {
+  if (isPushMode.value) {
+    if (
+      props.cmkAgentConnectionModeInputButtonElement?.checked &&
+      props.cmkAgentConnectionModeSelectElement
+    ) {
+      targetElement.value = props.cmkAgentConnectionModeSelectElement.parentNode as HTMLElement
+    } else if (props.cmkAgentConnectionModeDefaultElement) {
+      targetElement.value = props.cmkAgentConnectionModeDefaultElement.parentNode as HTMLElement
+    } else if (props.cmkAgentConnectionModeSelectElement) {
+      targetElement.value = props.cmkAgentConnectionModeSelectElement.parentNode as HTMLElement
+    }
+  } else {
+    targetElement.value = props.changeTagAgent.checked
+      ? (props.tagAgent.parentNode as HTMLElement)
+      : props.tagAgentDefault
+  }
+}
+
+onMounted(() => {
+  checkPushMode()
+  switchVisibility()
+  updateTargetElement()
+  ipV4Selected.value = props.ipv4InputButtonElement.checked
+  ipV6Selected.value = props.ipv6InputButtonElement.checked
+  ipV4.value = props.ipv4InputElement.value || ''
+  ipV6.value = props.ipv6InputElement.value || ''
+  siteId.value = resolveSiteId(
+    props.siteInputElement,
+    props.siteSelectElement,
+    props.siteDefaultElement,
+    props.sites
+  )
+  siteServer.value = props.serverPerSite.find((item) => item.site_id === siteId.value)?.server ?? ''
+
+  if (sessionStorage.getItem('reopenSlideIn') === 'true') {
+    if (!props.setupError) {
+      slideInOpen.value = true
+      savedAgentInstalled.value = sessionStorage.getItem('slideInAgentInstalled') === 'true'
+    }
+    sessionStorage.removeItem('reopenSlideIn')
+    sessionStorage.removeItem('slideInAgentInstalled')
+  }
+
+  props.formElement.addEventListener('change', (e: Event) => {
+    switch (e.target) {
+      case props.formElement:
+      case props.changeTagAgent: {
+        checkPushMode()
+        switchVisibility()
+        updateTargetElement()
+
+        siteId.value = resolveSiteId(
+          props.siteInputElement,
+          props.siteSelectElement,
+          props.siteDefaultElement,
+          props.sites
+        )
+        siteServer.value =
+          props.serverPerSite.find((item) => item.site_id === siteId.value)?.server ?? ''
+        agentReceiverPortFetched.value = false
+
+        break
+      }
+      case props.cmkAgentConnectionModeInputButtonElement: {
+        checkPushMode()
+        switchVisibility()
+        updateTargetElement()
+        break
+      }
+      case props.ipAddressFamilyInputElement:
+      case props.relayInputButtonElement: {
+        switchVisibility()
+        break
+      }
+      case props.siteInputElement: {
+        siteId.value = resolveSiteId(
+          props.siteInputElement,
+          props.siteSelectElement,
+          props.siteDefaultElement,
+          props.sites
+        )
+        siteServer.value =
+          props.serverPerSite.find((item) => item.site_id === siteId.value)?.server ?? ''
+        agentReceiverPortFetched.value = false
+        break
+      }
+      case props.ipv4InputButtonElement: {
+        if (!ipV4Selected.value) {
+          ipV4.value = ''
+        }
+        break
+      }
+      case props.ipv6InputButtonElement: {
+        if (!ipV6Selected.value) {
+          ipV6.value = ''
+        }
+        break
+      }
+    }
+  })
+  // Add ipaddress validation
+  function watchInput(input: HTMLInputElement, targetRef: Ref<string>) {
+    input.addEventListener('input', () => {
+      targetRef.value = input.value
+      isLoading.value = false
+      isSuccess.value = false
+      isError.value = false
+      if (props.setupError) {
+        setupErrorActive.value = false
+      }
+    })
+  }
+
+  function watchCheckbox(
+    checkbox: HTMLInputElement,
+    checkboxRef: Ref<boolean>,
+    valueRef: Ref<string>,
+    inputElement: HTMLInputElement
+  ) {
+    checkbox.addEventListener('change', () => {
+      checkboxRef.value = checkbox.checked
+
+      if (checkbox.checked) {
+        valueRef.value = inputElement.value
+      }
+
+      isLoading.value = false
+      isSuccess.value = false
+      isError.value = false
+      if (props.setupError) {
+        setupErrorActive.value = false
+      }
+    })
+  }
+
+  watchInput(props.hostnameInputElement, hostname)
+  watchInput(props.ipv4InputElement, ipV4)
+  watchInput(props.ipv6InputElement, ipV6)
+  watchCheckbox(props.ipv4InputButtonElement, ipV4Selected, ipV4, props.ipv4InputElement)
+  watchCheckbox(props.ipv6InputButtonElement, ipV6Selected, ipV6, props.ipv6InputElement)
+})
+
+const isLoading = ref(false)
+const isSuccess = ref(false)
+const isError = ref(false)
+const errorDetails = ref('')
+const savedAgentInstalled = ref(false)
+const tooltipText = computed(() => {
+  if (isLoading.value) {
+    return _t('Agent connection test running')
+  }
+  if (isSuccess.value) {
+    return _t('Agent connection successful')
+  }
+  if (isError.value) {
+    return _t(
+      'Connection failed, enter new hostname to check again or download and install the Checkmk agent.'
+    )
+  }
+  if (!hostname.value) {
+    return _t('Please enter a hostname to test Checkmk agent connection')
+  }
+  return _t('Test Checkmk agent connection')
+})
+const isNotRegistered = computed(() => {
+  if (savedAgentInstalled.value) {
+    return true
+  }
+  if (errorDetails.value.includes('controller not registered')) {
+    return true
+  }
+  return false
+})
+
+const slideOutTitle = computed(() => {
+  if (isPushMode.value) {
+    return _t('Install Checkmk agent (Push Mode)')
+  }
+  if (isNotRegistered.value) {
+    return _t('Register agent')
+  }
+  return _t('Install Checkmk agent')
+})
+
+type AutomationResponse = {
+  output: string
+  status_code: number
+}
+
+type AjaxResponse = {
+  result_code: number
+  result?: AutomationResponse
+}
+
+type AjaxOptions = {
+  method: 'POST' | 'GET'
+}
+
+async function callAjax(url: string, { method }: AjaxOptions): Promise<void> {
+  try {
+    const postDataRaw = new URLSearchParams({
+      host_name: hostname.value || '',
+      ipaddress: ipV4.value || ipV6.value || '',
+      address_family: props.ipAddressFamilySelectElement.value ?? 'ip-v4-only',
+      agent_port: String(agentPort.value),
+      timeout: '5',
+      site_id: siteId.value
+    })
+
+    const postData = postDataRaw.toString()
+
+    isLoading.value = true
+    isError.value = false
+    isSuccess.value = false
+
+    const res = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: postData
+    })
+
+    if (!res.ok) {
+      throw new Error(`Error: ${res.status}`)
+    }
+
+    const data: AjaxResponse = await res.json()
+
+    if (data.result?.status_code === 0) {
+      isSuccess.value = true
+    } else {
+      isError.value = true
+      errorDetails.value = data.result?.output ?? ''
+    }
+  } catch (err) {
+    console.error('Error:', err)
+    isError.value = true
+  } finally {
+    isLoading.value = false
+  }
+}
+
+// Use general way for AjaxCalls if available
+const startAjax = (): Promise<void> => {
+  isSuccess.value = false
+  isError.value = false
+  savedAgentInstalled.value = false
+  showSettings.value = false
+
+  return callAjax('wato_ajax_diag_cmk_agent.py', {
+    method: 'POST'
+  })
+}
+
+const reTestAgentTitle = _t('Re-test agent connection')
+const reTestAgentButton = _t('Re-test agent connection')
+const reTestAgentClick: () => Promise<void> = startAjax
+const openSlideoutClick: () => void = () => {
+  slideInOpen.value = true
+}
+
+watch(slideInOpen, (open) => {
+  if (open && !agentReceiverPortFetched.value && !props.agentSlideout.save_host) {
+    void fetchAgentReceiverPort(siteId.value)
+  }
+})
+
+interface ContainerValues {
+  header: string
+  error: string | null
+  txt: string
+  buttonOneTitle: string
+  buttonOneButton: string
+  buttonOneClick: () => void | Promise<void>
+  buttonTwoTitle: string | null
+  buttonTwoButton: string | null
+  buttonTwoClick: () => void | Promise<void>
+}
+
+const warnContainerValues = computed<ContainerValues>(() => {
+  let header: string
+  let txt: string
+  let error: string | null = errorDetails.value
+  let buttonOneTitle: string
+  let buttonOneButton: string
+  let buttonOneClick: () => void | Promise<void>
+  let buttonTwoTitle: string | null
+  let buttonTwoButton: string | null
+  let buttonTwoClick: () => void | Promise<void>
+
+  if (isNotRegistered.value) {
+    header = _t('Agent not registered')
+    error = null
+    txt = _t('The agent has been installed on the target system but has not yet been registered.')
+    buttonOneTitle = _t('Register agent')
+    buttonOneButton = _t('Register Checkmk agent')
+    buttonOneClick = openSlideoutClick
+    buttonTwoTitle = reTestAgentTitle
+    buttonTwoButton = reTestAgentButton
+    buttonTwoClick = reTestAgentClick
+  } else if (errorDetails.value.includes('is not providing it')) {
+    header = _t('TLS connection not provided')
+    error = null
+    txt = _t(
+      'The agent has been installed on the target system but is not providing a TLS connection.'
+    )
+    buttonOneTitle = _t('Provide TLS connection')
+    buttonOneButton = _t('Provide TLS connection')
+    buttonOneClick = openSlideoutClick
+    buttonTwoTitle = reTestAgentTitle
+    buttonTwoButton = reTestAgentButton
+    buttonTwoClick = reTestAgentClick
+  } else {
+    header = _t('Failed to connect to the Checkmk agent')
+    txt =
+      _t(`This can have different reasons. The Checkmk agent might not be installed, or communication may be blocked by firewall or network settings.
+If this host should be monitored via an agent, download and install the agent and check the connectivity.
+If not, you can ignore this message.`)
+    buttonOneTitle = _t('Download & install agent')
+    buttonOneButton = _t('Download Checkmk agent')
+    buttonOneClick = openSlideoutClick
+    buttonTwoTitle = reTestAgentTitle
+    buttonTwoButton = reTestAgentButton
+    buttonTwoClick = reTestAgentClick
+  }
+
+  return {
+    header,
+    error,
+    txt,
+    buttonOneTitle,
+    buttonOneButton,
+    buttonOneClick,
+    buttonTwoTitle,
+    buttonTwoButton,
+    buttonTwoClick
+  }
+})
+
+function onClose() {
+  slideInOpen.value = false
+  isError.value = false
+  if (!isPushMode.value) {
+    void startAjax()
+  }
+}
+const agentPort: Ref<number> = ref(6556)
+const showSettings = ref(false)
+</script>
+
+<template>
+  <Teleport v-if="showTest" :to="targetElement" defer>
+    <CmkButton
+      v-if="isPushMode && !props.isRegistered"
+      type="button"
+      :title="_t('Install & register agent')"
+      class="agent-test-button"
+      :disabled="!hostname"
+      @click="openSlideoutClick"
+    >
+      <CmkIcon
+        name="agents"
+        size="small"
+        :title="_t('Install & register agent')"
+        class="button-icon"
+      />
+      {{ _t('Install & register agent') }}
+    </CmkButton>
+
+    <template v-else-if="!isPushMode">
+      <span v-if="!isLoading && !isSuccess && !isError" class="test-controls">
+        <CmkButton
+          type="button"
+          :title="tooltipText"
+          class="agent-test-button"
+          :disabled="!hostname"
+          @click="startAjax"
+        >
+          <CmkIcon name="connection-tests" size="small" :title="tooltipText" class="button-icon" />
+          {{ _t('Test agent connection') }}
+        </CmkButton>
+
+        <button
+          type="button"
+          class="settings-toggle"
+          :class="{ disabled: !hostname }"
+          :disabled="!hostname"
+          :title="_t('Test settings')"
+          @click="showSettings = !showSettings"
+        >
+          <CmkIcon name="configuration" size="small" :title="_t('Test settings')" />
+        </button>
+
+        <div v-if="showSettings && !hostname" class="label-container disabled">
+          <CmkLabel :for="agentPortId"> {{ _t('Port') }}<CmkSpace size="small" /> </CmkLabel>
+          <CmkInput :id="agentPortId" v-model="agentPort" :disabled="true" type="number" />
+        </div>
+        <div v-else-if="showSettings && hostname" class="label-container enabled">
+          <CmkLabel :for="agentPortId"> {{ _t('Port') }}<CmkSpace size="small" /> </CmkLabel>
+          <CmkInput :id="agentPortId" v-model="agentPort" type="number" />
+        </div>
+      </span>
+
+      <CmkAlertBox v-if="isLoading" variant="loading" size="small" class="loading-container">
+        {{ _t('Testing agent connection ...') }}
+      </CmkAlertBox>
+
+      <CmkAlertBox v-if="isSuccess" variant="success" size="small" class="success-container">
+        {{ _t('Successfully connected to agent.') }}
+        <span class="success-button-container">
+          <a href="#" @click.prevent="startAjax">{{ _t('Re-test agent connection') }}</a>
+
+          <button
+            type="button"
+            class="settings-toggle"
+            :title="_t('Test settings')"
+            @click="showSettings = !showSettings"
+          >
+            <CmkIcon name="configuration" size="small" :title="_t('Test settings')" />
+          </button>
+
+          <div v-if="showSettings" class="label-container enabled">
+            <CmkLabel :for="agentPortId"> {{ _t('Port') }}<CmkSpace size="small" /> </CmkLabel>
+            <CmkInput :id="agentPortId" v-model="agentPort" type="number" />
+          </div>
+        </span>
+      </CmkAlertBox>
+
+      <CmkAlertBox
+        v-if="isError"
+        variant="warning"
+        size="small"
+        class="warn-container"
+        :heading="warnContainerValues.header"
+      >
+        <div class="warn-txt-container">
+          <CmkParagraph v-if="warnContainerValues.error">
+            {{ _t('Error: ') }} {{ warnContainerValues.error }}<br /><br />
+          </CmkParagraph>
+          <CmkParagraph>
+            {{ warnContainerValues.txt }}
+          </CmkParagraph>
+          <span class="warn-button-container">
+            <CmkButton
+              type="button"
+              :title="warnContainerValues.buttonOneTitle"
+              class="agent-test-button alert-box-button"
+              @click="warnContainerValues.buttonOneClick"
+            >
+              {{ warnContainerValues.buttonOneButton }}
+            </CmkButton>
+            <CmkButton
+              v-if="warnContainerValues.buttonTwoTitle"
+              type="button"
+              :title="warnContainerValues.buttonTwoTitle"
+              class="agent-test-button alert-box-button"
+              @click="warnContainerValues.buttonTwoClick"
+            >
+              {{ warnContainerValues.buttonTwoButton }}
+            </CmkButton>
+
+            <button
+              type="button"
+              class="settings-toggle"
+              :title="_t('Test settings')"
+              @click="showSettings = !showSettings"
+            >
+              <CmkIcon name="configuration" size="small" :title="_t('Test settings')" />
+            </button>
+
+            <div v-if="showSettings" class="label-container enabled">
+              <CmkLabel :for="agentPortId"> {{ _t('Port') }}<CmkSpace size="small" /> </CmkLabel>
+              <CmkInput :id="agentPortId" v-model="agentPort" type="number" />
+            </div>
+          </span>
+        </div>
+      </CmkAlertBox>
+    </template>
+
+    <CmkSlideInDialog
+      :header="{
+        title: slideOutTitle,
+        closeButton: true
+      }"
+      :open="slideInOpen"
+      @close="slideInOpen = false"
+    >
+      <AgentSlideOutContent
+        :all-agents-url="agentSlideout.all_agents_url"
+        :host-name="hostname"
+        :site-id="siteId"
+        :site-server="siteServer"
+        :agent-receiver-port="agentReceiverPort"
+        :agent-receiver-port-is-default="agentReceiverPortIsDefault"
+        :agent-install-cmds="agentSlideout.agent_install_cmds"
+        :agent-registration-cmds="agentSlideout.agent_registration_cmds"
+        :agent-status-cmds="agentSlideout.agent_status_cmds"
+        :legacy-agent-url="agentSlideout.legacy_agent_url"
+        :save-host="agentSlideout.save_host"
+        :host-exists="agentSlideout.host_exists ?? false"
+        :setup-error="setupErrorActive"
+        :close-button-title="isPushMode ? _t('Close slideout') : _t('Close & test connection')"
+        :agent-installed="isNotRegistered"
+        :is-push-mode="isPushMode"
+        :user-settings-url="agentSlideout.user_settings_url"
+        :unbaked-fallback="agentSlideout.unbaked_fallback ?? null"
+        @close="onClose"
+      />
+    </CmkSlideInDialog>
+  </Teleport>
+</template>
+
+<style scoped>
+/* stylelint-disable checkmk/vue-bem-naming-convention */
+
+button {
+  border: none;
+  margin: 0;
+  padding: 0;
+
+  .button-icon {
+    margin-right: var(--spacing-half);
+  }
+}
+
+.test-controls {
+  display: inline-flex;
+  align-items: center;
+  height: var(--form-field-height);
+  margin-left: var(--spacing-half);
+}
+
+.agent-test-button {
+  height: var(--form-field-height);
+
+  &.alert-box-button {
+    margin-left: 0;
+    margin-right: var(--spacing-half);
+  }
+}
+
+.settings-toggle {
+  background: none;
+  cursor: pointer;
+  margin-left: var(--spacing-half);
+  opacity: 0.6;
+
+  &:hover {
+    opacity: 1;
+  }
+
+  &.disabled {
+    cursor: default;
+    opacity: 0.3;
+  }
+}
+
+.label-container {
+  display: inline-flex;
+  align-items: center;
+  margin-left: var(--spacing-half);
+  position: relative;
+  top: var(--dimension-2);
+}
+
+.label-container.disabled {
+  opacity: 0.5;
+}
+
+.warn-container,
+.loading-container,
+.success-container {
+  display: inline-flex;
+  color: var(--font-color);
+  margin: 0 0 0 var(--dimension-4);
+}
+
+.success-container {
+  .success-button-container {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    margin-left: var(--spacing-half);
+  }
+}
+
+.warn-container {
+  padding: var(--dimension-4) var(--dimension-5);
+
+  .warn-txt-container {
+    white-space: pre-line;
+    display: inline-flex;
+    flex-direction: column;
+  }
+
+  .warn-button-container {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    margin: var(--spacing-half) 0 0;
+  }
+}
+</style>

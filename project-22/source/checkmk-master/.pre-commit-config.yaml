@@ -1,0 +1,198 @@
+#
+# This is the configuration file for the pre-commit framework.
+# To use this you need to install it separately and activate it for your repository.
+# To do so issue the following commands:
+#
+#     pip3 install pre-commit
+#
+# and in your repository
+#
+#     pre-commit install
+#
+# That's it. You're done.
+#
+# Stage overview:
+#   pre-commit  checks + format / lint / mypy / tests scoped to changed packages
+#   pre-push    (nothing — all checks run at pre-commit)
+#   manual      full CI-equivalent checks across all packages
+#               run via: pre-commit run --hook-stage manual
+#
+default_stages:
+    - pre-commit
+    - pre-push
+    - manual
+repos:
+    - repo: https://github.com/pre-commit/pre-commit-hooks
+      rev: v4.6.0
+      hooks:
+          - id: trailing-whitespace
+            exclude: ^.*\.patch$
+          - id: check-merge-conflict
+            types: [file]
+          - id: check-yaml # pre-commit cannot parse utf-16 files
+            exclude: |
+                (?x)(
+                    ^agents/wnx/test_files/config/check_mk_dev_malformed.yml|
+                    ^agents/wnx/test_files/config/check_mk_dev_utf16.yml
+                )
+          - id: end-of-file-fixer
+            exclude: '.werks/.*|.*\.patch$'
+          - id: fix-encoding-pragma
+            args: ["--remove"]
+            exclude: |
+                (?x)^(
+                    ^agents/plugins/|
+                    ^non-free/packages/cmk-update-agent/|
+                    ^tests/agent-plugin-unit/
+                )
+    - repo: https://github.com/gitleaks/gitleaks
+      rev: v8.16.1
+      hooks:
+          - id: gitleaks
+    - repo: local
+      hooks:
+          # ------------------------------------------------------------------ #
+          # pre-commit: fast per-file checks                                    #
+          # ------------------------------------------------------------------ #
+          - id: check-cmk-namespace
+            name: Check cmk namespace package
+            language: script
+            entry: .pre-commit-scripts/check-cmk-namespace
+            types: [file, python]
+            require_serial: true
+            stages: [pre-commit, manual]
+          - id: licence
+            name: Check licence headers
+            entry: .pre-commit-scripts/check-licence
+            language: script
+            types: [file, python]
+            require_serial: true
+            stages: [pre-commit, manual]
+          - id: qa-test-data submodule
+            name: Check qa-test-data submodule commit-id is not updated
+            entry: .pre-commit-scripts/check-qa-test-data
+            language: script
+            stages: [pre-commit, manual]
+          - id: requirements-locking
+            name: requirements locking
+            entry: bazel test //:requirements_test
+            pass_filenames: false
+            language: system
+            files: ^requirements.*\.txt$
+            verbose: true
+            require_serial: true
+            stages: [pre-commit, manual]
+          # Formats all changed files in one pass (Python via ruff, TOML via taplo,
+          # Bazel files via buildifier, etc.).  Replaces ruff-format, taplo, and
+          # buildifier_format with a single Bazel-native invocation.
+          - id: format
+            name: Format changed files
+            entry: bazel run //:format --
+            language: system
+            pass_filenames: true
+            require_serial: true
+            stages: [pre-commit]
+
+          # ------------------------------------------------------------------ #
+          # pre-commit: Bazel lint / mypy / tests scoped to changed packages  #
+          #                                                                     #
+          # Each script walks up the directory tree to find the owning Bazel   #
+          # package for every changed file, then runs the command on only      #
+          # those packages — avoiding full-graph analysis.                      #
+          # ------------------------------------------------------------------ #
+          - id: lint
+            name: Lint changed packages
+            entry: .pre-commit-scripts/run-lint-bazel
+            language: script
+            pass_filenames: true
+            require_serial: true
+            stages: [pre-commit]
+          - id: mypy
+            name: Check types in changed packages
+            entry: .pre-commit-scripts/run-mypy-bazel
+            language: script
+            types: [file, python]
+            pass_filenames: true
+            require_serial: true
+            stages: [pre-commit]
+          - id: unittest
+            name: Unit tests for changed packages
+            entry: .pre-commit-scripts/run-unittests-bazel
+            language: script
+            types: [file, python]
+            pass_filenames: true
+            require_serial: true
+            verbose: true
+            stages: [pre-commit]
+          # Bazel files only changed: fix lint issues (load ordering, unused loads, etc.)
+          # Uses //:buildifier which embeds --lint=fix, going beyond the formatting-only
+          # pass already done by the format hook above.
+          - id: buildifier_lint
+            name: Lint bazel files
+            entry: bazel run //:buildifier
+            language: system
+            types: ["bazel", "file", "non-executable", "text"]
+            verbose: true
+            require_serial: true
+            pass_filenames: false
+            stages: [pre-commit, manual]
+
+          # ------------------------------------------------------------------ #
+          # manual: full CI-equivalent checks across the entire repo            #
+          # These match .github/workflows/pr.yaml and stages.yml exactly.      #
+          # ------------------------------------------------------------------ #
+          - id: format-check
+            name: Run complete format check
+            entry: bazel run //:format.check
+            pass_filenames: false
+            verbose: true
+            language: system
+            require_serial: true
+            stages: [manual]
+          - id: lint-full
+            name: Lint full repository
+            entry: bazel lint --fixes=false ...
+            language: system
+            pass_filenames: false
+            require_serial: true
+            stages: [manual]
+          - id: mypy-full
+            name: Check types full repository
+            entry: bazel build --config=mypy ...
+            language: system
+            pass_filenames: false
+            require_serial: true
+            stages: [manual]
+          - id: unittest-full
+            name: Unit tests full repository
+            entry: bazel test ...
+            language: system
+            pass_filenames: false
+            require_serial: true
+            verbose: true
+            stages: [manual]
+          - id: sphinx
+            name: Sphinx Documentation
+            entry: make -C doc/documentation html
+            files: ^doc/documentation/.*(rst|puml)$
+            pass_filenames: false
+            language: script
+            types: [file]
+            require_serial: true
+            stages: [manual]
+          - id: doctest
+            name: Doctests
+            entry: .pre-commit-scripts/run-doctests
+            language: script
+            types: [file, python]
+            verbose: true
+            require_serial: true
+            stages: [manual]
+          - id: bandit
+            name: Run bandit
+            # -l level low -ll = level medium -lll level high
+            entry: scripts/run-uvenv bandit --config pyproject.toml -ll
+            language: script
+            types: [file, python]
+            require_serial: true
+            stages: [manual]

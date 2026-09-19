@@ -1,0 +1,44 @@
+@charset "UTF-8";
+/* stylelint-disable-next-line no-invalid-double-slash-comments */
+// Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+// This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+// conditions defined in the file COPYING, which is part of this source code package.
+
+/* Stylesheets for graphs */
+
+/* stylelint-disable-next-line selector-id-pattern */
+div#hover_menu div.cmk_graph_hover {
+  width: max-content;
+  max-width: 90vw;
+}
+
+/* The error placeholder from render_graph_error_html is the only server-rendered
+   "graph" box left; it used to take its frame from the legacy div.graph rule. */
+div.graph.brokengraph {
+  position: relative;
+  display: inline-block;
+  margin-bottom: 5px;
+  border: 1px solid $ux-theme-5;
+  box-shadow: none;
+
+  div.title {
+    padding: 8px;
+  }
+
+  pre {
+    padding: 0 8px 8px;
+    margin: 0;
+  }
+}
+
+div.color {
+  position: relative;
+  top: 1px;
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 8px;
+  vertical-align: top;
+  border: 1px solid;
+  border-radius: 0;
+}

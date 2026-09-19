@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+
+from collections.abc import Mapping
+from typing import Any
+
+from cmk.agent_based.v2 import (
+    any_of,
+    CheckPlugin,
+    CheckResult,
+    DiscoveryResult,
+    equals,
+    Metric,
+    Result,
+    Service,
+    SimpleSNMPSection,
+    SNMPTree,
+    State,
+    StringTable,
+)
+
+
+def discover_docsis_channels_downstream(section: StringTable) -> DiscoveryResult:
+    for line in section:
+        if line[1] != "0":
+            yield Service(item=line[0])
+
+
+def check_docsis_channels_downstream(
+    item: str, params: Mapping[str, Any], section: StringTable
+) -> CheckResult:
+    for channel_id, frequency, power in section:
+        if channel_id == item:
+            # Power
+            warn, crit = params["power"]
+            power_dbmv = float(int(power)) / 10
+            infotext = f"Power is {power_dbmv:.1f} dBmV"
+            levels = f" (Levels Warn/Crit at {warn} dBmV/ {crit} dBmV)"
+            state = State.OK
+            if power_dbmv <= crit:
+                state = State.CRIT
+                infotext += levels
+            elif power_dbmv <= warn:
+                state = State.WARN
+                infotext += levels
+            yield Result(state=state, summary=infotext)
+            yield Metric("power", power_dbmv, levels=(warn, crit))
+
+            # Check Frequency
+            frequency_mhz = float(frequency) / 1000000
+            infotext = f"Frequency is {frequency_mhz:.1f} MHz"
+            state = State.OK
+            if "frequency" in params:
+                warn, crit = params["frequency"]
+                levels = f" (warn/crit at {warn} MHz/ {crit} MHz)"
+                if frequency_mhz >= crit:
+                    state = State.CRIT
+                    infotext += levels
+                elif frequency_mhz >= warn:
+                    state = State.WARN
+                    infotext += levels
+            yield Result(state=state, summary=infotext)
+            yield Metric("frequency", frequency_mhz)
+            return
+
+    yield Result(state=State.UNKNOWN, summary="Channel information not found in SNMP data")
+
+
+# This Check is a subcheck because there is also a upstream version possible
+def parse_docsis_channels_downstream(string_table: StringTable) -> StringTable:
+    return string_table
+
+
+snmp_section_docsis_channels_downstream = SimpleSNMPSection(
+    name="docsis_channels_downstream",
+    parse_function=parse_docsis_channels_downstream,
+    detect=any_of(
+        equals(".1.3.6.1.2.1.1.2.0", ".1.3.6.1.4.1.4115.820.1.0.0.0.0.0"),
+        equals(".1.3.6.1.2.1.1.2.0", ".1.3.6.1.4.1.4115.900.2.0.0.0.0.0"),
+        equals(".1.3.6.1.2.1.1.2.0", ".1.3.6.1.4.1.9.1.827"),
+        equals(".1.3.6.1.2.1.1.2.0", ".1.3.6.1.4.1.4998.2.1"),
+        equals(".1.3.6.1.2.1.1.2.0", ".1.3.6.1.4.1.20858.2.600"),
+    ),
+    fetch=SNMPTree(
+        base=".1.3.6.1.2.1.10.127.1.1.1.1",
+        oids=["1", "2", "6"],
+    ),
+)
+
+check_plugin_docsis_channels_downstream = CheckPlugin(
+    name="docsis_channels_downstream",
+    service_name="Downstream Channel %s",
+    discovery_function=discover_docsis_channels_downstream,
+    check_function=check_docsis_channels_downstream,
+    check_ruleset_name="docsis_channels_downstream",
+    check_default_parameters={
+        "power": (5.0, 1.0),
+    },
+)
+
+# Information for future extensions of the check:
+# docsIfDownChannelId             1.3.6.1.2.1.10.127.1.1.1.1.1
+# docsIfDownChannelFrequency      1.3.6.1.2.1.10.127.1.1.1.1.2
+# docsIfDownChannelWidth          1.3.6.1.2.1.10.127.1.1.1.1.3
+# docsIfDownChannelModulation     1.3.6.1.2.1.10.127.1.1.1.1.4
+# docsIfDownChannelInterleave     1.3.6.1.2.1.10.127.1.1.1.1.5
+# docsIfDownChannelPower          1.3.6.1.2.1.10.127.1.1.1.1.6
+# docsIfDownChannelAnnex          1.3.6.1.2.1.10.127.1.1.1.1.7

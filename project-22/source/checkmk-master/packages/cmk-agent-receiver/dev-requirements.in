@@ -1,0 +1,6 @@
+pytest
+pytest-asyncio
+pytest-mock
+time-machine
+pytest-random-order
+pytest-socket

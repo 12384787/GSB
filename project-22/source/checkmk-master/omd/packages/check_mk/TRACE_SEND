@@ -1,0 +1,4 @@
+# Alias: Send traces
+# Menu: Add-ons
+# Description:
+#  Enable Checkmk to send OpenTelemetry traces.

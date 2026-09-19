@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from cmk.agent_based.v2 import Metric, Result, Service, State
+from cmk.plugins.oracle.agent_based.oracle_longactivesessions import (
+    check_oracle_longactivesessions,
+    discover_oracle_longactivesessions,
+    parse_oracle_longactivesessions,
+)
+
+INFO = [
+    ["orcl", "TUX12C", "Serial Number", "machine", "0", "osuser", "4800", "19", "0"],
+    [
+        "orcl",
+        "TUX12C",
+        "Another Serial Number",
+        "machine",
+        "0",
+        "another osuser",
+        "4800",
+        "500",
+        "0",
+    ],
+    [
+        "orcl1",
+        "TUX12C1",
+        "Yet Another Serial Number",
+        "another machine",
+        "0",
+        "yet another osuser",
+        "5800",
+        "500",
+        "0",
+    ],
+]
+
+
+def test_discovery() -> None:
+    assert list(discover_oracle_longactivesessions(parse_oracle_longactivesessions(INFO))) == [
+        Service(item="orcl"),
+        Service(item="orcl"),
+        Service(item="orcl1"),
+    ]
+
+
+_FAILURE_INFO = [["orcl", "FAILURE", "ORA-00942: table or view does not exist"]]
+
+
+def test_discovery_skips_failure_row() -> None:
+    assert not list(
+        discover_oracle_longactivesessions(parse_oracle_longactivesessions(_FAILURE_INFO))
+    )
+
+
+def test_check_failure_row_surfaces_error() -> None:
+    assert list(
+        check_oracle_longactivesessions(
+            "orcl", {"levels": (500, 1000)}, parse_oracle_longactivesessions(_FAILURE_INFO)
+        )
+    ) == [
+        Result(state=State.UNKNOWN, summary="ORA-00942: table or view does not exist"),
+    ]
+
+
+def test_check() -> None:
+    assert list(
+        check_oracle_longactivesessions(
+            "orcl", {"levels": (500, 1000)}, parse_oracle_longactivesessions(INFO)
+        )
+    ) == [
+        Result(state=State.OK, summary="2"),
+        Metric("count", 2, levels=(500, 1000)),
+        Result(
+            state=State.OK,
+            notice="Session (sid,serial,proc) TUX12C Another Serial Number 0 active for 8 minutes 20 seconds from machine osuser another osuser program 4800 sql_id 0 ",
+        ),
+    ]
+
+    result = list(
+        check_oracle_longactivesessions(
+            "orcl1", {"levels": (500, 1000)}, parse_oracle_longactivesessions(INFO)
+        )
+    )
+    assert result == [
+        Result(state=State.OK, summary="1"),
+        Metric("count", 1, levels=(500, 1000)),
+        Result(
+            state=State.OK,
+            notice="Session (sid,serial,proc) TUX12C1 Yet Another Serial Number 0 active for 8 minutes 20 seconds from another machine osuser yet another osuser program 5800 sql_id 0 ",
+        ),
+    ]
+
+
+_LEGACY_ERROR_INFO = [["orcl", "ORA-01017:", "invalid username/password"]]
+
+
+def test_discovery_skips_legacy_error_row() -> None:
+    assert not list(
+        discover_oracle_longactivesessions(parse_oracle_longactivesessions(_LEGACY_ERROR_INFO))
+    )
+
+
+def test_check_legacy_error_row_surfaces_error() -> None:
+    assert list(
+        check_oracle_longactivesessions(
+            "orcl", {"levels": (500, 1000)}, parse_oracle_longactivesessions(_LEGACY_ERROR_INFO)
+        )
+    ) == [
+        Result(
+            state=State.UNKNOWN,
+            summary='Found error in agent output "ORA-01017: invalid username/password"',
+        ),
+    ]

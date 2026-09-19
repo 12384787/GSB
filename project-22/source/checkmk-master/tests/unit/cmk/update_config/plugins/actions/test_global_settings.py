@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+# Copyright (C) 2021 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import logging
+
+import pytest
+from pytest_mock import MockerFixture
+
+from cmk.ccc.version import Edition
+from cmk.gui.config import active_config
+from cmk.gui.plugins.wato.utils import ConfigVariableGroupUserInterface
+from cmk.gui.wato._check_mk_configuration import ConfigVariableLogLevels
+from cmk.gui.watolib.config_domain_name import (
+    ConfigVariable,
+    ConfigVariableRegistry,
+)
+from cmk.gui.watolib.config_domains import ConfigDomainGUI
+from cmk.rulesets.v1.form_specs import String
+from cmk.update_config.plugins.actions import global_settings
+
+
+@pytest.mark.usefixtures("request_context")
+def test_update_global_config_migrates_form_spec_values(
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Disable variable filtering by known Checkmk variables
+    mocker.patch.object(
+        global_settings, "filter_unknown_settings", lambda global_config: global_config
+    )
+
+    ConfigVariableKey = ConfigVariable(
+        group=ConfigVariableGroupUserInterface,
+        primary_domain=ConfigDomainGUI,
+        ident="key",
+        form_spec=lambda context: String(migrate=lambda x: "new" if x == "old" else str(x)),  # noqa: ARG005
+    )
+
+    registry = ConfigVariableRegistry()
+    registry.register(ConfigVariableKey)
+    monkeypatch.setattr(global_settings, "config_variable_registry", registry)
+
+    assert global_settings.update_global_config(
+        logging.getLogger(),
+        {"key": "old"},
+        active_config,
+    ) == {"key": "new"}
+
+
+@pytest.mark.usefixtures("request_context")
+def test_update_global_config_migrates_renamed_log_level(
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # CMK-36979: the automations logger was renamed cmk.web.automations ->
+    # cmk.automations. A saved log_levels override must be rewritten during
+    # cmk-update-config so the configured level is preserved under the new key.
+
+    # Disable variable filtering by known Checkmk variables
+    mocker.patch.object(
+        global_settings, "filter_unknown_settings", lambda global_config: global_config
+    )
+
+    registry = ConfigVariableRegistry()
+    registry.register(ConfigVariableLogLevels(Edition.COMMUNITY))
+    monkeypatch.setattr(global_settings, "config_variable_registry", registry)
+
+    assert global_settings.update_global_config(
+        logging.getLogger(),
+        {"log_levels": {"cmk.web": 30, "cmk.web.automations": 10}},
+        active_config,
+    ) == {
+        "log_levels": {
+            "cmk.web": 30,
+            "cmk.automations": 10,
+        }
+    }
+
+
+def test_update_global_config(
+    mocker: MockerFixture,
+) -> None:
+    mocker.patch.object(
+        global_settings,
+        "_RENAMED_GLOBALS",
+        [
+            ("global_a", "new_global_a", {True: 1, False: 0}),
+            ("global_b", "new_global_b", {}),
+            ("missing", "new_missing", {}),
+        ],
+    )
+    mocker.patch.object(
+        global_settings,
+        "_REMOVED_OPTIONS",
+        ["old_unused"],
+    )
+
+    # Disable variable filtering by known Checkmk variables
+    mocker.patch.object(
+        global_settings, "filter_unknown_settings", lambda global_config: global_config
+    )
+
+    assert global_settings.update_global_config(
+        logging.getLogger(),
+        {
+            "global_a": True,
+            "global_b": 14,
+            "keep": "do not remove me",
+            "old_unused": "remove me",
+            "unknown": "How did this get here?",
+        },
+        active_config,
+    ) == {
+        "keep": "do not remove me",
+        "unknown": "How did this get here?",
+        "new_global_a": 1,
+        "new_global_b": 14,
+    }
+
+
+def test_remove_options() -> None:
+    assert global_settings._remove_options(  # noqa: SLF001
+        logging.getLogger(),
+        {
+            "global_a": True,
+            "global_b": 14,
+            "old_unused": "remove me",
+            "unknown": "How did this get here?",
+        },
+        ["old_unused"],
+    ) == {
+        "global_a": True,
+        "global_b": 14,
+        "unknown": "How did this get here?",
+    }
+
+
+def test_update_global_config_normalizes_only_non_string_user_icons(
+    mocker: MockerFixture,
+) -> None:
+    mocker.patch.object(
+        global_settings, "filter_unknown_settings", lambda global_config: global_config
+    )
+    mocker.patch.object(
+        global_settings, "_transform_global_config_values", lambda settings, _: settings
+    )
+
+    assert global_settings.update_global_config(
+        logging.getLogger(),
+        {
+            "user_icons_and_actions": {
+                # string icon values are left untouched (recoverable / runtime-handled)
+                "valid": {"icon": "status", "title": "Valid"},
+                "empty_string": {"icon": "", "title": "Empty string"},
+                "non_dict": "broken",
+                # non-string icon values are migrated to the missing icon
+                "none_icon": {"icon": None, "title": "None icon"},
+                "missing_key": {"title": "Missing key"},
+                "bool_icon": {"icon": True, "title": "Bool icon"},
+                "int_icon": {"icon": 123, "title": "Integer icon"},
+            }
+        },
+        active_config,
+    ) == {
+        "user_icons_and_actions": {
+            "valid": {"icon": "status", "title": "Valid"},
+            "empty_string": {"icon": "", "title": "Empty string"},
+            "non_dict": "broken",
+            "none_icon": {"icon": "missing", "title": "None icon"},
+            "missing_key": {"icon": "missing", "title": "Missing key"},
+            "bool_icon": {"icon": "missing", "title": "Bool icon"},
+            "int_icon": {"icon": "missing", "title": "Integer icon"},
+        }
+    }

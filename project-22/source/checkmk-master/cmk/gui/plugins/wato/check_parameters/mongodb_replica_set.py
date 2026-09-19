@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+from cmk.gui.i18n import _
+from cmk.gui.plugins.wato.utils import (
+    CheckParameterRulespecWithoutItem,
+    rulespec_registry,
+    RulespecGroupCheckParametersStorage,
+)
+from cmk.gui.valuespec import Age, Dictionary, Integer, Tuple
+
+
+def _parameter_valuespec_mongodb_replication_lag() -> Dictionary:
+    return Dictionary(
+        elements=[
+            (
+                "levels_mongdb_replication_lag",
+                _sec_tuple(_("Levels over an extended time period on replication lag")),
+            )
+        ]
+    )
+
+
+def _sec_tuple(title: str) -> Tuple:
+    return Tuple(
+        title=title,
+        elements=[
+            Integer(
+                title=_(
+                    "Time between the last operation on primary's oplog and on secondary above"
+                ),
+                unit=_("seconds"),
+                default_value=10,
+                minvalue=0,
+            ),
+            Age(title=_("Warning equal or after "), default_value=5 * 60),
+            Age(title=_("Critical equal or after "), default_value=15 * 60),
+        ],
+        help=_(
+            "Replication lag is a delay between an operation on the primary and the application "
+            "of that operation from the oplog to the secondary. "
+            "With this configuration, Checkmk will alert if replication lag is "
+            "exceeding a threshold over an extended period of time."
+        ),
+    )
+
+
+rulespec_registry.register(
+    CheckParameterRulespecWithoutItem(
+        check_group_name="mongodb_replica_set",
+        group=RulespecGroupCheckParametersStorage,
+        match_type="dict",
+        parameter_valuespec=_parameter_valuespec_mongodb_replication_lag,
+        title=lambda: _("MongoDB replica set"),
+    )
+)

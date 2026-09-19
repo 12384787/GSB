@@ -1,0 +1,110 @@
+<!--
+Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import type { DualListElement } from 'cmk-ui-library/components/CmkDualList'
+import CmkDualList from 'cmk-ui-library/components/CmkDualList/CmkDualList.vue'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import { computed, onMounted, watch } from 'vue'
+
+import { useVisualInfoCollection } from '@/dashboard/composables/api/useVisualInfoCollection'
+
+const props = defineProps<{
+  onlyIds?: string[] | null
+  hasErrors?: boolean
+}>()
+
+const selectedIds = defineModel<string[]>('selectedIds', { required: true })
+
+const { _t } = usei18n()
+const { ensureLoaded, list, isLoading, error } = useVisualInfoCollection()
+
+onMounted(async () => {
+  await ensureLoaded()
+})
+
+const allElements = computed<DualListElement[]>(() => {
+  const els: DualListElement[] = []
+  for (const visualInfo of list.value) {
+    els.push({ name: visualInfo.id!, title: _t('Single %{title}', { title: visualInfo.title! }) })
+  }
+  return els
+})
+
+const allowedIds = computed<Set<string> | null>(() => {
+  return props.onlyIds?.length ? new Set(props.onlyIds) : null
+})
+
+const filteredElements = computed<DualListElement[]>(() => {
+  if (!allowedIds.value) {
+    return allElements.value
+  }
+  return allElements.value.filter((e) => allowedIds.value!.has(e.name))
+})
+
+const dataElements = computed<DualListElement[]>({
+  get() {
+    const ids = selectedIds.value || []
+    const effective = allowedIds.value ? ids.filter((id) => allowedIds.value!.has(id)) : ids
+
+    return effective.map((id) => {
+      const found = filteredElements.value.find((e) => e.name === id)
+      if (!found) {
+        return { name: id, title: id }
+      }
+      const baseTitle = found!.title!
+      return { name: id, title: _t('Single %{title}', { title: baseTitle }) }
+    })
+  },
+  set(newEls) {
+    selectedIds.value = newEls.map((e) => e.name)
+  }
+})
+
+watch(allowedIds, () => {
+  if (!allowedIds.value) {
+    return
+  }
+  selectedIds.value = (selectedIds.value || []).filter((id) => allowedIds.value!.has(id))
+})
+</script>
+
+<template>
+  <div class="vi-selector" :class="{ 'db-selector-single-info__has-errors': hasErrors }">
+    <div class="vi-selector__meta">
+      <span v-if="isLoading">{{ _t('Loading…') }}</span>
+      <span v-else-if="error" class="error">
+        {{ _t('Failed to load options') }} — {{ error }}
+      </span>
+    </div>
+
+    <CmkDualList
+      v-if="!isLoading"
+      v-model="dataElements"
+      class="cmk-dual-list__single-list"
+      :elements="filteredElements"
+      :title="_t('Visual information')"
+      width="small"
+    />
+
+    <div v-else class="vi-selector__skeleton" aria-busy="true" aria-live="polite">
+      {{ _t('Loading options…') }}
+    </div>
+  </div>
+</template>
+
+<style scoped>
+/* stylelint-disable-next-line selector-pseudo-class-no-unknown,checkmk/vue-bem-naming-convention */
+.db-selector-single-info__has-errors
+  /* stylelint-disable-next-line selector-pseudo-class-no-unknown */
+  :deep(
+    .cmk-dual-list__body /* stylelint-disable-line checkmk/vue-bem-naming-convention */
+      .cmk-dual-list__single-list:first-child /* stylelint-disable-line checkmk/vue-bem-naming-convention */
+      .cmk-searchable-list__container /* stylelint-disable-line checkmk/vue-bem-naming-convention */
+      select
+  ) {
+  border: 1px solid var(--button-danger-border-color);
+}
+</style>

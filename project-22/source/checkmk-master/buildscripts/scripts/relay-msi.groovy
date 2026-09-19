@@ -1,0 +1,86 @@
+#!groovy
+
+/// file: relay-msi.groovy
+
+void main() {
+    def windows = load("${checkout_dir}/buildscripts/scripts/utils/windows.groovy");
+    def versioning = load("${checkout_dir}/buildscripts/scripts/utils/versioning.groovy");
+    def test_jenkins_helper = load("${checkout_dir}/buildscripts/scripts/utils/test_helper.groovy");
+
+    def branch_name = versioning.safe_branch_name();
+    def branch_version = versioning.get_branch_version(checkout_dir);
+    def cmk_vers_rc_aware = versioning.get_cmk_version(branch_name, branch_version, params.VERSION);
+    def cmk_version = versioning.strip_rc_number_from_version(cmk_vers_rc_aware);
+
+    def edition = params.EDITION;
+    // When FORCE_SIGN parameter is present we honour it. Otherwise we sign the MSI.
+    def should_sign = (params.FORCE_SIGN == null) || (params.FORCE_SIGN == true);
+    def use_azure = (params.SIGN_METHOD == "azure");
+
+    def allowed_editions = ["cloud", "ultimate", "ultimatemt"];
+    // The correlation ID suffix is a shared secret appended to every CorrelationId we send to
+    // Azure, so signing requests which did not originate from our CI can be spotted in the signing
+    // diagnostics. It therefore lives in the credential store, not in an env var. It stays bound
+    // for the whole build: the Azure client echoes the CorrelationId, and Jenkins only masks the
+    // secret inside this block.
+    def azure_creds = [
+        string(credentialsId: "azure_artifact_signing_client_secret", variable: "AZURE_ARTIFACT_SIGNING_CLIENT_SECRET"),
+        string(credentialsId: "azure_artifact_signing_correlation_suffix", variable: "AZURE_ARTIFACT_SIGNING_CORRELATION_SUFFIX"),
+    ];
+    // Choose the signing method, mirroring winagt-build.groovy. Azure signs in-process
+    // against the cloud service (no YubiKey / win_sign_key lock); YubiKey is the fallback.
+    def sign_target = use_azure ? 'relay_msi_with_sign_azure' : 'relay_msi_with_sign';
+
+    if (!(edition in allowed_editions)) {
+        error("Edition '${edition}' is not supported for the relay MSI build. Allowed editions: ${allowed_editions}.");
+    }
+
+    // Forward the pipeline version unchanged (like winagt-build does for the agent);
+    // build-msi.ps1 normalises it into the strict x.x.x.x WiX requires.
+    dir("${checkout_dir}") {
+        if (use_azure && should_sign) {
+            withCredentials(azure_creds) {
+                // Assembled inside the binding block: the suffix is only available there.
+                def correlation_id = windows.azure_signing_correlation_id(branch_name);
+                withEnv([
+                    "AZURE_ARTIFACT_SIGNING_ACCOUNT=${env.AZURE_ARTIFACT_SIGNING_ACCOUNT}",
+                    "AZURE_ARTIFACT_SIGNING_CLIENT_ID=${env.AZURE_ARTIFACT_SIGNING_CLIENT_ID}",
+                    "AZURE_ARTIFACT_SIGNING_ENDPOINT=${env.AZURE_ARTIFACT_SIGNING_ENDPOINT}",
+                    "AZURE_ARTIFACT_SIGNING_PROFILE=${env.AZURE_ARTIFACT_SIGNING_PROFILE}",
+                    "AZURE_ARTIFACT_SIGNING_TENANT_ID=${env.AZURE_ARTIFACT_SIGNING_TENANT_ID}",
+                    "AZURE_ARTIFACT_SIGNING_CORRELATION_ID=${correlation_id}",
+                ]) {
+                    windows.build(
+                        TARGET: sign_target,
+                        VERSION: cmk_version,
+                    );
+                }
+            }
+        } else {
+            windows.build(
+                TARGET: should_sign ? sign_target : 'relay_msi_no_sign',
+                VERSION: cmk_version,
+            );
+        }
+
+        // Unit tests: validate the MSI we just built (structure + signature).
+        // run-tests.ps1 gates via exit code AND emits a JUnit XML. Runs outside the
+        // signing credentials, exactly as before.
+        try {
+            windows.build(
+                TARGET: 'relay_msi_test',
+                REQUIRE_SIGNATURE: should_sign,
+            );
+        } finally {
+            // Publish the JUnit XML
+            archiveArtifacts(
+                allowEmptyArchive: true,
+                artifacts: "artefacts/relay_msi_test_results.xml",
+                fingerprint: true,
+            );
+            test_jenkins_helper.analyse_issues("JUNIT", "artefacts/relay_msi_test_results.xml");
+        }
+    }
+}
+
+return this;

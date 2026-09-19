@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+from typing import Annotated
+
+from cmk.gui.dashboard.store import get_all_dashboards
+from cmk.gui.dashboard.token_util import disable_dashboard_token
+from cmk.gui.openapi.framework import (
+    ApiContext,
+    APIVersion,
+    EndpointDoc,
+    EndpointHandler,
+    EndpointMetadata,
+    EndpointPermissions,
+    PathParam,
+    QueryParam,
+    VersionedEndpoint,
+)
+from cmk.gui.openapi.framework.model import ApiOmitted
+from cmk.gui.openapi.restful_objects.constructors import object_href
+from cmk.gui.openapi.utils import ProblemException
+from cmk.gui.type_defs import AnnotatedUserId
+
+from ._family import DASHBOARD_FAMILY
+from ._utils import (
+    get_permitted_user_id,
+    make_pending_changes,
+    PERMISSIONS_DASHBOARD_EDIT,
+    save_dashboard_to_file,
+    serialize_relative_grid_dashboard,
+)
+from .model.dashboard import RelativeGridDashboardRequest, RelativeGridDashboardResponse
+from .model.response_model import RelativeGridDashboardDomainObject
+
+
+def edit_relative_grid_dashboard_v1(
+    api_context: ApiContext,
+    body: RelativeGridDashboardRequest,
+    dashboard_id: Annotated[
+        str,
+        PathParam(description="Dashboard ID", example="main"),
+    ],
+    owner: Annotated[
+        AnnotatedUserId | ApiOmitted,
+        QueryParam(
+            description="The owner of the dashboard. If not provided, the current user is assumed.",
+            example="admin",
+        ),
+    ] = ApiOmitted(),
+) -> RelativeGridDashboardDomainObject:
+    """Edit a dashboard."""
+    user_id = get_permitted_user_id(owner, action="edit")
+
+    key = (user_id, dashboard_id)
+    dashboards = get_all_dashboards()
+    if key not in dashboards:
+        raise ProblemException(
+            status=404,
+            title="Dashboard not found",
+            detail=f"The dashboard with ID '{dashboard_id}' does not exist for user '{user_id}'.",
+        )
+
+    old_dashboard = dashboards[key]
+    embedded_views = old_dashboard.get("embedded_views", {})
+    body.validate(api_context, embedded_views=embedded_views)
+
+    new_dashboard = body.to_internal(user_id, embedded_views, old_dashboard.get("public_token_id"))
+
+    save_dashboard_to_file(
+        api_context.config.sites,
+        new_dashboard,
+        user_id,
+        pending_changes=make_pending_changes(api_context),
+        old_dashboard_id=dashboard_id,
+    )
+    disable_dashboard_token(new_dashboard)
+
+    return serialize_relative_grid_dashboard(
+        body.dashboard_id, RelativeGridDashboardResponse.from_internal(new_dashboard)
+    )
+
+
+ENDPOINT_EDIT_RELATIVE_GRID_DASHBOARD = VersionedEndpoint(
+    metadata=EndpointMetadata(
+        path=object_href("dashboard_relative_grid", "{dashboard_id}"),
+        link_relation="cmk/edit_dashboard_relative_grid",
+        method="put",
+    ),
+    permissions=EndpointPermissions(required=PERMISSIONS_DASHBOARD_EDIT),
+    doc=EndpointDoc(family=DASHBOARD_FAMILY.name),
+    versions={APIVersion.UNSTABLE: EndpointHandler(handler=edit_relative_grid_dashboard_v1)},
+)

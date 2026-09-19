@@ -1,0 +1,501 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import CmkButton from 'cmk-ui-library/components/CmkButton'
+import CmkIconButton from 'cmk-ui-library/components/CmkIconButton.vue'
+import usei18n, { untranslated } from 'cmk-ui-library/lib/i18n'
+import useClickOutside from 'cmk-ui-library/lib/useClickOutside'
+import { computed, nextTick, ref, watch } from 'vue'
+
+const { _t } = usei18n()
+const vClickOutside = useClickOutside()
+
+const model = defineModel<string>({ required: true })
+
+function parseTime(val: string): { hours: number; minutes: number } | null {
+  const match = val.match(/^(\d{1,2}):(\d{2})$/)
+  if (!match) {
+    return null
+  }
+  const h = parseInt(match[1]!)
+  const m = parseInt(match[2]!)
+  if (h < 0 || h > 23 || m < 0 || m > 59) {
+    return null
+  }
+  return { hours: h, minutes: m }
+}
+
+function pad(n: number): string {
+  return n.toString().padStart(2, '0')
+}
+
+const parsed = parseTime(model.value)
+const hours = ref(parsed?.hours ?? 0)
+const minutes = ref(parsed?.minutes ?? 0)
+const popupOpen = ref(false)
+const pendingHours = ref(hours.value)
+const pendingMinutes = ref(minutes.value)
+
+const hoursRef = ref<HTMLInputElement | null>(null)
+const minutesRef = ref<HTMLInputElement | null>(null)
+const hoursColumnRef = ref<HTMLDivElement | null>(null)
+const minutesColumnRef = ref<HTMLDivElement | null>(null)
+
+const hoursDisplay = ref(pad(hours.value))
+const minutesDisplay = ref(pad(minutes.value))
+let isTypingHours = false
+let isTypingMinutes = false
+
+const timeString = computed(() => `${pad(hours.value)}:${pad(minutes.value)}`)
+const allHours = Array.from({ length: 24 }, (_, i) => i)
+const allMinutes = Array.from({ length: 60 }, (_, i) => i)
+
+watch([hours, minutes], () => {
+  if (model.value !== timeString.value) {
+    model.value = timeString.value
+  }
+})
+
+watch(
+  hours,
+  () => {
+    if (!isTypingHours) {
+      hoursDisplay.value = pad(hours.value)
+    }
+  },
+  { flush: 'sync' }
+)
+
+watch(
+  minutes,
+  () => {
+    if (!isTypingMinutes) {
+      minutesDisplay.value = pad(minutes.value)
+    }
+  },
+  { flush: 'sync' }
+)
+
+watch(model, (newVal) => {
+  if (newVal === timeString.value) {
+    return
+  }
+  const p = parseTime(newVal)
+  if (p) {
+    hours.value = p.hours
+    minutes.value = p.minutes
+  }
+})
+
+function wrap(val: number, min: number, max: number): number {
+  if (val > max) {
+    return min
+  }
+  if (val < min) {
+    return max
+  }
+  return val
+}
+
+function onHoursKey(e: KeyboardEvent) {
+  if (e.key === 'ArrowUp') {
+    e.preventDefault()
+    hours.value = wrap(hours.value + 1, 0, 23)
+  } else if (e.key === 'ArrowDown') {
+    e.preventDefault()
+    hours.value = wrap(hours.value - 1, 0, 23)
+  } else if (e.key === 'ArrowRight' || e.key === ':') {
+    e.preventDefault()
+    minutesRef.value?.focus()
+    minutesRef.value?.select()
+  }
+}
+
+function onMinutesKey(e: KeyboardEvent) {
+  if (e.key === 'ArrowUp') {
+    e.preventDefault()
+    minutes.value = wrap(minutes.value + 1, 0, 59)
+  } else if (e.key === 'ArrowDown') {
+    e.preventDefault()
+    minutes.value = wrap(minutes.value - 1, 0, 59)
+  } else if (e.key === 'ArrowLeft') {
+    e.preventDefault()
+    hoursRef.value?.focus()
+    hoursRef.value?.select()
+  }
+}
+
+function onHoursInput(e: Event) {
+  const input = e.target as HTMLInputElement
+  const raw = input.value.replace(/\D/g, '').slice(0, 2)
+
+  if (raw.length === 0) {
+    return
+  }
+
+  isTypingHours = true
+  const val = parseInt(raw)
+  if (!isNaN(val)) {
+    hours.value = Math.min(val, 23)
+  }
+
+  if (raw.length >= 2) {
+    hoursDisplay.value = pad(hours.value)
+    isTypingHours = false
+    void nextTick(() => {
+      minutesRef.value?.focus()
+      minutesRef.value?.select()
+    })
+  } else {
+    hoursDisplay.value = raw
+    isTypingHours = false
+  }
+}
+
+function onMinutesInput(e: Event) {
+  const input = e.target as HTMLInputElement
+  const raw = input.value.replace(/\D/g, '').slice(0, 2)
+
+  if (raw.length === 0) {
+    return
+  }
+
+  isTypingMinutes = true
+  const val = parseInt(raw)
+  if (!isNaN(val)) {
+    minutes.value = Math.min(val, 59)
+  }
+
+  if (raw.length >= 2) {
+    minutesDisplay.value = pad(minutes.value)
+  } else {
+    minutesDisplay.value = raw
+  }
+  isTypingMinutes = false
+}
+
+function selectOnFocus(e: FocusEvent) {
+  ;(e.target as HTMLInputElement).select()
+}
+
+function onHoursBlur() {
+  hoursDisplay.value = pad(hours.value)
+}
+
+function onMinutesBlur() {
+  minutesDisplay.value = pad(minutes.value)
+}
+
+function togglePopup() {
+  if (popupOpen.value) {
+    cancelPopup()
+    return
+  }
+  pendingHours.value = hours.value
+  pendingMinutes.value = minutes.value
+  popupOpen.value = true
+  void nextTick(scrollAndFocusSelected)
+}
+
+function selectHour(h: number) {
+  pendingHours.value = h
+}
+
+function selectMinute(m: number) {
+  pendingMinutes.value = m
+}
+
+function confirmPopup() {
+  hours.value = pendingHours.value
+  minutes.value = pendingMinutes.value
+  popupOpen.value = false
+  minutesRef.value?.focus()
+}
+
+function cancelPopup() {
+  popupOpen.value = false
+}
+
+function selectedOption(column: HTMLDivElement | null): HTMLButtonElement | null {
+  return column?.querySelector('.cmk-deprecated-time-picker__option--selected') ?? null
+}
+
+function scrollAndFocusSelected() {
+  const h = selectedOption(hoursColumnRef.value)
+  const m = selectedOption(minutesColumnRef.value)
+  h?.scrollIntoView({ block: 'center' })
+  m?.scrollIntoView({ block: 'center' })
+  h?.focus()
+}
+
+function navigateOption(e: KeyboardEvent, which: 'hours' | 'minutes') {
+  const delta = e.key === 'ArrowDown' ? 1 : e.key === 'ArrowUp' ? -1 : 0
+  if (delta === 0) {
+    return
+  }
+  e.preventDefault()
+  if (which === 'hours') {
+    pendingHours.value = wrap(pendingHours.value + delta, 0, 23)
+    void nextTick(() => selectedOption(hoursColumnRef.value)?.focus())
+  } else {
+    pendingMinutes.value = wrap(pendingMinutes.value + delta, 0, 59)
+    void nextTick(() => selectedOption(minutesColumnRef.value)?.focus())
+  }
+}
+
+function onPopupKey(e: KeyboardEvent) {
+  if (e.key === 'Escape') {
+    e.preventDefault()
+    cancelPopup()
+    minutesRef.value?.focus()
+  } else if (
+    e.key === 'Enter' &&
+    (e.target as HTMLElement | null)?.classList.contains('cmk-deprecated-time-picker__option')
+  ) {
+    e.preventDefault()
+    confirmPopup()
+  }
+}
+</script>
+
+<template>
+  <span v-click-outside="() => (popupOpen = false)" class="cmk-deprecated-time-picker">
+    <!-- eslint-disable vue/no-bare-strings-in-template -->
+    <span class="cmk-deprecated-time-picker__field">
+      <input
+        ref="hoursRef"
+        class="cmk-deprecated-time-picker__segment"
+        type="text"
+        inputmode="numeric"
+        :value="hoursDisplay"
+        maxlength="2"
+        size="2"
+        :aria-label="_t('Hours')"
+        @input="onHoursInput"
+        @keydown="onHoursKey"
+        @focus="selectOnFocus"
+        @blur="onHoursBlur"
+      />
+      <span class="cmk-deprecated-time-picker__separator">:</span>
+      <input
+        ref="minutesRef"
+        class="cmk-deprecated-time-picker__segment"
+        type="text"
+        inputmode="numeric"
+        :value="minutesDisplay"
+        maxlength="2"
+        size="2"
+        :aria-label="_t('Minutes')"
+        @input="onMinutesInput"
+        @keydown="onMinutesKey"
+        @focus="selectOnFocus"
+        @blur="onMinutesBlur"
+      />
+    </span>
+    <CmkIconButton
+      class="cmk-deprecated-time-picker__trigger"
+      name="clock"
+      size="medium"
+      :aria-label="_t('Open time picker')"
+      @click="togglePopup"
+    />
+    <!-- eslint-enable vue/no-bare-strings-in-template -->
+    <div v-if="popupOpen" class="cmk-deprecated-time-picker__popup" @keydown="onPopupKey">
+      <div class="cmk-deprecated-time-picker__columns">
+        <div ref="hoursColumnRef" class="cmk-deprecated-time-picker__column">
+          <div class="cmk-deprecated-time-picker__column-header">{{ untranslated('H') }}</div>
+          <button
+            v-for="h in allHours"
+            :key="h"
+            type="button"
+            class="cmk-deprecated-time-picker__option"
+            :class="{ 'cmk-deprecated-time-picker__option--selected': h === pendingHours }"
+            :tabindex="h === pendingHours ? 0 : -1"
+            @click="selectHour(h)"
+            @keydown="navigateOption($event, 'hours')"
+          >
+            {{ pad(h) }}
+          </button>
+        </div>
+        <div ref="minutesColumnRef" class="cmk-deprecated-time-picker__column">
+          <div class="cmk-deprecated-time-picker__column-header">{{ untranslated('M') }}</div>
+          <button
+            v-for="m in allMinutes"
+            :key="m"
+            type="button"
+            class="cmk-deprecated-time-picker__option"
+            :class="{ 'cmk-deprecated-time-picker__option--selected': m === pendingMinutes }"
+            :tabindex="m === pendingMinutes ? 0 : -1"
+            @click="selectMinute(m)"
+            @keydown="navigateOption($event, 'minutes')"
+          >
+            {{ pad(m) }}
+          </button>
+        </div>
+      </div>
+      <div class="cmk-deprecated-time-picker__actions">
+        <CmkButton variant="secondary" @click="cancelPopup">
+          {{ _t('Cancel') }}
+        </CmkButton>
+        <CmkButton variant="primary" @click="confirmPopup">
+          {{ _t('Apply') }}
+        </CmkButton>
+      </div>
+    </div>
+  </span>
+</template>
+
+<style scoped>
+.cmk-deprecated-time-picker {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--dimension-4);
+}
+
+.cmk-deprecated-time-picker__field {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  border: 1px solid var(--default-form-element-border-color);
+  border-radius: var(--dimension-3);
+  padding: var(--dimension-1) 6px;
+  background: var(--default-form-element-bg-color);
+  font-size: var(--font-size-small);
+  line-height: 17px;
+  height: var(--form-field-height);
+  box-sizing: border-box;
+  font-variant-numeric: tabular-nums;
+}
+
+.cmk-deprecated-time-picker .cmk-deprecated-time-picker__segment {
+  width: 2ch;
+  border: none;
+  background: transparent;
+  color: var(--font-color);
+  font-size: var(--font-size-small);
+  line-height: 17px;
+  text-align: center;
+  padding: 0;
+  margin: 0;
+  border-radius: var(--dimension-2);
+  outline: none;
+  height: auto;
+  box-shadow: none;
+  font-variant-numeric: tabular-nums;
+
+  &:focus {
+    background: var(--color-dark-blue-50);
+    color: var(--white);
+  }
+}
+
+.cmk-deprecated-time-picker__separator {
+  color: var(--font-color-dimmed);
+  padding: 0 var(--dimension-1);
+}
+
+.cmk-deprecated-time-picker__trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: var(--form-field-height);
+  padding: 0 var(--dimension-2);
+  opacity: 0.7;
+
+  &:hover {
+    opacity: 1;
+  }
+
+  &:focus-visible {
+    outline: revert;
+  }
+}
+
+.cmk-deprecated-time-picker__popup {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: var(--z-index-modal-popup, 3500);
+  display: flex;
+  flex-direction: column;
+  gap: var(--dimension-3);
+  margin-top: var(--dimension-3);
+  background: var(--default-bg-color);
+  border: 1px solid var(--default-border-color);
+  border-radius: 6px;
+  padding: var(--dimension-3);
+  box-shadow: 0 4px 12px rgb(0 0 0 / 30%);
+}
+
+.cmk-deprecated-time-picker__columns {
+  display: flex;
+  gap: var(--dimension-2);
+}
+
+.cmk-deprecated-time-picker__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--dimension-3);
+  border-top: 1px solid var(--default-border-color);
+  padding-top: var(--dimension-3);
+}
+
+.cmk-deprecated-time-picker__column {
+  display: flex;
+  flex-direction: column;
+  max-height: 200px;
+  overflow: hidden auto;
+  width: 48px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-color, #888) transparent;
+}
+
+.cmk-deprecated-time-picker__column-header {
+  position: sticky;
+  top: 0;
+  background: var(--default-bg-color);
+  color: var(--font-color-dimmed);
+  font-size: var(--font-size-small);
+  font-weight: 600;
+  text-align: center;
+  padding: var(--dimension-3) 0;
+  border-bottom: 1px solid var(--default-border-color);
+}
+
+.cmk-deprecated-time-picker__option {
+  display: block;
+  width: 100%;
+  margin: 0;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--font-color);
+  font-size: var(--font-size-small);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  padding: var(--dimension-3) var(--dimension-4);
+  cursor: pointer;
+  box-shadow: none;
+
+  &:hover {
+    background: var(--input-hover-bg-color);
+  }
+
+  &:focus-visible {
+    outline: revert;
+  }
+}
+
+.cmk-deprecated-time-picker__option--selected {
+  background: var(--color-dark-blue-50);
+  color: var(--white);
+
+  &:hover {
+    background: var(--color-dark-blue-60);
+  }
+}
+</style>

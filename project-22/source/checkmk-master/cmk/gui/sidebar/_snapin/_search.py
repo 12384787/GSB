@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import traceback
+from typing import override
+
+import cmk.livestatus_client as livestatus
+from cmk.ccc.exceptions import MKException, MKGeneralException
+from cmk.gui.config import Config
+from cmk.gui.exceptions import HTTPRedirect
+from cmk.gui.htmllib.generator import HTMLWriter
+from cmk.gui.htmllib.html import html
+from cmk.gui.i18n import _
+from cmk.gui.log import logger
+from cmk.gui.pages import PageContext
+from cmk.gui.permissions import permission_registry
+from cmk.gui.search.quicksearch import (
+    ABCQuicksearchConductor,
+    get_url_builder,
+    IncorrectLabelInputError,
+)
+from cmk.gui.type_defs import SearchQuery, SearchResultsByTopic
+from cmk.gui.utils.roles import UserPermissions
+from cmk.web.utils.icons import IconNames, StaticIcon
+
+from ._base import PageHandlers, SidebarSnapin
+from ._quicksearch_manager import SnapinQuicksearchManager, TooManyRowsError
+
+
+def _maybe_strip(param: str | None) -> str | None:
+    if param is None:
+        return None
+    return param.strip()
+
+
+class QuicksearchSnapin(SidebarSnapin):
+    def __init__(self) -> None:
+        super().__init__()
+
+    @classmethod
+    @override
+    def type_name(cls) -> str:
+        return "search"
+
+    @classmethod
+    @override
+    def title(cls) -> str:
+        return _("Quick search")
+
+    @classmethod
+    @override
+    def description(cls) -> str:
+        return _(
+            "Interactive search field for direct access to monitoring instances (hosts, services, "
+            "host and service groups).<br>You can use the following filters: <i>h:</i> Host,<br> "
+            "<i>s:</i> Service, <i>hg:</i> Host group, <i>sg:</i> Service group,<br><i>ad:</i> "
+            "Address, <i>al:</i> Alias, <i>tg:</i> Host tag, <i>hl:</i> Host label, <i>sl:</i> "
+            "Service label"
+        )
+
+    @override
+    def show(self, config: Config) -> None:
+        id_ = "mk_side_search_field"
+        html.open_div(id_="mk_side_search", onclick="cmk.quicksearch.close_popup();")
+        html.input(id_=id_, type_="text", name="search", autocomplete="off")
+        html.icon_button(
+            "#",
+            _("Search"),
+            StaticIcon(IconNames.quicksearch),
+            onclick="cmk.quicksearch.on_search_click();",
+        )
+        html.close_div()
+        html.div("", id_="mk_side_clear")
+        html.javascript(f"cmk.quicksearch.register_search_field('{id_}');")
+
+    @override
+    def page_handlers(self) -> PageHandlers:
+        return {
+            "ajax_search": self._ajax_search,
+            "search_open": self._page_search_open,
+        }
+
+    def _ajax_search(self, ctx: PageContext) -> None:
+        """Generate the search result list"""
+        query = _maybe_strip(ctx.request.get_str_input("q"))
+        if not query:
+            return
+
+        quicksearch_manager = _build_quicksearch_manager_from_context(ctx)
+
+        search_objects: list[ABCQuicksearchConductor] = []
+        try:
+            search_objects = quicksearch_manager.determine_search_objects(
+                livestatus.lqencode(query),
+                UserPermissions.from_config(ctx.config, permission_registry),
+            )
+            quicksearch_manager.conduct_search(search_objects)
+
+        except TooManyRowsError as e:
+            html.show_warning(str(e))
+
+        except IncorrectLabelInputError:
+            pass
+
+        # I added MKGeneralException during a refactoring, but I did not check if it is needed.
+        except (MKException, MKGeneralException) as e:
+            html.show_error("%s" % e)
+
+        except Exception:
+            logger.exception("error generating quicksearch results")
+            if ctx.config.debug:
+                raise
+            html.show_error(traceback.format_exc())
+
+        if not search_objects:
+            return
+
+        results = quicksearch_manager.evaluate_results(search_objects)
+
+        _render_quicksearch_results(results, query)
+
+    def _page_search_open(self, ctx: PageContext) -> None:
+        """Generate the URL to the view that is opened when confirming the search field"""
+        query = _maybe_strip(ctx.request.var("q"))
+        if not query:
+            return
+
+        quicksearch_manager = _build_quicksearch_manager_from_context(ctx)
+
+        user_permissions = UserPermissions.from_config(ctx.config, permission_registry)
+        search_url = quicksearch_manager.generate_search_url(query, user_permissions)
+
+        raise HTTPRedirect(search_url)
+
+
+def _build_quicksearch_manager_from_context(ctx: PageContext) -> SnapinQuicksearchManager:
+    return SnapinQuicksearchManager(
+        row_limit=ctx.config.quicksearch_dropdown_limit,
+        search_order=ctx.config.quicksearch_search_order,
+        build_url=get_url_builder(ctx.request),
+    )
+
+
+def _render_quicksearch_results(results_by_topic: SearchResultsByTopic, query: SearchQuery) -> None:
+    sorted_results = sorted(results_by_topic, key=lambda x: x[0])
+    # Show search topic if at least two search objects provide elements
+    show_match_topics = len(sorted_results) > 1
+
+    for match_topic, results in sorted_results:
+        if show_match_topics:
+            html.div(match_topic, class_="topic")
+
+        for result in sorted(results, key=lambda x: x.title):
+            html.open_a(id_="result_%s" % query, href=result.url)
+            html.write_text_permissive(
+                result.title
+                + (" %s" % HTMLWriter.render_b(result.context) if result.context else "")
+            )
+            html.close_a()

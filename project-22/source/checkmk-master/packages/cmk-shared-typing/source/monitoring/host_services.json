@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2019-09/schema",
+  "type": "object",
+  "title": "Monitoring - Host Services App",
+  "$id": "../host_services.json",
+  "allOf": [{ "$ref": "monitoring/_base.json" }],
+  "properties": {
+    "host": {
+      "type": "string"
+    },
+    "site": {
+      "type": "string"
+    },
+    "host_url": {
+      "type": "string"
+    },
+    "ai_explain": {
+      "type": "boolean",
+      "default": false
+    },
+    "user_id": {
+      "type": "string"
+    },
+    "edition": { "$ref": "monitoring/_base.json#/$defs/edition" }
+  },
+  "required": ["host", "site", "host_url", "user_id", "edition"]
+}

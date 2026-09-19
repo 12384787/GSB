@@ -1,0 +1,51 @@
+{
+  "rules": {
+    "braces.ElseBlockBraces": "info",
+    "braces.ForStatementBraces": "info",
+    "braces.IfStatementBraces": "error",
+    "braces.WhileStatementBraces": "error",
+    "convention.NoTabCharacter": "error",
+    "formatting.BlankLineBeforePackage": "error",
+    "formatting.BlockEndsWithBlankLine": "error",
+    "formatting.BlockStartsWithBlankLine": "info",
+    "formatting.BracesForClass": "error",
+    "formatting.BracesForForLoop": "error",
+    "formatting.BracesForIfElse": "error",
+    "formatting.BracesForMethod": "error",
+    "formatting.BracesForTryCatchFinally": "error",
+    "formatting.ClassEndsWithBlankLine": "error",
+    "formatting.ClassStartsWithBlankLine": "error",
+    "formatting.ClosureStatementOnOpeningLineOfMultipleLineClosure": "off",
+    "formatting.ConsecutiveBlankLines": "error",
+    "formatting.FileEndsWithoutNewline": "error",
+    "formatting.Indentation": {
+      "spacesPerIndentLevel": 4,
+      "severity": "error"
+    },
+    "formatting.LineLength": {
+      "length": 140,
+      "severity": "error"
+    },
+    "formatting.MissingBlankLineAfterImports": "error",
+    "formatting.MissingBlankLineAfterPackage": "error",
+    "formatting.SpaceAfterCatch": "error",
+    "formatting.SpaceAfterClosingBrace": "error",
+    "formatting.SpaceAfterComma": "error",
+    "formatting.SpaceAfterFor": "error",
+    "formatting.SpaceAfterIf": "error",
+    "formatting.SpaceAfterMethodCallName": "error",
+    "formatting.SpaceAfterOpeningBrace": "error",
+    "formatting.SpaceAfterSemicolon": "error",
+    "formatting.SpaceAfterSwitch": "error",
+    "formatting.SpaceAfterWhile": "error",
+    "formatting.SpaceAroundClosureArrow": "error",
+    "formatting.SpaceAroundMapEntryColon": "off",
+    "formatting.SpaceAroundOperator": "error",
+    "formatting.SpaceBeforeClosingBrace": "off",
+    "formatting.SpaceBeforeOpeningBrace": "error",
+    "formatting.SpaceInsideParentheses": "error",
+    "formatting.TrailingWhitespace": "error",
+    "unnecessary.UnnecessaryGString": "off",
+    "unnecessary.UnnecessarySemicolon": "off"
+  }
+}

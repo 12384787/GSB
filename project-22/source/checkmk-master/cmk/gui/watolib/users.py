@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from typing import cast, Literal, override
+
+from cmk.ccc.plugin_registry import Registry
+from cmk.ccc.site import SiteId
+from cmk.ccc.user import UserId
+from cmk.ccc.version import Edition, edition
+from cmk.crypto.password import Password, PasswordPolicy
+from cmk.events.notify_types import EventRule
+from cmk.gui import site_config, userdb
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.form_specs.generators.age import Age as FSAge
+from cmk.gui.form_specs.unstable.legacy_converter.transform import (
+    TransformDataForLegacyFormatOrRecomposeFunction,
+)
+from cmk.gui.hooks import request_memoize
+from cmk.gui.i18n import _, _l
+from cmk.gui.logged_in import LoggedInUser, user
+from cmk.gui.type_defs import AnnotatedUserId, UserContactDetails, Users, UserSpec
+from cmk.gui.user_connection_config_types import UserConnectionConfig
+from cmk.gui.userdb import add_internal_attributes, get_connection, UserAttribute
+from cmk.gui.userdb.userdata import (
+    UserAlreadyExistsError,
+    UserData,
+    UserDataDiff,
+    UserDB,
+    UserNotFoundError,
+)
+from cmk.gui.utils.security_log_events import UserManagementEvent
+from cmk.gui.valuespec import Age, Alternative, EmailAddress, FixedValue
+from cmk.gui.watolib.audit_log import log_audit
+from cmk.gui.watolib.config_domain_name import CORE
+from cmk.gui.watolib.notifications import NotificationRuleConfigFile
+from cmk.gui.watolib.objref import ObjectRef, ObjectRefType
+from cmk.gui.watolib.pending_changes import Change, ChangeScope, PendingChanges
+from cmk.gui.watolib.simple_config_file import ConfigFileRegistry, WatoSingleConfigFile
+from cmk.gui.watolib.user_scripts import (
+    declare_notification_plugin_permissions,
+    user_script_choices,
+    user_script_title,
+)
+from cmk.gui.watolib.utils import multisite_dir, wato_root_dir
+from cmk.livestatus_client import SiteConfigurations
+from cmk.rulesets.v1 import form_specs as fs
+from cmk.rulesets.v1 import Help, Title
+from cmk.utils import paths
+from cmk.utils.object_diff import make_diff_text
+from cmk.utils.security_event import log_security_event
+
+type _UserAssociatedSitesFn = Callable[[UserSpec], Sequence[SiteId] | None]
+
+type _AffectedSites = set[SiteId] | Literal["all"]
+
+
+def default_sites(_user: UserSpec) -> Sequence[SiteId] | None:
+    """The default implementation to get sites associated with user.
+
+    Which sites are associated to a user is edition-specific."""
+    return _user.get("authorized_sites")
+
+
+def _update_affected_sites(
+    affected_sites: _AffectedSites,
+    user_sites: Sequence[SiteId] | None,
+) -> _AffectedSites:
+    if affected_sites == "all":
+        return "all"
+
+    if user_sites is None:
+        return "all"
+
+    return affected_sites | set(user_sites)
+
+
+def delete_users(
+    users_to_delete: Sequence[UserId],
+    sites: _UserAssociatedSitesFn,
+    user_attributes: Sequence[tuple[str, UserAttribute]],
+    user_connections: Sequence[UserConnectionConfig],
+    *,
+    pending_changes: PendingChanges,
+    use_git: bool,
+    acting_user: LoggedInUser,
+    pprint_value: bool,
+) -> tuple[list[UserId], dict[UserId, list[EventRule]]]:
+    acting_user.need_permission("wato.users")
+    acting_user.need_permission("wato.edit")
+
+    if user.id in users_to_delete:
+        raise MKUserError(None, _("You cannot delete your own account!"))
+
+    try:
+        userdb = UserDB(user_attributes, user_connections, pprint_value=pprint_value)
+        deleted = userdb.delete_users(users_to_delete)
+    except UserNotFoundError as e:
+        raise MKUserError(None, _("Cannot delete unknown user")) from e
+
+    affected_sites: _AffectedSites = set()
+    all_rules = NotificationRuleConfigFile().load_for_reading()
+    users_used_in_notification_rule: dict[UserId, list[EventRule]] = {}
+    for user_id, user_data in deleted.items():
+        affected_sites = _update_affected_sites(affected_sites, sites(user_data.to_userspec()))
+
+        if used_in_rules := _user_used_in_notification_rule(all_rules, user_id):
+            users_used_in_notification_rule[user_id] = used_in_rules
+
+        connection = get_connection(user_data.connection_id)
+        log_security_event(
+            UserManagementEvent(
+                event="user deleted",
+                affected_user=user_id,
+                acting_user=acting_user.id,
+                connector=connection.type() if connection else None,
+                connection_id=user_data.connection_id,
+            )
+        )
+
+        log_audit(
+            action="edit-user",
+            message="Deleted user: %s" % user_id,
+            user_id=acting_user.id,
+            use_git=use_git,
+            object_ref=make_user_object_ref(user_id),
+        )
+
+    if deleted:
+        pending_changes.add(
+            Change(
+                action_name="edit-users",
+                text=_l("Deleted user: %(users)s") % {"users": ", ".join(deleted)},
+                domains=[CORE],
+            ),
+            ChangeScope.all_activation_sites()
+            if affected_sites == "all"
+            else ChangeScope.sites(list(affected_sites)),
+        )
+    return list(deleted), users_used_in_notification_rule
+
+
+def _user_used_in_notification_rule(all_rules: list[EventRule], user_id: UserId) -> list[EventRule]:
+    return [
+        rule for rule in all_rules if "contact_users" in rule and rule["contact_users"] == [user_id]
+    ]
+
+
+def edit_user(
+    user_id: UserId,
+    new_spec: UserSpec,
+    sites: _UserAssociatedSitesFn,
+    user_attributes: Sequence[tuple[str, UserAttribute]],
+    user_connections: Sequence[UserConnectionConfig],
+    *,
+    pending_changes: PendingChanges,
+    use_git: bool,
+    acting_user: LoggedInUser,
+    pprint_value: bool,
+) -> None:
+    acting_user.need_permission("wato.users")
+    acting_user.need_permission("wato.edit")
+
+    _validate_user_attributes(user_id, new_spec, user_attributes, acting_user)
+
+    affected_sites: _AffectedSites = set()
+
+    try:
+        with UserDB(
+            user_attributes, user_connections, pprint_value=pprint_value
+        ).get_user_for_editing(user_id) as edit_user_data:
+            affected_sites = _update_affected_sites(
+                affected_sites, sites(edit_user_data.to_userspec())
+            )
+            affected_sites = _update_affected_sites(affected_sites, sites(new_spec))
+
+            diff = edit_user_data.update_from_userspec(new_spec, user_attributes)
+
+            log_audit(
+                action="edit-user",
+                message="Modified user: %s" % user_id,
+                user_id=acting_user.id,
+                use_git=use_git,
+                diff_text=make_user_diff_text(diff),
+                object_ref=make_user_object_ref(user_id),
+            )
+
+            connection_id = edit_user_data.connection_id
+            log_security_event(
+                UserManagementEvent(
+                    event="user modified",
+                    affected_user=user_id,
+                    acting_user=acting_user.id,
+                    connector=connection.type()
+                    if (connection := get_connection(connection_id))
+                    else None,
+                    connection_id=connection_id,
+                )
+            )
+
+    except UserNotFoundError:
+        raise MKUserError(None, _("The user you are trying to edit does not exist."))
+
+    pending_changes.add(
+        Change(
+            action_name="edit-users",
+            text=_l("Modified user: %(user_id)s") % {"user_id": user_id},
+            domains=[CORE],
+        ),
+        ChangeScope.all_activation_sites()
+        if affected_sites == "all"
+        else ChangeScope.sites(list(affected_sites)),
+    )
+
+
+def create_user(
+    user_id: UserId,
+    new_user: UserSpec,
+    sites: _UserAssociatedSitesFn,
+    user_attributes: Sequence[tuple[str, UserAttribute]],
+    user_connections: Sequence[UserConnectionConfig],
+    *,
+    pending_changes: PendingChanges,
+    use_git: bool,
+    acting_user: LoggedInUser,
+    pprint_value: bool,
+) -> None:
+    acting_user.need_permission("wato.users")
+    acting_user.need_permission("wato.edit")
+
+    _validate_user_attributes(user_id, new_user, user_attributes, acting_user)
+
+    add_internal_attributes(new_user)
+
+    new_user_data = UserData.from_userspec(user_id, new_user, user_attributes)
+    try:
+        UserDB(user_attributes, user_connections, pprint_value=pprint_value).add_user(new_user_data)
+    except UserAlreadyExistsError:
+        raise MKUserError("user_id", _("This username is already being used by another user."))
+
+    log_audit(
+        action="edit-user",
+        message="Created new user: %s" % user_id,
+        user_id=acting_user.id,
+        use_git=use_git,
+        diff_text=make_diff_text({}, make_user_audit_log_object(new_user)),
+        object_ref=make_user_object_ref(user_id),
+    )
+
+    connection_id = new_user.get("connector", None)
+    connection = get_connection(connection_id)
+    log_security_event(
+        UserManagementEvent(
+            event="user created",
+            affected_user=user_id,
+            acting_user=acting_user.id,
+            connector=connection.type() if connection else None,
+            connection_id=connection_id,
+        )
+    )
+
+    affected_sites = _update_affected_sites(set(), sites(new_user))
+    pending_changes.add(
+        Change(
+            action_name="edit-users",
+            text=_l("Created new user: %(user_id)s") % {"user_id": user_id},
+            domains=[CORE],
+        ),
+        ChangeScope.all_activation_sites()
+        if affected_sites == "all"
+        else ChangeScope.sites(list(affected_sites)),
+    )
+
+
+def remove_custom_attribute_from_all_users(
+    custom_attribute_name: str,
+    sites: _UserAssociatedSitesFn,
+    user_attributes: Sequence[tuple[str, UserAttribute]],
+    user_connections: Sequence[UserConnectionConfig],
+    *,
+    pending_changes: PendingChanges,
+    use_git: bool,
+    pprint_value: bool,
+) -> None:
+    # This function duplicates code from edit_user. However, it is the only place in the codebase
+    # where we need to update all users at once. For this it calls userdb.save_users directly.
+    user.need_permission("wato.users")
+    user.need_permission("wato.edit")
+
+    all_users = userdb.load_users(lock=True)
+    modified_users_info = []
+    affected_sites: _AffectedSites = set()
+
+    for user_id, old_user_attrs in all_users.items():
+        if custom_attribute_name not in old_user_attrs:
+            continue
+
+        changed_user_attrs = cast(
+            UserSpec, {k: v for k, v in old_user_attrs.items() if k != custom_attribute_name}
+        )
+
+        _validate_user_attributes(user_id, changed_user_attrs, user_attributes, user)
+
+        affected_sites = _update_affected_sites(affected_sites, sites(old_user_attrs))
+
+        modified_users_info.append(user_id)
+
+        log_audit(
+            action="edit-user",
+            message="Modified user: %s" % user_id,
+            user_id=user.id,
+            use_git=use_git,
+            diff_text=make_diff_text(
+                make_user_audit_log_object(old_user_attrs),
+                make_user_audit_log_object(changed_user_attrs),
+            ),
+            object_ref=make_user_object_ref(user_id),
+        )
+
+        connection_id = changed_user_attrs.get("connector", None)
+        connection = get_connection(connection_id)
+        log_security_event(
+            UserManagementEvent(
+                event="user modified",
+                affected_user=user_id,
+                acting_user=user.id,
+                connector=connection.type() if connection else None,
+                connection_id=connection_id,
+            )
+        )
+
+        all_users[user_id] = changed_user_attrs
+
+    if modified_users_info:
+        pending_changes.add(
+            Change(
+                action_name="edit-users",
+                text=_l("Modified users: %(users)s") % {"users": ", ".join(modified_users_info)},
+                domains=[CORE],
+            ),
+            ChangeScope.all_activation_sites()
+            if affected_sites == "all"
+            else ChangeScope.sites(list(affected_sites)),
+        )
+        userdb.save_users(
+            all_users,
+            user_attributes,
+            user_connections,
+            now=datetime.now(),
+            pprint_value=pprint_value,
+            call_users_saved_hook=True,
+        )
+
+
+def make_user_diff_text(diff: UserDataDiff) -> str:
+    """Render a UserData diff for the audit log"""
+    messages = [diff.attribute_changes] if diff.attribute_changes else []
+    if diff.credentials_changed:
+        messages.append(_("Credentials were changed."))
+    return "\n".join(messages) or _("Nothing was changed.")
+
+
+def make_user_audit_log_object(attributes: UserSpec) -> UserSpec:
+    """The resulting object is used for building object diffs"""
+    obj = attributes.copy()
+
+    # Password hashes should not be logged
+    obj.pop("password", None)
+    obj.pop("automation_secret", None)
+
+    # Skip internal attributes
+    obj.pop("user_scheme_serial", None)
+
+    # Skip default values (that will not be persisted)
+    if obj.get("start_url") is None:
+        obj.pop("start_url", None)
+    if obj.get("ui_sidebar_position") is None:
+        obj.pop("ui_sidebar_position", None)
+    if obj.get("ui_theme") is None:
+        obj.pop("ui_theme", None)
+
+    return obj
+
+
+def make_user_object_ref(user_id: UserId) -> ObjectRef:
+    return ObjectRef(ObjectRefType.User, str(user_id))
+
+
+def _validate_user_attributes(
+    user_id: UserId,
+    user_attrs: UserSpec,
+    user_attributes: Sequence[tuple[str, UserAttribute]],
+    acting_user: LoggedInUser,
+) -> None:
+    if user_id == "":  # reserved for UserId.builtin()
+        raise MKUserError("user_id", _("UserId cannot be empty"))
+
+    # Full name
+    if not user_attrs.get("alias"):
+        raise MKUserError(
+            "alias", _("Please specify a full name or descriptive alias for the user.")
+        )
+
+    # Locking
+    if user_id == acting_user.id and user_attrs.get("locked", False):
+        raise MKUserError("locked", _("You cannot lock your own account!"))
+
+    # Automation Secret
+    # Note: if a password is used it is verified before this; we only know the hash here
+    if "automation_secret" in user_attrs and len(user_attrs["automation_secret"]) < 10:
+        raise MKUserError(
+            "_auth_secret", _("Please enter an automation secret of at least 10 characters.")
+        )
+
+    # Email
+    email = user_attrs.get("email")
+    if "email" in user_attrs and email is not None:
+        vs_email = EmailAddress()
+        vs_email.validate_value(email, "email")
+
+    # Idle timeout
+    idle_timeout = user_attrs.get("idle_timeout")
+    vs_user_idle_timeout = get_vs_user_idle_timeout()
+    vs_user_idle_timeout.validate_value(idle_timeout, "idle_timeout")
+
+    fallback_contact = user_attrs.get("fallback_contact")
+    if fallback_contact and not email:
+        raise MKUserError(
+            "email",
+            _(
+                "You have enabled the fallback notifications but missed to configure an "
+                "email address. You need to configure your mail address in order "
+                "to be able to receive fallback notifications."
+            ),
+        )
+
+    # Custom user attributes
+    for name, attr in user_attributes:
+        value = user_attrs.get(name)
+        attr.valuespec().validate_value(value, "ua_" + name)
+
+
+def get_vs_user_idle_timeout() -> Alternative:
+    return Alternative(
+        title=_("Session idle timeout"),
+        elements=[
+            FixedValue(
+                value=None,
+                title=_("Use the global configuration"),
+                totext="",
+            ),
+            FixedValue(
+                value=False,
+                title=_("Disable the login timeout"),
+                totext="",
+            ),
+            vs_idle_timeout_duration(),
+        ],
+        orientation="horizontal",
+    )
+
+
+def vs_idle_timeout_duration() -> Age:
+    return Age(
+        title=_("Set an individual idle timeout"),
+        display=["minutes", "hours", "days"],
+        minvalue=60,
+        help=_(
+            "Normally, a user login session is valid until the password is changed, the "
+            "browser is closed or the user is locked. By enabling this option, you "
+            "can apply a time limit to login sessions which is applied when the user "
+            "stops interacting with the GUI for a given amount of time. When a user "
+            "exceeds the configured maximum idle time, the user will be logged "
+            "out and redirected to the login screen to renew the login session. "
+            "This setting can be overridden in each individual user's profile.",
+        ),
+        default_value=5400,
+    )
+
+
+def form_spec_idle_timeout_duration() -> TransformDataForLegacyFormatOrRecomposeFunction:
+    return FSAge(
+        title=Title("Set an individual idle timeout"),
+        displayed_magnitudes=[
+            fs.TimeMagnitude.MINUTE,
+            fs.TimeMagnitude.HOUR,
+            fs.TimeMagnitude.DAY,
+        ],
+        help_text=Help(
+            "Normally, a user login session is valid until the password is changed, the "
+            "browser is closed or the user is locked. By enabling this option, you "
+            "can apply a time limit to login sessions which is applied when the user "
+            "stops interacting with the GUI for a given amount of time. When a user "
+            "exceeds the configured maximum idle time, the user will be logged "
+            "out and redirected to the login screen to renew the login session. "
+            "This setting can be overridden in each individual user's profile.",
+        ),
+        prefill=fs.DefaultValue(5400.0),
+        custom_validate=[fs.validators.NumberInRange(min_value=60)],
+    )
+
+
+def notification_script_title(name: str) -> str:
+    return user_script_title("notifications", name)
+
+
+@request_memoize()
+def notification_script_choices() -> list[tuple[str, str]]:
+    # Ensure the required dynamic permissions are registered
+    declare_notification_plugin_permissions()
+
+    choices: list[tuple[str, str]] = []
+    for choice in user_script_choices("notifications"):
+        notification_plugin_name, _notification_plugin_title = choice
+        if user.may("notification_plugin.%s" % notification_plugin_name):
+            choices.append(choice)
+    return choices
+
+
+def verify_password_policy(
+    password: Password,
+    varname: str,
+    password_policy: PasswordPolicy,
+) -> None:
+    result = password.verify_policy(password_policy)
+    if result == PasswordPolicy.Result.TooShort:
+        raise MKUserError(
+            varname,
+            _(
+                "The password does not comply with the configured password policy: "
+                "It must have at least %(min_length)d characters."
+            )
+            % {"min_length": password_policy.min_length},
+        )
+    if result == PasswordPolicy.Result.TooSimple:
+        raise MKUserError(
+            varname,
+            _(
+                "The password does not comply with the configured password policy: "
+                "It must use at least %(min_groups)d different character groups, such as lowercase letters, "
+                "uppercase letters, digits or special characters."
+            )
+            % {"min_groups": password_policy.min_groups},
+        )
+
+    if result == PasswordPolicy.Result.WordlistMatch:
+        raise MKUserError(
+            varname,
+            _(
+                "The password was found in the common password list. Please choose "
+                "a different password."
+            ),
+        )
+
+
+class UsersConfigFile(WatoSingleConfigFile[Users]):
+    """Handles reading and writing users.mk file"""
+
+    def __init__(self) -> None:
+        super().__init__(
+            config_file_path=multisite_dir() / "users.mk",
+            config_variable="multisite_users",
+            spec_class=Users,
+        )
+
+
+class ContactsConfigFile(WatoSingleConfigFile[dict[AnnotatedUserId, UserContactDetails]]):
+    """Handles reading and writing contacts.mk file"""
+
+    def __init__(self) -> None:
+        super().__init__(
+            config_file_path=wato_root_dir() / "contacts.mk",
+            config_variable="contacts",
+            spec_class=dict[AnnotatedUserId, UserContactDetails],
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class UserFeatures:
+    edition: Edition
+    sites: _UserAssociatedSitesFn
+
+
+class UserFeaturesRegistry(Registry[UserFeatures]):
+    @override
+    def plugin_name(self, instance: UserFeatures) -> str:
+        return str(instance.edition)
+
+    def features(self) -> UserFeatures:
+        return self[str(edition(paths.omd_root))]
+
+
+user_features_registry = UserFeaturesRegistry()
+
+
+def get_enabled_remote_sites_for_user(
+    user_spec: UserSpec, site_configs: SiteConfigurations
+) -> SiteConfigurations:
+    all_enabled_slave_sites = site_config.distributed_setup_remote_sites(site_configs)
+    if (site_ids_for_user := user_features_registry.features().sites(user_spec)) is None:
+        return all_enabled_slave_sites
+
+    return SiteConfigurations(
+        {
+            site_id: site_config
+            for site_id, site_config in all_enabled_slave_sites.items()
+            if site_id in site_ids_for_user
+        }
+    )
+
+
+def get_enabled_remote_sites_for_logged_in_user(
+    logged_in_user: LoggedInUser, site_configs: SiteConfigurations
+) -> SiteConfigurations:
+    return get_enabled_remote_sites_for_user(logged_in_user.attributes, site_configs)
+
+
+def register(config_file_registry: ConfigFileRegistry) -> None:
+    config_file_registry.register(UsersConfigFile())
+    config_file_registry.register(ContactsConfigFile())

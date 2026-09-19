@@ -1,0 +1,900 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# Agent plugins still need to support Python 3.4
+# ruff: noqa: UP007  # PEP 604 (Allow writing union types as X | Y) is a Python 3.10 feature
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import json
+import logging
+import os
+import pwd
+import shlex
+import socket
+import subprocess
+import sys
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from shutil import which
+from typing import Callable, Literal, TypedDict, Union  # noqa: UP035
+
+if sys.version_info >= (3, 12):  # noqa: UP036
+    from typing import override
+else:
+
+    def override(func):
+        return func
+
+
+__version__ = "3.0.0b1"
+
+LOGGER = logging.getLogger(__name__)
+
+
+def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="mk_podman", description="Checkmk Podman agent plugin")
+    parser.add_argument("--debug", action="store_true", help="Debug mode: raise Python exceptions")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Verbose mode (use -vv for debug output)",
+    )
+    args = parser.parse_args(argv)
+
+    fmt = "%%(levelname)5s: %s%%(message)s"
+    if args.verbose == 0:
+        LOGGER.propagate = False
+    elif args.verbose == 1:
+        logging.basicConfig(level=logging.INFO, format=fmt % "")
+    else:
+        logging.basicConfig(level=logging.DEBUG, format=fmt % "(line %(lineno)3d) ")
+
+    LOGGER.debug("parsed args: %(args)r", {"args": args})
+    return args
+
+
+DEFAULT_CFG_FILE = Path(os.getenv("MK_CONFDIR", "")) / "mk_podman.cfg"
+
+DEFAULT_CFG_SECTION = {
+    "connection_method": "api",
+    "socket_detection_method": "auto",
+    "socket_paths": "",
+    "piggyback_name_method": "nodename_name",
+    "keep_non_zero_exit_containers": "true",
+}
+
+DEFAULT_SOCKET_PATH = "/run/podman/podman.sock"
+
+DEFAULT_SCHEME = "http+unix://"
+
+CLI_TIMEOUT_SECONDS = 30
+
+PODMAN_API_VERSION = "v4.0.0"
+
+
+def _is_podman_host() -> bool:
+    return os.path.isdir("/var/lib/podman") or os.path.isdir("/run/podman") or bool(which("podman"))
+
+
+class ConnectionMethod(Enum):
+    API = "api"
+    CLI = "cli"
+
+
+class AutomaticSocketDetectionMethod(Enum):
+    AUTO = "auto"
+    ONLY_ROOT_SOCKET = "only_root_socket"
+    ONLY_USER_SOCKETS = "only_user_sockets"
+
+
+class PiggybackNameMethod(Enum):
+    NAME = "name"
+    NODENAME_NAME = "nodename_name"
+    NAME_ID = "name_id"
+
+
+class PodmanConfig(TypedDict):
+    connection_method: ConnectionMethod
+    socket_detection: Union[AutomaticSocketDetectionMethod, tuple[Literal["manual"], Sequence[str]]]
+    piggyback_name_method: PiggybackNameMethod
+    keep_non_zero_exit_containers: bool
+
+
+def _parse_piggyback_name_method(value: str | None, cfg_file: Path) -> PiggybackNameMethod:
+    try:
+        return (
+            PiggybackNameMethod(value) if value is not None else PiggybackNameMethod.NODENAME_NAME
+        )
+    except ValueError:
+        write_section(
+            Error(
+                "config",
+                f"Invalid piggyback_name_method '{value}' in {cfg_file}. "
+                f"Valid options are: {', '.join(m.value for m in PiggybackNameMethod)}. "
+                "Using default 'nodename_name'.",
+            )
+        )
+        return PiggybackNameMethod.NODENAME_NAME
+
+
+def load_cfg(cfg_file: Path = DEFAULT_CFG_FILE) -> Union[PodmanConfig, None]:
+    config = configparser.ConfigParser(DEFAULT_CFG_SECTION)
+
+    if not cfg_file.is_file():
+        LOGGER.debug(
+            "No config file found at %(cfg_file)s, using defaults.", {"cfg_file": cfg_file}
+        )
+        return None
+
+    try:
+        config.read(cfg_file)
+        section_name = "PODMAN" if config.sections() else "DEFAULT"
+        conf_dict = dict(config.items(section_name))
+
+        try:
+            connection_method = ConnectionMethod(conf_dict.get("connection_method"))
+        except ValueError:
+            write_section(
+                Error(
+                    "config",
+                    f"Invalid connection_method '{conf_dict.get('connection_method')}' in {cfg_file}. "
+                    f"Valid options are: {', '.join(m.value for m in ConnectionMethod)}. "
+                    "Using default 'api'.",
+                )
+            )
+            connection_method = ConnectionMethod.API
+
+        method = conf_dict["socket_detection_method"]
+        socket_paths_str = conf_dict["socket_paths"]
+        piggyback_name_method = _parse_piggyback_name_method(
+            conf_dict.get("piggyback_name_method"), cfg_file
+        )
+
+        keep_non_zero_exit_containers = (
+            conf_dict.get("keep_non_zero_exit_containers", "true") == "true"
+        )
+
+        if method == "manual" and socket_paths_str:
+            socket_paths = [p.strip() for p in socket_paths_str.split(",") if p.strip()]
+            LOGGER.info(
+                "Config loaded from %(cfg_file)s: manual socket paths: %(socket_paths)s",
+                {"cfg_file": cfg_file, "socket_paths": socket_paths},
+            )
+            return PodmanConfig(
+                connection_method=connection_method,
+                socket_detection=("manual", socket_paths),
+                piggyback_name_method=piggyback_name_method,
+                keep_non_zero_exit_containers=keep_non_zero_exit_containers,
+            )
+        LOGGER.info(
+            "Config loaded from %(cfg_file)s: socket detection method: %(method)s",
+            {"cfg_file": cfg_file, "method": method},
+        )
+        return PodmanConfig(
+            connection_method=connection_method,
+            socket_detection=AutomaticSocketDetectionMethod(method),
+            piggyback_name_method=piggyback_name_method,
+            keep_non_zero_exit_containers=keep_non_zero_exit_containers,
+        )
+
+    except Exception as e:
+        write_section(
+            Error(
+                "config",
+                f"Failed to load config file {cfg_file}: {e}. Using 'auto' method as default.",
+            )
+        )
+        return None
+
+
+def get_socket_owner(socket_path: Path) -> Union[str, None]:
+    try:
+        return pwd.getpwuid(os.stat(socket_path).st_uid).pw_name
+    except (OSError, KeyError):  # fmt: skip
+        return None
+
+
+def find_user_sockets() -> Sequence[str]:
+    run_user_dir = "/run/user"
+
+    if not os.path.isdir(run_user_dir):
+        return []
+
+    sockets = [
+        os.path.join(run_user_dir, entry, "podman", "podman.sock")
+        for entry in os.listdir(run_user_dir)
+        if os.path.exists(os.path.join(run_user_dir, entry, "podman", "podman.sock"))
+    ]
+    LOGGER.debug("Discovered user sockets: %(sockets)s", {"sockets": sockets})
+    return sockets
+
+
+def find_podman_users_from_conmon() -> Sequence[Union[str, None]]:
+    users: set[str] = set()
+
+    try:
+        # Use UID instead of username to avoid truncation issues with ps
+        result = subprocess.run(
+            ["ps", "-e", "-o", "uid=", "-o", "comm="],
+            capture_output=True,
+            text=True,
+            timeout=CLI_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if result.returncode != 0:
+            LOGGER.warning(
+                "'ps' command failed (rc=%(returncode)d): %(stderr)s. Falling back to root user only.",
+                {"returncode": result.returncode, "stderr": result.stderr.strip()},
+            )
+            return [None]
+
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "conmon":
+                try:
+                    uid = int(parts[0])
+                    if uid != 0:
+                        pw_entry = pwd.getpwuid(uid)
+                        users.add(pw_entry.pw_name)
+                except (ValueError, KeyError):  # fmt: skip
+                    # Skip if UID is invalid or user not found
+                    continue
+    except Exception as e:
+        LOGGER.warning(
+            "Failed to discover podman users from conmon: %(error)s. Falling back to root user only.",
+            {"error": e},
+        )
+        return [None]
+
+    # Always include root/current user first
+    result_list: list[Union[str, None]] = [None]
+    result_list.extend(sorted(users))
+    LOGGER.debug("Discovered podman users from conmon: %(users)s", {"users": result_list})
+    return result_list
+
+
+def get_socket_paths(config: Union[PodmanConfig, None]) -> Sequence[str]:
+    if (
+        config is None
+        or (socket_detection := config["socket_detection"]) is AutomaticSocketDetectionMethod.AUTO
+    ):
+        socket_paths = [DEFAULT_SOCKET_PATH]
+        socket_paths.extend(find_user_sockets())
+        return socket_paths
+
+    if socket_detection is AutomaticSocketDetectionMethod.ONLY_ROOT_SOCKET:
+        return [DEFAULT_SOCKET_PATH]
+
+    if socket_detection is AutomaticSocketDetectionMethod.ONLY_USER_SOCKETS:
+        return find_user_sockets()
+
+    return socket_detection[1]
+
+
+@dataclass(frozen=True)
+class JSONSection:
+    name: str
+    content: str
+
+
+@dataclass(frozen=True)
+class Error:
+    label: str
+    message: str
+
+
+def write_sections(sections: Sequence[Union[JSONSection, Error]]) -> None:
+    for section in sections:
+        write_section(section)
+
+
+def write_section(section: Union[JSONSection, Error]) -> None:
+    if isinstance(section, JSONSection):
+        write_serialized_section(section.name, section.content)
+    elif isinstance(section, Error):
+        write_serialized_section(
+            "errors",
+            json.dumps({"endpoint": section.label, "message": section.message}),
+        )
+
+
+def write_serialized_section(name: str, json_content: str) -> None:
+    sys.stdout.write(f"<<<podman_{name}:sep(0)>>>\n")
+    sys.stdout.write(f"{json_content}\n")
+    sys.stdout.flush()
+
+
+def write_piggyback_section(target_host: str, section: Union[JSONSection, Error]) -> None:
+    sys.stdout.write(f"<<<<{target_host}>>>>\n")
+    write_section(section)
+    sys.stdout.write("<<<<>>>>\n")
+    sys.stdout.flush()
+
+
+try:
+    from requests import Session
+    from requests.adapters import HTTPAdapter
+    from urllib3.connection import HTTPConnection
+    from urllib3.connectionpool import HTTPConnectionPool
+
+    _HAS_REQUESTS = True
+except ImportError:
+    _HAS_REQUESTS = False
+
+
+# This was taken from cmk.utils.unixsocket_http
+# But, since we don't have access to that module here, we reimplement it.
+def make_unixsocket_session(
+    socket_path: Path,
+    target_base_url: str,
+) -> Session:
+    session = Session()
+    session.trust_env = False
+    session.mount(
+        target_base_url,
+        _LocalAdapter(socket_path),
+    )
+    return session
+
+
+class _LocalConnection(HTTPConnection):
+    def __init__(self, socket_path: Path) -> None:
+        super().__init__("localhost")
+        self._socket_path = socket_path
+
+    @override
+    def connect(self) -> None:
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(str(self._socket_path))
+
+
+class _LocalConnectionPool(HTTPConnectionPool):
+    def __init__(self, socket_path: Path) -> None:
+        super().__init__("localhost")
+        self._connection = _LocalConnection(socket_path)
+
+    @override
+    def _new_conn(self) -> _LocalConnection:
+        return self._connection
+
+
+class _LocalAdapter(HTTPAdapter):
+    def __init__(self, socket_path: Path) -> None:
+        super().__init__()
+        self._connection_pool = _LocalConnectionPool(socket_path)
+
+    @override
+    def get_connection(
+        self,
+        url: Union[str, bytes],  # noqa: ARG002
+        proxies: object = None,  # noqa: ARG002
+    ) -> _LocalConnectionPool:
+        return self._connection_pool
+
+    @override
+    def get_connection_with_tls_context(
+        self,
+        request: object,  # noqa: ARG002
+        verify: object,  # noqa: ARG002
+        proxies: object = None,  # noqa: ARG002
+        cert: object = None,  # noqa: ARG002
+    ) -> _LocalConnectionPool:
+        return self._connection_pool
+
+
+# =============================================================================
+# CLI-based query functions (for socket-less configurations)
+# =============================================================================
+
+
+def run_podman_command(
+    args: Sequence[str], run_as_user: Union[str, None] = None
+) -> Union[str, Error]:
+    try:
+        cmd = ["podman", *args]
+        if run_as_user and os.geteuid() == 0:
+            cmd = ["su", "-", "--", run_as_user, "-c", shlex.join(cmd)]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=CLI_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if result.returncode != 0:
+            return Error(f"podman {' '.join(args)}", result.stderr.strip())
+        return result.stdout
+    except subprocess.TimeoutExpired:
+        return Error(
+            f"podman {' '.join(args)}", f"Command timed out after {CLI_TIMEOUT_SECONDS} seconds"
+        )
+    except FileNotFoundError:
+        return Error(f"podman {' '.join(args)}", "podman command not found")
+    except Exception as e:
+        return Error(f"podman {' '.join(args)}", str(e))
+
+
+def _strip_login_banner(output: str) -> str:
+    """Strip login banner/MOTD lines printed by 'su -' before the actual JSON output."""
+    for i, line in enumerate(output.splitlines()):
+        if line.lstrip().startswith(("{", "[")):
+            return "\n".join(output.splitlines()[i:])
+    return output
+
+
+def _run_cli_json_query(
+    args: Sequence[str],
+    section_name: str,
+    default: object = None,
+    run_as_user: Union[str, None] = None,
+    transform: Union[Callable[[object], object], None] = None,
+) -> Union[JSONSection, Error]:
+    result = run_podman_command(args, run_as_user)
+    if isinstance(result, Error):
+        return result
+    try:
+        result = _strip_login_banner(result)
+        data = json.loads(result) if result.strip() else default
+        if transform is not None:
+            data = transform(data)
+        return JSONSection(section_name, json.dumps(data))
+    except json.JSONDecodeError as e:
+        return Error(f"podman {' '.join(args)}", f"Failed to parse JSON: {e}")
+
+
+def query_containers_cli(
+    run_as_user: Union[str, None] = None,
+) -> Union[JSONSection, Error]:
+    def transform(cs: object) -> object:
+        assert isinstance(cs, Iterable)
+        return [c for c in cs if not c.get("IsInfra", False)]
+
+    return _run_cli_json_query(
+        ["ps", "--all", "--format", "json"],
+        "containers",
+        default=[],
+        run_as_user=run_as_user,
+        transform=transform,
+    )
+
+
+def query_disk_usage_cli(
+    run_as_user: Union[str, None] = None,
+) -> Union[JSONSection, Error]:
+    return _run_cli_json_query(
+        ["system", "df", "--format", "json"], "disk_usage", default={}, run_as_user=run_as_user
+    )
+
+
+def query_engine_cli(
+    run_as_user: Union[str, None] = None,
+) -> Union[JSONSection, Error]:
+    return _run_cli_json_query(
+        ["info", "--format", "json"], "engine", default={}, run_as_user=run_as_user
+    )
+
+
+def query_pods_cli(
+    run_as_user: Union[str, None] = None,
+) -> Union[JSONSection, Error]:
+    return _run_cli_json_query(
+        ["pod", "ps", "--format", "json"], "pods", default=[], run_as_user=run_as_user
+    )
+
+
+def query_container_inspect_cli(
+    container_id: str,
+    run_as_user: Union[str, None] = None,
+) -> Union[JSONSection, Error]:
+    socket_owner: str
+    if run_as_user is not None:
+        socket_owner = run_as_user
+    else:
+        try:
+            socket_owner = pwd.getpwuid(os.getuid()).pw_name
+        except KeyError:
+            socket_owner = "root"
+
+    def _transform(d: object) -> object:
+        result = d[0] if isinstance(d, list) and d else d
+        if isinstance(result, dict):
+            result["SocketUser"] = socket_owner
+        return result
+
+    return _run_cli_json_query(
+        ["inspect", container_id],
+        "container_inspect",
+        default=[],
+        run_as_user=run_as_user,
+        transform=_transform,
+    )
+
+
+def query_raw_stats_cli(
+    run_as_user: Union[str, None] = None,
+) -> Union[Mapping[str, object], Error]:
+    result = run_podman_command(["stats", "--all", "--no-stream", "--format", "json"], run_as_user)
+    if isinstance(result, Error):
+        return result
+    try:
+        result = _strip_login_banner(result)
+        stats_list = json.loads(result) if result.strip() else []
+        # Convert to the same format as the API response
+        return {"Stats": stats_list}
+    except json.JSONDecodeError as e:
+        return Error("podman stats", f"Failed to parse JSON: {e}")
+
+
+def _skip_container(
+    container: Mapping[str, object],
+    keep_non_zero_exit_containers: bool,
+) -> bool:
+    state = str(container.get("State", ""))
+    exit_code = container.get("ExitCode") or 0
+    return bool(state == "exited" and (not keep_non_zero_exit_containers or exit_code == 0))
+
+
+def handle_containers_stats_cli(
+    containers: Sequence[Mapping[str, object]],
+    container_stats: Mapping[str, object],
+    piggyback_name_method: PiggybackNameMethod,
+    nodename: Union[str, None] = None,
+    run_as_user: Union[str, None] = None,
+    keep_non_zero_exit_containers: bool = True,
+) -> None:
+    for container in containers:
+        if _skip_container(container, keep_non_zero_exit_containers):
+            continue
+
+        container_id = str(container.get("Id", ""))
+        target_host = get_piggyback_host(
+            container_id,
+            get_container_name(container.get("Names")),
+            piggyback_name_method,
+            nodename,
+        )
+        if not target_host:
+            continue
+
+        write_piggyback_section(
+            target_host=target_host,
+            section=query_container_inspect_cli(container_id, run_as_user),
+        )
+
+        if stats := container_stats.get(container_id) or container_stats.get(container_id[:12]):
+            write_piggyback_section(
+                target_host=target_host,
+                section=JSONSection("container_stats", json.dumps(stats)),
+            )
+
+
+def run_cli_queries_for_user(
+    piggyback_name_method: PiggybackNameMethod,
+    run_as_user: Union[str, None] = None,
+    keep_non_zero_exit_containers: bool = True,
+) -> None:
+    LOGGER.info("Running CLI queries as user: %(user)s", {"user": run_as_user or "root"})
+    containers_section = query_containers_cli(run_as_user)
+    engine_section = query_engine_cli(run_as_user)
+
+    write_sections(
+        [
+            containers_section,
+            query_disk_usage_cli(run_as_user),
+            engine_section,
+            query_pods_cli(run_as_user),
+        ]
+    )
+
+    nodename = extract_nodename_from_engine(engine_section)
+
+    raw_container_stats = query_raw_stats_cli(run_as_user)
+    container_stats = (
+        extract_container_stats(raw_container_stats)
+        if not isinstance(raw_container_stats, Error)
+        else {}
+    )
+
+    if not isinstance(containers_section, Error):
+        handle_containers_stats_cli(
+            containers=json.loads(containers_section.content),
+            container_stats=container_stats,
+            piggyback_name_method=piggyback_name_method,
+            nodename=nodename,
+            run_as_user=run_as_user,
+            keep_non_zero_exit_containers=keep_non_zero_exit_containers,
+        )
+    else:
+        write_section(containers_section)
+
+
+def run_cli_queries(
+    piggyback_name_method: PiggybackNameMethod,
+    keep_non_zero_exit_containers: bool = True,
+) -> None:
+    podman_users = find_podman_users_from_conmon()
+
+    for user in podman_users:
+        run_cli_queries_for_user(piggyback_name_method, user, keep_non_zero_exit_containers)
+
+
+# =============================================================================
+# Socket-based query functions
+# =============================================================================
+
+
+def build_url_human_readable(socket_path: str, endpoint_uri: str) -> str:
+    return f"{socket_path}{endpoint_uri}"
+
+
+def build_url_callable(socket_path: str, endpoint_uri: str) -> str:
+    return f"{DEFAULT_SCHEME}{socket_path.replace('/', '%2F')}{endpoint_uri}"
+
+
+def query_containers(session: Session, socket_path: str) -> Union[JSONSection, Error]:
+    endpoint = f"/{PODMAN_API_VERSION}/libpod/containers/json"
+    try:
+        response = session.get(build_url_callable(socket_path, endpoint), params={"all": "true"})
+        response.raise_for_status()
+        output = [c for c in response.json() if not c.get("IsInfra", False)]
+    except Exception as e:
+        return Error(build_url_human_readable(socket_path, endpoint), str(e))
+    return JSONSection("containers", json.dumps(output))
+
+
+def query_disk_usage(session: Session, socket_path: str) -> Union[JSONSection, Error]:
+    endpoint = f"/{PODMAN_API_VERSION}/libpod/system/df"
+    try:
+        response = session.get(build_url_callable(socket_path, endpoint))
+        response.raise_for_status()
+    except Exception as e:
+        return Error(build_url_human_readable(socket_path, endpoint), str(e))
+    return JSONSection("disk_usage", json.dumps(response.json()))
+
+
+def query_engine(session: Session, socket_path: str) -> Union[JSONSection, Error]:
+    endpoint = f"/{PODMAN_API_VERSION}/libpod/info"
+    try:
+        response = session.get(build_url_callable(socket_path, endpoint))
+        response.raise_for_status()
+    except Exception as e:
+        return Error(build_url_human_readable(socket_path, endpoint), str(e))
+    return JSONSection("engine", json.dumps(response.json()))
+
+
+def query_pods(session: Session, socket_path: str) -> Union[JSONSection, Error]:
+    endpoint = f"/{PODMAN_API_VERSION}/libpod/pods/json"
+    try:
+        response = session.get(build_url_callable(socket_path, endpoint), params={"all": "true"})
+        response.raise_for_status()
+    except Exception as e:
+        return Error(build_url_human_readable(socket_path, endpoint), str(e))
+    return JSONSection("pods", json.dumps(response.json()))
+
+
+def query_container_inspect(
+    session: Session,
+    socket_path: str,
+    container_id: str,
+    socket_owner: Union[str, None] = None,
+) -> Union[JSONSection, Error]:
+    endpoint = f"/{PODMAN_API_VERSION}/libpod/containers/{container_id}/json"
+    try:
+        response = session.get(build_url_callable(socket_path, endpoint))
+        response.raise_for_status()
+        data = response.json()
+        if socket_owner is not None:
+            data["SocketUser"] = socket_owner
+        section: Union[JSONSection, Error] = JSONSection("container_inspect", json.dumps(data))
+    except Exception as e:
+        section = Error(build_url_human_readable(socket_path, endpoint), str(e))
+    return section
+
+
+def query_raw_stats(session: Session, socket_path: str) -> Union[Mapping[str, object], Error]:
+    endpoint = f"/{PODMAN_API_VERSION}/libpod/containers/stats"
+    try:
+        response = session.get(
+            build_url_callable(socket_path, endpoint),
+            params={"stream": "false", "all": "true"},
+        )
+        response.raise_for_status()
+        result: Mapping[str, object] = response.json()
+        return result
+    except Exception as e:
+        return Error(build_url_human_readable(socket_path, endpoint), str(e))
+
+
+def extract_container_stats(stats_data: Mapping[str, object]) -> Mapping[str, object]:
+    if not isinstance(stats := stats_data.get("Stats", []), list):
+        return {}
+
+    result = {}
+    for stat in stats:
+        container_id = stat.get("ContainerID") or stat.get("id")
+        if container_id:
+            result[container_id] = stat
+
+    return result
+
+
+def get_container_name(names: object) -> str:
+    if isinstance(names, list) and names:
+        return str(names[0]).lstrip("/")
+    return "unnamed"
+
+
+def extract_nodename_from_engine(engine_section: Union[JSONSection, Error]) -> Union[str, None]:
+    if isinstance(engine_section, Error):
+        return None
+    try:
+        data = json.loads(engine_section.content)
+        return str(data["host"]["hostname"])
+    except (json.JSONDecodeError, KeyError, TypeError):  # fmt: skip
+        return None
+
+
+def get_piggyback_host(
+    container_id: str,
+    container_name: str,
+    piggyback_name_method: PiggybackNameMethod,
+    nodename: Union[str, None] = None,
+) -> Union[str, None]:
+    if not container_id:
+        return None
+
+    if piggyback_name_method is PiggybackNameMethod.NODENAME_NAME:
+        if nodename is None:
+            nodename = os.uname()[1]
+        return f"{nodename}_{container_name}"
+
+    if piggyback_name_method is PiggybackNameMethod.NAME_ID:
+        return f"{container_name}_{container_id[:12]}"
+
+    # Default: PiggybackNameMethod.NAME (fallback when no specific method matches)
+    return container_name
+
+
+def handle_containers_stats(
+    containers: Sequence[Mapping[str, object]],
+    container_stats: Mapping[str, object],
+    socket_path: str,
+    session: Session,
+    piggyback_name_method: PiggybackNameMethod = PiggybackNameMethod.NODENAME_NAME,
+    nodename: Union[str, None] = None,
+    keep_non_zero_exit_containers: bool = True,
+) -> None:
+    socket_owner = get_socket_owner(Path(socket_path))
+    for container in containers:
+        if _skip_container(container, keep_non_zero_exit_containers):
+            continue
+
+        container_id = str(container.get("Id", ""))
+        target_host = get_piggyback_host(
+            container_id,
+            get_container_name(container.get("Names")),
+            piggyback_name_method,
+            nodename,
+        )
+        if not target_host or not container_id:
+            continue
+
+        write_piggyback_section(
+            target_host=target_host,
+            section=query_container_inspect(session, socket_path, container_id, socket_owner),
+        )
+
+        if stats := container_stats.get(container_id):
+            write_piggyback_section(
+                target_host=target_host,
+                section=JSONSection("container_stats", json.dumps(stats)),
+            )
+
+
+def _get_piggyback_name_method(config: Union[PodmanConfig, None]) -> PiggybackNameMethod:
+    if config is None:
+        return PiggybackNameMethod.NODENAME_NAME
+    return config["piggyback_name_method"]
+
+
+def main() -> None:
+    if not _is_podman_host():
+        sys.stderr.write("mk_podman.py: Does not seem to be a podman host. Terminating.\n")
+        sys.exit(1)
+    if not _HAS_REQUESTS:
+        write_section(
+            Error(
+                label="Missing Python dependency: requests.",
+                message="Import error: No module named 'requests'. "
+                "Install the OS package (for example: python3-requests on RHEL/Rocky via EPEL) "
+                "or the pip package 'requests'. ",
+            )
+        )
+        sys.exit(0)
+    parse_arguments()
+    config = load_cfg()
+    piggyback_name_method = _get_piggyback_name_method(config)
+
+    # Write empty errors section to indicate successful start
+    write_serialized_section("errors", json.dumps({}))
+
+    keep_non_zero_exit_containers = (
+        config.get("keep_non_zero_exit_containers", True) if config else True
+    )
+
+    if config is not None and config["connection_method"] is ConnectionMethod.CLI:
+        LOGGER.info("Connection method: CLI (from config).")
+        run_cli_queries(piggyback_name_method, keep_non_zero_exit_containers)
+        return
+
+    socket_paths = get_socket_paths(config)
+    available_sockets = [sp for sp in socket_paths if os.path.exists(sp)]
+
+    if not available_sockets:
+        checked = ", ".join(socket_paths) if socket_paths else "(none configured)"
+        LOGGER.error("No podman socket available.")
+        write_section(
+            Error(
+                "podman_status",
+                f"No podman socket found. "
+                f"Checked paths: {checked}. "
+                "Ensure the podman socket service is running "
+                "(e.g. systemctl enable --now podman.socket).",
+            )
+        )
+        return
+
+    for socket_path_str in available_sockets:
+        LOGGER.info("Querying podman via socket: %(socket_path)s", {"socket_path": socket_path_str})
+        socket_path = Path(socket_path_str)
+        with make_unixsocket_session(
+            socket_path=socket_path,
+            target_base_url=DEFAULT_SCHEME,
+        ) as session:
+            containers_section = query_containers(session, socket_path_str)
+            engine_section = query_engine(session, socket_path_str)
+
+            write_sections(
+                [
+                    containers_section,
+                    query_disk_usage(session, socket_path_str),
+                    engine_section,
+                    query_pods(session, socket_path_str),
+                ]
+            )
+
+            nodename = extract_nodename_from_engine(engine_section)
+
+            raw_container_stats = query_raw_stats(session, socket_path_str)
+            container_stats = (
+                extract_container_stats(raw_container_stats)
+                if not isinstance(raw_container_stats, Error)
+                else {}
+            )
+
+            if not isinstance(containers_section, Error):
+                handle_containers_stats(
+                    containers=json.loads(containers_section.content),
+                    container_stats=container_stats,
+                    socket_path=socket_path_str,
+                    session=session,
+                    piggyback_name_method=piggyback_name_method,
+                    nodename=nodename,
+                    keep_non_zero_exit_containers=keep_non_zero_exit_containers,
+                )
+            else:
+                write_section(containers_section)
+
+
+if __name__ == "__main__":
+    main()

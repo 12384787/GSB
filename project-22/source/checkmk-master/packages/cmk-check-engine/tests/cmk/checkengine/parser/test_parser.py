@@ -1,0 +1,1279 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+
+import copy
+import itertools
+import time
+from collections.abc import MutableMapping, Sequence
+from pathlib import Path
+from typing import override
+
+import pytest
+
+from cmk.ccc.hostaddress import HostName
+from cmk.ccc.translations import TranslationOptions
+from cmk.checkengine.helper_interface import AgentRawData
+from cmk.checkengine.parser import (
+    AgentParser,
+    AgentRawDataSectionElem,
+    NO_SELECTION,
+    SectionStore,
+    SNMPParser,
+)
+from cmk.checkengine.parser._agent import ParserState
+from cmk.checkengine.parser._markers import PiggybackMarker, SectionMarker
+from cmk.checkengine.plugins import SectionName
+from cmk.checkengine.snmplib import SNMPRawData, SNMPSectionMarker
+
+StringTable = list[list[str]]
+
+
+class TestSectionStore:
+    def test_repr(self) -> None:
+        assert isinstance(
+            repr(
+                SectionStore(
+                    Path("/dev/null"),
+                )
+            ),
+            str,
+        )
+
+
+class TestAgentParser:
+    @pytest.fixture
+    def hostname(self) -> HostName:
+        return HostName("testhost")
+
+    @pytest.fixture
+    def store_path(self, tmp_path: Path) -> Path:
+        return tmp_path / "store"
+
+    @pytest.fixture
+    def store(self, store_path: Path) -> SectionStore[Sequence[AgentRawDataSectionElem]]:
+        return SectionStore[Sequence[AgentRawDataSectionElem]](store_path)
+
+    @pytest.fixture
+    def parser(
+        self,
+        hostname: HostName,
+        store: SectionStore[Sequence[AgentRawDataSectionElem]],
+    ) -> AgentParser:
+        return AgentParser(
+            hostname,
+            store,
+            host_check_interval=0,
+            keep_outdated=True,
+            translation=TranslationOptions(),
+            encoding_fallback="ascii",
+        )
+
+    def test_missing_host_header(
+        self, parser: AgentParser, store: SectionStore[Sequence[AgentRawDataSectionElem]]
+    ) -> None:
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"hey!",
+                    b"a header",
+                    b"is missing",
+                )
+            )
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert ahs.sections == {}
+        assert ahs.cache_info == {}
+        assert ahs.piggybacked_raw_data == {}
+        assert not store.load()
+
+    def test_piggy_name_as_hostname_is_piggybacked(
+        self,
+        parser: AgentParser,
+        store: SectionStore[Sequence[AgentRawDataSectionElem]],
+        hostname: HostName,
+    ) -> None:
+        host_name_bytes = str(hostname).encode("ascii")
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"<<<<%s>>>>" % host_name_bytes,
+                    b"<<<some_section>>>",
+                    b"line0",
+                    b"line1",
+                    b"line2",
+                )
+            )
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert ahs.sections == {}
+        assert ahs.cache_info == {}
+        assert hostname in ahs.piggybacked_raw_data
+        assert any(b"some_section" in chunk for chunk in ahs.piggybacked_raw_data[hostname])
+        assert not store.load()
+
+    def test_no_section_header_after_piggyback(
+        self, parser: AgentParser, store: SectionStore[Sequence[AgentRawDataSectionElem]]
+    ) -> None:
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"<<<<piggy>>>>",
+                    b"line0",
+                    b"line1",
+                    b"line2",
+                )
+            )
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert ahs.sections == {}
+        assert ahs.cache_info == {}
+        assert ahs.piggybacked_raw_data == {HostName("piggy"): []}
+        assert not store.load()
+
+    def test_raw_section_populates_sections(
+        self, parser: AgentParser, store: SectionStore[Sequence[AgentRawDataSectionElem]]
+    ) -> None:
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"<<<a_section>>>",
+                    b"first line",
+                    b"second line",
+                    b"<<<>>>",  # ignored
+                    b"<<<another_section>>>",
+                    b"first line",
+                    b"second line",
+                )
+            )
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+
+        assert ahs.sections == {
+            SectionName("a_section"): [["first", "line"], ["second", "line"]],
+            SectionName("another_section"): [["first", "line"], ["second", "line"]],
+        }
+        assert ahs.cache_info == {}
+        assert ahs.piggybacked_raw_data == {}
+        assert not store.load()
+
+    def test_partial_header_is_not_a_header(
+        self, parser: AgentParser, store: SectionStore[Sequence[AgentRawDataSectionElem]]
+    ) -> None:
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"<<<a_section>>>",
+                    b"<<< first line",
+                    b">>> second line",
+                    b"third line >>>",
+                    b"forth line <<<",
+                )
+            )
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert ahs.sections == {
+            SectionName("a_section"): [
+                ["<<<", "first", "line"],
+                [">>>", "second", "line"],
+                ["third", "line", ">>>"],
+                ["forth", "line", "<<<"],
+            ]
+        }
+        assert ahs.cache_info == {}
+        assert ahs.piggybacked_raw_data == {}
+        assert not store.load()
+
+    def test_merge_split_raw_sections(
+        self, parser: AgentParser, store: SectionStore[Sequence[AgentRawDataSectionElem]]
+    ) -> None:
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"<<<a_section>>>",
+                    b"first line",
+                    b"second line",
+                    b"<<<another_section>>>",
+                    b"a line",
+                    b"b line",
+                    b"<<<a_section>>>",
+                    b"third line",
+                    b"forth line",
+                    b"<<<another_section>>>",
+                    b"c line",
+                    b"d line",
+                    b"<<<a_section:sep(124)>>>",
+                    b"fifth|line",
+                    b"sixth|line",
+                )
+            )
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert ahs.sections == {
+            SectionName("a_section"): [
+                ["first", "line"],
+                ["second", "line"],
+                ["third", "line"],
+                ["forth", "line"],
+                ["fifth", "line"],
+                ["sixth", "line"],
+            ],
+            SectionName("another_section"): [
+                ["a", "line"],
+                ["b", "line"],
+                ["c", "line"],
+                ["d", "line"],
+            ],
+        }
+        assert ahs.cache_info == {}
+        assert ahs.piggybacked_raw_data == {}
+        assert not store.load()
+
+    def test_nameless_sections_are_skipped(
+        self, parser: AgentParser, store: SectionStore[Sequence[AgentRawDataSectionElem]]
+    ) -> None:
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"<<<a_section>>>",
+                    b"a first line",
+                    b"a second line",
+                    b"<<<:cached(10, 5)>>>",
+                    b"ignored first line",
+                    b"ignored second line",
+                    b"<<<b_section>>>",
+                    b"b first line",
+                    b"b second line",
+                    b"<<<>>>",
+                    b"ignored third line",
+                    b"ignored forth line",
+                    b"<<<c_section>>>",
+                    b"c first line",
+                    b"c second line",
+                )
+            )
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert ahs.sections == {
+            SectionName("a_section"): [["a", "first", "line"], ["a", "second", "line"]],
+            SectionName("b_section"): [["b", "first", "line"], ["b", "second", "line"]],
+            SectionName("c_section"): [["c", "first", "line"], ["c", "second", "line"]],
+        }
+        assert ahs.cache_info == {}
+        assert ahs.piggybacked_raw_data == {}
+        assert not store.load()
+
+    def test_nameless_piggybacked_sections_are_skipped(
+        self,
+        parser: AgentParser,
+        store: SectionStore[Sequence[AgentRawDataSectionElem]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(time, "time", lambda c=itertools.count(1000, 50): next(c))
+        monkeypatch.setattr(parser, "cache_piggybacked_data_for", 900)
+
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"<<<<piggyback_header>>>>",
+                    b"<<<a_section>>>",
+                    b"a first line",
+                    b"a second line",
+                    b"<<<:cached(10, 5)>>>",
+                    b"ignored first line",
+                    b"ignored second line",
+                    b"<<<>>>",
+                    b"ignored third line",
+                    b"ignored forth line",
+                    b"<<<b_section>>>",
+                    b"b first line",
+                    b"b second line",
+                    b"<<<>>>",
+                    b"ignored fifth line",
+                    b"ignored sixth line",
+                )
+            )
+        )
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert ahs.sections == {}
+        assert ahs.cache_info == {}
+        assert ahs.piggybacked_raw_data == {
+            "piggyback_header": [
+                b"<<<a_section:cached(1000,900)>>>",
+                b"a first line",
+                b"a second line",
+                b"<<<b_section:cached(1000,900)>>>",
+                b"b first line",
+                b"b second line",
+            ]
+        }
+        assert not store.load()
+
+    def test_unrecoverably_invalid_hosts_are_ignored(self, parser: AgentParser) -> None:
+        # a too long name can't be a valid hostname -- not even after character replacements
+        too_long = b"piggybackedhost" * 100
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"<<<section1>>>",
+                    b"one line",
+                    b"<<<<%s>>>>" % too_long,  # <- invalid host name
+                    b"<<<this_goes_nowhere>>>",
+                    b"dead line",
+                    b"<<<<>>>>",
+                    b"<<<section2>>>",
+                    b"a first line",
+                    b"a second line",
+                )
+            )
+        )
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert set(ahs.sections) == {SectionName("section1"), SectionName("section2")}
+        assert ahs.piggybacked_raw_data == {}
+
+    def test_invalid_hosts_are_projected(
+        self, parser: AgentParser, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(time, "time", lambda c=itertools.count(1000, 50): next(c))
+        monkeypatch.setattr(parser, "cache_piggybacked_data_for", 900)
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"<<<section1>>>",
+                    b"one line",
+                    b"<<<<Foo Bar>>>>",  # <- invalid host name
+                    b"<<<this_is_found>>>",
+                    b"some line",
+                    b"<<<<>>>>",
+                    b"<<<section2>>>",
+                    b"a first line",
+                    b"a second line",
+                )
+            )
+        )
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert set(ahs.sections) == {SectionName("section1"), SectionName("section2")}
+        assert ahs.piggybacked_raw_data == {
+            "Foo_Bar": [b"<<<this_is_found:cached(1000,900)>>>", b"some line"]
+        }
+
+    def test_closing_piggyback_out_of_piggyback_section_closes_section(
+        self, parser: AgentParser, store: SectionStore[Sequence[AgentRawDataSectionElem]]
+    ) -> None:
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"<<<a_section>>>",
+                    b"first line",
+                    b"second line",
+                    b"<<<<>>>>",  # noop
+                    b"<<<<>>>>",  # noop
+                    b"<<<another_section>>>",
+                    b"a line",
+                    b"b line",
+                )
+            )
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert ahs.sections == {
+            SectionName("a_section"): [
+                ["first", "line"],
+                ["second", "line"],
+            ],
+            SectionName("another_section"): [
+                ["a", "line"],
+                ["b", "line"],
+            ],
+        }
+        assert ahs.cache_info == {}
+        assert ahs.piggybacked_raw_data == {}
+        assert not store.load()
+
+    def test_piggyback_populates_piggyback_raw_data(
+        self,
+        parser: AgentParser,
+        store: SectionStore[Sequence[AgentRawDataSectionElem]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(time, "time", lambda c=itertools.count(1000, 50): next(c))
+        monkeypatch.setattr(parser, "cache_piggybacked_data_for", 900)
+
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"<<<<piggyback_header>>>>",
+                    b"<<<section>>>",
+                    b"first line",
+                    b"second line",
+                    b"<<<<>>>>",  # <- omitting this line makes no difference
+                    b"<<<<piggyback_other>>>>",
+                    b"<<<other_section>>>",
+                    b"first line",
+                    b"second line",
+                    b"<<<other_other_section>>>",
+                    b"third line",
+                    b"forth line",
+                    b"<<<<>>>>",
+                    b"<<<</b_l-u/>>>>",
+                    b"<<<section>>>",
+                    b"first line",
+                )
+            )
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+
+        assert ahs.sections == {}
+        assert ahs.cache_info == {}
+        assert ahs.piggybacked_raw_data == {
+            "piggyback_header": [
+                b"<<<section:cached(1000,900)>>>",
+                b"first line",
+                b"second line",
+            ],
+            "piggyback_other": [
+                b"<<<other_section:cached(1000,900)>>>",
+                b"first line",
+                b"second line",
+                b"<<<other_other_section:cached(1000,900)>>>",
+                b"third line",
+                b"forth line",
+            ],
+            "_b_l-u_": [
+                b"<<<section:cached(1000,900)>>>",
+                b"first line",
+            ],
+        }
+        assert not store.load()
+
+    def test_merge_split_piggyback_sections(
+        self,
+        parser: AgentParser,
+        store: SectionStore[Sequence[AgentRawDataSectionElem]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(time, "time", lambda c=itertools.count(1000, 50): next(c))
+        monkeypatch.setattr(parser, "cache_piggybacked_data_for", 900)
+
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"<<<<piggy>>>>",
+                    b"<<<a_section>>>",
+                    b"first line",
+                    b"second line",
+                    b"<<<another_section>>>",
+                    b"a line",
+                    b"b line",
+                    b"<<<<>>>>",
+                    b"<<<<piggy>>>>",
+                    b"<<<a_section>>>",
+                    b"third line",
+                    b"forth line",
+                    b"<<<another_section>>>",
+                    b"c line",
+                    b"d line",
+                    b"<<<<>>>>",
+                )
+            )
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert ahs.sections == {}
+        assert ahs.cache_info == {}
+        assert ahs.piggybacked_raw_data == {
+            "piggy": [
+                b"<<<a_section:cached(1000,900)>>>",
+                b"first line",
+                b"second line",
+                b"<<<another_section:cached(1000,900)>>>",
+                b"a line",
+                b"b line",
+                b"<<<a_section:cached(1000,900)>>>",
+                b"third line",
+                b"forth line",
+                b"<<<another_section:cached(1000,900)>>>",
+                b"c line",
+                b"d line",
+            ],
+        }
+        assert not store.load()
+
+    def test_persist_option_populates_cache_info(
+        self,
+        parser: AgentParser,
+        store: SectionStore[Sequence[AgentRawDataSectionElem]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(time, "time", lambda c=itertools.count(1000, 50): next(c))
+
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"<<<section:persist(%i)>>>" % (1000 + 50),
+                    b"first line",
+                    b"second line",
+                )
+            )
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+
+        assert ahs.sections == {SectionName("section"): [["first", "line"], ["second", "line"]]}
+        assert ahs.cache_info == {SectionName("section"): (1000, 50)}
+        assert ahs.piggybacked_raw_data == {}
+        assert store.load() == {
+            SectionName("section"): (1000, 1050, [["first", "line"], ["second", "line"]]),
+        }
+
+    def test_persist_option_and_persisted_sections(
+        self,
+        parser: AgentParser,
+        store: SectionStore[Sequence[AgentRawDataSectionElem]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(time, "time", lambda c=itertools.count(1000, 50): next(c))
+        monkeypatch.setattr(
+            SectionStore,
+            "load",
+            lambda self: {  # noqa: ARG005
+                SectionName("persisted"): (42, 69, [["content"]]),
+            },
+        )
+        # Patch IO:
+        monkeypatch.setattr(SectionStore, "store", lambda self, sections: None)  # noqa: ARG005
+
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"<<<section:persist(%i)>>>" % (1000 + 50),
+                    b"first line",
+                    b"second line",
+                )
+            )
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+
+        assert ahs.sections == {
+            SectionName("section"): [["first", "line"], ["second", "line"]],
+            SectionName("persisted"): [["content"]],
+        }
+        assert ahs.cache_info == {
+            SectionName("section"): (1000, 50),
+            SectionName("persisted"): (42, 27),
+        }
+        assert ahs.piggybacked_raw_data == {}
+        assert store.load() == {
+            SectionName("persisted"): (42, 69, [["content"]]),
+        }
+
+    def test_section_filtering_and_merging_host(
+        self,
+        parser: AgentParser,
+        store: SectionStore[Sequence[AgentRawDataSectionElem]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(time, "time", lambda c=itertools.count(1000, 50): next(c))
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"<<<deselected:persist(1000)>>>",
+                    b"1st line",
+                    b"2nd line",
+                    b"<<<selected:persist(1000)>>>",
+                    b"3rd line",
+                    b"4th line",
+                    b"<<<deselected:persist(1000)>>>",
+                    b"5th line",
+                    b"6th line",
+                    b"<<<selected:persist(1000)>>>",
+                    b"7th line",
+                    b"8th line",
+                )
+            )
+        )
+
+        ahs = parser.parse(raw_data, selection=frozenset({SectionName("selected")}))
+
+        assert ahs.sections == {
+            SectionName("selected"): [
+                ["3rd", "line"],
+                ["4th", "line"],
+                ["7th", "line"],
+                ["8th", "line"],
+            ],
+        }
+        assert ahs.cache_info == {SectionName("selected"): (1000, 0)}
+        assert ahs.piggybacked_raw_data == {}
+        assert store.load() == {
+            SectionName("selected"): (
+                1000,
+                1000,
+                [
+                    ["3rd", "line"],
+                    ["4th", "line"],
+                    ["7th", "line"],
+                    ["8th", "line"],
+                ],
+            )
+        }
+
+    def test_section_filtering_and_merging_piggyback(
+        self,
+        parser: AgentParser,
+        store: SectionStore[Sequence[AgentRawDataSectionElem]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(time, "time", lambda c=itertools.count(1000, 50): next(c))
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"<<<<piggyback_header>>>>",
+                    b"<<<deselected>>>",
+                    b"1st line",
+                    b"2nd line",
+                    b"<<<selected>>>",
+                    b"3rd line",
+                    b"4th line",
+                    b"<<<<>>>>",
+                    b"<<<deselected>>>",
+                    b"5th line",
+                    b"6th line",
+                    b"<<<selected>>>",
+                    b"7th line",
+                    b"8th line",
+                )
+            )
+        )
+
+        ahs = parser.parse(raw_data, selection=frozenset({SectionName("selected")}))
+
+        assert ahs.sections == {
+            SectionName("selected"): [["7th", "line"], ["8th", "line"]],
+        }
+        assert ahs.cache_info == {}
+        # we don't expect the piggybacked sections to get filtered:
+        assert ahs.piggybacked_raw_data == {
+            "piggyback_header": [
+                b"<<<deselected:cached(1000,0)>>>",
+                b"1st line",
+                b"2nd line",
+                b"<<<selected:cached(1000,0)>>>",
+                b"3rd line",
+                b"4th line",
+            ]
+        }
+        assert not store.load()
+
+    def test_section_lines_are_correctly_ordered_with_different_separators(
+        self, parser: AgentParser, store: SectionStore[Sequence[AgentRawDataSectionElem]]
+    ) -> None:
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"<<<section:sep(124)>>>",
+                    b"a|1",
+                    b"<<<section:sep(44)>>>",
+                    b"b,2",
+                    b"<<<section:sep(124)>>>",
+                    b"c|3",
+                )
+            )
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert ahs.sections == {
+            SectionName("section"): [
+                ["a", "1"],
+                ["b", "2"],
+                ["c", "3"],
+            ],
+        }
+        assert ahs.cache_info == {}
+        assert ahs.piggybacked_raw_data == {}
+        assert not store.load()
+
+    def test_section_lines_are_correctly_ordered_with_different_separators_and_piggyback(
+        self,
+        parser: AgentParser,
+        store: SectionStore[Sequence[AgentRawDataSectionElem]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(time, "time", lambda c=itertools.count(1000, 50): next(c))
+        monkeypatch.setattr(parser, "cache_piggybacked_data_for", 900)
+
+        raw_data = AgentRawData(
+            b"\n".join(
+                (
+                    b"<<<<piggy>>>>",
+                    b"<<<section:sep(124)>>>",
+                    b"a|1",
+                    b"<<<section:sep(44)>>>",
+                    b"b,2",
+                    b"<<<section:sep(124)>>>",
+                    b"c|3",
+                )
+            )
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert ahs.sections == {}
+        assert ahs.cache_info == {}
+        assert ahs.piggybacked_raw_data == {
+            "piggy": [
+                b"<<<section:cached(1000,900):sep(124)>>>",
+                b"a|1",
+                b"<<<section:cached(1000,900):sep(44)>>>",
+                b"b,2",
+                b"<<<section:cached(1000,900):sep(124)>>>",
+                b"c|3",
+            ],
+        }
+        assert store.load() == {}
+
+
+class ParserStateAdapter(ParserState):
+    def __init__(self, *, translation: TranslationOptions | None = None):
+        super().__init__(
+            HostName("foo"),
+            sections=[],
+            piggyback_sections={},
+            translation={} if translation is None else translation,
+            encoding_fallback="utf-8",
+        )
+
+    @override
+    def do_action(self, line: bytes) -> ParserState:
+        raise AssertionError("unexpected data line")
+
+    @override
+    def on_piggyback_header(self, piggyback_header: PiggybackMarker) -> ParserState:
+        raise AssertionError("unexpected piggyback header")
+
+    @override
+    def on_piggyback_footer(self) -> ParserState:
+        raise AssertionError("unexpected piggyback footer")
+
+    @override
+    def on_section_header(self, section_header: SectionMarker) -> ParserState:
+        raise AssertionError("unexpected section header")
+
+    @override
+    def on_section_footer(self) -> ParserState:
+        raise AssertionError("unexpected section footer")
+
+
+class TestSectionMarker:
+    @pytest.mark.parametrize(
+        "line",
+        [
+            b"<<<section>>>",
+            b"<<<section:cached(1,2):encoding(ascii):nostrip():persist(42):sep(124)>>>",
+        ],
+    )
+    def test_stringify(self, line: bytes) -> None:
+        parsed: SectionMarker | None = None
+
+        class ExpectSectionHeader(ParserStateAdapter):
+            @override
+            def on_section_header(self, section_header: SectionMarker) -> ParserState:
+                nonlocal parsed
+                parsed = section_header
+                return self
+
+        ExpectSectionHeader()(line)
+        parsed_line = parsed
+        ExpectSectionHeader()(str(parsed).encode("ascii"))
+        assert parsed_line == parsed
+        assert str(parsed_line) == str(parsed)
+
+    @pytest.mark.parametrize(
+        "line, expected",
+        [
+            (  # defaults
+                b"<<<norris>>>",
+                SectionMarker(
+                    name=SectionName("norris"),
+                    cached=None,
+                    encoding="utf-8",
+                    nostrip=False,
+                    persist=None,
+                    separator=None,
+                ),
+            ),
+            (
+                b"<<<norris:encoding(chuck)>>>",
+                SectionMarker(
+                    name=SectionName("norris"),
+                    cached=None,
+                    encoding="chuck",
+                    nostrip=False,
+                    persist=None,
+                    separator=None,
+                ),
+            ),
+            (
+                b"<<<my_section:sep(0):cached(23,42)>>>",
+                SectionMarker(
+                    name=SectionName("my_section"),
+                    cached=(23, 42),
+                    encoding="utf-8",
+                    nostrip=False,
+                    persist=None,
+                    separator="\x00",
+                ),
+            ),
+            (
+                b"<<<name:cached(1,2):encoding(ascii):nostrip():persist(42):sep(124)>>>",
+                SectionMarker(
+                    name=SectionName("name"),
+                    cached=(1, 2),
+                    encoding="ascii",
+                    nostrip=True,
+                    persist=42,
+                    separator="|",
+                ),
+            ),
+            (  # option without parentheses gets ignored
+                b"<<<norris:encoding:encoding(dong)>>>",
+                SectionMarker(
+                    name=SectionName("norris"),
+                    cached=None,
+                    encoding="dong",
+                    nostrip=False,
+                    persist=None,
+                    separator=None,
+                ),
+            ),
+            (  # unknown option gets ignored
+                b"<<<norris:hurz(42):encoding(blah)>>>",
+                SectionMarker(
+                    name=SectionName("norris"),
+                    cached=None,
+                    encoding="blah",
+                    nostrip=False,
+                    persist=None,
+                    separator=None,
+                ),
+            ),
+            (b"<<<my.section:sep(0):cached(23,42)>>>", None),  # invalid section name
+            (b"<<< >>>", None),  # invalid section name
+        ],
+    )
+    def test_options_from_headerline(self, line: bytes, expected: SectionMarker | None) -> None:
+        class ExpectSectionHeader(ParserStateAdapter):
+            @override
+            def on_section_header(self, section_header: SectionMarker) -> ParserState:
+                assert section_header == expected
+                return self
+
+        try:
+            ExpectSectionHeader()(line)
+        except ValueError:
+            assert expected is None
+
+
+class TestPiggybackMarker:
+    @staticmethod
+    def _parse_header(header: bytes, translation: TranslationOptions) -> PiggybackMarker:
+        parsed: PiggybackMarker | None = None
+
+        class ExpectPiggybackHeader(ParserStateAdapter):
+            @override
+            def on_piggyback_header(self, piggyback_header: PiggybackMarker) -> ParserState:
+                nonlocal parsed
+                parsed = piggyback_header
+                return self
+
+        ExpectPiggybackHeader(translation=translation)(header)
+        assert parsed is not None
+        return parsed
+
+    @pytest.mark.parametrize(
+        "header, translation, expected_hostname",
+        [
+            pytest.param(
+                b"<<<<My virtual machine>>>>",
+                TranslationOptions(),
+                HostName("My_virtual_machine"),
+                id="invalid characters are converted into underscores",
+            ),
+            pytest.param(
+                b"<<<<VM01 - Testserver>>>>",
+                TranslationOptions(regex=[(r"(\S+) .*", r"\1")]),
+                HostName("VM01"),
+                # The expression only matches the space-containing name, so
+                # this pins that translation happens before the conversion
+                # into underscores.
+                id="regexes match the raw name as sent by the agent",
+            ),
+            pytest.param(
+                b"<<<<host123.foobar.de>>>>",
+                TranslationOptions(drop_domain=True),
+                HostName("host123"),
+                id="convert FQHN drops the domain part",
+            ),
+            pytest.param(
+                b"<<<<vm42>>>>",
+                TranslationOptions(case="upper"),
+                HostName("VM42"),
+                id="case translation converts the case",
+            ),
+            pytest.param(
+                b"<<<<VM01 - Testserver>>>>",
+                TranslationOptions(regex=[(r"(VM\d+)", r"\1")]),
+                HostName("VM01_-_Testserver"),
+                id="regex pattern must match the whole name",
+            ),
+            pytest.param(
+                b"<<<<VM01 - Testserver>>>>",
+                TranslationOptions(regex=[(r"(vm\d+) .*", r"\1")]),
+                HostName("VM01_-_Testserver"),
+                id="regex match is case sensitive",
+            ),
+            pytest.param(
+                b"<<<<VM01 - Testserver>>>>",
+                TranslationOptions(case="lower", regex=[(r"(vm\d+) .*", r"\1")]),
+                HostName("vm01"),
+                id="regexes are applied after the case translation",
+            ),
+            pytest.param(
+                b"<<<<vm42>>>>",
+                TranslationOptions(regex=[(r"(vm\d+)", r"first-\1"), (r"(v.*)", r"second-\1")]),
+                HostName("first-vm42"),
+                id="regexes are executed successively until the first match",
+            ),
+            pytest.param(
+                b"<<<<vm42>>>>",
+                TranslationOptions(
+                    case="upper",
+                    regex=[(r"(VM\d+)", r"\1-translated")],
+                    mapping=[("VM42-translated", "mapped")],
+                ),
+                HostName("mapped"),
+                id="mapping is applied after case conversion and regexes",
+            ),
+        ],
+    )
+    def test_translation_behaves_as_documented(
+        self,
+        header: bytes,
+        translation: TranslationOptions,
+        expected_hostname: HostName,
+    ) -> None:
+        """Pins the behavior documented in the help texts of the "Host name translation for
+        piggybacked hosts" rule. If one of these cases needs adjusting, the help texts must be
+        adjusted as well, and vice versa.
+        """
+        parsed = self._parse_header(header, translation)
+        assert parsed.hostname == expected_hostname
+
+    def test_translation_results_in_None(self) -> None:
+        parsed = self._parse_header(
+            b"<<<<x>>>>",
+            TranslationOptions(
+                case=None,
+                drop_domain=False,
+                mapping=[],
+                regex=[(".*(.*?)", r"\1")],
+            ),
+        )
+        assert parsed.hostname is None
+
+
+class TestSNMPParser:
+    @pytest.fixture
+    def hostname(self) -> str:
+        return "hostname"
+
+    @pytest.fixture
+    def parser(self) -> SNMPParser:
+        return SNMPParser()
+
+    def test_empty_raw_data(self, parser: SNMPParser) -> None:
+        raw_data: SNMPRawData = {}
+
+        host_sections = parser.parse(raw_data, selection=NO_SELECTION)
+        assert host_sections.sections == {}
+        assert host_sections.cache_info == {}
+        assert not host_sections.piggybacked_raw_data
+
+    @pytest.fixture
+    def sections(self) -> dict[SectionName, StringTable]:
+        # See also the tests to HostSections.
+        section_a = SectionName("section_a")
+        content_a = [["first", "line"], ["second", "line"]]
+        section_b = SectionName("section_b")
+        content_b = [["third", "line"], ["forth", "line"]]
+        return {section_a: content_a, section_b: content_b}
+
+    def test_no_cache(self, parser: SNMPParser, sections: dict[SectionName, StringTable]) -> None:
+        host_sections = parser.parse(
+            {SNMPSectionMarker(n): c for n, c in sections.items()}, selection=NO_SELECTION
+        )
+        assert host_sections.sections == sections
+        assert host_sections.cache_info == {}
+        assert not host_sections.piggybacked_raw_data
+
+    def test_with_cached_sections(self, parser: SNMPParser) -> None:
+        ahs = parser.parse(
+            {SNMPSectionMarker("my_section:cached(123,456)"): [["content"]]}, selection=NO_SELECTION
+        )
+        assert ahs.sections == {SectionName("my_section"): [["content"]]}
+        assert ahs.cache_info == {SectionName("my_section"): (123, 456)}
+        assert ahs.piggybacked_raw_data == {}
+
+
+class MockStore(SectionStore[Sequence[Sequence[str]]]):
+    def __init__(
+        self,
+        path: Path,
+        sections: MutableMapping[SectionName, tuple[int, int, Sequence[Sequence[str]]]],
+    ) -> None:
+        super().__init__(path)
+        self._sections = sections
+
+    @override
+    def store(
+        self, sections: MutableMapping[SectionName, tuple[int, int, Sequence[Sequence[str]]]]
+    ) -> None:
+        self._sections = copy.copy(sections)
+
+    @override
+    def load(self) -> MutableMapping[SectionName, tuple[int, int, Sequence[Sequence[str]]]]:
+        return copy.copy(self._sections)
+
+
+class TestAgentPersistentSectionHandling:
+    def test_update_with_empty_store_and_empty_raw_data(self) -> None:
+        section_store = MockStore(Path("/dev/null"), {})
+        raw_data = AgentRawData(b"")
+        parser = AgentParser(
+            HostName("testhost"),
+            section_store,
+            host_check_interval=0,
+            keep_outdated=True,
+            translation=TranslationOptions(),
+            encoding_fallback="ascii",
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert not ahs.sections
+        assert not ahs.cache_info
+        assert not ahs.piggybacked_raw_data
+        assert section_store.load() == {}
+
+    def test_update_with_store_and_empty_raw_data(self) -> None:
+        section_store = MockStore(
+            Path("/dev/null"),
+            {SectionName("stored"): (0, 0, [])},
+        )
+        raw_data = AgentRawData(b"")
+        parser = AgentParser(
+            HostName("testhost"),
+            section_store,
+            host_check_interval=0,
+            keep_outdated=True,
+            translation=TranslationOptions(),
+            encoding_fallback="ascii",
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert ahs.sections == {SectionName("stored"): []}
+        assert ahs.cache_info == {SectionName("stored"): (0, 0)}
+        assert not ahs.piggybacked_raw_data
+        assert section_store.load() == {SectionName("stored"): (0, 0, [])}
+
+    def test_update_with_empty_store_and_raw_data(self) -> None:
+        raw_data = AgentRawData(b"<<<fresh>>>")
+        section_store = MockStore(Path("/dev/null"), {})
+        parser = AgentParser(
+            HostName("testhost"),
+            section_store,
+            host_check_interval=0,
+            keep_outdated=True,
+            translation=TranslationOptions(),
+            encoding_fallback="ascii",
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert ahs.sections == {SectionName("fresh"): []}
+        assert not ahs.cache_info
+        assert not ahs.piggybacked_raw_data
+        assert section_store.load() == {}
+
+    def test_update_with_store_and_non_persisting_raw_data(self) -> None:
+        section_store = MockStore(
+            Path("/dev/null"),
+            {SectionName("stored"): (0, 0, [])},
+        )
+        raw_data = AgentRawData(b"<<<fresh>>>")
+        parser = AgentParser(
+            HostName("testhost"),
+            section_store,
+            host_check_interval=0,
+            keep_outdated=True,
+            translation=TranslationOptions(),
+            encoding_fallback="ascii",
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert ahs.sections == {
+            SectionName("fresh"): [],
+            SectionName("stored"): [],
+        }
+        assert ahs.cache_info == {SectionName("stored"): (0, 0)}
+        assert not ahs.piggybacked_raw_data
+        assert section_store.load() == {SectionName("stored"): (0, 0, [])}
+
+    def test_update_with_store_and_persisting_raw_data(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(time, "time", lambda c=itertools.count(1000, 50): next(c))
+        section_store = MockStore(
+            Path("/dev/null"),
+            {SectionName("stored"): (0, 0, [["canned", "section"]])},
+        )
+        raw_data = AgentRawData(b"<<<fresh:persist(10)>>>\nhello section")
+        parser = AgentParser(
+            HostName("testhost"),
+            section_store,
+            host_check_interval=0,
+            keep_outdated=True,
+            translation=TranslationOptions(),
+            encoding_fallback="ascii",
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert ahs.sections == {
+            SectionName("fresh"): [["hello", "section"]],
+            SectionName("stored"): [["canned", "section"]],
+        }
+        assert ahs.cache_info == {
+            SectionName("stored"): (0, 0),
+            SectionName("fresh"): (1000, -990),
+        }
+        assert not ahs.piggybacked_raw_data
+        assert section_store.load() == {
+            SectionName("stored"): (0, 0, [["canned", "section"]]),
+            SectionName("fresh"): (1000, 10, [["hello", "section"]]),
+        }
+
+    def test_update_store_with_newest(self) -> None:
+        section_store = MockStore(
+            Path("/dev/null"),
+            {SectionName("section"): (0, 0, [["oldest"]])},
+        )
+        raw_data = AgentRawData(b"<<<section>>>\nnewest")
+        parser = AgentParser(
+            HostName("testhost"),
+            section_store,
+            host_check_interval=0,
+            keep_outdated=True,
+            translation=TranslationOptions(),
+            encoding_fallback="ascii",
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert ahs.sections == {SectionName("section"): [["newest"]]}
+        assert not ahs.cache_info
+        assert not ahs.piggybacked_raw_data
+        assert section_store.load() == {SectionName("section"): (0, 0, [["oldest"]])}
+
+    def test_keep_outdated_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(time, "time", lambda c=itertools.count(1000, 50): next(c))
+
+        raw_data = AgentRawData(b"<<<another_section>>>")
+        section_store = MockStore(
+            Path("/dev/null"),
+            {SectionName("section"): (500, 600, [])},
+        )
+        parser = AgentParser(
+            HostName("testhost"),
+            section_store,
+            host_check_interval=42,
+            keep_outdated=False,
+            translation=TranslationOptions(),
+            encoding_fallback="ascii",
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert ahs.sections == {SectionName("another_section"): []}
+        assert not ahs.cache_info
+        assert not ahs.piggybacked_raw_data
+        assert section_store.load() == {}
+
+    def test_keep_outdated_true(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(time, "time", lambda c=itertools.count(1000, 50): next(c))
+
+        raw_data = AgentRawData(b"<<<another_section>>>")
+        section_store = MockStore(
+            Path("/dev/null"),
+            {SectionName("section"): (500, 600, [])},
+        )
+        parser = AgentParser(
+            HostName("testhost"),
+            section_store,
+            host_check_interval=42,
+            keep_outdated=True,
+            translation=TranslationOptions(),
+            encoding_fallback="ascii",
+        )
+
+        ahs = parser.parse(raw_data, selection=NO_SELECTION)
+        assert ahs.sections == {
+            SectionName("another_section"): [],
+            SectionName("section"): [],
+        }
+        assert ahs.cache_info == {SectionName("section"): (500, 100)}
+        assert not ahs.piggybacked_raw_data
+        assert section_store.load() == {SectionName("section"): (500, 600, [])}
+
+
+class TestMarkers:
+    @pytest.mark.parametrize("line", [b"<<<x>>>", b"<<<x:cached(10, 5)>>>"])
+    def test_section_header(self, line: bytes) -> None:
+        class ExpectSectionHeader(ParserStateAdapter):
+            @override
+            def on_section_header(self, section_header: SectionMarker) -> ParserState:
+                return self
+
+        ExpectSectionHeader()(line)
+
+    @pytest.mark.parametrize("line", [b"<<<>>>", b"<<<:cached(10, 5)>>>"])
+    def test_section_footer(self, line: bytes) -> None:
+        class ExpectSectionFooter(ParserStateAdapter):
+            @override
+            def on_section_footer(self) -> ParserState:
+                return self
+
+        ExpectSectionFooter()(line)
+
+    def test_piggybacked_host_header(self) -> None:
+        class ExpectPiggybackHeader(ParserStateAdapter):
+            @override
+            def on_piggyback_header(self, piggyback_header: PiggybackMarker) -> ParserState:
+                return self
+
+        ExpectPiggybackHeader()(b"<<<<x>>>>")
+
+    def test_piggybacked_host_footer(self) -> None:
+        class ExpectPiggybackFooter(ParserStateAdapter):
+            @override
+            def on_piggyback_footer(self) -> ParserState:
+                return self
+
+        ExpectPiggybackFooter()(b"<<<<>>>>")

@@ -1,0 +1,1801 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import abc
+import multiprocessing
+import os
+import subprocess
+from collections.abc import Iterator, Sequence
+from pathlib import Path
+from typing import override
+
+import requests
+import urllib3
+
+import cmk.utils.paths
+import cmk.utils.render
+from cmk.backup.gui.handler import BackupConfig
+from cmk.ccc.exceptions import MKGeneralException
+from cmk.ccc.site import SiteId
+from cmk.ccc.user import UserId
+from cmk.gui import userdb
+from cmk.gui.config import active_config, Config
+from cmk.gui.http import request
+from cmk.gui.i18n import _
+from cmk.gui.permissions import permission_registry
+from cmk.gui.site_config import (
+    distributed_setup_remote_sites,
+    has_distributed_setup_remote_sites,
+    is_distributed_setup_remote_site,
+)
+from cmk.gui.type_defs import Users
+from cmk.gui.utils.roles import UserPermissions
+from cmk.gui.watolib.analyze_configuration import (
+    ABCACTestPluginAPIs,
+    ACResultState,
+    ACSingleResult,
+    ACTest,
+    ACTestCategories,
+    ACTestRegistry,
+    try_relative_site_path,
+)
+from cmk.gui.watolib.check_mk_automations import find_unknown_check_parameter_rule_sets
+from cmk.gui.watolib.config_domain_name import ABCConfigDomain
+from cmk.gui.watolib.config_domains import ConfigDomainOMD
+from cmk.gui.watolib.hosts_and_folders import folder_tree
+from cmk.gui.watolib.rulesets import AllRulesets, SingleRulesetRecursively
+from cmk.gui.watolib.sites import site_management_registry
+from cmk.livestatus_client import LocalConnection, SiteConfiguration, SiteConfigurations
+from cmk.ruleset_matcher.definition import RuleGroup, RuleGroupType
+from cmk.utils.paths import (
+    local_gui_plugins_dir,
+    local_pnp_templates_dir,
+    local_web_dir,
+)
+
+# Disable python warnings in background job output or logs like "Unverified
+# HTTPS request is being made". We warn the user using analyze configuration.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def register(ac_test_registry: ACTestRegistry) -> None:
+    ac_test_registry.register(ACTestPersistentConnections)
+    ac_test_registry.register(ACTestLiveproxyd)
+    ac_test_registry.register(ACTestLivestatusUsage)
+    ac_test_registry.register(ACTestTmpfs)
+    ac_test_registry.register(ACTestLivestatusSecured)
+    ac_test_registry.register(ACTestNumberOfUsers)
+    ac_test_registry.register(ACTestHTTPSecured)
+    ac_test_registry.register(ACTestBackupConfigured)
+    ac_test_registry.register(ACTestBackupNotEncryptedConfigured)
+    ac_test_registry.register(ACTestEscapeHTMLDisabled)
+    ac_test_registry.register(ACTestApacheNumberOfProcesses)
+    ac_test_registry.register(ACTestApacheProcessUsage)
+    ac_test_registry.register(ACTestCheckMKHelperUsage)
+    ac_test_registry.register(ACTestCheckMKFetcherUsage)
+    ac_test_registry.register(ACTestCheckMKCheckerUsage)
+    ac_test_registry.register(ACTestGenericCheckHelperUsage)
+    ac_test_registry.register(ACTestSizeOfExtensions)
+    ac_test_registry.register(ACTestBrokenGUIExtension)
+    ac_test_registry.register(ACTestDeprecatedRuleSets)
+    ac_test_registry.register(ACTestUnknownCheckParameterRuleSets)
+    ac_test_registry.register(ACTestDeprecatedGUIExtensions)
+    ac_test_registry.register(ACTestDeprecatedLegacyGUIExtensions)
+    ac_test_registry.register(ACTestDeprecatedPNPTemplates)
+    ac_test_registry.register(ACTestSpecialAgentsAPI)
+    ac_test_registry.register(ACTestPasswordStoreAPI)
+    ac_test_registry.register(ACTestHaSIAPI)
+    ac_test_registry.register(ACTestBakeryAPI)
+    ac_test_registry.register(ACTestUnexpectedAllowedIPRanges)
+    ac_test_registry.register(ACTestCheckMKCheckerNumber)
+    ac_test_registry.register(ACTestAutomationUserSecret)
+
+
+class ACTestPersistentConnections(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.performance
+
+    @override
+    def title(self) -> str:
+        return _("Persistent connections")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "Persistent connections may be a configuration to improve the performance of the GUI, "
+            "but be aware that you really need to tune your system to make it work properly. "
+            "When you have enabled persistent connections, the single GUI pages may use already "
+            "established connections of the Apache process. This saves the time that is needed "
+            "for establishing the Livestatus connections. But you need to be aware that each "
+            "Apache process that is running is keeping a persistent connection to each configured "
+            "site via Livestatus open. This means you need to balance the maximum Apache "
+            "processes with the maximum parallel Livestatus connections. Otherwise Livestatus "
+            "requests will be blocked by existing and possibly idle connections."
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        # This check is only executed on the central instance of multisite setups
+        return len(active_config.sites) > 1
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        yield from (
+            self._check_site(site_id, active_config.sites[site_id])
+            for site_id in active_config.sites
+        )
+
+    def _check_site(self, site_id: SiteId, site_config: SiteConfiguration) -> ACSingleResult:
+        persist = site_config.get("persist", False)
+
+        if persist and _site_is_using_livestatus_proxy(site_id):
+            return ACSingleResult(
+                state=ACResultState.WARN,
+                text=_(
+                    "Persistent connections are nearly useless "
+                    "with Livestatus proxy daemon. Better disable it."
+                ),
+                site_id=site_id,
+            )
+
+        if persist:
+            # TODO: At least for the local site we could calculate this.
+            #       Or should we get the apache config from the remote site via automation?
+            return ACSingleResult(
+                state=ACResultState.WARN,
+                text=_(
+                    "Either disable persistent connections or "
+                    "carefully review maximum number of Apache processes and "
+                    "possible Livestatus connections."
+                ),
+                site_id=site_id,
+            )
+
+        return ACSingleResult(
+            state=ACResultState.OK,
+            text=_("Is not using persistent connections."),
+            site_id=site_id,
+        )
+
+
+class ACTestLiveproxyd(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.performance
+
+    @override
+    def title(self) -> str:
+        return _("Use Livestatus proxy daemon")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "The Livestatus proxy daemon is available with all commercial editions and improves"
+            " the management of the inter site connections using Livestatus. Using the Livestatus"
+            " proxy daemon improves the responsiveness and performance of your GUI and will"
+            " decrease resource usage."
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        # This check is only executed on the central instance of multisite setups
+        return len(active_config.sites) > 1
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        yield from (
+            self._check_site(site_id, active_config.sites) for site_id in active_config.sites
+        )
+
+    def _check_site(self, site_id: SiteId, site_configs: SiteConfigurations) -> ACSingleResult:
+        if _site_is_using_livestatus_proxy(site_id):
+            return ACSingleResult(
+                state=ACResultState.OK,
+                text=_("Site is using the Livestatus proxy daemon"),
+                site_id=site_id,
+            )
+
+        if not is_distributed_setup_remote_site(site_configs):
+            return ACSingleResult(
+                state=ACResultState.WARN,
+                text=_(
+                    "The Livestatus proxy is not only good for remote sites, "
+                    "enable it for your central site."
+                ),
+                site_id=site_id,
+            )
+
+        return ACSingleResult(
+            state=ACResultState.WARN,
+            text=_("Use the Livestatus proxy daemon for your site"),
+            site_id=site_id,
+        )
+
+
+class ACTestLivestatusUsage(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.performance
+
+    @override
+    def title(self) -> str:
+        return _("Livestatus usage")
+
+    @override
+    def help(self) -> str:
+        # astrein: disable=localization-named-placeholder
+        return _(
+            # xgettext: no-python-format
+            "<p>Livestatus is used by several components, for example the GUI, to gather "
+            "information about the monitored objects from the monitoring core. It is "
+            "very important for the overall performance of the monitoring system that "
+            "Livestatus is reliable and performant.</p>"
+            "<p>There should always be enough free Livestatus slots to serve new "
+            "incoming queries.</p>"
+            "<p>You should never reach a Livestatus usage of 100% for a longer time. "
+            "Consider increasing the number of parallel Livestatus connections or track down "
+            "the clients to check whether or not you can reduce the usage somehow.</p>"
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return True
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        local_connection = LocalConnection()
+        site_status = local_connection.query_row(
+            "GET status\n"
+            "Columns: livestatus_usage livestatus_threads livestatus_active_connections livestatus_overflows_rate"
+        )
+
+        usage, threads, active_connections, overflows_rate = site_status
+
+        # Micro Core has an averaged usage pre-calculated. The Nagios core does not have this column.
+        # Calculate a non averaged usage instead
+        if usage is None:
+            usage = float(active_connections) / float(threads)
+
+        usage_perc = 100 * usage
+
+        usage_warn, usage_crit = 80, 95
+        if usage_perc >= usage_crit:
+            state = ACResultState.CRIT
+        elif usage_perc >= usage_warn:
+            state = ACResultState.WARN
+        else:
+            state = ACResultState.OK
+
+        yield ACSingleResult(
+            state=state,
+            text=_("The current Livestatus usage is %(usage_perc).2f%%")
+            % {"usage_perc": usage_perc},
+            site_id=site_id,
+        )
+        yield ACSingleResult(
+            state=state,
+            text=_("%(active_connections)d of %(threads)d connections used")
+            % {"active_connections": active_connections, "threads": threads},
+            site_id=site_id,
+        )
+
+        # Only available with Micro Core
+        if overflows_rate is not None:
+            yield ACSingleResult(
+                state=state,
+                text=_("you have a connection overflow rate of %(overflows_rate).2f/s")
+                % {"overflows_rate": overflows_rate},
+                site_id=site_id,
+            )
+
+
+class ACTestTmpfs(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.performance
+
+    @override
+    def title(self) -> str:
+        return _("Temporary file system mounted")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "<p>By default, each Checkmk site has its own temporary file system "
+            "(a ramdisk) mounted to <tt>[SITE]/tmp</tt>. In case the mount is not "
+            "possible, Checkmk starts without this temporary file system.</p>"
+            "<p>Even if this is possible, it is not recommended to use Checkmk this "
+            "way, because it may reduce the overall performance of Checkmk.</p>"
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return True
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        if self._tmpfs_mounted(site_id):
+            yield ACSingleResult(
+                state=ACResultState.OK,
+                text=_("The temporary file system is mounted"),
+                site_id=site_id,
+            )
+        else:
+            yield ACSingleResult(
+                state=ACResultState.WARN,
+                text=_(
+                    "The temporary file system is not mounted. Your installation may work with degraded performance."
+                ),
+                site_id=site_id,
+            )
+
+    def _tmpfs_mounted(self, site_id: SiteId) -> bool:
+        # Borrowed from omd binary
+        #
+        # Problem here: if /omd is a symbolic link somewhere else,
+        # then in /proc/mounts the physical path will appear and be
+        # different from tmp_path. We just check the suffix therefore.
+        path_suffix = "sites/%s/tmp" % site_id
+        with Path("/proc/mounts").open(encoding="utf-8") as f:
+            for line in f:
+                try:
+                    _device, mp, fstype, _options, _dump, _fsck = line.split()
+                    if mp.endswith(path_suffix) and fstype == "tmpfs":
+                        return True
+                except Exception:
+                    continue
+        return False
+
+
+class ACTestLivestatusSecured(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.security
+
+    @override
+    def title(self) -> str:
+        return _("Livestatus encryption")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "<p>In distributed setups, Livestatus is used to transport the status information "
+            "gathered in one site to the central site. Since Checkmk 1.6, it is natively "
+            "possible and highly recommended to encrypt this Livestatus traffic.</p> "
+            "<p>This can be enabled using the global setting "
+            '<a href="global_settings.py?varname=site_livestatus_tcp">Access to Livestatus via TCP</a>. Before enabling this, you should ensure that all your Livestatus clients '
+            "are able to handle the SSL encrypted Livestatus communication. Have a look at "
+            '<a href="werk.py?werk=7017">Werk #7017</a> for further information.</p>'
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        cfg = ConfigDomainOMD().default_globals()
+        return bool(cfg["site_livestatus_tcp"])
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        cfg = ConfigDomainOMD().default_globals()
+        if not cfg["site_livestatus_tcp"]:
+            yield ACSingleResult(
+                state=ACResultState.OK,
+                text=_("Livestatus network traffic is encrypted"),
+                site_id=site_id,
+            )
+            return
+
+        if not cfg["site_livestatus_tcp"]["tls"]:
+            yield ACSingleResult(
+                state=ACResultState.CRIT,
+                text=_("Livestatus network traffic is unencrypted"),
+                site_id=site_id,
+            )
+
+
+class ACTestNumberOfUsers(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.performance
+
+    @override
+    def title(self) -> str:
+        return _("Number of users")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "<p>Having a large number of users configured in Checkmk may decrease the "
+            "performance of the web GUI.</p>"
+            "<p>It may be possible that you are using the LDAP sync to create the users. "
+            "Please review the filter configuration of the LDAP sync. Maybe you can "
+            "decrease the sync scope to get a smaller number of users.</p>"
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return True
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        users = userdb.load_users()
+        num_users = len(users)
+        user_warn_threshold = 500
+
+        if num_users <= user_warn_threshold:
+            yield ACSingleResult(
+                state=ACResultState.OK,
+                text=_("You have %(num_users)d users configured") % {"num_users": num_users},
+                site_id=site_id,
+            )
+        else:
+            yield ACSingleResult(
+                state=ACResultState.WARN,
+                text=_(
+                    "You have %(num_users)d users configured. Please review the number of "
+                    "users you have configured in Checkmk."
+                )
+                % {"num_users": num_users},
+                site_id=site_id,
+            )
+
+
+class ACTestHTTPSecured(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.security
+
+    @override
+    def title(self) -> str:
+        return _("Secure GUI (HTTP)")
+
+    @override
+    def help(self) -> str:
+        return (
+            _(
+                "When using the regular HTTP protocol all data transfered between the Checkmk "
+                "and the clients using the GUI is sent over the network in plain text (unencrypted). "
+                "This includes the passwords users enter to authenticate with Checkmk and other "
+                "sensitive information. It is highly recommended to enable SSL for securing the "
+                "transported data."
+            )
+            + " "
+            + _(
+                'Please note that you have to set <tt>RequestHeader set X-Forwarded-Proto "https"</tt> in '
+                "your system Apache configuration to tell the Checkmk GUI about the SSL setup."
+            )
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return True
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        if request.is_ssl_request:
+            yield ACSingleResult(
+                state=ACResultState.OK,
+                text=_("Site is using HTTPS"),
+                site_id=site_id,
+            )
+        else:
+            yield ACSingleResult(
+                state=ACResultState.WARN,
+                text=_("Site is using plain HTTP. Consider enabling HTTPS."),
+                site_id=site_id,
+            )
+
+
+class ACTestBackupConfigured(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.reliability
+
+    @override
+    def title(self) -> str:
+        return _("Backup configured")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "A reliable backup ensures that your monitoring "
+            "environment can be restored in case of data loss.<br><br>We recommend "
+            'using the <a href="wato.py?mode=backup">Checkmk backup</a> '
+            "feature to create a consistent backup "
+            "of your running site.<br><br>Virtual machine snapshots alone are not "
+            "sufficient, as they do not guarantee data consistency.<br>"
+            "Similarly, third-party backup solutions may fail to capture a "
+            "consistent state."
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return True
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        n_configured_jobs = len(BackupConfig.load().jobs)
+        if n_configured_jobs:
+            yield ACSingleResult(
+                state=ACResultState.OK,
+                text=_("You have configured %(n_configured_jobs)d backup jobs")
+                % {"n_configured_jobs": n_configured_jobs},
+                site_id=site_id,
+            )
+        else:
+            yield ACSingleResult(
+                state=ACResultState.WARN,
+                text=_("There is no backup job configured"),
+                site_id=site_id,
+            )
+
+
+class ACTestBackupNotEncryptedConfigured(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.security
+
+    @override
+    def title(self) -> str:
+        return _("Encrypt backups")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "Please check whether or not your backups are stored securely. In "
+            "case you are storing your backup on a storage system the storage may "
+            "already be secure enough without extra backup encryption. But in "
+            "some cases it may be a good idea to store the backup encrypted."
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return True
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        for job in BackupConfig.load().jobs.values():
+            if job.is_encrypted():
+                yield ACSingleResult(
+                    state=ACResultState.OK,
+                    text=_('The job "%(title)s" is encrypted') % {"title": job.title},
+                    site_id=site_id,
+                )
+            else:
+                yield ACSingleResult(
+                    state=ACResultState.WARN,
+                    text=_('There job "%(title)s" is not encrypted') % {"title": job.title},
+                    site_id=site_id,
+                )
+
+
+class ACTestEscapeHTMLDisabled(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.security
+
+    @override
+    def title(self) -> str:
+        return _("Escape HTML globally enabled")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "By default, for security reasons, the GUI does not interpret any HTML "
+            "code received from external sources, like service output or log messages. "
+            "But there are specific reasons to deactivate this security feature. E.g. when "
+            "you want to display the HTML output produced by a specific check plug-in. "
+            "Disabling the escaping also allows the plug-in to execute not only HTML, but "
+            "also Javascript code in the context of your browser. This makes it possible to "
+            "execute arbitrary Javascript, even for injection attacks.<br>"
+            "For this reason, you should only disable this for a small, very specific number of "
+            "services, to be sure that not every random check plug-in is able to produce code "
+            "which your browser interprets."
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return True
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        if not self._get_effective_global_setting(site_id, config, "escape_plugin_output"):
+            yield ACSingleResult(
+                state=ACResultState.CRIT,
+                text=_(
+                    "Please consider configuring the host or service rule sets "
+                    '<a href="%(service_url)s">Escape HTML in service output</a> or '
+                    '<a href="%(host_url)s">Escape HTML in host output</a> instead '
+                    'of <a href="%(global_url)s">disabling escaping globally</a>.'
+                )
+                % {
+                    "service_url": "wato.py?mode=edit_ruleset&varname=extra_service_conf:_ESCAPE_PLUGIN_OUTPUT",
+                    "host_url": "wato.py?mode=edit_ruleset&varname=extra_host_conf:_ESCAPE_PLUGIN_OUTPUT",
+                    "global_url": "global_settings.py?varname=escape_plugin_output",
+                },
+                site_id=site_id,
+            )
+        else:
+            yield ACSingleResult(
+                state=ACResultState.OK,
+                text=_('Escaping is <a href="%(url)s">enabled globally</a>')
+                % {"url": "global_settings.py?varname=escape_plugin_output"},
+                site_id=site_id,
+            )
+
+
+class ABCACApacheTest(ACTest, abc.ABC):
+    """Abstract base class for apache related tests"""
+
+    def _get_number_of_idle_processes(self) -> int:
+        apache_status = self._get_apache_status()
+
+        for line in apache_status.split("\n"):
+            if line.startswith("Scoreboard:"):
+                scoreboard = line.split(": ")[1]
+                return scoreboard.count(".")
+
+        raise MKGeneralException("Failed to parse the score board")
+
+    def _get_maximum_number_of_processes(self) -> int:
+        apache_status = self._get_apache_status()
+
+        for line in apache_status.split("\n"):
+            if line.startswith("Scoreboard:"):
+                scoreboard = line.split(": ")[1]
+                return len(scoreboard)
+
+        raise MKGeneralException("Failed to parse the score board")
+
+    def _get_apache_status(self) -> str:
+        cfg = ConfigDomainOMD().default_globals()
+        url = "http://127.0.0.1:%s/server-status?auto" % cfg["site_apache_tcp_port"]
+
+        response = requests.get(url, headers={"Accept": "text/plain"}, timeout=110)
+        return response.text
+
+
+class ACTestApacheNumberOfProcesses(ABCACApacheTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.performance
+
+    @override
+    def title(self) -> str:
+        return _("Apache number of processes")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "<p>The Apache has a number of maximum processes it may start in case of high "
+            "load situations. These Apache processes may use a decent amount of memory, so "
+            "you need to configure them in a way that your system can handle them without "
+            "reaching out of memory situations.</p>"
+            "<p>Please note that this value is only a rough estimation, because the memory "
+            "usage of the Apache processes may vary with the requests being processed.</p>"
+            "<p>Possible actions:<ul>"
+            '<li>Change the <a href="global_settings.py?varname=apache_process_tuning">number of Apache processes</a></li>'
+            "</ul>"
+            "</p>"
+            "<p>Once you have verified your settings, you can acknowledge this test. The "
+            "test will not automatically turn to OK, because it can not exactly estimate "
+            "the required memory needed by the Apache processes."
+            "</p>"
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return True
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        process_limit = self._get_maximum_number_of_processes()
+        average_process_size = self._get_average_process_size()
+
+        estimated_memory_size = process_limit * (average_process_size * 1.2)
+
+        yield ACSingleResult(
+            state=ACResultState.WARN,
+            text=_(
+                "The Apache may start up to %(process_limit)d processes while the current "
+                "average process size is %(average_process_size)s. With these process limits the Apache may "
+                "use up to %(estimated_memory_size)s RAM. Please ensure that your system is able to "
+                "handle this."
+            )
+            % {
+                "process_limit": process_limit,
+                "average_process_size": cmk.utils.render.fmt_bytes(average_process_size),
+                "estimated_memory_size": cmk.utils.render.fmt_bytes(estimated_memory_size),
+            },
+            site_id=site_id,
+        )
+
+    def _get_average_process_size(self) -> float:
+        try:
+            pid_file = cmk.utils.paths.omd_root / "tmp/apache/run/apache.pid"
+            with pid_file.open(encoding="utf-8") as f:
+                ppid = int(f.read())
+        except OSError, ValueError:
+            raise MKGeneralException(_("Failed to read the Apache process ID"))
+
+        sizes = []
+        for pid in subprocess.check_output(
+            [
+                "ps",
+                "--ppid",
+                "%d" % ppid,
+                "h",
+                "o",
+                "pid",
+            ]
+        ).splitlines():
+            sizes.append(self._get_process_size(pid))
+
+        if not sizes:
+            raise MKGeneralException(_("Failed to estimate the Apache process size"))
+
+        return sum(sizes) / float(len(sizes))
+
+    def _get_process_size(self, pid: bytes) -> float:
+        # Summary line seems to be different on the supported distros
+        # Ubuntu 17.10 (pmap from procps-ng 3.3.12):
+        # mapped: 25036K    writeable/private: 2704K    shared: 28K
+        # SLES12
+        # 4020K writable-private, 102960K readonly-private, 1856K shared, and 636K referenced
+        # SLES12SP3 (pmap using library of procps-ng 3.3.9)
+        # 2784K writable-private, 21052K readonly-private, and 28K shared
+        # CentOS 5.5 (pmap procps version 3.2.7)
+        # mapped: 66176K    writeable/private: 548K    shared: 28K
+        # CentOS 7 (pmap from procps-ng 3.3.10)
+        # mapped: 115524K    writeable/private: 684K    shared: 28K
+        summary_line = subprocess.check_output(["pmap", "-d", "%d" % int(pid)]).splitlines()[-1]
+
+        parts = summary_line.split()
+        writable_private = parts[0] if parts[1] == b"writable-private," else parts[3]
+
+        return int(writable_private[:-1]) * 1024.0
+
+
+class ACTestApacheProcessUsage(ABCACApacheTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.performance
+
+    @override
+    def title(self) -> str:
+        return _("Apache process usage")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "The Apache has a number maximum processes it can start in case of high "
+            "load situations. The usage of these processes should not be too high "
+            "in normal situations. Otherwise, if all processes are in use, the "
+            "users of the GUI might have to wait too long for a free process, which "
+            "would result in a slow GUI."
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return True
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        total_slots = self._get_maximum_number_of_processes()
+        open_slots = self._get_number_of_idle_processes()
+        used_slots = total_slots - open_slots
+
+        usage = float(used_slots) * 100 / total_slots
+
+        usage_warn, usage_crit = 60, 90
+        if usage >= usage_crit:
+            state = ACResultState.CRIT
+        elif usage >= usage_warn:
+            state = ACResultState.WARN
+        else:
+            state = ACResultState.OK
+
+        yield ACSingleResult(
+            state=state,
+            text=_(
+                "%(used_slots)d of the configured maximum of %(total_slots)d processes have been started. This is a usage of %(usage)0.2f %%."
+            )
+            % {"used_slots": used_slots, "total_slots": total_slots, "usage": usage},
+            site_id=site_id,
+        )
+
+
+class ACTestCheckMKHelperUsage(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.performance
+
+    @override
+    def title(self) -> str:
+        return _("Checkmk helper usage")
+
+    @override
+    def help(self) -> str:
+        return _(
+            # xgettext: no-python-format
+            "<p>The Checkmk Micro Core uses Checkmk helper processes to execute "
+            "the Checkmk and Checkmk Discovery services of the hosts monitored "
+            "with Checkmk. There should always be enough helper processes to handle "
+            "the configured checks.</p>"
+            "<p>In case the helper pool is used to 100%, checks will not be executed in "
+            "time, the check latency will grow and the states are not up to date.</p>"
+            "<p>Possible actions:<ul>"
+            "<li>Check whether or not you can decrease check timeouts</li>"
+            '<li>Check which checks / plug-ins are <a href="view.py?view_name=service_check_durations">consuming most helper process time</a></li>'
+            '<li>Increase the <a href="global_settings.py?varname=cmc_fetcher_helpers">number of Checkmk helpers</a></li>'
+            "</ul>"
+            "</p>"
+            "<p>But you need to be careful that you don't configure too many Checkmk "
+            "check helpers, because they consume a lot of memory. Your system needs "
+            "to be able to handle the memory demand for all of them at once. An additional "
+            "problem is that the Checkmk helpers are initialized in parallel during startup "
+            "of the Checkmk Micro Core, which may cause load peaks when having "
+            "a lot of Checkmk helper processes configured.</p>"
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return self._uses_microcore()
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        local_connection = LocalConnection()
+        row = local_connection.query_row(
+            "GET status\nColumns: helper_usage_checker average_latency_checker\n"
+        )
+
+        helper_usage_checker_percent = 100 * row[0]
+        average_latency_checker = row[1]
+
+        usage_warn, usage_crit = 85, 95
+        if helper_usage_checker_percent >= usage_crit:
+            state = ACResultState.CRIT
+        elif helper_usage_checker_percent >= usage_warn:
+            state = ACResultState.WARN
+        else:
+            state = ACResultState.OK
+
+        yield ACSingleResult(
+            state=state,
+            text=_(
+                "The current checker usage is %(helper_usage_checker_percent).2f%%. The checkers have an average latency of %(average_latency_checker).3fs."
+            )
+            % {
+                "helper_usage_checker_percent": helper_usage_checker_percent,
+                "average_latency_checker": average_latency_checker,
+            },
+            site_id=site_id,
+        )
+
+
+class ACTestCheckMKFetcherUsage(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.performance
+
+    @override
+    def title(self) -> str:
+        return _("Checkmk fetcher usage")
+
+    @override
+    def help(self) -> str:
+        return _(
+            # xgettext: no-python-format
+            "<p>The Checkmk Micro Core uses Checkmk fetcher processes to obtain data about "
+            "the Checkmk and Checkmk Discovery services of the hosts monitored "
+            "with Checkmk. There should always be enough fetcher processes to handle "
+            "the configured checks just in time.</p>"
+            "<p>In case the fetcher helper pool is used to 100%, checks will not be executed in "
+            "time, the check latency will grow and the states are not up to date.</p>"
+            "<p>Possible actions:<ul>"
+            "<li>Check whether or not you can decrease check timeouts</li>"
+            '<li>Check which checks / plug-ins are <a href="view.py?view_name=service_check_durations">consuming most helper process time</a></li>'
+            '<li>Increase the <a href="global_settings.py?varname=cmc_fetcher_helpers">number of Checkmk fetchers</a></li>'
+            "</ul>"
+            "</p>"
+            "<p>But you need to be careful that you don't configure too many Checkmk "
+            "fetcher helpers, because they consume resources. An additional "
+            "problem is that the Checkmk fetchers are initialized in parallel during startup "
+            "of the Checkmk Micro Core, which may cause load peaks when having "
+            "a lot of Checkmk helper processes configured.</p>"
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return self._uses_microcore()
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        local_connection = LocalConnection()
+        row = local_connection.query_row(
+            "GET status\nColumns: helper_usage_fetcher average_latency_fetcher\n"
+        )
+
+        fetcher_usage_perc = 100 * row[0]
+        fetcher_latency = row[1]
+
+        usage_warn, usage_crit = 85, 95
+        if fetcher_usage_perc >= usage_crit:
+            state = ACResultState.CRIT
+        elif fetcher_usage_perc >= usage_warn:
+            state = ACResultState.WARN
+        else:
+            state = ACResultState.OK
+
+        yield ACSingleResult(
+            state=state,
+            text=_(
+                "The current fetcher usage is %(fetcher_usage_perc).2f%%."
+                " The checks have an average check latency of %(fetcher_latency).3fs."
+            )
+            % {"fetcher_usage_perc": fetcher_usage_perc, "fetcher_latency": fetcher_latency},
+            site_id=site_id,
+        )
+
+        # Only report this as warning in case the user increased the default helper configuration
+        default_values = ABCConfigDomain.get_all_default_globals()
+        if (
+            self._get_effective_global_setting(site_id, config, "cmc_fetcher_helpers")
+            > default_values["cmc_fetcher_helpers"]
+            and fetcher_usage_perc < 50
+        ):
+            yield ACSingleResult(
+                state=ACResultState.WARN,
+                text=_(
+                    "The fetcher usage is below 50%, you may decrease the number of "
+                    "fetchers to reduce the memory consumption."
+                ),
+                site_id=site_id,
+            )
+
+
+class ACTestCheckMKCheckerUsage(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.performance
+
+    @override
+    def title(self) -> str:
+        return _("Checkmk checker usage")
+
+    @override
+    def help(self) -> str:
+        return _(
+            # xgettext: no-python-format
+            "<p>The Checkmk Micro Core uses Checkmk checker processes to execute "
+            "the Checkmk and Checkmk Discovery services of the hosts monitored "
+            "with Checkmk. There should always be enough helper processes to handle "
+            "the configured checks.</p>"
+            "<p>In case the checker helper pool is used to 100%, checks will not be executed in "
+            "time, the check latency will grow and the states are not up to date.</p>"
+            "<p>Possible actions:<ul>"
+            "<li>Check whether or not you can decrease check timeouts</li>"
+            '<li>Check which checks / plug-ins are <a href="view.py?view_name=service_check_durations">consuming most helper process time</a></li>'
+            '<li>Increase the <a href="global_settings.py?varname=cmc_checker_helpers">number of Checkmk checkers</a></li>'
+            "</ul>"
+            "</p>"
+            "<p>But you need to be careful that you don't configure too many Checkmk "
+            "checker helpers, because they consume a lot of memory. Your system has "
+            "to be able to handle the memory demand for all of them at once. An additional "
+            "problem is that the Checkmk helpers are initialized in parallel during startup "
+            "of the Checkmk Micro Core, which may cause load peaks when having "
+            "a lot of Checkmk helper processes configured.</p>"
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return self._uses_microcore()
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        local_connection = LocalConnection()
+        row = local_connection.query_row(
+            "GET status\nColumns: helper_usage_checker average_latency_fetcher\n"
+        )
+
+        checker_usage_perc = 100 * row[0]
+        fetcher_latency = row[1]
+
+        usage_warn, usage_crit = 85, 95
+        if checker_usage_perc >= usage_crit:
+            state = ACResultState.CRIT
+        elif checker_usage_perc >= usage_warn:
+            state = ACResultState.WARN
+        else:
+            state = ACResultState.OK
+
+        yield ACSingleResult(
+            state=state,
+            text=_(
+                "The current checker usage is %(checker_usage_perc).2f%%. "
+                "The checks have an average check latency of %(fetcher_latency).3fs."
+            )
+            % {"checker_usage_perc": checker_usage_perc, "fetcher_latency": fetcher_latency},
+            site_id=site_id,
+        )
+
+        # Only report this as warning in case the user increased the default helper configuration
+        default_values = ABCConfigDomain.get_all_default_globals()
+        if (
+            self._get_effective_global_setting(site_id, config, "cmc_checker_helpers")
+            > default_values["cmc_checker_helpers"]
+            and checker_usage_perc < 50
+        ):
+            yield ACSingleResult(
+                state=ACResultState.WARN,
+                text=_(
+                    "The checker usage is below 50%, you may decrease the number of "
+                    "checkers to reduce the memory consumption."
+                ),
+                site_id=site_id,
+            )
+
+
+class ACTestGenericCheckHelperUsage(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.performance
+
+    @override
+    def title(self) -> str:
+        return _("Check helper usage")
+
+    @override
+    def help(self) -> str:
+        return _(
+            # xgettext: no-python-format
+            "<p>The Checkmk Micro Core uses generic check helper processes to execute "
+            "the active check based services (e.g. check_http, check_...). There should "
+            "always be enough helper processes to handle the configured checks.</p>"
+            "<p>In case the helper pool is used to 100%, checks will not be executed in "
+            "time, the check latency will grow and the states are not up to date.</p>"
+            "<p>Possible actions:<ul>"
+            "<li>Check whether or not you can decrease check timeouts</li>"
+            '<li>Check which checks / plug-ins are <a href="view.py?view_name=service_check_durations">consuming most helper process time</a></li>'
+            '<li>Increase the <a href="global_settings.py?varname=cmc_check_helpers">number of check helpers</a></li>'
+            "</ul>"
+            "</p>"
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return self._uses_microcore()
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        local_connection = LocalConnection()
+        row = local_connection.query_row(
+            "GET status\nColumns: helper_usage_generic average_latency_generic\n"
+        )
+
+        helper_usage_perc = 100 * row[0]
+        check_latency_generic = row[1]
+
+        usage_warn, usage_crit = 85, 95
+        if helper_usage_perc >= usage_crit:
+            state = ACResultState.CRIT
+        elif helper_usage_perc >= usage_warn:
+            state = ACResultState.WARN
+        else:
+            state = ACResultState.OK
+        yield ACSingleResult(
+            state=state,
+            text=_("The current check helper usage is %(helper_usage_perc).2f%%")
+            % {"helper_usage_perc": helper_usage_perc},
+            site_id=site_id,
+        )
+
+        state = ACResultState.CRIT if check_latency_generic > 1 else ACResultState.OK
+        yield ACSingleResult(
+            state=state,
+            text=_(
+                "The active check services have an average check latency of %(check_latency_generic).3fs."
+            )
+            % {"check_latency_generic": check_latency_generic},
+            site_id=site_id,
+        )
+
+
+class ACTestSizeOfExtensions(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.performance
+
+    @override
+    def title(self) -> str:
+        return _("Size of extensions")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "<p>In distributed setups it is possible to synchronize the "
+            "extensions (MKPs and files in <tt>~/local/</tt>) to the remote sites. "
+            "These files are synchronized on every replication with a remote site and "
+            "can possibly slow down the synchronization in case the files are large. "
+            "You could either disable the MKP sync or check whether or not you need "
+            "all the extensions.</p>"
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return has_distributed_setup_remote_sites(active_config.sites) and self._replicates_mkps(
+            active_config.sites
+        )
+
+    def _replicates_mkps(self, site_configs: SiteConfigurations) -> bool:
+        return any(
+            site.get("replicate_mkps")
+            for site in distributed_setup_remote_sites(site_configs).values()
+        )
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        size = self._size_of_extensions()
+        state = ACResultState.CRIT if size > 100 * 1024 * 1024 else ACResultState.OK
+
+        yield ACSingleResult(
+            state=state,
+            text=_("Your extensions have a size of %(size)s.")
+            % {"size": cmk.utils.render.fmt_bytes(size)},
+            site_id=site_id,
+        )
+
+    def _size_of_extensions(self) -> int:
+        return int(
+            subprocess.check_output(["du", "-sb", "%s/local" % cmk.utils.paths.omd_root]).split()[0]
+        )
+
+
+class ACTestBrokenGUIExtension(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.deprecations
+
+    @override
+    def title(self) -> str:
+        return _("Broken GUI extensions")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "Since 1.6.0i1 broken GUI extensions don't block the whole GUI initialization anymore. "
+            "Instead of this, the errors are logged in <tt>var/log/web.log</tt>. In addition to this, "
+            "the errors are displayed here."
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return True
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        from cmk.gui.legacy_plugins import get_failed_plugins
+
+        errors = get_failed_plugins()
+        if not errors:
+            yield ACSingleResult(
+                state=ACResultState.OK,
+                text=_("No broken extensions were found."),
+                site_id=site_id,
+            )
+
+        for plugin_filepath, gui_part, plugin_file, error in errors:
+            yield ACSingleResult(
+                state=ACResultState.CRIT,
+                text=_('Loading "%(gui_part)s/%(plugin_file)s" failed: %(error)s')
+                % {"gui_part": gui_part, "plugin_file": plugin_file, "error": error},
+                site_id=site_id,
+                path=plugin_filepath,
+            )
+
+
+class ACTestDeprecatedRuleSets(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.deprecations
+
+    @override
+    def title(self) -> str:
+        return _("Deprecated rule sets")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "These rule sets are configured in your site, but marked as deprecated. They still"
+            " work, but need to be migrated to their successor or be removed before the update"
+            " to the next major release. There should be a Werk for each of these rules providing"
+            " you with further information on what to do specifically."
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return True
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        unknown_check_parameter_rule_sets = [
+            f"{RuleGroupType.CHECKGROUP_PARAMETERS.value}:{r}"
+            for r in find_unknown_check_parameter_rule_sets(debug=active_config.debug).result
+        ]
+        if deprecated_rule_sets := [
+            r
+            for r in AllRulesets.load_all_rulesets(folder_tree()).get_rulesets().values()
+            if r.is_deprecated()
+            and r.num_rules()
+            and r.name not in unknown_check_parameter_rule_sets
+        ]:
+            for rule_set in deprecated_rule_sets:
+                yield ACSingleResult(
+                    state=ACResultState.WARN,
+                    text=_("Found configured rules of deprecated rule set %(name)r.")
+                    % {"name": rule_set.name},
+                    site_id=site_id,
+                )
+            return
+
+        yield ACSingleResult(
+            state=ACResultState.OK,
+            text=_("No deprecated rule sets found."),
+            site_id=site_id,
+        )
+
+
+class ACTestUnknownCheckParameterRuleSets(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.deprecations
+
+    @override
+    def title(self) -> str:
+        return _("Unknown check parameter rule sets")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "These rule sets are configured in your site, but not used by any check plug-in."
+            " There are two main reasons to have such rule sets configured:"
+            "<ol>"
+            "<li> Rule sets which were used by built-in check plug-ins that have been deprecated and"
+            " removed in the past. These can be cleaned up without any negative side effect.</li>"
+            "<li> Rule sets which belong to disabled or removed extension packages. If you plan to"
+            " keep the related extension package removed, you can safely clean the rule sets up."
+            " In case the extension package was"
+            " temporarily disabled, you may consider keeping the rule sets in place.</li>"
+            "</ol>"
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return True
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        if rule_sets := find_unknown_check_parameter_rule_sets(debug=active_config.debug).result:
+            for rule_set in rule_sets:
+                yield ACSingleResult(
+                    state=ACResultState.WARN,
+                    text=(
+                        _(
+                            "Found configured rules of unknown check parameter rule set %(rule_set)r."
+                        )
+                        % {"rule_set": rule_set}
+                    ),
+                    site_id=site_id,
+                )
+            return
+
+        yield ACSingleResult(
+            state=ACResultState.OK,
+            text=_("No unknown check parameter rule sets found."),
+            site_id=site_id,
+        )
+
+
+def _walk(folder: Path) -> Iterator[Path]:
+    for root, _dirs, files in os.walk(folder):
+        for file in files:
+            if (path := Path(root, file)).is_file() and path.suffix == ".py":
+                yield path
+
+
+class ACTestDeprecatedGUIExtensions(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.deprecations
+
+    @override
+    def title(self) -> str:
+        return _("Deprecated GUI extensions")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "GUI extensions in <tt>'%(plugins_dir)s'</tt> are marked as 'deprecated'"
+            " and will be ignored in future Checkmk versions"
+            " (official deprecation timeline not decided yet)."
+        ) % {"plugins_dir": str(local_gui_plugins_dir)}
+
+    def _get_files(self) -> Sequence[Path]:
+        try:
+            return list(_walk(local_gui_plugins_dir))
+        except FileNotFoundError:
+            return []
+
+    @override
+    def is_relevant(self) -> bool:
+        return True
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        if files := self._get_files():
+            for plugin_filepath in files:
+                yield ACSingleResult(
+                    state=ACResultState.WARN,
+                    text=(
+                        _(
+                            "GUI extension in %(plugin_name)r uses an API which is marked "
+                            "as deprecated and may not work anymore due to "
+                            "unknown imports or objects (file: %(file)s)."
+                        )
+                        % {
+                            "plugin_name": plugin_filepath.parent.name,
+                            "file": try_relative_site_path(site_id, plugin_filepath),
+                        }
+                    ),
+                    site_id=site_id,
+                    path=plugin_filepath,
+                )
+            return
+
+        yield ACSingleResult(
+            state=ACResultState.OK,
+            text=_("No GUI extensions using the deprecated API"),
+            site_id=site_id,
+        )
+
+
+class ACTestDeprecatedLegacyGUIExtensions(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.deprecations
+
+    @override
+    def title(self) -> str:
+        return _("Deprecated legacy GUI extensions")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "Legacy GUI extensions in <tt>'%(web_dir)s'</tt> are marked as 'deprecated'"
+            " and will be ignored in future Checkmk versions"
+            " (official deprecation timeline not decided yet)."
+        ) % {"web_dir": str(local_web_dir)}
+
+    def _get_files(self) -> Sequence[Path]:
+        try:
+            return list(_walk(local_web_dir))
+        except FileNotFoundError:
+            return []
+
+    @override
+    def is_relevant(self) -> bool:
+        return True
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        if files := self._get_files():
+            for plugin_filepath in files:
+                match plugin_filepath.parent.name:
+                    case "metrics" | "perfometer" | "wato":
+                        pass  # We've been warning for those for long enough now.
+                    case _:
+                        yield ACSingleResult(
+                            state=ACResultState.WARN,
+                            text=(
+                                _(
+                                    "Legacy GUI extension in %(plugin_name)r uses an "
+                                    "API which is marked as deprecated "
+                                    "and may not work anymore due to "
+                                    "unknown imports or objects (file: %(file)s)."
+                                )
+                                % {
+                                    "plugin_name": plugin_filepath.parent.name,
+                                    "file": try_relative_site_path(site_id, plugin_filepath),
+                                }
+                            ),
+                            site_id=site_id,
+                            path=plugin_filepath,
+                        )
+            return
+
+        yield ACSingleResult(
+            state=ACResultState.OK,
+            text=_("No legacy GUI extensions using the deprecated API"),
+            site_id=site_id,
+        )
+
+
+class ACTestDeprecatedPNPTemplates(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.deprecations
+
+    @override
+    def title(self) -> str:
+        return _("Deprecated PNP templates")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "PNP templates in <tt>'%(templates_dir)s'</tt> are marked as 'deprecated'"
+            " and will be ignored in future Checkmk versions"
+            " (official deprecation timeline not decided yet)."
+        ) % {"templates_dir": str(local_pnp_templates_dir)}
+
+    def _get_files(self) -> Sequence[Path]:
+        try:
+            return list(local_pnp_templates_dir.iterdir())
+        except FileNotFoundError:
+            return []
+
+    @override
+    def is_relevant(self) -> bool:
+        return True
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        if files := self._get_files():
+            for plugin_filepath in files:
+                yield ACSingleResult(
+                    state=ACResultState.CRIT,
+                    text=(
+                        _(
+                            "PNP template uses an API which was removed in an earlier"
+                            " Checkmk version (file: %(file)s)."
+                        )
+                        % {"file": try_relative_site_path(site_id, plugin_filepath)}
+                    ),
+                    site_id=site_id,
+                    path=plugin_filepath,
+                )
+            return
+
+        yield ACSingleResult(
+            state=ACResultState.OK,
+            text=_("No PNP templates using the deprecated API"),
+            site_id=site_id,
+        )
+
+
+class ACTestSpecialAgentsAPI(ABCACTestPluginAPIs):
+    @property
+    @override
+    def api_name(self) -> str:
+        return _("Special agents API 'cmk.special_agents'")
+
+    @property
+    @override
+    def successor(self) -> str:
+        return "cmk.server_side_programs.v1"
+
+    @property
+    @override
+    def deprecated_version(self) -> str:
+        return "3.0.0"
+
+    @property
+    @override
+    def removed_version(self) -> str:
+        return "3.1.0"
+
+    @property
+    @override
+    def import_paths(self) -> tuple[str, ...]:
+        return ("cmk.special_agents",)
+
+    @property
+    @override
+    def content_patterns(self) -> tuple[str, ...]:
+        return ()
+
+
+class ACTestPasswordStoreAPI(ABCACTestPluginAPIs):
+    @property
+    @override
+    def api_name(self) -> str:
+        return _("Password store utils 'cmk.utils.password_store'")
+
+    @property
+    @override
+    def successor(self) -> str:
+        return "cmk.password_store.v1"
+
+    @property
+    @override
+    def deprecated_version(self) -> str:
+        return "3.0.0"
+
+    @property
+    @override
+    def removed_version(self) -> str:
+        return "3.1.0"
+
+    @property
+    @override
+    def import_paths(self) -> tuple[str, ...]:
+        return ("cmk.utils.password_store",)
+
+    @property
+    @override
+    def content_patterns(self) -> tuple[str, ...]:
+        return ()
+
+
+class ACTestHaSIAPI(ABCACTestPluginAPIs):
+    @property
+    @override
+    def api_name(self) -> str:
+        return _("HW/SW inventory display hints")
+
+    @property
+    @override
+    def successor(self) -> str:
+        return "cmk.inventory_ui.v1"
+
+    @property
+    @override
+    def deprecated_version(self) -> str:
+        return "3.0.0"
+
+    @property
+    @override
+    def removed_version(self) -> str:
+        return "3.1.0"
+
+    @property
+    @override
+    def import_paths(self) -> tuple[str, ...]:
+        return ()
+
+    @property
+    @override
+    def content_patterns(self) -> tuple[str, ...]:
+        return ("inventory_displayhints.update",)
+
+
+class ACTestBakeryAPI(ABCACTestPluginAPIs):
+    @property
+    @override
+    def api_name(self) -> str:
+        return _("Bakery API v1")
+
+    @property
+    @override
+    def successor(self) -> str:
+        return "cmk.bakery.v2"
+
+    @property
+    @override
+    def deprecated_version(self) -> str:
+        return "3.0.0"
+
+    @property
+    @override
+    def removed_version(self) -> str:
+        return "3.1.0"
+
+    @property
+    @override
+    def import_paths(self) -> tuple[str, ...]:
+        return (
+            "cmk.bakery.v1",
+            # Please do NOT rename 'cee': It's the legacy path for bakery plug-ins.
+            "cmk.base.cee.plugins.bakery.bakery_api",
+            "cmk.base.plugins.bakery.bakery_api",
+            ".bakery_api",
+        )
+
+    @property
+    @override
+    def content_patterns(self) -> tuple[str, ...]:
+        return ()
+
+
+def _site_is_using_livestatus_proxy(site_id: SiteId) -> bool:
+    site_configs = site_management_registry["site_management"].load_sites()
+    return site_configs[site_id].get("proxy") is not None
+
+
+class ACTestUnexpectedAllowedIPRanges(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.security
+
+    @override
+    def title(self) -> str:
+        return _("Restricted address mismatch")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "This check returns CRIT if the parameter <b>State in case of restricted address mismatch</b> in the rule set <b>Checkmk agent installation auditing</b> is configured and differs from states <b>WARN</b> (default) or <b>CRIT</b>. With the above setting you can overwrite the default service state. This will help you to reduce above warnings during the update process of your Checkmk sites and agents. We recommend to set this option only for the affected hosts as long as you monitor agents older than Checkmk 2.0. After updating them, you should change this setting back to its original value. Background: With IP access lists you can control which servers are allowed to talk to these agents. Thus it's a security issue and should not be disabled or set to <b>OK</b> permanently."
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return bool(self._get_rules())
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        rules = self._get_rules()
+        if not rules:
+            yield ACSingleResult(
+                state=ACResultState.OK,
+                text=_(
+                    "No rule set <b>State in case of restricted address mismatch</b> is configured"
+                ),
+                site_id=site_id,
+            )
+            return
+
+        for folder_title, rule_state in rules:
+            yield ACSingleResult(
+                state=ACResultState.CRIT,
+                text=f"Rule in <b>{folder_title}</b> has value <b>{rule_state}</b>",
+                site_id=site_id,
+            )
+
+    def _get_rules(self) -> list[tuple[str, str]]:
+        ruleset = SingleRulesetRecursively.load_single_ruleset_recursively(
+            folder_tree(), RuleGroup.CheckgroupParameters("agent_update")
+        ).get(RuleGroup.CheckgroupParameters("agent_update"))
+        state_map = {0: "OK", 1: "WARN", 2: "CRIT", 3: "UNKNOWN"}
+        return [
+            (folder.title(), state_map[rule.value.get("restricted_address_mismatch", 1)])
+            for folder, _rule_index, rule in ruleset.get_rules()
+            if rule.value.get("restricted_address_mismatch", 1) not in (1, 2)
+        ]
+
+
+class ACTestCheckMKCheckerNumber(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.performance
+
+    @override
+    def title(self) -> str:
+        return _("Checkmk checker count")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "The Checkmk Micro Core uses Checkmk checker processes to process the results "
+            "from the Checkmk fetchers. Since the checker processes are not I/O bound, they are "
+            "most effective when each checker gets a dedicated CPU. Configuring more checkers than "
+            "the number of available CPUs has a negative effect, because it increases "
+            "the amount of context switches."
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return self._uses_microcore()
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        try:
+            num_cpu = multiprocessing.cpu_count()
+        except NotImplementedError:
+            yield ACSingleResult(
+                state=ACResultState.OK,
+                text=_("Cannot test. Unable to determine the number of CPUs on target system."),
+                site_id=site_id,
+            )
+            return
+
+        if self._get_effective_global_setting(site_id, config, "cmc_checker_helpers") > num_cpu:
+            yield ACSingleResult(
+                state=ACResultState.WARN,
+                text=_(
+                    "Configuring more checkers than the number of available CPUs (%(num_cpu)d) has "
+                    "a detrimental effect, since they are not I/O bound."
+                )
+                % {"num_cpu": num_cpu},
+                site_id=site_id,
+            )
+            return
+
+        yield ACSingleResult(
+            state=ACResultState.OK,
+            text=_("Number of Checkmk checkers is less than number of CPUs"),
+            site_id=site_id,
+        )
+
+
+# We consider a permission as dangerous if we can run arbitrary code with that permission.
+# The wato.users can change permissions so we include it here as well.
+DANGEROUS_PERMISSIONS: frozenset[str] = frozenset(
+    {
+        "wato.add_or_modify_executables",
+        "wato.automation",
+        "wato.backups",
+        "wato.users",
+        "wato.manage_mkps",
+    }
+)
+
+
+class ACTestAutomationUserSecret(ACTest):
+    @override
+    def category(self) -> str:
+        return ACTestCategories.security
+
+    @override
+    def title(self) -> str:
+        return _("Stored secrets for automation users")
+
+    @override
+    def help(self) -> str:
+        return _(
+            "With 2.4.0 (Werk #17344) it was made optional to store the secret of an automation user. "
+            "We do not recommend to store the secret for automation users with high privileges."
+        )
+
+    @override
+    def is_relevant(self) -> bool:
+        return not is_distributed_setup_remote_site(active_config.sites)
+
+    @staticmethod
+    def get_flagged_users(
+        user_permissions: UserPermissions, user_db: Users
+    ) -> dict[UserId, list[str]]:
+        return {
+            user_id: sorted(dps)
+            for user_id, user_spec in user_db.items()
+            if user_spec.get("store_automation_secret", False)
+            and (
+                dps := [
+                    dp for dp in DANGEROUS_PERMISSIONS if user_permissions.user_may(user_id, dp)
+                ]
+            )
+        }
+
+    @override
+    def execute(self, site_id: SiteId, config: Config) -> Iterator[ACSingleResult]:
+        flagged_users = self.get_flagged_users(
+            UserPermissions.from_config(config, permission_registry),
+            userdb.load_users(),
+        )
+
+        if not flagged_users:
+            yield ACSingleResult(
+                state=ACResultState.OK,
+                text=_(
+                    "No automation users with stored secrets have dangerous permissions configured"
+                ),
+                site_id=site_id,
+            )
+            return
+
+        for user_id, dangerous_perms in flagged_users.items():
+            yield ACSingleResult(
+                state=ACResultState.WARN,
+                text=_(
+                    "Automation user %(user_id)s has stored secret with %(count)d dangerous permission(s): %(permissions)s"
+                )
+                % {
+                    "user_id": user_id,
+                    "count": len(dangerous_perms),
+                    "permissions": ", ".join(
+                        (perm.title if (perm := permission_registry.get(p)) else p)
+                        for p in dangerous_perms
+                    ),
+                },
+                site_id=site_id,
+            )

@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import pathlib
+from collections.abc import Iterator
+
+import pytest
+from fastapi.testclient import TestClient
+
+from cmk.agent_receiver.lib.config import Config, get_config
+from cmk.agent_receiver.main import main_app
+from cmk.testlib.agent_receiver.builder import AgentReceiverConfigBuilder, AgentReceiverSite
+from cmk.testlib.agent_receiver.native_wiremock import run_wiremock
+from cmk.testlib.agent_receiver.site_mock import SiteMock, User
+from cmk.testlib.agent_receiver.wiremock import Wiremock
+
+
+@pytest.fixture()
+def ar_site(wiremock: Wiremock, tmp_path: pathlib.Path) -> AgentReceiverSite:
+    return AgentReceiverConfigBuilder(
+        omd_root=tmp_path / "some-test-name",
+        site_name="some-test-name",
+        apache_address=wiremock.wiremock_hostname,
+        apache_port=wiremock.port,
+    ).build()
+
+
+@pytest.fixture()
+def site_name(ar_site: AgentReceiverSite) -> str:
+    return ar_site.config.site_name
+
+
+@pytest.fixture()
+def site_context(ar_site: AgentReceiverSite, monkeypatch: pytest.MonkeyPatch) -> Config:
+    for key, value in ar_site.env.items():
+        monkeypatch.setenv(key, value)
+    get_config.cache_clear()
+    return ar_site.config
+
+
+@pytest.fixture()
+def test_client(site_context: Config) -> Iterator[TestClient]:
+    app = main_app()
+    client = TestClient(app)
+    yield client
+
+    print(site_context.log_path.read_text())  # noqa: T201  # It's OK for test/script helpers to print()
+
+
+@pytest.fixture(scope="session")
+def wiremock() -> Iterator[Wiremock]:
+    """
+    Provide a Wiremock instance for the tests.
+    """
+    with run_wiremock() as process:
+        yield Wiremock(
+            port=process.http_port,
+            wiremock_hostname=process.hostname,
+        )
+
+
+@pytest.fixture
+def user() -> User:
+    return User("testmo", "supersecret")
+
+
+@pytest.fixture
+def site(wiremock: Wiremock, user: User, ar_site: AgentReceiverSite) -> SiteMock:
+    wiremock.reset()
+    return SiteMock(
+        wiremock,
+        ar_site.config.site_name,
+        user,
+        ar_site.internal_credentials,
+        ar_site.config.omd_root,
+    )

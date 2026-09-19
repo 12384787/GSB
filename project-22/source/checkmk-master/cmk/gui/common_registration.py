@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+"""Central module for common (non-edition specific) registrations"""
+
+from collections.abc import Callable
+
+import cmk.gui.help
+from cmk.ccc.version import Edition
+from cmk.gui import (
+    activate_menu,
+    agent_registration,
+    autocompleters,
+    crash_reporting,
+    default_permissions,
+    deprecations,
+    experimental_flags,
+    global_settings,
+    help_menu,
+    hooks,
+    inventory,
+    main,
+    message,
+    mobile,
+    notifications,
+    pagetypes,
+    painter_options,
+    product_usage_analytics,
+    rulespec,
+    search_menu,
+    user_message,
+    valuespec,
+    weblib,
+    welcome,
+    werks,
+)
+from cmk.gui.agent_download import registration as agent_download_registration
+from cmk.gui.autocompleters import AutocompleterRegistry
+from cmk.gui.availability import registration as availability_registration
+from cmk.gui.background_job.job import BackgroundJobRegistry
+from cmk.gui.background_job.wato import registration as background_job_registration
+from cmk.gui.bi import registration as bi_registration
+from cmk.gui.cron import CronJobRegistry
+from cmk.gui.dashboard import DashletRegistry
+from cmk.gui.dashboard import registration as dashboard_registration
+from cmk.gui.data_source import DataSourceRegistry
+from cmk.gui.form_specs import registration as vue_registration
+from cmk.gui.graphing import registration as graphing_registration
+from cmk.gui.graphing.openapi import register as register_graphing_openapi_endpoints
+from cmk.gui.logged_in import user
+from cmk.gui.main_menu import MainMenuRegistry
+from cmk.gui.monitor.command import downtime_recurrences, monitor_commands
+from cmk.gui.monitor.hosts import registration as monitor_hosts_registration
+from cmk.gui.monitor.hosts._folder import monitor_folders, SetupFolders
+from cmk.gui.monitor.services import registration as monitor_services_registration
+from cmk.gui.monitor.services._page_menu import host_menus
+from cmk.gui.nodevis import nodevis
+from cmk.gui.oauth2_connections.registration import register as register_oauth2_connections
+from cmk.gui.openapi import registration as openapi_registration
+from cmk.gui.openapi.framework.registry import VersionedEndpointRegistry
+from cmk.gui.openapi.restful_objects.endpoint_family import EndpointFamilyRegistry
+from cmk.gui.openapi.restful_objects.registry import EndpointRegistry
+from cmk.gui.page_menu_utils import LegacyHostMenus
+from cmk.gui.pages import PageRegistry
+from cmk.gui.pagetypes import registration as pagetypes_registration
+from cmk.gui.painter.v0 import PainterRegistry
+from cmk.gui.painter_options import PainterOptionRegistry
+from cmk.gui.permissions import PermissionRegistry, PermissionSectionRegistry
+from cmk.gui.quick_setup import registration as quick_setup_registration
+from cmk.gui.quick_setup.v0_unstable._registry import QuickSetupRegistry
+from cmk.gui.rule_specs.registering import register_plugin
+from cmk.gui.search import registration as search_registration
+from cmk.gui.search.matchers import MatchItemGeneratorRegistry, MatchPluginRegistry
+from cmk.gui.sidebar import SnapinRegistry
+from cmk.gui.token_auth import TokenAuthenticatedPageRegistry
+from cmk.gui.userdb import register_config_file as user_connections_config
+from cmk.gui.userdb import register_userroles_config_file as register_userroles
+from cmk.gui.userdb import registration as userdb_registration
+from cmk.gui.userdb import UserConnectorRegistry
+from cmk.gui.userdb._user_attribute._registry import UserAttributeRegistry
+from cmk.gui.view_breadcrumbs import make_service_breadcrumb
+from cmk.gui.views import registration as views_registration
+from cmk.gui.views.command import CommandGroupRegistry, CommandRegistry
+from cmk.gui.views.icon import IconRegistry
+from cmk.gui.views.layout import LayoutRegistry
+from cmk.gui.views.row_post_processing import RowPostProcessorRegistry
+from cmk.gui.views.sorter import SorterRegistry
+from cmk.gui.views.store import multisite_builtin_views
+from cmk.gui.visuals.filter import FilterRegistry
+from cmk.gui.visuals.info import VisualInfoRegistry
+from cmk.gui.visuals.type import VisualTypeRegistry
+from cmk.gui.wato import _pre_21_plugin_api
+from cmk.gui.watolib import broker_connections as broker_connections_config
+from cmk.gui.watolib import configuration_bundle_store, groups_io, password_store
+from cmk.gui.watolib import notifications as notifications_config
+from cmk.gui.watolib import registration as watolib_registration
+from cmk.gui.watolib import sites as sites_config
+from cmk.gui.watolib import tags as tag_config
+from cmk.gui.watolib import users as user_config
+from cmk.gui.watolib.automation_commands import AutomationCommandRegistry
+from cmk.gui.watolib.config_domain_name import (
+    ConfigDomainRegistry,
+    ConfigVariableGroupRegistry,
+    ConfigVariableRegistry,
+)
+from cmk.gui.watolib.config_sync import ReplicationPathRegistry
+from cmk.gui.watolib.groups_io import ContactGroupUsageFinderRegistry
+from cmk.gui.watolib.host_attributes import (
+    HostAttributeRegistry,
+    HostAttributeTopicRegistry,
+)
+from cmk.gui.watolib.host_rename import RenameHostHookRegistry
+from cmk.gui.watolib.hosts_and_folders import (
+    all_folder_title_paths,
+    folder_title_path,
+    folder_tree,
+    FolderValidatorsRegistry,
+)
+from cmk.gui.watolib.main_menu import MainModuleRegistry, MainModuleTopicRegistry
+from cmk.gui.watolib.mode import ModeRegistry
+from cmk.gui.watolib.notification_parameter import notification_parameter_registry
+from cmk.gui.watolib.rulespecs import RulespecGroupRegistry, RulespecRegistry
+from cmk.gui.watolib.sample_config import SampleConfigGeneratorRegistry
+from cmk.gui.watolib.simple_config_file import ConfigFileRegistry
+from cmk.gui.watolib.timeperiods import TimeperiodUsageFinderRegistry
+from cmk.licensing.registry import register_community_licensing_handler
+from cmk.shared_typing.main_menu import NavItemTopicEntry
+
+
+def register(
+    *,
+    edition: Edition,
+    main_menu_registry: MainMenuRegistry,
+    job_registry: BackgroundJobRegistry,
+    permission_section_registry: PermissionSectionRegistry,
+    permission_registry: PermissionRegistry,
+    sorter_registry: SorterRegistry,
+    painter_option_registry: PainterOptionRegistry,
+    painter_registry: PainterRegistry,
+    page_registry: PageRegistry,
+    command_registry: CommandRegistry,
+    visual_type_registry: VisualTypeRegistry,
+    row_post_processor_registry: RowPostProcessorRegistry,
+    visual_info_registry: VisualInfoRegistry,
+    filter_registry: FilterRegistry,
+    rulespec_registry: RulespecRegistry,
+    config_variable_group_registry: ConfigVariableGroupRegistry,
+    mode_registry: ModeRegistry,
+    main_module_registry: MainModuleRegistry,
+    config_variable_registry: ConfigVariableRegistry,
+    rulespec_group_registry: RulespecGroupRegistry,
+    icon_and_action_registry: IconRegistry,
+    cron_job_registry: CronJobRegistry,
+    dashlet_registry: DashletRegistry,
+    contact_group_usage_finder_registry: ContactGroupUsageFinderRegistry,
+    autocompleter_registry: AutocompleterRegistry,
+    data_source_registry: DataSourceRegistry,
+    config_domain_registry: ConfigDomainRegistry,
+    timeperiod_usage_finder_registry: TimeperiodUsageFinderRegistry,
+    automation_command_registry: AutomationCommandRegistry,
+    main_module_topic_registry: MainModuleTopicRegistry,
+    snapin_registry: SnapinRegistry,
+    match_item_generator_registry: MatchItemGeneratorRegistry,
+    match_plugin_registry: MatchPluginRegistry,
+    sample_config_generator_registry: SampleConfigGeneratorRegistry,
+    host_attribute_registry: HostAttributeRegistry,
+    host_attribute_topic_registry: HostAttributeTopicRegistry,
+    replication_path_registry: ReplicationPathRegistry,
+    endpoint_registry: EndpointRegistry,
+    versioned_endpoint_registry: VersionedEndpointRegistry,
+    endpoint_family_registry: EndpointFamilyRegistry,
+    user_connector_registry: UserConnectorRegistry,
+    layout_registry: LayoutRegistry,
+    config_file_registry: ConfigFileRegistry,
+    rename_host_hook_registry: RenameHostHookRegistry,
+    command_group_registry: CommandGroupRegistry,
+    folder_validators_registry: FolderValidatorsRegistry,
+    user_attribute_registry: UserAttributeRegistry,
+    quick_setup_registry: QuickSetupRegistry,
+    help_info_line: Callable[[], str],
+    help_learning_entries: Callable[[], list[NavItemTopicEntry]],
+    help_developer_entries: Callable[[], list[NavItemTopicEntry]],
+    help_about_checkmk_entries: Callable[[], list[NavItemTopicEntry]],
+    token_authenticated_page_registry: TokenAuthenticatedPageRegistry,
+    builtin_pagetype_topic_registry: pagetypes.BuiltinPagetypeTopicRegistry,
+    agent_bakery_enabled: bool,
+) -> None:
+    hooks.register_thread_cache_cleanup()
+    notification_parameter_registry.register_form_spec_plugin = register_plugin
+    pagetypes_registration.register(
+        main_menu_registry,
+        builtin_pagetype_topic_registry,
+        versioned_endpoint_registry,
+        endpoint_family_registry,
+        match_item_generator_registry,
+    )
+    search_menu.register(main_menu_registry)
+    help_menu.register(
+        main_menu_registry,
+        help_info_line,
+        help_learning_entries,
+        help_developer_entries,
+        help_about_checkmk_entries,
+    )
+    activate_menu.register(main_menu_registry)
+    default_permissions.register(permission_section_registry, permission_registry)
+    register_community_licensing_handler()
+    painter_options.register(painter_option_registry)
+    views_registration.register(
+        permission_section_registry,
+        permission_registry,
+        page_registry,
+        visual_type_registry,
+        multisite_builtin_views,
+        row_post_processor_registry,
+        command_registry,
+        command_group_registry,
+        painter_registry,
+        painter_option_registry,
+        layout_registry,
+        sorter_registry,
+        data_source_registry,
+        endpoint_family_registry,
+        versioned_endpoint_registry,
+    )
+    inventory.register(
+        config_variable_registry,
+        page_registry,
+        visual_info_registry,
+        filter_registry,
+        rulespec_group_registry,
+        rulespec_registry,
+        icon_and_action_registry,
+        cron_job_registry,
+        endpoint_family_registry,
+        versioned_endpoint_registry,
+    )
+    dashboard_registration.register(
+        permission_section_registry,
+        page_registry,
+        token_authenticated_page_registry,
+        visual_type_registry,
+        dashlet_registry,
+        contact_group_usage_finder_registry,
+        autocompleter_registry,
+        endpoint_family_registry,
+        versioned_endpoint_registry,
+    )
+    monitor_commands.use_legacy_source(command_registry)
+    downtime_recurrences.use_legacy_source(command_registry)
+    host_menus.use_legacy_source(LegacyHostMenus())
+    # Setup answers about the folders of whoever is asking, so both the tree and the user are read
+    # per call - `user` is the request's, not this wiring's.
+    monitor_folders.use_setup_source(
+        SetupFolders(
+            title_of=lambda path: folder_title_path(folder_tree(), path, user),
+            all_titles=lambda: all_folder_title_paths(folder_tree(), user),
+        )
+    )
+    monitor_hosts_registration.register(
+        endpoint_family_registry,
+        versioned_endpoint_registry,
+        page_registry,
+        monitor_commands,
+        downtime_recurrences,
+    )
+    monitor_services_registration.register(
+        endpoint_family_registry,
+        versioned_endpoint_registry,
+        page_registry,
+        monitor_commands,
+        downtime_recurrences,
+        host_menus,
+    )
+    crash_reporting.register(
+        page_registry,
+        data_source_registry,
+        painter_registry,
+        sorter_registry,
+        command_registry,
+        config_variable_group_registry,
+        config_variable_registry,
+        filter_registry,
+        cron_job_registry,
+    )
+    watolib_registration.register(
+        edition,
+        rulespec_group_registry,
+        automation_command_registry,
+        job_registry,
+        sample_config_generator_registry,
+        config_domain_registry,
+        host_attribute_topic_registry,
+        host_attribute_registry,
+        contact_group_usage_finder_registry,
+        timeperiod_usage_finder_registry,
+        config_variable_group_registry,
+        autocompleter_registry,
+        replication_path_registry,
+        folder_validators_registry,
+        cron_job_registry,
+    )
+
+    mobile.register(layout_registry)
+    userdb_registration.register(
+        page_registry,
+        user_attribute_registry,
+        user_connector_registry,
+        job_registry,
+        contact_group_usage_finder_registry,
+        timeperiod_usage_finder_registry,
+        cron_job_registry,
+    )
+
+    bi_registration.register(
+        data_source_registry=data_source_registry,
+        painter_registry=painter_registry,
+        painter_option_registry=painter_option_registry,
+        permission_section_registry=permission_section_registry,
+        permission_registry=permission_registry,
+        page_registry=page_registry,
+        filter_registry=filter_registry,
+        rename_host_hook_registry=rename_host_hook_registry,
+        main_module_topic_registry=main_module_topic_registry,
+        main_module_registry=main_module_registry,
+        mode_registry=mode_registry,
+        icon_and_action_registry=icon_and_action_registry,
+        snapin_registry=snapin_registry,
+        endpoint_registry=endpoint_registry,
+        command_registry=command_registry,
+        command_group_registry=command_group_registry,
+        cron_job_registry=cron_job_registry,
+    )
+    nodevis.register(page_registry, filter_registry, icon_and_action_registry, cron_job_registry)
+    notifications.register(page_registry, permission_section_registry)
+    user_message.register(
+        page_registry,
+        versioned_endpoint_registry,
+        endpoint_family_registry,
+    )
+    valuespec.register(page_registry)
+    autocompleters.register(page_registry)
+    _register_visuals_autocompleters(autocompleter_registry)
+    werks.register(page_registry)
+    message.register(page_registry, cron_job_registry)
+    cmk.gui.help.register(page_registry)
+    main.register(page_registry)
+    product_usage_analytics.register(
+        page_registry,
+        permission_registry,
+        config_domain_registry,
+        config_variable_registry,
+        config_variable_group_registry,
+        replication_path_registry,
+    )
+    experimental_flags.register(
+        config_domain_registry,
+        config_variable_registry,
+        config_variable_group_registry,
+        replication_path_registry,
+    )
+    quick_setup_registration.register(
+        automation_command_registry,
+        main_module_topic_registry,
+        main_module_registry,
+        mode_registry,
+        quick_setup_registry,
+        job_registry,
+    )
+    background_job_registration.register(
+        edition,
+        automation_command_registry,
+        page_registry,
+        mode_registry,
+        main_module_registry,
+        cron_job_registry,
+        permission_section_registry,
+        permission_registry,
+    )
+    vue_registration.register()
+    agent_registration.register(
+        permission_section_registry,
+        endpoint_family_registry,
+        versioned_endpoint_registry,
+    )
+    weblib.register(page_registry)
+    openapi_registration.register(
+        endpoint_registry,
+        versioned_endpoint_registry,
+        endpoint_family_registry,
+    )
+    agent_download_registration.register(
+        page_registry,
+        mode_registry,
+        endpoint_registry,
+        versioned_endpoint_registry,
+    )
+    availability_registration.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+
+    register_userroles(config_file_registry)
+    groups_io.register(config_file_registry)
+    password_store.register(config_file_registry)
+    notifications_config.register(config_file_registry)
+    tag_config.register(config_file_registry)
+    sites_config.register(config_file_registry)
+    broker_connections_config.register(config_file_registry)
+    user_connections_config(config_file_registry)
+    user_config.register(config_file_registry)
+    configuration_bundle_store.register(config_file_registry)
+    deprecations.register(cron_job_registry)
+    rulespec.register(
+        edition,
+        rulespec_registry,
+        notification_parameter_registry,
+        agent_bakery_enabled,
+    )
+    welcome.register(page_registry, snapin_registry)
+    global_settings.register(page_registry, match_item_generator_registry)
+    search_registration.register(
+        page_registry,
+        job_registry,
+        match_plugin_registry,
+    )
+    register_oauth2_connections(
+        mode_registry, page_registry, main_module_registry, permission_registry
+    )
+    _pre_21_plugin_api.register()
+    graphing_registration.register_prediction_page(page_registry, make_service_breadcrumb)
+    register_graphing_openapi_endpoints(versioned_endpoint_registry, endpoint_family_registry)
+
+
+def _register_visuals_autocompleters(
+    autocompleter_registry: AutocompleterRegistry,
+) -> None:
+    from cmk.gui.visuals._autocompleters import (
+        check_command_autocompleter,
+        kubernetes_labels_autocompleter,
+        label_autocompleter,
+        monitored_hostname_autocompleter,
+        monitored_service_description_autocompleter,
+    )
+
+    autocompleter_registry.register_autocompleter(
+        "monitored_hostname", monitored_hostname_autocompleter
+    )
+    autocompleter_registry.register_autocompleter("check_cmd", check_command_autocompleter)
+    autocompleter_registry.register_autocompleter(
+        "monitored_service_description", monitored_service_description_autocompleter
+    )
+    autocompleter_registry.register_autocompleter(
+        "kubernetes_labels", kubernetes_labels_autocompleter
+    )
+    autocompleter_registry.register_autocompleter("label", label_autocompleter)

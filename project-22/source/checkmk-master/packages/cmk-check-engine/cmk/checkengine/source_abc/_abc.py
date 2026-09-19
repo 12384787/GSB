@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+
+
+import abc
+from collections.abc import Sized
+
+from cmk.checkengine.fetcher_abc import Fetcher
+from cmk.checkengine.filecache import FileCache, FileCacheOptions
+from cmk.checkengine.helper_interface import SourceInfo
+
+
+class Source[TRawData: Sized](abc.ABC):
+    """Abstract source factory.
+
+    Note:
+        Pass arguments to `__init__` if they depend on the type of the source;
+        pass arguments to the factory method if they are independent.
+
+    See Also:
+        https://refactoring.guru/design-patterns/abstract-factory
+
+    """
+
+    @abc.abstractmethod
+    def source_info(self) -> SourceInfo: ...
+
+    @abc.abstractmethod
+    def fetcher(self) -> Fetcher[TRawData]: ...
+
+    @abc.abstractmethod
+    def file_cache(
+        self, *, simulation: bool, file_cache_options: FileCacheOptions
+    ) -> FileCache[TRawData]: ...

@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+
+
+import pprint
+import time
+from collections.abc import Callable, Iterable, Iterator, Mapping, Reversible, Sequence
+from typing import Any, Final, override, TypedDict
+
+import cmk.ccc.debug
+from cmk.utils.timeperiod import TimeperiodName, TIMESPECIFIC_DEFAULT_KEY, TIMESPECIFIC_VALUES_KEY
+
+__all__ = [
+    "Parameters",
+    "TimespecificParameters",
+    "TimespecificParametersPreview",
+    "TimespecificParameterSet",
+    "IsTimeperiodActiveCallback",
+]
+
+
+class Parameters(Mapping[str, Any]):
+    """Parameter objects are used to pass parameters to plug-in functions.
+
+    Intentionally not a `dict` subclass: the legacy check API relies on
+    `isinstance(..., Parameters)` to tell new-style (immutable) parameters
+    apart from plain dicts.
+
+    The value type is `Any` by API contract; narrowing it would be an
+    incompatible API change.
+    """
+
+    def __init__(self, data: Mapping[str, Any]) -> None:
+        self._data = dict(data)
+
+    @override
+    def __getitem__(self, key: str) -> object:
+        return self._data[key]
+
+    @override
+    def __len__(self) -> int:
+        return len(self._data)
+
+    @override
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    @override
+    def __repr__(self) -> str:
+        # use pformat to be testable.
+        return f"{self.__class__.__name__}({pprint.pformat(self._data)})"
+
+
+type IsTimeperiodActiveCallback = Callable[[TimeperiodName], bool | None]
+
+
+class _InnerTimespecificParametersPreview(TypedDict):
+    params: Mapping[str, object]
+    computed_at: float
+
+
+class TimespecificParametersPreview(TypedDict):
+    tp_computed_params: _InnerTimespecificParametersPreview
+
+
+class TimespecificParameters:
+    def __init__(self, entries: Sequence[TimespecificParameterSet] = ()) -> None:
+        self.entries: Final = tuple(entries)
+
+    @override
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, TimespecificParameters) and self.entries == other.entries
+
+    @override
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self.entries!r})"
+
+    def evaluate(self, is_active: IsTimeperiodActiveCallback) -> Mapping[str, object]:
+        return merge_parameters(
+            [entry.evaluate(is_active) for entry in self.entries],
+            {},
+        )
+
+    def is_constant(self) -> bool:
+        return not any(p.timeperiod_values for p in self.entries)
+
+    def preview(
+        self, is_active: IsTimeperiodActiveCallback
+    ) -> TimespecificParametersPreview | Mapping[str, object]:
+        """Create a serializeable version for preview via automation call"""
+        if self.is_constant():
+            return self.evaluate(is_active)
+        return {
+            "tp_computed_params": {
+                "params": self.evaluate(is_active),
+                "computed_at": time.time(),
+            }
+        }
+
+
+class TimespecificParameterSet:
+    def __init__(
+        self,
+        default: Mapping[str, object],
+        timeperiod_values: Sequence[tuple[TimeperiodName, Mapping[str, object]]],
+    ) -> None:
+        self.default: Final = default
+        self.timeperiod_values: Final = tuple(timeperiod_values)
+
+    @classmethod
+    def from_parameters(cls, parameters: Mapping[str, object]) -> TimespecificParameterSet:
+        if (
+            TIMESPECIFIC_DEFAULT_KEY in parameters
+            and isinstance((default := parameters[TIMESPECIFIC_DEFAULT_KEY]), dict)
+            and isinstance((tp_values := parameters[TIMESPECIFIC_VALUES_KEY]), list)
+        ):
+            return cls(default, tp_values)
+        return cls(parameters, ())
+
+    @override
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, TimespecificParameterSet)
+            and self.default == other.default
+            and self.timeperiod_values == other.timeperiod_values
+        )
+
+    @override
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self.default!r}, {self.timeperiod_values!r})"
+
+    def _active_subsets(
+        self,
+        is_active: IsTimeperiodActiveCallback,
+    ) -> Iterable[Mapping[str, object]]:
+        for timeperiod_name, tp_entry in self.timeperiod_values:
+            try:
+                if is_active(timeperiod_name):
+                    yield tp_entry
+            except Exception:
+                # Connection error
+                if cmk.ccc.debug.enabled():
+                    raise
+                return
+
+    def evaluate(self, is_active: IsTimeperiodActiveCallback) -> Mapping[str, object]:
+        return merge_parameters(list(self._active_subsets(is_active)), self.default)
+
+
+def merge_parameters[T](
+    parameters: Reversible[Mapping[str, T]], default: Mapping[str, T]
+) -> Mapping[str, T]:
+    """
+    Merge dictionary based parameters.
+
+    The keys in the result are the union of the keys of the elements of `parameters`.
+    First occurrance wins:
+
+        >>> merge_parameters([{'a': 1},{'a': 2, 'b': 3}], {})
+        {'a': 1, 'b': 3}
+
+    The check engine uses this logic to merge discovered parameters and
+    (sets of) time specific parameters.
+    It is consistent with the merge behavior of the ruleset matcher
+    and other places in Checkmk.
+    """
+    merged = {**default}
+    for par in reversed(parameters):
+        merged.update(par)
+    return merged

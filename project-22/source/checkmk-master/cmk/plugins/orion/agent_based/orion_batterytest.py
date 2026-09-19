@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+from cmk.agent_based.v2 import (
+    CheckPlugin,
+    CheckResult,
+    Result,
+    SimpleSNMPSection,
+    SNMPTree,
+    startswith,
+    State,
+    StringTable,
+)
+from cmk.agent_based.v3_unstable import discover_one_service
+
+
+def parse_orion_batterytest(string_table: StringTable) -> StringTable | None:
+    return string_table or None
+
+
+snmp_section_orion_batterytest = SimpleSNMPSection(
+    name="orion_batterytest",
+    parse_function=parse_orion_batterytest,
+    detect=startswith(".1.3.6.1.2.1.1.2.0", ".1.3.6.1.4.1.20246"),
+    fetch=SNMPTree(
+        base=".1.3.6.1.4.1.20246.2.3.1.1.1.2.5.2.2",
+        oids=["1", "2"],
+    ),
+)
+
+
+def check_orion_batterytest(section: StringTable) -> CheckResult:
+    map_states: dict[str, tuple[State, str]] = {
+        "1": (State.OK, "none"),
+        "2": (State.CRIT, "failed"),
+        "3": (State.WARN, "aborted"),
+        "4": (State.CRIT, "load failure"),
+        "5": (State.OK, "OK"),
+        "6": (State.WARN, "aborted manual"),
+        "7": (State.WARN, "aborted ev ctrl charge"),
+        "8": (State.WARN, "aborted inhibit ev"),
+    }
+
+    last_test_date, test_result = section[0]
+    if test_result != "1":
+        # dcBatteryTestResult:
+        # This parameter is valid only if there is a test result available.
+        state, state_readable = map_states.get(
+            test_result, (State.UNKNOWN, f"unknown[{test_result}]")
+        )
+        yield Result(
+            state=state, summary=f"Last performed: {last_test_date}, Result: {state_readable}"
+        )
+    else:
+        yield Result(state=State.OK, summary="No test result available")
+
+
+check_plugin_orion_batterytest = CheckPlugin(
+    name="orion_batterytest",
+    service_name="Battery Test",
+    discovery_function=discover_one_service,
+    check_function=check_orion_batterytest,
+)

@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from collections.abc import Mapping, Sequence
+
+import pytest
+
+from cmk.agent_based.v2 import Result, Service, State, StringTable
+from cmk.plugins.enterasys.agent_based.enterasys_powersupply import (
+    check_enterasys_powersupply,
+    discover_enterasys_powersupply,
+    parse_enterasys_powersupply,
+)
+
+
+@pytest.mark.parametrize(
+    "string_table, expected_discoveries",
+    [
+        ([["101", "3", "1", "1"], ["102", "", "", "1"]], [Service(item="101")]),
+    ],
+)
+def test_discover_enterasys_powersupply(
+    string_table: StringTable, expected_discoveries: Sequence[Service]
+) -> None:
+    """Test discovery function for enterasys_powersupply check."""
+    parsed = parse_enterasys_powersupply(string_table)
+    assert list(discover_enterasys_powersupply(parsed)) == list(expected_discoveries)
+
+
+@pytest.mark.parametrize(
+    "item, params, string_table, expected_results",
+    [
+        (
+            "101",
+            {"redundancy_ok_states": [1]},
+            [["101", "3", "1", "1"], ["102", "", "", "1"]],
+            [Result(state=State.OK, summary="Status: working and redundant (ac-dc)")],
+        ),
+    ],
+)
+def test_check_enterasys_powersupply(
+    item: str,
+    params: Mapping[str, Sequence[int]],
+    string_table: StringTable,
+    expected_results: Sequence[Result],
+) -> None:
+    """Test check function for enterasys_powersupply check."""
+    parsed = parse_enterasys_powersupply(string_table)
+    assert list(check_enterasys_powersupply(item, params, parsed)) == list(expected_results)

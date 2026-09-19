@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+import dataclasses
+
+from cmk.gui.breadcrumb import Breadcrumb, BreadcrumbItem, make_topic_breadcrumb
+from cmk.gui.http import request
+from cmk.gui.main_menu import main_menu_registry
+from cmk.gui.pagetypes import PagetypeTopics
+from cmk.gui.type_defs import VisualContext
+from cmk.gui.utils.roles import UserPermissions
+from cmk.web.utils.urls import HTTPVariable, makeuri, makeuri_contextless
+
+from .type_defs import DashboardConfig
+
+__all__ = ["dashboard_breadcrumb"]
+
+
+@dataclasses.dataclass
+class EvaluatedBreadcrumbItem:
+    title: str
+    link: str | None
+    id: str | None
+
+    @classmethod
+    def from_breadcrumb_item(cls, item: BreadcrumbItem) -> EvaluatedBreadcrumbItem:
+        return cls(title=str(item.title), link=item.url, id=item.id)
+
+
+def dashboard_topic_breadcrumb(topic: str, user_permissions: UserPermissions) -> Breadcrumb:
+    page = PagetypeTopics.get_topic(topic, user_permissions)
+    return make_topic_breadcrumb(
+        main_menu_registry.menu_monitoring(),
+        page.title(),
+        page.name(),
+    )
+
+
+# These dashboards are not part of the Azure overview -> subscription ->
+# resource group drill-down hierarchy and keep the default breadcrumb
+_AZURE_BREADCRUMB_EXCLUDES = {
+    "azure_vm_overview",
+    "azure_vm_instances",
+    "azure_storage_overview",
+    "azure_storage_accounts",
+}
+
+
+def dashboard_breadcrumb(
+    name: str,
+    board: DashboardConfig,
+    title: str,
+    context: VisualContext,
+    user_permissions: UserPermissions,
+) -> Breadcrumb:
+    breadcrumb = dashboard_topic_breadcrumb(board["topic"], user_permissions)
+
+    if "kubernetes" in name:
+        return kubernetes_dashboard_breadcrumb(name, board, title, breadcrumb, context)
+
+    if name.startswith("azure_") and name not in _AZURE_BREADCRUMB_EXCLUDES:
+        return azure_dashboard_breadcrumb(name, title, breadcrumb, context)
+
+    breadcrumb.append(
+        BreadcrumbItem(title, makeuri(request, [("name", name)]), f"dashboard_{name}")
+    )
+    return breadcrumb
+
+
+def azure_dashboard_breadcrumb(
+    name: str,
+    title: str,
+    breadcrumb: Breadcrumb,
+    context: VisualContext,
+) -> Breadcrumb:
+    """
+    Realize the Azure hierarchy breadcrumb
+    Azure (overview board) -> Azure subscription -> Azure resource group
+    """
+    breadcrumb.append(
+        BreadcrumbItem(
+            "Azure",
+            makeuri_contextless(request, [("name", "azure_overview")]),
+            "dashboard_azure_overview",
+        )
+    )
+    if name == "azure_overview":
+        return breadcrumb
+
+    # Subscription
+    subscription_id: str | None = context.get("azure_subscription", {}).get("azure_subscription")
+    if not subscription_id:
+        breadcrumb.append(BreadcrumbItem(title, makeuri(request, [("name", name)]), None))
+        return breadcrumb
+    subscription_name: str | None = context.get("azure_subscription_name", {}).get(
+        "azure_subscription_name"
+    )
+    add_vars: list[HTTPVariable] = [
+        ("site", context.get("site", {}).get("site")),
+        ("azure_subscription", subscription_id),
+        ("azure_subscription_name", subscription_name),
+    ]
+    breadcrumb.append(
+        BreadcrumbItem(
+            f"Subscription {subscription_name or subscription_id}",
+            makeuri_contextless(request, [("name", "azure_subscription"), *add_vars]),
+            "azure_subscription",
+        )
+    )
+    if name == "azure_subscription":
+        return breadcrumb
+
+    # Resource group
+    resource_group: str | None = context.get("azure_resource_group", {}).get("azure_resource_group")
+    if not resource_group:
+        breadcrumb.append(BreadcrumbItem(title, makeuri(request, [("name", name)]), None))
+        return breadcrumb
+    add_vars.append(("azure_resource_group", resource_group))
+    breadcrumb.append(
+        BreadcrumbItem(
+            f"Resource group {resource_group}",
+            makeuri_contextless(request, [("name", "azure_resource_group"), *add_vars]),
+            "azure_resource_group",
+        )
+    )
+    if name == "azure_resource_group":
+        return breadcrumb
+
+    # Any deeper Azure dashboard not covered above (e.g. one missing from the
+    # exclude list) still gets a final breadcrumb item for the current page.
+    breadcrumb.append(BreadcrumbItem(title, makeuri(request, [("name", name)]), None))
+    return breadcrumb
+
+
+def kubernetes_dashboard_breadcrumb(
+    name: str,
+    board: DashboardConfig,  # noqa: ARG001
+    title: str,
+    breadcrumb: Breadcrumb,
+    context: VisualContext,
+) -> Breadcrumb:
+    """Realize the Kubernetes hierarchy breadcrumb
+
+    Kubernetes (overview board)
+     |
+     + Kubernetes Cluster
+       |
+       + Kubernetes Namespace
+         |
+         + Kubernetes [DaemonSet|StatefulSet|Deployment]
+    """
+    k8s_ids: dict[str, str] = {
+        ident: "kubernetes_%s" % ident
+        for ident in [
+            "overview",
+            "cluster",
+            "cluster-host",  # for the host label only; not a dashboard name
+            "namespace",
+            "daemonset",
+            "statefulset",
+            "deployment",
+        ]
+    }
+    # Overview
+    breadcrumb.append(
+        BreadcrumbItem(
+            "Kubernetes",
+            makeuri_contextless(request, [("name", k8s_ids["overview"])]),
+            "dashboard_kubernetes",
+        )
+    )
+    if name == k8s_ids["overview"]:
+        return breadcrumb
+
+    # Cluster
+    cluster_name: str | None = context.get(k8s_ids["cluster"], {}).get(k8s_ids["cluster"])
+    cluster_host: str | None = (
+        # take current host from context, if on the cluster dashboard
+        context.get("host", {}).get("host")
+        if name == k8s_ids["cluster"]
+        # else take the cluster-host from request (url)
+        else request.get_str_input(k8s_ids["cluster-host"])
+    )
+    if not (cluster_name and cluster_host):
+        breadcrumb.append(BreadcrumbItem(title, makeuri(request, [("name", name)]), None))
+        return breadcrumb
+    add_vars: list[HTTPVariable] = [
+        ("site", context.get("site", {}).get("site")),
+        (k8s_ids["cluster"], cluster_name),
+        (k8s_ids["cluster-host"], cluster_host),
+    ]
+    breadcrumb.append(
+        BreadcrumbItem(
+            f"Cluster {cluster_name}",
+            makeuri_contextless(
+                request,
+                [
+                    ("name", k8s_ids["cluster"]),
+                    ("host", cluster_host),
+                    *add_vars,
+                ],
+            ),
+            "k8s_cluster",
+        )
+    )
+    if name == k8s_ids["cluster"]:
+        return breadcrumb
+
+    # Namespace
+    namespace_name: str | None = context.get(k8s_ids["namespace"], {}).get(k8s_ids["namespace"])
+    if not namespace_name:
+        breadcrumb.append(BreadcrumbItem(title, makeuri(request, [("name", name)]), None))
+        return breadcrumb
+    add_vars.append((k8s_ids["namespace"], namespace_name))
+    breadcrumb.append(
+        BreadcrumbItem(
+            f"Namespace {namespace_name}",
+            makeuri_contextless(
+                request,
+                [
+                    ("name", k8s_ids["namespace"]),
+                    ("host", f"namespace_{cluster_name}_{namespace_name}"),
+                    *add_vars,
+                ],
+            ),
+            "k8s_namespace",
+        )
+    )
+    if name == k8s_ids["namespace"]:
+        return breadcrumb
+
+    # [DaemonSet|StatefulSet|Deployment]
+    for obj_type, obj_type_camelcase in [
+        ("daemonset", "DaemonSet"),
+        ("statefulset", "StatefulSet"),
+        ("deployment", "Deployment"),
+    ]:
+        if obj_name := context.get(k8s_ids[obj_type], {}).get(k8s_ids[obj_type]):
+            title = f"{obj_type_camelcase} {obj_name}"
+            add_vars.append((k8s_ids[obj_type], obj_name))
+            host_name = f"{obj_type}_{cluster_name}_{namespace_name}_{obj_name}"
+            breadcrumb.append(
+                BreadcrumbItem(
+                    title,
+                    makeuri_contextless(
+                        request,
+                        [("name", k8s_ids[obj_type]), ("host", host_name), *add_vars],
+                    ),
+                    f"k8s_{obj_type}",
+                )
+            )
+            break
+    if not obj_name:  # type: ignore[possibly-undefined]
+        breadcrumb.append(BreadcrumbItem(title, makeuri(request, [("name", name)]), None))
+
+    return breadcrumb

@@ -1,0 +1,14 @@
+title: Generic UPS Device: Out Voltage
+agents: snmp
+catalog: hw/power/generic
+license: GPLv2
+distribution: check_mk
+description:
+ Out Voltage
+
+item:
+ ID of the phase
+
+discovery:
+ One service is created for each phase that reports a voltage above zero.
+ Phases that do not report a numeric voltage are ignored.

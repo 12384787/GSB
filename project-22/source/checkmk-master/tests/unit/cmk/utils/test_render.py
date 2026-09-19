@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import pytest
+
+from cmk.utils import render
+
+
+@pytest.mark.parametrize(
+    ["value", "result"],
+    [
+        (
+            5,
+            "5.00 B",
+        ),
+        (
+            2300,
+            "2.25 KiB",
+        ),
+        (
+            -2300,
+            "-2.25 KiB",
+        ),
+        (
+            int(3e6),
+            "2.86 MiB",
+        ),
+        (
+            int(4e9),
+            "3.73 GiB",
+        ),
+        (
+            int(-5e12),
+            "-4.55 TiB",
+        ),
+        (
+            int(6e15),
+            "5.33 PiB",
+        ),
+    ],
+)
+def test_fmt_bytes(value: int, result: str) -> None:
+    assert render.fmt_bytes(value) == result
+
+
+def test_fmt_bytes_si_zero_precision() -> None:
+    assert (
+        render.fmt_bytes(
+            5,
+            unit_prefix_type=render.SIUnitPrefixes,
+            precision=0,
+        )
+        == "5 B"
+    )
+
+
+def test_fmt_bytes_si_rate() -> None:
+    assert (
+        render.fmt_bytes(
+            int(3e6),
+            unit_prefix_type=render.SIUnitPrefixes,
+            precision=2,
+            unit="B/s",
+        )
+        == "3.00 MB/s"
+    )
+
+
+@pytest.mark.parametrize(
+    ["perc", "result"],
+    [
+        (0.0, "0%"),
+        (9.0e-05, "0.00009%"),
+        (0.00009, "0.00009%"),
+        (0.00103, "0.001%"),
+        (0.0019, "0.002%"),
+        (0.129, "0.13%"),
+        (8.25752, "8.26%"),
+        (8, "8.0%"),
+        (80, "80.0%"),
+        (100.123, "100%"),
+        (200.123, "200%"),
+        (1234567, "1234567%"),
+    ],
+)
+def test_percent_std(perc: float, result: str) -> None:
+    assert render.percent(perc, False) == result
+
+
+@pytest.mark.parametrize(
+    ["value", "precision", "result"],
+    [
+        (0.00009, 2, "9.00e-5"),
+        (0.00009, 1, "9.0e-5"),
+        (0.00009, 0, "9e-5"),
+        (0.009, 3, "0.009"),
+        (0.009, 2, "0.01"),
+        (0.009, 1, "0.0"),
+        (0.009, 0, "0"),
+        (0.1, 2, "0.10"),
+        (100, 0, "100"),
+        (100, 2, "100"),
+        (100, 4, "100.00"),
+        (100, 5, "100.000"),
+        (10000, 5, "10000.0"),
+        (10000, 6, "10000.00"),
+        (1000000, 2, "1.00e+6"),
+        (9000000, 2, "9.00e+6"),
+    ],
+)
+def test_scientific(value: float, precision: int, result: str) -> None:
+    assert render.scientific(value, precision) == result
+
+
+@pytest.mark.parametrize(
+    ["perc", "result"],
+    [
+        (0.00009, "9.0e-5%"),
+        (0.00019, "0.0002%"),
+        (12345, "12345%"),
+        (1234567, "1.2e+6%"),
+    ],
+)
+def test_percent_scientific(perc: float, result: str) -> None:
+    assert render.percent(perc, True) == result
+
+
+@pytest.mark.parametrize(
+    ["value", "precision", "result"],
+    [
+        (
+            10000486,
+            5,
+            "10.00049 M",
+        ),
+        (
+            100000000,
+            2,
+            "100.00 M",
+        ),
+    ],
+)
+def test_fmt_number_with_precision(value: float, precision: int, result: str) -> None:
+    assert render.fmt_number_with_precision(value, precision=precision) == result
+
+
+@pytest.mark.parametrize(
+    ["speed", "result"],
+    [
+        (10000000, "10 Mbit/s"),
+        (100000000, "100 Mbit/s"),
+        (1000000000, "1 Gbit/s"),
+        (1400, "1.4 kbit/s"),
+        (8450, "8.45 kbit/s"),
+        (26430, "26.43 kbit/s"),
+        (8583000, "8.58 Mbit/s"),
+        (int(7.84e9), "7.84 Gbit/s"),
+    ],
+)
+def test_fmt_nic_speed(speed: int, result: str) -> None:
+    assert render.fmt_nic_speed(speed) == result
+
+
+@pytest.mark.parametrize(
+    ["secs", "result"],
+    [
+        (-1234.5, "-20 m"),
+        (234.7e-15, "235 fs"),
+        (234.7e-12, "235 ps"),
+        (234.7e-9, "235 ns"),
+        (234.7e-6, "235 µs"),
+        (234.7e-3, "235 ms"),
+        (3.125, "3.12 s"),
+        (42.125, "42.1 s"),
+        (200.125, "200 s"),
+        (345.125, "5 m"),
+        (345.125, "5 m"),
+        (23456.125, "6 h"),
+        (172800.0, "2 d"),
+        (234567.125, "2.7 d"),
+        (54321012.125, "629 d"),
+        (98765432.125, "3.1 y"),
+        (987654321.125, "31 y"),
+    ],
+)
+def test_approx_age(secs: int, result: str) -> None:
+    assert render.approx_age(secs) == result

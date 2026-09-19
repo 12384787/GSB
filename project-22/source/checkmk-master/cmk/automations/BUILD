@@ -1,0 +1,41 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+load("@cmk_requirements//:requirements.bzl", "requirement")
+
+py_library(
+    name = "automations",
+    srcs = [
+        "__init__.py",
+        "client.py",
+        "logging.py",
+        "types.py",
+    ] + glob([
+        "backends/*.py",
+        "models/*.py",
+        "models/**/*.py",
+        "results/*.py",
+    ]),
+    imports = ["../.."],
+    visibility = [
+        "//cmk:__subpackages__",
+        "//tests:__subpackages__",
+    ],
+    deps = [
+        "//cmk/checkengine",
+        "//cmk/utils",
+        "//cmk/utils:unixsocket_http",
+        "//packages/cmk-ccc:exceptions",
+        "//packages/cmk-ccc:i18n",
+        "//packages/cmk-ccc:log",
+        "//packages/cmk-ccc:plugin-registry",
+        "//packages/cmk-ccc:version",
+        "//packages/cmk-check-engine:helper-interface",
+        "//packages/cmk-check-engine:lib",
+        "//packages/cmk-check-engine:specs",
+        "//packages/cmk-check-engine/cmk/checkengine/discovery",
+        "//packages/cmk-check-engine/cmk/checkengine/plugins",
+        "//packages/cmk-events",
+        "//packages/cmk-plugin-apis:password_store",
+        "//packages/cmk-trace",
+        requirement("requests"),
+    ],
+)

@@ -1,0 +1,102 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@cmk_requirements//:requirements.bzl", "requirement")
+load("@rules_python//python:packaging.bzl", "py_wheel")
+load("//bazel/rules:doctest.bzl", "py_doc_test")
+load("//bazel/rules:package_wheel.bzl", "package_wheel")
+load("//bazel/rules:py_cmk_test.bzl", "py_cmk_test")
+load("//bazel/rules:py_requirements_test.bzl", "py_requirements_test")
+
+exports_files([
+    "dev-requirements.in",
+    "requirements.in",
+])
+
+py_library(
+    name = "cmk-messaging",
+    srcs = [
+        "cmk/messaging/__init__.py",
+        "cmk/messaging/_config.py",
+        "cmk/messaging/_connection.py",
+        "cmk/messaging/_constants.py",
+        "cmk/messaging/_logging.py",
+        "cmk/messaging/broker_test.py",
+        "cmk/messaging/rabbitmq.py",
+    ],
+    data = ["cmk/messaging/py.typed"],
+    imports = ["."],
+    visibility = [
+        "//cmk:__subpackages__",
+        "//tests/unit:__subpackages__",
+    ],
+    deps = [
+        requirement("pika"),
+        requirement("pydantic"),
+        "//packages/cmk-ccc:site",
+    ],
+)
+
+py_doc_test(
+    name = "doctest",
+    size = "small",
+    srcs = ["cmk-messaging"],
+)
+
+py_cmk_test(
+    name = "unit",
+    size = "small",
+    srcs = glob(["tests/**/*.py"]),
+    deps = [
+        ":cmk-messaging",
+        requirement("pika"),
+    ],
+)
+
+py_wheel(
+    name = "wheel",
+    distribution = "cmk-messaging",
+    entry_points = {
+        "console_scripts": [
+            "cmk-broker-test = cmk.messaging.broker_test:main",
+        ],
+    },
+    strip_path_prefixes = ["packages/cmk-messaging"],
+    version = "0.1.0",
+    visibility = ["//visibility:public"],
+    deps = [
+        "py_typed",
+        ":cmk-messaging",
+    ],
+)
+
+build_test(
+    name = "build_test",
+    targets = ["wheel"],
+)
+
+filegroup(
+    name = "py_typed",
+    srcs = ["cmk/messaging/py.typed"],
+)
+
+package_wheel(
+    name = "pkg_tar",
+    visibility = ["//visibility:public"],
+    whl = "wheel",
+)
+
+sh_library(
+    name = "helpers",
+    srcs = [
+        ".f12",
+        "run",
+    ],
+)
+
+py_requirements_test(
+    name = "requirements-test",
+    libs = [
+        ":cmk-messaging",
+    ],
+    requirements_in = "requirements.in",
+)

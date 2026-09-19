@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<table width="100%"
+       style="border-spacing: 0;
+              max-width: 600px;
+              margin: 0 auto">
+    <tr>
+        <td style="height: 20px;
+                   line-height: 20px;
+                   font-size: 0;
+                   mso-line-height-rule: exactly">&nbsp;</td>
+    </tr>
+    <tr>
+        <th style="font-size: 18px;
+                   font-weight: 600;
+                   text-align: left"
+            colspan="2">
+            <img class="section-icon"
+                 src="cid:vector.png"
+                 alt="Vector icon"
+                 width="18"
+                 height="19"
+                 style="display:inline-block;
+                        vertical-align:middle;
+                        width:18px;
+                        height:19px;
+                        border:0;
+                        background-color:#ffffff;
+                        color-scheme:light dark;
+                        supported-color-schemes:light dark;
+                        mso-line-height-rule:exactly" />
+            Host tags
+        </th>
+    </tr>
+    <tr>
+        <td style=" padding: 10px 10px 30px 0; ">
+            {% for key, value in data.items() %}
+                {% if key.startswith("HOSTTAG_") %}
+                    <span style="margin: 0px 5px 10px 0;
+                                 display: inline-block;
+                                 color: #2c3843;
+                                 text-decoration: none;
+                                 font-size: 14px;
+                                 line-height: 24px;
+                                 padding: 0 10px;
+                                 border-radius: 8px;
+                                 background-color: #dcdcdc;
+                                 border: 1px solid #ccc">{{ key[8:] }}:{{ value }}</span>
+                {% endif %}
+            {% endfor %}
+        </td>
+    </tr>
+</table>

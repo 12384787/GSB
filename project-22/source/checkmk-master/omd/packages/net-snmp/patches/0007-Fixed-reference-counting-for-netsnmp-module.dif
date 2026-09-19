@@ -1,0 +1,12 @@
+diff --git a/python/netsnmp/client_intf.c b/python/netsnmp/client_intf.c
+index 4c53cdc4f..6d3149b47 100644
+--- a/python/netsnmp/client_intf.c
++++ b/python/netsnmp/client_intf.c
+@@ -851,6 +851,7 @@ py_netsnmp_construct_varbind(void)
+   if (!module)
+       return NULL;
+   dict = PyModule_GetDict(module);
++  Py_DECREF(module);  /* module is a new ref, dict/callable are borrowed!  */
+   if (!dict)
+       return NULL;
+   callable = PyDict_GetItemString(dict, "Varbind");

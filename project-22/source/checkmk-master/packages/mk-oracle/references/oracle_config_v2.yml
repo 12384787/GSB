@@ -1,0 +1,103 @@
+# Monitoring instance data consists from 3
+# 1. authentication: username + password + role
+# 2. connection: host + port
+# 3. target: (service_name[, instance_name[, sid]] [, service_type]) or alias or sid
+# previously target was a part of the connection, now it is separated but without special section
+---
+system:
+  logging:
+    level: "warn" # optional, default: "info"
+    max_size: 1000000
+    max_count: 5
+oracle:
+  main: # mandatory, defines main SQL check to be executed
+    options: # optional
+      max_connections: 6 # optional, default: absent, 6
+      max_queries: 16 # optional, for the future use
+      use_host_client: never # optional, default: auto, values: auto, never, always, "path-to-oci-lib"
+      IGNORE_DB_NAME: 0 # optional, default: 0, values: 0, 1. If 1, will not check the DB name against the instance name
+    authentication: # mandatory
+      username: "foo" # mandatory if not using wallet, examples: "mydbuser", "c##multitenantuser"
+      password: "bar" # optional
+      role: "sysdba" # optional, default: empty, values: sysdba, sysasm, ...
+      type: "standard" # mandatory, default: "standard", values: standard, wallet
+    connection: # optional
+      hostname: "localhost" # optional, default: "localhost"
+      port: 1521 # optional, default: 1521
+      timeout: 5 # optional, default 5
+      tns_admin: "/path/to/oracle/config/files/" # optional, default: agent plugin config folder. Points to the location of sqlnet.ora and tnsnames.ora
+      oracle_local_registry: "/etc/oracle/olr.loc" # optional, default: folder of oracle configuration files like oratab
+      service_name: "INST1" # optional, deprecated
+      instance_name: "INST1" # optional, deprecated
+      sid: "INST1" # optional, deprecated
+    alias: myservicename # optional, deprecated
+
+    sections: # optional, if absent will use default as defined below
+    - instance: # special section
+      affinity: "db"
+    - asm_instance: # special section
+      affinity: "asm"
+    - dataguard_stats:
+    - locks:
+    - logswitches:
+    - longactivesessions:
+    - performance:
+    - processes:
+      affinity: "all" # optional, default "db", values: "all", "db", "asm"
+    - recovery_area:
+    - recovery_status:
+    - sessions:
+    - systemparameter:
+    - undostat:
+    - asm_diskgroup:
+      is_async: yes
+      affinity: "asm" # optional, default: "asm", values: "all", "db", "asm"
+    - iostats:
+      is_async: yes
+    - jobs:
+      is_async: yes
+    - resumable:
+      is_async: yes
+    - rman:
+      is_async: yes
+    - tablespaces:
+      is_async: yes
+    excluded_sections: # optional, sections not to be queried, per target
+      - target_id: # mandatory, identified by alias, service_name or sid, as in an instances entry
+          alias: myservicename # matches the INST1 instance below: its alias wins over sid
+        sections: [tablespaces, recovery_status] # mandatory
+      - target_id:
+          sid: "INST2"
+        sections: [jobs]
+    cache_age: 600 # optional, default: 600
+    custom_metrics_cache_age: 600 # optional, default: 600
+    piggyback_host: "mypiggybackhost" # optional
+    discovery: # optional, defines instances to be monitored
+      detect: yes # optional
+      include: ["foo", "bar", "inst1"] # optional
+      exclude: ["baz"] # optional
+    instances: # optional
+      - service_name: "INST1" # optional
+        instance_name: "INST1" # optional
+        sid: "INST1" # optional
+        alias: myservicename # optional
+        authentication: # optional, if absent will use main
+        connection: # optional, if absent will use main
+          # tns_admin: reserved, not used per-instance right now. Only the main
+          # connection's tns_admin is applied to all instances.
+        piggyback: # optional
+          hostname: "mypiggybackhost" # mandatory
+          sections: # optional, if absent will use main
+    mode: "port" # optional, default: "port", values: "port", "special"
+  configs:
+    - main:
+      options: # optional, if absent will use main
+      authentication: # optional, if absent will use main
+        username: "foo" # mandatory if not using wallet
+      connection: # optional, if absent will use main
+        hostname: "myremoteserver" # optional, default: "localhost", empty string: "localhost"
+      instances: # optiona, describes how to monitor/access instances, both detected and non-detectable
+        - sid: "MYDATABASE" # mandatory
+
+
+

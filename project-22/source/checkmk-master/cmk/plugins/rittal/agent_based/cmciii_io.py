@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+# Copyright (C) 2021 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from cmk.agent_based.v2 import CheckPlugin, CheckResult, DiscoveryResult, Result, RuleSetType, State
+from cmk.plugins.rittal.lib.cmciii import (
+    CheckParams,
+    discover_cmciii_sensors,
+    discovery_default_parameters,
+    DiscoveryParams,
+    get_sensor,
+    Section,
+    Sensor,
+)
+
+
+def discover_cmciii_io(params: DiscoveryParams, section: Section) -> DiscoveryResult:
+    yield from discover_cmciii_sensors("io", params, section)
+
+
+def state(entry: Sensor) -> State:
+    state_readable = entry["Status"]
+
+    state_mapping = {
+        "OK": State.OK,
+        "Off": State.OK,
+        "On": State.WARN,
+        "Open": State.WARN,
+        "Closed": State.OK,
+    }
+
+    return state_mapping.get(state_readable, State.WARN)
+
+
+def check_cmciii_io(item: str, params: CheckParams, section: Section) -> CheckResult:
+    entry = get_sensor(item, params, section["io"])
+    if not entry:
+        return
+
+    yield Result(state=state(entry), summary="Status: %s" % entry["Status"])
+
+    for key in ["Logic", "Delay", "Relay"]:
+        if key in entry:
+            yield Result(state=State.OK, summary=f"{key}: {entry[key]}")
+
+
+check_plugin_cmciii_io = CheckPlugin(
+    name="cmciii_io",
+    sections=["cmciii"],
+    service_name="%s",
+    discovery_function=discover_cmciii_io,
+    check_function=check_cmciii_io,
+    discovery_ruleset_name="discovery_cmciii",
+    discovery_default_parameters=discovery_default_parameters(),
+    discovery_ruleset_type=RuleSetType.MERGED,
+    check_default_parameters={},
+)

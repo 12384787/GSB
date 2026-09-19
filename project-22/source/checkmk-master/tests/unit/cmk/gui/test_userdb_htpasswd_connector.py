@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from pathlib import Path
+
+import pytest
+from pytest import MonkeyPatch
+
+from cmk.ccc.user import UserId
+from cmk.crypto import password_hashing
+from cmk.crypto.password import Password
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.user_connection_config_types import HtpasswdUserConnectionConfig
+from cmk.gui.userdb import CheckCredentialsResult, htpasswd
+
+
+@pytest.fixture(name="htpasswd_file", autouse=True)  # ruff: ignore[pytest-fixture-autouse]
+def htpasswd_file_fixture(tmp_path: Path, monkeypatch: MonkeyPatch) -> Path:
+    htpasswd_file_path = tmp_path / "htpasswd"
+    # HtpasswdUserConnector will use this path:
+    monkeypatch.setattr("cmk.utils.paths.htpasswd_file", htpasswd_file_path)
+
+    hashes = [
+        # all hashes below belong to the password "cmk"
+        "$cmk@dmin$:$2y$04$XZECL0BqDf8Er3iygLfRBO7wwg8igYcI4K49Jtn8AnJMJaP2Lx/ki",
+        "bärnd:$2y$04$71x8EVHr7c8FP8HJ/PWN7uM27SC0Z89waQCaiYovaiSAslb1sh2sO",
+        "locked_bärnd:!$2y$04$71x8EVHr7c8FP8HJ/PWN7uM27SC0Z89waQCaiYovaiSAslb1sh2sO",
+        # sha256_crypt hashes (of "cmk"), which are no longer supported
+        "legacy_hash:$5$kNFothH2RmxLOgvZ$zYYzORO.TxsYwbWvdXdQURuNlO2yFBmEZaRk2QxT1dC",
+        "locked_legacy_hash:!$5$kNFothH2RmxLOgvZ$zYYzORO.TxsYwbWvdXdQURuNlO2yFBmEZaRk2QxT1dC",
+    ]
+
+    htpasswd_file_path.write_text("\n".join(sorted(hashes)) + "\n", encoding="utf-8")
+
+    return htpasswd_file_path
+
+
+@pytest.mark.parametrize("password", ["blä", "😀", "😀" * 18, "a" * 71])
+def test_hash_password(password: str) -> None:
+    hashed_pw = htpasswd.hash_password(Password(password))
+    password_hashing.verify(Password(password), hashed_pw)
+
+
+def test_truncation_error() -> None:
+    """Bcrypt doesn't allow passwords longer than 72 bytes"""
+
+    with pytest.raises(MKUserError):
+        htpasswd.hash_password(Password("A" * 72 + "foo"))
+
+    with pytest.raises(MKUserError):
+        htpasswd.hash_password(Password("😀" * 19))
+
+
+@pytest.mark.parametrize(
+    # uids/passwords correspond to users from the htpasswd_file_fixture
+    "uid,password,expect",
+    [
+        # valid
+        (UserId("$cmk@dmin$"), Password("cmk"), UserId("$cmk@dmin$")),
+        (UserId("bärnd"), Password("cmk"), UserId("bärnd")),
+        # wrong password
+        (UserId("bärnd"), Password("foo"), False),
+        # unsupported hash
+        (UserId("legacy_hash"), Password("cmk"), False),
+        # user not in htpasswd (potentially other connector)
+        (UserId("unknown"), Password("cmk"), None),
+        # check that PWs too long for bcrypt are handled gracefully and don't raise
+        (UserId("bärnd"), Password("A" * 100), False),
+    ],
+)
+def test_user_connector_verify_password(
+    uid: UserId, password: Password, expect: CheckCredentialsResult
+) -> None:
+    assert (
+        htpasswd.HtpasswdUserConnector(
+            cfg := HtpasswdUserConnectionConfig(
+                {
+                    "type": "htpasswd",
+                    "id": "htpasswd",
+                    "disabled": False,
+                }
+            )
+        ).check_credentials(
+            uid,
+            password,
+            [],
+            [cfg],
+            default_user_profile={},
+        )
+        == expect
+    )
+
+
+@pytest.mark.parametrize(
+    "uid,password",
+    [
+        (UserId("locked_bärnd"), Password("cmk")),
+        (UserId("locked_legacy_hash"), Password("cmk")),
+    ],
+)
+def test_user_connector_verify_password_locked_users(
+    uid: UserId,
+    password: Password,
+) -> None:
+    with pytest.raises(MKUserError, match="User is locked"):
+        htpasswd.HtpasswdUserConnector(
+            cfg := HtpasswdUserConnectionConfig(
+                {
+                    "type": "htpasswd",
+                    "id": "htpasswd",
+                    "disabled": False,
+                }
+            )
+        ).check_credentials(
+            uid,
+            password,
+            [],
+            [cfg],
+            default_user_profile={},
+        )
+
+
+def test_save_users_drops_hash_of_user_owned_by_another_connector(
+    htpasswd_file: Path,
+) -> None:
+    """A user owned by an LDAP/SAML connection keeps no local password hash.
+
+    ``save_users`` rebuilds the htpasswd file from scratch and skips every user
+    whose ``connector`` is not ``htpasswd``, so an externally-owned user has no
+    local credential -- which is why deleting their connection locks them out
+    entirely instead of falling back to a local login (the resolution side of
+    that is pinned in
+    ``tests/unit/cmk/gui/userdb/test_identity_unification.py``).
+    """
+    connector = htpasswd.HtpasswdUserConnector(
+        HtpasswdUserConnectionConfig({"type": "htpasswd", "id": "htpasswd", "disabled": False})
+    )
+    local_hash = htpasswd.hash_password(Password("cmk"))
+
+    connector.save_users(
+        {
+            UserId("local_user"): {
+                "connector": "htpasswd",
+                "password": local_hash,
+                "locked": False,
+            },
+            UserId("ldap_user"): {
+                "connector": "ldap_corp",
+                "password": local_hash,
+                "locked": False,
+            },
+        }
+    )
+
+    written = htpasswd_file.read_text(encoding="utf-8")
+    assert "local_user:" in written
+    assert "ldap_user" not in written, (
+        "an LDAP-owned user must not keep a local password hash -- otherwise "
+        "connector ownership would not decide where the user authenticates"
+    )

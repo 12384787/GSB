@@ -1,0 +1,2088 @@
+#!/usr/bin/env python3
+# Copyright (C) 2022 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# ruff: noqa: ARG001  # Unused fixtures are needed for setup side effects
+
+
+import dataclasses
+import json
+from collections import defaultdict
+from collections.abc import Generator, Mapping, Sequence
+from unittest.mock import call, MagicMock, patch
+
+import pytest
+from pytest_mock import MockerFixture
+
+from cmk.automations.results import (
+    AnalyzeServiceRuleMatchesResult,
+    DeleteHostsResult,
+    GetServicesLabelsResult,
+    ServiceDiscoveryPreviewResult,
+    SetAutochecksInput,
+    SetAutochecksV2Result,
+)
+from cmk.ccc.hostaddress import HostName
+from cmk.ccc.site import SiteId
+from cmk.ccc.user import UserId
+from cmk.checkengine.discovery import CheckPreviewEntry, DiscoverySettings
+from cmk.checkengine.plugins import AutocheckEntry, CheckPluginName, SectionName
+from cmk.checkengine.specs.checkresults import MetricTuple
+from cmk.gui.logged_in import user
+from cmk.gui.utils import transaction_manager
+from cmk.gui.utils.roles import UserPermissionSerializableConfig
+from cmk.gui.watolib.audit_log import AuditLogStore, make_audit_log_change_hook
+from cmk.gui.watolib.hosts_and_folders import folder_tree, Host
+from cmk.gui.watolib.pending_changes import NoopPendingChangesStore, PendingChanges
+from cmk.gui.watolib.services import (
+    Discovery,
+    DiscoveryAction,
+    DiscoveryResult,
+    DiscoveryTransition,
+    get_check_table,
+    initial_discovery_result,
+    perform_fix_all,
+    perform_host_label_discovery,
+    perform_service_discovery,
+)
+from cmk.livestatus_client import SiteConfigurations
+from cmk.ruleset_matcher.labels import HostLabel
+from cmk.utils.automation_config import LocalAutomationConfig
+from cmk.utils.everythingtype import EVERYTHING
+from cmk.utils.servicename import ServiceName
+
+_TEST_PENDING_CHANGES: PendingChanges = PendingChanges(
+    activation_sites=SiteConfigurations({}),
+    local_site=SiteId("NO_SITE"),
+    acting_user=None,
+    store=NoopPendingChangesStore(),
+    hooks=(make_audit_log_change_hook(use_git=False),),
+)
+
+MOCK_DISCOVERY_RESULT = ServiceDiscoveryPreviewResult(
+    check_table=[
+        CheckPreviewEntry(
+            "unchanged",
+            "cpu.loads",
+            "cpu_load",
+            None,
+            None,
+            {},
+            {},
+            {"levels": (5.0, 10.0)},
+            "CPU load",
+            0,
+            "15 min load: 1.32 at 8 Cores (0.17 per Core)",
+            [
+                MetricTuple(name="load1", value=2.7, warn=40.0, crit=80.0, min_=0, max_=8),
+                MetricTuple(name="load5", value=1.63, warn=40.0, crit=80.0, min_=0, max_=8),
+                MetricTuple(name="load15", value=1.32, warn=40.0, crit=80.0, min_=0, max_=8),
+            ],
+            {},
+            {},
+            [HostName("heute")],
+        ),
+        CheckPreviewEntry(
+            "active",
+            "cmk_inv",
+            None,
+            None,
+            "Check_MK HW/SW Inventory",
+            {},
+            {},
+            {},
+            "Check_MK HW/SW Inventory",
+            None,
+            "WAITING - Active check, cannot be done offline",
+            [],
+            {},
+            {},
+            [HostName("heute")],
+        ),
+    ],
+    nodes_check_table={},
+    host_labels={"cmk/check_mk_server": {"plugin_name": "labels", "value": "yes"}},
+    output="output",
+    new_labels={},
+    vanished_labels={},
+    changed_labels={},
+    source_results=[(0, "Success")],
+    labels_by_host={
+        HostName("heute"): [HostLabel("cmk/check_mk_server", "yes", SectionName("labels"))]
+    },
+    config_warnings=["Ihr Dualband ist gerissen. Bitte legen Sie ein neues ein."],
+)
+
+
+@pytest.fixture(name="mock_discovery_preview")
+def fixture_mock_discovery_preview(mocker: MockerFixture) -> MagicMock:
+    return mocker.patch(
+        "cmk.gui.watolib.services.local_discovery_preview", return_value=MOCK_DISCOVERY_RESULT
+    )
+
+
+@pytest.fixture(name="mock_discovery")
+def fixture_mock_discovery(mocker: MockerFixture) -> MagicMock:
+    return mocker.patch("cmk.gui.watolib.services.local_discovery")
+
+
+@pytest.fixture(name="mock_set_autochecks")
+def fixture_mock_set_autochecks(mocker: MockerFixture) -> MagicMock:
+    return mocker.patch(
+        "cmk.gui.watolib.services.set_autochecks_v2", return_value=SetAutochecksV2Result()
+    )
+
+
+@pytest.fixture(name="mock_check_transaction")
+def fixture_check_transaction() -> object:
+    return patch.object(
+        transaction_manager.TransactionManager, "check_transaction", MagicMock(side_effect=[True])
+    )
+
+
+@pytest.fixture(name="sample_host_name")
+def fixture_sample_host_name() -> HostName:
+    return HostName("heute")
+
+
+@pytest.fixture(name="sample_host")
+def fixture_sample_host(
+    request_context: None,
+    with_admin_login: UserId,
+    sample_host_name: HostName,
+) -> Generator[Host]:
+    hostname = sample_host_name
+    root_folder = folder_tree().root_folder()
+    root_folder.create_hosts(
+        [(hostname, {}, None)],
+        pprint_value=False,
+        pending_changes=_TEST_PENDING_CHANGES,
+        acting_user=user,
+    )
+    host = root_folder.host(hostname)
+    assert host is not None
+    yield host
+    root_folder.delete_hosts(
+        [hostname],
+        automation=lambda *args, **kwargs: DeleteHostsResult(),  # noqa: ARG005
+        pprint_value=False,
+        debug=False,
+        pending_changes=_TEST_PENDING_CHANGES,
+        acting_user=user,
+    )
+
+
+def test_discovery_action_json_serializable() -> None:
+    assert [json.dumps(a) for a in DiscoveryAction] == [
+        '""',
+        '"stop"',
+        '"fix_all"',
+        '"refresh"',
+        '"tabula_rasa"',
+        '"single_update"',
+        '"bulk_update"',
+        '"update_host_labels"',
+        '"update_services"',
+        '"update_service_labels"',
+        '"update_discovery_parameters"',
+        '"single_update_service_properties"',
+    ]
+
+
+@pytest.mark.usefixtures("inline_background_jobs")
+def test_perform_discovery_none_action(
+    sample_host: Host, mock_discovery_preview: MagicMock
+) -> None:
+    discovery_result = initial_discovery_result(
+        action=DiscoveryAction.NONE,
+        host=sample_host,
+        previous_discovery_result=None,
+        automation_config=LocalAutomationConfig(),
+        user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+        raise_errors=True,
+        debug=False,
+        use_git=False,
+        pending_changes=_TEST_PENDING_CHANGES,
+    )
+    mock_discovery_preview.assert_called_once()
+    assert discovery_result.check_table == MOCK_DISCOVERY_RESULT.check_table
+
+
+@pytest.mark.usefixtures("inline_background_jobs")
+def test_perform_discovery_tabula_rasa_action_with_no_previous_discovery_result(
+    sample_host_name: HostName,
+    sample_host: Host,
+    mock_discovery_preview: MagicMock,
+    mock_discovery: MagicMock,
+) -> None:
+    discovery_result = get_check_table(
+        sample_host,
+        DiscoveryAction.TABULA_RASA,
+        automation_config=LocalAutomationConfig(),
+        user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+        raise_errors=True,
+        debug=False,
+        use_git=False,
+        pending_changes=_TEST_PENDING_CHANGES,
+    )
+
+    mock_discovery.assert_called_once()
+    mock_discovery_preview.assert_has_calls(
+        [
+            call(sample_host_name, prevent_fetching=False, raise_errors=False, debug=False),
+        ]
+    )
+    assert discovery_result.check_table == MOCK_DISCOVERY_RESULT.check_table
+
+
+@pytest.mark.usefixtures("inline_background_jobs", "mock_discovery_preview")
+def test_perform_discovery_tabula_rasa_removes_vanished_services(
+    sample_host: Host, mock_discovery: MagicMock
+) -> None:
+    """TABULA_RASA must call local_discovery with remove_vanished_services=True so that
+    vanished services (including those matched by a 'Disabled services' rule, which since
+    werk c20678bc are classified as 'vanished') are dropped from the autochecks file."""
+    get_check_table(
+        sample_host,
+        DiscoveryAction.TABULA_RASA,
+        automation_config=LocalAutomationConfig(),
+        user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+        raise_errors=True,
+        debug=False,
+        use_git=False,
+        pending_changes=_TEST_PENDING_CHANGES,
+    )
+
+    mock_discovery.assert_called_once()
+    settings = mock_discovery.call_args.args[0]
+    assert isinstance(settings, DiscoverySettings)
+    assert settings.remove_vanished_services is True
+
+
+@pytest.mark.usefixtures("inline_background_jobs")
+def test_perform_discovery_fix_all_with_previous_discovery_result(
+    mocker: MockerFixture,
+    sample_host_name: HostName,
+    sample_host: Host,
+    mock_set_autochecks: MagicMock,
+) -> None:
+    mocker.patch("cmk.gui.watolib.services.update_host_labels", return_value={})
+    mock_discovery_preview = mocker.patch(
+        "cmk.gui.watolib.services.local_discovery_preview",
+        return_value=ServiceDiscoveryPreviewResult(
+            output="",
+            check_table=[
+                CheckPreviewEntry(
+                    check_source="unchanged",
+                    check_plugin_name="lnx_thermal",
+                    ruleset_name="temperature",
+                    discovery_ruleset_name=None,
+                    item="Zone 1",
+                    old_discovered_parameters={},
+                    new_discovered_parameters={},
+                    effective_parameters={
+                        "levels": (70.0, 80.0),
+                        "device_levels_handling": "devdefault",
+                    },
+                    description="Temperature Zone 1",
+                    state=0,
+                    output="Temperature: 43.0°C\nTemperature: 43.0°C\nConfiguration: prefer device levels over user levels (used device levels)",
+                    metrics=[],
+                    old_labels={},
+                    new_labels={},
+                    found_on_nodes=[sample_host_name],
+                ),
+                CheckPreviewEntry(
+                    check_source="active",
+                    check_plugin_name="cmk_inv",
+                    ruleset_name=None,
+                    discovery_ruleset_name=None,
+                    item="Check_MK HW/SW Inventory",
+                    old_discovered_parameters={},
+                    new_discovered_parameters={},
+                    effective_parameters={"status_data_inventory": True},
+                    description="Check_MK HW/SW Inventory",
+                    state=None,
+                    output="WAITING - Active check, cannot be done offline",
+                    metrics=[],
+                    old_labels={},
+                    new_labels={},
+                    found_on_nodes=[sample_host_name],
+                ),
+            ],
+            nodes_check_table={},
+            host_labels={
+                "cmk/check_mk_server": {"value": "yes", "plugin_name": "omd_info"},
+                "cmk/os_family": {"value": "linux", "plugin_name": "check_mk"},
+            },
+            new_labels={},
+            vanished_labels={},
+            changed_labels={},
+            source_results=[(0, "Success")],
+            labels_by_host={
+                sample_host_name: [
+                    HostLabel("cmk/check_mk_server", "yes", SectionName("omd_info")),
+                    HostLabel("cmk/os_family", "linux", SectionName("check_mk")),
+                ],
+            },
+            config_warnings=["We're all alone."],
+        ),
+    )
+    previous_discovery_result = DiscoveryResult(
+        job_status={
+            "state": "initialized",
+            "started": 1654006465.892057,
+            "pid": None,
+            "loginfo": {"JobProgressUpdate": [], "JobResult": [], "JobException": []},
+            "is_active": False,
+        },
+        check_table_created=1654006465,
+        check_table=[
+            CheckPreviewEntry(
+                check_source="new",
+                check_plugin_name="lnx_thermal",
+                ruleset_name="temperature",
+                discovery_ruleset_name=None,
+                item="Zone 1",
+                old_discovered_parameters={},
+                new_discovered_parameters={},
+                effective_parameters={
+                    "levels": (70.0, 80.0),
+                    "device_levels_handling": "devdefault",
+                },
+                description="Temperature Zone 1",
+                state=0,
+                output="Temperature: 42.0°C\nTemperature: 42.0°C\nConfiguration: prefer device levels over user levels (used device levels)",
+                metrics=[],
+                old_labels={},
+                new_labels={},
+                found_on_nodes=[sample_host_name],
+            ),
+            CheckPreviewEntry(
+                check_source="active",
+                check_plugin_name="cmk_inv",
+                ruleset_name=None,
+                discovery_ruleset_name=None,
+                item="Check_MK HW/SW Inventory",
+                old_discovered_parameters={},
+                new_discovered_parameters={},
+                effective_parameters={"status_data_inventory": True},
+                description="Check_MK HW/SW Inventory",
+                state=None,
+                output="WAITING - Active check, cannot be done offline",
+                metrics=[],
+                old_labels={},
+                new_labels={},
+                found_on_nodes=[sample_host_name],
+            ),
+        ],
+        nodes_check_table={},
+        host_labels={
+            "cmk/check_mk_server": {"value": "yes", "plugin_name": "omd_info"},
+            "cmk/os_family": {"value": "linux", "plugin_name": "check_mk"},
+        },
+        new_labels={
+            "cmk/check_mk_server": {"value": "yes", "plugin_name": "omd_info"},
+            "cmk/os_family": {"value": "linux", "plugin_name": "check_mk"},
+        },
+        vanished_labels={},
+        changed_labels={},
+        sources=[(0, "Success")],
+        labels_by_host={
+            sample_host_name: [
+                HostLabel("cmk/check_mk_server", "yes", SectionName("omd_info")),
+                HostLabel("cmk/os_family", "linux", SectionName("check_mk")),
+            ],
+        },
+        config_warnings=["Nothing lasts forever."],
+    )
+
+    discovery_result = perform_fix_all(
+        discovery_result=initial_discovery_result(
+            action=DiscoveryAction.FIX_ALL,
+            host=sample_host,
+            previous_discovery_result=previous_discovery_result,
+            automation_config=LocalAutomationConfig(),
+            user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+            raise_errors=True,
+            debug=False,
+            use_git=False,
+            pending_changes=_TEST_PENDING_CHANGES,
+        ),
+        host=sample_host,
+        automation_config=LocalAutomationConfig(),
+        user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+        raise_errors=True,
+        pprint_value=False,
+        debug=False,
+        use_git=False,
+        pending_changes=_TEST_PENDING_CHANGES,
+    )
+    sample_autochecks: Mapping[ServiceName, AutocheckEntry] = {
+        "Temperature Zone 1": AutocheckEntry(CheckPluginName("lnx_thermal"), "Zone 1", {}, {}),
+    }
+    mock_set_autochecks.assert_called_with(
+        LocalAutomationConfig(),
+        SetAutochecksInput(
+            sample_host_name,
+            sample_autochecks,
+            {},
+        ),
+        debug=False,
+    )
+    mock_discovery_preview.assert_called_once()
+    assert [entry.check_source for entry in discovery_result.check_table] == [
+        "unchanged",
+        "active",
+    ]
+    assert discovery_result.new_labels == {}
+
+    store = AuditLogStore()
+    assert [
+        log_entry.text for log_entry in store.read() if log_entry.action == "update-host-labels"
+    ] == [f"Updated discovered host labels of '{sample_host_name}' with 2 labels"]
+
+
+@pytest.mark.usefixtures("inline_background_jobs", "mock_set_autochecks")
+def test_perform_discovery_fix_all_removes_vanished_service(
+    mocker: MockerFixture, sample_host_name: HostName, sample_host: Host
+) -> None:
+    """Vanished services must be dropped from the result after fix_all, not re-introduced as new."""
+    mocker.patch("cmk.gui.watolib.services.update_host_labels", return_value={})
+    mock_discovery_preview = mocker.patch(
+        "cmk.gui.watolib.services.local_discovery_preview",
+        return_value=ServiceDiscoveryPreviewResult(
+            output="",
+            check_table=[
+                CheckPreviewEntry(
+                    check_source="unchanged",
+                    check_plugin_name="cpu_loads",
+                    ruleset_name="cpu_load",
+                    discovery_ruleset_name=None,
+                    item=None,
+                    old_discovered_parameters={},
+                    new_discovered_parameters={},
+                    effective_parameters={},
+                    description="CPU load",
+                    state=0,
+                    output="",
+                    metrics=[],
+                    old_labels={},
+                    new_labels={},
+                    found_on_nodes=[sample_host_name],
+                ),
+            ],
+            nodes_check_table={},
+            host_labels={},
+            new_labels={},
+            vanished_labels={},
+            changed_labels={},
+            source_results=[],
+            labels_by_host={},
+            config_warnings=[],
+        ),
+    )
+    previous_discovery_result = DiscoveryResult(
+        job_status={
+            "state": "finished",
+            "started": 1654006465.892057,
+            "pid": None,
+            "loginfo": {"JobProgressUpdate": [], "JobResult": [], "JobException": []},
+            "is_active": False,
+        },
+        check_table_created=1654006465,
+        check_table=[
+            CheckPreviewEntry(
+                check_source="vanished",
+                check_plugin_name="lnx_if",
+                ruleset_name="interfaces",
+                discovery_ruleset_name=None,
+                item="1",
+                old_discovered_parameters={},
+                new_discovered_parameters={},
+                effective_parameters={},
+                description="Interface 1",
+                state=2,
+                output="Interface vanished",
+                metrics=[],
+                old_labels={},
+                new_labels={},
+                found_on_nodes=[sample_host_name],
+            ),
+            CheckPreviewEntry(
+                check_source="unchanged",
+                check_plugin_name="cpu_loads",
+                ruleset_name="cpu_load",
+                discovery_ruleset_name=None,
+                item=None,
+                old_discovered_parameters={},
+                new_discovered_parameters={},
+                effective_parameters={},
+                description="CPU load",
+                state=0,
+                output="",
+                metrics=[],
+                old_labels={},
+                new_labels={},
+                found_on_nodes=[sample_host_name],
+            ),
+        ],
+        nodes_check_table={},
+        host_labels={},
+        new_labels={},
+        vanished_labels={},
+        changed_labels={},
+        sources=[],
+        labels_by_host={sample_host_name: []},
+        config_warnings=(),
+    )
+
+    discovery_result = perform_fix_all(
+        discovery_result=initial_discovery_result(
+            action=DiscoveryAction.FIX_ALL,
+            host=sample_host,
+            previous_discovery_result=previous_discovery_result,
+            automation_config=LocalAutomationConfig(),
+            user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+            raise_errors=True,
+            debug=False,
+            use_git=False,
+            pending_changes=_TEST_PENDING_CHANGES,
+        ),
+        host=sample_host,
+        automation_config=LocalAutomationConfig(),
+        pprint_value=False,
+        debug=False,
+        use_git=False,
+        raise_errors=True,
+        user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+        pending_changes=_TEST_PENDING_CHANGES,
+    )
+
+    mock_discovery_preview.assert_called_once()
+    assert len(discovery_result.check_table) == 1
+    (kept,) = discovery_result.check_table
+    assert kept.check_source == "unchanged"
+    assert kept.check_plugin_name == "cpu_loads"
+
+
+# NOTE: `test_perform_fix_all_clears_host_labels_without_service_changes` (CMK-31896,
+# CMK-32535) moved to `test_services_dispatch.py::test_host_labels_are_written_even_when_no
+# _service_changes`, which asserts the same property on the `update-host-labels` automation
+# that actually leaves the process, instead of on the label deltas of the re-read result
+# behind a patched `local_discovery_preview`.
+
+
+@pytest.mark.usefixtures("inline_background_jobs")
+def test_perform_fix_all_does_not_write_ignored_services_to_autochecks(
+    mocker: MockerFixture,
+    sample_host_name: HostName,
+    sample_host: Host,
+    mock_set_autochecks: MagicMock,
+) -> None:
+    """Services matched by a 'Disabled services' rule must not end up in the autochecks file.
+
+    Scenario:
+
+    * a broad disabled-services rule exists.
+    * 'CPU load' and 'Memory' are both matched by the rule; neither belongs in autochecks.
+    * An unrelated new service 'Interface 1' causes apply_changes=True and therefore triggers
+      the autochecks save.
+    """
+    mocker.patch("cmk.gui.watolib.services.update_host_labels", return_value={})
+    mocker.patch(
+        "cmk.gui.watolib.rulesets.get_services_labels",
+        return_value=GetServicesLabelsResult(labels=defaultdict(dict)),
+    )
+    mocker.patch(
+        "cmk.gui.watolib.rulesets.analyze_service_rule_matches",
+        return_value=AnalyzeServiceRuleMatchesResult({}),
+    )
+    mocker.patch(
+        "cmk.gui.watolib.services.local_discovery_preview",
+        return_value=ServiceDiscoveryPreviewResult(
+            output="",
+            check_table=[],
+            nodes_check_table={},
+            host_labels={},
+            new_labels={},
+            vanished_labels={},
+            changed_labels={},
+            source_results=[],
+            labels_by_host={},
+            config_warnings=[],
+        ),
+    )
+    perform_fix_all(
+        discovery_result=initial_discovery_result(
+            action=DiscoveryAction.FIX_ALL,
+            host=sample_host,
+            previous_discovery_result=DiscoveryResult(
+                job_status={
+                    "state": "finished",
+                    "started": 1654006465.0,
+                    "pid": None,
+                    "loginfo": {"JobProgressUpdate": [], "JobResult": [], "JobException": []},
+                    "is_active": False,
+                },
+                check_table_created=1654006465,
+                check_table=[
+                    CheckPreviewEntry(
+                        check_source="ignored",
+                        check_plugin_name="cpu_loads",
+                        ruleset_name="cpu_load",
+                        discovery_ruleset_name=None,
+                        item=None,
+                        old_discovered_parameters={},
+                        new_discovered_parameters={},
+                        effective_parameters={},
+                        description="CPU load",
+                        state=0,
+                        output="",
+                        metrics=[],
+                        old_labels={},
+                        new_labels={},
+                        found_on_nodes=[sample_host_name],
+                    ),
+                    CheckPreviewEntry(
+                        check_source="ignored",
+                        check_plugin_name="mem_linux",
+                        ruleset_name="memory_linux",
+                        discovery_ruleset_name=None,
+                        item=None,
+                        old_discovered_parameters={},
+                        new_discovered_parameters={},
+                        effective_parameters={},
+                        description="Memory",
+                        state=0,
+                        output="",
+                        metrics=[],
+                        old_labels={},
+                        new_labels={},
+                        found_on_nodes=[sample_host_name],
+                    ),
+                    CheckPreviewEntry(
+                        check_source="new",
+                        check_plugin_name="lnx_if",
+                        ruleset_name="interfaces",
+                        discovery_ruleset_name=None,
+                        item="1",
+                        old_discovered_parameters={},
+                        new_discovered_parameters={},
+                        effective_parameters={},
+                        description="Interface 1",
+                        state=0,
+                        output="",
+                        metrics=[],
+                        old_labels={},
+                        new_labels={},
+                        found_on_nodes=[sample_host_name],
+                    ),
+                ],
+                nodes_check_table={},
+                host_labels={},
+                new_labels={},
+                vanished_labels={},
+                changed_labels={},
+                sources=[],
+                labels_by_host={sample_host_name: []},
+                config_warnings=(),
+            ),
+            automation_config=LocalAutomationConfig(),
+            user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+            raise_errors=True,
+            debug=False,
+            use_git=False,
+            pending_changes=_TEST_PENDING_CHANGES,
+        ),
+        host=sample_host,
+        automation_config=LocalAutomationConfig(),
+        pprint_value=False,
+        debug=False,
+        use_git=False,
+        raise_errors=True,
+        user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+        pending_changes=_TEST_PENDING_CHANGES,
+    )
+
+    saved_input = mock_set_autochecks.call_args.args[1]
+    assert "Interface 1" in saved_input.target_services  # new service accepted normally
+    assert "CPU load" not in saved_input.target_services  # rule-matched → must not be written
+    assert "Memory" not in saved_input.target_services  # rule-matched → must not be written
+
+
+@pytest.mark.usefixtures("inline_background_jobs")
+def test_perform_discovery_single_update(
+    mocker: MockerFixture,
+    sample_host_name: HostName,
+    sample_host: Host,
+    mock_set_autochecks: MagicMock,
+) -> None:
+    mock_discovery_preview = mocker.patch(
+        "cmk.gui.watolib.services.local_discovery_preview",
+        return_value=ServiceDiscoveryPreviewResult(
+            output="",
+            check_table=[
+                CheckPreviewEntry(
+                    check_source="unchanged",
+                    check_plugin_name="checkmk_agent",
+                    ruleset_name="agent_update",
+                    discovery_ruleset_name=None,
+                    item=None,
+                    old_discovered_parameters={},
+                    new_discovered_parameters={},
+                    effective_parameters={
+                        "agent_version": ("ignore", {}),
+                        "agent_version_missmatch": 1,
+                        "restricted_address_mismatch": 1,
+                        "legacy_pull_mode": 1,
+                    },
+                    description="Check_MK Agent",
+                    state=1,
+                    output=(
+                        "Version: 2022.05.23, OS: linux, TLS is not activated on monitored host"
+                        " (see details)(!), Agent plug-ins: 0, Local checks: 0\nVersion:"
+                        " 2022.05.23\nOS: linux\nThe hosts agent supports TLS, but it is not"
+                        " being used.\nWe strongly recommend to enable TLS by registering the host"
+                        " to the site (using the `cmk-agent-ctl register` command on the monitored"
+                        " host).\nNOTE: A registered host will refuse all unencrypted connections."
+                        " If the host is monitored by multiple sites, you must register to all of"
+                        " them. This can be problematic if you are monitoring the same host from a"
+                        " site running Checkmk version 2.0 or earlier.\nIf you can not register"
+                        ' the host, you can configure missing TLS to be OK in the setting "State'
+                        ' in case of available but not enabled TLS" of the ruleset "Checkmk Agent'
+                        ' installation auditing".(!)\nAgent plug-ins: 0\nLocal checks: 0'
+                    ),
+                    metrics=[],
+                    old_labels={},
+                    new_labels={},
+                    found_on_nodes=[HostName("TODAY")],
+                ),
+                CheckPreviewEntry(
+                    check_source="unchanged",
+                    check_plugin_name="mem_linux",
+                    ruleset_name="memory_linux",
+                    discovery_ruleset_name=None,
+                    item=None,
+                    old_discovered_parameters={},
+                    new_discovered_parameters={},
+                    effective_parameters={
+                        "levels_virtual": ("perc_used", (80.0, 90.0)),
+                        "levels_total": ("perc_used", (120.0, 150.0)),
+                        "levels_shm": ("perc_used", (20.0, 30.0)),
+                        "levels_pagetables": ("perc_used", (8.0, 16.0)),
+                        "levels_committed": ("perc_used", (100.0, 150.0)),
+                        "levels_commitlimit": ("perc_free", (20.0, 10.0)),
+                        "levels_vmalloc": ("abs_free", (52428800, 31457280)),
+                        "levels_hardwarecorrupted": ("abs_used", (1, 1)),
+                    },
+                    description="Memory",
+                    state=0,
+                    output=(
+                        "Total virtual memory: 23.14% - 7.41 GB of 32.04 GB\n"
+                        "Total virtual memory: 23.14% - 7.41 GB of 32.04 GB\n"
+                        "RAM: 23.72% - 7.37 GB of 31.08 GB\n"
+                        "Swap: 4.07% - 39.75 MB of 976.00 MB\n"
+                        "Committed: 65.38% - 20.95 GB of 32.04 GB virtual memory\n"
+                        "Commit Limit: 48.51% - 15.54 GB of 32.04 GB virtual memory\n"
+                        "Shared memory: 6.66% - 2.07 GB of 31.08 GB RAM\n"
+                        "Page tables: 0.22% - 71.04 MB of 31.08 GB RAM\n"
+                        "Disk Writeback: 0.008% - 2.50 MB of 31.08 GB RAM\n"
+                        "RAM available: 67.55% free - 21.00 GB of 31.08 GB\n"
+                        "Hardware Corrupted: 0% - 0.00 B of 31.08 GB RAM"
+                    ),
+                    metrics=[],
+                    old_labels={},
+                    new_labels={},
+                    found_on_nodes=[HostName("TODAY")],
+                ),
+            ],
+            nodes_check_table={},
+            host_labels={
+                "cmk/check_mk_server": {"value": "yes", "plugin_name": "omd_info"},
+                "cmk/os_family": {"value": "linux", "plugin_name": "check_mk"},
+            },
+            new_labels={},
+            vanished_labels={},
+            changed_labels={},
+            source_results=[(0, "Success")],
+            labels_by_host={
+                HostName("TODAY"): [
+                    HostLabel("cmk/check_mk_server", "yes", SectionName("omd_info")),
+                    HostLabel("cmk/os_family", "linux", SectionName("check_mk")),
+                ],
+            },
+            config_warnings=["Your feet have expired."],
+        ),
+    )
+    previous_discovery_result = DiscoveryResult(
+        job_status={
+            "duration": 2.351154088973999,
+            "estimated_duration": 2.37550950050354,
+            "host_name": HostName("TODAY"),
+            "logfile_path": "~/var/log/web.log",
+            "pid": 1363226,
+            "ppid": 1363225,
+            "started": 1654173769.3507118,
+            "state": "finished",
+            "stoppable": True,
+            "title": "Refresh",
+            "user": "cmkadmin",
+            "loginfo": {
+                "JobProgressUpdate": ["Starting job...", "Completed."],
+                "JobResult": [],
+                "JobException": [],
+            },
+            "is_active": False,
+        },
+        check_table_created=1654237821,
+        check_table=[
+            CheckPreviewEntry(
+                check_source="unchanged",
+                check_plugin_name="checkmk_agent",
+                ruleset_name="agent_update",
+                discovery_ruleset_name=None,
+                item=None,
+                old_discovered_parameters={},
+                new_discovered_parameters={},
+                effective_parameters={
+                    "agent_version": ("ignore", {}),
+                    "agent_version_missmatch": 1,
+                    "restricted_address_mismatch": 1,
+                    "legacy_pull_mode": 1,
+                },
+                description="Check_MK Agent",
+                state=1,
+                output=(
+                    "Version: 2022.05.23, OS: linux, TLS is not activated on monitored host"
+                    " (see details)(!), Agent plug-ins: 0, Local checks: 0\nVersion: 2022.05.23\n"
+                    "OS: linux\nThe hosts agent supports TLS, but it is not being used.\n"
+                    "We strongly recommend to enable TLS by registering the host to the site"
+                    " (using the `cmk-agent-ctl register` command on the monitored host).\n"
+                    "NOTE: A registered host will refuse all unencrypted connections. If the"
+                    " host is monitored by multiple sites, you must register to all of them."
+                    " This can be problematic if you are monitoring the same host from a site"
+                    " running Checkmk version 2.0 or earlier.\nIf you can not register the host,"
+                    ' you can configure missing TLS to be OK in the setting "State in case of'
+                    ' available but not enabled TLS" of the ruleset "Checkmk Agent installation'
+                    ' auditing".(!)\nAgent plug-ins: 0\nLocal checks: 0'
+                ),
+                metrics=[],
+                old_labels={},
+                new_labels={},
+                found_on_nodes=[HostName("TODAY")],
+            ),
+            CheckPreviewEntry(
+                check_source="new",
+                check_plugin_name="mem_linux",
+                ruleset_name="memory_linux",
+                discovery_ruleset_name=None,
+                item=None,
+                old_discovered_parameters={},
+                new_discovered_parameters={},
+                effective_parameters={
+                    "levels_virtual": ("perc_used", (80.0, 90.0)),
+                    "levels_total": ("perc_used", (120.0, 150.0)),
+                    "levels_shm": ("perc_used", (20.0, 30.0)),
+                    "levels_pagetables": ("perc_used", (8.0, 16.0)),
+                    "levels_committed": ("perc_used", (100.0, 150.0)),
+                    "levels_commitlimit": ("perc_free", (20.0, 10.0)),
+                    "levels_vmalloc": ("abs_free", (52428800, 31457280)),
+                    "levels_hardwarecorrupted": ("abs_used", (1, 1)),
+                },
+                description="Memory",
+                state=0,
+                output=(
+                    "Total virtual memory: 23.14% - 7.41 GB of 32.04 GB\n"
+                    "Total virtual memory: 23.14% - 7.41 GB of 32.04 GB\n"
+                    "RAM: 23.72% - 7.37 GB of 31.08 GB\n"
+                    "Swap: 4.07% - 39.75 MB of 976.00 MB\n"
+                    "Committed: 65.38% - 20.95 GB of 32.04 GB virtual memory\n"
+                    "Commit Limit: 48.51% - 15.54 GB of 32.04 GB virtual memory\n"
+                    "Shared memory: 6.66% - 2.07 GB of 31.08 GB RAM\n"
+                    "Page tables: 0.22% - 71.04 MB of 31.08 GB RAM\n"
+                    "Disk Writeback: 0.008% - 2.50 MB of 31.08 GB RAM\n"
+                    "RAM available: 67.55% free - 21.00 GB of 31.08 GB\n"
+                    "Hardware Corrupted: 0% - 0.00 B of 31.08 GB RAM"
+                ),
+                metrics=[],
+                old_labels={},
+                new_labels={},
+                found_on_nodes=[HostName("TODAY")],
+            ),
+        ],
+        nodes_check_table={},
+        host_labels={
+            "cmk/check_mk_server": {"value": "yes", "plugin_name": "omd_info"},
+            "cmk/os_family": {"value": "linux", "plugin_name": "check_mk"},
+        },
+        new_labels={},
+        vanished_labels={},
+        changed_labels={},
+        sources=[(0, "Success")],
+        labels_by_host={
+            HostName("TODAY"): [
+                HostLabel("cmk/check_mk_server", "yes", SectionName("omd_info")),
+                HostLabel("cmk/os_family", "linux", SectionName("check_mk")),
+            ],
+        },
+        config_warnings=(),
+    )
+
+    discovery_result = perform_service_discovery(
+        action=DiscoveryAction.SINGLE_UPDATE,
+        discovery_result=initial_discovery_result(
+            action=DiscoveryAction.SINGLE_UPDATE,
+            host=sample_host,
+            previous_discovery_result=previous_discovery_result,
+            automation_config=LocalAutomationConfig(),
+            user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+            raise_errors=True,
+            debug=False,
+            use_git=False,
+            pending_changes=_TEST_PENDING_CHANGES,
+        ),
+        selected_services=(("mem_linux", None),),
+        update_source="new",
+        update_target="unchanged",
+        host=sample_host,
+        raise_errors=True,
+        automation_config=LocalAutomationConfig(),
+        user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+        pprint_value=False,
+        debug=False,
+        use_git=False,
+        pending_changes=_TEST_PENDING_CHANGES,
+    )
+    sample_autochecks: Mapping[ServiceName, AutocheckEntry] = {
+        "Check_MK Agent": AutocheckEntry(CheckPluginName("checkmk_agent"), None, {}, {}),
+        "Memory": AutocheckEntry(CheckPluginName("mem_linux"), None, {}, {}),
+    }
+    mock_set_autochecks.assert_called_with(
+        LocalAutomationConfig(),
+        SetAutochecksInput(
+            sample_host_name,
+            sample_autochecks,
+            {},
+        ),
+        debug=False,
+    )
+    mock_discovery_preview.assert_called_with(
+        sample_host_name,
+        prevent_fetching=True,
+        raise_errors=False,
+        debug=False,
+    )
+    assert [
+        entry.check_source
+        for entry in discovery_result.check_table
+        if entry.check_plugin_name == "mem_linux"
+    ] == ["unchanged"]
+
+    store = AuditLogStore()
+    assert [
+        log_entry.text for log_entry in store.read() if log_entry.action == "set-autochecks"
+    ] == [f"Saved check configuration of host '{sample_host_name}' with 2 services"]
+
+
+@pytest.mark.usefixtures("inline_background_jobs", "mock_set_autochecks")
+def test_perform_discovery_single_update__ignore(
+    mocker: MockerFixture, sample_host_name: HostName, sample_host: Host
+) -> None:
+    mock_save_function = mocker.patch(
+        "cmk.gui.watolib.services.Discovery._save_host_service_enable_disable_rules",
+        return_value=None,
+    )
+    mocker.patch(
+        "cmk.gui.watolib.services.local_discovery_preview",
+        return_value=ServiceDiscoveryPreviewResult(
+            output="",
+            check_table=[
+                CheckPreviewEntry(
+                    check_source="unchanged",
+                    check_plugin_name="checkmk_agent",
+                    ruleset_name="agent_update",
+                    discovery_ruleset_name=None,
+                    item=None,
+                    old_discovered_parameters={},
+                    new_discovered_parameters={},
+                    effective_parameters={
+                        "agent_version": ("ignore", {}),
+                        "agent_version_missmatch": 1,
+                        "restricted_address_mismatch": 1,
+                        "legacy_pull_mode": 1,
+                    },
+                    description="Check_MK Agent",
+                    state=1,
+                    output=(
+                        "Version: 2022.05.23, OS: linux, TLS is not activated on monitored host"
+                        " (see details)(!), Agent plug-ins: 0, Local checks: 0\nVersion:"
+                        " 2022.05.23\nOS: linux\nThe hosts agent supports TLS, but it is not"
+                        " being used.\nWe strongly recommend to enable TLS by registering the host"
+                        " to the site (using the `cmk-agent-ctl register` command on the monitored"
+                        " host).\nNOTE: A registered host will refuse all unencrypted connections."
+                        " If the host is monitored by multiple sites, you must register to all of"
+                        " them. This can be problematic if you are monitoring the same host from a"
+                        " site running Checkmk version 2.0 or earlier.\nIf you can not register"
+                        ' the host, you can configure missing TLS to be OK in the setting "State'
+                        ' in case of available but not enabled TLS" of the ruleset "Checkmk Agent'
+                        ' installation auditing".(!)\nAgent plug-ins: 0\nLocal checks: 0'
+                    ),
+                    metrics=[],
+                    old_labels={},
+                    new_labels={},
+                    found_on_nodes=[HostName("TODAY")],
+                ),
+                CheckPreviewEntry(
+                    check_source="unchanged",
+                    check_plugin_name="mssql_instance",
+                    ruleset_name="mssql_instance",
+                    discovery_ruleset_name=None,
+                    item="S2DT",
+                    old_discovered_parameters={},
+                    new_discovered_parameters={},
+                    effective_parameters={},
+                    description="MSSQL S2DT Instance",
+                    state=0,
+                    output="nobody cares",
+                    metrics=[],
+                    old_labels={},
+                    new_labels={},
+                    found_on_nodes=[HostName("host23")],
+                ),
+            ],
+            nodes_check_table={},
+            host_labels={
+                "cmk/check_mk_server": {"value": "yes", "plugin_name": "omd_info"},
+                "cmk/os_family": {"value": "linux", "plugin_name": "check_mk"},
+            },
+            new_labels={},
+            vanished_labels={},
+            changed_labels={},
+            source_results=[(0, "Success")],
+            labels_by_host={
+                HostName("host23"): [],
+            },
+            config_warnings=(),
+        ),
+    )
+
+    previous_discovery_result = DiscoveryResult(
+        job_status={
+            "state": "finished",
+            "started": 1764593093.764405,
+            "pid": 604583,
+            "loginfo": {"JobProgressUpdate": [], "JobResult": [], "JobException": []},
+            "is_active": False,
+            "duration": 0.36932802200317383,
+            "title": "Refresh",
+            "stoppable": True,
+            "deletable": True,
+            "user": "cmkadmin",
+            "estimated_duration": 0.0,
+            "ppid": 604485,
+            "logfile_path": "~/var/log/web.log",
+            "acknowledged_by": None,
+            "lock_wato": False,
+            "host_name": sample_host_name,
+        },
+        check_table_created=1764596025,
+        check_table=[
+            CheckPreviewEntry(
+                check_source="unchanged",
+                check_plugin_name="mssql_instance",
+                ruleset_name="mssql_instance",
+                discovery_ruleset_name=None,
+                item="S2DT",
+                old_discovered_parameters={},
+                new_discovered_parameters={},
+                effective_parameters={},
+                description="MSSQL S2DT Instance",
+                state=0,
+                output="nobody cares",
+                metrics=[],
+                old_labels={},
+                new_labels={},
+                found_on_nodes=[HostName("host23")],
+            ),
+        ],
+        nodes_check_table={
+            HostName("host22"): [],
+            HostName("host23"): [
+                CheckPreviewEntry(
+                    check_source="clustered_old",
+                    check_plugin_name="mssql_instance",
+                    ruleset_name="mssql_instance",
+                    discovery_ruleset_name=None,
+                    item="S2DT",
+                    old_discovered_parameters={},
+                    new_discovered_parameters={},
+                    effective_parameters={},
+                    description="MSSQL S2DT Instance",
+                    state=0,
+                    output="nobody cares",
+                    metrics=[],
+                    old_labels={},
+                    new_labels={},
+                    found_on_nodes=[HostName("host23")],
+                )
+            ],
+        },
+        host_labels={},
+        new_labels={},
+        vanished_labels={},
+        changed_labels={},
+        labels_by_host={HostName("host22"): [], HostName("host23"): [], sample_host_name: []},
+        sources=[
+            (0, "[agent] Success"),
+            (0, "[piggyback] Success (but no data found for this host)"),
+        ],
+        config_warnings=(),
+    )
+
+    perform_service_discovery(
+        action=DiscoveryAction.SINGLE_UPDATE,
+        discovery_result=previous_discovery_result,
+        selected_services=(("mssql_instance", "S2DT"),),
+        update_source="unchanged",
+        update_target="ignored",
+        host=sample_host,
+        raise_errors=True,
+        automation_config=LocalAutomationConfig(),
+        user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+        pprint_value=False,
+        debug=False,
+        use_git=False,
+        pending_changes=_TEST_PENDING_CHANGES,
+    )
+    mock_save_function.assert_called_once()
+    remove_disabled_rule, add_disabled_rule, *_ = mock_save_function.call_args_list[0][0]
+    assert len(remove_disabled_rule) == 0
+    assert add_disabled_rule == {"MSSQL S2DT Instance"}
+
+
+@pytest.mark.usefixtures("mock_set_autochecks")
+def test_perform_discovery_single_update__ignore_does_not_re_add_existing_disabled_services(
+    mocker: MockerFixture, sample_host_name: HostName, sample_host: Host
+) -> None:
+    """Disabling a single service must not funnel all already-disabled services of the host into
+    add_disabled_rule again.
+
+    Each entry in add_disabled_rule triggers a separate analyze_service_rule_matches automation in
+    EnabledDisabledServicesEditor. On a host with many already-disabled services this caused one
+    automation call per service and ran into the automation timeout, even though the user only
+    toggled a single service. See SUP-29608, CMK-26792, CMK-33299.
+    """
+    already_disabled = [f"Disabled service {i}" for i in range(5)]
+    mock_save_function = mocker.patch(
+        "cmk.gui.watolib.services.Discovery._save_host_service_enable_disable_rules",
+        return_value=None,
+    )
+    mocker.patch(
+        "cmk.gui.watolib.services.local_discovery_preview",
+        return_value=ServiceDiscoveryPreviewResult(
+            output="",
+            check_table=[],
+            nodes_check_table={},
+            host_labels={},
+            new_labels={},
+            vanished_labels={},
+            changed_labels={},
+            source_results=[(0, "Success")],
+            labels_by_host={sample_host_name: []},
+            config_warnings=(),
+        ),
+    )
+
+    previous_discovery_result = DiscoveryResult(
+        job_status={
+            "state": "finished",
+            "started": 1764593093.764405,
+            "pid": 604583,
+            "loginfo": {"JobProgressUpdate": [], "JobResult": [], "JobException": []},
+            "is_active": False,
+            "duration": 0.36932802200317383,
+            "title": "Refresh",
+            "stoppable": True,
+            "deletable": True,
+            "user": "cmkadmin",
+            "estimated_duration": 0.0,
+            "ppid": 604485,
+            "logfile_path": "~/var/log/web.log",
+            "acknowledged_by": None,
+            "lock_wato": False,
+            "host_name": sample_host_name,
+        },
+        check_table_created=1764596025,
+        check_table=[
+            # The single monitored service the user explicitly disables.
+            CheckPreviewEntry(
+                check_source="unchanged",
+                check_plugin_name="mssql_instance",
+                ruleset_name="mssql_instance",
+                discovery_ruleset_name=None,
+                item="S2DT",
+                old_discovered_parameters={},
+                new_discovered_parameters={},
+                effective_parameters={},
+                description="MSSQL S2DT Instance",
+                state=0,
+                output="nobody cares",
+                metrics=[],
+                old_labels={},
+                new_labels={},
+                found_on_nodes=[sample_host_name],
+            ),
+            # A large number of services that are already disabled and stay disabled. These are
+            # not selected by the user and must not end up in add_disabled_rule.
+            *[
+                CheckPreviewEntry(
+                    check_source="ignored",
+                    check_plugin_name="local",
+                    ruleset_name=None,
+                    discovery_ruleset_name=None,
+                    item=descr,
+                    old_discovered_parameters={},
+                    new_discovered_parameters={},
+                    effective_parameters={},
+                    description=descr,
+                    state=0,
+                    output="nobody cares",
+                    metrics=[],
+                    old_labels={},
+                    new_labels={},
+                    found_on_nodes=[sample_host_name],
+                )
+                for descr in already_disabled
+            ],
+        ],
+        nodes_check_table={},
+        host_labels={},
+        new_labels={},
+        vanished_labels={},
+        changed_labels={},
+        labels_by_host={sample_host_name: []},
+        sources=[(0, "[agent] Success")],
+        config_warnings=(),
+    )
+
+    perform_service_discovery(
+        action=DiscoveryAction.SINGLE_UPDATE,
+        discovery_result=previous_discovery_result,
+        selected_services=(("mssql_instance", "S2DT"),),
+        update_source="unchanged",
+        update_target="ignored",
+        host=sample_host,
+        raise_errors=True,
+        automation_config=LocalAutomationConfig(),
+        user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+        pprint_value=False,
+        debug=False,
+        use_git=False,
+        pending_changes=PendingChanges(
+            activation_sites=SiteConfigurations({}),
+            local_site=SiteId("NO_SITE"),
+            acting_user=None,
+            store=NoopPendingChangesStore(),
+            hooks=(),
+        ),
+    )
+
+    mock_save_function.assert_called_once()
+    remove_disabled_rule, add_disabled_rule, *_ = mock_save_function.call_args_list[0][0]
+    assert len(remove_disabled_rule) == 0
+    # Only the explicitly selected service, none of the already-disabled ones.
+    assert add_disabled_rule == {"MSSQL S2DT Instance"}
+
+
+# NOTE: `TestPerformDiscoverySingleUpdate`'s duplicate-service-description tests (werk 19062,
+# CMK-26792) moved to `test_discovery_transition_matrix.py`, which asserts the same two facts on
+# `DiscoveryTransition` instead of on the arguments of the patched private
+# `Discovery._save_host_service_enable_disable_rules`:
+#   * `test_no_disabled_rule_is_written_for_a_service_disabled_by_a_disabled_checks_rule`
+#     (werk 6708's guard)
+#   * `test_explicitly_selected_service_is_disabled_despite_the_shared_description`
+#     (werk 19062's carve-out)
+
+
+@pytest.mark.usefixtures("inline_background_jobs")
+class TestPerformDiscoverySingleUpdate:
+    def test_ignored_nonexistent_service_set_to_undecided_is_removed_from_autochecks(
+        self,
+        mocker: MockerFixture,
+        sample_host_name: HostName,
+        sample_host: Host,
+        mock_set_autochecks: MagicMock,
+    ) -> None:
+        """A disabled (ignored) service that no longer exists stays 'ignored' rather than
+        'vanished' because a disabled rule matches it.  Setting it to 'undecided' must remove
+        the disabled rule and drop the service from autochecks.
+
+        Note: the check_table here deliberately has no two entries sharing a description.  With
+        duplicates, old_autochecks -- which is keyed by description -- loses track of the ignored
+        entry and the removal assertion becomes vacuous."""
+        mock_save_function = mocker.patch(
+            "cmk.gui.watolib.services.Discovery._save_host_service_enable_disable_rules",
+            return_value=None,
+        )
+        check_table = [
+            CheckPreviewEntry(
+                check_source="ignored",
+                check_plugin_name="ignored_plugin",
+                ruleset_name="some_rule",
+                discovery_ruleset_name=None,
+                item="X",
+                old_discovered_parameters={},
+                new_discovered_parameters={},
+                effective_parameters={},
+                description="Ignored Service",
+                state=0,
+                output="",
+                metrics=[],
+                old_labels={},
+                new_labels={},
+                found_on_nodes=[sample_host_name],
+            ),
+            CheckPreviewEntry(
+                check_source="unchanged",
+                check_plugin_name="kept_plugin",
+                ruleset_name="some_rule",
+                discovery_ruleset_name=None,
+                item=None,
+                old_discovered_parameters={},
+                new_discovered_parameters={},
+                effective_parameters={},
+                description="Kept Service",
+                state=0,
+                output="",
+                metrics=[],
+                old_labels={},
+                new_labels={},
+                found_on_nodes=[sample_host_name],
+            ),
+        ]
+        mocker.patch(
+            "cmk.gui.watolib.services.local_discovery_preview",
+            return_value=ServiceDiscoveryPreviewResult(
+                output="",
+                check_table=check_table,
+                nodes_check_table={},
+                host_labels={},
+                new_labels={},
+                vanished_labels={},
+                changed_labels={},
+                source_results=[],
+                labels_by_host={},
+                config_warnings=[],
+            ),
+        )
+        perform_service_discovery(
+            action=DiscoveryAction.SINGLE_UPDATE,
+            discovery_result=DiscoveryResult(
+                job_status={
+                    "state": "finished",
+                    "started": 0.0,
+                    "pid": None,
+                    "loginfo": {"JobProgressUpdate": [], "JobResult": [], "JobException": []},
+                    "is_active": False,
+                },
+                check_table_created=0,
+                check_table=check_table,
+                nodes_check_table={},
+                host_labels={},
+                new_labels={},
+                vanished_labels={},
+                changed_labels={},
+                labels_by_host={sample_host_name: []},
+                sources=[],
+                config_warnings=[],
+            ),
+            selected_services=(("ignored_plugin", "X"),),
+            update_source="ignored",
+            update_target="new",
+            host=sample_host,
+            automation_config=LocalAutomationConfig(),
+            pprint_value=False,
+            debug=False,
+            use_git=False,
+            raise_errors=True,
+            user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+            pending_changes=_TEST_PENDING_CHANGES,
+        )
+
+        mock_save_function.assert_called_once()
+        remove_disabled_rule, add_disabled_rule, *_ = mock_save_function.call_args_list[0][0]
+        assert remove_disabled_rule == {"Ignored Service"}
+        assert len(add_disabled_rule) == 0
+
+        # The service was removed from autochecks (it was present as 'ignored'; now it is gone).
+        saved_input = mock_set_autochecks.call_args.args[1]
+        assert "Ignored Service" not in saved_input.target_services
+        assert "Kept Service" in saved_input.target_services
+
+
+def test_perform_discovery_action_update_services(
+    mocker: MockerFixture,
+    sample_host_name: HostName,
+    sample_host: Host,
+    mock_set_autochecks: MagicMock,
+) -> None:
+    mock_discovery_preview = mocker.patch(
+        "cmk.gui.watolib.services.local_discovery_preview",
+        return_value=ServiceDiscoveryPreviewResult(
+            output="",
+            check_table=[
+                CheckPreviewEntry(
+                    check_source="unchanged",
+                    check_plugin_name="df",
+                    ruleset_name="filesystem",
+                    discovery_ruleset_name=None,
+                    item="/opt/omd/sites/heute/tmp",
+                    old_discovered_parameters={
+                        "mountpoint_for_block_devices": "volume_name",
+                        "item_appearance": "mountpoint",
+                    },
+                    new_discovered_parameters={
+                        "mountpoint_for_block_devices": "volume_name",
+                        "item_appearance": "mountpoint",
+                    },
+                    effective_parameters={
+                        "levels": (80.0, 90.0),
+                        "magic_normsize": 20,
+                        "levels_low": (50.0, 60.0),
+                        "trend_range": 24,
+                        "trend_perfdata": True,
+                        "show_levels": "onmagic",
+                        "inodes_levels": (10.0, 5.0),
+                        "show_inodes": "onlow",
+                        "show_reserved": False,
+                        "mountpoint_for_block_devices": "volume_name",
+                        "item_appearance": "mountpoint",
+                    },
+                    description="Filesystem /opt/omd/sites/heute/tmp",
+                    state=0,
+                    output="0.04% used (5.59 MB of 15.54 GB), trend: -89.23 kB / 24 hours\n0.04% used (5.59 MB of 15.54 GB)\ntrend: -89.23 kB / 24 hours",
+                    metrics=[],
+                    old_labels={},
+                    new_labels={},
+                    found_on_nodes=[HostName("TODAY")],
+                ),
+            ],
+            nodes_check_table={},
+            host_labels={
+                "cmk/check_mk_server": {"value": "yes", "plugin_name": "omd_info"},
+                "cmk/os_family": {"value": "linux", "plugin_name": "check_mk"},
+            },
+            new_labels={},
+            vanished_labels={},
+            changed_labels={},
+            source_results=[(0, "Success")],
+            labels_by_host={
+                HostName("TODAY"): [
+                    HostLabel("cmk/check_mk_server", "yes", SectionName("omd_info")),
+                    HostLabel("cmk/os_family", "linux", SectionName("check_mk")),
+                ],
+            },
+            config_warnings=["The end is near."],
+        ),
+    )
+    previous_discovery_result = DiscoveryResult(
+        job_status={
+            "duration": 2.351154088973999,
+            "estimated_duration": 2.37550950050354,
+            "host_name": "TODAY",
+            "logfile_path": "~/var/log/web.log",
+            "pid": 1363226,
+            "ppid": 1363225,
+            "started": 1654173769.3507118,
+            "state": "finished",
+            "stoppable": True,
+            "title": "Refresh",
+            "user": "cmkadmin",
+            "loginfo": {
+                "JobProgressUpdate": ["Starting job...", "Completed."],
+                "JobResult": [],
+                "JobException": [],
+            },
+            "is_active": False,
+        },
+        check_table_created=1654237821,
+        check_table=[
+            CheckPreviewEntry(
+                check_source="new",
+                check_plugin_name="df",
+                ruleset_name="filesystem",
+                discovery_ruleset_name=None,
+                item="/opt/omd/sites/heute/tmp",
+                old_discovered_parameters={
+                    "mountpoint_for_block_devices": "volume_name",
+                    "item_appearance": "mountpoint",
+                },
+                new_discovered_parameters={
+                    "mountpoint_for_block_devices": "volume_name",
+                    "item_appearance": "mountpoint",
+                },
+                effective_parameters={
+                    "levels": (80.0, 90.0),
+                    "magic_normsize": 20,
+                    "levels_low": (50.0, 60.0),
+                    "trend_range": 24,
+                    "trend_perfdata": True,
+                    "show_levels": "onmagic",
+                    "inodes_levels": (10.0, 5.0),
+                    "show_inodes": "onlow",
+                    "show_reserved": False,
+                    "mountpoint_for_block_devices": "volume_name",
+                    "item_appearance": "mountpoint",
+                },
+                description="Filesystem /opt/omd/sites/heute/tmp",
+                state=0,
+                output="0.04% used (5.78 MB of 15.54 GB), trend: +10.38 kB / 24 hours\n0.04% used (5.78 MB of 15.54 GB)\ntrend: +10.38 kB / 24 hours",
+                metrics=[],
+                old_labels={},
+                new_labels={},
+                found_on_nodes=[HostName("TODAY")],
+            ),
+            CheckPreviewEntry(
+                check_source="vanished",
+                check_plugin_name="lnx_if",
+                ruleset_name="dummy_name",
+                discovery_ruleset_name=None,
+                item="2",
+                old_discovered_parameters={
+                    "discovered_oper_status": ["1"],
+                    "discovered_speed": 10000000,
+                },
+                new_discovered_parameters={
+                    "discovered_oper_status": ["1"],
+                    "discovered_speed": 10000000,
+                },
+                effective_parameters={
+                    "errors": {"both": ("perc", (0.01, 0.1))},
+                    "discovered_oper_status": ["1"],
+                    "discovered_speed": 10000000,
+                },
+                description="Interface 2",
+                state=2,
+                output="[docker0], (down)(!!), MAC: 02:42:E3:80:F5:EE, Speed: 10 MBit/s (assumed)\n[docker0]\nOperational state: down(!!)\nMAC: 02:42:E3:80:F5:EE\nSpeed: 10 MBit/s (assumed)",
+                metrics=[],
+                old_labels={},
+                new_labels={},
+                found_on_nodes=[HostName("TODAY")],
+            ),
+        ],
+        nodes_check_table={},
+        host_labels={
+            "cmk/check_mk_server": {"value": "yes", "plugin_name": "omd_info"},
+            "cmk/os_family": {"value": "linux", "plugin_name": "check_mk"},
+        },
+        new_labels={},
+        vanished_labels={},
+        changed_labels={},
+        sources=[(0, "Success")],
+        labels_by_host={
+            HostName("TODAY"): [
+                HostLabel("cmk/check_mk_server", "yes", SectionName("omd_info")),
+                HostLabel("cmk/os_family", "linux", SectionName("check_mk")),
+            ],
+        },
+        config_warnings=(),
+    )
+
+    discovery_result = perform_service_discovery(
+        action=DiscoveryAction.UPDATE_SERVICES,
+        discovery_result=initial_discovery_result(
+            action=DiscoveryAction.UPDATE_SERVICES,
+            host=sample_host,
+            previous_discovery_result=previous_discovery_result,
+            automation_config=LocalAutomationConfig(),
+            user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+            raise_errors=True,
+            debug=False,
+            use_git=False,
+            pending_changes=_TEST_PENDING_CHANGES,
+        ),
+        selected_services=EVERYTHING,
+        update_source=None,
+        update_target=None,
+        host=sample_host,
+        raise_errors=True,
+        automation_config=LocalAutomationConfig(),
+        user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+        pprint_value=False,
+        debug=False,
+        use_git=False,
+        pending_changes=_TEST_PENDING_CHANGES,
+    )
+    sample_autochecks: Mapping[ServiceName, AutocheckEntry] = {
+        "Filesystem /opt/omd/sites/heute/tmp": AutocheckEntry(
+            CheckPluginName("df"),
+            "/opt/omd/sites/heute/tmp",
+            {
+                "item_appearance": "mountpoint",
+                "mountpoint_for_block_devices": "volume_name",
+            },
+            {},
+        )
+    }
+    mock_set_autochecks.assert_called_with(
+        LocalAutomationConfig(),
+        SetAutochecksInput(
+            sample_host_name,
+            sample_autochecks,
+            {},
+        ),
+        debug=False,
+    )
+    mock_discovery_preview.assert_called_with(
+        sample_host_name,
+        prevent_fetching=True,
+        raise_errors=False,
+        debug=False,
+    )
+    assert [entry.check_source for entry in discovery_result.check_table] == ["unchanged"]
+
+    store = AuditLogStore()
+    assert [
+        log_entry.text for log_entry in store.read() if log_entry.action == "set-autochecks"
+    ] == [f"Saved check configuration of host '{sample_host_name}' with 1 services"]
+
+
+def test_perform_discovery_action_update_host_labels(
+    mocker: MockerFixture,
+    sample_host_name: HostName,
+    sample_host: Host,
+    mock_set_autochecks: MagicMock,
+) -> None:
+    mock_update_host_labels = mocker.patch(
+        "cmk.gui.watolib.services.update_host_labels", return_value=None
+    )
+    mock_discovery_preview = mocker.patch(
+        "cmk.gui.watolib.services.local_discovery_preview",
+        return_value=ServiceDiscoveryPreviewResult(
+            output="",
+            check_table=[],
+            nodes_check_table={},
+            host_labels={
+                "cmk/os_family": {"value": "linux", "plugin_name": "check_mk"},
+            },
+            new_labels={},
+            vanished_labels={},
+            changed_labels={},
+            source_results=[(0, "Success")],
+            labels_by_host={
+                HostName(sample_host_name): [
+                    HostLabel("cmk/os_family", "linux", SectionName("check_mk"))
+                ],
+            },
+            config_warnings=(),
+        ),
+    )
+    previous_discovery_result = DiscoveryResult(
+        job_status={
+            "duration": 2.351154088973999,
+            "estimated_duration": 2.37550950050354,
+            "host_name": "heute",
+            "logfile_path": "~/var/log/web.log",
+            "pid": 1363226,
+            "ppid": 1363225,
+            "started": 1654173769.3507118,
+            "state": "finished",
+            "stoppable": True,
+            "title": "Refresh",
+            "user": "cmkadmin",
+            "loginfo": {
+                "JobProgressUpdate": ["Starting job...", "Completed."],
+                "JobResult": [],
+                "JobException": [],
+            },
+            "is_active": False,
+        },
+        check_table_created=1654248127,
+        check_table=[],
+        nodes_check_table={},
+        host_labels={
+            # "cmk/check_mk_server": {"value": "yes", "plugin_name": "omd_info"},
+            "cmk/os_family": {"value": "linux", "plugin_name": "check_mk"},
+        },
+        new_labels={},
+        vanished_labels={"cmk/check_mk_server": {"value": "yes", "plugin_name": "omd_info"}},
+        changed_labels={},
+        sources=[(0, "Success")],
+        labels_by_host={
+            HostName(sample_host_name): [
+                HostLabel("cmk/os_family", "linux", SectionName("check_mk"))
+            ],
+        },
+        config_warnings=(),
+    )
+
+    discovery_result = perform_host_label_discovery(
+        action=DiscoveryAction.UPDATE_HOST_LABELS,
+        discovery_result=initial_discovery_result(
+            action=DiscoveryAction.UPDATE_HOST_LABELS,
+            host=sample_host,
+            previous_discovery_result=previous_discovery_result,
+            automation_config=LocalAutomationConfig(),
+            user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+            raise_errors=True,
+            debug=False,
+            use_git=False,
+            pending_changes=_TEST_PENDING_CHANGES,
+        ),
+        host=sample_host,
+        raise_errors=True,
+        automation_config=LocalAutomationConfig(),
+        user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+        pprint_value=False,
+        debug=False,
+        use_git=False,
+        pending_changes=_TEST_PENDING_CHANGES,
+    )
+
+    mock_update_host_labels.assert_called_once_with(
+        LocalAutomationConfig(),
+        sample_host_name,
+        [
+            # HostLabel("cmk/check_mk_server", "yes", SectionName("omd_info")),
+            HostLabel("cmk/os_family", "linux", SectionName("check_mk")),
+        ],
+        debug=False,
+    )
+    mock_set_autochecks.assert_not_called()
+    mock_discovery_preview.assert_called_with(
+        sample_host_name,
+        prevent_fetching=True,
+        raise_errors=False,
+        debug=False,
+    )
+    assert "cmk/check_mk_server" not in discovery_result.host_labels
+
+    store = AuditLogStore()
+    assert [
+        log_entry.text for log_entry in store.read() if log_entry.action == "update-host-labels"
+    ] == [f"Updated discovered host labels of '{sample_host_name}' with 1 labels"]
+
+
+def _make_discovery_result(
+    check_table: Sequence[CheckPreviewEntry],
+    nodes_check_table: Mapping[HostName, Sequence[CheckPreviewEntry]],
+) -> DiscoveryResult:
+    """make a dummy discovery result from the values relevant for the test"""
+    return DiscoveryResult(
+        job_status={},
+        check_table_created=0,
+        check_table=check_table,
+        nodes_check_table=nodes_check_table,
+        host_labels={},
+        new_labels={},
+        vanished_labels={},
+        changed_labels={},
+        labels_by_host={},
+        sources=[],
+        config_warnings=(),
+    )
+
+
+def _make_preview_entry(
+    check_source: str,
+    old_params: Mapping[str, object],
+    new_params: Mapping[str, object],
+    found_on_nodes: list[HostName],
+) -> CheckPreviewEntry:
+    """make a dummy preview entry from the values relevant for the test"""
+    return CheckPreviewEntry(
+        check_source=check_source,
+        check_plugin_name="dummy_plugin",
+        ruleset_name=None,
+        discovery_ruleset_name=None,
+        item=None,
+        old_discovered_parameters=old_params,
+        new_discovered_parameters=new_params,
+        effective_parameters={},
+        description="my-description",
+        state=0,
+        output="",
+        metrics=[],
+        old_labels={},
+        new_labels={},
+        found_on_nodes=found_on_nodes,
+    )
+
+
+def _make_autocheck_entry(parameter_value: str) -> AutocheckEntry:
+    """make a dummy autocheck entry from the values relevant for the test"""
+    return AutocheckEntry(
+        check_plugin_name=CheckPluginName("dummy_plugin"),
+        item=None,
+        parameters={"p": parameter_value},
+        service_labels={},
+    )
+
+
+def _grant_all_permissions(_p: object) -> None:
+    pass
+
+
+class TestDiscovery:
+    @staticmethod
+    def _make_clustered_service_vanished_result() -> DiscoveryResult:
+        """Test scenario where a clustered service vanished from the primary node"""
+        return _make_discovery_result(
+            check_table=[
+                _make_preview_entry(
+                    check_source="changed",
+                    old_params={"p": "old"},
+                    new_params={"p": "new"},
+                    found_on_nodes=[HostName("node2")],
+                ),
+            ],
+            nodes_check_table={
+                HostName("node1"): [
+                    _make_preview_entry("clustered_vanished", {"p": "old"}, {"p": "old"}, []),
+                ],
+                HostName("node2"): [
+                    _make_preview_entry(
+                        "clustered_old", {"p": "new"}, {"p": "new"}, [HostName("node2")]
+                    ),
+                ],
+            },
+        )
+
+    def test_cluster_discovery_removes_outdated_node_services_fix_all(self) -> None:
+        """Tests that the discovery transition removes outdated node services
+        if other nodes discover newer services.
+
+        Failing to do this leads to wrong discovered parameters.
+        """
+        target_host = HostName("mycluster")
+        discovery_result = self._make_clustered_service_vanished_result()
+        assert Discovery(
+            host=object(),  # type: ignore[arg-type] # not accessed in this test
+            action=DiscoveryAction.FIX_ALL,
+            update_target=None,
+            selected_services=(),
+            user_need_permission=_grant_all_permissions,
+        ).compute_discovery_transition(discovery_result, target_host) == DiscoveryTransition(
+            need_sync=False,
+            add_disabled_rule=set(),
+            remove_disabled_rule=set(),
+            old_autochecks=SetAutochecksInput(
+                discovered_host=target_host,
+                target_services={"my-description": _make_autocheck_entry("old")},
+                nodes_services={  # why is this empty?
+                    HostName("node1"): {},
+                    HostName("node2"): {},
+                },
+            ),
+            new_autochecks=SetAutochecksInput(
+                discovered_host=target_host,
+                target_services={
+                    "my-description": _make_autocheck_entry("new"),
+                },
+                nodes_services={
+                    HostName("node1"): {},
+                    HostName("node2"): {
+                        "my-description": _make_autocheck_entry("new"),
+                    },
+                },
+            ),
+        )
+
+    def test_cluster_discovery_removes_outdated_node_services_update_params(self) -> None:
+        """Tests that the discovery transition removes outdated node services
+        if other nodes discover newer services.
+
+        Failing to do this leads to wrong discovered parameters.
+        """
+        target_host = HostName("mycluster")
+        discovery_result = self._make_clustered_service_vanished_result()
+        assert Discovery(
+            host=object(),  # type: ignore[arg-type] # not accessed in this test
+            action=DiscoveryAction.UPDATE_DISCOVERY_PARAMETERS,
+            update_target="unchanged",
+            selected_services=(),
+            user_need_permission=_grant_all_permissions,
+        ).compute_discovery_transition(discovery_result, target_host) == DiscoveryTransition(
+            need_sync=False,
+            remove_disabled_rule=set(),
+            add_disabled_rule=set(),
+            old_autochecks=SetAutochecksInput(
+                discovered_host=target_host,
+                target_services={"my-description": _make_autocheck_entry("old")},
+                nodes_services={  # why is this empty?
+                    HostName("node1"): {},
+                    HostName("node2"): {},
+                },
+            ),
+            new_autochecks=SetAutochecksInput(
+                discovered_host=target_host,
+                target_services={"my-description": _make_autocheck_entry("new")},
+                nodes_services={
+                    HostName("node1"): {},
+                    HostName("node2"): {"my-description": _make_autocheck_entry("new")},
+                },
+            ),
+        )
+
+    def test_ignored_service_set_to_undecided_removes_disabled_rule_and_drops_from_autochecks(
+        self,
+    ) -> None:
+        """A disabled (ignored) service that no longer exists stays 'ignored' rather than
+        'vanished' because a disabled rule matches it.  Setting it to 'undecided' must remove
+        the disabled rule and drop the service from autochecks (it was present before as
+        'ignored'; now it should be gone)."""
+        target_host = HostName("myhost")
+        discovery_result = _make_discovery_result(
+            check_table=[
+                _make_preview_entry(
+                    check_source="ignored",
+                    old_params={},
+                    new_params={},
+                    found_on_nodes=[target_host],
+                )
+            ],
+            nodes_check_table={},
+        )
+        assert Discovery(
+            host=object(),  # type: ignore[arg-type]
+            action=DiscoveryAction.SINGLE_UPDATE,
+            update_target="new",
+            selected_services=(("dummy_plugin", None),),
+            user_need_permission=_grant_all_permissions,
+        ).compute_discovery_transition(discovery_result, target_host) == DiscoveryTransition(
+            need_sync=True,
+            remove_disabled_rule={"my-description"},
+            add_disabled_rule=set(),
+            old_autochecks=SetAutochecksInput(
+                discovered_host=target_host,
+                target_services={
+                    "my-description": AutocheckEntry(
+                        check_plugin_name=CheckPluginName("dummy_plugin"),
+                        item=None,
+                        parameters={},
+                        service_labels={},
+                    )
+                },
+                nodes_services={},
+            ),
+            new_autochecks=SetAutochecksInput(
+                discovered_host=target_host,
+                target_services={},
+                nodes_services={},
+            ),
+        )
+
+
+@pytest.mark.usefixtures("inline_background_jobs")
+def test_perform_discovery_bulk_update__ignored_service_set_to_undecided(
+    mocker: MockerFixture,
+    sample_host_name: HostName,
+    sample_host: Host,
+    mock_set_autochecks: MagicMock,
+) -> None:
+    """Same case as the SINGLE_UPDATE test but via BULK_UPDATE: a disabled (ignored)
+    service that no longer exists must have its disabled rule removed and must be dropped
+    from autochecks when the user targets it to 'undecided'."""
+    mock_save_function = mocker.patch(
+        "cmk.gui.watolib.services.Discovery._save_host_service_enable_disable_rules",
+        return_value=None,
+    )
+    other_entry = CheckPreviewEntry(
+        check_source="unchanged",
+        check_plugin_name="other_plugin",
+        ruleset_name="other_rule",
+        discovery_ruleset_name=None,
+        item=None,
+        old_discovered_parameters={},
+        new_discovered_parameters={},
+        effective_parameters={},
+        description="Running Service",
+        state=0,
+        output="",
+        metrics=[],
+        old_labels={},
+        new_labels={},
+        found_on_nodes=[sample_host_name],
+    )
+    ignored_entry = CheckPreviewEntry(
+        check_source="ignored",
+        check_plugin_name="some_plugin",
+        ruleset_name="some_rule",
+        discovery_ruleset_name=None,
+        item="A",
+        old_discovered_parameters={},
+        new_discovered_parameters={},
+        effective_parameters={},
+        description="Disabled Service",
+        state=0,
+        output="",
+        metrics=[],
+        old_labels={},
+        new_labels={},
+        found_on_nodes=[sample_host_name],
+    )
+    # After the disabled rule is removed, re-running discovery returns the service as "new".
+    post_transition_entry = dataclasses.replace(ignored_entry, check_source="new")
+    mocker.patch(
+        "cmk.gui.watolib.services.local_discovery_preview",
+        return_value=ServiceDiscoveryPreviewResult(
+            output="",
+            check_table=[post_transition_entry, other_entry],
+            nodes_check_table={},
+            host_labels={},
+            new_labels={},
+            vanished_labels={},
+            changed_labels={},
+            source_results=[],
+            labels_by_host={},
+            config_warnings=[],
+        ),
+    )
+    result = perform_service_discovery(
+        action=DiscoveryAction.BULK_UPDATE,
+        discovery_result=DiscoveryResult(
+            job_status={
+                "state": "finished",
+                "started": 0.0,
+                "pid": None,
+                "loginfo": {"JobProgressUpdate": [], "JobResult": [], "JobException": []},
+                "is_active": False,
+            },
+            check_table_created=0,
+            check_table=[ignored_entry, other_entry],
+            nodes_check_table={},
+            host_labels={},
+            new_labels={},
+            vanished_labels={},
+            changed_labels={},
+            labels_by_host={sample_host_name: []},
+            sources=[],
+            config_warnings=[],
+        ),
+        selected_services=(("some_plugin", "A"),),
+        update_source="ignored",
+        update_target="new",
+        host=sample_host,
+        automation_config=LocalAutomationConfig(),
+        pprint_value=False,
+        debug=False,
+        use_git=False,
+        raise_errors=True,
+        user_permission_config=UserPermissionSerializableConfig({}, {}, []),
+        pending_changes=_TEST_PENDING_CHANGES,
+    )
+
+    mock_save_function.assert_called_once()
+    remove_disabled_rule, add_disabled_rule, *_ = mock_save_function.call_args_list[0][0]
+    assert remove_disabled_rule == {"Disabled Service"}
+    assert len(add_disabled_rule) == 0
+
+    # The entry transitions to 'new' (undecided) in the result view.
+    (transitioned,) = (e for e in result.check_table if e.check_plugin_name == "some_plugin")
+    assert transitioned.check_source == "new"
+
+    # The service was removed from autochecks (it was present as 'ignored'; now it is gone).
+    saved_input = mock_set_autochecks.call_args.args[1]
+    assert "Disabled Service" not in saved_input.target_services

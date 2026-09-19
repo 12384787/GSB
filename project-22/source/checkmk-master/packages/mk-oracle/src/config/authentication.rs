@@ -1,0 +1,662 @@
+// Copyright (C) 2025 Checkmk GmbH
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use super::defines::{defaults, keys, values};
+use super::yaml::{Get, Yaml};
+use anyhow::{anyhow, Result};
+use std::fmt;
+use std::str::FromStr;
+
+const SQL_DB_ENDPOINT_HOST: usize = 0;
+const SQL_DB_ENDPOINT_USER: usize = 1;
+const SQL_DB_ENDPOINT_PASSWORD: usize = 2;
+const SQL_DB_ENDPOINT_PORT: usize = 3;
+const SQL_DB_ENDPOINT_INSTANCE: usize = 4;
+const SQL_DB_ENDPOINT_ROLE: usize = 5;
+const SQL_DB_ENDPOINT_SERVICE_NAME: usize = 6;
+const SQL_DB_ENDPOINT_SID: usize = 7;
+
+// See ticket CMK-23904 for details on the format of this environment variable.
+// CI_ORA1_DB_TEST=ora1.lan.tribe29.net:system:ABcd#1234:1521:XE:sysdba:_:_:_
+#[allow(dead_code)]
+#[derive(PartialEq, Clone)]
+pub struct SqlDbEndpoint {
+    pub host: String,
+    pub user: String,
+    pub pwd: String,
+    pub port: u16,
+    pub role: Option<Role>,
+    pub service_name: String,
+    pub instance_name: Option<String>,
+    pub sid: Option<String>,
+}
+
+impl fmt::Debug for SqlDbEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("SqlDbEndpoint")
+            .field("host", &self.host)
+            .field("user", &self.user)
+            .field("pwd", &"***")
+            .field("port", &self.port)
+            .field("role", &self.role)
+            .field("service_name", &self.service_name)
+            .field("instance_name", &self.instance_name)
+            .field("sid", &self.sid)
+            .finish()
+    }
+}
+
+impl SqlDbEndpoint {
+    pub fn from_env(endpoint_var: &str) -> Result<Self> {
+        let env_value =
+            std::env::var(endpoint_var).map_err(|e| anyhow::anyhow!("{e}: {endpoint_var}"))?;
+        Self::from_str(&env_value)
+    }
+}
+
+impl FromStr for SqlDbEndpoint {
+    type Err = anyhow::Error;
+    fn from_str(env_value: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = env_value.split(':').collect();
+        if parts.len() < 6 {
+            anyhow::bail!("Invalid format for {}", env_value);
+        }
+        Ok(Self {
+            host: parts[SQL_DB_ENDPOINT_HOST].to_string(),
+            user: parts[SQL_DB_ENDPOINT_USER].to_string(),
+            pwd: parts[SQL_DB_ENDPOINT_PASSWORD].to_string(),
+            port: parts[SQL_DB_ENDPOINT_PORT]
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Wrong/malformed port number in {}", env_value))?,
+            service_name: parts[SQL_DB_ENDPOINT_SERVICE_NAME].to_string(),
+            role: Role::new(parts[SQL_DB_ENDPOINT_ROLE]),
+            instance_name: parts
+                .get(SQL_DB_ENDPOINT_INSTANCE)
+                .filter(|s| !s.is_empty() && **s != "_")
+                .map(|s| s.to_string()),
+            sid: parts
+                .get(SQL_DB_ENDPOINT_SID)
+                .filter(|s| !s.is_empty() && **s != "_")
+                .map(|s| s.to_string()),
+        })
+    }
+}
+
+#[derive(PartialEq, Debug, Clone)]
+pub enum Role {
+    SysDba,
+    SysOper,
+    SysBackup,
+    SysDG,
+    SysKM,
+    SysASM,
+}
+
+impl Role {
+    pub fn from_yaml(auth: &Yaml) -> Option<Self> {
+        auth.get_string(keys::ROLE)
+            .and_then(|role| Role::new(role.as_str()))
+    }
+    pub fn new(value: &str) -> Option<Self> {
+        match str::to_ascii_lowercase(value).as_ref() {
+            values::SYS_DBA => Some(Self::SysDba),
+            values::SYS_OPER => Some(Self::SysOper),
+            values::SYS_BACKUP => Some(Self::SysBackup),
+            values::SYS_DG => Some(Self::SysDG),
+            values::SYS_KM => Some(Self::SysKM),
+            values::SYS_ASM => Some(Self::SysASM),
+            "" => {
+                log::info!("No role specified");
+                None
+            }
+            _ => {
+                log::error!("Invalid role {value}");
+                None
+            }
+        }
+    }
+}
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::SysDba => write!(f, "{}", values::SYS_DBA),
+            Self::SysOper => write!(f, "{}", values::SYS_OPER),
+            Self::SysBackup => write!(f, "{}", values::SYS_BACKUP),
+            Self::SysDG => write!(f, "{}", values::SYS_DG),
+            Self::SysKM => write!(f, "{}", values::SYS_KM),
+            Self::SysASM => write!(f, "{}", values::SYS_ASM),
+        }
+    }
+}
+#[derive(PartialEq, Clone)]
+pub struct Authentication {
+    username: String,
+    password: Option<String>,
+    auth_type: AuthType,
+    role: Option<Role>,
+    asm_username: Option<String>,
+    asm_password: Option<String>,
+    asm_role: Option<Role>,
+    /// Explicit ASM auth type from the config; when set it overrides the derived one.
+    asm_type: Option<AuthType>,
+}
+
+impl std::fmt::Debug for Authentication {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Authentication")
+            .field("username", &self.username)
+            .field("password", &"***")
+            .field("auth_type", &self.auth_type)
+            .field("role", &self.role)
+            .finish()
+    }
+}
+
+impl Default for Authentication {
+    fn default() -> Self {
+        Self {
+            username: "".to_owned(),
+            password: None,
+            auth_type: AuthType::default(),
+            role: None,
+            asm_username: None,
+            asm_password: None,
+            asm_role: None,
+            asm_type: None,
+        }
+    }
+}
+impl Authentication {
+    pub fn from_yaml(yaml: &Yaml) -> Result<Option<Self>> {
+        let auth = yaml.get(keys::AUTHENTICATION);
+        if auth.is_badvalue() {
+            return Ok(None);
+        }
+
+        let auth_type = AuthType::try_from(
+            auth.get_string(keys::TYPE)
+                .as_deref()
+                .unwrap_or(defaults::AUTH_TYPE),
+        )?;
+        let role = Role::from_yaml(auth);
+        let asm_username = auth.get_string(keys::ASM_USERNAME);
+        let asm_password = auth.get_string(keys::ASM_PASSWORD);
+        let asm_role = auth
+            .get_string(keys::ASM_ROLE)
+            .and_then(|r| Role::new(r.as_str()));
+        let asm_type = auth
+            .get_string(keys::ASM_TYPE)
+            .map(|t| AuthType::try_from(t.as_str()))
+            .transpose()?;
+
+        if auth_type == AuthType::Os {
+            Ok(Some(Self {
+                username: String::new(),
+                password: None,
+                auth_type,
+                role,
+                asm_username,
+                asm_password,
+                asm_role,
+                asm_type,
+            }))
+        } else {
+            Ok(Some(Self {
+                username: auth
+                    .get_string(keys::USERNAME)
+                    .map(_extract_username_if_env_var)
+                    .unwrap_or_default(),
+                password: auth
+                    .get_string(keys::PASSWORD)
+                    .map(_extract_password_if_env_var),
+                auth_type,
+                role,
+                asm_username,
+                asm_password,
+                asm_role,
+                asm_type,
+            }))
+        }
+    }
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+    pub fn password(&self) -> Option<&str> {
+        self.password.as_deref()
+    }
+    pub fn auth_type(&self) -> &AuthType {
+        &self.auth_type
+    }
+    pub fn asm_auth_type(&self) -> AuthType {
+        // An explicit `asm_type` from the config wins; otherwise calc it from credentials.
+        if let Some(asm_type) = &self.asm_type {
+            return asm_type.clone();
+        }
+        match self.asm_username.as_deref() {
+            // `/` is external (OS/wallet) authentication.
+            Some("/") => AuthType::Wallet,
+            // A named ASM user with a password is standard auth, otherwise external.
+            Some(user) if !user.is_empty() => {
+                if self.asm_password.is_some() {
+                    AuthType::Standard
+                } else {
+                    AuthType::Wallet
+                }
+            }
+            // No (or empty) ASM user: reuse the regular auth type.
+            _ => self.auth_type.clone(),
+        }
+    }
+
+    pub fn role(&self) -> Option<&Role> {
+        self.role.as_ref()
+    }
+
+    pub fn asm_username(&self) -> &str {
+        self.asm_username.as_deref().unwrap_or(&self.username)
+    }
+
+    pub fn asm_password(&self) -> Option<&str> {
+        if self.asm_username.is_some() {
+            self.asm_password.as_deref()
+        } else {
+            self.password.as_deref()
+        }
+    }
+
+    pub fn asm_role(&self) -> Option<&Role> {
+        self.asm_role.as_ref().or(self.role.as_ref())
+    }
+
+    pub fn db_auth(&self) -> ConnectionAuth {
+        ConnectionAuth {
+            auth_type: self.auth_type.clone(),
+            username: self.username().to_owned(),
+            password: self.password().map(str::to_owned),
+            role: self.role().cloned(),
+        }
+    }
+
+    pub fn asm_auth(&self) -> ConnectionAuth {
+        ConnectionAuth {
+            auth_type: self.asm_auth_type(),
+            username: self.asm_username().to_owned(),
+            password: self.asm_password().map(str::to_owned),
+            role: self.asm_role().cloned(),
+        }
+    }
+}
+
+/// The credentials, role and auth type used to open one connection, resolved
+/// out of an [`Authentication`] by [`Authentication::db_auth`] /
+/// [`Authentication::asm_auth`].
+#[derive(PartialEq, Debug, Clone)]
+pub struct ConnectionAuth {
+    pub auth_type: AuthType,
+    pub username: String,
+    pub password: Option<String>,
+    pub role: Option<Role>,
+}
+
+fn _extract_username_if_env_var<T: AsRef<str> + Sized>(value: T) -> String {
+    let v = value.as_ref();
+    _extract_endpoint_if_env_var(v)
+        .map(|ep| ep.user)
+        .or_else(|| _extract_env_var(v))
+        .unwrap_or_else(|| v.to_owned())
+}
+
+fn _extract_password_if_env_var<T: AsRef<str> + Sized>(value: T) -> String {
+    let v = value.as_ref();
+    _extract_endpoint_if_env_var(v)
+        .map(|ep| ep.pwd)
+        .or_else(|| _extract_env_var(v))
+        .unwrap_or_else(|| v.to_owned())
+}
+
+fn _extract_env_var(value: &str) -> Option<String> {
+    let name = value.strip_prefix('$')?;
+    if name.is_empty() {
+        return None;
+    }
+    std::env::var(name).ok()
+}
+
+fn _extract_endpoint_if_env_var<T: AsRef<str> + Sized>(value: T) -> Option<SqlDbEndpoint> {
+    let v = value.as_ref();
+    if v.is_empty() {
+        return None;
+    }
+    if !v.starts_with('$') {
+        return None;
+    }
+    SqlDbEndpoint::from_env(&v[1..]).ok()
+}
+
+#[derive(PartialEq, Debug, Clone, Default)]
+pub enum AuthType {
+    #[default]
+    Standard,
+    Os,
+    Wallet,
+}
+
+impl TryFrom<&str> for AuthType {
+    type Error = anyhow::Error;
+
+    fn try_from(val: &str) -> Result<Self> {
+        match str::to_ascii_lowercase(val).as_ref() {
+            values::STANDARD => Ok(AuthType::Standard),
+            values::OS => Ok(AuthType::Os),
+            values::WALLET => Ok(AuthType::Wallet),
+            _ => Err(anyhow!("unsupported auth type `{val}`")),
+        }
+    }
+}
+
+impl fmt::Display for AuthType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            AuthType::Standard => write!(f, "{}", values::STANDARD),
+            AuthType::Os => write!(f, "{}", values::OS),
+            AuthType::Wallet => write!(f, "{}", values::WALLET),
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::yaml::test_tools::create_yaml;
+
+    #[test]
+    fn test_endpoint() {
+        assert_eq!(
+            SqlDbEndpoint::from_str("host:user:password:13::sysdba:xe:").unwrap(),
+            SqlDbEndpoint {
+                host: "host".to_string(),
+                user: "user".to_string(),
+                pwd: "password".to_string(),
+                port: 13,
+                service_name: "xe".to_string(),
+                role: Role::new("sysdba"),
+                instance_name: None,
+                sid: None,
+            }
+        )
+    }
+
+    #[test]
+    fn test_asm_auth_type() {
+        let mk = |user: Option<&str>, pw: Option<&str>| {
+            let a = Authentication {
+                asm_username: user.map(str::to_owned),
+                asm_password: pw.map(str::to_owned),
+                ..Default::default()
+            };
+            a.asm_auth_type()
+        };
+        assert_eq!(mk(Some("/"), None), AuthType::Wallet);
+        assert_eq!(mk(Some("asm_user"), Some("pw")), AuthType::Standard);
+        assert_eq!(mk(Some("asm_user"), None), AuthType::Wallet);
+        assert_eq!(mk(Some(""), None), AuthType::default()); // base auth_type
+        assert_eq!(mk(None, None), AuthType::default()); // base auth_type
+    }
+
+    #[test]
+    fn test_asm_auth_type_explicit_overrides_derived() {
+        // `asm_username: "/"` -> Wallet, but an explicit asm_type wins.
+        let a = Authentication {
+            asm_username: Some("/".to_owned()),
+            asm_type: Some(AuthType::Standard),
+            ..Default::default()
+        };
+        assert_eq!(a.asm_auth_type(), AuthType::Standard);
+    }
+
+    #[test]
+    fn test_asm_auth_type_legacy_typical() {
+        // `asm_username: "/"` -> Wallet, but an explicit asm_type wins.
+        let a = Authentication {
+            asm_username: Some("/".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(a.asm_auth_type(), AuthType::Wallet);
+    }
+
+    #[test]
+    fn test_asm_auth_type_read_from_yaml() {
+        let a = Authentication::from_yaml(&create_yaml(
+            r#"
+authentication:
+  username: "foo"
+  password: "bar"
+  type: "standard"
+  asm_username: "/"
+  asm_type: "standard"
+"#,
+        ))
+        .unwrap()
+        .unwrap();
+        // Read from the file: explicit `asm_type: standard` overrides the derived Wallet.
+        assert_eq!(a.asm_auth_type(), AuthType::Standard);
+    }
+    mod data {
+        pub const AUTHENTICATION_NO_ASM: &str = r#"
+authentication:
+  username: "foo"
+  password: "bar"
+  type: "standard"
+  role: sysdba
+"#;
+        pub const AUTHENTICATION_OS: &str = r#"
+authentication:
+  username: "foo"
+  password: "bar"
+  type: "os"
+"#;
+        pub const AUTHENTICATION_MINI: &str = r#"
+authentication:
+  username: "foo"
+  _password: "bar"
+  _type: "system"
+"#;
+        pub const AUTHENTICATION_ASM: &str = r#"
+authentication:
+  username: "foo"
+  password: "bar"
+  type: "standard"
+  role: sysdba
+  asm_username: "asm_user"
+  asm_password: "asm_pass"
+  asm_role: sysasm
+"#;
+    }
+
+    #[test]
+    fn test_authentication_from_yaml() {
+        let a = Authentication::from_yaml(&create_yaml(data::AUTHENTICATION_NO_ASM))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.username(), "foo");
+        assert_eq!(a.password(), Some("bar"));
+        assert_eq!(a.auth_type(), &AuthType::Standard);
+        assert_eq!(a.role(), Some(&Role::SysDba));
+    }
+    #[test]
+    fn test_authentication_role() {
+        pub const AUTHENTICATION_FIRST: &str = r#"
+authentication:
+  username: "foo"
+  password: "bar"
+  type: "standard"
+  role: "#;
+        let test_set: Vec<(&str, Option<&Role>)> = vec![
+            ("", None),
+            ("aaa", None),
+            ("SYSdba", Some(&Role::SysDba)),
+            ("sysoper", Some(&Role::SysOper)),
+            ("sysbackup", Some(&Role::SysBackup)),
+            ("sysdg", Some(&Role::SysDG)),
+            ("syskm", Some(&Role::SysKM)),
+            ("sysasm", Some(&Role::SysASM)),
+        ];
+        for (role, expected) in test_set {
+            let a =
+                Authentication::from_yaml(&create_yaml(AUTHENTICATION_FIRST.to_string() + role))
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(a.role(), expected);
+        }
+    }
+
+    #[test]
+    fn test_authentication_from_yaml_empty() {
+        assert!(Authentication::from_yaml(&create_yaml(r"authentication:")).is_ok());
+    }
+
+    #[test]
+    fn test_authentication_from_yaml_no_username() {
+        assert!(Authentication::from_yaml(&create_yaml(
+            r#"
+authentication:
+  _username: 'aa'
+"#
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn test_authentication_from_yaml_mini() {
+        let a = Authentication::from_yaml(&create_yaml(data::AUTHENTICATION_MINI))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.username(), "foo");
+        assert_eq!(a.password(), None);
+        assert_eq!(a.auth_type(), &AuthType::Standard);
+    }
+
+    #[test]
+    fn test_authentication_from_yaml_asm_fields() {
+        let a = Authentication::from_yaml(&create_yaml(data::AUTHENTICATION_ASM))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.asm_username(), "asm_user");
+        assert_eq!(a.asm_password(), Some("asm_pass"));
+        assert_eq!(a.asm_role(), Some(&Role::SysASM));
+    }
+
+    #[test]
+    fn test_asm_auth_uses_asm_fields() {
+        let a = Authentication::from_yaml(&create_yaml(data::AUTHENTICATION_ASM))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            a.asm_auth(),
+            ConnectionAuth {
+                auth_type: AuthType::Standard,
+                username: "asm_user".to_owned(),
+                password: Some("asm_pass".to_owned()),
+                role: Some(Role::SysASM),
+            }
+        );
+        // The regular connection is unaffected by the `asm_*` fields.
+        assert_eq!(
+            a.db_auth(),
+            ConnectionAuth {
+                auth_type: AuthType::Standard,
+                username: "foo".to_owned(),
+                password: Some("bar".to_owned()),
+                role: Some(Role::SysDba),
+            }
+        );
+    }
+
+    #[test]
+    fn test_asm_auth_falls_back_to_regular_fields() {
+        let a = Authentication::from_yaml(&create_yaml(data::AUTHENTICATION_NO_ASM))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.asm_auth(), a.db_auth());
+    }
+
+    #[test]
+    fn test_asm_auth_wallet_with_standard_regular_auth() {
+        let a = Authentication::from_yaml(&create_yaml(
+            r#"
+authentication:
+  username: "foo"
+  password: "bar"
+  type: "standard"
+  role: sysdba
+  asm_username: "/"
+  asm_role: sysasm
+"#,
+        ))
+        .unwrap()
+        .unwrap();
+        // `asm_username: "/"` is external auth: no password is passed on.
+        assert_eq!(a.asm_auth().auth_type, AuthType::Wallet);
+        assert_eq!(a.asm_auth().role, Some(Role::SysASM));
+        assert_eq!(a.db_auth().auth_type, AuthType::Standard);
+    }
+
+    #[test]
+    fn test_authentication_asm_fallback_to_regular() {
+        let a = Authentication::from_yaml(&create_yaml(data::AUTHENTICATION_NO_ASM))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.asm_username(), "foo");
+        assert_eq!(a.asm_password(), Some("bar"));
+        assert_eq!(a.asm_role(), Some(&Role::SysDba));
+    }
+
+    #[test]
+    fn test_authentication_from_yaml_integrated() {
+        let a = Authentication::from_yaml(&create_yaml(data::AUTHENTICATION_OS))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.username(), "");
+        assert_eq!(a.password(), None);
+        assert_eq!(a.auth_type(), &AuthType::Os);
+    }
+
+    #[test]
+    fn test_extract_env_var() {
+        assert_eq!(_extract_env_var("no_dollar"), None);
+        assert_eq!(_extract_env_var(""), None);
+        assert_eq!(_extract_env_var("$"), None);
+        assert_eq!(_extract_env_var("$SURELY_UNSET_VAR_XYZ"), None);
+    }
+
+    #[test]
+    fn test_extract_if_env_var_literal_passthrough() {
+        assert_eq!(_extract_username_if_env_var("admin"), "admin");
+        assert_eq!(_extract_password_if_env_var("secret"), "secret");
+        assert_eq!(
+            _extract_username_if_env_var("$SURELY_UNSET_VAR_XYZ"),
+            "$SURELY_UNSET_VAR_XYZ"
+        );
+    }
+
+    #[test]
+    fn test_extract_from_ci_env_var() {
+        if std::env::var("CI_ORA_TEST_PASSWORD").is_err() {
+            return;
+        }
+        assert!(!_extract_password_if_env_var("$CI_ORA_TEST_PASSWORD").is_empty());
+        assert!(!_extract_username_if_env_var("$CI_ORA_TEST_PASSWORD").is_empty());
+    }
+}

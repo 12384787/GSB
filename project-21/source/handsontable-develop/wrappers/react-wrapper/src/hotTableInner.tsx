@@ -1,0 +1,350 @@
+import React, {
+  Children,
+  Fragment,
+  useEffect,
+  useCallback,
+  useImperativeHandle,
+  useRef,
+  forwardRef
+} from 'react';
+import Handsontable from 'handsontable/base';
+import { SettingsMapper } from './settingsMapper';
+import { RenderersPortalManager } from './renderersPortalManager';
+import { HotColumn, isHotColumn } from './hotColumn';
+import { HotEditorHooks, HotTableProps, HotTableRef } from './types';
+import {
+  HOT_DESTROYED_WARNING,
+  AUTOSIZE_WARNING,
+  EDITOR_PORTAL_HOST_CLASSNAME,
+  MISSING_ROOT_PORTAL_WARNING,
+  createEditorPortal,
+  getContainerAttributesProps,
+  isComponentEditor,
+  isCSR,
+  resolveEditorSetting,
+  warn,
+  displayObsoleteRenderersEditorsWarning,
+  useUpdateEffect,
+  displayChildrenOfTypeWarning
+} from './helpers';
+import PropTypes from 'prop-types';
+import { getRenderer } from 'handsontable/renderers/registry';
+import { getEditor } from 'handsontable/editors/registry';
+import { useHotTableContext } from './hotTableContext'
+import { HotColumnContextProvider } from './hotColumnContext'
+import { EditorContextProvider, makeEditorClass } from './hotEditor';
+
+const HotTableInner = forwardRef<
+  HotTableRef,
+  HotTableProps
+>((props, ref) => {
+
+  /**
+   * Reference to the Handsontable instance.
+   */
+  const __hotInstance = useRef<Handsontable | null>(null);
+
+  /**
+   * Reference to the main Handsontable DOM element.
+   */
+  const hotElementRef = useRef<HTMLDivElement>(null);
+
+  /**
+   * Reference to component-based editor overridden hooks object.
+   */
+  const globalEditorHooksRef = useRef<HotEditorHooks | null>(null);
+
+  /**
+   * Reference to HOT-native custom editor class instance.
+   */
+  const globalEditorClassInstance = useRef<Handsontable.editors.BaseEditor | null>(null);
+
+  /**
+   * Stable host for React editor portals. Appended to `rootPortalElement` after init
+   * so core treats editor UI as inside the grid (see `#isPathWithinGrid`).
+   */
+  const editorPortalHostRef = useRef<HTMLElement | null>(null);
+
+  /**
+   * Reference to the previous props object.
+   */
+  const prevProps = useRef<HotTableProps>();
+
+  /**
+   * HotTable context exposing helper functions.
+   */
+  const context = useHotTableContext();
+
+  /**
+   * Getter for the property storing the Handsontable instance.
+   */
+  const getHotInstance = useCallback((): Handsontable | null => {
+    if (!__hotInstance.current || !__hotInstance.current.isDestroyed) {
+
+      // Will return the Handsontable instance or `null` if it's not yet been created.
+      return __hotInstance.current;
+
+    } else {
+      console.warn(HOT_DESTROYED_WARNING);
+
+      return null;
+    }
+  }, [__hotInstance]);
+
+  const isHotInstanceDestroyed = useCallback((): boolean => {
+    return !__hotInstance.current || __hotInstance.current.isDestroyed;
+  }, [__hotInstance]);
+
+  /**
+   * Clear both the editor and the renderer cache.
+   */
+  const clearCache = useCallback((): void => {
+    context.clearRenderedCellCache();
+    context.componentRendererColumns.clear();
+  }, [context]);
+
+  /**
+   * Get the `Document` object corresponding to the main component element.
+   *
+   * @returns The `Document` object used by the component.
+   */
+  const getOwnerDocument = useCallback((): Document | null => {
+    if (isCSR()) {
+      return hotElementRef.current ? hotElementRef.current.ownerDocument : document;
+    }
+
+    return null;
+  }, [hotElementRef]);
+
+  /**
+   * Get or create the stable editor portal host.
+   *
+   * @returns {HTMLElement | null} The host element, or `null` before a document is available.
+   */
+  const getEditorPortalHost = useCallback((): HTMLElement | null => {
+    const doc = getOwnerDocument();
+
+    if (!doc) {
+      return null;
+    }
+
+    if (!editorPortalHostRef.current) {
+      const host = doc.createElement('div');
+
+      host.className = EDITOR_PORTAL_HOST_CLASSNAME;
+      doc.body.appendChild(host);
+      editorPortalHostRef.current = host;
+    } else if (!editorPortalHostRef.current.isConnected) {
+      doc.body.appendChild(editorPortalHostRef.current);
+    }
+
+    return editorPortalHostRef.current;
+  }, [getOwnerDocument]);
+
+  /**
+   * Create a new settings object containing the column settings and global editors and renderers.
+   *
+   * @returns {Handsontable.GridSettings} New global set of settings for Handsontable.
+   */
+  const createNewGlobalSettings = (init: boolean = false, prevProps: HotTableProps = {}): Handsontable.GridSettings => {
+    const liveSettings = !isHotInstanceDestroyed() ? getHotInstance()?.getSettings() : undefined;
+    const initOnlySettingKeys = (liveSettings as any)?._initOnlySettings || [];
+    const newSettings = SettingsMapper.getSettings(
+      props, {
+        prevProps,
+        isInit: init,
+        initOnlySettingKeys,
+        currentSettings: liveSettings
+      }
+    );
+
+    if (context.columnsSettings.length) {
+      newSettings.columns = context.columnsSettings;
+    }
+
+    if (props.renderer) {
+      newSettings.renderer = context.getRendererWrapper(props.renderer);
+      context.componentRendererColumns.set('global', true);
+    } else {
+      newSettings.renderer = props.hotRenderer || getRenderer('text');
+    }
+
+    if (isComponentEditor(props.editor)) {
+      newSettings.editor = makeEditorClass(globalEditorHooksRef, globalEditorClassInstance);
+    } else {
+      const editorSetting = resolveEditorSetting(props.editor, props.hotEditor);
+
+      // `undefined` means neither prop named an editor, so the grid falls back to the default one.
+      newSettings.editor = editorSetting === undefined ?
+        getEditor('text') as Handsontable.GridSettings['editor'] :
+        editorSetting;
+    }
+
+    return newSettings;
+  };
+
+  /**
+   * Detect if `autoRowSize` or `autoColumnSize` is defined, and if so, throw an incompatibility warning.
+   */
+  const displayAutoSizeWarning = (hotInstance: Handsontable | null): void => {
+    if (
+      hotInstance &&
+      (
+        hotInstance.getPlugin('autoRowSize')?.enabled ||
+        hotInstance.getPlugin('autoColumnSize')?.enabled
+      )
+    ) {
+      if (context.componentRendererColumns.size > 0) {
+        warn(AUTOSIZE_WARNING);
+      }
+    }
+  };
+
+  /**
+   * Initialize Handsontable after the component has mounted.
+   */
+  useEffect(() => {
+    // React guarantees child effects run before parent effects on each
+    // commit, so by the time this parent useEffect runs, every HotColumn
+    // has already written its slot. Trim to drop any leftover slots from
+    // a previous mount (e.g. StrictMode's double-invoke or HMR).
+    const hotColumnCount = Children.toArray(props.children).filter(isHotColumn).length;
+
+    context.trimColumnSettings(hotColumnCount);
+
+    const newGlobalSettings = createNewGlobalSettings(true);
+
+    // Update prevProps with the current props
+    prevProps.current = props;
+
+    __hotInstance.current = new Handsontable.Core(hotElementRef.current!, newGlobalSettings);
+
+    /**
+     * Handsontable's `beforeViewRender` hook callback.
+     */
+    __hotInstance.current.addHook('beforeViewRender', () => {
+      context.clearPortalCache();
+      context.clearRenderedCellCache();
+    });
+
+    /**
+     * Handsontable's `afterViewRender` hook callback.
+     */
+    __hotInstance.current.addHook('afterViewRender', () => {
+      context.pushCellPortalsIntoPortalManager();
+    });
+
+    __hotInstance.current.init();
+
+    const portalHost = editorPortalHostRef.current;
+    const rootPortalElement = __hotInstance.current.rootPortalElement;
+
+    if (portalHost && rootPortalElement) {
+      if (portalHost.parentNode !== rootPortalElement) {
+        rootPortalElement.appendChild(portalHost);
+      }
+    } else if (portalHost && !rootPortalElement) {
+      warn(MISSING_ROOT_PORTAL_WARNING);
+    }
+
+    displayAutoSizeWarning(__hotInstance.current);
+
+    if (!displayObsoleteRenderersEditorsWarning(props.children)) {
+      displayChildrenOfTypeWarning(props.children, HotColumn);
+    }
+
+    /**
+     * Destroy the Handsontable instance when the parent component unmounts.
+     */
+    return () => {
+      editorPortalHostRef.current?.remove();
+      clearCache();
+      getHotInstance()?.destroy();
+    }
+  }, []);
+
+  /**
+   * Logic performed after the component update.
+   */
+  useUpdateEffect((): void => {
+    clearCache();
+
+    const hotInstance = getHotInstance();
+
+    // React guarantees child effects run before parent effects on each
+    // commit, so by the time this parent useUpdateEffect runs, every
+    // surviving HotColumn has already written its slot. Trim to drop
+    // stale entries left behind by HotColumns that unmounted.
+    const hotColumnCount = Children.toArray(props.children).filter(isHotColumn).length;
+
+    context.trimColumnSettings(hotColumnCount);
+
+    const newGlobalSettings = createNewGlobalSettings(false, prevProps.current);
+
+    // Update prevProps with the current props
+    prevProps.current = props;
+
+    hotInstance?.updateSettings(newGlobalSettings, false);
+
+    displayAutoSizeWarning(hotInstance);
+    displayObsoleteRenderersEditorsWarning(props.children);
+  });
+
+  /**
+   * Interface exposed to parent components by HotTable instance via React ref
+   */
+  useImperativeHandle(ref, () => ({
+    get hotElementRef() {
+      return hotElementRef.current!;
+    },
+    get hotInstance() {
+      return getHotInstance();
+    }
+  }));
+
+  /**
+   * Render the component.
+   */
+  const hotColumnWrapped = Children.toArray(props.children)
+    .filter(isHotColumn)
+    .map((childNode, columnIndex) => (
+      <HotColumnContextProvider columnIndex={columnIndex}
+                                getOwnerDocument={getOwnerDocument}
+                                getEditorPortalHost={getEditorPortalHost}
+                                key={columnIndex}>
+        {childNode}
+      </HotColumnContextProvider>
+    ));
+
+  const containerProps = getContainerAttributesProps(props);
+  const editorPortal = createEditorPortal(getOwnerDocument(), props.editor, getEditorPortalHost());
+
+  return (
+    <Fragment>
+      <div
+        ref={hotElementRef}
+        {...containerProps}
+        style={{ height: '100%', ...containerProps.style }}
+      >
+        {hotColumnWrapped}
+      </div>
+      <RenderersPortalManager ref={context.setRenderersPortalManagerRef} />
+      <EditorContextProvider hooksRef={globalEditorHooksRef}
+                             hotCustomEditorInstanceRef={globalEditorClassInstance}>
+        {editorPortal}
+      </EditorContextProvider>
+    </Fragment>
+  );
+});
+
+/**
+ * Prop types to be checked at runtime.
+ */
+HotTableInner.propTypes = {
+  style: PropTypes.object,
+  id: PropTypes.string,
+  className: PropTypes.string
+};
+
+export default HotTableInner;
+export { HotTableInner };

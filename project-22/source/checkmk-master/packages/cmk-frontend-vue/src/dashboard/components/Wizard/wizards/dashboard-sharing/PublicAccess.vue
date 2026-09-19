@@ -1,0 +1,302 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import CmkAlertBox from 'cmk-ui-library/components/CmkAlertBox.vue'
+import CmkButton from 'cmk-ui-library/components/CmkButton'
+import CmkCatalogPanel from 'cmk-ui-library/components/CmkCatalogPanel.vue'
+import CmkCode from 'cmk-ui-library/components/CmkCode.vue'
+import CmkLabel from 'cmk-ui-library/components/CmkLabel.vue'
+import CmkHeading from 'cmk-ui-library/components/typography/CmkHeading.vue'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import { type Reactive, computed, reactive, ref, toRef, watch } from 'vue'
+
+import ContentSpacer from '@/dashboard/components/ContentSpacer.vue'
+import PopupDialog, { type PopupDialogProps } from '@/dashboard/components/PopupDialog.vue'
+import type { DashboardFeatures, DashboardKey } from '@/dashboard/types/dashboard'
+import { urlHandler } from '@/dashboard/utils'
+
+import PublicAccessSettings from './PublicAccessSettings.vue'
+import RuntimeFiltersWarning from './RuntimeFiltersWarning.vue'
+import { type DashboardTokenModel } from './api'
+import { usePublicAccess } from './composables/usePublicAccess'
+
+const { _t } = usei18n()
+
+interface PublicAccessLinkProps {
+  dashboardKey: DashboardKey
+  publicToken: DashboardTokenModel | null
+  dashboardFeatures: DashboardFeatures
+  hasRuntimeFilters: boolean
+}
+
+interface PublicAccessEmits {
+  refreshDashboardSettings: []
+  reviewFilters: []
+}
+const props = defineProps<PublicAccessLinkProps>()
+const emit = defineEmits<PublicAccessEmits>()
+
+const dialogData: Reactive<PopupDialogProps> = reactive({
+  open: false,
+  title: _t('Stop sharing public link?'),
+  message: _t('This will disable the link and revoke access for all viewers.'),
+  variant: 'warning',
+  buttons: [
+    {
+      title: _t('Enable access'),
+      testId: 'enable-access-popup-action',
+      variant: 'warning',
+      onclick: () => {}
+    }
+  ]
+})
+
+const handler = usePublicAccess(
+  props.dashboardKey.name,
+  props.dashboardKey.owner,
+  toRef(props, 'publicToken'),
+  props.dashboardFeatures
+)
+
+const activeAction = ref<'create' | 'update' | 'delete' | null>(null)
+const actionInProgress = computed(() => activeAction.value !== null)
+const displayReviewFilterDialog = ref<boolean>(false)
+
+watch(
+  () => props.publicToken,
+  () => {
+    activeAction.value = null
+  }
+)
+
+const handleEnableAccess = async () => {
+  if (actionInProgress.value || !handler.validate()) {
+    return
+  }
+
+  if (props.hasRuntimeFilters) {
+    displayReviewFilterDialog.value = true
+    return
+  }
+
+  dialogData.title = _t('Enable public link?')
+  dialogData.message = [_t('Anyone with the link can view this dashboard.')]
+
+  if (handler.validUntil.value) {
+    const expiryDateStr = handler.validUntil.value.toISOString().split('T')[0]!
+    dialogData.message.push(
+      _t('Access will automatically expire on %{date}.', { date: expiryDateStr })
+    )
+  }
+
+  dialogData.buttons = [
+    {
+      title: _t('Enable access'),
+      variant: 'warning',
+      testId: 'enable-access-popup-action',
+      onclick: async () => {
+        dialogData.open = false
+        activeAction.value = 'update'
+        handler.isDisabled.value = false
+        await handler.updateToken()
+        emit('refreshDashboardSettings')
+      }
+    }
+  ]
+
+  dialogData.open = true
+}
+
+const handleDisableAccess = async () => {
+  if (actionInProgress.value || !handler.validate()) {
+    return
+  }
+  dialogData.title = _t('Stop sharing public link?')
+  dialogData.message = _t('This will disable the link and revoke access for all viewers.')
+
+  dialogData.buttons = [
+    {
+      title: _t('Disable access'),
+      variant: 'warning',
+      testId: 'disable-access-popup-action',
+      onclick: async () => {
+        dialogData.open = false
+        activeAction.value = 'update'
+        handler.isDisabled.value = true
+        await handler.updateToken()
+        emit('refreshDashboardSettings')
+      }
+    }
+  ]
+
+  dialogData.open = true
+}
+
+const handleCreate = async () => {
+  if (actionInProgress.value) {
+    return
+  }
+
+  if (props.hasRuntimeFilters) {
+    displayReviewFilterDialog.value = true
+    return
+  }
+
+  activeAction.value = 'create'
+  await handler.createToken()
+  emit('refreshDashboardSettings')
+}
+
+const handleDelete = () => {
+  if (actionInProgress.value) {
+    return
+  }
+  dialogData.title = _t('Delete public link?')
+  dialogData.message = _t('This will delete the link and revoke access for all viewers.')
+
+  dialogData.buttons = [
+    {
+      title: _t('Delete public link?'),
+      variant: 'warning',
+      onclick: async () => {
+        dialogData.open = false
+        activeAction.value = 'delete'
+        await handler.deleteToken()
+        emit('refreshDashboardSettings')
+      }
+    }
+  ]
+  dialogData.open = true
+}
+
+const handleUpdate = async () => {
+  if (actionInProgress.value || !handler.validate()) {
+    return
+  }
+  activeAction.value = 'update'
+  await handler.updateToken()
+  emit('refreshDashboardSettings')
+}
+</script>
+
+<template>
+  <CmkCatalogPanel :title="_t('Public access')" variant="padded">
+    <CmkHeading type="h3">{{ _t('Anyone with this link can view the dashboard') }}</CmkHeading>
+    <CmkAlertBox variant="info">
+      <ul class="db-public-access__info">
+        <li>{{ _t('Navigation and menus are hidden.') }}</li>
+        <li>
+          {{ _t("Runtime filtering isn't available. Set default filter values before sharing.") }}
+        </li>
+        <li>
+          {{ _t('View widgets may not render all rows, if they exceed the soft limit.') }}
+        </li>
+        <li>{{ _t('Sidebar widgets are not available on shared dashboards.') }}</li>
+      </ul>
+    </CmkAlertBox>
+
+    <div v-if="displayReviewFilterDialog">
+      <ContentSpacer :dimension="4" />
+      <RuntimeFiltersWarning @review-filters="emit('reviewFilters')" />
+    </div>
+
+    <ContentSpacer :dimension="5" />
+
+    <PopupDialog
+      :open="dialogData.open"
+      :title="dialogData.title"
+      :message="dialogData.message"
+      :buttons="dialogData.buttons"
+      :variant="dialogData.variant"
+      :dismissal_button="{ title: _t('Cancel'), key: 'cancel' }"
+      @close="dialogData.open = false"
+    />
+
+    <CmkButton
+      v-if="!publicToken"
+      :disabled="actionInProgress"
+      :class="{ 'shimmer-input-button': activeAction === 'create' }"
+      @click="handleCreate"
+      >{{ _t('Generate public link') }}</CmkButton
+    >
+    <template v-else>
+      <CmkLabel>{{ _t('Public dashboard URL') }}</CmkLabel>
+      <div class="db-public-access__row">
+        <CmkCode
+          class="db-public-access__cell db-public-access__overflow"
+          :code-text="urlHandler.getSharedDashboardLink(publicToken.token_id)"
+        />
+
+        <div class="db-public-access__cell">
+          <CmkButton
+            v-if="publicToken.is_disabled"
+            :disabled="actionInProgress"
+            :class="{ 'shimmer-input-button': activeAction === 'update' }"
+            @click="handleEnableAccess"
+            >{{ _t('Enable access') }}</CmkButton
+          >
+
+          <CmkButton
+            v-else
+            :disabled="actionInProgress"
+            :class="{ 'shimmer-input-button': activeAction === 'update' }"
+            @click="handleDisableAccess"
+            >{{ _t('Disable access') }}</CmkButton
+          >
+        </div>
+
+        <div class="db-public-access__cell">
+          <a href="#" @click.prevent="handleDelete">{{ _t('Delete') }}</a>
+        </div>
+      </div>
+    </template>
+
+    <template v-if="handler.isShared.value">
+      <ContentSpacer :height="10" />
+      <hr class="db-public-access__hr" />
+      <ContentSpacer :dimension="7" />
+      <PublicAccessSettings
+        v-model:has-validity="handler.hasValidity.value"
+        v-model:valid-until="handler.validUntil.value"
+        v-model:comment="handler.comment.value"
+        :validate="handler.validate"
+        :validation-error="handler.validationError.value"
+        :dashboard-features="dashboardFeatures"
+        @update-settings="handleUpdate"
+      />
+    </template>
+  </CmkCatalogPanel>
+</template>
+
+<style scoped>
+.db-public-access__info {
+  padding-inline-start: var(--dimension-8);
+  margin-block: 0;
+}
+
+.db-public-access__row {
+  display: flex;
+  flex-flow: row nowrap;
+  place-content: flex-start space-between;
+  align-items: baseline;
+  width: 100%;
+  gap: var(--dimension-5);
+}
+
+.db-public-access__cell {
+  text-wrap: nowrap;
+}
+
+.db-public-access__overflow {
+  overflow-x: auto;
+}
+
+.db-public-access__hr {
+  width: 100%;
+  border: none;
+  border-bottom: var(--dimension-1) solid var(--ux-theme-5);
+}
+</style>

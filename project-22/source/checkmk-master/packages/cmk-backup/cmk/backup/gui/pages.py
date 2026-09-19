@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+"""Pages for managing backup and restore of WATO"""
+
+from collections.abc import Collection
+from typing import override
+
+import cmk.utils.paths
+from cmk.backup.gui import handler
+from cmk.ccc.version import Edition
+from cmk.crypto.password import Password
+from cmk.gui.config import active_config
+from cmk.gui.i18n import _
+from cmk.gui.logged_in import user
+from cmk.gui.pages import AjaxPage, PageContext, PageEndpoint, PageRegistry, PageResult
+from cmk.gui.watolib.audit_log import log_audit
+from cmk.gui.watolib.mode import ModeRegistry, WatoMode
+from cmk.web.utils.permission_verification import PermissionName
+
+
+def register(edition: Edition, page_registry: PageRegistry, mode_registry: ModeRegistry) -> None:
+    page_registry.register(PageEndpoint("ajax_backup_job_state", PageAjaxBackupJobState(edition)))
+    mode_registry.register(ModeBackup)
+    mode_registry.register(ModeBackupTargets)
+    mode_registry.register(ModeEditBackupTarget)
+    mode_registry.register(ModeEditBackupJob)
+    mode_registry.register(ModeBackupJobState)
+    mode_registry.register(ModeBackupKeyManagement)
+    mode_registry.register(ModeBackupEditKey)
+    mode_registry.register(ModeBackupUploadKey)
+    mode_registry.register(ModeBackupDownloadKey)
+    mode_registry.register(ModeBackupRestore)
+
+
+class ModeBackup(handler.ModeBackup):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "backup"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["backups"]
+
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx, key_store=make_site_backup_keypair_store())
+
+    @override
+    def title(self) -> str:
+        return _("Site backup")
+
+
+class ModeBackupTargets(handler.ModeBackupTargets):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "backup_targets"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["backups"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeBackup
+
+
+class ModeEditBackupTarget(handler.ModeEditBackupTarget):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "edit_backup_target"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["backups"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeBackupTargets
+
+
+class ModeEditBackupJob(handler.ModeEditBackupJob):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "edit_backup_job"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["backups"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeBackup
+
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx, key_store=make_site_backup_keypair_store())
+
+
+class ModeBackupJobState(handler.ModeBackupJobState):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "backup_job_state"
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeBackup
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["backups"]
+
+
+class PageAjaxBackupJobState(AjaxPage):
+    def __init__(self, edition: Edition) -> None:
+        self._edition = edition
+
+    # TODO: Better use AjaxPage.handle_page() for standard AJAX call error handling. This
+    # would need larger refactoring of the generic html.popup_trigger() mechanism.
+    @override
+    def handle_page(self, ctx: PageContext) -> None:
+        self._handle_exc(ctx, self.page)
+
+    @override
+    def page(self, ctx: PageContext) -> PageResult:
+        user.need_permission("wato.backups")
+        handler.show_job_details(
+            handler.PageBackupRestoreState().job
+            if ctx.request.var("job") == "restore"
+            else ModeBackupJobState(self._edition, ctx).job
+        )
+        return None
+
+
+def make_site_backup_keypair_store() -> handler.BackupKeypairStore:
+    return handler.BackupKeypairStore(cmk.utils.paths.default_config_dir / "backup_keys.mk", "keys")
+
+
+class ModeBackupKeyManagement(handler.ModeBackupKeyManagement):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "backup_keys"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["backups"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeBackup
+
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx, key_store=make_site_backup_keypair_store())
+
+
+class ModeBackupEditKey(handler.ModeBackupEditKey):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "backup_edit_key"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["backups"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeBackupKeyManagement
+
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx, key_store=make_site_backup_keypair_store())
+
+
+class ModeBackupUploadKey(handler.ModeBackupUploadKey):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "backup_upload_key"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["backups"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeBackupKeyManagement
+
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx, key_store=make_site_backup_keypair_store())
+
+    @override
+    def _upload_key(self, key_file: str, alias: str, passphrase: Password) -> None:
+        log_audit(
+            action="upload-backup-key",
+            message="Uploaded backup key '%s'" % alias,
+            user_id=user.id,
+            use_git=active_config.wato_use_git,
+        )
+        super()._upload_key(key_file, alias, passphrase)
+
+
+class ModeBackupDownloadKey(handler.ModeBackupDownloadKey):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "backup_download_key"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["backups"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeBackupKeyManagement
+
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx, key_store=make_site_backup_keypair_store())
+
+
+class ModeBackupRestore(handler.ModeBackupRestore):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "backup_restore"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["backups"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeBackup
+
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx, key_store=make_site_backup_keypair_store())

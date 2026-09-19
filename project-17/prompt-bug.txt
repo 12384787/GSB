@@ -1,0 +1,5 @@
+任务类型：Bug 修复
+任务难度：困难
+语言/框架：Go
+
+请在已有的 itchyny/gojq 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：Pure Go implementation of jq。围绕真实入口（.dockerignore,.gitattributes .github,.gitignore CHANGELOG.md,Dockerfile LICENSE,Makefile README.md,_gojq _tools,builtin.go builtin.jq,cli cmd,code.go compare.go,compare_test.go compiler.go,compiler_test.go debug.go,encoder.go encoder_test.go,env.go error.go,execute.go func.go,go.dev.mod go.dev.sum,go.mod go.sum,gojq.go iter.go,lexer.go module_loader.go,operator.go option.go,option_environ_loader_test.go option_function_test.go,option_input_iter_test.go option_iter_function_test.go,option_module_loader_test.go option_test.go,option_variables_test.go parser.go,parser.go.y preview.go,preview_test）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。

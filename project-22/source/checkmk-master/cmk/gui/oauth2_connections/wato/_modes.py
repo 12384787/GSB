@@ -1,0 +1,886 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import uuid
+from collections.abc import Collection, Mapping
+from dataclasses import asdict
+from typing import override
+
+from cmk.ccc.site import omd_site
+from cmk.ccc.version import Edition
+from cmk.gui import userdb
+from cmk.gui.breadcrumb import Breadcrumb
+from cmk.gui.config import active_config, Config
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.form_specs import RawDiskData, serialize_data_for_frontend
+from cmk.gui.form_specs.unstable import TwoColumnDictionary
+from cmk.gui.form_specs.visitors.single_choice import SingleChoiceVisitor
+from cmk.gui.htmllib.html import html
+from cmk.gui.http import request
+from cmk.gui.i18n import _, ungettext
+from cmk.gui.logged_in import user
+from cmk.gui.oauth2_connections.watolib.store import (
+    delete_oauth2_connection,
+    load_oauth2_connections,
+    OAuth2ConnectionsConfigFile,
+)
+from cmk.gui.page_menu import (
+    make_simple_link,
+    PageMenu,
+    PageMenuDropdown,
+    PageMenuEntry,
+    PageMenuSearch,
+    PageMenuTopic,
+)
+from cmk.gui.pages import PageContext
+from cmk.gui.site_config import site_is_local
+from cmk.gui.table import Table
+from cmk.gui.type_defs import ActionResult
+from cmk.gui.user_sites import activation_sites, get_configured_site_choices
+from cmk.gui.utils.transaction_manager import transactions
+from cmk.gui.wato import SimpleEditMode, SimpleListMode, SimpleModeType
+from cmk.gui.wato._group_selection import sorted_contact_group_choices
+from cmk.gui.watolib.audit_log import make_audit_log_change_hook
+from cmk.gui.watolib.config_domain_name import ABCConfigDomain
+from cmk.gui.watolib.config_domains import ConfigDomainCore
+from cmk.gui.watolib.hosts_and_folders import folder_preserving_link, folder_tree
+from cmk.gui.watolib.mode import mode_url, ModeRegistry, redirect, WatoMode
+from cmk.gui.watolib.passwords import load_passwords, remove_password
+from cmk.gui.watolib.pending_changes import (
+    index_update_change_hook,
+    PendingChanges,
+    PendingChangesStore,
+)
+from cmk.gui.watolib.rulesets import SingleRulesetRecursively
+from cmk.gui.watolib.rulespecs import rulespec_registry
+from cmk.gui.watolib.sidebar_reload import sidebar_reload_change_hook
+from cmk.livestatus_client import SiteConfiguration
+from cmk.rulesets.internal.form_specs import (
+    MultipleChoiceElementExtended,
+    MultipleChoiceExtended,
+    MultipleChoiceExtendedLayout,
+    SingleChoiceElementExtended,
+    SingleChoiceExtended,
+)
+from cmk.rulesets.v1 import Help, Message, Title
+from cmk.rulesets.v1.form_specs import (
+    CascadingSingleChoice,
+    CascadingSingleChoiceElement,
+    DefaultValue,
+    DictElement,
+    DictGroup,
+    Dictionary,
+    FixedValue,
+    InputHint,
+    Password,
+    String,
+    validators,
+)
+from cmk.rulesets.v1.form_specs.validators import ValidationError
+from cmk.shared_typing.mode_oauth2_connection import (
+    AuthorityUrls,
+    MicrosoftEntraIdUrls,
+    Oauth2ConnectionConfig,
+    Oauth2Urls,
+)
+from cmk.utils.oauth2_connection import OAuth2Connection
+from cmk.web.utils.html import HTML
+from cmk.web.utils.icons import IconNames, StaticIcon
+from cmk.web.utils.permission_verification import PermissionName
+from cmk.web.utils.urls import makeuri, makeuri_contextless
+
+
+def register(mode_registry: ModeRegistry) -> None:
+    mode_registry.register(ModeRedirectOAuth2Connection)
+    mode_registry.register(ModeCreateOAuth2Connection)
+    mode_registry.register(ModeOAuth2Connections)
+    mode_registry.register(ModeMicrosoftEntraIdConnections)
+    mode_registry.register(ModeCreateMicrosoftEntraIdConnection)
+
+
+def uuid4_validator(error_msg: Message | None = None) -> validators.MatchRegex:
+    return validators.MatchRegex(
+        regex="^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
+        error_msg=error_msg,
+    )
+
+
+def _custom_validate_editable_by(value: tuple[str, object]) -> None:
+    if user.may("wato.edit_all_passwords"):
+        return
+
+    assert user.id
+    match value:
+        case ("administrators", None):
+            raise ValidationError(
+                Message(
+                    "Only users with the permission 'Write access to all passwords' can assign ownership to 'Administrators'."
+                )
+            )
+        case ("contact_group", group_name):
+            user_groups = userdb.contactgroups_of_user(user.id)
+            if group_name not in user_groups:
+                raise ValidationError(
+                    Message("You can only assign ownership to contact groups you are a member of.")
+                )
+        case _:
+            pass
+
+
+def get_oauth2_connection_form_spec(ident: str | None = None) -> Dictionary:
+    editable_by_elements: list[
+        CascadingSingleChoiceElement[str] | CascadingSingleChoiceElement[None]
+    ] = []
+    editable_by_default_value: DefaultValue[str] | None = None
+    if user.may("wato.edit_all_passwords"):
+        editable_by_elements.append(
+            CascadingSingleChoiceElement(
+                name="administrators",
+                title=Title("Administrators"),
+                parameter_form=FixedValue(value=None),
+            )
+        )
+        editable_by_default_value = DefaultValue("administrators")
+    user_contact_groups = userdb.contactgroups_of_user(user.id) if user.id else []
+    if user_contact_groups:
+        editable_by_elements.append(
+            CascadingSingleChoiceElement(
+                name="contact_group",
+                title=Title("Members of the contact group"),
+                parameter_form=SingleChoiceExtended(
+                    title=Title("Select contact group"),
+                    help_text=Help(
+                        "Select the contact group that can edit this OAuth2 connection."
+                    ),
+                    elements=[
+                        SingleChoiceElementExtended(
+                            name=name,
+                            title=Title("%(title)s") % {"title": title},
+                        )
+                        for name, title in sorted_contact_group_choices()
+                        if name in user_contact_groups
+                    ],
+                ),
+            ),
+        )
+    configured_site_choices = get_configured_site_choices()
+    return TwoColumnDictionary(
+        title=Title("Define OAuth parameters"),
+        elements={
+            "ident": DictElement(
+                required=True,
+                render_only=True,
+                parameter_form=String(
+                    title=Title("OAuth2 connection ID"),
+                    help_text=Help("A unique identifier for this OAuth2 connection."),
+                    prefill=DefaultValue(ident or str(uuid.uuid4())),
+                    custom_validate=[
+                        uuid4_validator(
+                            error_msg=Message("OAuth2 connection ID must be a valid UUID.")
+                        ),
+                    ],
+                ),
+                group=DictGroup(title=Title("Hidden")),
+            ),
+            "override_site": DictElement(
+                required=False,
+                parameter_form=SingleChoiceExtended(
+                    title=Title("Use different site for authentication process"),
+                    elements=[
+                        SingleChoiceElementExtended(
+                            name=site_id,
+                            title=Title("%(name)s") % {"name": name},
+                        )
+                        for site_id, name in configured_site_choices
+                    ],
+                    prefill=DefaultValue(configured_site_choices[0][0])
+                    if configured_site_choices
+                    else InputHint(Title("Please choose")),
+                ),
+                group=DictGroup(title=Title("Redirect URI")),
+            ),
+            "title": DictElement(
+                required=True,
+                parameter_form=String(
+                    title=Title("Title"),
+                    help_text=Help("A descriptive name for this OAuth2 connection."),
+                    custom_validate=[
+                        validators.LengthInRange(
+                            min_value=1, error_msg=Message("Title is required")
+                        ),
+                    ],
+                ),
+                group=DictGroup(title=Title("General properties")),
+            ),
+            "editable_by": DictElement(
+                required=True,
+                parameter_form=CascadingSingleChoice(
+                    title=Title("Editable by"),
+                    prefill=editable_by_default_value or DefaultValue("contact_group"),
+                    elements=editable_by_elements,
+                    custom_validate=[_custom_validate_editable_by],
+                ),
+                group=DictGroup(title=Title("General properties")),
+            ),
+            "shared_with": DictElement(
+                required=True,
+                parameter_form=MultipleChoiceExtended(
+                    title=Title("Share with"),
+                    elements=[
+                        MultipleChoiceElementExtended(
+                            name=name,
+                            title=Title("%(title)s") % {"title": title},
+                        )
+                        for name, title in sorted_contact_group_choices()
+                    ],
+                    show_toggle_all=True,
+                    layout=MultipleChoiceExtendedLayout.dual_list,
+                ),
+                group=DictGroup(title=Title("General properties")),
+            ),
+            "sites": DictElement(
+                required=True,
+                parameter_form=CascadingSingleChoice(
+                    title=Title("Sites"),
+                    help_text=Help(
+                        "Restrict this OAuth2 connection to specific sites or make it available on all sites."
+                    ),
+                    prefill=DefaultValue("all"),
+                    elements=[
+                        CascadingSingleChoiceElement(
+                            name="all",
+                            title=Title("All sites"),
+                            parameter_form=FixedValue(value=None),
+                        ),
+                        CascadingSingleChoiceElement(
+                            name="restricted",
+                            title=Title("Restricted to specific sites"),
+                            parameter_form=MultipleChoiceExtended(
+                                title=Title("Site restriction"),
+                                help_text=Help(
+                                    "Restrict this OAuth2 connection to specific sites."
+                                ),
+                                elements=[
+                                    MultipleChoiceElementExtended(
+                                        name=site_id,
+                                        title=Title("%(name)s") % {"name": name},
+                                    )
+                                    for site_id, name in get_configured_site_choices()
+                                ],
+                                show_toggle_all=True,
+                                layout=MultipleChoiceExtendedLayout.dual_list,
+                            ),
+                        ),
+                    ],
+                ),
+                group=DictGroup(title=Title("General properties")),
+            ),
+            "authority": DictElement(
+                required=True,
+                parameter_form=SingleChoiceExtended(
+                    title=Title("Authority"),
+                    help_text=Help("Select the authority for the OAuth2 connection."),
+                    elements=[
+                        SingleChoiceElementExtended(
+                            name="global",
+                            title=Title("Global"),
+                        ),
+                        SingleChoiceElementExtended(
+                            name="china",
+                            title=Title("China"),
+                        ),
+                    ],
+                    prefill=DefaultValue("global"),
+                ),
+                group=DictGroup(title=Title("IDs")),
+            ),
+            "tenant_id": DictElement(
+                required=True,
+                parameter_form=String(
+                    title=Title("Directory (tenant) ID"),
+                    help_text=Help(
+                        "The Directory (Tenant) ID of your Microsoft Entra ID instance."
+                    ),
+                    custom_validate=[
+                        validators.LengthInRange(
+                            min_value=1, error_msg=Message("Tenant ID is required")
+                        ),
+                        uuid4_validator(error_msg=Message("Tenant ID must be a valid UUID.")),
+                    ],
+                ),
+                group=DictGroup(title=Title("IDs")),
+            ),
+            "client_id": DictElement(
+                required=True,
+                parameter_form=String(
+                    title=Title("Application (client) ID"),
+                    help_text=Help("The Application (Client) ID of your registered application."),
+                    custom_validate=[
+                        validators.LengthInRange(
+                            min_value=1, error_msg=Message("Client ID is required")
+                        ),
+                        uuid4_validator(error_msg=Message("Client ID must be a valid UUID.")),
+                    ],
+                ),
+                group=DictGroup(title=Title("IDs")),
+            ),
+            "client_secret": DictElement(
+                required=True,
+                parameter_form=Password(
+                    title=Title("Client secret"),
+                    help_text=Help("The client secret of your registered application."),
+                    custom_validate=[
+                        validators.LengthInRange(
+                            min_value=1, error_msg=Message("Client secret is required")
+                        ),
+                    ],
+                ),
+                group=DictGroup(title=Title("Secret")),
+            ),
+            "access_token": DictElement(
+                render_only=True,
+                required=True,
+                parameter_form=Password(
+                    title=Title("Access token"),
+                    help_text=Help("The access token for this OAuth2 connection."),
+                    custom_validate=[
+                        validators.LengthInRange(
+                            min_value=1, error_msg=Message("Access token is required")
+                        ),
+                    ],
+                ),
+                group=DictGroup(title=Title("Hidden")),
+            ),
+            "refresh_token": DictElement(
+                render_only=True,
+                required=True,
+                parameter_form=Password(
+                    title=Title("Refresh token"),
+                    help_text=Help("The refresh token for this OAuth2 connection."),
+                    custom_validate=[
+                        validators.LengthInRange(
+                            min_value=1, error_msg=Message("Refresh token is required")
+                        ),
+                    ],
+                ),
+                group=DictGroup(title=Title("Hidden")),
+            ),
+        },
+    )
+
+
+def _site_redirect_url(site_config: SiteConfiguration) -> str | None:
+    redirect_path = "wato.py?mode=redirect_oauth2_connection"
+    if site_is_local(site_config):
+        return f"{request.host_url}{omd_site()}/check_mk/{redirect_path}"
+    multisiteurl = site_config.get("multisiteurl", "")
+    return f"{multisiteurl}{redirect_path}" if multisiteurl else None
+
+
+def _get_site_redirect_urls() -> Mapping[str, str]:
+    return {
+        SingleChoiceVisitor.option_id(site_id): url
+        for site_id, site_config in active_config.sites.items()
+        if (url := _site_redirect_url(site_config)) is not None
+    }
+
+
+def get_oauth2_connection_config() -> Oauth2ConnectionConfig:
+    return Oauth2ConnectionConfig(
+        urls=Oauth2Urls(
+            redirect=makeuri(request, [("mode", "redirect_oauth2_connection")]),
+            site_redirect_urls=_get_site_redirect_urls(),
+            back=makeuri(request, [("mode", "oauth2_connections")]),
+            microsoft_entra_id=MicrosoftEntraIdUrls(
+                global_=AuthorityUrls(
+                    base_url="https://login.microsoftonline.com/###tenant_id###/oauth2/v2.0"
+                ),
+                china=AuthorityUrls(
+                    base_url="https://login.chinacloudapi.cn/###tenant_id###/oauth2/v2.0"
+                ),
+            ),
+        )
+    )
+
+
+def get_authority_mapping() -> Mapping[str, str]:
+    return {
+        SingleChoiceVisitor.option_id("global"): "global_",
+        SingleChoiceVisitor.option_id("china"): "china",
+    }
+
+
+class OAuth2ModeType(SimpleModeType[OAuth2Connection]):
+    @override
+    def type_name(self) -> str:
+        return "oauth2_connection"
+
+    @override
+    def name_singular(self) -> str:
+        return _("OAuth2 connection")
+
+    @override
+    def is_site_specific(self) -> bool:
+        return False
+
+    @override
+    def can_be_disabled(self) -> bool:
+        return False
+
+    @override
+    def affected_config_domains(self) -> list[ABCConfigDomain]:
+        return [ConfigDomainCore()]
+
+
+class MicrosoftEntraIdModeType(SimpleModeType[OAuth2Connection]):
+    @override
+    def type_name(self) -> str:
+        return "microsoft_entra_id_connection"
+
+    @override
+    def name_singular(self) -> str:
+        return _("Microsoft Entra ID connection")
+
+    @override
+    def is_site_specific(self) -> bool:
+        return False
+
+    @override
+    def can_be_disabled(self) -> bool:
+        return False
+
+    @override
+    def edit_mode_name(self) -> str:
+        return "edit_microsoft_entra_id_connection"
+
+    @override
+    def affected_config_domains(self) -> list[ABCConfigDomain]:
+        return [ConfigDomainCore()]
+
+
+class ModeOAuth2Connections(SimpleListMode[OAuth2Connection]):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "oauth2_connections"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["general.oauth2_connections", "passwords"]
+
+    @override
+    def _table_title(self) -> str:
+        return self.title()
+
+    @classmethod
+    def _connector_type(cls) -> str | None:
+        return None
+
+    def __init__(
+        self,
+        edition: Edition,
+        ctx: PageContext,
+        mode_type: SimpleModeType[OAuth2Connection] | None = None,
+    ) -> None:
+        super().__init__(
+            edition,
+            ctx,
+            mode_type=mode_type or OAuth2ModeType(),
+            store=OAuth2ConnectionsConfigFile(),
+        )
+
+    @override
+    def title(self) -> str:
+        return _("OAuth2 connections")
+
+    @override
+    def page(self, config: Config) -> None:
+        self._show_table(
+            self._filter_for_connector_type(
+                self._store.filter_editable_entries(self._store.load_for_reading(), user)
+            ),
+            table_row_limit=config.table_row_limit,
+        )
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        return PageMenu(
+            dropdowns=[
+                PageMenuDropdown(
+                    name=self._mode_type.type_name(),
+                    title=self._mode_type.name_singular(),
+                    topics=[
+                        PageMenuTopic(
+                            title=self._mode_type.name_singular(),
+                            entries=[
+                                PageMenuEntry(
+                                    title=_("Add Microsoft Entra ID connection"),
+                                    icon_name=StaticIcon(IconNames.new),
+                                    item=make_simple_link(
+                                        makeuri_contextless(
+                                            request,
+                                            [
+                                                (
+                                                    "mode",
+                                                    "edit_microsoft_entra_id_connection",
+                                                ),
+                                            ],
+                                        )
+                                    ),
+                                    is_shortcut=True,
+                                    is_suggested=True,
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+            breadcrumb=breadcrumb,
+            inpage_search=PageMenuSearch(),
+        )
+
+    def _filter_for_connector_type(
+        self, entries: dict[str, OAuth2Connection]
+    ) -> dict[str, OAuth2Connection]:
+        if self._connector_type() is None:
+            return entries
+        return {
+            ident: entry
+            for ident, entry in entries.items()
+            if entry["connector_type"] == self._connector_type()
+        }
+
+    @override
+    def _show_entry_cells(self, table: Table, ident: str, entry: OAuth2Connection) -> None:
+        table.cell(_("Title"), entry["title"])
+        if self._connector_type() is None:
+            table.cell(_("Connector type"), entry["connector_type"])
+        table.cell(_("ID"), ident)
+
+    @override
+    def _delete_confirm_message(self) -> str:
+        return " ".join(
+            [
+                _(
+                    "<b>Beware:</b> The OAuth2 connection may be used in checks. If you "
+                    "delete the connection, the checks won't be able to "
+                    "authenticate with this connection anymore."
+                ),
+                super()._delete_confirm_message(),
+            ]
+        )
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        if not transactions.transaction_valid(request):
+            return None
+
+        action_var = request.get_str_input("_action")
+        if action_var is None:
+            return None
+
+        if not transactions.check_transaction(request):
+            return redirect(mode_url(self._mode_type.list_mode_name()))
+
+        ident = request.get_ascii_input("_delete")
+        entries = load_oauth2_connections()
+        if ident not in entries:
+            raise MKUserError(
+                "_delete",
+                _("This %(name)s does not exist.") % {"name": self._mode_type.name_singular()},
+            )
+
+        found_rules = []
+        for ruleset_name in [
+            "active_checks:mail",
+            "active_checks:mail_loop",
+            "active_checks:mailboxes",
+        ]:
+            for folder, index, rule in (
+                SingleRulesetRecursively.load_single_ruleset_recursively(
+                    folder_tree(), ruleset_name
+                )
+                .get_rulesets()[ruleset_name]
+                .get_rules()
+            ):
+                if str(("cmk_postprocessed", "oauth2_connection", ident)) in repr(rule.value):
+                    found_rules.append((ruleset_name, (folder, index, rule)))
+
+        if found_rules:
+            content = HTML.with_escaping("").join(
+                html.render_li(
+                    html.render_a(
+                        f"{rulespec_registry[ruleset_name].title} {index}",
+                        folder_preserving_link(
+                            request,
+                            [
+                                ("mode", "edit_rule"),
+                                ("varname", ruleset_name),
+                                ("rulenr", index),
+                                ("rule_folder", folder.path()),
+                                ("rule_id", rule.id),
+                            ],
+                        ),
+                    )
+                )
+                for ruleset_name, (folder, index, rule) in found_rules
+            )
+            raise MKUserError(
+                "_delete",
+                ungettext(
+                    "OAuth2 connection '%(title)s' is still being used by this rule: %(rules)s",
+                    "OAuth2 connection '%(title)s' is still being used by these rules: %(rules)s",
+                    len(found_rules),
+                )
+                % {"title": entries[ident]["title"], "rules": html.render_ul(content)},
+            )
+
+        pending_changes = PendingChanges(
+            activation_sites=activation_sites(config.sites),
+            local_site=omd_site(),
+            acting_user=user.id,
+            store=PendingChangesStore(),
+            hooks=(
+                make_audit_log_change_hook(use_git=config.wato_use_git),
+                sidebar_reload_change_hook,
+                index_update_change_hook,
+            ),
+        )
+        self._delete_passwords(entries[ident], config, pending_changes)
+        delete_oauth2_connection(
+            ident,
+            pprint_value=config.wato_pprint_config,
+            pending_changes=pending_changes,
+        )
+        return redirect(mode_url(self._mode_type.list_mode_name()))
+
+    def _delete_passwords(
+        self, entry: OAuth2Connection, config: Config, pending_changes: PendingChanges
+    ) -> None:
+        for key in ("client_secret", "access_token", "refresh_token"):
+            remove_password(
+                entry[key][2][0],
+                acting_user=user,
+                pprint_value=config.wato_pprint_config,
+                pending_changes=pending_changes,
+            )
+
+
+class ModeMicrosoftEntraIdConnections(ModeOAuth2Connections):
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx, mode_type=MicrosoftEntraIdModeType())
+
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "microsoft_entra_id_connections"
+
+    @override
+    def title(self) -> str:
+        return _("Microsoft Entra ID connections")
+
+    @override
+    def page(self, config: Config) -> None:
+        html.vue_component(component_name="cmk-oauth2-connection-info", data={})
+        super().page(config)
+
+    @classmethod
+    @override
+    def _connector_type(cls) -> str | None:
+        return "microsoft_entra_id"
+
+
+class ModeCreateOAuth2Connection(SimpleEditMode[OAuth2Connection]):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "edit_oauth2_connection"
+
+    def __init__(
+        self,
+        edition: Edition,
+        ctx: PageContext,
+        mode_type: SimpleModeType[OAuth2Connection] | None = None,
+    ) -> None:
+        super().__init__(
+            edition,
+            ctx,
+            mode_type=mode_type or OAuth2ModeType(),
+            store=OAuth2ConnectionsConfigFile(),
+        )
+
+    @classmethod
+    def _connector_type(cls) -> str | None:
+        return None
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["general.oauth2_connections", "passwords"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode[None]] | None:
+        return ModeOAuth2Connections
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        return PageMenu(dropdowns=[], breadcrumb=breadcrumb)
+
+    def _check_connection_permissions(self, editable_by: str | None) -> None:
+        if user.may("wato.edit_all_passwords"):
+            return
+
+        if editable_by is None:
+            raise MKUserError(
+                "",
+                _("You don't have permission to edit this %(name)s.")
+                % {"name": self._mode_type.name_singular()},
+            )
+        assert user.id
+        if editable_by not in userdb.contactgroups_of_user(user.id):
+            raise MKUserError(
+                "",
+                _("You don't have permission to edit this %(name)s.")
+                % {"name": self._mode_type.name_singular()},
+            )
+
+    @override
+    def page(self, config: Config, form_name: str = "edit") -> None:
+        html.enable_help_toggle()
+        assert user.id
+        if len(userdb.contactgroups_of_user(user.id)) == 0 and not user.may(
+            "wato.edit_all_passwords"
+        ):
+            raise MKUserError(
+                "",
+                _("You need to be a member of at least one contact group to create a %(name)s.")
+                % {"name": self._mode_type.name_singular()},
+            )
+
+        if self._new and not self._clone:
+            html.vue_component(
+                "cmk-mode-create-oauth2-connection",
+                data={
+                    "new": True,
+                    "config": asdict(get_oauth2_connection_config()),
+                    "form_spec": asdict(
+                        serialize_data_for_frontend(
+                            form_spec=get_oauth2_connection_form_spec(),
+                            field_id=form_name,
+                            do_validate=False,
+                        )
+                    ),
+                    "authority_mapping": get_authority_mapping(),
+                    "connector_type": self._connector_type(),
+                },
+            )
+            return
+
+        client_secret = load_passwords(user)[self._entry["client_secret"][2][0]]
+        editable_by = client_secret["owned_by"]
+        self._check_connection_permissions(editable_by)
+
+        if self._clone:
+            html.vue_component(
+                "cmk-mode-create-oauth2-connection",
+                data={
+                    "new": True,
+                    "config": asdict(get_oauth2_connection_config()),
+                    "form_spec": asdict(
+                        serialize_data_for_frontend(
+                            form_spec=get_oauth2_connection_form_spec(),
+                            value=RawDiskData(
+                                {k: v for k, v in self._entry.items() if k != "connector_type"}
+                                | {
+                                    "editable_by": ("contact_group", editable_by)
+                                    if editable_by
+                                    else ("administrators", None),
+                                    "shared_with": client_secret["shared_with"],
+                                }
+                            ),
+                            field_id=form_name,
+                            do_validate=False,
+                        )
+                    ),
+                    "authority_mapping": get_authority_mapping(),
+                    "connector_type": self._entry["connector_type"],
+                },
+            )
+            return
+
+        html.vue_component(
+            "cmk-mode-create-oauth2-connection",
+            data={
+                "new": False,
+                "config": asdict(get_oauth2_connection_config()),
+                "form_spec": asdict(
+                    serialize_data_for_frontend(
+                        form_spec=get_oauth2_connection_form_spec(self._ident),
+                        value=RawDiskData(
+                            value={k: v for k, v in self._entry.items() if k != "connector_type"}
+                            | {
+                                "editable_by": ("contact_group", editable_by)
+                                if editable_by
+                                else ("administrators", None),
+                                "shared_with": client_secret["shared_with"],
+                            }
+                        ),
+                        field_id=form_name,
+                        do_validate=False,
+                    )
+                ),
+                "authority_mapping": get_authority_mapping(),
+                "connector_type": self._entry["connector_type"],
+            },
+        )
+
+
+class ModeCreateMicrosoftEntraIdConnection(ModeCreateOAuth2Connection):
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx, mode_type=MicrosoftEntraIdModeType())
+
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "edit_microsoft_entra_id_connection"
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode[None]] | None:
+        return ModeMicrosoftEntraIdConnections
+
+    @classmethod
+    @override
+    def _connector_type(cls) -> str | None:
+        return "microsoft_entra_id"
+
+
+class ModeRedirectOAuth2Connection(WatoMode[None]):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "redirect_oauth2_connection"
+
+    @override
+    def title(self) -> str:
+        return _("OAuth2 connection")
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["general.oauth2_connections", "passwords"]
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        return PageMenu(dropdowns=[], breadcrumb=breadcrumb)
+
+    @override
+    def page(self, config: Config) -> None:
+        html.vue_component(
+            "cmk-mode-redirect-oauth2-connection",
+            data={"code": request.get_ascii_input("code")},
+        )

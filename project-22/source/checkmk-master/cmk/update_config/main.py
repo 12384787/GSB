@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+# Copyright (C) 2021 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+"""Tool for updating Checkmk configuration files after version updates
+
+This command is normally executed automatically at the end of "omd update" on
+all sites and on remote sites after receiving a snapshot and does not need to
+be called manually.
+"""
+
+import argparse
+import logging
+import os
+import subprocess
+import sys
+import traceback
+from collections.abc import Callable, Generator, Iterator, Sequence
+from contextlib import contextmanager
+from itertools import chain
+from typing import Literal
+
+# This special script needs persistence and conversion code from different
+# places of Checkmk. We may centralize the conversion and move the persistance
+# to a specific layer in the future, but for the the moment we need to deal
+# with it.
+from cmk.base import config as base_config
+from cmk.ccc import debug, tty
+from cmk.ccc.log import CMKFormatter
+from cmk.ccc.site import omd_site, SiteId
+from cmk.ccc.version import Edition
+from cmk.ccc.version import edition as cmk_edition
+from cmk.gui import main_modules
+from cmk.gui.config import active_config
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.log import logger as gui_logger
+from cmk.gui.request_globals import set_global_vars
+from cmk.gui.session_context import SuperUserContext
+from cmk.gui.site_config import all_activation_sites, is_distributed_setup_remote_site
+from cmk.gui.watolib.audit_log import make_audit_log_change_hook
+from cmk.gui.watolib.automations import ENV_VARIABLE_FORCE_CLI_INTERFACE
+from cmk.gui.watolib.config_domain_name import CORE
+from cmk.gui.watolib.pending_changes import (
+    Change,
+    ChangeScope,
+    index_update_change_hook,
+    PendingChanges,
+    PendingChangesStore,
+)
+from cmk.gui.watolib.site_changes import ChangeSpec
+from cmk.gui.wsgi.app import gui_context
+from cmk.update_config.plugins.pre_actions.utils import ConflictMode
+from cmk.utils import log, paths
+from cmk.utils.log import VERBOSE
+from cmk.utils.paths import check_mk_config_dir
+from cmk.utils.plugin_loader import load_plugins_with_exceptions
+from cmk.utils.redis import disable_redis
+
+from .registry import pre_update_action_registry, update_action_registry
+
+
+def main(
+    args: Sequence[str], ensure_site_is_stopped_callback: Callable[[logging.Logger], None]
+) -> int:
+    arguments = _parse_arguments(args)
+
+    if arguments.debug:
+        debug.enable()
+
+    logger = _setup_logging(arguments.verbose)
+    logger.debug("parsed arguments: %(arguments)s", {"arguments": arguments})
+
+    if not arguments.site_may_run:
+        ensure_site_is_stopped_callback(logger)
+
+    logger.info(
+        "%(yellow)sATTENTION%(normal)s\n  Some steps may take a long time depending "
+        "on your installation.\n  Please be patient.\n",
+        {"yellow": tty.yellow, "normal": tty.normal},
+    )
+    edition = cmk_edition(paths.omd_root)
+    main_modules.register(edition)
+
+    with _force_automations_cli_interface():
+        exit_code = main_check_config(edition, logger, arguments.conflict)
+        if exit_code != 0 or arguments.dry_run:
+            return exit_code
+        return main_update_config(edition, logger, arguments.conflict)
+
+
+def main_update_config(
+    edition: Edition,
+    logger: logging.Logger,
+    conflict: ConflictMode,  # noqa: ARG001
+) -> Literal[0, 1]:
+    _load_plugins(edition, logger)
+
+    try:
+        return update_config(edition, logger)
+    except Exception:
+        if debug.enabled():
+            raise
+        logger.exception(
+            'ERROR: Please repair this and run "cmk-update-config" BEFORE starting the site again.'
+        )
+        return 1
+
+
+def main_check_config(
+    edition: Edition, logger: logging.Logger, conflict: ConflictMode
+) -> Literal[0, 1]:
+    _load_pre_plugins(edition)
+    try:
+        # This has to be done BEFORE initializing the GUI context on start of
+        # the pre update actions
+        _cleanup_precompiled_files(logger)
+
+        check_config(edition, logger, conflict)
+    except Exception as e:
+        if not isinstance(e, MKUserError):
+            traceback.print_exc()
+        sys.stderr.write(
+            f"\nUpdate aborted with Error: {e}.\n"
+            "The update can be retried after the error has been fixed.\n"
+        )
+        return 1
+    return 0
+
+
+def _cleanup_precompiled_files(logger: logging.Logger) -> None:
+    logger.info("Cleanup precompiled host and folder files")
+    for p in (check_mk_config_dir / "wato").glob("**/*.pkl"):
+        p.unlink(missing_ok=True)
+
+
+def _parse_arguments(args: Sequence[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--debug", action="store_true", help="Debug mode: raise Python exceptions")
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Verbose mode (use multiple times for more output)",
+    )
+    p.add_argument(
+        "--conflict",
+        choices=list(ConflictMode),
+        default=ConflictMode.ASK,
+        type=ConflictMode,
+        help=(
+            f"If you choose '{ConflictMode.ASK}', you will need to manually answer all upcoming questions. "
+            f"With '{ConflictMode.FORCE}' or '{ConflictMode.ABORT}' no interaction is needed. "
+            f"'{ConflictMode.FORCE}' continues the update even if errors occur during the pre-flight checks. "
+            f"If you choose '{ConflictMode.ABORT}', the update will be aborted if interaction is needed."
+        ),
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Executes `Verifying Checkmk configuration` only.",
+    )
+    p.add_argument(
+        "--site-may-run",
+        action="store_true",
+        help="Execute the command even if the site is running.",
+    )
+    return p.parse_args(args)
+
+
+# TODO: Fix this cruel hack caused by our funny mix of GUI + console stuff.
+def _setup_logging(verbose: int) -> logging.Logger:
+    log.logger.setLevel(log.verbosity_to_log_level(verbose))
+
+    logger = logging.getLogger("cmk.update_config")
+    logger.setLevel(log.logger.level)
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(CMKFormatter(message_only=True))
+    logging.getLogger().addHandler(handler)
+
+    # Special case for PIL module producing messages like "STREAM b'IHDR' 16 13" in debug level
+    logging.getLogger("PIL").setLevel(logging.INFO)
+
+    # The default in cmk.gui is WARNING, whereas our default is INFO. Hence, our
+    # default corresponds to INFO in cmk.gui, which results in too much logging.
+    gui_logger.setLevel(log.logger.level + 10)
+
+    return logger
+
+
+def ensure_site_is_stopped(logger: logging.Logger) -> None:
+    if (
+        subprocess.call(["omd", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        != 1
+    ):
+        logger.error(
+            "ERROR: The Checkmk site is still running. Please stop the site "
+            "before updating the configuration. You can stop the site using 'omd stop'."
+        )
+        sys.exit(1)
+
+
+def _load_plugins(edition: Edition, logger: logging.Logger) -> None:
+    for plugin, exc in chain(
+        load_plugins_with_exceptions("cmk.update_config.plugins.actions"),
+        (
+            []
+            if edition is Edition.COMMUNITY
+            else load_plugins_with_exceptions("cmk.update_config.nonfree.pro.plugins.actions")
+        ),
+        (
+            load_plugins_with_exceptions("cmk.update_config.nonfree.ultimate.plugins.actions")
+            if edition in (Edition.ULTIMATE, Edition.ULTIMATEMT)
+            else []
+        ),
+        (
+            load_plugins_with_exceptions("cmk.update_config.nonfree.cloud.plugins.actions")
+            if edition is Edition.CLOUD
+            else []
+        ),
+    ):
+        logger.error(
+            "Error in action plug-in %(plugin)s: %(exc)s\n", {"plugin": plugin, "exc": exc}
+        )
+        if debug.enabled():
+            raise exc
+
+
+def _load_pre_plugins(edition: Edition) -> None:
+    for plugin, exc in chain(
+        load_plugins_with_exceptions("cmk.update_config.plugins.pre_actions"),
+        (
+            []
+            if edition is Edition.COMMUNITY
+            else load_plugins_with_exceptions("cmk.update_config.nonfree.pro.plugins.pre_actions")
+        ),
+        (
+            load_plugins_with_exceptions("cmk.update_config.nonfree.ultimate.plugins.pre_actions")
+            if edition in (Edition.ULTIMATE, Edition.ULTIMATEMT)
+            else []
+        ),
+        (
+            load_plugins_with_exceptions("cmk.update_config.nonfree.cloud.plugins.pre_actions")
+            if edition is Edition.CLOUD
+            else []
+        ),
+    ):
+        sys.stderr.write(f"Error in pre action plug-in {plugin}: {exc}\n")
+        if debug.enabled():
+            raise exc
+
+
+# TODO(sk): check_config can't raise exception(raise is an reaction on check, i.e. 2 in 1):
+# change name assert_config or ensure_valid_config for example
+# or change logic
+def check_config(edition: Edition, logger: logging.Logger, conflict_mode: ConflictMode) -> None:  # noqa: ARG001
+    """Raise exception on failure"""
+    pre_update_actions = sorted(pre_update_action_registry.values(), key=lambda a: a.sort_index)
+    total = len(pre_update_actions)
+    logger.info("Verifying Checkmk configuration...")
+
+    # Note: Redis has to be disabled first, the other contexts depend on it
+    with disable_redis(), gui_context():
+        _initialize_base_environment()
+        for count, pre_action in enumerate(pre_update_actions, start=1):
+            logger.info(
+                " %(yellow)s%(count)02d/%(total)02d%(normal)s %(title)s...",
+                {
+                    "yellow": tty.yellow,
+                    "count": count,
+                    "total": total,
+                    "normal": tty.normal,
+                    "title": pre_action.title,
+                },
+            )
+            pre_action(logger, conflict_mode)
+
+    logger.info("Done (%(green)ssuccess%(normal)s)\n", {"green": tty.green, "normal": tty.normal})
+
+
+def update_config(edition: Edition, logger: logging.Logger) -> Literal[0, 1]:  # noqa: ARG001
+    """Return exit code, 0 is ok, 1 is failure"""
+    has_errors = False
+    logger.log(VERBOSE, "Initializing application...")
+
+    actions = sorted(update_action_registry.values(), key=lambda a: a.sort_index)
+    total = len(actions)
+
+    # Note: Redis has to be disabled first, the other contexts depend on it
+    with disable_redis(), gui_context(), SuperUserContext():
+        set_global_vars()
+        _check_failed_gui_plugins(logger)
+        _initialize_base_environment()
+
+        logger.info("Updating Checkmk configuration...")
+
+        with _forbid_pending_change_writes():
+            for num, action in enumerate(actions, start=1):
+                logger.info(
+                    " %(yellow)s%(num)02d/%(total)02d%(normal)s %(title)s...",
+                    {
+                        "yellow": tty.yellow,
+                        "num": num,
+                        "total": total,
+                        "normal": tty.normal,
+                        "title": action.title,
+                    },
+                )
+                try:
+                    action(logger)
+                except ForbiddenPendingChangeWriteError:
+                    # A forbidden pending change write is always a programming error in an update
+                    # action. It must fail hard regardless of continue_on_failure / debug mode.
+                    raise
+                except Exception:
+                    has_errors = True
+                    logger.exception(' + "%(title)s" failed', {"title": action.title})
+                    if not action.continue_on_failure or debug.enabled():
+                        raise
+
+        if not has_errors and not is_distributed_setup_remote_site(active_config.sites):
+            # Force synchronization of the config after a successful configuration update
+            PendingChanges(
+                activation_sites=all_activation_sites(active_config.sites),
+                local_site=omd_site(),
+                acting_user=None,
+                store=PendingChangesStore(),
+                hooks=(make_audit_log_change_hook(use_git=False), index_update_change_hook),
+            ).add(
+                Change(
+                    action_name="cmk-update-config",
+                    text="Successfully updated Checkmk configuration",
+                    force_sync=True,
+                    domains=[CORE],
+                ),
+                ChangeScope.all_activation_sites(),
+            )
+
+    if has_errors:
+        logger.error("Done (%(red)swith errors%(normal)s)", {"red": tty.red, "normal": tty.normal})
+        return 1
+
+    logger.info("Done (%(green)ssuccess%(normal)s)", {"green": tty.green, "normal": tty.normal})
+    return 0
+
+
+def _check_failed_gui_plugins(logger: logging.Logger) -> None:
+    if main_modules.get_failed_plugins():
+        logger.error(
+            "\n"
+            "ERROR: Failed to load some GUI plugins. You will either have \n"
+            "       to remove or update them to be compatible with this \n"
+            "       Checkmk version."
+            "\n"
+        )
+
+
+def _initialize_base_environment() -> None:
+    base_config.load()
+
+
+@contextmanager
+def _force_automations_cli_interface() -> Generator[None]:
+    try:
+        os.environ[ENV_VARIABLE_FORCE_CLI_INTERFACE] = "True"
+        yield
+    finally:
+        os.environ.pop(ENV_VARIABLE_FORCE_CLI_INTERFACE, None)
+
+
+class ForbiddenPendingChangeWriteError(RuntimeError):
+    pass
+
+
+@contextmanager
+def _forbid_pending_change_writes() -> Iterator[None]:
+    original_append = PendingChangesStore.append
+
+    def _raise(self: PendingChangesStore, site_id: SiteId, entry: ChangeSpec) -> None:  # noqa: ARG001
+        raise ForbiddenPendingChangeWriteError(
+            "Update config actions must use a NoopPendingChangesStore to not record any change."
+        )
+
+    PendingChangesStore.append = _raise  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        PendingChangesStore.append = original_append  # type: ignore[method-assign]

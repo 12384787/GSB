@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+from cmk.gui.i18n import _
+from cmk.gui.plugins.wato.utils import (
+    CheckParameterRulespecWithoutItem,
+    rulespec_registry,
+    RulespecGroupCheckParametersStorage,
+)
+from cmk.gui.valuespec import Dictionary, Filesize, Tuple
+
+
+def _parameter_valuespec_netapp_fcportio() -> Dictionary:
+    return Dictionary(
+        elements=[
+            (
+                "read",
+                Tuple(
+                    title=_("Read"),
+                    elements=[
+                        Filesize(title=_("Warning if below")),
+                        Filesize(title=_("Critical if below")),
+                    ],
+                ),
+            ),
+            (
+                "write",
+                Tuple(
+                    title=_("Write"),
+                    elements=[
+                        Filesize(title=_("Warning at")),
+                        Filesize(title=_("Critical at")),
+                    ],
+                ),
+            ),
+        ],
+    )
+
+
+rulespec_registry.register(
+    CheckParameterRulespecWithoutItem(
+        check_group_name="netapp_fcportio",
+        group=RulespecGroupCheckParametersStorage,
+        match_type="dict",
+        parameter_valuespec=_parameter_valuespec_netapp_fcportio,
+        title=lambda: _("Netapp FC Port throughput"),
+    )
+)

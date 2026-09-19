@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+import pytest
+
+from cmk.agent_based.v2 import InventoryResult, StringTable, TableRow
+from cmk.plugins.perle.agent_based.perle_psmu import inventorize_perle_psmu, parse_perle_psmu
+
+
+@pytest.mark.parametrize(
+    "string_table, expected_result",
+    [
+        ([], []),
+        (
+            [
+                ["1", "MCR-ACPWR", "Foo", "104-101015T10175", "1", "12.05", "6.75", "1"],
+                ["2", "MCR-ACPWR", "Bar", "104-101015T10177", "1", "12.05", "6.75", "1"],
+            ],
+            [
+                TableRow(
+                    path=["hardware", "components", "psus"],
+                    key_columns={
+                        "index": "1",
+                    },
+                    inventory_columns={
+                        "description": "Foo",
+                        "model": "MCR-ACPWR",
+                        "serial": "104-101015T10175",
+                    },
+                    status_columns={},
+                ),
+                TableRow(
+                    path=["hardware", "components", "psus"],
+                    key_columns={
+                        "index": "2",
+                    },
+                    inventory_columns={
+                        "description": "Bar",
+                        "model": "MCR-ACPWR",
+                        "serial": "104-101015T10177",
+                    },
+                    status_columns={},
+                ),
+            ],
+        ),
+    ],
+)
+def test_inventorize_perle_psmu(
+    string_table: StringTable, expected_result: InventoryResult
+) -> None:
+    assert list(inventorize_perle_psmu(parse_perle_psmu(string_table))) == list(expected_result)

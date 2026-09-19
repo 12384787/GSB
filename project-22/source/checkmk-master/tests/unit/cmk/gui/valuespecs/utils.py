@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+# Copyright (C) 2022 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+from collections.abc import Iterator
+from contextlib import contextmanager
+from unittest.mock import patch
+
+import pytest
+
+import cmk.gui.valuespec as vs
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.http import request
+
+
+@contextmanager
+def request_var(
+    **request_variables: str,
+) -> Iterator[None]:
+    with patch.dict(request.legacy_vars, request_variables):
+        yield
+
+
+def validate[T](valuespec: vs.ValueSpec[T], value: T) -> None:
+    valuespec.validate_datatype(value, "varprefix")
+    valuespec.validate_value(value, "varprefix")
+
+
+def expect_validate_failure[T](
+    valuespec: vs.ValueSpec[T], value: T, *, match: str | None = None
+) -> None:
+    with pytest.raises(MKUserError, match=match):
+        validate(valuespec, value)
+
+
+# NOTE: Both the ValueSpecs themselves and the tests for them are a bit... "interesting"
+# regarding typing, so we effectively have to lie below. :-/
+def expect_validate_failure_untypeable[T, U](
+    valuespec: vs.ValueSpec[T], value: U, *, match: str | None = None
+) -> None:
+    expect_validate_failure(valuespec, value, match=match)  # type: ignore[misc]
+
+
+def expect_validate_success[T](valuespec: vs.ValueSpec[T], value: T) -> None:
+    validate(valuespec, value)
+
+
+def _validate_migrate_or_transform(valuespec: vs.Migrate | vs.Transform, value: object) -> None:
+    valuespec.validate_datatype(value, "varprefix")
+    valuespec.validate_value(value, "varprefix")
+
+
+def expect_validate_failure_migrate_or_transform(
+    valuespec: vs.Migrate | vs.Transform, value: object, *, match: str | None = None
+) -> None:
+    with pytest.raises(MKUserError, match=match):
+        _validate_migrate_or_transform(valuespec, value)
+
+
+def expect_validate_success_migrate_or_transform(
+    valuespec: vs.Migrate | vs.Transform, value: object
+) -> None:
+    _validate_migrate_or_transform(valuespec, value)
+
+
+def raise_exception() -> None:
+    raise Exception("This is an exception")

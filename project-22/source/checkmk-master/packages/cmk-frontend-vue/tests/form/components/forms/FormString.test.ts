@@ -1,0 +1,264 @@
+/**
+ * Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+import { fireEvent, render, screen, waitFor } from '@testing-library/vue'
+import type * as FormSpec from 'cmk-shared-typing/typescript/vue_formspec_components'
+import { Response } from 'cmk-ui-library/components/CmkSuggestions'
+
+import FormString from '@/form/private/forms/FormString.vue'
+
+import { renderForm } from '../cmk-form-helper'
+
+const validators: FormSpec.Validator[] = [
+  {
+    type: 'length_in_range',
+    min_value: 1,
+    max_value: 20,
+    error_message: 'String length must be between 1 and 20'
+  }
+]
+
+const spec: FormSpec.String = {
+  type: 'string',
+  title: 'fooTitle',
+  help: 'fooHelp',
+  label: 'fooLabel',
+  validators: validators,
+  input_hint: 'fooInputHint',
+  autocompleter: null,
+  field_size: 'small'
+}
+
+test('FormString renders value', () => {
+  render(FormString, {
+    props: {
+      spec,
+      data: 'fooData',
+      backendValidation: []
+    }
+  })
+
+  const element = screen.getByRole<HTMLInputElement>('textbox', { name: 'fooLabel' })
+
+  expect(element.value).toBe('fooData')
+})
+
+test('FormString updates data', async () => {
+  const { getCurrentData } = await renderForm({
+    spec,
+    data: 'fooData',
+    backendValidation: []
+  })
+
+  const element = screen.getByRole<HTMLInputElement>('textbox', { name: 'fooLabel' })
+  await fireEvent.update(element, 'some_other_value')
+
+  expect(getCurrentData()).toBe('"some_other_value"')
+})
+
+test('FormString checks validators', async () => {
+  render(FormString, {
+    props: {
+      spec,
+      data: 'fooData',
+      backendValidation: []
+    }
+  })
+
+  const element = screen.getByRole<HTMLInputElement>('textbox', { name: 'fooLabel' })
+  await fireEvent.update(element, '')
+
+  screen.getByText('String length must be between 1 and 20')
+})
+
+test('FormString with autocompleter renders backend validation messages', async () => {
+  const specWithAutocompleter: FormSpec.String = {
+    ...spec,
+    autocompleter: {
+      data: { ident: '', params: {} },
+      fetch_method: 'ajax_vs_autocomplete'
+    }
+  }
+  render(FormString, {
+    props: {
+      spec: specWithAutocompleter,
+      data: 'fooData',
+      backendValidation: [
+        {
+          location: [],
+          message: 'Backend error message',
+          replacement_value: 'some_replacement_value'
+        }
+      ]
+    }
+  })
+
+  await screen.findByText('Backend error message')
+})
+
+test('FormString renders backend validation messages', async () => {
+  render(FormString, {
+    props: {
+      spec,
+      data: 'fooData',
+      backendValidation: [
+        {
+          location: [],
+          message: 'Backend error message',
+          replacement_value: 'some_replacement_value'
+        }
+      ]
+    }
+  })
+
+  await screen.findByText('Backend error message')
+  const element = screen.getByRole<HTMLInputElement>('textbox', { name: 'fooLabel' })
+  expect(element.value).toBe('some_replacement_value')
+})
+
+test('FormString displays required', async () => {
+  render(FormString, {
+    props: {
+      spec,
+      data: 'fooData',
+      backendValidation: []
+    }
+  })
+
+  screen.getByText('(required)')
+})
+
+vi.mock(
+  import('cmk-ui-library/components/FormAutocompleter/autocompleter'),
+  async (importOriginal) => {
+    const mod = await importOriginal() // type is inferred
+    return {
+      ...mod,
+      fetchSuggestions: vi.fn(async (_config: unknown, _v: string) => {
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        return new Response([
+          { name: 'val1', title: 'Value 1' },
+          { name: 'val2', title: 'Value 2' }
+        ])
+      })
+    }
+  }
+)
+
+test('FormString with autocompleter loads value', async () => {
+  render(FormString, {
+    props: {
+      spec: {
+        type: 'string',
+        title: '',
+        help: '',
+        validators: [],
+        label: 'ut_label',
+        input_hint: '',
+        field_size: 'medium',
+        autocompleter: {
+          data: {
+            ident: 'config_hostname',
+            params: {
+              show_independent_of_context: true,
+              strict: true,
+              escape_regex: true,
+              world: 'world',
+              context: {}
+            }
+          },
+          fetch_method: 'ajax_vs_autocomplete'
+        }
+      },
+      data: 'val1',
+      backendValidation: []
+    }
+  })
+
+  const element = screen.getByRole<HTMLInputElement>('combobox', { name: 'ut_label' })
+  await waitFor(() => {
+    expect(element.textContent).toBe('Value 1')
+  })
+})
+
+test('FormString with autocompleter shows placeholder when data is empty string', async () => {
+  render(FormString, {
+    props: {
+      spec: {
+        type: 'string',
+        title: '',
+        help: '',
+        validators: [],
+        label: 'ut_label',
+        input_hint: 'Select hostname',
+        field_size: 'medium',
+        autocompleter: {
+          data: {
+            ident: 'config_hostname',
+            params: {
+              show_independent_of_context: true,
+              strict: true,
+              escape_regex: true,
+              world: 'world',
+              context: {}
+            }
+          },
+          fetch_method: 'ajax_vs_autocomplete'
+        }
+      },
+      data: '',
+      backendValidation: []
+    }
+  })
+
+  const element = screen.getByRole('combobox', { name: 'ut_label' })
+  await waitFor(() => {
+    expect(element.textContent).toContain('Select hostname')
+  })
+})
+
+test('FormString with autocompleter updates value to title', async () => {
+  render(FormString, {
+    props: {
+      spec: {
+        type: 'string',
+        title: '',
+        help: '',
+        validators: [],
+        label: 'ut_label',
+        input_hint: '',
+        field_size: 'medium',
+        autocompleter: {
+          data: {
+            ident: 'config_hostname',
+            params: {
+              show_independent_of_context: true,
+              strict: true,
+              escape_regex: true,
+              world: 'world',
+              context: {}
+            }
+          },
+          fetch_method: 'ajax_vs_autocomplete'
+        }
+      },
+      data: 'val1',
+      backendValidation: []
+    }
+  })
+
+  const element = screen.getByRole<HTMLInputElement>('combobox', { name: 'ut_label' })
+  await waitFor(() => {
+    expect(element.textContent).toContain('Value 1')
+  })
+  await fireEvent.click(element)
+
+  const option = await screen.findByRole('option', { name: 'Value 2' })
+  await fireEvent.click(option)
+
+  await waitFor(() => {
+    expect(element.textContent).toBe('Value 2')
+  })
+})

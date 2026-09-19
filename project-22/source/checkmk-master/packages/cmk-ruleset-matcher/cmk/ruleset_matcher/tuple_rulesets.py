@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from collections.abc import Iterable, Sequence
+from re import Pattern
+
+import cmk.ccc.debug
+from cmk.ccc.exceptions import MKGeneralException
+from cmk.ccc.regex import combine_patterns, regex
+from cmk.ruleset_matcher.tags import TagID
+
+# Conveniance macros for legacy tuple based host and service rules
+PHYSICAL_HOSTS = ["@physical"]  # all hosts but not clusters
+CLUSTER_HOSTS = ["@cluster"]  # all cluster hosts
+ALL_HOSTS = ["@all"]  # physical and cluster hosts
+ALL_SERVICES = [""]  # optical replacement"
+NEGATE = "@negate"  # negation in boolean lists
+
+# TODO: We could make some more optimizations to host/item list matching:
+# - Is it worth to detect matches that are no regex matches?
+# - We could remove .* from end of regexes
+# - What's about compilation of the regexes?
+
+
+def get_rule_options(
+    entry: (
+        tuple[str, Sequence[TagID], Sequence[str], Sequence[str], dict[str, object]]
+        | tuple[str, Sequence[TagID], Sequence[str], Sequence[str]]
+        | tuple[str, Sequence[str], Sequence[str], dict[str, object]]
+        | tuple[str, Sequence[str], Sequence[str]]
+    ),
+) -> tuple[
+    tuple[str, Sequence[TagID], Sequence[str], Sequence[str]]
+    | tuple[str, Sequence[str], Sequence[str]],
+    dict[str, object],
+]:
+    """Get the options from a rule.
+
+    Pick out the option element of a rule. Currently the options "disabled"
+    and "comments" are being honored."""
+    if isinstance(entry[-1], dict):
+        return entry[:-1], entry[-1]
+
+    return entry, {}
+
+
+def in_extraconf_hostlist(hostlist: Sequence[str], hostname: str | bool) -> bool:
+    """Whether or not the given host matches the hostlist.
+
+    Entries in list are hostnames that must equal the hostname.
+    Expressions beginning with ! are negated: if they match,
+    the item is excluded from the list.
+
+    Expressions beginning with ~ are treated as regular expression.
+    Also the three special tags '@all', '@clusters', '@physical'
+    are allowed.
+    """
+
+    # Migration help: print error if old format appears in config file
+    # FIXME: When can this be removed?
+    try:
+        if hostlist[0] == "":
+            raise MKGeneralException('Invalid empty entry [ "" ] in configuration')
+    except IndexError:
+        pass  # Empty list, no problem.
+
+    for hostentry in hostlist:
+        if hostentry == "":
+            raise MKGeneralException("Empty host name in host list %r" % hostlist)
+        negate = False
+        use_regex = False
+        if hostentry[0] == "@":
+            if hostentry == "@all":
+                return True
+            # TODO: Is not used anymore for a long time. Will be cleaned up
+            # with 1.6 tuple ruleset cleanup
+            # ic = is_cluster(hostname)
+            # if hostentry == '@cluster' and ic:
+            #    return True
+            # elif hostentry == '@physical' and not ic:
+            #    return True
+
+        # Allow negation of hostentry with prefix '!'
+        else:
+            if hostentry[0] == "!":
+                hostentry = hostentry[1:]
+                negate = True
+
+            # Allow regex with prefix '~'
+            if hostentry[0] == "~":
+                hostentry = hostentry[1:]
+                use_regex = True
+
+        try:
+            if not use_regex and hostname == hostentry:
+                return not negate
+            # Handle Regex. Note: hostname == True -> generic unknown host
+            if (
+                use_regex
+                and isinstance(hostname, str)
+                and regex(hostentry).match(hostname) is not None
+            ):
+                return not negate
+        except MKGeneralException:
+            if cmk.ccc.debug.enabled():
+                raise
+
+    return False
+
+
+# Slow variant of checking wether a service is matched by a list
+# of regexes
+def in_extraconf_servicelist(service_patterns: list[str], service: str) -> bool:
+    if optimized_pattern := convert_pattern_list(service_patterns):
+        return optimized_pattern.match(service) is not None
+
+    return False
+
+
+def hosttags_match_taglist(hosttags: Sequence[TagID], required_tags: Iterable[TagID]) -> bool:
+    """Check if a host fulfills the requirements of a tag list.
+
+    The host must have all tags in the list, except
+    for those negated with '!'. Those the host must *not* have!
+    A trailing + means a prefix match."""
+    for tag in required_tags:
+        negate, tag_str = _parse_negated(tag)
+        if tag_str and tag_str[-1] == "+":
+            tag_prefix = TagID(tag_str[:-1])
+            matches = False
+            for t in hosttags:
+                if t.startswith(tag_prefix):
+                    matches = True
+                    break
+
+        else:
+            matches = TagID(tag_str) in hosttags
+
+        if matches == negate:
+            return False
+
+    return True
+
+
+def convert_pattern_list(patterns: list[str]) -> Pattern[str] | None:
+    """Compiles a list of service match patterns to a single regex
+
+    Reducing the number of individual regex matches improves the performance dramatically.
+    This function assumes either all or no pattern is negated (like WATO creates the rules).
+    """
+    if not patterns:
+        return None
+
+    pattern_parts: list[tuple[bool, str]] = []
+
+    for pattern in patterns:
+        negate, pattern = _parse_negated(pattern)
+        # Skip ALL_SERVICES from end of negated lists
+        if negate and pattern == ALL_SERVICES[0]:
+            continue
+        pattern_parts.append((negate, pattern))
+
+    return regex(combine_patterns(pattern_parts))
+
+
+def _parse_negated(pattern: str) -> tuple[bool, str]:
+    # Allow negation of pattern with prefix '!'
+    try:
+        negate = pattern[0] == "!"
+        if negate:
+            pattern = pattern[1:]
+    except IndexError:
+        negate = False
+
+    return negate, pattern

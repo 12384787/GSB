@@ -1,0 +1,70 @@
+/**
+ * Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+import usei18n from 'cmk-ui-library/lib/i18n'
+import type { TranslatedString } from 'cmk-ui-library/lib/i18nString'
+import { type Ref, ref, watch } from 'vue'
+
+import { DashboardFeatures } from '@/dashboard/types/dashboard'
+
+import type { WidgetItemList } from '../../../components/WidgetSelection/types'
+import { ElementSelection } from '../../../types'
+import { Graph } from '../types'
+
+const { _t } = usei18n()
+
+const graphSelector = {
+  [ElementSelection.SPECIFIC]: [
+    Graph.SITE_OVERVIEW,
+    Graph.HOST_STATE,
+    Graph.HOST_STATE_SUMMARY,
+    Graph.HOST_STATS
+  ],
+  [ElementSelection.MULTIPLE]: [Graph.SITE_OVERVIEW, Graph.HOST_STATE_SUMMARY, Graph.HOST_STATS]
+}
+
+type UseAvailableGraphs = Ref<Graph[]>
+
+export const useSelectGraphTypes = (
+  hostSelection: Ref<ElementSelection>,
+  dashboardFeatures: DashboardFeatures
+): UseAvailableGraphs => {
+  const availableGraphs = ref<Graph[]>([])
+
+  watch(
+    hostSelection,
+    (newHostSelection): void => {
+      availableGraphs.value = getAvailableGraphs(newHostSelection, dashboardFeatures)
+    },
+    { deep: true, immediate: true }
+  )
+
+  return availableGraphs
+}
+
+export const getAvailableGraphs = (
+  hostSelection: ElementSelection,
+  dashboardFeatures: DashboardFeatures
+): Graph[] => {
+  if (dashboardFeatures === DashboardFeatures.RESTRICTED) {
+    return [Graph.HOST_STATS]
+  }
+
+  return [...graphSelector[hostSelection]]
+}
+
+export const getDisabledTooltip = (dashboardFeatures: DashboardFeatures): TranslatedString =>
+  dashboardFeatures === DashboardFeatures.RESTRICTED
+    ? _t('Available in Checkmk Pro or higher.')
+    : _t('Only available for a single host.')
+
+export const allHostSiteWidgets = (): WidgetItemList => {
+  return [
+    { id: Graph.SITE_OVERVIEW, label: _t('Site overview'), icon: 'site-overview' },
+    { id: Graph.HOST_STATS, label: _t('Host statistics'), icon: 'host-statistics' },
+    { id: Graph.HOST_STATE, label: _t('Host state'), icon: 'host-state' },
+    { id: Graph.HOST_STATE_SUMMARY, label: _t('Host state summary'), icon: 'host-state-summary' }
+  ]
+}

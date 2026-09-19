@@ -1,0 +1,15 @@
+packages:
+    - '.ide/vscode'
+    - 'bazel/tools'
+    - 'packages/cmk-frontend'
+    - 'packages/cmk-frontend-vue'
+    - 'packages/cmk-shared-typing'
+    - 'packages/cmk-ui-library'
+    - 'packages/cmk-werks'
+
+overrides:
+  "typescript-eslint": "8.58.1"
+  "glob": "^11.1.0" # "CMK-28102",
+  "js-yaml": "^4.1.0" # "CMK-28103"
+  "uuid": "^14.0.0" # CMK-34957
+  "@ranfdev/deepobj": "^1.0.3" # CMK-34943

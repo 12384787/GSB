@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+# Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+"""Configuration entities / Notification Parameter
+
+These endpoints can be used to manipulate notification parameter via the configuration
+entity API, for more information see "Configuration entities" endpoints."""
+
+from collections.abc import Mapping
+
+from cmk import fields
+from cmk.gui.http import Response
+from cmk.gui.logged_in import user
+from cmk.gui.openapi.endpoints.configuration_entity._common import (
+    get_endpoint_decorator,
+    list_endpoint_decorator,
+    serve_configuration_entity,
+    serve_configuration_entity_list,
+)
+from cmk.gui.openapi.restful_objects.registry import EndpointRegistry
+from cmk.gui.openapi.restful_objects.response_schemas import DomainObject, DomainObjectCollection
+from cmk.shared_typing.configuration_entity import ConfigEntityType
+
+
+class NotificationParamResponse(DomainObject):
+    domainType = fields.Constant(  # type: ignore[mutable-override]
+        ConfigEntityType.notification_parameter.value,
+        description="The domain type of the object.",
+    )
+
+
+class NotificationParamResponseCollection(DomainObjectCollection):
+    domainType = fields.Constant(  # type: ignore[mutable-override]
+        ConfigEntityType.notification_parameter.value,
+        description="The domain type of the objects in the collection.",
+    )
+    value = fields.List(  # type: ignore[mutable-override]
+        fields.Nested(NotificationParamResponse),
+        description="A list of notification parameter objects.",
+    )
+
+
+@list_endpoint_decorator(
+    ConfigEntityType.notification_parameter, NotificationParamResponseCollection
+)
+def _list_notification_parameters(params: Mapping[str, object]) -> Response:
+    """List existing notification parameters"""
+    return serve_configuration_entity_list(
+        None, ConfigEntityType.notification_parameter, params, user
+    )
+
+
+@get_endpoint_decorator(ConfigEntityType.notification_parameter)
+def _get_notification_parameter(params: Mapping[str, object]) -> Response:
+    """Get a notification parameter"""
+    return serve_configuration_entity(ConfigEntityType.notification_parameter, params, user)
+
+
+def register(endpoint_registry: EndpointRegistry) -> None:
+    endpoint_registry.register(_list_notification_parameters)
+    endpoint_registry.register(_get_notification_parameter)

@@ -1,0 +1,170 @@
+load("@@//:package_versions.bzl", "PYTHON_VERSION")
+load("@@//bazel/rules:dependency_info.bzl", "dependency_info")
+load("@@//omd/packages/Python:version.bzl", "PYTHON_MAJOR_DOT_MINOR", "PYTHON_VERSION_MAJOR")
+load("@rules_foreign_cc//foreign_cc:defs.bzl", "configure_make")
+
+package(default_visibility = ["//visibility:public"])
+
+INSTALL_PREFIX = "py_install"
+
+# Stable, version-independent placeholder baked into the binaries as the
+# compile-time prefix (Python's getpath PREFIX/EXEC_PREFIX, recorded in
+# libpython's .rodata) instead of the per-build bazel sandbox path. It is
+# fixed up to the real OMD path at install time, exactly like the sysconfig
+# placeholder handling in postfix_script below (SUP-28810).
+OMD_PREFIX_PLACEHOLDER = "/replace-me"
+
+# Where `make install` stages the tree (DESTDIR) and where rules_foreign_cc
+# then collects it from: DESTDIR + the baked --prefix == BUILD_TMPDIR/<this>.
+STAGING_PREFIX = INSTALL_PREFIX + OMD_PREFIX_PLACEHOLDER
+
+dependency_info(
+    name = "dependency_info",
+    package_name = "python",
+    cpe_format_str = "cpe:2.3:a:python:python:%s:*:*:*:*:*:*:*",
+    license_kind = "@package_metadata//licenses/spdx:PSF-2.0",
+    license_text = "LICENSE",
+    purl_namespace = None,
+    purl_type = "generic",
+    version = PYTHON_VERSION,
+)
+
+filegroup(
+    name = "all_srcs",
+    srcs = glob(
+        include = ["**/*"],
+        exclude = ["*.bazel"],
+    ),
+    package_metadata = [":dependency_info"],
+)
+
+out_binaries = [
+    "python",
+    "python%s" % PYTHON_VERSION_MAJOR,
+    "python%s" % PYTHON_MAJOR_DOT_MINOR,
+    "pip%s" % PYTHON_VERSION_MAJOR,
+    "pip%s" % PYTHON_VERSION_MAJOR,
+    "pip%s" % PYTHON_MAJOR_DOT_MINOR,
+    "idle%s" % PYTHON_VERSION_MAJOR,
+    "idle%s" % PYTHON_MAJOR_DOT_MINOR,
+    "pydoc%s" % PYTHON_VERSION_MAJOR,
+    "pydoc%s" % PYTHON_MAJOR_DOT_MINOR,
+    "python%s-config" % PYTHON_VERSION_MAJOR,
+    "python%s-config" % PYTHON_MAJOR_DOT_MINOR,
+]
+
+configure_make(
+    name = "python",
+    # Redirect `make install` into the sandbox via DESTDIR so the baked-in
+    # --prefix below can be the stable /replace-me placeholder rather than the
+    # bazel sandbox path. DESTDIR + --prefix == BUILD_TMPDIR/py_install/replace-me,
+    # which is exactly what install_prefix points rules_foreign_cc at.
+    args = [
+        "-j2",
+        "DESTDIR=$$BUILD_TMPDIR$$/%s" % INSTALL_PREFIX,
+    ],
+    configure_command = "configure",
+    configure_in_place = True,
+    configure_options = [
+        "LDFLAGS='-static-libstdc++ -static-libgcc'",
+        "--with-openssl=$$EXT_BUILD_DEPS/openssl",
+        "--with-openssl-rpath=auto",
+        "--with-ssl-default-suites=openssl",
+        "CFLAGS='-Dredacted=\"redacted\"'",
+        "--enable-optimizations",
+        "--enable-shared",
+        "--with-lto",
+        "--without-static-libpython",
+        # Bake a stable prefix into the binaries instead of the bazel sandbox
+        # path. rules_foreign_cc passes its own --prefix=$BUILD_TMPDIR/... first;
+        # autotools honours the last --prefix, so this one wins for the value
+        # compiled into libpython (getpath PREFIX/EXEC_PREFIX). Install is kept
+        # inside the sandbox via DESTDIR (see args above).
+        "--prefix=%s" % OMD_PREFIX_PLACEHOLDER,
+    ],
+    data = [
+        "@@//omd/packages/Python:pip",
+        "@@//omd/packages/Python:sitecustomize.py",
+    ],
+    env = {
+        "PKG_CONFIG_PATH": ":".join([
+            "/usr/lib/pkgconfig",
+            "/usr/lib64/pkgconfig",
+            "/usr/lib/x86_64-linux-gnu/pkgconfig",
+        ]),
+    },
+
+    # rules_foreign_cc defaults the install_prefix to "python". This conflicts with the "python" executable that is generated.
+    # Point it at the DESTDIR+prefix staging dir (BUILD_TMPDIR/py_install/replace-me) so the collected tree has the expected bin/lib/... layout at $INSTALLDIR root.
+    install_prefix = STAGING_PREFIX,
+    lib_source = ":all_srcs",
+    linkopts = ["-Wl,--strip-all"],
+    out_binaries = out_binaries,
+    out_data_dirs = [
+        "lib",
+        "share",
+        "tar",
+    ],
+    out_include_dir = "include/python%s" % PYTHON_MAJOR_DOT_MINOR,
+    postfix_script = """
+        py_install_dir="$$BUILD_TMPDIR/{installPrefix}";
+        bin_dir="$$INSTALLDIR/bin";
+        sysconfig_path="$$INSTALLDIR/lib/python{pyMajMin}/_sysconfigdata__linux_x86_64-linux-gnu.py"
+        # omd_prefix must be fixed-up to the corresponding omd path (e.g. /omd/versions/2.2.0p2.cee)
+        omd_prefix="/replace-me"
+
+        echo '### Install sitecustomize.py ###';
+        install -m 644 $$EXT_BUILD_ROOT/omd/packages/Python/sitecustomize.py $$INSTALLDIR/lib/python{pyMajMin}/;
+
+        echo '### Fix sysconfigdata ###';
+        # For now 'OMD_VERSION' is not yet available in Bazel, therefore we use a well defined placeholder
+        sed -i "s|$$py_install_dir|$$omd_prefix|g" $$sysconfig_path;
+
+        # include & lib of openssl are found under different paths...
+        sed -i "s|$$EXT_BUILD_DEPS/openssl/include|$$omd_prefix/include/openssl|g" $$sysconfig_path;
+        sed -i "s|$$EXT_BUILD_DEPS/openssl/lib|$$omd_prefix/lib|g" $$sysconfig_path;
+
+        # This one is not really helpful... but we don't want to have bazel paths in _sysconfig
+        sed -i "s|$$BUILD_TMPDIR|$$omd_prefix|g" $$sysconfig_path;
+
+        cd $$bin_dir && ln -s python{pyMaj} python
+
+        # Fix pip3 configuration by using own wrapper script
+        # * PIP_TARGET currently has an issue when installing non-wheel packages, see https://github.com/pypa/pip/issues/8438
+        # * The workaround is to set the target via the commandline
+        # * The wrapper script we're using is based on what PipScriptMaker would create, see:
+        # https://github.com/pypa/pip/blob/83c800d3b8b367b6ae1fbf92fd4f699612cecfc7/src/pip/_internal/operations/install/wheel.py#L422
+        # * However, we may run into issues in the future again. It seems actually the module invocation (python -m pip) is more solid, see:
+        # https://github.com/pypa/pip/issues/5599
+        install -m 644 $$EXT_BUILD_ROOT/omd/packages/Python/pip $$bin_dir/pip{pyMaj};
+        install -m 644 $$EXT_BUILD_ROOT/omd/packages/Python/pip $$bin_dir/pip{pyMajMin};
+
+        # Tests are not needed in final package
+        rm -rf $$INSTALLDIR/lib/python{pyMajMin}/test ;
+
+        echo '### Pre-compile all bytecode, hash-based (CMK-35159) ###';
+        # Pre-compile EVERY shipped .py as a hash-based pyc, so no .py is ever
+        # missing a pyc at import time. Hash-based pycs are validated by source
+        # content, not mtime, so copying/staging the @python tree (which bumps
+        # .py mtimes) no longer invalidates them: a build action that runs this
+        # interpreter finds the source byte-identical to what was compiled, uses
+        # the pyc, and writes nothing back into @python's output tree. Such a
+        # write would otherwise invalidate @python's action cache (a ~30 min PGO
+        # rebuild under DISABLE_CACHE), race python_rest, and succeed even on the
+        # read-only output trees because CI builds as root. -f also covers pip's
+        # vendored packages, which ship without pycs. checked-hash (not
+        # unchecked) so that if a source ever does diverge from its pyc the
+        # interpreter recompiles from source instead of silently running stale
+        # bytecode -- e.g. _sysconfigdata, whose source is version-stamped later
+        # by string_replace in omd/packages/Python/BUILD: its shipped pyc no
+        # longer matches, so the runtime transparently recompiles it.
+        LD_LIBRARY_PATH=$$py_install_dir/lib $$py_install_dir/bin/python{pyMaj} -E -m compileall -f -j4 -o 0 -o 1 -o 2 --invalidation-mode checked-hash -d $$omd_prefix/lib/python{pyMajMin} -q $$INSTALLDIR/lib/python{pyMajMin} ;
+    """.format(
+        installPrefix = STAGING_PREFIX,
+        pyMaj = PYTHON_VERSION_MAJOR,
+        pyMajMin = PYTHON_MAJOR_DOT_MINOR,
+        pyVers = PYTHON_VERSION,
+    ),
+    visibility = ["//visibility:public"],
+    deps = ["@openssl"],
+)

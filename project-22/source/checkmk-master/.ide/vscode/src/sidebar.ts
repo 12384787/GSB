@@ -1,0 +1,587 @@
+/**
+ * Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+import * as fs from 'fs'
+import * as path from 'path'
+import * as vscode from 'vscode'
+
+import {
+  detectRegression,
+  flushBenchmarkRun,
+  getBenchmarkHistory,
+  isBenchmarkEnabled,
+  time
+} from './benchmark/startup'
+import { getBazelCacheSnapshot, setBazelCacheRefreshCallback } from './build/bazelCache'
+import { type BuildStatus, checkBuildStatus } from './build/buildStatus'
+import type { SettingsEntry } from './build/settings'
+import { type ExtensionSets, loadConfig } from './core/config'
+import { error, log, notifyInfo, notifyWarn, setActivityRefreshCallback } from './core/log'
+import { runCommand, waitForTask } from './core/tasks'
+import { getVersionMismatch, rebuildExtension } from './core/versionCheck'
+import { getDevSiteToolsState, setDevSiteRefreshCallback } from './omd/devSiteTools'
+import {
+  detectOmdSites,
+  forceRefreshOmdStatusFiles,
+  getOmdStatus,
+  setOmdStatusRefreshCallback
+} from './omd/omd'
+import { getActiveProxies } from './omd/proxy'
+import * as profileManager from './profiles/profileManager'
+import { getDmypyHealthSnapshot } from './profiles/python/dmypyHealth'
+import { getMypyTargetsSnapshot } from './profiles/python/dynamicMypyTargets'
+import {
+  getAllocatorSnapshot,
+  setAllocatorRefreshCallback
+} from './profiles/python/jemallocAllocator'
+import { getPylanceHealthSnapshot } from './profiles/python/pylanceHealth'
+import { getGitState, invalidateGitState, setGitStateRefreshCallback } from './scm/gitState'
+import * as activitySection from './sidebar/activity'
+import * as environmentSection from './sidebar/environment'
+import { renderLoading } from './sidebar/html'
+import * as ideHealthSection from './sidebar/ideHealth'
+import { type IssueItem, IssuesProvider, updateIssues } from './sidebar/issues'
+import * as omdSection from './sidebar/omd'
+import * as overviewSection from './sidebar/overview'
+import * as profilesSection from './sidebar/profiles'
+import type { SectionModule, StateCache, WebviewMessage } from './sidebar/types'
+
+const SECTIONS = ['overview', 'environment', 'omd', 'ideHealth', 'profiles', 'activity'] as const
+
+const sectionModules: Record<string, SectionModule> = {
+  overview: overviewSection,
+  environment: environmentSection,
+  profiles: profilesSection,
+  ideHealth: ideHealthSection,
+  omd: omdSection,
+  activity: activitySection
+}
+
+// ── Shared state ──
+
+let _context: vscode.ExtensionContext | null = null
+let _onboardingDismissed = false
+let _extensionsConfig: ExtensionSets | null = null
+let _settingsConfig: Record<string, SettingsEntry> | null = null
+let _stateCache: StateCache | null = null
+let _commands: Record<string, unknown> | null = null
+let _issuesView: vscode.TreeView<IssueItem> | null = null
+let _issuesProvider: IssuesProvider | null = null
+let _refreshStatusBar: ((precomputed?: BuildStatus) => void) | null = null
+const _providers: Record<string, SectionViewProvider> = {}
+
+// ── State cache ──
+
+function refreshStateCache(): StateCache {
+  try {
+    _extensionsConfig = time('loadConfig.extensions', () => loadConfig<ExtensionSets>('extensions'))
+    _settingsConfig = time('loadConfig.settings', () =>
+      loadConfig<Record<string, SettingsEntry>>('settings')
+    )
+
+    const wsPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+    const buildStatus = time('checkBuildStatus', () => (wsPath ? checkBuildStatus(wsPath) : {}))
+    const profiles = time('profileManager.getAll', () => profileManager.getAll())
+    const pyEnvsExt = vscode.extensions.getExtension('ms-python.vscode-python-envs')
+    const pythonEnvsActive = !!pyEnvsExt && pyEnvsExt.isActive
+    const environment = time('getEnvironmentInfo', () =>
+      environmentSection.getEnvironmentInfo(wsPath)
+    )
+    const extensionHealth = time('getExtensionHealth', () =>
+      ideHealthSection.getExtensionHealth(_extensionsConfig)
+    )
+    const settingsMismatches = time('getSettingsMismatches', () =>
+      ideHealthSection.getSettingsMismatches(_settingsConfig)
+    )
+    const omdSites = time('detectOmdSites+status', () =>
+      detectOmdSites().map((site) => {
+        const status = getOmdStatus(site.name)
+        return { ...site, status }
+      })
+    )
+    const activeProxies = time('getActiveProxies', () => getActiveProxies())
+    const devSiteTools = time('getDevSiteToolsState', () => getDevSiteToolsState())
+    const versionMismatch = time('getVersionMismatch', () =>
+      _context ? getVersionMismatch(_context) : null
+    )
+    const onboarding = time('getOnboardingState', () =>
+      environmentSection.getOnboardingState(environment, buildStatus, _context)
+    )
+    const mypySnapshot = time('getMypyTargetsSnapshot', () => getMypyTargetsSnapshot(wsPath))
+    const pythonProfileActive = profileManager.isActive('python')
+    _stateCache = {
+      buildStatus,
+      profiles,
+      commands: _commands || {},
+      pythonEnvsActive,
+      environment,
+      extensionHealth,
+      settingsMismatches,
+      omdSites,
+      activeProxies,
+      devSiteTools,
+      versionMismatch,
+      onboarding,
+      onboardingDismissed: _onboardingDismissed,
+      configInWorkspace: (() => {
+        if (!wsPath) return false
+        const configDir = path.join(wsPath, '.ide', 'vscode', 'config')
+        return (
+          fs.existsSync(configDir) && fs.readdirSync(configDir).some((f) => f.endsWith('.json'))
+        )
+      })(),
+      mypyTargets: { ...mypySnapshot, pythonProfileActive },
+      allocator: time('getAllocatorSnapshot', () => getAllocatorSnapshot()),
+      pylanceHealth: time('getPylanceHealthSnapshot', () => getPylanceHealthSnapshot()),
+      gitState: time('getGitState', () => {
+        const g = getGitState()
+        const folder = vscode.workspace.workspaceFolders?.[0]
+        const preCommitDismissed = vscode.workspace
+          .getConfiguration('cmk.cockpit.git', folder?.uri)
+          .get<boolean>('ignorePreCommit', false)
+        return {
+          preCommitSkipping: g.preCommitSkipping,
+          preCommitDismissed,
+          preCommitMissing: g.preCommitMissing,
+          qaTestDataDirty: g.qaTestDataDirty
+        }
+      }),
+      startupRegression:
+        _context && isBenchmarkEnabled() ? detectRegression(getBenchmarkHistory(_context)) : null,
+      dmypyHealth: time('getDmypyHealthSnapshot', () => getDmypyHealthSnapshot()),
+      bazelCache: time('getBazelCacheSnapshot', () => getBazelCacheSnapshot())
+    }
+
+    updateIssues(_issuesView, _issuesProvider, _stateCache)
+
+    if (_context) {
+      void flushBenchmarkRun(_context)
+    }
+
+    return _stateCache
+  } catch (err) {
+    error(`refreshStateCache failed: ${(err as Error).message}`)
+    if (_stateCache) return _stateCache
+    return {
+      buildStatus: {},
+      profiles: [],
+      commands: _commands || {},
+      pythonEnvsActive: false,
+      environment: {
+        python: '',
+        pythonPath: '',
+        node: '',
+        pnpm: '',
+        bazel: '',
+        bazelisk: '',
+        docker: '',
+        gcc: '',
+        pyenv: false,
+        systemReady: false
+      },
+      extensionHealth: [],
+      settingsMismatches: [],
+      omdSites: [],
+      activeProxies: [],
+      devSiteTools: { installed: false, installedVersion: '' },
+      versionMismatch: null,
+      onboarding: {
+        systemDone: false,
+        venvDone: false,
+        ideDone: false,
+        currentStep: null,
+        allDone: false
+      },
+      onboardingDismissed: _onboardingDismissed,
+      configInWorkspace: false,
+      mypyTargets: {
+        enabled: false,
+        pythonProfileActive: false,
+        activeCount: 0,
+        catalogSize: 0,
+        activeTargets: [],
+        baselineTargets: [],
+        alwaysOnTargets: [],
+        stagedActiveAdd: [],
+        stagedActiveRemove: [],
+        stagedBaselineAdd: [],
+        stagedBaselineRemove: [],
+        dismissedPromptedTargets: [],
+        catalog: []
+      },
+      allocator: {
+        mode: 'default',
+        libraryAvailable: false,
+        recommendationDismissed: false,
+        wrapperExists: false,
+        dmypyExecutableMatches: false,
+        runUsingInterpreterOff: false
+      },
+      pylanceHealth: {
+        pid: null,
+        rssMiB: null,
+        thresholdMiB: 2048,
+        overThreshold: false,
+        extensionActive: false,
+        monitored: false,
+        inStartupGrace: false
+      },
+      gitState: {
+        preCommitSkipping: false,
+        preCommitDismissed: false,
+        preCommitMissing: false,
+        qaTestDataDirty: false
+      },
+      startupRegression: null,
+      dmypyHealth: { running: false, stale: false, configMtimeMs: null, daemonStartMs: null },
+      bazelCache: {
+        sizeBytes: null,
+        thresholdGiB: 50,
+        cachePath: null,
+        overThreshold: false
+      }
+    }
+  }
+}
+
+// ── Section view provider ──
+
+class SectionViewProvider implements vscode.WebviewViewProvider {
+  private _context: vscode.ExtensionContext
+  private _section: string
+  private _view: vscode.WebviewView | null = null
+  private _codiconUri: vscode.Uri | undefined
+  private _cspSource: string | undefined
+
+  constructor(context: vscode.ExtensionContext, section: string) {
+    this._context = context
+    this._section = section
+  }
+
+  resolveWebviewView(webviewView: vscode.WebviewView): void {
+    this._view = webviewView
+    const extUri = this._context.extensionUri
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [vscode.Uri.joinPath(extUri, 'icons')]
+    }
+    this._codiconUri = webviewView.webview.asWebviewUri(
+      vscode.Uri.joinPath(extUri, 'icons', 'codicon.ttf')
+    )
+    this._cspSource = webviewView.webview.cspSource
+
+    webviewView.webview.onDidReceiveMessage(
+      async (msg: WebviewMessage) => {
+        await handleMessage(msg)
+      },
+      null,
+      this._context.subscriptions
+    )
+
+    webviewView.onDidChangeVisibility(
+      () => {
+        if (webviewView.visible) this.refresh()
+      },
+      null,
+      this._context.subscriptions
+    )
+
+    this.refresh()
+  }
+
+  refresh(): void {
+    if (!this._view) return
+    const state = _stateCache || refreshStateCache()
+    const mod = sectionModules[this._section]
+    this._view.webview.html = mod
+      ? mod.render(state, this._codiconUri, this._cspSource)
+      : renderLoading()
+  }
+
+  showLoadingThenRefresh(): void {
+    if (!this._view) return
+    this._view.webview.html = renderLoading()
+    setTimeout(() => {
+      _stateCache = null
+      this.refresh()
+    }, 400)
+  }
+
+  showLoading(): void {
+    if (!this._view) return
+    this._view.webview.html = renderLoading()
+  }
+
+  isVisible(): boolean {
+    return !!this._view?.visible
+  }
+}
+
+function showSectionLoading(...sections: string[]): void {
+  for (const s of sections) {
+    if (_providers[s]) _providers[s].showLoading()
+  }
+}
+
+// ── Message handling ──
+
+async function handleMessage(msg: WebviewMessage): Promise<void> {
+  if (msg.type === 'onboardingDismiss') {
+    if (_context) _context.globalState.update('cmk.onboardingDismissed', true)
+    _onboardingDismissed = true
+    refreshAll()
+    return
+  }
+
+  if (msg.type === 'refresh') {
+    refreshAll()
+    return
+  }
+
+  const ctx = { refreshAll, refreshOmd, refreshProfiles, showSectionLoading }
+  for (const mod of Object.values(sectionModules)) {
+    if (await mod.handleMessage(msg, ctx)) return
+  }
+}
+
+// ── Public API ──
+
+/** Current state snapshot for read-only consumers (e.g. the diagnostics
+ *  report). Forces a full refresh if the cache has never been built. */
+export function getState(): StateCache {
+  return _stateCache ?? refreshStateCache()
+}
+
+export function refreshOmd(): void {
+  if (!_stateCache) return
+  const omdSites = detectOmdSites().map((site) => ({
+    ...site,
+    status: getOmdStatus(site.name)
+  }))
+  const activeProxies = getActiveProxies()
+  _stateCache = { ..._stateCache, omdSites, activeProxies }
+  updateIssues(_issuesView, _issuesProvider, _stateCache)
+  _providers['omd']?.refresh()
+}
+
+/**
+ * Re-render after a profile toggle using the existing state cache. Cheaper
+ * than `refreshAll()`: re-reads only the `profiles` slice (no bazel build
+ * status / OMD / mypy recompute) and re-renders the views that reflect
+ * profile state. Stale per-profile build severity self-corrects on the next
+ * overview tick / watcher-driven `refreshAll()`.
+ */
+export function refreshProfiles(): void {
+  if (!_stateCache) {
+    refreshAll()
+    return
+  }
+  _stateCache = { ..._stateCache, profiles: profileManager.getAll() }
+  updateIssues(_issuesView, _issuesProvider, _stateCache)
+  _providers['profiles']?.refresh()
+  _providers['overview']?.refresh()
+}
+
+export function refreshAll(): void {
+  refreshStateCache()
+  for (const p of Object.values(_providers)) {
+    p.refresh()
+  }
+  _refreshStatusBar?.(_stateCache?.buildStatus)
+}
+
+/**
+ * Re-render just the cockpit using the existing state cache. Cheaper than
+ * `refreshAll()` (no recompute); used by the auto-refresh interval and by
+ * actions that don't materially change StateCache.
+ */
+export function refreshOverview(): void {
+  if (!_stateCache) {
+    refreshAll()
+    return
+  }
+  // Pull the latest SWR-backed slices before re-rendering. Without this, the
+  // 5 s auto-refresh tick and the gitState/bazelCache callbacks both read
+  // back the frozen snapshot from the last full refreshStateCache() — e.g.
+  // re-enabling the pre-commit hook would leave the cockpit's "bypassed"
+  // chip stuck on the previous state until the user triggered refreshAll().
+  const g = getGitState()
+  const folder = vscode.workspace.workspaceFolders?.[0]
+  const preCommitDismissed = vscode.workspace
+    .getConfiguration('cmk.cockpit.git', folder?.uri)
+    .get<boolean>('ignorePreCommit', false)
+  _stateCache = {
+    ..._stateCache,
+    gitState: {
+      preCommitSkipping: g.preCommitSkipping,
+      preCommitDismissed,
+      preCommitMissing: g.preCommitMissing,
+      qaTestDataDirty: g.qaTestDataDirty
+    },
+    bazelCache: getBazelCacheSnapshot()
+  }
+  _providers['overview']?.refresh()
+}
+
+function overviewConsumersVisible(): boolean {
+  return _providers['overview']?.isVisible() ?? false
+}
+
+export function registerSidebar(
+  context: vscode.ExtensionContext,
+  commands: Record<string, unknown>,
+  refreshStatusBar?: (precomputed?: BuildStatus) => void
+): void {
+  _context = context
+  _onboardingDismissed = context.globalState.get('cmk.onboardingDismissed', false) as boolean
+  _commands = commands
+  _refreshStatusBar = refreshStatusBar ?? null
+  _extensionsConfig = loadConfig<ExtensionSets>('extensions')
+  _settingsConfig = loadConfig<Record<string, SettingsEntry>>('settings')
+
+  environmentSection.setEnvironmentRefreshCallback(refreshAll)
+  setDevSiteRefreshCallback(refreshAll)
+  setOmdStatusRefreshCallback(refreshOmd)
+  setAllocatorRefreshCallback(refreshAll)
+  setActivityRefreshCallback(() => _providers['activity']?.refresh())
+  setGitStateRefreshCallback(() => refreshOverview())
+  setBazelCacheRefreshCallback(() => refreshOverview())
+
+  for (const section of SECTIONS) {
+    const provider = new SectionViewProvider(context, section)
+    _providers[section] = provider
+    context.subscriptions.push(
+      vscode.window.registerWebviewViewProvider(`cmk.dashboard.${section}`, provider, {
+        webviewOptions: { retainContextWhenHidden: true }
+      })
+    )
+  }
+
+  _issuesProvider = new IssuesProvider()
+  _issuesView = vscode.window.createTreeView('cmk.dashboard.badge', {
+    treeDataProvider: _issuesProvider
+  })
+  context.subscriptions.push(_issuesView)
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cmk.dashboard', () => {
+      vscode.commands.executeCommand('cmk.dashboard.environment.focus')
+    })
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      'cmk.applySetting',
+      async (key: string, expected: unknown, scope: string) => {
+        try {
+          await ideHealthSection.writeMismatchSetting(key, expected, scope)
+          notifyInfo(`CMK ▸ IDE: Applied ${key}`, `${JSON.stringify(expected)} [${scope}]`)
+        } catch (err) {
+          notifyWarn(`CMK ▸ IDE: Failed to apply ${key}`, (err as Error).message)
+        }
+        refreshAll()
+      }
+    )
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cmk.rebuildExtension', () => {
+      rebuildExtension(context)
+    })
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cmk.installDevSite', async () => {
+      log('Install cmk-dev-site')
+      const exec = runCommand('Install cmk-dev-site', 'pipx install cmk-dev-site')
+      if (exec) {
+        await waitForTask(exec)
+        vscode.commands.executeCommand('setContext', 'cmk.devSiteInstalled', true)
+        refreshAll()
+      }
+    })
+  )
+
+  const wsPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+  if (wsPath) {
+    const settingsWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(wsPath, '.vscode/settings.json')
+    )
+    settingsWatcher.onDidChange(() => refreshAll())
+    settingsWatcher.onDidCreate(() => refreshAll())
+    context.subscriptions.push(settingsWatcher)
+
+    const configWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(wsPath, '.ide/vscode/config/*.json')
+    )
+    configWatcher.onDidChange(() => refreshAll())
+    configWatcher.onDidCreate(() => refreshAll())
+    context.subscriptions.push(configWatcher)
+
+    // Pre-commit toggle reactivity: watch the active hook *and* the cmk-
+    // disabled stash so cockpit `bypassed` chip changes land within ~100 ms
+    // of the toggle. Invalidates gitState's TTL so the next refresh doesn't
+    // read back the cached pre-toggle value.
+    const preCommitWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(wsPath, '.git/hooks/pre-commit*')
+    )
+    const onPreCommitChange = (): void => {
+      invalidateGitState()
+      refreshAll()
+    }
+    preCommitWatcher.onDidCreate(onPreCommitChange)
+    preCommitWatcher.onDidChange(onPreCommitChange)
+    preCommitWatcher.onDidDelete(onPreCommitChange)
+    context.subscriptions.push(preCommitWatcher)
+
+    // Cockpit hyper-reactivity: watch the canonical venv binary so build-status
+    // changes (rebuild, clean) reflect within ~100 ms.
+    const venvWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(wsPath, '.venv/bin/python')
+    )
+    venvWatcher.onDidCreate(() => refreshAll())
+    venvWatcher.onDidChange(() => refreshAll())
+    venvWatcher.onDidDelete(() => refreshAll())
+    context.subscriptions.push(venvWatcher)
+  }
+
+  let configDebounce: ReturnType<typeof setTimeout> | null = null
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration(() => {
+      if (configDebounce) clearTimeout(configDebounce)
+      configDebounce = setTimeout(() => refreshAll(), 100)
+    })
+  )
+
+  // Overview-only auto-refresh: cheap re-render every 5 s catches background-
+  // resolved state (OMD stale-while-revalidate, Pylance memory poll, dev-site
+  // update check) without paying the cost of a full refreshAll. Skipped
+  // whenever no cockpit consumer is visible — saves ~720 HTML rebuilds/hour
+  // of pure churn while the user is editing code in another sidebar.
+  const overviewInterval = setInterval(() => {
+    if (!overviewConsumersVisible()) return
+    refreshOverview()
+  }, 5000)
+  context.subscriptions.push({ dispose: () => clearInterval(overviewInterval) })
+
+  for (const section of SECTIONS) {
+    context.subscriptions.push(
+      vscode.commands.registerCommand(`cmk.dashboard.refresh.${section}`, async () => {
+        const p = _providers[section]
+        if (!p) return
+        if (section === 'omd') {
+          p.showLoading()
+          await forceRefreshOmdStatusFiles()
+          refreshAll()
+          return
+        }
+        if (section === 'environment') {
+          environmentSection.invalidateEnvironmentCache()
+        }
+        p.showLoadingThenRefresh()
+      })
+    )
+  }
+}

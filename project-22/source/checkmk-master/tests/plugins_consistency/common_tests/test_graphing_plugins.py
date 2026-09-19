@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+# Copyright (C) 2023 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+from collections import Counter
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Literal
+
+import pytest
+
+from cmk.discover_plugins import PluginLocation
+from cmk.graphing.v1 import graphs as graphs_v1
+from cmk.graphing.v1 import metrics as metrics_v1
+from cmk.graphing.v1 import perfometers as perfometers_v1
+from cmk.graphing.v1 import translations as translations_api
+from cmk.graphing.v2_unstable import graphs as graphs_v2_unstable
+from cmk.graphing.v2_unstable import metrics as metrics_v2_unstable
+from cmk.graphing.v2_unstable import perfometers as perfometers_v2_unstable
+from cmk.gui.graphing import GraphFromAPI, graphing_plugins, PerfometerFromAPI
+
+
+def test_graphing_plugins_load_without_errors() -> None:
+    discovered_graphing_plugins = graphing_plugins()
+    assert not discovered_graphing_plugins.errors
+    assert discovered_graphing_plugins.plugins
+
+
+def test_translations_to_be_standalone() -> None:
+    by_module: dict[str, Counter] = {}
+    for plugin_location, plugin in graphing_plugins().plugins.items():
+        counter = by_module.setdefault(plugin_location.module, Counter())
+        match plugin:
+            case translations_api.Translation():
+                counter.update(["translations"])
+            case _:
+                counter.update(["others"])
+    for module, counter in by_module.items():
+        if counter["translations"]:
+            assert not counter["rest"], (
+                f"The module {module!r} contains translations and other graphing plugins. Our"
+                " graphing modules are allowed to contain either translations or other plugins."
+            )
+        if counter["rest"]:
+            assert not counter["translations"], (
+                f"The module {module!r} contains translations and other graphing plugins. Our"
+                " graphing modules are allowed to contain either translations or other plugins."
+            )
+
+
+_MB_TO_BYTES = 1048576
+_SIZE_TREND_RAW_METRICS = ("growth", "trend")
+
+
+def test_growth_and_trend_translations_scale_mb_per_day_to_bytes_per_day() -> None:
+    """The raw growth/trend metrics are recorded in MB/day but render directly in bytes/day, so
+    every translation of them must rename and scale by 1 MiB. See SUP-29835."""
+    offenders = [
+        f"{location.module}: translation {plugin.name!r} maps {raw_name!r} via {op!r}"
+        for location, plugin in graphing_plugins().plugins.items()
+        if isinstance(plugin, translations_api.Translation)
+        for raw_name, op in plugin.translations.items()
+        if raw_name in _SIZE_TREND_RAW_METRICS
+        and not (isinstance(op, translations_api.RenameToAndScaleBy) and op.factor == _MB_TO_BYTES)
+    ]
+    assert not offenders, (
+        f"growth/trend must be renamed and scaled by 1 MiB ({_MB_TO_BYTES}) to convert MB/day to"
+        " bytes/day; these translations render the graph in the wrong unit:\n"
+        + "\n".join(offenders)
+    )
+
+
+def _collect_metric_names_from_quantity(
+    quantity: (
+        str
+        | metrics_v1.Constant
+        | metrics_v2_unstable.LowerWarningOf
+        | metrics_v2_unstable.LowerCriticalOf
+        | metrics_v1.WarningOf
+        | metrics_v1.CriticalOf
+        | metrics_v1.MinimumOf
+        | metrics_v1.MaximumOf
+        | metrics_v1.Sum
+        | metrics_v1.Product
+        | metrics_v1.Difference
+        | metrics_v1.Fraction
+    ),
+) -> Iterator[str]:
+    match quantity:
+        case str():
+            yield quantity
+        case (
+            metrics_v2_unstable.LowerWarningOf()
+            | metrics_v2_unstable.LowerCriticalOf()
+            | metrics_v1.WarningOf()
+            | metrics_v1.CriticalOf()
+            | metrics_v1.MinimumOf()
+            | metrics_v1.MaximumOf()
+        ):
+            yield quantity.metric_name
+        case metrics_v1.Sum():
+            for summand in quantity.summands:
+                yield from _collect_metric_names_from_quantity(summand)
+        case metrics_v1.Product():
+            for factor in quantity.factors:
+                yield from _collect_metric_names_from_quantity(factor)
+        case metrics_v1.Difference():
+            yield from _collect_metric_names_from_quantity(quantity.minuend)
+            yield from _collect_metric_names_from_quantity(quantity.subtrahend)
+        case metrics_v1.Fraction():
+            yield from _collect_metric_names_from_quantity(quantity.dividend)
+            yield from _collect_metric_names_from_quantity(quantity.divisor)
+        case _:
+            pass  # TODO: Hmmmm...
+
+
+def _collect_metric_names_from_perfometer(
+    perfometer: perfometers_v1.Perfometer | perfometers_v2_unstable.Perfometer,
+) -> Iterator[str]:
+    if not isinstance(perfometer.focus_range.lower.value, int | float):
+        yield from _collect_metric_names_from_quantity(perfometer.focus_range.lower.value)
+    if not isinstance(perfometer.focus_range.upper.value, int | float):
+        yield from _collect_metric_names_from_quantity(perfometer.focus_range.upper.value)
+    for segment in perfometer.segments:
+        yield from _collect_metric_names_from_quantity(segment)
+
+
+def _collect_metric_names_from_graph(
+    graph: graphs_v1.Graph | graphs_v2_unstable.Graph,
+) -> Iterator[str]:
+    if graph.minimal_range:
+        if not isinstance(graph.minimal_range.lower, int | float):
+            yield from _collect_metric_names_from_quantity(graph.minimal_range.lower)
+        if not isinstance(graph.minimal_range.lower, int | float):
+            yield from _collect_metric_names_from_quantity(graph.minimal_range.lower)
+    for compound_line in graph.compound_lines:
+        yield from _collect_metric_names_from_quantity(compound_line)
+    for simple_line in graph.simple_lines:
+        yield from _collect_metric_names_from_quantity(simple_line)
+    yield from graph.optional
+    yield from graph.conflicting
+
+
+@dataclass(frozen=True)
+class _MetricNamesInModule:
+    _from_metrics: set[str] = field(default_factory=set)
+    _from_perfometer_or_graph: dict[tuple[Literal["perfometer", "graph"], str], set[str]] = field(
+        default_factory=dict
+    )
+
+    @property
+    def from_metrics(self) -> Sequence[str]:
+        return list(self._from_metrics)
+
+    @property
+    def bundles(self) -> Sequence[tuple[str, ...]]:
+        bundles: set[tuple[str, ...]] = set()
+        for left_ident, left_metric_names in self._from_perfometer_or_graph.items():
+            bundle_ = left_metric_names
+            for (
+                right_ident,
+                right_metric_names,
+            ) in self._from_perfometer_or_graph.items():
+                if left_ident == right_ident:
+                    continue
+                if left_metric_names.intersection(right_metric_names):
+                    bundle_.update(right_metric_names)
+            bundles.add(tuple(sorted(bundle_)))
+        # remove subsets
+        result: set[tuple[str, ...]] = set()
+        for bundle in sorted(bundles, key=len, reverse=True):
+            if any(set(bundle).issubset(r) for r in result):
+                continue
+            result.add(bundle)
+        return list(result)
+
+    def add_from_plugin(
+        self,
+        plugin: (
+            metrics_v1.Metric | PerfometerFromAPI | GraphFromAPI | translations_api.Translation
+        ),
+    ) -> None:
+        match plugin:
+            case metrics_v1.Metric():
+                self._from_metrics.add(plugin.name)
+            case perfometers_v1.Perfometer() | perfometers_v2_unstable.Perfometer():
+                self._from_perfometer_or_graph.setdefault(
+                    ("perfometer", plugin.name),
+                    set(_collect_metric_names_from_perfometer(plugin)),
+                )
+            case perfometers_v1.Bidirectional() | perfometers_v2_unstable.Bidirectional():
+                self._from_perfometer_or_graph.setdefault(
+                    ("perfometer", plugin.name),
+                    set(_collect_metric_names_from_perfometer(plugin.left)).union(
+                        _collect_metric_names_from_perfometer(plugin.right)
+                    ),
+                )
+            case perfometers_v1.Stacked() | perfometers_v2_unstable.Stacked():
+                self._from_perfometer_or_graph.setdefault(
+                    ("perfometer", plugin.name),
+                    set(_collect_metric_names_from_perfometer(plugin.lower)).union(
+                        _collect_metric_names_from_perfometer(plugin.upper)
+                    ),
+                )
+            case graphs_v1.Graph() | graphs_v2_unstable.Graph():
+                self._from_perfometer_or_graph.setdefault(
+                    ("graph", plugin.name),
+                    set(_collect_metric_names_from_graph(plugin)),
+                )
+            case graphs_v1.Bidirectional() | graphs_v2_unstable.Bidirectional():
+                self._from_perfometer_or_graph.setdefault(
+                    ("graph", plugin.name),
+                    set(_collect_metric_names_from_graph(plugin.lower)).union(
+                        _collect_metric_names_from_graph(plugin.upper)
+                    ),
+                )
+            case _:
+                pass
+
+
+@pytest.mark.parametrize(
+    "from_plugins, expected_bundles",
+    [
+        pytest.param({}, [], id="empty"),
+        pytest.param(
+            {(0, "perfometer", "name"): ["b", "a"]},
+            [("a", "b")],
+            id="one-perfometer",
+        ),
+        pytest.param(
+            {("graph", "name"): ["b", "a"]},
+            [("a", "b")],
+            id="one-graph",
+        ),
+        pytest.param(
+            {
+                ("perfometer", "name"): ["b", "a"],
+                ("graph", "name"): ["d", "c"],
+            },
+            [("a", "b"), ("c", "d")],
+            id="no-intersection",
+        ),
+        pytest.param(
+            {
+                ("perfometer", "name"): ["b", "a"],
+                ("graph", "name"): ["c", "b"],
+            },
+            [("a", "b", "c")],
+            id="intersection-1",
+        ),
+        pytest.param(
+            {
+                ("perfometer", "name"): ["b", "a"],
+                ("graph", "name1"): ["d", "c"],
+                ("graph", "name2"): ["b", "d"],
+            },
+            [("a", "b", "c", "d")],
+            id="intersection-via-third",
+        ),
+        pytest.param(
+            {
+                ("perfometer", "name1"): ["b", "a"],
+                ("graph", "name1"): ["c", "b"],
+                ("perfometer", "name2"): ["e", "d"],
+                ("graph", "name2"): ["f", "e"],
+            },
+            [("a", "b", "c"), ("d", "e", "f")],
+            id="two-bundles",
+        ),
+        pytest.param(
+            {
+                ("perfometer", "name1"): ["b", "a"],
+                ("graph", "name1"): ["c", "b"],
+                ("perfometer", "name2"): ["e", "d"],
+                ("graph", "name2"): ["f", "e"],
+                ("graph", "name3"): ["f", "c"],
+            },
+            [("a", "b", "c", "d", "e", "f")],
+            id="two-bundles-intersection-via-third",
+        ),
+    ],
+)
+def test__MetricNamesInModule_bundles(
+    from_plugins: Mapping[tuple[Literal["perfometer", "graph"], str], Sequence[str]],
+    expected_bundles: Sequence[tuple[str, ...]],
+) -> None:
+    metric_names = _MetricNamesInModule(set(), {i: set(m) for i, m in from_plugins.items()})
+    assert sorted(metric_names.bundles) == expected_bundles
+
+
+def _metric_names_by_module(
+    plugins: Mapping[
+        PluginLocation,
+        metrics_v1.Metric | PerfometerFromAPI | GraphFromAPI | translations_api.Translation,
+    ],
+) -> Mapping[str, _MetricNamesInModule]:
+    metric_names_by_module: dict[str, _MetricNamesInModule] = {}
+    for plugin_location, plugin in plugins.items():
+        metric_names_by_module.setdefault(
+            plugin_location.module, _MetricNamesInModule()
+        ).add_from_plugin(plugin)
+    return metric_names_by_module
+
+
+@pytest.mark.skip_if_edition("community")
+def test_bundles() -> None:
+    offenders = [
+        (module, metric_names, bundles)
+        for module, metric_names in _metric_names_by_module(graphing_plugins().plugins).items()
+        if (bundles := metric_names.bundles)
+        and (len(bundles) > 1 or set(metric_names.from_metrics) != set(bundles[0]))
+    ]
+
+    assert not [m for m, *_ in offenders]
+    for module, metric_names, bundles in offenders:
+        assert len(bundles) <= 1, (
+            f"The module {module} defines multiple bundles. Our graphing modules are allowed to"
+            " contain either standalone metric definitions or exactly one cohesive bundle of"
+            " metric, perfometer or graph template definitions."
+        )
+        raise AssertionError(
+            f"The module {module} contains metric definitions which do not belong to a"
+            " bundle. Our graphing modules are allowed to contain either standalone metric"
+            " definitions or exactly one cohesive bundle of metric, perfometer or graph"
+            " template definitions."
+        )
+
+
+_ALLOWED_DUPLICATE_METRIC_TITLES = {
+    "Active": {"docker_active", "mem_lnx_active"},
+    "Age": {"age", "kube_info_age"},
+    "Active connections": {
+        "active",
+        "active_connections",
+        "aws_active_connections",
+        "fw_connections_active",
+    },
+    "Allocatable": {
+        "kube_memory_allocatable",
+        "kube_pod_allocatable",
+        "kube_cpu_allocatable",
+    },
+    "Allocated space": {"mem_lnx_vmalloc_used", "allocated_size"},
+    "Average consumption": {"aws_dynamodb_consumed_wcu", "aws_dynamodb_consumed_rcu"},
+    "Average latency": {"latency_ave", "average_latency_s"},
+    "Average usage": {
+        "aws_dynamodb_consumed_rcu_perc",
+        "aws_dynamodb_consumed_wcu_perc",
+    },
+    "Cluster utilization": {
+        "kube_cpu_cluster_allocatable_utilization",
+        "kube_memory_cluster_allocatable_utilization",
+    },
+    "Connection time": {"aws_route53_connection_time", "connection_time"},
+    "Failed connections": {"connections_failed_rate", "failed_connections"},
+    "GPU utilization": {"esx_gpu_utilization", "gpu_utilization"},
+    "Fan speed": {"fan_perc", "fan", "fan_speed"},
+    "HTTP 500 errors": {"http_5xx", "aws_http_500_rate"},
+    "Harddrive uncorrectable errors": {
+        "harddrive_uncorrectable_erros",
+        "harddrive_uncorrectable_errors",
+    },
+    "Limits": {"kube_cpu_limit", "kube_memory_limit"},
+    "Limits utilization": {
+        "kube_cpu_limit_utilization",
+        "kube_memory_limit_utilization",
+    },
+    "Maximum single-request consumption": {
+        "aws_dynamodb_maximum_consumed_wcu",
+        "aws_dynamodb_maximum_consumed_rcu",
+    },
+    "Memory used": {"memused_couchbase_bucket", "memory_used"},
+    "Minimum single-request consumption": {
+        "aws_dynamodb_minimum_consumed_rcu",
+        "aws_dynamodb_minimum_consumed_wcu",
+    },
+    "New connections": {"new_connections", "aws_new_connections"},
+    "Number of Go routines": {"bazel_cache_status_num_goroutines", "bazel_cache_go_go_goroutines"},
+    "Node utilization": {
+        "kube_cpu_node_allocatable_utilization",
+        "kube_memory_node_allocatable_utilization",
+    },
+    "Nodes": {"number_of_nodes", "aws_elasticache_nodes"},
+    "Non-compliant devices": {
+        "mobileiron_non_compliant",
+        "mobileiron_non_compliant_summary",
+    },
+    "Power usage": {"power_usage", "power_usage_percentage"},
+    "Pressure": {"pressure_pa", "pressure"},
+    "Rate of metrics received": {"perf_data_count_rate", "metrics_count_rate"},
+    "Queue length": {"queue", "queue_length"},
+    "Read latency": {"db_read_latency_s", "read_latency"},
+    "Read operations": {"disk_read_ios", "read_ops"},
+    "Requests": {"kube_memory_request", "kube_cpu_request", "aws_cloudfront_requests"},
+    "Requests per second": {"requests", "requests_per_sec", "requests_per_second"},
+    "Requests utilization": {
+        "kube_memory_request_utilization",
+        "kube_cpu_request_utilization",
+    },
+    "Reserved space": {"reserved_size", "reserved"},
+    "Running containers": {
+        "docker_running_containers",
+        "kube_node_container_count_running",
+    },
+    "Shared memory": {"mem_esx_shared", "mem_lnx_shmem"},
+    "Smoke": {"smoke_perc", "smoke_ppm"},
+    "Storage space used": {"storage_used", "storage_percent"},
+    "Streams": {"streams", "num_streams"},
+    "Swap used": {"swap_used", "swap_used_percent"},
+    "System": {"system", "system_size"},
+    "Total devices": {"ap_devices_total", "mobileiron_devices_total"},
+    "Total size": {"fs_size", "elasticsearch_size"},
+    "Total virtual memory": {"mem_lnx_total_total", "mem_total_virtual_in_bytes"},
+    "Usage": {"kube_cpu_usage", "pd_exclusivesnapshot", "kube_memory_usage"},
+    "Used licenses": {"licenses", "license_percentage"},
+    "Used virtual memory": {"pagefile_used_percent", "pagefile_used"},
+    "Used virtual memory (averaged)": {
+        "pagefile_used_percent_avg",
+        "pagefile_used_avg",
+    },
+    "User": {"user", "num_user"},
+    "Utilization": {"cisco_sma_queue_utilization", "generic_util"},
+    "Write latency": {"write_latency", "db_write_latency_s"},
+    "Write operations": {"write_ops_s", "disk_write_ios"},
+}
+
+
+def test_duplicate_metric_titles_new() -> None:
+    # CMK-26844
+    metric_names_by_title: dict[str, set[str]] = {}
+    for plugin in graphing_plugins().plugins.values():
+        if isinstance(plugin, metrics_v1.Metric):
+            metric_names_by_title.setdefault(plugin.title.localize(str), set()).add(plugin.name)
+
+    duplicate_metric_titles = {t: mns for t, mns in metric_names_by_title.items() if len(mns) > 1}
+
+    new = {}
+    for t, duplicates in duplicate_metric_titles.items():
+        if (allowed := _ALLOWED_DUPLICATE_METRIC_TITLES.get(t)) is None:
+            new[t] = duplicates
+            continue
+
+        if duplicates != allowed:
+            new[t] = duplicates.difference(allowed)
+    assert not new, "Found new duplicate titles:\n" + "\n".join(
+        [f"- {t}: {', '.join(mns)}" for t, mns in new.items()]
+    )
+
+
+def test_duplicate_metric_titles_fixed() -> None:
+    # CMK-26844
+    metric_names_by_title: dict[str, set[str]] = {}
+    for plugin in graphing_plugins().plugins.values():
+        if isinstance(plugin, metrics_v1.Metric):
+            metric_names_by_title.setdefault(plugin.title.localize(str), set()).add(plugin.name)
+
+    duplicate_metric_titles = {t: mns for t, mns in metric_names_by_title.items() if len(mns) > 1}
+
+    already_fixed = {}
+    for t, allowed in _ALLOWED_DUPLICATE_METRIC_TITLES.items():
+        if (duplicates := duplicate_metric_titles.get(t)) is None:
+            already_fixed[t] = allowed
+            continue
+
+        if allowed != duplicates:
+            already_fixed[t] = allowed.difference(duplicates)
+
+    assert not already_fixed, "Found already fixed duplicate titles:\n" + "\n".join(
+        [f"- {t}: {', '.join(gps)}" for t, gps in already_fixed.items()]
+    )
+
+
+_ALLOWED_DUPLICATE_GRAPH_TITLES = {
+    "Access point statistics": {"access_point_statistics2", "access_point_statistics"},
+    "Active sessions": {"active_sessions", "active_sessions_with_peak_value"},
+    "Bandwidth": {"bandwidth_translated", "bandwidth"},
+    "Capacity usage": {"capacity_usage_2", "capacity_usage"},
+    "Disk latency": {"disk_latency", "disk_rw_latency"},
+    "Huge pages": {"huge_pages_2", "huge_pages"},
+    "Packets": {"packets_1", "packets_2", "packets_3"},
+    "Traffic": {"traffic", "read_write_data"},
+    "VMalloc address space": {"vmalloc_address_space_2", "vmalloc_address_space_1"},
+}
+
+
+def test_duplicate_graph_titles_new() -> None:
+    # CMK-26844
+    graphs_by_title: dict[str, set[str]] = {}
+    for plugin in graphing_plugins().plugins.values():
+        if isinstance(
+            plugin,
+            graphs_v1.Graph
+            | graphs_v1.Bidirectional
+            | graphs_v2_unstable.Graph
+            | graphs_v2_unstable.Bidirectional,
+        ):
+            graphs_by_title.setdefault(plugin.title.localize(str), set()).add(plugin.name)
+
+    duplicate_graph_titles = {t: gps for t, gps in graphs_by_title.items() if len(gps) > 1}
+
+    new = {}
+    for t, duplicates in duplicate_graph_titles.items():
+        if (allowed := _ALLOWED_DUPLICATE_GRAPH_TITLES.get(t)) is None:
+            new[t] = duplicates
+            continue
+
+        if duplicates != allowed:
+            new[t] = duplicates.difference(allowed)
+
+    assert not new, "Found new duplicate titles:\n" + "\n".join(
+        [f"- {t}: {', '.join(gps)}" for t, gps in new.items()]
+    )
+
+
+def test_duplicate_graph_titles_fixed() -> None:
+    # CMK-26844
+    graphs_by_title: dict[str, set[str]] = {}
+    for plugin in graphing_plugins().plugins.values():
+        if isinstance(
+            plugin,
+            graphs_v1.Graph
+            | graphs_v1.Bidirectional
+            | graphs_v2_unstable.Graph
+            | graphs_v2_unstable.Bidirectional,
+        ):
+            graphs_by_title.setdefault(plugin.title.localize(str), set()).add(plugin.name)
+
+    duplicate_graph_titles = {t: gps for t, gps in graphs_by_title.items() if len(gps) > 1}
+
+    already_fixed = {}
+    for t, allowed in _ALLOWED_DUPLICATE_GRAPH_TITLES.items():
+        if (duplicates := duplicate_graph_titles.get(t)) is None:
+            already_fixed[t] = allowed
+            continue
+
+        if allowed != duplicates:
+            already_fixed[t] = allowed.difference(duplicates)
+
+    assert not already_fixed, "Found already fixed duplicate titles:\n" + "\n".join(
+        [f"- {t}: {', '.join(gps)}" for t, gps in already_fixed.items()]
+    )

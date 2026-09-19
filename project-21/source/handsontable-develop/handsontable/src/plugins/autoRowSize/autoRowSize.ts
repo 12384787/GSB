@@ -1,0 +1,1134 @@
+import type { HotInstance } from '../../core/types';
+import { BasePlugin } from '../base';
+import { cancelIdleTask, requestIdleTask } from '../../helpers/feature';
+import GhostTable from '../../utils/ghostTable';
+import { isObject } from '../../helpers/object';
+import { valueAccordingPercent, rangeEach } from '../../helpers/number';
+import SamplesGenerator from '../../utils/samplesGenerator';
+import { isPercentValue } from '../../helpers/string';
+import { formatCellValue } from '../../renderers/renderCell';
+import type { PhysicalIndexToValueMap as IndexToValueMap } from '../../translations';
+import { addClass, removeClass } from '../../helpers/dom/element';
+
+export const PLUGIN_KEY = 'autoRowSize';
+export const PLUGIN_PRIORITY = 40;
+const ROW_WIDTHS_MAP_NAME = 'autoRowSize';
+const FIRST_COLUMN_NOT_RENDERED_CLASS_NAME = 'htFirstDatasetColumnNotRendered';
+const AUTO_ROW_SIZE_CLASS_NAME = 'htAutoRowSize';
+
+/**
+ * @plugin AutoRowSize
+ * @class AutoRowSize
+ * @description
+ * The `AutoRowSize` plugin allows you to set row heights based on their highest cells.
+ *
+ * By default, the plugin is declared as `undefined`, which makes it disabled (same as if it was declared as `false`).
+ * Enabling this plugin may decrease the overall table performance, as it needs to calculate the heights of all cells to
+ * resize the rows accordingly.
+ * If you experience problems with the performance, try turning this feature off and declaring the row heights manually.
+ *
+ * But, to display Handsontable's scrollbar in a proper size, you need to enable the `AutoRowSize` plugin,
+ * by setting the [`autoRowSize`](@/api/options.md#autoRowSize) option to `true`.
+ *
+ * Row height calculations are divided into sync and async part. Each of this parts has their own advantages and
+ * disadvantages. Synchronous calculations are faster but they block the browser UI, while the slower asynchronous
+ * operations don't block the browser UI.
+ *
+ * To configure the sync/async distribution, you can pass an absolute value (number of rows) or a percentage value to a config object:
+ * ```js
+ * // as a number (300 rows in sync, rest async)
+ * autoRowSize: {syncLimit: 300},
+ *
+ * // as a string (percent)
+ * autoRowSize: {syncLimit: '40%'},
+ * ```
+ *
+ * To speed up the calculations, the plugin samples a subset of rows rather than measuring every row. By default, it
+ * skips rows whose value it has already sampled, on the assumption that identical values render at the same height.
+ *
+ * Sampling accepts additional options:
+ * - *samplingRatio* - Defines how many samples for the same length will be used to calculate. Default is `3`.
+ *
+ * ```js
+ *   autoRowSize: {
+ *     samplingRatio: 10,
+ *   }
+ * ```
+ *
+ * Set the `allowSampleDuplicates` option to `true` to sample duplicate values as well:
+ *
+ * ```js
+ * autoRowSize: {allowSampleDuplicates: true},
+ * ```
+ *
+ * Both sampling options take effect when you change them with {@link Core#updateSettings}, and the
+ * row heights are recalculated so the new sampling is applied to rows that were already measured.
+ * `samplingRatio` must be a whole number above zero; any other value falls back to the default.
+ *
+ * Enable this option when rows with the same value can still render at different heights - for example, with multiline
+ * text, or with custom renderers that vary a row's height based on its position or other data. Without it, the plugin
+ * may sample only one of those rows and apply its height to the rest, leading to incorrect row heights.
+ *
+ * The tradeoff is performance: allowing duplicates increases the number of rows measured, which lengthens the
+ * calculation and can block the UI for longer on large data sets.
+ *
+ * ::: tip
+ * Note: Updating some of the table's settings can cause the row heights to change (e.g. `wordWrap`, `textEllipsis`, renderers etc.).
+ * In those cases, to ensure that the row heights are properly recalculated, you need to call the {@link AutoRowSize#recalculateAllRowsHeight} method after calling {@link Core#updateSettings}.
+ * :::
+ *
+ * ::: tip
+ * If you use custom renderers, multiline text, or custom styles that produce non-standard row heights, and you call
+ * {@link Core#scrollViewportTo}, you must enable `AutoRowSize`. Without it, `scrollViewportTo()` calculates scroll
+ * positions based on the default row height and may scroll to an incorrect position.
+ * :::
+ *
+ * To configure this plugin see {@link Options#autoRowSize}.
+ *
+ * @example
+ *
+ * ::: only-for javascript
+ * ```js
+ * const hot = new Handsontable(document.getElementById('example'), {
+ *   data: getData(),
+ *   autoRowSize: true
+ * });
+ * // Access to plugin instance:
+ * const plugin = hot.getPlugin('autoRowSize');
+ *
+ * plugin.getRowHeight(4);
+ *
+ * if (plugin.isEnabled()) {
+ *   // code...
+ * }
+ * ```
+ * :::
+ *
+ * ::: only-for react
+ * ```jsx
+ * const hotRef = useRef(null);
+ *
+ * ...
+ *
+ * // First, let's contruct Handsontable
+ * <HotTable
+ *   ref={hotRef}
+ *   data={getData()}
+ *   autoRowSize={true}
+ * />
+ *
+ * ...
+ *
+ * // Access to plugin instance:
+ * const hot = hotRef.current.hotInstance;
+ * const plugin = hot.getPlugin('autoRowSize');
+ *
+ * plugin.getRowHeight(4);
+ *
+ * if (plugin.isEnabled()) {
+ *   // code...
+ * }
+ * ```
+ * :::
+ *
+ * ::: only-for angular
+ * ```ts
+ * import { AfterViewInit, Component, ViewChild } from "@angular/core";
+ * import {
+ *   GridSettings,
+ *   HotTableModule,
+ *   HotTableComponent,
+ * } from "@handsontable/angular-wrapper";
+ *
+ * `@Component`({
+ *   selector: "app-example",
+ *   standalone: true,
+ *   imports: [HotTableModule],
+ *   template: ` <div>
+ *     <hot-table [settings]="gridSettings" />
+ *   </div>`,
+ * })
+ * export class ExampleComponent implements AfterViewInit {
+ *   `@ViewChild`(HotTableComponent, { static: false })
+ *   readonly hotTable!: HotTableComponent;
+ *
+ *   readonly gridSettings = <GridSettings>{
+ *     data: this.getData(),
+ *     autoRowSize: true,
+ *   };
+ *
+ *   ngAfterViewInit(): void {
+ *     // Access to plugin instance:
+ *     const hot = this.hotTable.hotInstance;
+ *     const plugin = hot.getPlugin("autoRowSize");
+ *
+ *     plugin.getRowHeight(4);
+ *
+ *     if (plugin.isEnabled()) {
+ *       // code...
+ *     }
+ *   }
+ *
+ *   private getData(): Array<*> {
+ *     // get some data
+ *   }
+ * }
+ * ```
+ * :::
+ */
+export class AutoRowSize extends BasePlugin {
+  /**
+   * Returns the plugin key used to identify this plugin in Handsontable settings.
+   */
+  static get PLUGIN_KEY() {
+    return PLUGIN_KEY;
+  }
+
+  /**
+   * Returns the priority order used to determine the order in which plugins are initialized.
+   */
+  static get PLUGIN_PRIORITY() {
+    return PLUGIN_PRIORITY;
+  }
+
+  /**
+   * Returns `true` so the plugin updates on every `updateSettings` call, regardless of config object contents.
+   */
+  static get SETTING_KEYS(): string[] | boolean {
+    return true;
+  }
+
+  /**
+   * Returns the default settings applied when the plugin is enabled without explicit configuration.
+   *
+   * There is deliberately no `useHeaders` entry here, even though {@link AutoColumnSize} declares one.
+   * That setting decides whether a header is rendered next to the samples being measured, and this
+   * plugin never asks that question: a row's height is measured with its row header always attached
+   * (see `GhostTable#createRow`, which keys off `hasRowHeaders()`), and the column header's own
+   * height is measured separately by `addColumnHeadersRow`. Declaring the setting anyway would offer
+   * a switch that changes nothing.
+   */
+  static get DEFAULT_SETTINGS(): { samplingRatio: number | null; allowSampleDuplicates: boolean } {
+    return {
+      samplingRatio: null,
+      allowSampleDuplicates: false,
+    };
+  }
+
+  /**
+   * Returns the number of rows processed in a single calculation step during asynchronous sizing.
+   */
+  static get CALCULATION_STEP() {
+    return 50;
+  }
+
+  /**
+   * Returns the maximum number of rows whose heights are calculated synchronously before switching to async mode.
+   */
+  static get SYNC_CALCULATION_LIMIT() {
+    return 500;
+  }
+
+  /**
+   * Columns header's height cache.
+   *
+   * @private
+   * @type {number}
+   */
+  headerHeight: number | null = null;
+  /**
+   * Instance of {@link GhostTable} for rows and columns size calculations.
+   *
+   * @private
+   * @type {GhostTable}
+   */
+  ghostTable = new GhostTable(this.hot);
+  /**
+   * Instance of {@link SamplesGenerator} for generating samples necessary for rows height calculations.
+   *
+   * @private
+   * @type {SamplesGenerator}
+   */
+  samplesGenerator = new SamplesGenerator((row: number, column: number) => {
+    const physicalColumn = this.hot.toPhysicalColumn(column);
+
+    if (this.hot.columnIndexMapper.isHidden(physicalColumn)) {
+      return false;
+    }
+
+    let cellMeta;
+
+    if (row >= 0 && column >= 0) {
+      // The transient read resolves the full dynamic meta (hooks + `cells`, so `hidden` from
+      // merged cells works) without storing anything - this sampler sweeps every row, and the
+      // eager `getCellMeta` would permanently materialize one meta per visited cell.
+      cellMeta = this.hot.getCellMetaTransient(row, column);
+
+      if (cellMeta.hidden) {
+        // do not generate samples for cells that are covered by merged cell (null values)
+        return false;
+      }
+    }
+
+    let cellValue;
+
+    if (row >= 0) {
+      cellValue = this.hot.getDataAtCell(row, column);
+
+      if (cellMeta) {
+        // Format through the same precedence as the render path (cell-level `valueFormatter`, then
+        // the renderer's own static), so the measured string matches what the renderer produces.
+        cellValue = formatCellValue(cellValue, cellMeta, this.hot.getCellRenderer(cellMeta));
+      }
+    } else if (row === -1) {
+      cellValue = this.hot.getColHeader(column);
+    }
+
+    return { value: cellValue };
+  });
+  /**
+   * `true` if the size calculation is in progress.
+   *
+   * @type {boolean}
+   */
+  inProgress: boolean = false;
+  /**
+   * Number of already measured rows (we already know their sizes).
+   *
+   * @type {number}
+   */
+  measuredRows: number = 0;
+  /**
+   * PhysicalIndexToValueMap to keep and track heights for physical row indexes.
+   *
+   * @private
+   * @type {PhysicalIndexToValueMap}
+   */
+  rowHeightsMap: IndexToValueMap;
+  /**
+   * An array of row indexes whose height will be recalculated.
+   *
+   * @type {number[]}
+   */
+  #visualRowsToRefresh: number[] = [];
+  /**
+   * Disposer function for the row heights map observer. Called on disable to clean up.
+   *
+   * @type {Function|null}
+   */
+  #disposeMapObserver: (() => void) | null = null;
+  /**
+   * `true` value indicates that the #onInit() function has been already called.
+   *
+   * @type {boolean}
+   */
+  #isInitialized = false;
+  /**
+   * `true` when a full row-height recalculation is already scheduled for the current
+   * column-resize gesture. Resizing several selected columns fires `beforeColumnResize` once
+   * per column in one synchronous loop — the flag coalesces those calls into a single
+   * recalculation that runs after every new width has been applied.
+   *
+   * @type {boolean}
+   */
+  #columnResizeRecalcScheduled = false;
+  /**
+   * `true` when a full `clearCache()` wiped every measured height and the replacement pass has not
+   * run yet.
+   *
+   * Only a render measures rows, and it measures just the visible band, so an emptied cache leaves
+   * every row below the fold unmeasured for good. Such a row falls back to the default height,
+   * which its own cell then refuses to honor once a wide wrapping column scrolls into view - a
+   * cell never renders shorter than its text - while the row header, having nothing to push it
+   * taller, does honor it. The two tables drift apart from there.
+   *
+   * The flag makes the next render restore the measurements the way `#onInit` does. Deferring
+   * rather than measuring inside `clearCache()` keeps repeated calls down to one recalculation and
+   * leaves `clearCache()` as cheap as it has always been.
+   *
+   * "The next render" means a full one: `beforeRender` is raised by `TableView#render()`, not by
+   * the engine's scroll draw, so a caller that clears the cache and then only scrolls gets nothing.
+   * Every documented use of `clearCache()` pairs it with a redraw.
+   *
+   * @type {boolean}
+   */
+  #fullRecalculationScheduled = false;
+  /**
+   * Handle of the idle task driving the in-flight full sweep, or `0` when none is running.
+   *
+   * Held on the instance rather than in `calculateAllRowsHeight()`'s closure so a new sweep can
+   * abandon the one before it - see the cancellation there.
+   *
+   * @type {number}
+   */
+  #idleSweepTimer = 0;
+
+  /**
+   * Initializes the plugin, registers the row heights map, and sets up the row resize hook.
+   */
+  constructor(hotInstance: HotInstance) {
+    super(hotInstance);
+    // The map holds numbers only, so re-writing an unchanged height is a no-op that must not
+    // invalidate the row-height position cache.
+    this.rowHeightsMap = this.hot.rowIndexMapper.createAndRegisterIndexMap(
+      ROW_WIDTHS_MAP_NAME, 'physicalIndexToValue', null, { skipUnchangedWrites: true },
+    );
+
+    // Leave the listener active to allow auto-sizing the rows when the plugin is disabled.
+    // This is necessary for height recalculation for resize handler doubleclick (ManualRowResize).
+    this.addHook('beforeRowResize', this.#onBeforeRowResize);
+  }
+
+  /**
+   * Checks if the plugin is enabled in the handsontable settings. This method is executed in {@link Hooks#beforeInit}
+   * hook and if it returns `true` then the {@link AutoRowSize#enablePlugin} method is called.
+   *
+   * @returns {boolean}
+   */
+  isEnabled(): boolean {
+    const settings = this.hot.getSettings()[PLUGIN_KEY];
+
+    return settings === true || isObject(settings);
+  }
+
+  /**
+   * Enables the plugin functionality for this Handsontable instance.
+   */
+  enablePlugin(): void {
+    if (this.enabled) {
+      return;
+    }
+
+    this.#applySamplingSettings();
+
+    this.addHook('afterLoadData', this.#onAfterLoadData);
+    this.addHook('beforeChangeRender', this.#onBeforeChange);
+    this.addHook('beforeColumnResize', this.#onBeforeColumnResize);
+    this.addHook('afterFormulasValuesUpdate', this.#onAfterFormulasValuesUpdate);
+    this.addHook('beforeViewRender', this.#onBeforeViewRender);
+    this.addHook('beforeRender', this.#onBeforeRender);
+    this.addHook('modifyRowHeight', (height: number, row: number) => this.getRowHeight(row, height));
+    this.addHook('init', this.#onInit);
+    this.addHook('modifyColumnHeaderHeight', () => this.getColumnHeaderHeight());
+
+    this.#disposeMapObserver = this.hot.rowIndexMapper
+      .observeMapChange(this.rowHeightsMap, () => {
+        this.hot.view?.invalidateRowHeightCache();
+      });
+
+    addClass(this.hot.rootElement, AUTO_ROW_SIZE_CLASS_NAME);
+
+    super.enablePlugin();
+  }
+
+  /**
+   * Updates the plugin's state after the table settings change.
+   *
+   * The sampling settings have to be re-read here, not only in `enablePlugin`: that method returns
+   * early on an already-enabled plugin, and `BasePlugin` only re-runs the enable/disable pair when
+   * the plugin's enabled state itself changed. Without this, `samplingRatio` and
+   * `allowSampleDuplicates` were silently ignored whenever they arrived through `updateSettings`.
+   *
+   * The measured heights are dropped only when a sampling setting actually changed. The framework
+   * wrappers re-send unchanged settings on every update (React on every commit), so clearing the
+   * cache unconditionally would re-measure every row on each of them.
+   *
+   * @param {object} [newSettings] The settings passed to `updateSettings`.
+   */
+  updatePlugin(newSettings?: Record<string, unknown>): void {
+    // `SETTING_KEYS` is `true`, so an update that never mentions this plugin still arrives here -
+    // and `BasePlugin#onUpdateSettings` has already fed `updatePluginSettings()` the missing key as
+    // `undefined`, wiping the stored settings. Restore them from the merged settings before reading
+    // them, or an unrelated `updateSettings({ colHeaders: true })` would read the defaults, reset
+    // the user's `samplingRatio`, and drop every measured height.
+    if (newSettings !== undefined && newSettings[PLUGIN_KEY] === undefined) {
+      this.updatePluginSettings(this.hot.getSettings()[PLUGIN_KEY]);
+    }
+
+    if (this.#applySamplingSettings()) {
+      this.clearCache();
+    }
+
+    super.updatePlugin();
+  }
+
+  /**
+   * Reads the sampling-related settings and applies them to the samples generator.
+   *
+   * @returns {boolean} `true` when a setting changed, which means the measured heights are stale.
+   */
+  #applySamplingSettings(): boolean {
+    return this.samplesGenerator.applySamplingOptions({
+      samplingRatio: this.getSetting('samplingRatio'),
+      allowDuplicates: this.getSetting<boolean>('allowSampleDuplicates'),
+    });
+  }
+
+  /**
+   * Disables the plugin functionality for this Handsontable instance.
+   */
+  disablePlugin(): void {
+    if (this.#disposeMapObserver) {
+      this.#disposeMapObserver();
+      this.#disposeMapObserver = null;
+    }
+
+    this.headerHeight = null;
+
+    removeClass(this.hot.rootElement, AUTO_ROW_SIZE_CLASS_NAME);
+
+    super.disablePlugin();
+
+    // Remove the "first dataset column not rendered" class name when the plugin is disabled.
+    this.#toggleFirstDatasetColumnRenderedClassName(false);
+
+    // Leave the listener active to allow auto-sizing the rows when the plugin is disabled.
+    // This is necessary for height recalculation for resize handler doubleclick (ManualRowResize).
+    this.addHook('beforeRowResize', this.#onBeforeRowResize);
+  }
+
+  /**
+   * Calculates heights for visible rows in the viewport only.
+   */
+  calculateVisibleRowsHeight(): void {
+    // Keep last row heights unchanged for situation when all columns was deleted or trimmed
+    if (!this.hot.countCols()) {
+      return;
+    }
+
+    const firstVisibleRow = this.getFirstVisibleRow();
+    const lastVisibleRow = this.getLastVisibleRow();
+
+    if (firstVisibleRow === -1 || lastVisibleRow === -1) {
+      return;
+    }
+
+    const overwriteCache = this.hot.forceFullRender;
+
+    this.calculateRowsHeight({ from: firstVisibleRow, to: lastVisibleRow }, undefined, overwriteCache);
+  }
+
+  /**
+   * Calculate a given rows height.
+   *
+   * @param {number|object} rowRange Row index or an object with `from` and `to` indexes as a range.
+   * @param {number|object} colRange Column index or an object with `from` and `to` indexes as a range.
+   * @param {boolean} [overwriteCache=false] If `true` the calculation will be processed regardless of whether the width exists in the cache.
+   */
+  calculateRowsHeight(
+    rowRange: number | { from: number, to: number } = { from: 0, to: this.hot.countRows() - 1 },
+    colRange: number | { from: number, to: number } = { from: 0, to: this.hot.countCols() - 1 },
+    overwriteCache: boolean = false
+  ): void {
+    const rowsRange = typeof rowRange === 'number' ? { from: rowRange, to: rowRange } : rowRange;
+    const columnsRange = typeof colRange === 'number' ? { from: colRange, to: colRange } : colRange;
+
+    // The cached header height is reused unless the caller explicitly overwrites the cache
+    // (full renders triggered by data or settings changes do). Without this guard, every
+    // render — including selection-driven ones — would re-sample the header row across all
+    // columns and force a ghost-table reflow even when every height is already cached.
+    if ((overwriteCache || this.headerHeight === null) && this.hot.getColHeader(0) !== null) {
+      const samples = this.samplesGenerator.generateRowSamples(-1, columnsRange);
+
+      this.ghostTable.addColumnHeadersRow(samples.get(-1));
+    }
+
+    rangeEach(rowsRange.from, rowsRange.to, (visualRow) => {
+      let physicalRow = this.hot.toPhysicalRow(visualRow);
+
+      if (physicalRow === null) {
+        physicalRow = visualRow;
+      }
+
+      // For rows we must calculate row height even when user had set height value manually.
+      // We can shrink column but cannot shrink rows!
+      if (overwriteCache || this.rowHeightsMap.getValueAtIndex(physicalRow) === null) {
+        const samples = this.samplesGenerator.generateRowSamples(visualRow, columnsRange);
+
+        samples.forEach((sample, row) => this.ghostTable.addRow(row, sample));
+      }
+    });
+
+    if (this.ghostTable.rows.length) {
+      this.hot.batchExecution(() => {
+        this.ghostTable.getHeights((row: number, height: number) => {
+          if (row < 0) {
+            this.headerHeight = height;
+          } else {
+            this.rowHeightsMap.setValueAtIndex(this.hot.toPhysicalRow(row), height);
+          }
+        });
+      }, true);
+
+      this.measuredRows = rowsRange.to + 1;
+      this.ghostTable.clean();
+    }
+  }
+
+  /**
+   * Calculate all rows heights. The calculated row will be cached in the {@link AutoRowSize#heights} property.
+   * To retrieve height for specified row use {@link AutoRowSize#getRowHeight} method.
+   *
+   * @param {object|number} colRange Row index or an object with `from` and `to` properties which define row range.
+   * @param {boolean} [overwriteCache] If `true` the calculation will be processed regardless of whether the width exists in the cache.
+   */
+  calculateAllRowsHeight(
+    colRange: number | { from: number, to: number } = { from: 0, to: this.hot.countCols() - 1 },
+    overwriteCache: boolean = false
+  ): void {
+    let current = 0;
+    const length = this.hot.countRows() - 1;
+
+    // A sweep already walking the grid is abandoned rather than left to run beside this one. Every
+    // sweep starts at row 0 and covers every row, so the new one measures everything the old one
+    // still had left. Two in flight would double the work and, worse, race on `inProgress`:
+    // whichever finished first would clear it while the other was still writing heights, and
+    // `#onBeforeRender` reads that flag to decide whether the refresh queue is safe to drain.
+    cancelIdleTask(this.#idleSweepTimer);
+    this.#idleSweepTimer = 0;
+
+    this.inProgress = true;
+
+    const loop = () => {
+      // When hot was destroyed after calculating finished cancel frame
+      if (!this.hot) {
+        cancelIdleTask(this.#idleSweepTimer);
+        this.#idleSweepTimer = 0;
+        this.inProgress = false;
+
+        return;
+      }
+
+      try {
+        this.calculateRowsHeight({
+          from: current,
+          to: Math.min(current + AutoRowSize.CALCULATION_STEP, length)
+        }, colRange, overwriteCache);
+      } catch (error) {
+        // This runs inside an idle task, so the throw escapes whatever called
+        // `calculateAllRowsHeight()` - no caller's try/catch can see it. Leave the plugin
+        // recoverable before it goes.
+        this.#abandonSweep();
+
+        throw error;
+      }
+
+      current = current + AutoRowSize.CALCULATION_STEP + 1;
+
+      if (current < length) {
+        this.#idleSweepTimer = requestIdleTask(loop);
+      } else {
+        cancelIdleTask(this.#idleSweepTimer);
+        this.#idleSweepTimer = 0;
+        this.inProgress = false;
+
+        // Rows queued while this sweep was running were held back, because the two share one ghost
+        // table. The sweep ends without a render of its own, so nothing else would pick them up
+        // until the next full render - which never comes on a grid the user only scrolls.
+        this.#drainRowRefreshQueue();
+      }
+    };
+
+    const syncLimit = this.getSyncCalculationLimit();
+
+    // sync
+    if (syncLimit >= 0) {
+      try {
+        this.calculateRowsHeight({ from: 0, to: syncLimit }, colRange, overwriteCache);
+      } catch (error) {
+        this.#abandonSweep();
+
+        throw error;
+      }
+
+      current = syncLimit + 1;
+    }
+    // async
+    if (current < length) {
+      loop();
+    } else {
+      this.inProgress = false;
+
+      // The whole grid fitted inside the sync limit, so `loop()` never ran and its completion
+      // branch - the other place the queue is drained - was never reached.
+      this.#drainRowRefreshQueue();
+    }
+  }
+
+  /**
+   * Puts the plugin back into a state the next render can recover from, after a measurement threw
+   * part way through a sweep.
+   *
+   * Without it `inProgress` stays `true` for the instance's life, which does more than leave the
+   * heights half measured: `#drainRowRefreshQueue()` refuses to run while a sweep is in flight, so
+   * the refresh queue is silently disabled too. The full recalculation is re-owed, so the next
+   * render starts over.
+   */
+  #abandonSweep(): void {
+    cancelIdleTask(this.#idleSweepTimer);
+    this.#idleSweepTimer = 0;
+    this.inProgress = false;
+    this.#fullRecalculationScheduled = true;
+
+    // The ghost table has to be emptied too, or the retry above dies on arrival. `GhostTable#addRow`
+    // pushes its row object BEFORE it runs the renderers and only fills in `.table` once they have
+    // all returned, so a renderer that throws leaves a half-built entry behind - and `getHeights()`
+    // reads `.table` on every row it holds. Only the success path calls `clean()`, so without this
+    // the next sweep throws on that leftover, and so does the one after it.
+    this.ghostTable.clean();
+  }
+
+  /**
+   * Measures the rows waiting in the refresh queue, if this moment can measure them at all.
+   *
+   * Two moments cannot, and both KEEP the queue rather than dropping it, so the rows are measured
+   * at the first moment that can:
+   *
+   * - while a full sweep is running, because the sweep and this pass share one ghost table;
+   * - while the grid has no columns, because the measurement would then write a near-empty height
+   *   which, no longer being `null`, is never re-measured when the columns come back. That is the
+   *   same trap the scheduled full recalculation is guarded against.
+   *
+   * Called from the render, and again when a sweep finishes - a sweep ends without a render of its
+   * own, so without that second call a queue held back by the first condition would wait for the
+   * next full render, which on a grid the user only scrolls never comes.
+   */
+  #drainRowRefreshQueue(): void {
+    if (this.inProgress || this.hot.countCols() === 0 || this.#visualRowsToRefresh.length === 0) {
+      return;
+    }
+
+    // Cleared after the call, not before: a measurement that throws leaves the rows queued for the
+    // next attempt rather than dropping them.
+    this.#calculateSpecificRowsHeight(this.#visualRowsToRefresh);
+    this.#visualRowsToRefresh = [];
+  }
+
+  /**
+   * Calculates specific rows height (overwrite cache values).
+   *
+   * @param {number[]} visualRows List of visual rows to calculate.
+   */
+  #calculateSpecificRowsHeight(visualRows: number[]) {
+    const columnsRange = {
+      from: 0,
+      to: this.hot.countCols() - 1,
+    };
+
+    visualRows.forEach((visualRow: number) => {
+      // For rows we must calculate row height even when user had set height value manually.
+      // We can shrink column but cannot shrink rows!
+      const samples = this.samplesGenerator.generateRowSamples(visualRow, columnsRange);
+
+      samples.forEach((sample, row) => this.ghostTable.addRow(row, sample));
+    });
+
+    if (this.ghostTable.rows.length) {
+      this.hot.batchExecution(() => {
+        this.ghostTable.getHeights((visualRow: number, height: number) => {
+          const physicalRow = this.hot.toPhysicalRow(visualRow);
+
+          this.rowHeightsMap.setValueAtIndex(physicalRow, height);
+        });
+      }, true);
+
+      this.ghostTable.clean();
+    }
+  }
+
+  /**
+   * Recalculates all rows height (overwrite cache values).
+   */
+  recalculateAllRowsHeight(): void {
+    if (this.hot.view.isVisible()) {
+      this.calculateAllRowsHeight({ from: 0, to: this.hot.countCols() - 1 }, true);
+    }
+  }
+
+  /**
+   * Gets value which tells how many rows should be calculated synchronously (rest of the rows will be calculated
+   * asynchronously). The limit is calculated based on `syncLimit` set to autoRowSize option (see {@link Options#autoRowSize}).
+   *
+   * @returns {number}
+   */
+  getSyncCalculationLimit(): number {
+    const settings = this.hot.getSettings()[PLUGIN_KEY];
+    /* eslint-disable no-bitwise */
+    let limit = AutoRowSize.SYNC_CALCULATION_LIMIT;
+    const rowsLimit = this.hot.countRows() - 1;
+
+    if (isObject(settings)) {
+      limit = this.getSetting<number>('syncLimit');
+
+      if (isPercentValue(limit as unknown as string)) {
+        limit = valueAccordingPercent(rowsLimit, limit as unknown as string);
+      } else {
+        // Force to integer (NaN — e.g. when syncLimit is undefined — falls back to 0)
+        const numericLimit = Number(limit);
+
+        limit = Number.isFinite(numericLimit) ? Math.trunc(numericLimit) : 0;
+      }
+    }
+
+    return Math.min(limit, rowsLimit);
+  }
+
+  /**
+   * Get a row's height, as measured in the DOM.
+   *
+   * The height returned includes 1 px of the row's bottom border.
+   *
+   * Mind that this method is different from the
+   * [`getRowHeight()`](@/api/core.md#getrowheight) method
+   * of Handsontable's [Core](@/api/core.md).
+   *
+   * @param {number} row A visual row index.
+   * @param {number} [defaultHeight] If no height is found, `defaultHeight` is returned instead.
+   * @returns {number} The height of the specified row, in pixels.
+   */
+  getRowHeight(row: number, defaultHeight: number = this.hot.stylesHandler.getDefaultRowHeight(row) ?? 0): number {
+    if (row < 0) {
+      return this.headerHeight ?? defaultHeight;
+    }
+
+    const physicalRow = this.hot.toPhysicalRow(row);
+
+    if (this.hot.rowIndexMapper.isHidden(physicalRow)) {
+      return defaultHeight;
+    }
+
+    const cachedHeight = this.rowHeightsMap.getValueAtIndex<number>(physicalRow);
+    let height = defaultHeight;
+
+    if (cachedHeight !== undefined && cachedHeight !== null && cachedHeight > defaultHeight) {
+      height = cachedHeight;
+
+      if (
+        this.hot.stylesHandler.firstRenderedRowDrawsTopBorder() &&
+        row === this.hot.view.getFirstRenderedVisibleRow()
+      ) {
+        // add 1px border-top-width compensation for the first rendered row
+        height += 1;
+      }
+    }
+
+    return height;
+  }
+
+  /**
+   * Get the calculated column header height.
+   *
+   * @returns {number|undefined}
+   */
+  getColumnHeaderHeight(): number | null | undefined {
+    return this.headerHeight;
+  }
+
+  /**
+   * Get the first visible row.
+   *
+   * When the {@link MergeCells} plugin is enabled with its default `virtualized: false` setting, a merged
+   * cell that crosses the viewport edge extends the rendered row range. In that case this method can
+   * return a row index outside the strictly visible viewport. To read the actual visible viewport, use
+   * {@link Core#getFirstFullyVisibleRow} or {@link Core#getFirstPartiallyVisibleRow}.
+   *
+   * @returns {number} Returns row index, -1 if table is not rendered or if there are no rows to base the the calculations on.
+   */
+  getFirstVisibleRow(): number {
+    return this.hot.getFirstRenderedVisibleRow() ?? -1;
+  }
+
+  /**
+   * Gets the last visible row.
+   *
+   * When the {@link MergeCells} plugin is enabled with its default `virtualized: false` setting, a merged
+   * cell that crosses the viewport edge extends the rendered row range. In that case this method can
+   * return a row index outside the strictly visible viewport. To read the actual visible viewport, use
+   * {@link Core#getLastFullyVisibleRow} or {@link Core#getLastPartiallyVisibleRow}.
+   *
+   * @returns {number} Returns row index or -1 if table is not rendered.
+   */
+  getLastVisibleRow(): number {
+    return this.hot.getLastRenderedVisibleRow() ?? -1;
+  }
+
+  /**
+   * Clears cache of calculated row heights. If you want to clear only selected rows pass an array with their indexes.
+   * Otherwise whole cache will be cleared.
+   *
+   * Clearing the whole cache schedules a full re-measurement, which runs on the next render. Note
+   * that a scroll is not a render in this sense - pair the call with {@link Core#render} the way the
+   * examples do, or the heights are not rebuilt.
+   *
+   * Passing an array clears those rows only, and queues exactly those rows for re-measurement on
+   * the next render.
+   *
+   * @param {number[]} [physicalRows] List of physical row indexes to clear.
+   */
+  clearCache(physicalRows?: number[]): void {
+    this.headerHeight = null;
+
+    if (Array.isArray(physicalRows)) {
+      this.hot.batchExecution(() => {
+        physicalRows.forEach((physicalIndex) => {
+          this.rowHeightsMap.setValueAtIndex(physicalIndex, null);
+        });
+      }, true);
+
+      this.#queueClearedRowsForRefresh(physicalRows);
+
+    } else {
+      this.rowHeightsMap.clear();
+      // Nothing is measured any more, so the next render owes a full recalculation - see
+      // `#fullRecalculationScheduled`.
+      //
+      // `measuredRows` is deliberately left alone. It is what the public `isNeedRecalculate()`
+      // slices, and zeroing it makes that method answer "nothing to recalculate" at the exact
+      // moment every height was dropped. AutoColumnSize leaves its counterpart alone for the same
+      // reason.
+      this.#fullRecalculationScheduled = true;
+    }
+  }
+
+  /**
+   * Clears cache by range. The cleared rows are queued for re-measurement on the next render.
+   *
+   * @param {object|number} range Row index or an object with `from` and `to` properties which define row range.
+   */
+  clearCacheByRange(range: number | { from: number, to: number }): void {
+    const { from, to } = typeof range === 'number' ? { from: range, to: range } : range;
+    const clearedRows: number[] = [];
+
+    this.hot.batchExecution(() => {
+      rangeEach(Math.min(from, to), Math.max(from, to), (row) => {
+        this.rowHeightsMap.setValueAtIndex(row, null);
+        clearedRows.push(row);
+      });
+    }, true);
+
+    this.#queueClearedRowsForRefresh(clearedRows);
+  }
+
+  /**
+   * Queues rows whose cached height was just dropped, so the next render measures them again.
+   *
+   * Without this they are only measured if and when they are drawn, and a render measures only the
+   * band it draws - so a cleared row below the fold keeps the default height, and once a wide
+   * wrapping column is scrolled into view its cell renders taller than the row header, which is the
+   * misalignment `#fullRecalculationScheduled` exists to prevent. `#calculateSpecificRowsHeight()`
+   * reads a row from the data rather than from the screen, so being off-screen is no obstacle.
+   *
+   * The queue is the same one data changes use, and it is drained in one synchronous pass, so
+   * clearing a very large range costs a correspondingly large measurement on the next render. That
+   * matches what the caller asked for, and it is the shape `#onBeforeChange` has always had; the
+   * alternative - leaving the rows silently wrong - is the defect.
+   *
+   * @param {number[]} physicalRows Physical row indexes whose heights were cleared.
+   */
+  #queueClearedRowsForRefresh(physicalRows: number[]): void {
+    physicalRows.forEach((physicalRow) => {
+      const visualRow = this.hot.toVisualRow(physicalRow);
+
+      // A row outside the dataset, or one a trimming map hides, has no visual index to measure.
+      // Duplicates are skipped, the way the other producers of this queue do it: while the queue is
+      // held back (a column-less grid, or a sweep in flight) overlapping calls would otherwise pile
+      // the same row up and measure it once per copy.
+      if (visualRow !== null && !this.#visualRowsToRefresh.includes(visualRow)) {
+        this.#visualRowsToRefresh.push(visualRow);
+      }
+    });
+  }
+
+  /**
+   * Checks if all heights were calculated. If not then return `true` (need recalculate).
+   *
+   * @returns {boolean}
+   */
+  isNeedRecalculate(): boolean {
+    return !!this.rowHeightsMap.getValues()
+      .slice(0, this.measuredRows).filter(item => (item === null)).length;
+  }
+
+  /**
+   * Toggles the "first dataset column not rendered" class name.
+   * Used to apply special styling when the first column is visible (used only in the classic (legacy) theme, with the AutoRowSize plugin enabled).
+   *
+   * @param {boolean} [forceState] Force the class to be added or removed (`true` to add, `false` to remove).
+   */
+  #toggleFirstDatasetColumnRenderedClassName(forceState?: boolean) {
+    const firstRenderedColumnVisualIndex = this.hot.getFirstRenderedVisibleColumn();
+    const firstRenderedColumnPhysicalIndex =
+      this.hot.columnIndexMapper.getPhysicalFromVisualIndex(firstRenderedColumnVisualIndex);
+
+    if (
+      forceState === false ||
+      firstRenderedColumnPhysicalIndex === this.hot.columnIndexMapper.getPhysicalFromRenderableIndex(0)
+    ) {
+      removeClass(this.hot.rootElement, FIRST_COLUMN_NOT_RENDERED_CLASS_NAME);
+
+    } else {
+      addClass(this.hot.rootElement, FIRST_COLUMN_NOT_RENDERED_CLASS_NAME);
+    }
+  }
+
+  /**
+   * Toggles the `htFirstDatasetColumnNotRendered` CSS class based on whether the first
+   * physical column is currently in the renderable viewport.
+   */
+  #onBeforeViewRender = () => {
+    this.#toggleFirstDatasetColumnRenderedClassName();
+  };
+
+  /**
+   * Recalculates heights for currently visible rows and processes any rows queued by data
+   * changes before the next render.
+   */
+  #onBeforeRender = () => {
+    this.calculateVisibleRowsHeight();
+    this.#drainRowRefreshQueue();
+
+    // A wiped cache is restored in full, so the rows below the fold are measured too and not just
+    // the visible band - see `#fullRecalculationScheduled`. It runs AFTER the visible band above,
+    // never instead of it: `calculateAllRowsHeight()` only measures up to `syncLimit` rows
+    // synchronously and leaves the rest to an idle sweep, so on a grid scrolled past that limit the
+    // band on screen would otherwise draw unmeasured, which is the very defect this repairs.
+    //
+    // The flag is held rather than consumed whenever this render cannot measure: while the grid is
+    // hidden `recalculateAllRowsHeight()` is a no-op, and with no columns the measurement writes a
+    // near-empty height for every row that nothing would ever correct (the same reason
+    // `calculateVisibleRowsHeight()` bails out on a column-less grid). The row count is checked for
+    // the same shape of reason, though nothing is at stake: a sweep over no rows measures nothing,
+    // so holding the flag just keeps the work owed until there is something to measure.
+    if (this.#fullRecalculationScheduled &&
+        this.hot.countCols() > 0 &&
+        this.hot.countRows() > 0 &&
+        this.hot.view.isVisible()) {
+      // Consumed before the call, not after: the sweep resizes the overlays, and a re-entrant
+      // render reaching this branch with the flag still set would recurse. It is re-owed if the
+      // sweep throws - the ghost table runs the real renderers, so a renderer that throws would
+      // otherwise leave every unmeasured row at the default height for the instance's life.
+      this.#fullRecalculationScheduled = false;
+
+      try {
+        this.recalculateAllRowsHeight();
+      } catch (error) {
+        this.#fullRecalculationScheduled = true;
+
+        throw error;
+      }
+    }
+  };
+
+  /**
+   * Schedules a single full row-height recalculation per column-resize gesture. The hook fires
+   * once per selected column, so the recalculation is deferred until the gesture's synchronous
+   * loop (and the render that applies the new widths) has finished — the heights are then
+   * measured once, against the final column widths.
+   */
+  #onBeforeColumnResize = () => {
+    if (this.#columnResizeRecalcScheduled) {
+      return;
+    }
+
+    this.#columnResizeRecalcScheduled = true;
+
+    this.hot._registerTimeout(() => {
+      this.#columnResizeRecalcScheduled = false;
+      this.recalculateAllRowsHeight();
+    }, 0);
+  };
+
+  /**
+   * Recalculates the row height from content on a double-click and returns it as the new
+   * size; returns the user-dragged size otherwise.
+   */
+  #onBeforeRowResize = (size: number, row: number, isDblClick: boolean) => {
+    let newSize = size;
+
+    if (isDblClick) {
+      this.calculateRowsHeight(row, undefined, true);
+
+      newSize = this.getRowHeight(row);
+    }
+
+    return newSize;
+  };
+
+  /**
+   * Triggers a full row height recalculation after new data is loaded, skipping the initial
+   * load since `#onInit` already handles it.
+   */
+  #onAfterLoadData = (_sourceData: unknown[], isFirstLoad: boolean) => {
+    if (!isFirstLoad) {
+      this.recalculateAllRowsHeight();
+    }
+  };
+
+  /**
+   * Queues the visual row indexes affected by the incoming changes so their heights are
+   * recalculated on the next render.
+   */
+  #onBeforeChange = (changes: unknown[][]) => {
+    const changedRows = new Set<number>();
+
+    changes.forEach(([row]: unknown[]) => {
+      changedRows.add(Number(row));
+    });
+
+    changedRows.forEach((rowIndex) => {
+      this.#visualRowsToRefresh.push(rowIndex);
+    });
+  };
+
+  /**
+   * Triggers the first full row height recalculation after Handsontable has finished initializing.
+   */
+  #onInit = () => {
+    this.recalculateAllRowsHeight();
+    this.#isInitialized = true;
+  };
+
+  /**
+   * Queues visual row indexes whose formula results changed so their heights are recalculated
+   * before the next render. Skips changes belonging to a different sheet.
+   */
+  #onAfterFormulasValuesUpdate = (changes: unknown[]) => {
+    if (!this.#isInitialized) {
+      return;
+    }
+
+    const formulasPlugin = this.hot.getPlugin('formulas');
+    const sheetId = (formulasPlugin as unknown as Record<string, unknown> | undefined)?.sheetId;
+
+    const changedRows = changes.reduce<number[]>((acc, change: unknown) => {
+      const changeRecord = change as Record<string, unknown>;
+
+      if (sheetId !== null && sheetId !== undefined &&
+          (changeRecord.address as Record<string, unknown>)?.sheet !== sheetId) {
+        return acc;
+      }
+
+      const physicalRow = Number((changeRecord.address as Record<string, unknown>)?.row);
+
+      if (Number.isInteger(physicalRow)) {
+        const visualRow = this.hot.toVisualRow(physicalRow);
+
+        if (visualRow !== null && acc.indexOf(visualRow) === -1) {
+          acc.push(visualRow);
+        }
+      }
+
+      return acc;
+    }, [] as number[]);
+
+    this.#visualRowsToRefresh.push(...changedRows);
+  };
+
+  /**
+   * Destroys the plugin instance.
+   */
+  destroy(): void {
+    this.ghostTable.clean();
+    super.destroy();
+  }
+}

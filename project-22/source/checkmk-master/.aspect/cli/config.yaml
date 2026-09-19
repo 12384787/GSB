@@ -1,0 +1,18 @@
+---
+lint:
+  quiet: true
+  aspects:
+    - //bazel/tools:aspects.bzl%astrein
+    - //bazel/tools:aspects.bzl%bandit
+    - //bazel/tools:aspects.bzl%deballast
+    - //bazel/tools:aspects.bzl%clang_tidy
+    - //bazel/tools:aspects.bzl%groovy
+    - //bazel/tools:aspects.bzl%clippy
+    - //bazel/tools:aspects.bzl%py_import_cycles
+    - //bazel/tools:aspects.bzl%eslint
+    - //bazel/tools:aspects.bzl%ruff
+    - //bazel/tools:aspects.bzl%shellcheck
+    - //bazel/tools:aspects.bzl%stylelint
+    - //bazel/tools:aspects.bzl%license_header_checker
+    - //bazel/tools:aspects.bzl%python_extension_checker
+    - //bazel/tools:aspects.bzl%ps_script_analyzer

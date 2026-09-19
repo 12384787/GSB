@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="comparison-overlap"
+
+from collections.abc import Iterator, Sequence
+from pathlib import Path
+
+import pytest
+from pytest_mock import MockerFixture
+from werkzeug.test import create_environ
+
+from cmk.gui import sidebar
+from cmk.gui.config import active_config, Config
+from cmk.gui.http import Request, request
+from cmk.gui.logged_in import user
+from cmk.gui.pages import PageContext
+from cmk.gui.sidebar import UserSidebarSnapin
+from cmk.gui.utils.roles import UserPermissions
+
+
+@pytest.fixture(scope="function", autouse=True)  # ruff: ignore[pytest-fixture-autouse]
+def fixture_user(request_context: None, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:  # noqa: ARG001  # Unused fixtures are needed for setup side effects
+    with monkeypatch.context() as m:
+        m.setattr(user, "confdir", Path(""))
+        m.setattr(user, "may", lambda x: True)  # noqa: ARG005
+        yield
+
+
+def test_user_config_fold_unfold() -> None:
+    user_permissions = UserPermissions({}, {}, {}, [])
+    user_config = sidebar.UserSidebarConfig(user, active_config.sidebar, user_permissions)
+    assert user_config.folded is False
+    user_config.folded = True
+    assert user_config.folded is True
+    user_config.folded = False
+    assert user_config.folded is False
+
+
+def test_user_config_add_snapin() -> None:
+    user_permissions = UserPermissions({}, {}, {}, [])
+    user_config = sidebar.UserSidebarConfig(user, active_config.sidebar, user_permissions)
+    del user_config.snapins[:]
+    snapin = UserSidebarSnapin.from_snapin_type_id("tactical_overview", user_permissions)
+    user_config.add_snapin(snapin)
+    assert user_config.snapins == [snapin]
+
+
+def test_user_config_get_snapin() -> None:
+    user_permissions = UserPermissions({}, {}, {}, [])
+    user_config = sidebar.UserSidebarConfig(user, active_config.sidebar, user_permissions)
+    del user_config.snapins[:]
+    snapin = UserSidebarSnapin.from_snapin_type_id("tactical_overview", user_permissions)
+    user_config.add_snapin(snapin)
+
+    assert user_config.get_snapin("tactical_overview") == snapin
+
+
+def test_user_config_get_not_existing_snapin() -> None:
+    user_permissions = UserPermissions({}, {}, {}, [])
+    user_config = sidebar.UserSidebarConfig(user, active_config.sidebar, user_permissions)
+    del user_config.snapins[:]
+
+    with pytest.raises(KeyError) as e:
+        user_config.get_snapin("tactical_overview")
+    msg = "%s" % e
+    assert "does not exist" in msg
+
+
+@pytest.mark.parametrize(
+    "move_id,before_id,result",
+    [
+        (
+            "tactical_overview",
+            "views",
+            ["performance", "tactical_overview", "views"],
+        ),
+        (
+            "tactical_overview",
+            "performance",
+            ["tactical_overview", "performance", "views"],
+        ),
+        ("not_existing", "performance", None),
+        # TODO: Shouldn't this also be handled?
+        # ("performance",  "not_existing", [
+        #    ("performance", "open"),
+        #    ("views", "open"),
+        #    ("tactical_overview", "open"),
+        # ]),
+        (
+            "performance",
+            "",
+            ["views", "tactical_overview", "performance"],
+        ),
+    ],
+)
+def test_user_config_move_snapin_before(
+    move_id: str, before_id: str, result: Sequence[str]
+) -> None:
+    user_permissions = UserPermissions({}, {}, {}, [])
+    user_config = sidebar.UserSidebarConfig(user, active_config.sidebar, user_permissions)
+    del user_config.snapins[:]
+    user_config.snapins.extend(
+        [
+            UserSidebarSnapin.from_snapin_type_id("performance", user_permissions),
+            UserSidebarSnapin.from_snapin_type_id("views", user_permissions),
+            UserSidebarSnapin.from_snapin_type_id("tactical_overview", user_permissions),
+        ]
+    )
+
+    try:
+        move = user_config.get_snapin(move_id)
+    except KeyError as e:
+        if result is None:
+            assert "does not exist" in "%s" % e  # type: ignore[unreachable]
+            return
+        raise
+
+    try:
+        before: UserSidebarSnapin | None = user_config.get_snapin(before_id)
+    except KeyError:
+        before = None
+
+    user_config.move_snapin_before(move, before)
+    assert user_config.snapins == [
+        UserSidebarSnapin.from_snapin_type_id(snapin_id, user_permissions) for snapin_id in result
+    ]
+
+
+def test_load_default_config_for_new_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that new users (with created_on_version >= 2.5.0) get the welcome snapin by default."""
+    # Mock the user to have the created_on_version attribute (new user created in 2.5+)
+    with monkeypatch.context() as m:
+        m.setattr(
+            user,
+            "get_attribute",
+            lambda key, default=None: "2.5.0" if key == "created_on_version" else default,
+        )
+
+        user_permissions = UserPermissions({}, {}, {}, [])
+        user_config = sidebar.UserSidebarConfig(user, active_config.sidebar, user_permissions)
+        assert user_config.folded is False
+        assert user_config.snapins == [
+            UserSidebarSnapin.from_snapin_type_id("a_welcome", user_permissions),
+            UserSidebarSnapin.from_snapin_type_id("tactical_overview", user_permissions),
+            UserSidebarSnapin.from_snapin_type_id("bookmarks", user_permissions),
+            UserSidebarSnapin(
+                sidebar.snapin_registry["master_control"], sidebar.SnapinVisibility.CLOSED
+            ),
+        ]
+
+
+def test_load_default_config_for_existing_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that existing users (without created_on_version attribute) don't get the welcome snapin."""
+    # Mock the user to NOT have the created_on_version attribute (existing user from 2.4)
+    with monkeypatch.context() as m:
+        m.setattr(user, "get_attribute", lambda key, default=None: default)  # noqa: ARG005
+
+        user_permissions = UserPermissions({}, {}, {}, [])
+        user_config = sidebar.UserSidebarConfig(user, active_config.sidebar, user_permissions)
+        assert user_config.folded is False
+        # Should NOT include a_welcome snapin for existing users
+        assert user_config.snapins == [
+            UserSidebarSnapin.from_snapin_type_id("tactical_overview", user_permissions),
+            UserSidebarSnapin.from_snapin_type_id("bookmarks", user_permissions),
+            UserSidebarSnapin(
+                sidebar.snapin_registry["master_control"], sidebar.SnapinVisibility.CLOSED
+            ),
+        ]
+
+
+def test_load_default_config_with_custom_snapin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A custom snap-in in the default config must not crash the sidebar.
+
+    Custom snap-ins are not part of the static snapin_registry, so the
+    included_in_default_sidebar() filter must not look them up directly. The
+    unknown snap-in is dropped by the all_snapins() filter instead of raising."""
+    with monkeypatch.context() as m:
+        m.setattr(user, "get_attribute", lambda key, default=None: default)  # noqa: ARG005
+
+        user_permissions = UserPermissions({}, {}, {}, [])
+        user_config = sidebar.UserSidebarConfig(
+            user,
+            [("tactical_overview", "open"), ("my_custom_snapin", "open")],
+            user_permissions,
+        )
+        assert user_config.folded is False
+        assert user_config.snapins == [
+            UserSidebarSnapin.from_snapin_type_id("tactical_overview", user_permissions),
+        ]
+
+
+@pytest.mark.parametrize(
+    "default_config",
+    [
+        pytest.param(
+            [{"snapin_type_id": "tactical_overview", "visibility": "open"}],
+            id="new_format_dict",
+        ),
+        pytest.param(
+            [["tactical_overview", "open"]],
+            id="list_instead_of_tuple",
+        ),
+        pytest.param(
+            [("tactical_overview", "open"), {"master_control", "closed"}],
+            id="set_instead_of_tuple",
+        ),
+        pytest.param(
+            [("tactical_overview", "open"), {"snapin_type_id": "master_control"}],
+            id="dict_without_visibility",
+        ),
+        pytest.param(
+            [("tactical_overview", "open"), ("master_control",)],
+            id="tuple_without_visibility",
+        ),
+    ],
+)
+def test_load_default_config_with_non_tuple_entry(
+    monkeypatch: pytest.MonkeyPatch, default_config: Sequence[tuple[str, str]]
+) -> None:
+    """A default config entry that is not a legacy (id, visibility) pair must not crash.
+
+    The included_in_default_sidebar() filter used to index every entry as a tuple, so a
+    new-format dictionary or a hand-written malformed entry took the whole sidebar down.
+    Interpretable entries are kept, the rest are dropped."""
+    with monkeypatch.context() as m:
+        m.setattr(user, "get_attribute", lambda key, default=None: default)  # noqa: ARG005
+
+        user_permissions = UserPermissions({}, {}, {}, [])
+        user_config = sidebar.UserSidebarConfig(user, default_config, user_permissions)
+        assert user_config.snapins == [
+            UserSidebarSnapin.from_snapin_type_id("tactical_overview", user_permissions),
+        ]
+
+
+def test_load_legacy_list_user_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sidebar.UserSidebarConfig,
+        "_user_config",
+        lambda x: [("tactical_overview", "open"), ("views", "closed")],  # noqa: ARG005
+    )
+
+    user_permissions = UserPermissions({}, {}, {}, [])
+    user_config = sidebar.UserSidebarConfig(user, active_config.sidebar, user_permissions)
+    assert user_config.folded is False
+    assert user_config.snapins == [
+        UserSidebarSnapin.from_snapin_type_id("tactical_overview", user_permissions),
+        UserSidebarSnapin(sidebar.snapin_registry["views"], sidebar.SnapinVisibility.CLOSED),
+    ]
+
+
+def test_load_legacy_off_user_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sidebar.UserSidebarConfig,
+        "_user_config",
+        lambda x: [("search", "off"), ("views", "closed")],  # noqa: ARG005
+    )
+
+    user_permissions = UserPermissions({}, {}, {}, [])
+    user_config = sidebar.UserSidebarConfig(user, active_config.sidebar, user_permissions)
+    assert user_config.folded is False
+    assert user_config.snapins == [
+        UserSidebarSnapin(sidebar.snapin_registry["views"], sidebar.SnapinVisibility.CLOSED),
+    ]
+
+
+def test_load_skip_not_existing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sidebar.UserSidebarConfig,
+        "_user_config",
+        lambda x: {"fold": False, "snapins": [("bla", "closed"), ("views", "closed")]},  # noqa: ARG005
+    )
+
+    user_permissions = UserPermissions({}, {}, {}, [])
+    user_config = sidebar.UserSidebarConfig(user, active_config.sidebar, user_permissions)
+    assert user_config.folded is False
+    assert user_config.snapins == [
+        UserSidebarSnapin(sidebar.snapin_registry["views"], sidebar.SnapinVisibility.CLOSED),
+    ]
+
+
+def test_load_skip_not_permitted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sidebar.UserSidebarConfig,
+        "_user_config",
+        lambda x: {  # noqa: ARG005
+            "fold": False,
+            "snapins": [("tactical_overview", "closed"), ("views", "closed")],
+        },
+    )
+    with monkeypatch.context() as m:
+        m.setattr(user, "may", lambda x: x != "sidesnap.tactical_overview")
+
+        user_permissions = UserPermissions({}, {}, {}, [])
+        user_config = sidebar.UserSidebarConfig(user, active_config.sidebar, user_permissions)
+        assert user_config.folded is False
+        assert user_config.snapins == [
+            UserSidebarSnapin(sidebar.snapin_registry["views"], sidebar.SnapinVisibility.CLOSED),
+        ]
+
+
+def test_load_user_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sidebar.UserSidebarConfig,
+        "_user_config",
+        lambda x: {  # noqa: ARG005
+            "fold": True,
+            "snapins": [
+                ("search", "closed"),
+                ("views", "open"),
+            ],
+        },
+    )
+
+    user_permissions = UserPermissions({}, {}, {}, [])
+    user_config = sidebar.UserSidebarConfig(user, active_config.sidebar, user_permissions)
+    assert user_config.folded is True
+    assert user_config.snapins == [
+        UserSidebarSnapin(sidebar.snapin_registry["search"], sidebar.SnapinVisibility.CLOSED),
+        UserSidebarSnapin.from_snapin_type_id("views", user_permissions),
+    ]
+
+
+def test_save_user_config_denied(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    with monkeypatch.context() as m:
+        m.setattr(user, "may", lambda x: x != "general.configure_sidebar")
+        save_user_file_mock = mocker.patch.object(user, "save_file")
+        user_permissions = UserPermissions({}, {}, {}, [])
+        user_config = sidebar.UserSidebarConfig(user, active_config.sidebar, user_permissions)
+        user_config.save()
+        save_user_file_mock.assert_not_called()
+        mocker.stopall()
+
+
+def test_save_user_config_allowed(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    with monkeypatch.context() as m:
+        m.setattr(user, "may", lambda x: x == "general.configure_sidebar")
+        save_user_file_mock = mocker.patch.object(user, "save_file")
+        user_permissions = UserPermissions({}, {}, {}, [])
+        user_config = sidebar.UserSidebarConfig(user, active_config.sidebar, user_permissions)
+        user_config._config = {"fold": True, "snapins": []}  # noqa: SLF001
+        user_config.save()
+        save_user_file_mock.assert_called_once_with("sidebar", {"fold": True, "snapins": []})
+        mocker.stopall()
+
+
+@pytest.mark.parametrize(
+    "origin_state,fold_var,set_state",
+    [
+        (False, "yes", True),
+        (True, "", False),
+    ],
+)
+def test_ajax_fold(
+    mocker: MockerFixture, origin_state: bool, fold_var: str, set_state: bool
+) -> None:
+    m_config = mocker.patch.object(
+        user,
+        "load_file",
+        return_value={
+            "fold": origin_state,
+            "snapins": [("tactical_overview", "open")],
+        },
+    )
+    m_save = mocker.patch.object(user, "save_file")
+
+    request.set_var("fold", fold_var)
+    sidebar.AjaxFoldSnapin().page(
+        PageContext(
+            config=Config(),
+            request=Request(create_environ()),
+        )
+    )
+
+    m_config.assert_called_once()
+    m_save.assert_called_once_with(
+        "sidebar",
+        {
+            "fold": set_state,
+            "snapins": [
+                {
+                    "snapin_type_id": "tactical_overview",
+                    "visibility": "open",
+                }
+            ],
+        },
+    )
+    mocker.stopall()
+
+
+@pytest.mark.parametrize(
+    "origin_state,set_state",
+    [
+        ("open", "closed"),
+        ("closed", "open"),
+        ("closed", "closed"),
+        ("open", "open"),
+        ("open", "off"),
+        ("closed", "off"),
+    ],
+)
+def test_ajax_openclose_close(mocker: MockerFixture, origin_state: str, set_state: str) -> None:
+    request.set_var("name", "tactical_overview")
+    request.set_var("state", set_state)
+    m_config = mocker.patch.object(
+        user,
+        "load_file",
+        return_value={
+            "fold": False,
+            "snapins": [
+                ("tactical_overview", origin_state),
+                ("views", "open"),
+            ],
+        },
+    )
+    m_save = mocker.patch.object(user, "save_file")
+
+    user_permissions = UserPermissions({}, {}, {}, [])
+    sidebar.AjaxOpenCloseSnapin().page(
+        PageContext(
+            config=Config(),
+            request=Request(create_environ()),
+        )
+    )
+
+    snapins = [UserSidebarSnapin.from_snapin_type_id("views", user_permissions)]
+
+    if set_state != "off":
+        snapins.insert(
+            0,
+            UserSidebarSnapin.from_config(
+                {"snapin_type_id": "tactical_overview", "visibility": set_state}, user_permissions
+            ),
+        )
+
+    m_config.assert_called_once()
+    m_save.assert_called_once_with(
+        "sidebar",
+        {
+            "fold": False,
+            "snapins": [e.to_config() for e in snapins],
+        },
+    )
+    mocker.stopall()
+
+
+def test_move_snapin_not_permitted(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture) -> None:
+    with monkeypatch.context() as m:
+        m.setattr(user, "may", lambda x: x != "general.configure_sidebar")
+        m_load = mocker.patch.object(sidebar.UserSidebarConfig, "_load")
+        sidebar.move_snapin(
+            PageContext(
+                config=Config(),
+                request=Request(create_environ()),
+            )
+        )
+        m_load.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "move,before,do_save",
+    [
+        ("tactical_overview", "views", True),
+        ("not_existing", "performance", None),
+    ],
+)
+def test_move_snapin(mocker: MockerFixture, move: str, before: str, do_save: bool) -> None:
+    request.set_var("name", move)
+    request.set_var("before", before)
+    m_save = mocker.patch.object(sidebar.UserSidebarConfig, "save")
+
+    sidebar.move_snapin(
+        PageContext(
+            config=Config(),
+            request=Request(create_environ()),
+        )
+    )
+
+    if do_save is None:
+        m_save.assert_not_called()  # type: ignore[unreachable]
+    else:
+        m_save.assert_called_once()

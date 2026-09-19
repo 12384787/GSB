@@ -1,0 +1,40 @@
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+
+package(default_visibility = ["//visibility:public"])
+
+string_flag(
+    name = "edition",
+    build_setting_default = "community",
+    values = [
+        "community",
+        "ultimate",
+        "pro",
+        "ultimatemt",
+        "cloud",
+    ],
+)
+
+config_setting(
+    name = "community",
+    flag_values = {":edition": "community"},
+)
+
+config_setting(
+    name = "ultimate",
+    flag_values = {":edition": "ultimate"},
+)
+
+config_setting(
+    name = "pro",
+    flag_values = {":edition": "pro"},
+)
+
+config_setting(
+    name = "ultimatemt",
+    flag_values = {":edition": "ultimatemt"},
+)
+
+config_setting(
+    name = "cloud",
+    flag_values = {":edition": "cloud"},
+)

@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+"""Change the attributes of a number of selected hosts at once. Also the
+cleanup is implemented here: the bulk removal of explicit attribute
+values."""
+
+# mypy: disable-error-code="type-arg"
+
+from collections.abc import Collection, Mapping, Sequence
+from hashlib import sha256
+from typing import override
+
+from cmk.ccc.site import omd_site, SiteId
+from cmk.ccc.user import UserId
+from cmk.gui import forms
+from cmk.gui.breadcrumb import Breadcrumb
+from cmk.gui.config import Config
+from cmk.gui.htmllib.html import html
+from cmk.gui.http import request
+from cmk.gui.i18n import _
+from cmk.gui.logged_in import user
+from cmk.gui.page_menu import make_simple_form_page_menu, PageMenu
+from cmk.gui.type_defs import ActionResult
+from cmk.gui.user_sites import activation_sites
+from cmk.gui.utils.csrf_token import check_csrf_token
+from cmk.gui.utils.transaction_manager import transactions
+from cmk.gui.wato.pages.folders import ModeFolder
+from cmk.gui.watolib.audit_log import make_audit_log_change_hook
+from cmk.gui.watolib.host_attributes import (
+    ABCHostAttribute,
+    all_host_attributes,
+    collect_attributes,
+    sorted_host_attributes,
+)
+from cmk.gui.watolib.hosts_and_folders import (
+    disk_or_search_folder_from_request,
+    Folder,
+    folder_tree,
+    Host,
+    SearchFolder,
+)
+from cmk.gui.watolib.mode import ModeRegistry, redirect, WatoMode
+from cmk.gui.watolib.pending_changes import (
+    index_update_change_hook,
+    PendingChanges,
+    PendingChangesStore,
+)
+from cmk.gui.watolib.sidebar_reload import sidebar_reload_change_hook
+from cmk.web.utils.flashed_messages import flash
+from cmk.web.utils.permission_verification import PermissionName
+
+from ._bulk_actions import get_hostnames_from_checkboxes, get_hosts_from_checkboxes
+from ._host_attributes import configure_attributes
+
+
+def register(mode_registry: ModeRegistry) -> None:
+    mode_registry.register(ModeBulkEdit)
+    mode_registry.register(ModeBulkCleanup)
+
+
+class ModeBulkEdit(WatoMode):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "bulkedit"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["hosts", "edit_hosts"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeFolder
+
+    @override
+    def _from_vars(self) -> None:
+        self._folder = disk_or_search_folder_from_request(
+            folder_tree(),
+            request.var("folder"),
+            request.get_ascii_input("host"),
+            acting_user=user,
+            request=request,
+        )
+
+    @override
+    def title(self) -> str:
+        return _("Bulk edit of hosts")
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        return make_simple_form_page_menu(
+            _("Hosts"), breadcrumb, form_name="edit_host", button_name="_save"
+        )
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        check_csrf_token()
+
+        if not transactions.check_transaction(request):
+            return None
+
+        user.need_permission("wato.edit_hosts")
+
+        changed_attributes = collect_attributes(
+            all_host_attributes(
+                config.wato_host_attrs,
+                config.tags.get_tag_groups_by_topic(),
+            ),
+            "bulk",
+            new=False,
+        )
+        host_names = get_hostnames_from_checkboxes(self._folder)
+        for host_name in host_names:
+            host = self._folder.load_host(host_name)
+            host.update_attributes(
+                changed_attributes,
+                pprint_value=config.wato_pprint_config,
+                pending_changes=_pending_changes(
+                    config=config, local_site=omd_site(), acting_user=user.id
+                ),
+                acting_user=user,
+            )
+            # call_hook_hosts_changed() is called too often.
+            # Either offer API in class Host for bulk change or
+            # delay saving until end somehow
+
+        flash(_("Edited %(count)d hosts") % {"count": len(host_names)})
+        return redirect(self._folder.url(request))
+
+    @override
+    def page(self, config: Config) -> None:
+        host_names = get_hostnames_from_checkboxes(self._folder)
+        hosts = {host_name: self._folder.load_host(host_name) for host_name in host_names}
+        current_host_hash = sha256(repr(hosts).encode()).hexdigest()
+
+        # When bulk edit has been made with some hosts, then other hosts have been selected
+        # and then another bulk edit has made, the attributes need to be reset before
+        # rendering the form. Otherwise the second edit will have the attributes of the
+        # first set.
+        host_hash = request.var("host_hash")
+        if not host_hash or host_hash != current_host_hash:
+            request.del_vars(prefix="attr_")
+            request.del_vars(prefix="bulk_change_")
+
+        html.p(
+            "%s%s %s"
+            % (
+                _(
+                    "You have selected <b>%(count)d</b> hosts for bulk edit. You can now change "
+                    "host attributes for all selected hosts at once. "
+                )
+                % {"count": len(hosts)},
+                _(
+                    "If a selection is set to <i>, this value differs between the selected hosts.</i> "
+                    "Then, currently not all selected hosts share the same setting for this attribute. "
+                    "If you keep that selection, all hosts will keep their individual settings."
+                ),
+                _(
+                    "In case you want to <i>unset</i> attributes on multiple hosts, you need to "
+                    "use the <i>Remove explicit attribute settings</i> option instead of bulk edit."
+                ),
+            )
+        )
+
+        with html.form_context("edit_host", method="POST"):
+            html.prevent_password_auto_completion()
+            html.hidden_field("host_hash", current_host_hash)
+            configure_attributes(
+                all_host_attributes(config.wato_host_attrs, config.tags.get_tag_groups_by_topic()),
+                new=False,
+                hosts={str(k): v for k, v in hosts.items()},
+                for_what="bulk",
+                parent=self._folder,
+                aux_tags_by_tag=config.tags.get_aux_tags_by_tag(),
+                config=config,
+            )
+            forms.end()
+            html.hidden_fields()
+
+
+class ModeBulkCleanup(WatoMode):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "bulkcleanup"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["hosts", "edit_hosts"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeFolder
+
+    @override
+    def _from_vars(self) -> None:
+        self._folder = disk_or_search_folder_from_request(
+            folder_tree(),
+            request.var("folder"),
+            request.get_ascii_input("host"),
+            acting_user=user,
+            request=request,
+        )
+
+    @override
+    def title(self) -> str:
+        return _("Bulk removal of explicit attributes")
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        hosts = get_hosts_from_checkboxes(self._folder)
+
+        return make_simple_form_page_menu(
+            _("Attributes"),
+            breadcrumb,
+            form_name="bulkcleanup",
+            button_name="_save",
+            save_is_enabled=bool(
+                self._get_attributes_for_bulk_cleanup(
+                    all_host_attributes(
+                        config.wato_host_attrs,
+                        config.tags.get_tag_groups_by_topic(),
+                    ),
+                    hosts,
+                ),
+            ),
+        )
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        check_csrf_token()
+
+        if not transactions.check_transaction(request):
+            return None
+
+        user.need_permission("wato.edit_hosts")
+        to_clean = self._bulk_collect_cleaned_attributes(
+            all_host_attributes(config.wato_host_attrs, config.tags.get_tag_groups_by_topic())
+        )
+        if "contactgroups" in to_clean:
+            self._folder.permissions.need_permission("write", user)
+
+        hosts = get_hosts_from_checkboxes(self._folder)
+
+        # Check all permissions before doing any edit
+        for host in hosts:
+            host.permissions.need_permission("write", user)
+
+        for host in hosts:
+            host.clean_attributes(
+                to_clean,
+                pprint_value=config.wato_pprint_config,
+                pending_changes=_pending_changes(
+                    config=config, local_site=omd_site(), acting_user=user.id
+                ),
+                acting_user=user,
+            )
+
+        return redirect(self._folder.url(request))
+
+    def _bulk_collect_cleaned_attributes(
+        self, host_attributes: Mapping[str, ABCHostAttribute]
+    ) -> list[str]:
+        to_clean = []
+        for attrname, attr in host_attributes.items():
+            if not attr.show_in_host_cleanup():
+                continue
+            if html.get_checkbox("_clean_" + attrname) is True:
+                to_clean.append(attrname)
+        return to_clean
+
+    @override
+    def page(self, config: Config) -> None:
+        hosts = get_hosts_from_checkboxes(self._folder)
+
+        html.p(
+            _(
+                "You have selected <b>%(count)d</b> hosts for bulk cleanup. This means removing "
+                "explicit attribute values from hosts. The hosts will then inherit attributes "
+                "configured at the host list or folders or simply fall back to the built-in "
+                "default values."
+            )
+            % {"count": len(hosts)}
+        )
+
+        with html.form_context("bulkcleanup", method="POST"):
+            forms.header(_("Attributes to remove from hosts"))
+            self._select_attributes_for_bulk_cleanup(
+                all_host_attributes(config.wato_host_attrs, config.tags.get_tag_groups_by_topic()),
+                hosts,
+            )
+            html.hidden_fields()
+
+    def _select_attributes_for_bulk_cleanup(
+        self, host_attributes: Mapping[str, ABCHostAttribute], hosts: Sequence[Host]
+    ) -> None:
+        attributes = self._get_attributes_for_bulk_cleanup(host_attributes, hosts)
+
+        for attr, is_inherited, num_haveit in attributes:
+            # Legend and Help
+            forms.section(attr.title())
+
+            if attr.is_mandatory() and not is_inherited:
+                html.write_text_permissive(
+                    _(
+                        "This attribute is mandatory and there is no value "
+                        "defined in the host list or any parent folder."
+                    )
+                )
+            else:
+                label = "clean this attribute on <b>%s</b> hosts" % (
+                    num_haveit == len(hosts) and "all selected" or str(num_haveit)
+                )
+                html.checkbox("_clean_%s" % attr.name(), False, label=label)
+            html.help(attr.help())
+
+        forms.end()
+
+        if not attributes:
+            html.write_text_permissive(_("The selected hosts have no explicit attributes"))
+
+    def _get_attributes_for_bulk_cleanup(
+        self, host_attributes: Mapping[str, ABCHostAttribute], hosts: Sequence[Host]
+    ) -> list[tuple[ABCHostAttribute, bool, int]]:
+        attributes = []
+        for attr in sorted_host_attributes(list(host_attributes.values())):
+            attrname = attr.name()
+
+            if not attr.show_in_host_cleanup():
+                continue
+
+            # only show attributes that at least on host have set
+            num_haveit = 0
+            for host in hosts:
+                if attrname in host.attributes:
+                    num_haveit += 1
+
+            if not num_haveit:
+                continue
+
+            # If the attribute is mandatory and no value is inherited
+            # by file or folder, the attribute cannot be cleaned.
+            container: Folder | SearchFolder | None = self._folder
+            is_inherited = False
+            while container:
+                if attrname in container.attributes:
+                    is_inherited = True
+                    break
+                container = container.parent()
+
+            attributes.append((attr, is_inherited, num_haveit))
+        return attributes
+
+
+def _pending_changes(
+    *,
+    config: Config,
+    local_site: SiteId,
+    acting_user: UserId | None,
+) -> PendingChanges:
+    return PendingChanges(
+        activation_sites=activation_sites(config.sites),
+        local_site=local_site,
+        acting_user=acting_user,
+        store=PendingChangesStore(),
+        hooks=(
+            make_audit_log_change_hook(use_git=config.wato_use_git),
+            sidebar_reload_change_hook,
+            index_update_change_hook,
+        ),
+    )

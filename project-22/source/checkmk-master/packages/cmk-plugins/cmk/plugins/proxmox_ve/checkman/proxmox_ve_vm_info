@@ -1,0 +1,15 @@
+title: Proxmox VE: VM Info
+agents: proxmox_ve
+catalog: os/misc
+license: GPLv2
+distribution: check_mk
+description:
+ This check is OK when a given Proxmox VE VM's {status} matches a configured value, WARN otherwise.
+ It shows {vmid} (e.g. "101"), {status} (e.g. "running"), {type} ("lxc" or "qemu") and {host} values
+ returned by the API for the given VM.
+
+ Tags set on the VM in Proxmox VE are exported as host labels of the form
+ {cmk/pve/tag/<tag>:yes}.
+
+discovery:
+ One service per system is created.

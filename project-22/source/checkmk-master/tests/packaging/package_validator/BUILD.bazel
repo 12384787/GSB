@@ -1,0 +1,163 @@
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@tools_crates//:defs.bzl", "aliases", "all_crate_deps")
+load("//bazel/rules:xcomp/rust.bzl", "rust_binary")
+
+rust_library(
+    name = "package_validator_lib",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    aliases = aliases(),
+    crate_name = "package_validator",
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(),
+)
+
+rust_binary(
+    name = "package_validator",
+    srcs = [
+        "src/args.rs",
+        "src/main.rs",
+    ],
+    aliases = aliases(),
+    edition = "2021",
+    opt = True,
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps() + [":package_validator_lib"],
+)
+
+rust_test(
+    name = "unit_tests",
+    size = "small",
+    aliases = aliases(),
+    crate = ":package_validator_lib",
+    data = glob(["fixtures/**"]),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps() + ["@rules_rust//tools/runfiles"],
+)
+
+rust_test(
+    name = "integration_tests",
+    size = "small",
+    srcs = ["tests/integration_test.rs"],
+    aliases = aliases(),
+    crate_name = "integration_test",
+    data = glob(["fixtures/**"]),
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps() + [
+        ":package_validator_lib",
+        "@rules_rust//tools/runfiles",
+    ],
+)
+
+build_test(
+    name = "build_test",
+    targets = [":package_validator"],
+)
+
+filegroup(
+    name = "system_dependencies_all",
+    srcs = ["system-dependencies.all.txt"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "system_dependencies_ubuntu",
+    srcs = ["system-dependencies.ubuntu.txt"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "system_dependencies_debian",
+    srcs = ["system-dependencies.debian.txt"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "system_dependencies_el",
+    srcs = ["system-dependencies.el.txt"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "system_dependencies_sles",
+    srcs = ["system-dependencies.sles.txt"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "system_dependencies_noble",
+    srcs = ["system-dependencies.noble.txt"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "system_dependencies_jammy",
+    srcs = ["system-dependencies.jammy.txt"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "system_dependencies_resolute",
+    srcs = ["system-dependencies.resolute.txt"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "system_dependencies_trixie",
+    srcs = ["system-dependencies.trixie.txt"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "system_dependencies_bookworm",
+    srcs = ["system-dependencies.bookworm.txt"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "system_dependencies_el8",
+    srcs = ["system-dependencies.el8.txt"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "system_dependencies_el9",
+    srcs = ["system-dependencies.el9.txt"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "system_dependencies_el10",
+    srcs = ["system-dependencies.el10.txt"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "system_dependencies_sles15sp7",
+    srcs = ["system-dependencies.sles15sp7.txt"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "system_dependencies_sles16_0",
+    srcs = ["system-dependencies.sles16.0.txt"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "system_dependencies_cma",
+    srcs = ["system-dependencies.cma.txt"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "ignore_files",
+    srcs = ["ignore-files.txt"],
+    visibility = ["//visibility:public"],
+)

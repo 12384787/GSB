@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+# Copyright (C) 2022 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from collections import Counter
+from collections.abc import Sequence
+
+from cmk.rulesets.v1 import Help, Label, Message, Title
+from cmk.rulesets.v1.form_specs import (
+    DefaultValue,
+    DictElement,
+    Dictionary,
+    FixedValue,
+    List,
+    migrate_to_password,
+    migrate_to_proxy,
+    MultipleChoice,
+    MultipleChoiceElement,
+    Password,
+    Proxy,
+    SingleChoice,
+    SingleChoiceElement,
+    String,
+    TimeMagnitude,
+    TimeSpan,
+)
+from cmk.rulesets.v1.form_specs.validators import LengthInRange, NumberInRange, ValidationError
+from cmk.rulesets.v1.rule_specs import SpecialAgent, Topic
+
+
+def _migrate_to_valid_ident(value: object) -> Sequence[str]:
+    if not isinstance(value, list):
+        raise ValueError(f"Expected a list of strings, got {value}")
+    return [name.replace("-", "_") for name in value if isinstance(name, str)]
+
+
+def _check_for_duplicates(value: Sequence[str]) -> None:
+    if any(item for item, count in Counter(value).items() if count > 1):
+        raise ValidationError(message=Message("Duplicated elements provided."))
+
+
+def _form_special_agent_cisco_meraki() -> Dictionary:
+    return Dictionary(
+        title=Title("Cisco Meraki"),
+        elements={
+            "api_key": DictElement(
+                parameter_form=Password(title=Title("API key"), migrate=migrate_to_password),
+                required=True,
+            ),
+            "proxy": DictElement(parameter_form=Proxy(migrate=migrate_to_proxy)),
+            "region": DictElement(
+                parameter_form=SingleChoice(
+                    title=Title("Meraki region"),
+                    help_text=Help(
+                        "<p>The Meraki API is available under different URLs for different regions of the world.</p>"
+                        "<ul>"
+                        '<li>Default (most of the world): "https://api.meraki.com/api/v1"</li>'
+                        '<li>Canada	"https://api.meraki.ca/api/v1"</li>'
+                        '<li>China	"https://api.meraki.cn/api/v1"</li>'
+                        '<li>India	"https://api.meraki.in/api/v1"</li>'
+                        '<li>United States FedRAMP	"https://api.gov-meraki.com/api/v1"</li>'
+                        "</ul>"
+                        '<p>For more details, see the <a href="https://developer.cisco.com/meraki/api-v1/getting-started/#base-uri">API Documentation</a>.</p>'
+                    ),
+                    elements=[
+                        SingleChoiceElement(name="default", title=Title("Default")),
+                        SingleChoiceElement(name="canada", title=Title("Canada")),
+                        SingleChoiceElement(name="china", title=Title("China")),
+                        SingleChoiceElement(name="india", title=Title("India")),
+                        SingleChoiceElement(name="us_gov", title=Title("United States FedRAMP")),
+                    ],
+                    prefill=DefaultValue("default"),
+                )
+            ),
+            "sections": DictElement(
+                parameter_form=MultipleChoice(
+                    title=Title("Sections"),
+                    help_text=Help(
+                        "Select the sections that you want to include in the agent output."
+                    ),
+                    elements=[
+                        MultipleChoiceElement(
+                            name="api_response_codes",
+                            title=Title("API response codes"),
+                        ),
+                        MultipleChoiceElement(
+                            name="appliance_performance",
+                            title=Title("Appliance performance"),
+                        ),
+                        MultipleChoiceElement(
+                            name="appliance_uplinks",
+                            title=Title("Appliance uplink statuses"),
+                        ),
+                        MultipleChoiceElement(
+                            name="appliance_vpns",
+                            title=Title("Appliance VPN statuses"),
+                        ),
+                        MultipleChoiceElement(
+                            name="device_statuses",
+                            title=Title("Device statuses"),
+                        ),
+                        MultipleChoiceElement(
+                            name="device_uplinks_info",
+                            title=Title("Device uplinks (HW/SW inventory only)"),
+                        ),
+                        MultipleChoiceElement(
+                            name="licenses_overview",
+                            title=Title("Licenses overview"),
+                        ),
+                        MultipleChoiceElement(
+                            name="sensor_readings",
+                            title=Title("Sensor readings"),
+                        ),
+                        MultipleChoiceElement(
+                            name="switch_ports_statuses",
+                            title=Title("Switch ports statuses"),
+                        ),
+                        MultipleChoiceElement(
+                            name="wireless_device_statuses",
+                            title=Title("Wireless device statuses"),
+                        ),
+                        MultipleChoiceElement(
+                            name="wireless_ethernet_statuses",
+                            title=Title("Wireless Ethernet statuses"),
+                        ),
+                    ],
+                    prefill=DefaultValue(
+                        [
+                            "api_response_codes",
+                            "appliance_uplinks",
+                            "appliance_vpns",
+                            "device_statuses",
+                            "device_uplinks_info",
+                            "licenses_overview",
+                            "sensor_readings",
+                            "wireless_ethernet_statuses",
+                        ]
+                    ),
+                    custom_validate=[
+                        LengthInRange(
+                            min_value=1,
+                            error_msg=Message("Specify at least one section."),
+                        )
+                    ],
+                    migrate=_migrate_to_valid_ident,
+                )
+            ),
+            "orgs": DictElement(
+                parameter_form=List(
+                    element_template=String(macro_support=True),
+                    title=Title("Organizations IDs"),
+                    help_text=Help("Specify by ID which organizations to fetch data from."),
+                    custom_validate=[_check_for_duplicates],
+                )
+            ),
+            "org_id_as_prefix": DictElement(
+                parameter_form=FixedValue(
+                    value=True,
+                    title=Title("Use organization ID as host prefix"),
+                    label=Label("The organization ID will be used as host name prefix"),
+                    help_text=Help(
+                        "The organization ID will be used as prefix for the host name (separated by a -). Use "
+                        'this option together with a "Host name translation for piggybacked hosts" to add an '
+                        "organization prefix to the hosts from the Cisco Meraki cloud to avoid conflicting "
+                        'host names. You can also use this option along with the "Dynamic host management" to '
+                        "sort the host in organization-specific folders."
+                    ),
+                )
+            ),
+            "net_id_as_prefix": DictElement(
+                parameter_form=FixedValue(
+                    value=True,
+                    title=Title("Use Network-ID as host prefix"),
+                    label=Label("The Network-ID will be used as host name prefix"),
+                    help_text=Help(
+                        "The network ID will be used as prefix for the host name (separated by a -). Use "
+                        'this option together with a "Host name translation for piggybacked hosts" to add a '
+                        "network prefix to the hosts from the Cisco Meraki cloud to avoid conflicting "
+                        'host names. You can also use this option along with the "Dynamic host management" to '
+                        "sort the hosts in location specific folders."
+                    ),
+                )
+            ),
+            "no_cache": DictElement(
+                parameter_form=FixedValue(
+                    title=Title("Disable cache"),
+                    help_text=Help("Always fetch data from Meraki API."),
+                    label=Label("API cache is disabled."),
+                    value=True,
+                )
+            ),
+            "cache_per_resource": DictElement(
+                parameter_form=Dictionary(
+                    title=Title("Cache per resource"),
+                    help_text=Help(
+                        "By setting a higher value for a given resource, you reduce the amount of "
+                        "requests sent to the Meraki API instance. If not changed, the predefined "
+                        "default time to live (TTL) cache interval will be used."
+                    ),
+                    elements={
+                        "appliances": DictElement(
+                            parameter_form=TimeSpan(
+                                title=Title("Appliances"),
+                                displayed_magnitudes=(
+                                    TimeMagnitude.HOUR,
+                                    TimeMagnitude.MINUTE,
+                                ),
+                                prefill=DefaultValue(3600.0),  # 1 hour
+                                custom_validate=[NumberInRange(min_value=0.0)],
+                                help_text=Help(
+                                    "The following sections utilize this setting:"
+                                    "<ul>"
+                                    "<li>Appliance uplink statuses</li>"
+                                    "<li>Appliance VPN statuses</li>"
+                                    "</ul>"
+                                ),
+                            )
+                        ),
+                        "devices": DictElement(
+                            parameter_form=TimeSpan(
+                                title=Title("Devices"),
+                                displayed_magnitudes=(
+                                    TimeMagnitude.HOUR,
+                                    TimeMagnitude.MINUTE,
+                                ),
+                                prefill=DefaultValue(3600.0),  # 1 hour
+                                custom_validate=[NumberInRange(min_value=0.0)],
+                                help_text=Help(
+                                    "The following sections utilize this setting:"
+                                    "<ul>"
+                                    "<li>Device statuses</li>"
+                                    "<li>Device uplinks</li>"
+                                    "</ul>"
+                                ),
+                            )
+                        ),
+                        "licenses": DictElement(
+                            parameter_form=TimeSpan(
+                                title=Title("Licenses"),
+                                displayed_magnitudes=(
+                                    TimeMagnitude.HOUR,
+                                    TimeMagnitude.MINUTE,
+                                ),
+                                prefill=DefaultValue(36000.0),  # 10 hours
+                                custom_validate=[NumberInRange(min_value=0.0)],
+                                help_text=Help(
+                                    "The following sections utilize this setting:"
+                                    "<ul>"
+                                    "<li>Licenses overview</li>"
+                                    "</ul>"
+                                ),
+                            )
+                        ),
+                        "networks": DictElement(
+                            parameter_form=TimeSpan(
+                                title=Title("Networks"),
+                                displayed_magnitudes=(
+                                    TimeMagnitude.HOUR,
+                                    TimeMagnitude.MINUTE,
+                                ),
+                                prefill=DefaultValue(36000.0),  # 10 hours
+                                custom_validate=[NumberInRange(min_value=0.0)],
+                                help_text=Help(
+                                    "The following sections utilize this setting:"
+                                    "<ul>"
+                                    "<li>Networks</li>"
+                                    "</ul>"
+                                    "This setting also indirectly affects the piggyback headings "
+                                    "when the 'Use Network-ID as host prefix' setting is applied."
+                                ),
+                            )
+                        ),
+                        "wireless": DictElement(
+                            parameter_form=TimeSpan(
+                                title=Title("Wireless"),
+                                displayed_magnitudes=(
+                                    TimeMagnitude.HOUR,
+                                    TimeMagnitude.MINUTE,
+                                ),
+                                prefill=DefaultValue(1800.0),  # 30 minutes
+                                custom_validate=[NumberInRange(min_value=0.0)],
+                                help_text=Help(
+                                    "The following sections utilize this setting:"
+                                    "<ul>"
+                                    "<li>Wireless device statuses</li>"
+                                    "<li>Wireless Ethernet statuses</li>"
+                                    "</ul>"
+                                ),
+                            )
+                        ),
+                    },
+                    custom_validate=[
+                        LengthInRange(
+                            min_value=1,
+                            error_msg=Message("Specify at least one resource to cache."),
+                        )
+                    ],
+                ),
+            ),
+        },
+    )
+
+
+rule_spec_cisco_meraki = SpecialAgent(
+    name="cisco_meraki",
+    title=Title("Cisco Meraki"),
+    topic=Topic.NETWORKING,
+    parameter_form=_form_special_agent_cisco_meraki,
+)

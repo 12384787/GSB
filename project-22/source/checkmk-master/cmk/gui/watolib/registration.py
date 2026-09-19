@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+from collections.abc import Sequence
+from datetime import timedelta
+
+from cmk.ccc import version
+from cmk.gui import hooks
+from cmk.gui.autocompleters import AutocompleterRegistry
+from cmk.gui.background_job.job import BackgroundJobRegistry
+from cmk.gui.config import Config
+from cmk.gui.cron import CronJob, CronJobRegistry
+from cmk.gui.form_specs.unstable import SingleChoiceEditable
+from cmk.gui.form_specs.unstable.time_specific import TimeSpecific
+from cmk.gui.form_specs.visitors import register_recomposer_function, register_visitor_class
+from cmk.rulesets.internal.form_specs import InternalProxy
+from cmk.rulesets.v1.form_specs import Password, Proxy, TimePeriod
+
+from . import (
+    _sync_remote_sites,
+    activate_changes,
+    autodiscovery,
+    automatic_host_removal,
+    automation_background_job,
+    automation_commands,
+    builtin_attributes,
+    config_domains,
+    config_variable_groups,
+    groups,
+    host_attributes,
+    host_relations_export,
+    rulespec_groups,
+    sample_config,
+)
+from .activate_changes import (
+    ActivateChangesSchedulerBackgroundJob,
+    AutomationGetConfigSyncState,
+    AutomationReceiveConfigSync,
+    execute_activation_cleanup_job,
+)
+from .agent_registration import AutomationRemoveTLSRegistration
+from .agent_token_automations import (
+    AutomationAgentDownloadTokenCreate,
+    AutomationAgentRegistrationTokenCreate,
+)
+from .analyze_configuration import AutomationCheckAnalyzeConfig
+from .automation_commands import AutomationCommandRegistry
+from .broker_certificates import (
+    AutomationCreateBrokerCertificates,
+    AutomationStoreBrokerCertificates,
+)
+from .builtin_host_labels import update_builtin_host_labels_file
+from .bulk_discovery import BulkDiscoveryBackgroundJob
+from .config_domain_name import (
+    ConfigDomainRegistry,
+    ConfigVariableGroupRegistry,
+)
+from .config_hostname import config_hostname_autocompleter
+from .config_sync import ReplicationPathRegistry
+from .groups_io import ContactGroupUsageFinderRegistry
+from .host_attributes import (
+    ABCHostAttribute,
+    HostAttributeRegistry,
+    HostAttributeTopicRegistry,
+)
+from .host_label_sync import AutomationDiscoveredHostLabelSync
+from .host_rename import (
+    AutomationRenameHostsUUIDLink,
+    RenameHostBackgroundJob,
+    RenameHostsBackgroundJob,
+)
+from .hosts_and_folders import (
+    find_usages_of_contact_group_in_hosts_and_folders,
+    FolderValidators,
+    FolderValidatorsRegistry,
+    rebuild_folder_lookup_cache,
+)
+from .notifications import (
+    find_timeperiod_usage_in_notification_rules,
+    find_usages_of_contact_group_in_notification_rules,
+)
+from .password_visitor import PasswordVisitor
+from .recomposers.internal_proxy import recompose as recompose_internal_proxy
+from .recomposers.proxy import recompose as recompose_proxy
+from .recomposers.time_period import recompose as recompose_time_period
+from .rulesets import (
+    find_timeperiod_usage_in_host_and_service_rules,
+    find_timeperiod_usage_in_time_specific_parameters,
+)
+from .rulespecs import (
+    RulespecGroupEnforcedServices,
+    RulespecGroupRegistry,
+)
+from .sample_config import SampleConfigGeneratorRegistry
+from .services import ServiceDiscoveryBackgroundJob
+from .single_choice_editable_visitor import SingleChoiceEditableVisitor
+from .time_specific_visitor import TimeSpecificVisitor
+from .timeperiods import TimeperiodUsageFinderRegistry
+from .user_profile import handle_ldap_sync_finished, PushUserProfilesToSite
+
+
+def register(
+    edition: version.Edition,
+    rulespec_group_registry: RulespecGroupRegistry,
+    automation_command_registry: AutomationCommandRegistry,
+    job_registry: BackgroundJobRegistry,
+    sample_config_generator_registry: SampleConfigGeneratorRegistry,
+    config_domain_registry: ConfigDomainRegistry,
+    host_attribute_topic_registry: HostAttributeTopicRegistry,
+    host_attribute_registry: HostAttributeRegistry,
+    contact_group_usage_finder_registry_: ContactGroupUsageFinderRegistry,
+    timeperiod_usage_finder_registry: TimeperiodUsageFinderRegistry,
+    config_variable_group_registry: ConfigVariableGroupRegistry,
+    autocompleter_registry: AutocompleterRegistry,
+    replication_path_registry: ReplicationPathRegistry,
+    folder_validators_registry: FolderValidatorsRegistry,
+    cron_job_registry: CronJobRegistry,
+) -> None:
+    _register_automation_commands(automation_command_registry)
+    _register_gui_background_jobs(job_registry)
+    _register_config_domains(config_domain_registry)
+    host_attributes.register(host_attribute_topic_registry)
+    activate_changes.register(replication_path_registry)
+    host_relations_export.register(replication_path_registry)
+    _register_host_attribute(host_attribute_registry)
+    _register_cronjobs(cron_job_registry)
+    folder_validators_registry.register(
+        FolderValidators(
+            str(edition),
+            validate_edit_host=lambda s, n, a, si: None,  # noqa: ARG005
+            validate_create_hosts=lambda e, s, si: None,  # noqa: ARG005
+            validate_create_subfolder=lambda f, a, si: None,  # noqa: ARG005
+            validate_edit_folder=lambda f, a, si: None,  # noqa: ARG005
+            validate_move_hosts=lambda f, n, t, si: None,  # noqa: ARG005
+            validate_move_subfolder_to=lambda f, t, si: None,  # noqa: ARG005
+        )
+    )
+    _sync_remote_sites.register(automation_command_registry, cron_job_registry)
+    rulespec_groups.register(rulespec_group_registry)
+    rulespec_group_registry.register(RulespecGroupEnforcedServices)
+    automation_command_registry.register(PushUserProfilesToSite)
+    automation_command_registry.register(AutomationStoreBrokerCertificates)
+    automation_command_registry.register(AutomationCreateBrokerCertificates)
+    automation_command_registry.register(AutomationGetConfigSyncState)
+    automation_command_registry.register(AutomationReceiveConfigSync)
+    automation_command_registry.register(AutomationRemoveTLSRegistration)
+    automation_command_registry.register(AutomationAgentDownloadTokenCreate)
+    automation_command_registry.register(AutomationAgentRegistrationTokenCreate)
+    automation_command_registry.register(AutomationCheckAnalyzeConfig)
+    automation_command_registry.register(AutomationDiscoveredHostLabelSync)
+    sample_config.register(sample_config_generator_registry)
+    contact_group_usage_finder_registry_.register(find_usages_of_contact_group_in_hosts_and_folders)
+    contact_group_usage_finder_registry_.register(
+        find_usages_of_contact_group_in_notification_rules
+    )
+    timeperiod_usage_finder_registry.register(find_timeperiod_usage_in_host_and_service_rules)
+    timeperiod_usage_finder_registry.register(find_timeperiod_usage_in_time_specific_parameters)
+    timeperiod_usage_finder_registry.register(find_timeperiod_usage_in_notification_rules)
+    config_variable_groups.register(config_variable_group_registry)
+    autocompleter_registry.register_autocompleter("config_hostname", config_hostname_autocompleter)
+    _register_autocompleters(autocompleter_registry)
+    automation_background_job.register(job_registry, automation_command_registry)
+    hooks.register_builtin("validate-host", builtin_attributes.validate_host_parents)
+    hooks.register_builtin("validate-host", builtin_attributes.validate_host_relations)
+    hooks.register_builtin("ldap-sync-finished", handle_ldap_sync_finished)
+    hooks.register_builtin("pre-activate-changes", update_builtin_host_labels_file)
+    _register_form_specs()
+
+
+def _register_automation_commands(automation_command_registry: AutomationCommandRegistry) -> None:
+    clss: Sequence[type[automation_commands.AutomationCommand]] = (
+        automation_commands.AutomationPing,
+        automation_commands.AutomationGetAgentReceiverPort,
+        automatic_host_removal.AutomationHostsForAutoRemoval,
+        AutomationRenameHostsUUIDLink,
+    )
+    for cls in clss:
+        automation_command_registry.register(cls)
+
+
+def _register_gui_background_jobs(job_registry: BackgroundJobRegistry) -> None:
+    job_registry.register(config_domains.OMDConfigChangeBackgroundJob)
+    job_registry.register(autodiscovery.AutodiscoveryBackgroundJob)
+    job_registry.register(BulkDiscoveryBackgroundJob)
+    job_registry.register(ActivateChangesSchedulerBackgroundJob)
+    job_registry.register(RenameHostsBackgroundJob)
+    job_registry.register(RenameHostBackgroundJob)
+    job_registry.register(ServiceDiscoveryBackgroundJob)
+
+
+def _register_config_domains(config_domain_registry: ConfigDomainRegistry) -> None:
+    config_domain_registry.register(config_domains.ConfigDomainCore())
+    config_domain_registry.register(config_domains.ConfigDomainGUI())
+    config_domain_registry.register(config_domains.ConfigDomainCACertificates())
+    config_domain_registry.register(config_domains.ConfigDomainSiteCertificate())
+    config_domain_registry.register(config_domains.ConfigDomainOMD())
+
+
+def _register_host_attribute(host_attribute_registry: HostAttributeRegistry) -> None:
+    clss: Sequence[type[ABCHostAttribute]] = [
+        builtin_attributes.HostAttributeAlias,
+        builtin_attributes.HostAttributeIPv4Address,
+        builtin_attributes.HostAttributeIPv6Address,
+        builtin_attributes.HostAttributeAdditionalIPv4Addresses,
+        builtin_attributes.HostAttributeAdditionalIPv6Addresses,
+        builtin_attributes.HostAttributeSNMPCommunity,
+        builtin_attributes.HostAttributeParents,
+        builtin_attributes.HostAttributeManagementAddress,
+        builtin_attributes.HostAttributeManagementProtocol,
+        builtin_attributes.HostAttributeManagementSNMPCommunity,
+        builtin_attributes.HostAttributeManagementIPMICredentials,
+        builtin_attributes.HostAttributeRelations,
+        builtin_attributes.HostAttributeSite,
+        builtin_attributes.HostAttributeLockedBy,
+        builtin_attributes.HostAttributeLockedAttributes,
+        builtin_attributes.HostAttributeMetaData,
+        builtin_attributes.HostAttributeDiscoveryFailed,
+        builtin_attributes.HostAttributeWaitingForDiscovery,
+        builtin_attributes.HostAttributeLabels,
+        groups.HostAttributeContactGroups,
+    ]
+    for cls in clss:
+        host_attribute_registry.register(cls)
+
+
+def _register_cronjobs(cron_job_registry: CronJobRegistry) -> None:
+    cron_job_registry.register(
+        CronJob[Config](
+            name="execute_activation_cleanup_job",
+            callable=execute_activation_cleanup_job,
+            interval=timedelta(minutes=1),
+            run_in_thread=True,
+        )
+    )
+    cron_job_registry.register(
+        CronJob[Config](
+            name="rebuild_folder_lookup_cache",
+            callable=rebuild_folder_lookup_cache,
+            interval=timedelta(minutes=1),
+        )
+    )
+    cron_job_registry.register(
+        CronJob[Config](
+            name="execute_host_removal_job",
+            callable=automatic_host_removal.execute_host_removal_job,
+            interval=timedelta(minutes=1),
+            run_in_thread=True,
+        )
+    )
+    cron_job_registry.register(
+        CronJob[Config](
+            name="execute_autodiscovery",
+            callable=autodiscovery.execute_autodiscovery,
+            interval=timedelta(minutes=5),
+        )
+    )
+
+
+def _register_form_specs() -> None:
+    register_visitor_class(SingleChoiceEditable, SingleChoiceEditableVisitor)
+    register_visitor_class(TimeSpecific, TimeSpecificVisitor)
+    register_visitor_class(Password, PasswordVisitor)
+    register_recomposer_function(Proxy, recompose_proxy)
+    register_recomposer_function(TimePeriod, recompose_time_period)
+    register_recomposer_function(InternalProxy, recompose_internal_proxy)
+
+
+def _register_autocompleters(autocompleter_registry: AutocompleterRegistry) -> None:
+    from ._autocompleters import (
+        check_types_autocompleter,
+        hostgroup_autocompleter,
+        tag_group_autocompleter,
+        tag_group_opt_autocompleter,
+    )
+
+    autocompleter_registry.register_autocompleter("allgroups", hostgroup_autocompleter)
+    autocompleter_registry.register_autocompleter("tag_groups", tag_group_autocompleter)
+    autocompleter_registry.register_autocompleter("tag_groups_opt", tag_group_opt_autocompleter)
+    autocompleter_registry.register_autocompleter("check_types", check_types_autocompleter)

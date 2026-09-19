@@ -1,0 +1,25 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+load("@cmk_requirements//:requirements.bzl", "requirement")
+
+py_library(
+    name = "token_auth",
+    srcs = glob(["**/*.py"]),
+    imports = ["../../.."],
+    visibility = [
+        "//cmk:__subpackages__",
+        "//packages/cmk-wsgi:__pkg__",
+        "//tests:__subpackages__",
+    ],
+    deps = [
+        "//cmk/gui:core_toolkit",
+        "//cmk/gui:page_toolkit",
+        "//cmk/gui/utils:middle",
+        "//cmk/utils",
+        "//packages/cmk-ccc:hostaddress",
+        "//packages/cmk-ccc:plugin-registry",
+        "//packages/cmk-ccc:store",
+        "//packages/cmk-ccc:user",
+        requirement("python-dateutil"),
+        requirement("pydantic"),
+    ],
+)

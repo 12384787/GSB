@@ -1,0 +1,966 @@
+// Copyright (C) 2023 Checkmk GmbH - License: GNU General Public License v2
+// This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+// conditions defined in the file COPYING, which is part of this source code package.
+
+use crate::types::{ClusterName, HostName, InstanceName, Port};
+
+pub struct Block {
+    pub headline: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+}
+
+impl Block {
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub fn first(&self) -> Option<&Vec<String>> {
+        self.rows.first()
+    }
+    pub fn last(&self) -> Option<&Vec<String>> {
+        self.rows.last()
+    }
+
+    pub fn get_value_by_name(&self, row: &[String], idx: &str) -> String {
+        if let Some(index) = self.headline.iter().position(|r| r == idx) {
+            row.get(index).cloned()
+        } else {
+            None
+        }
+        .unwrap_or_default()
+    }
+
+    pub fn get_bigint_by_name(&self, row: &[String], idx: &str) -> String {
+        self.get_value_by_name(row, idx)
+            .parse::<i64>()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    pub fn get_first_row_column(&self, column: usize) -> Option<String> {
+        self.rows.first().and_then(|r| r.get(column)).cloned()
+    }
+}
+
+pub fn get_row_value_by_idx(row: &[String], idx: usize) -> String {
+    row.get(idx).cloned().unwrap_or_default()
+}
+
+#[allow(dead_code)] // NamedPipe is needed on Windows and not Linux.
+#[derive(Debug, Clone)]
+struct NamedPipe(String);
+
+#[derive(Debug, Clone)]
+struct TcpPoint {
+    enabled_and_active: bool,
+    port: Option<Port>,
+    dynamic_port: Option<Port>,
+    hostname: HostName,
+}
+#[derive(Debug, Clone)]
+struct Tcp {
+    port: Option<Port>,
+    dynamic_port: Option<Port>,
+    listen_all_ips: bool,
+    peers: Vec<TcpPoint>,
+}
+
+pub struct PeerTcpInfo {
+    pub active: bool,
+    pub enabled: bool,
+    pub hostname: String,
+    pub port: Option<Port>,
+    pub dynamic_port: Option<Port>,
+}
+
+pub struct HostTcpInfo {
+    pub enabled: bool,
+    pub listen_on_all_ips: bool,
+    pub peers: Vec<PeerTcpInfo>,
+}
+
+pub fn get_host_tcp_info() -> HostTcpInfo {
+    HostTcpInfo {
+        enabled: true,
+        listen_on_all_ips: true,
+        peers: Vec::new(),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct InstanceInfo {
+    pub name: InstanceName,
+    pub cluster_name: Option<ClusterName>,
+    shared_memory: bool,
+    pipe: Option<NamedPipe>,
+    tcp: Option<Tcp>,
+}
+
+fn first_non_zero_port(first: &Option<Port>, second: &Option<Port>) -> Option<Port> {
+    if let Some(p) = first {
+        if p.value() != 0 {
+            return Some(p.clone());
+        }
+    }
+    if let Some(dp) = second {
+        if dp.value() != 0 {
+            return Some(dp.clone());
+        }
+    }
+    None
+}
+
+impl Tcp {
+    pub fn port(&self) -> Option<Port> {
+        if !self.listen_all_ips {
+            for peer in &self.peers {
+                if let Some(p) = first_non_zero_port(&peer.port, &peer.dynamic_port) {
+                    return Some(p);
+                }
+            }
+            return None;
+        }
+
+        first_non_zero_port(&self.port, &self.dynamic_port)
+    }
+
+    pub fn hostname(&self) -> Option<HostName> {
+        if self.listen_all_ips {
+            return Some(HostName::from("localhost".to_string()));
+        }
+
+        for peer in &self.peers {
+            if peer.enabled_and_active
+                && first_non_zero_port(&peer.port, &peer.dynamic_port).is_some()
+            {
+                return Some(peer.hostname.clone());
+            }
+        }
+
+        None
+    }
+}
+
+impl InstanceInfo {
+    pub fn final_port(&self) -> Option<Port> {
+        if !self.is_tcp() {
+            return None;
+        }
+
+        self.tcp.as_ref().and_then(|t| t.port().clone())
+    }
+
+    pub fn final_host(&self) -> Option<HostName> {
+        if !self.is_tcp() {
+            return None;
+        }
+
+        self.tcp.as_ref().and_then(|t| t.hostname())
+    }
+
+    pub fn is_shared_memory(&self) -> bool {
+        self.shared_memory
+    }
+
+    pub fn is_pipe(&self) -> bool {
+        self.pipe.is_some()
+    }
+
+    pub fn is_tcp(&self) -> bool {
+        self.tcp
+            .as_ref()
+            .map(|t| t.port().is_some())
+            .unwrap_or_default()
+    }
+
+    pub fn is_odbc_only(&self) -> bool {
+        !self.is_tcp()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        platform::{first_non_zero_port, InstanceInfo, Tcp},
+        types::{InstanceName, Port},
+    };
+
+    #[test]
+    fn test_first_non_zero_port() {
+        // both ports ar non-zero => returns first port
+        assert_eq!(
+            first_non_zero_port(&Some(Port::from(1433)), &Some(Port::from(5000))),
+            Some(Port::from(1433))
+        );
+
+        // first port is zero, second is non-zero => returns second port
+        assert_eq!(
+            first_non_zero_port(&Some(Port::from(0)), &Some(Port::from(5000))),
+            Some(Port::from(5000))
+        );
+        // both are zero => returns None
+        assert_eq!(
+            first_non_zero_port(&Some(Port::from(0)), &Some(Port::from(0))),
+            None
+        );
+
+        // first port is non-zero, second is None => returns first
+        assert_eq!(
+            first_non_zero_port(&Some(Port::from(1433)), &None),
+            Some(Port::from(1433))
+        );
+        // first port is None, second is non-zero => returns second
+        assert_eq!(
+            first_non_zero_port(&None, &Some(Port::from(5000))),
+            Some(Port::from(5000))
+        );
+
+        // first port is zero, second is None => returns None
+        assert_eq!(first_non_zero_port(&Some(Port::from(0)), &None), None);
+        // first is None, second is zero => returns None
+        assert_eq!(first_non_zero_port(&None, &Some(Port::from(0))), None);
+
+        // both are None => returns None
+        assert_eq!(first_non_zero_port(&None, &None), None);
+    }
+
+    #[test]
+    fn test_instance_final_port() {
+        let make_i = |port: Option<u16>, dynamic_port: Option<u16>| InstanceInfo {
+            name: InstanceName::from("doesn't-matter".to_owned()),
+            cluster_name: None,
+            shared_memory: false,
+            pipe: None,
+            tcp: Some(Tcp {
+                port: port.map(|p| p.into()),
+                dynamic_port: dynamic_port.map(|p| p.into()),
+                listen_all_ips: true,
+                peers: vec![],
+            }),
+        };
+
+        let std_port = 1;
+        let dyn_port = 2;
+        assert_eq!(
+            make_i(Some(std_port), None).final_port().unwrap(),
+            Port::from(std_port)
+        );
+        assert_eq!(
+            make_i(Some(0), Some(dyn_port)).final_port().unwrap(),
+            Port::from(dyn_port)
+        );
+        assert_eq!(
+            make_i(Some(std_port), Some(dyn_port)).final_port().unwrap(),
+            Port::from(std_port)
+        );
+        assert_eq!(
+            make_i(None, Some(dyn_port)).final_port().unwrap(),
+            Port::from(dyn_port)
+        );
+        assert_eq!(
+            make_i(Some(std_port), Some(0)).final_port().unwrap(),
+            Port::from(std_port)
+        );
+        assert!(make_i(Some(0), Some(0)).final_port().is_none());
+    }
+}
+
+#[cfg(windows)]
+pub mod odbc {
+    use super::Block;
+    use crate::config::ms_sql::{AuthType, Authentication, Endpoint};
+    use crate::types::ClusterName;
+    use anyhow::Result;
+    use odbc_api::{
+        buffers::{ColumnarBuffer, TextColumn, TextRowSet},
+        ConnectionOptions, Cursor, Environment, ResultSetMetadata,
+    };
+
+    const ODBC_DRIVER_LIST: &str = "Get-OdbcDriver -Name '* SQL Server' -Platform 32-Bit | Format-Table -HideTableHeaders -Property Name";
+
+    use crate::types::{HostName, InstanceName};
+    lazy_static::lazy_static! {
+        pub static ref ODBC_DRIVER: String = gather_odbc_drivers().last().unwrap_or(&"".to_string()).clone();
+    }
+
+    pub fn gather_odbc_drivers() -> Vec<String> {
+        match run_powershell_command(ODBC_DRIVER_LIST) {
+            Ok(output) => {
+                let output_text = std::str::from_utf8(&output.stdout)
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                output_text
+                    .split('\n')
+                    .map(|s| s.to_string().replace('\r', ""))
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<String>>()
+            }
+            Err(e) => {
+                log::error!("Failed to gather ODBC drivers: {:?}", e);
+                vec![]
+            }
+        }
+    }
+
+    fn run_powershell_command(command: &str) -> std::io::Result<std::process::Output> {
+        std::process::Command::new("powershell")
+            .args(["-Command", command])
+            .output()
+    }
+
+    /// creates a local connection string for the ODBC driver
+    /// always SSPI = Trusted connection, but TrustServerCertificate depends
+    pub fn make_connection_string(
+        hostname: Option<&HostName>,
+        cluster_name: Option<&ClusterName>,
+        instance: &InstanceName,
+        database: Option<&str>,
+        driver: Option<&str>,
+        endpoint: &Endpoint,
+    ) -> String {
+        let server = match cluster_name {
+            Some(c) => c.to_string(),
+            None => hostname
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "(local)".to_string()),
+        };
+        format!(
+            "Driver={{{}}};SERVER={}{};Database={};{};Encrypt=yes;TrustServerCertificate={};",
+            driver.unwrap_or(&ODBC_DRIVER.clone()),
+            server,
+            if instance.to_string().to_uppercase() == *"MSSQLSERVER" {
+                "".to_string()
+            } else {
+                format!("\\{}", instance)
+            },
+            database.unwrap_or("master"),
+            make_connection_sub_string(endpoint.auth()),
+            if endpoint.conn().trust_server_certificate() {
+                "yes"
+            } else {
+                "no"
+            }
+        )
+    }
+
+    fn make_connection_sub_string(auth: &Authentication) -> String {
+        match auth.auth_type() {
+            AuthType::Windows | AuthType::Integrated => {
+                log::info!("Connection substring {:#?}", auth);
+                "Integrated Security=SSPI;Trusted_Connection=yes".to_string()
+            }
+            AuthType::SqlServer => {
+                log::info!("Connection substring {:#?}", auth);
+                format!(
+                    "UID={};PWD={}",
+                    auth.username(),
+                    auth.password().map(|s| s.as_str()).unwrap_or_default()
+                )
+            }
+            AuthType::Token => format!(
+                "AccessToken={}",
+                auth.access_token().map(|s| s.as_str()).unwrap_or_default()
+            ),
+            AuthType::Undefined => "Integrated Security=SSPI;Trusted_Connection=yes".to_string(),
+        }
+    }
+
+    fn redact_sensitive_key(s: &str, key: &str) -> String {
+        let Some((before, after)) = s.split_once(key) else {
+            return s.to_string();
+        };
+        match after.split_once(';') {
+            Some((_, rest)) => format!("{before}{key}***;{rest}"),
+            None => format!("{before}{key}***"),
+        }
+    }
+
+    fn redact_connection_string(s: &str) -> String {
+        let s = redact_sensitive_key(s, "PWD=");
+        redact_sensitive_key(&s, "AccessToken=")
+    }
+
+    type BufferType = ColumnarBuffer<TextColumn<u8>>;
+
+    // TODO(sk): make it ASYNC!
+    pub fn execute(
+        connection_string: &str,
+        query: &str,
+        timeout: Option<u32>,
+    ) -> Result<Vec<Block>> {
+        let env = Environment::new()?;
+
+        log::info!(
+            "Connecting with string {}",
+            redact_connection_string(connection_string)
+        );
+
+        let conn = env.connect_with_connection_string(
+            connection_string,
+            ConnectionOptions {
+                login_timeout_sec: timeout,
+                ..Default::default()
+            },
+        )?;
+
+        // TODO(sk): replace execute with execute_polling
+        if let Some(mut cursor) = conn.execute(query, ())? {
+            const BATCH_SIZE: usize = 5000;
+            let mut blocks: Vec<Block> = Vec::new();
+
+            let headline = cursor.column_names()?.collect::<Result<_, _>>()?;
+            let mut buffers = TextRowSet::for_cursor(BATCH_SIZE, &mut cursor, Some(4096))?;
+            let mut row_set_cursor = cursor.bind_buffer(&mut buffers)?;
+
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            while let Some(batch) = row_set_cursor.fetch()? {
+                rows.extend(process_batch(batch));
+            }
+            blocks.push(Block { headline, rows });
+
+            if let Ok((cursor, mut _buffer)) = row_set_cursor.unbind() {
+                if let Ok(Some(mut c)) = cursor.more_results() {
+                    let headline = c.column_names()?.collect::<Result<_, _>>()?;
+                    let mut buffers = TextRowSet::for_cursor(BATCH_SIZE, &mut c, Some(4096))?;
+                    let mut rows: Vec<Vec<String>> = Vec::new();
+                    let mut row_set_cursor = c.bind_buffer(&mut buffers)?;
+                    while let Some(batch) = row_set_cursor.fetch()? {
+                        rows.extend(process_batch(batch));
+                    }
+                    blocks.push(Block { headline, rows });
+                }
+            }
+            return Ok(blocks);
+        }
+
+        Ok(vec![])
+    }
+
+    pub fn process_batch(batch: &BufferType) -> Vec<Vec<String>> {
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        for row in 0..batch.num_rows() {
+            let row: Vec<String> = (0..batch.num_cols())
+                .map(|col_index| get_batch_field(batch, col_index, row))
+                .collect();
+            rows.push(row);
+        }
+        rows
+    }
+
+    pub fn get_batch_field(batch: &BufferType, col_index: usize, row: usize) -> String {
+        if let Ok(some) = batch.at_as_str(col_index, row) {
+            return some.unwrap_or_default().to_string();
+        }
+
+        // can't decode utf8 -> try 1252
+        // TODO(sk): get real encoding of database and use corresponding encoding
+        if let Some(some_bin) = batch.at(col_index, row) {
+            let (val, _, _) = encoding_rs::WINDOWS_1252.decode(some_bin);
+            log::trace!("*** WINDOWS_1252 decode {} @ {}", val, col_index);
+            val.to_string()
+        } else {
+            log::info!("*** can't decode {} binary is absent too", col_index);
+            "<malformed>".to_string()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::config::ms_sql::{Authentication, Connection, Endpoint};
+        use crate::config::yaml::test_tools::create_yaml;
+        use crate::platform::odbc::{self, ODBC_DRIVER};
+        use crate::types::{ClusterName, HostName, InstanceName};
+        use yaml_rust2::YamlLoader;
+
+        fn make_endpoint(trust_server_certificate: bool) -> Endpoint {
+            let y = create_yaml(&format!(
+                "connection:\n  trust_server_certificate: {} ",
+                if trust_server_certificate {
+                    "yes"
+                } else {
+                    "no"
+                }
+            ));
+            let conn = Connection::from_yaml(&y, None).unwrap_or_default().unwrap();
+            Endpoint::new(&Authentication::default(), &conn)
+        }
+
+        #[test]
+        fn test_make_connection_string() {
+            assert_eq!( odbc::make_connection_string(
+                None,
+                None,
+                &InstanceName::from("SQLEXPRESS_NAME"),
+                None,
+                None, &make_endpoint(false)),
+                format!("Driver={{{}}};SERVER=(local)\\SQLEXPRESS_NAME;Database=master;Integrated Security=SSPI;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=no;", ODBC_DRIVER.clone()));
+            let auth_str = "authentication:\n  username: x\n  password: p\n  type: sql_server";
+            let a =
+                Authentication::from_yaml(&YamlLoader::load_from_str(auth_str).unwrap()[0].clone())
+                    .unwrap();
+            assert_eq!(
+                odbc::make_connection_string(
+                    Some(&HostName::from("host".to_string())),
+                    None,
+                    &InstanceName::from("Instance"),
+                    Some("db"),
+                    Some("driver"),
+                    &Endpoint::new(&a, &Connection::default())
+                ),
+                "Driver={driver};SERVER=host\\Instance;Database=db;UID=x;PWD=p;Encrypt=yes;TrustServerCertificate=yes;"
+            );
+            assert_eq!(
+                odbc::make_connection_string(
+                    Some(&HostName::from("host".to_string())),
+                    None,
+                    &InstanceName::from("Instance"),
+                    Some("db"),
+                    Some("driver"),
+                    &make_endpoint(true)
+                ),
+                "Driver={driver};SERVER=host\\Instance;Database=db;Integrated Security=SSPI;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes;"
+            );
+            assert_eq!(
+                odbc::make_connection_string(
+                    Some(&HostName::from("host".to_string())),
+                    Some(&ClusterName::from("cluster".to_string())),
+                    &InstanceName::from("Instance"),
+                    Some("db"),
+                    Some("driver"),
+                    &make_endpoint(true)
+                ),
+                "Driver={driver};SERVER=cluster\\Instance;Database=db;Integrated Security=SSPI;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes;"
+            );
+            assert_eq!( odbc::make_connection_string(
+                Some(&HostName::from("host".to_string())),
+                None,
+                &InstanceName::from("mssqlserver"),
+                    None,
+                    None, &make_endpoint(false)),
+                    format!("Driver={{{}}};SERVER=host;Database=master;Integrated Security=SSPI;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=no;", ODBC_DRIVER.clone()));
+        }
+
+        #[test]
+        fn test_redact_connection_string() {
+            assert_eq!(
+                super::redact_connection_string("Driver={drv};PWD=secret;Server=host;"),
+                "Driver={drv};PWD=***;Server=host;"
+            );
+            assert_eq!(
+                super::redact_connection_string("AccessToken=tok123;Server=host;"),
+                "AccessToken=***;Server=host;"
+            );
+            assert_eq!(
+                super::redact_connection_string("PWD=p;AccessToken=t;X=1;"),
+                "PWD=***;AccessToken=***;X=1;"
+            );
+            assert_eq!(
+                super::redact_connection_string("Driver={drv};Integrated Security=SSPI;"),
+                "Driver={drv};Integrated Security=SSPI;"
+            );
+            assert_eq!(
+                super::redact_connection_string("PWD=trailing_no_semi"),
+                "PWD=***"
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+pub mod registry {
+    use super::{InstanceInfo, NamedPipe, Tcp, TcpPoint};
+    use crate::types::{ClusterName, HostName, InstanceName, Port};
+    use std::collections::HashMap;
+    use winreg::{enums::HKEY_LOCAL_MACHINE, RegKey};
+    const MS_SQL_DEFAULT_BRANCH_LOCATION: &str = r"SOFTWARE\";
+
+    pub fn get_instances(custom_branch: Option<String>) -> Vec<InstanceInfo> {
+        let branch = custom_branch.unwrap_or_default() + MS_SQL_DEFAULT_BRANCH_LOCATION;
+        let instances_std =
+            get_instances_on_key(&(branch.clone() + r"Microsoft\Microsoft SQL Server\"));
+        let instances_wow =
+            get_instances_on_key(&(branch + r"WOW6432Node\Microsoft\Microsoft SQL Server\"));
+
+        instances_std.into_iter().chain(instances_wow).collect()
+    }
+
+    fn get_instances_on_key(sql_key: &str) -> Vec<InstanceInfo> {
+        let root_key = RegKey::predef(HKEY_LOCAL_MACHINE);
+        let result = root_key.open_subkey_with_flags(
+            sql_key.to_owned() + r"Instance Names\SQL",
+            winreg::enums::KEY_READ | winreg::enums::KEY_WOW64_64KEY,
+        );
+        if let Err(e) = result {
+            let key = sql_key.to_owned() + r"Instance Names\SQL";
+            if e.kind() == std::io::ErrorKind::NotFound {
+                log::info!("Registry key '{key}' is not found, it's ok");
+            } else {
+                log::error!("Error opening registry key '{key}': {e:?}",);
+            }
+            return vec![];
+        }
+        let names_map: HashMap<String, String> = result
+            .expect("Impossible")
+            .enum_values()
+            .filter_map(|x| x.ok())
+            .map(|x| (x.0, format!("{}", x.1)))
+            .collect();
+
+        names_map
+            .iter()
+            .map(|x| instance_info(sql_key, x.0, x.1))
+            .collect::<Vec<InstanceInfo>>()
+    }
+
+    fn open_subkey(sub_key: impl AsRef<str>) -> Option<RegKey> {
+        RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey_with_flags(
+                sub_key.as_ref(),
+                winreg::enums::KEY_READ | winreg::enums::KEY_WOW64_64KEY,
+            )
+            .ok()
+    }
+
+    fn get_shared_memory(sql_key: &str, key_name: &str) -> bool {
+        let instance_sm_key = format!(r"{}{}\MSSQLServer\SuperSocketNetLib\Sm", sql_key, key_name);
+        if let Some(key) = open_subkey(instance_sm_key) {
+            key.get_value::<u32, _>("Enabled").unwrap_or_default() != 0
+        } else {
+            false
+        }
+    }
+
+    fn get_pipe(sql_key: &str, key_name: &str) -> Option<String> {
+        let instance_pipe_key =
+            format!(r"{}{}\MSSQLServer\SuperSocketNetLib\Np", sql_key, key_name);
+        if let Some(key) = open_subkey(instance_pipe_key) {
+            let pipe_enabled: u32 = key.get_value("Enabled").unwrap_or_default();
+            if pipe_enabled != 0 {
+                key.get_value("PipeName").ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    fn cluster_name(sql_key: &str, key_name: &str) -> Option<ClusterName> {
+        let cluster_key = format!(r"{}{}\Cluster", sql_key, key_name);
+        if let Ok(key) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(
+            &cluster_key,
+            winreg::enums::KEY_READ | winreg::enums::KEY_WOW64_64KEY,
+        ) {
+            let value: Option<String> = key.get_value("ClusterName").ok();
+            log::info!(
+                "Read cluster name {:?} instance '{}' from registry",
+                value,
+                key_name
+            );
+            value.map(ClusterName::from)
+        } else {
+            log::trace!(
+                "Can't open cluster key {} instance '{}' from registry",
+                cluster_key,
+                key_name
+            );
+            None
+        }
+    }
+
+    fn _read_tcp_port(key: &RegKey, value: &str) -> u16 {
+        key.get_value::<String, _>(value)
+            .unwrap_or_default()
+            .parse::<u16>()
+            .unwrap_or(0)
+    }
+
+    fn get_tcp(sql_key: &str, key_name: &str) -> Option<Tcp> {
+        let instance_tcp_key =
+            format!(r"{}{}\MSSQLServer\SuperSocketNetLib\Tcp", sql_key, key_name);
+        let root_key = RegKey::predef(HKEY_LOCAL_MACHINE);
+        if let Ok(key) = root_key.open_subkey_with_flags(
+            &instance_tcp_key,
+            winreg::enums::KEY_READ | winreg::enums::KEY_WOW64_64KEY,
+        ) {
+            let tcp_enabled: u32 = key.get_value("Enabled").unwrap_or_default();
+            if tcp_enabled == 0 {
+                return None;
+            }
+            let ip_all_key = key.open_subkey_with_flags(
+                "IPAll",
+                winreg::enums::KEY_READ | winreg::enums::KEY_WOW64_64KEY,
+            );
+            // read ports
+            let (port, dynamic_port) = ip_all_key
+                .ok()
+                .map(|key| {
+                    let port: u16 = _read_tcp_port(&key, "TcpPort");
+                    let dynamic_port: u16 = _read_tcp_port(&key, "TcpDynamicPorts");
+                    (Some(port), Some(dynamic_port))
+                })
+                .unwrap();
+            Some(Tcp {
+                port: port.map(Port::from),
+                dynamic_port: dynamic_port.map(Port::from),
+                listen_all_ips: key
+                    .get_value::<u32, _>("ListenOnAllIPs")
+                    .unwrap_or_default()
+                    != 0,
+                peers: _gather_instances(key),
+            })
+        } else {
+            log::error!("Error opening registry key '{instance_tcp_key}'");
+            None
+        }
+    }
+
+    fn _gather_instances(key: RegKey) -> Vec<TcpPoint> {
+        let keys = key.enum_keys().filter_map(|x| x.ok());
+        keys.filter_map(|k| {
+            let ip_key = key.open_subkey_with_flags(
+                k,
+                winreg::enums::KEY_READ | winreg::enums::KEY_WOW64_64KEY,
+            );
+            if let Ok(ip_key) = ip_key {
+                let dynamic_port = ip_key
+                    .get_value::<String, _>("TcpDynamicPorts")
+                    .unwrap_or_default();
+                let port = ip_key.get_value::<String, _>("TcpPort").unwrap_or_default();
+                let hostname = ip_key
+                    .get_value::<String, _>("IpAddress")
+                    .unwrap_or_default();
+                let enabled = ip_key.get_value::<u32, _>("Enabled").unwrap_or_default() != 0;
+                let active = ip_key.get_value::<u32, _>("Active").unwrap_or_default() != 0;
+                if !enabled || !active {
+                    return None;
+                }
+                Some(TcpPoint {
+                    enabled_and_active: enabled && active,
+                    hostname: HostName::from(hostname),
+                    port: port.parse::<u16>().ok().map(Port::from),
+                    dynamic_port: dynamic_port.parse::<u16>().ok().map(Port::from),
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+    }
+
+    /// Ctor
+    fn instance_info(
+        sql_key: &str,
+        instance_name: &str,
+        registry_instance_name: &str,
+    ) -> InstanceInfo {
+        InstanceInfo {
+            name: InstanceName::from(instance_name),
+            cluster_name: cluster_name(sql_key, registry_instance_name),
+            shared_memory: get_shared_memory(sql_key, registry_instance_name),
+            pipe: get_pipe(sql_key, registry_instance_name).map(NamedPipe),
+            tcp: get_tcp(sql_key, registry_instance_name),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::collections::HashSet;
+
+        use super::get_instances;
+        use crate::types::InstanceName;
+
+        /// must be in sync with test files
+        /// allowed not be in sync with actual repo branch(may be in future)
+        const REPO_NAME: &str = "2.5.0";
+
+        fn obtain_test_instances_registry_branch(test_set_name: &str) -> String {
+            format!(
+                r"SOFTWARE\checkmk\tests\{}\mk-sql\instances\{}\",
+                REPO_NAME, test_set_name
+            )
+        }
+
+        #[test]
+        #[ignore] // this test fails on registry
+        fn test_get_instances() {
+            let custom_branch = obtain_test_instances_registry_branch("test-std");
+            let infos = get_instances(Some(custom_branch.to_owned()))
+                .into_iter()
+                .filter(|i| {
+                    i.name != InstanceName::from("SQLEXPRESS_OLD")
+                        && i.name != InstanceName::from("SQLBAD")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(infos.len(), 3usize);
+        }
+
+        #[test]
+        #[ignore] // this test fails on registry
+        fn test_get_host_tcp_info() {
+            let custom_branch = obtain_test_instances_registry_branch("test-not-all");
+            let infos = get_instances(Some(custom_branch.to_owned()))
+                .into_iter()
+                .map(|i| i.tcp)
+                .collect::<Vec<_>>();
+            assert_eq!(infos.len(), 2usize);
+            assert_eq!(infos[0].as_ref().unwrap().port().unwrap().value(), 1433);
+            assert_eq!(infos[1].as_ref().unwrap().port().unwrap().value(), 1433);
+            let host_name_set = infos
+                .into_iter()
+                .map(|i| i.unwrap().hostname().unwrap().to_string())
+                .collect::<HashSet<_>>();
+            assert_eq!(
+                host_name_set,
+                ["192.168.125.175", "192.168.121.170"]
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect::<HashSet<_>>()
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+pub mod registry {
+    use super::InstanceInfo;
+    pub fn get_instances(_custom_branch: Option<String>) -> Vec<InstanceInfo> {
+        vec![]
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::get_instances;
+        #[test]
+        fn test_get_instances() {
+            assert!(get_instances(None).is_empty());
+        }
+    }
+}
+
+/// Finds running MS SQL Server instances via the Windows Service Control Manager.
+///
+/// Enumerates all active Win32 services and returns the instance name for every
+/// service whose name is `MSSQLSERVER` (default instance) or `MSSQL$<NAME>`
+/// (named instance).  Only services in the `Running` state are included.
+#[cfg(windows)]
+pub mod processes {
+    use std::mem;
+    use std::ptr::null;
+    use winapi::um::winsvc::{
+        CloseServiceHandle, EnumServicesStatusExW, OpenSCManagerW, ENUM_SERVICE_STATUS_PROCESSW,
+    };
+
+    const SC_MANAGER_ENUMERATE_SERVICE: u32 = 0x0004;
+    const SC_ENUM_PROCESS_INFO: u32 = 0;
+    const SERVICE_WIN32: u32 = 0x0030; // OWN_PROCESS | SHARE_PROCESS
+    const SERVICE_ACTIVE: u32 = 0x0001;
+    const SERVICE_RUNNING: u32 = 0x0004;
+
+    pub fn find_running_instances() -> Vec<String> {
+        unsafe {
+            let scm = OpenSCManagerW(null(), null(), SC_MANAGER_ENUMERATE_SERVICE);
+            if scm.is_null() {
+                log::error!(
+                    "OpenSCManagerW failed: {:?}",
+                    std::io::Error::last_os_error()
+                );
+                return vec![];
+            }
+
+            let instances = enum_mssql_services(scm);
+            CloseServiceHandle(scm);
+            instances
+        }
+    }
+
+    unsafe fn enum_mssql_services(scm: winapi::um::winsvc::SC_HANDLE) -> Vec<String> {
+        let mut bytes_needed: u32 = 0;
+        let mut count: u32 = 0;
+        let mut resume: u32 = 0;
+
+        let enum_services =
+            |ptr: *mut u8, size: u32, bytes_needed: &mut u32, count: &mut u32, resume: &mut u32| {
+                EnumServicesStatusExW(
+                    scm,
+                    SC_ENUM_PROCESS_INFO,
+                    SERVICE_WIN32,
+                    SERVICE_ACTIVE,
+                    ptr,
+                    size,
+                    bytes_needed,
+                    count,
+                    resume,
+                    null(),
+                )
+            };
+
+        enum_services(
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_needed,
+            &mut count,
+            &mut resume,
+        );
+
+        if bytes_needed == 0 {
+            log::debug!("No active Win32 services found");
+            return vec![];
+        }
+
+        let stride = mem::size_of::<ENUM_SERVICE_STATUS_PROCESSW>();
+        let n_elems = (bytes_needed as usize).div_ceil(stride);
+        let mut buf: Vec<ENUM_SERVICE_STATUS_PROCESSW> =
+            (0..n_elems).map(|_| mem::zeroed()).collect();
+        let buf_bytes = (buf.len() * stride) as u32;
+        resume = 0;
+
+        let ok = enum_services(
+            buf.as_mut_ptr() as *mut u8,
+            buf_bytes,
+            &mut bytes_needed,
+            &mut count,
+            &mut resume,
+        );
+
+        if ok == 0 {
+            log::error!(
+                "EnumServicesStatusExW failed: {:?}",
+                std::io::Error::last_os_error()
+            );
+            return vec![];
+        }
+
+        buf.into_iter()
+            .take(count as usize)
+            .filter_map(|entry| {
+                if entry.ServiceStatusProcess.dwCurrentState != SERVICE_RUNNING {
+                    return None;
+                }
+                instance_from_service_name(wide_ptr_to_string(entry.lpServiceName))
+            })
+            .collect()
+    }
+
+    fn instance_from_service_name(name: String) -> Option<String> {
+        let upper = name.to_uppercase();
+        if upper == "MSSQLSERVER" {
+            return Some(upper);
+        }
+        upper
+            .strip_prefix("MSSQL$")
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    }
+
+    unsafe fn wide_ptr_to_string(ptr: *const u16) -> String {
+        if ptr.is_null() {
+            log::warn!("Null service name pointer");
+            return String::new();
+        }
+        let mut len = 0;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+    }
+}

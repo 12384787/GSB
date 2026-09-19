@@ -1,0 +1,13 @@
+title: Generic UPS Device: In Frequency
+agents: snmp
+catalog: hw/power/generic
+license: GPLv2
+distribution: check_mk
+description:
+ In Frequenz in Hz
+
+item:
+ ID of the phase
+
+discovery:
+ One service is created for each phase.

@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+from collections import defaultdict
+
+from cmk.agent_based.v2 import AgentSection, StringTable
+from cmk.plugins.network import lib_bonding as bonding
+
+
+def parse_windows_os_bonding(string_table: StringTable) -> bonding.Section:
+    bonds: dict[str, bonding.Bond] = {}
+    bonds_interfaces: dict[str, dict[str, bonding.Interface]] = defaultdict(dict)
+
+    for line in string_table:
+        if len(line) > 1:
+            item = line[1].lstrip()
+        if line[0] == "Team Name":
+            bond = item  # type: ignore[possibly-undefined]
+            bonds[bond] = {}
+            bonds[bond]["interfaces"] = {}
+        elif line[0] == "Bonding Mode":
+            bonds[bond]["mode"] = item  # type: ignore[possibly-undefined]
+        elif line[0] == "Status":
+            bonds[bond]["status"] = item.lower()  # type: ignore[possibly-undefined]
+        elif line[0] == "Speed":
+            bonds[bond]["speed"] = item  # type: ignore[possibly-undefined]
+        elif line[0] == "Slave Name":
+            slave = item  # type: ignore[possibly-undefined]
+            bonds_interfaces[bond][slave] = {}  # type: ignore[possibly-undefined]
+        elif line[0] == "Slave Status":
+            bonds_interfaces[bond][slave]["status"] = item.lower()  # type: ignore[possibly-undefined]
+        elif line[0] == "Slave MAC address":
+            bonds_interfaces[bond][slave]["hwaddr"] = item.lower().replace("-", ":")  # type: ignore[possibly-undefined]
+
+    for name, interfaces in bonds_interfaces.items():
+        bonds[name]["interfaces"] = interfaces
+    return bonds
+
+
+agent_section_windows_os_bonding = AgentSection(
+    name="windows_os_bonding",
+    parsed_section_name="bonding",
+    parse_function=parse_windows_os_bonding,
+)

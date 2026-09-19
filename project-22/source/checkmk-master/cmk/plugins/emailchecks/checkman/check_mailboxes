@@ -1,0 +1,30 @@
+title: IMAP Mailboxes
+agents: active
+catalog: agentless
+license: GPLv2
+distribution: check_mk
+description:
+ This active check logs into an IMAP or EWS account and optionally monitors the age of the oldest
+ or newest mail as well as the total count of mails in one or multiple mailboxes.
+
+ There is a caveat though: Many mailservers don't support retrieving mails sorted by
+ age and it would be very costy (in terms of traffic and check time) to retrive all
+ mails. To work around this, the check retrieves a configurable number of the least
+ recently and most recently modified mails from the server and checks the age of those.
+ Unless mails get moved between mailboxes, the least recenly modified mail should also
+ be the oldest one and the most recently modified mail should be the newest.
+
+ The following protocols and authentication methods are supported for fetching:
+
+ IMAP: Username/password (basic authentication).
+
+ EWS (Exchange Web Services): Username/password (basic authentication) or OAuth2 using
+ ClientID, TenantID, and a client secret. When using EWS, the mailbox can optionally be
+ identified by an email address (a.k.a. 'PrimarySmtpAddress') instead of the username.
+
+ Microsoft Exchange Online (Graph API): Microsoft Entra ID authentication via an OAuth2
+ connection. The connection can be configured directly in the check rule or managed centrally
+ via Setup > Microsoft Entra ID connections and then referenced in the rule. In distributed
+ environments, the OAuth2 connection can be created on the central site while the OAuth2
+ authentication process (redirect URI) is handled by a different remote site. The site used
+ for the authentication redirect can be selected when configuring the OAuth2 connection.

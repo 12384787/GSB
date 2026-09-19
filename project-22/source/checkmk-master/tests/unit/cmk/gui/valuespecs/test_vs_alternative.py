@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+# Copyright (C) 2022 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+from collections.abc import Callable
+
+import pytest
+
+import cmk.gui.valuespec as vs
+from cmk.gui.exceptions import MKUserError
+from cmk.web.utils.html import HTML
+
+from .utils import expect_validate_failure, expect_validate_success, raise_exception, request_var
+
+FAILURE_MATCH = "The data type of the value does not match any of the allowed alternatives."
+
+
+def get_alternative(
+    match: Callable[[vs.AlternativeModel], int] | None = None,  # noqa: ARG001
+    show_alternative_title: bool = False,
+    default_value: vs.ValueSpecDefault[vs.AlternativeModel] = vs.DEF_VALUE,
+) -> vs.Alternative:
+    return vs.Alternative(
+        [
+            vs.Integer(default_value=1),
+            vs.TextInput(title="text"),
+            vs.Tuple(elements=[vs.Integer(), vs.Integer()]),
+            vs.Tuple(elements=[vs.Integer(), vs.Integer(), vs.Integer()]),
+        ],
+        show_alternative_title=show_alternative_title,
+        default_value=default_value,
+    )
+
+
+class TestValuespecAlternative:
+    def _validate(
+        self,
+        match: Callable[[vs.AlternativeModel], int] | None = None,
+    ) -> None:
+        expect_validate_success(get_alternative(match=match), 1)
+        expect_validate_success(get_alternative(match=match), "eins")
+        expect_validate_success(get_alternative(match=match), (2, 3))
+        expect_validate_success(get_alternative(match=match), (2, 3, 4))
+        expect_validate_failure(get_alternative(match=match), ("eins", "zwei"), match=FAILURE_MATCH)
+        expect_validate_failure(get_alternative(match=match), (), match=FAILURE_MATCH)
+        expect_validate_failure(get_alternative(match=match), {}, match=FAILURE_MATCH)
+
+        with pytest.raises(MKUserError, match=FAILURE_MATCH):
+            # expect_validate_failure executes validate_datatype first,
+            # but we want to also cover this code path!
+            get_alternative(match=match).validate_value(object, "")
+
+    def test_validate(self) -> None:
+        self._validate()
+
+    def test_validate_match(self) -> None:
+        def _match(value: int | str | tuple) -> int:
+            # creative way to match the value to the index of alternatives
+            if isinstance(value, int):
+                return 0
+            if isinstance(value, str):
+                return 1
+            if isinstance(value, tuple):
+                return len(value)
+            raise MKUserError("", message=FAILURE_MATCH)
+
+        self._validate(_match)
+
+    def test_canonical_value(self) -> None:
+        assert get_alternative().canonical_value() == 0
+        assert vs.Alternative([vs.TextInput()]).canonical_value() == ""
+
+    def test_default_value(self) -> None:
+        assert get_alternative().default_value() == 1
+        assert get_alternative(default_value="zwei").default_value() == "zwei"
+        assert get_alternative(default_value=lambda: "drei").default_value() == "drei"
+        assert get_alternative(default_value=raise_exception).default_value() == 1
+
+    def test_mask(self) -> None:
+        assert get_alternative().mask(1) == 1
+        assert get_alternative().mask("eins") == "eins"
+        with pytest.raises(ValueError, match=r"^Invalid value: \('zwei', 'drei'\)"):
+            get_alternative().mask(("zwei", "drei"))
+
+    def test_value_to_html(self) -> None:
+        assert get_alternative().value_to_html("testing") == "testing"
+        assert get_alternative().value_to_html({}) == "invalid: {}"
+        assert get_alternative(show_alternative_title=True).value_to_html(
+            "testing"
+        ) == HTML.without_escaping("text<br />testing")
+
+    @pytest.mark.usefixtures("request_context")
+    def test_from_html_vars(self) -> None:
+        with request_var(a_use="2", a_2_0="2", a_2_1="3"):
+            assert get_alternative().from_html_vars("a") == (2, 3)
+
+    def test_value_to_json(self) -> None:
+        assert get_alternative().value_to_json((2, 3)) == [2, 3]
+        assert get_alternative().value_to_json("eins") == "eins"
+        with pytest.raises(ValueError, match=r"^Invalid value: \('a', 'b'\)"):
+            assert get_alternative().value_to_json(("a", "b"))
+
+    @pytest.mark.usefixtures("request_context")
+    def test_render_input_type_mismatch_uses_default(self) -> None:
+        """When the user switches alternatives, the old value may not match the new type.
+
+        Regression test for CMK-31604: cloning an SNMP host and switching from SNMPv3
+        (tuple) to SNMPv2c (string/Password) crashed with
+        AttributeError: 'tuple' object has no attribute 'encode'.
+        """
+        alternative = vs.Alternative(
+            [
+                vs.Password(title="community"),
+                vs.Tuple(title="credentials", elements=[vs.TextInput(), vs.Password()]),
+            ]
+        )
+        # User selected the Password alternative (index 0), but the stored value
+        # is a tuple from the Tuple alternative (index 1).
+        with request_var(prefix_use="0"):
+            # This must not crash — it should fall back to Password's default value.
+            alternative.render_input("prefix", ("authproto", "secret"))
+
+    def test_value_from_json(self) -> None:
+        # TODO: this is wrong! should be transformed into a tuple,
+        # see comment on Value_from_json
+        assert get_alternative().value_from_json([2, 3]) == [2, 3]

@@ -1,0 +1,6 @@
+# Alias: TCP port number for RabbitMQ Instance
+# Menu: Basic
+# Description:
+#  Configure the port on which the RabbitMQ Instance
+#  will listen for connections. If the port isn't
+#  available, the next available port will be chosen.

@@ -1,0 +1,176 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import CmkHelpText from 'cmk-ui-library/components/CmkHelpText.vue'
+import CmkIndent from 'cmk-ui-library/components/CmkIndent.vue'
+import CmkCheckbox from 'cmk-ui-library/components/user-input/CmkCheckbox.vue'
+import CmkInput from 'cmk-ui-library/components/user-input/CmkInput.vue'
+import CmkLabelRequired from 'cmk-ui-library/components/user-input/CmkLabelRequired.vue'
+import usei18n, { untranslated } from 'cmk-ui-library/lib/i18n'
+import { useDebounceFn } from 'cmk-ui-library/lib/useDebounce'
+import { computed, watch } from 'vue'
+
+import IconSelector from '../IconSelector/IconSelector.vue'
+import FieldComponent from '../TableForm/FieldComponent.vue'
+import FieldDescription from '../TableForm/FieldDescription.vue'
+import TableForm from '../TableForm/TableForm.vue'
+import TableFormRow from '../TableForm/TableFormRow.vue'
+import { generateUniqueId, isIdInUse, toSnakeCase } from './utils'
+
+const { _t } = usei18n()
+
+interface GeneralPropertiesProps {
+  nameValidationErrors: string[]
+  uniqueIdValidationErrors: string[]
+  originalDashboardId?: string
+  loggedInUser: string
+}
+
+const props = defineProps<GeneralPropertiesProps>()
+
+const name = defineModel<string>('name', { required: true })
+const addFilterSuffix = defineModel<boolean>('addFilterSuffix', {
+  required: false,
+  default: undefined
+})
+const createUniqueId = defineModel<boolean>('createUniqueId', { required: true })
+const uniqueId = defineModel<string>('uniqueId', { required: true })
+const dashboardIcon = defineModel<string | null>('dashboardIcon', {
+  required: false,
+  default: null
+})
+const dashboardEmblem = defineModel<string | null>('dashboardEmblem', {
+  required: false,
+  default: null
+})
+
+const _generateUniqueId = async (base: string) => {
+  uniqueId.value = (await isIdInUse(props.loggedInUser, base, props?.originalDashboardId))
+    ? await generateUniqueId(props.loggedInUser, base, props?.originalDashboardId)
+    : base
+}
+const _debouncedGenerateUniqueId = useDebounceFn(_generateUniqueId, 300)
+
+watch(
+  [name, createUniqueId],
+  ([newName, newCreateUniqueId]) => {
+    if (!newCreateUniqueId) {
+      return
+    }
+    _debouncedGenerateUniqueId(toSnakeCase(newName.trim().toLowerCase()))
+  },
+  { deep: true, immediate: true }
+)
+
+const displaySuffixInput = computed(() => addFilterSuffix.value !== undefined)
+
+const uniqueIdCheckboxLabel = computed((): string => {
+  const suffix = createUniqueId.value ? `: ${uniqueId.value}` : ''
+  return `${_t('Automatically create unique ID')}${suffix}`
+})
+
+watch(
+  () => props.uniqueIdValidationErrors,
+  (errors) => {
+    if (errors.length > 0) {
+      createUniqueId.value = false
+    }
+  },
+  { deep: true }
+)
+</script>
+
+<template>
+  <div>
+    <TableForm>
+      <TableFormRow>
+        <FieldDescription> {{ _t('Name') }}<CmkLabelRequired space="before" /></FieldDescription>
+        <FieldComponent>
+          <div class="db-general-properties__item">
+            <CmkInput
+              v-model:model-value="name as string"
+              :placeholder="_t('Enter name')"
+              :aria-label="_t('Enter name')"
+              type="text"
+              :external-errors="nameValidationErrors"
+              required
+              field-size="large"
+            />
+          </div>
+          <div v-if="displaySuffixInput" class="db-general-properties__item">
+            <CmkCheckbox
+              v-model="addFilterSuffix!"
+              :label="_t('Add filter as suffix')"
+              :help="_t('Include dashboard filter contents to the dashboard title.')"
+            />
+          </div>
+        </FieldComponent>
+      </TableFormRow>
+
+      <TableFormRow>
+        <FieldDescription>
+          {{ _t('Unique ID') }}<CmkLabelRequired space="before" />
+        </FieldDescription>
+        <FieldComponent>
+          <div class="db-general-properties__item">
+            <CmkCheckbox v-model="createUniqueId" :label="untranslated(uniqueIdCheckboxLabel)" />
+          </div>
+          <div v-if="!createUniqueId" class="db-general-properties__item">
+            <CmkIndent>
+              <CmkInput
+                :model-value="uniqueId"
+                :placeholder="_t('Add unique ID')"
+                :aria-label="_t('Add unique ID')"
+                type="text"
+                required
+                field-size="large"
+                :external-errors="uniqueIdValidationErrors"
+                @update:model-value="(val: string | undefined) => (uniqueId = val ?? uniqueId)"
+              />
+            </CmkIndent>
+          </div>
+        </FieldComponent>
+      </TableFormRow>
+
+      <TableFormRow>
+        <FieldDescription>
+          {{ _t('Dashboard icon') }}
+          <CmkHelpText
+            :help="
+              _t(
+                'This selection is only relevant if under \'User\' -> \'Edit Profile\' -> \'Mega menu icons\' you have selected the options \'Per Entry\'. You can select the icon to display next to your dashboard in the Monitoring menu. You can choose either a single colored icon or one with an additional symbol.'
+              )
+            "
+          />
+        </FieldDescription>
+        <FieldComponent>
+          <div class="db-general-properties__item">
+            <div class="db-general-properties__inline">
+              <div><IconSelector v-model:selected-icon="dashboardIcon" /></div>
+              <span>+</span>
+              <div>
+                <IconSelector v-model:selected-icon="dashboardEmblem" :select-emblems="true" />
+              </div>
+            </div>
+          </div>
+        </FieldComponent>
+      </TableFormRow>
+    </TableForm>
+  </div>
+</template>
+
+<style scoped>
+.db-general-properties__item {
+  display: block;
+  padding-bottom: var(--spacing-half);
+}
+
+.db-general-properties__inline {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: var(--spacing-half);
+}
+</style>

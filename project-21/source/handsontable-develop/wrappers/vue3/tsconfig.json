@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "esnext",
+    "module": "esnext",
+    "moduleResolution": "node",
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "sourceMap": true,
+    "baseUrl": ".",
+    "experimentalDecorators": true,
+    "skipLibCheck": true,
+    "strictNullChecks": true,
+    "declaration": true,
+    "declarationDir": "./types",
+    "types": [
+      "jest"
+    ]
+  },
+  "include": [
+    "src/*"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}

@@ -1,0 +1,797 @@
+{
+  "name": "cmk-vscode",
+  "displayName": "CMK Dev Tools for VS Code",
+  "description": "Build commands and helpers for Checkmk development",
+  "version": "0.4.31",
+  "publisher": "checkmk",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Checkmk/checkmk.git",
+    "directory": ".ide/vscode"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "workspaceContains:.ide/vscode/package.json"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "colors": [
+      {
+        "id": "cmk.logoColor",
+        "description": "Color for the Checkmk logo in the status bar",
+        "defaults": {
+          "dark": "#15d1a0",
+          "light": "#15d1a0",
+          "highContrast": "#15d1a0"
+        }
+      }
+    ],
+    "icons": {
+      "cmk-logo": {
+        "description": "Checkmk logo",
+        "default": {
+          "fontPath": "icons/cmk-icons.woff2",
+          "fontCharacter": "\\F101"
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cmk-dashboard",
+          "title": "Checkmk",
+          "icon": "icons/cmk-activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "cmk-dashboard": [
+        {
+          "type": "webview",
+          "id": "cmk.dashboard.overview",
+          "name": "Cockpit"
+        },
+        {
+          "type": "webview",
+          "id": "cmk.dashboard.environment",
+          "name": "Environment",
+          "visibility": "collapsed"
+        },
+        {
+          "type": "webview",
+          "id": "cmk.dashboard.omd",
+          "name": "OMD Sites",
+          "when": "cmk.omdAvailable || cmk.devSiteInstalled"
+        },
+        {
+          "type": "webview",
+          "id": "cmk.dashboard.ideHealth",
+          "name": "IDE Health",
+          "visibility": "collapsed"
+        },
+        {
+          "type": "webview",
+          "id": "cmk.dashboard.profiles",
+          "name": "Profiles",
+          "visibility": "hidden"
+        },
+        {
+          "id": "cmk.dashboard.badge",
+          "name": "Issues",
+          "visibility": "collapsed"
+        },
+        {
+          "type": "webview",
+          "id": "cmk.dashboard.activity",
+          "name": "Activity",
+          "visibility": "collapsed"
+        }
+      ],
+      "test": [
+        {
+          "type": "webview",
+          "id": "cmk.bazelTests.config",
+          "name": "CMK Tests · Config",
+          "visibility": "collapsed"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "cmk.dashboard",
+        "title": "CMK ▸ Dashboard"
+      },
+      {
+        "command": "cmk.dashboard.refresh.overview",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "cmk.dashboard.refresh.environment",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "cmk.dashboard.refresh.activity",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "cmk.activity.clear",
+        "title": "CMK ▸ Activity: Clear buffer"
+      },
+      {
+        "command": "cmk.dashboard.refresh.ideHealth",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "cmk.dashboard.refresh.profiles",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "cmk.dashboard.refresh.omd",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "cmk.omdStart",
+        "title": "CMK ▸ OMD: Start Site"
+      },
+      {
+        "command": "cmk.omdStop",
+        "title": "CMK ▸ OMD: Stop Site"
+      },
+      {
+        "command": "cmk.omdRestart",
+        "title": "CMK ▸ OMD: Restart Site"
+      },
+      {
+        "command": "cmk.omdOpenBrowser",
+        "title": "CMK ▸ OMD: Open in Browser"
+      },
+      {
+        "command": "cmk.omdAuth",
+        "title": "CMK ▸ OMD: Authenticate sudo"
+      },
+      {
+        "command": "cmk.omdCreateSite",
+        "title": "CMK ▸ OMD: Create Site",
+        "icon": "$(add)"
+      },
+      {
+        "command": "cmk.applySetting",
+        "title": "CMK ▸ IDE: Apply Setting"
+      },
+      {
+        "command": "cmk.rebuildExtension",
+        "title": "CMK ▸ Rebuild & Install Extension"
+      },
+      {
+        "command": "cmk.collectDiagnostics",
+        "title": "CMK ▸ Collect Diagnostics Report"
+      },
+      {
+        "command": "cmk.installDevSite",
+        "title": "CMK ▸ OMD: Install cmk-dev-site"
+      },
+      {
+        "command": "cmk.omdProxy",
+        "title": "CMK ▸ OMD: Socket Proxy"
+      },
+      {
+        "command": "cmk.omdMockAuth",
+        "title": "CMK ▸ OMD: Start Mock Auth Server"
+      },
+      {
+        "command": "cmk.omdDeploy",
+        "title": "CMK ▸ OMD: Deploy (cmk-dev-deploy)",
+        "icon": "$(rocket)"
+      },
+      {
+        "command": "cmk.omdLogRefresh",
+        "title": "CMK ▸ OMD: Refresh Log Snapshot",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "cmk.omdLogTail",
+        "title": "CMK ▸ OMD: Tail Log in Terminal",
+        "icon": "$(debug-console)"
+      },
+      {
+        "command": "cmk.buildVenv",
+        "title": "CMK ▸ Cmd: Build venv"
+      },
+      {
+        "command": "cmk.buildSharedTyping",
+        "title": "CMK ▸ Cmd: Build shared-typing"
+      },
+      {
+        "command": "cmk.buildCmkFrontend",
+        "title": "CMK ▸ Cmd: Build cmk-frontend"
+      },
+      {
+        "command": "cmk.buildCmkFrontendVue",
+        "title": "CMK ▸ Cmd: Build cmk-frontend-vue"
+      },
+      {
+        "command": "cmk.runUcl",
+        "title": "CMK ▸ Cmd: Run UI Component Library"
+      },
+      {
+        "command": "cmk.refreshCompileCommands",
+        "title": "CMK ▸ Cmd: Refresh C++ compile_commands.json"
+      },
+      {
+        "command": "cmk.installPicker",
+        "title": "CMK ▸ IDE: Install Extensions"
+      },
+      {
+        "command": "cmk.configurePicker",
+        "title": "CMK ▸ IDE: Configure Settings"
+      },
+      {
+        "command": "cmk.setupPicker",
+        "title": "CMK ▸ IDE: Setup (Install + Configure)"
+      },
+      {
+        "command": "cmk.newFromTemplate",
+        "title": "CMK ▸ New: Create from Template"
+      },
+      {
+        "command": "cmk.buildAllStale",
+        "title": "CMK ▸ Cmd: Build All Stale"
+      },
+      {
+        "command": "cmk.statusBarMenu",
+        "title": "CMK ▸ Cmd: Build Menu"
+      },
+      {
+        "command": "cmk.refreshBuildStatus",
+        "title": "CMK ▸ Cmd: Refresh Build Status"
+      },
+      {
+        "command": "cmk.regenerateMypyConfig",
+        "title": "CMK ▸ Cmd: Regenerate mypy config"
+      },
+      {
+        "command": "cmk.rebuildExtension",
+        "title": "CMK ▸ Cmd: Rebuild & Reinstall Extension"
+      },
+      {
+        "command": "cmk.mypy.resetTargetsToBaseline",
+        "title": "CMK ▸ Mypy: Apply Baseline"
+      },
+      {
+        "command": "cmk.mypy.activateTargetPick",
+        "title": "CMK ▸ Mypy: Activate Target…"
+      },
+      {
+        "command": "cmk.mypy.applyStagedTargets",
+        "title": "CMK ▸ Mypy: Apply Staged Targets"
+      },
+      {
+        "command": "cmk.mypy.discardStagedTargets",
+        "title": "CMK ▸ Mypy: Discard Staged Targets"
+      },
+      {
+        "command": "cmk.mypy.reviewDismissedPrompts",
+        "title": "CMK ▸ Mypy: Review Dismissed Prompts…"
+      },
+      {
+        "command": "cmk.mypy.clearDismissedPrompts",
+        "title": "CMK ▸ Mypy: Clear Dismissed Prompts"
+      },
+      {
+        "command": "cmk.mypy.restartDmypy",
+        "title": "CMK ▸ Mypy: Restart dmypy daemon"
+      },
+      {
+        "command": "cmk.bazel.cleanDiskCache",
+        "title": "CMK ▸ Bazel: Clean disk cache"
+      },
+      {
+        "command": "cmk.installPreCommit",
+        "title": "CMK ▸ Git: Install pre-commit hook"
+      },
+      {
+        "command": "cmk.mypy.installJemalloc",
+        "title": "CMK ▸ Mypy: Install jemalloc"
+      },
+      {
+        "command": "cmk.mypy.enableJemalloc",
+        "title": "CMK ▸ Mypy: Enable jemalloc allocator"
+      },
+      {
+        "command": "cmk.mypy.reapplyJemalloc",
+        "title": "CMK ▸ Mypy: Re-apply jemalloc settings"
+      },
+      {
+        "command": "cmk.python.restartLanguageServer",
+        "title": "CMK ▸ Python: Restart Language Server (Pylance)"
+      },
+      {
+        "command": "cmk.pushToGerrit",
+        "title": "CMK ▸ Push to Gerrit",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "cmk.checkoutBranch",
+        "title": "CMK ▸ Git: Checkout Branch…",
+        "icon": "$(git-branch)"
+      },
+      {
+        "command": "cmk.createSandboxBranch",
+        "title": "CMK ▸ Git: Create Sandbox Branch…"
+      },
+      {
+        "command": "cmk.toggleSkipPreCommit",
+        "title": "CMK ▸ pre-commit ON — click to skip",
+        "icon": "$(verified-filled)"
+      },
+      {
+        "command": "cmk.toggleSkipPreCommit.skipped",
+        "title": "CMK ▸ pre-commit SKIPPED — click to re-enable",
+        "icon": {
+          "light": "icons/pre-commit-skipped.svg",
+          "dark": "icons/pre-commit-skipped.svg"
+        }
+      },
+      {
+        "command": "cmk.bazelTestFile",
+        "title": "CMK ▸ Test: Run File (Bazel)"
+      },
+      {
+        "command": "cmk.bazelTestFunction",
+        "title": "CMK ▸ Test: Run Function at Cursor (Bazel)"
+      },
+      {
+        "command": "cmk.bazelTests.configure",
+        "title": "CMK ▸ Test: Configure Bazel run options"
+      },
+      {
+        "command": "cmk.bazelTests.refresh",
+        "title": "CMK ▸ Test: Refresh Bazel test targets"
+      },
+      {
+        "command": "cmk.showWhatsNew",
+        "title": "CMK ▸ Show What's New"
+      },
+      {
+        "command": "cmk.pickChangelog",
+        "title": "CMK ▸ Pick Changelog Version"
+      },
+      {
+        "command": "cmk.whatsNew.reset",
+        "title": "CMK ▸ Dev: Reset What's New marker"
+      },
+      {
+        "command": "cmk.showStartupBenchmarks",
+        "title": "CMK ▸ Show Startup Benchmarks"
+      },
+      {
+        "command": "cmk.benchmarkRunSamples",
+        "title": "CMK ▸ Run Startup Samples…"
+      },
+      {
+        "command": "cmk.benchmarkCancelSamples",
+        "title": "CMK ▸ Cancel Startup Sampler"
+      },
+      {
+        "command": "cmk.benchmarkTrimRecent",
+        "title": "CMK ▸ Benchmark: Trim Recent Runs…"
+      },
+      {
+        "command": "cmk.fixQaTestDataSubmodule",
+        "title": "CMK ▸ Git: Reset tests/qa-test-data to tracked SHA"
+      }
+    ],
+    "configuration": {
+      "title": "CMK Dev Tools",
+      "properties": {
+        "cmk.activeProfiles": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "python",
+              "frontend",
+              "rust",
+              "cpp"
+            ]
+          },
+          "default": [
+            "python",
+            "frontend"
+          ],
+          "description": "Active family profiles. Toggle via the CMK status bar menu."
+        },
+        "cmk.profileDetector.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Suggest enabling/disabling language profiles based on file activity."
+        },
+        "cmk.scm.autoShowGitOutputOnCommit": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-open the built-in Git output channel when a git commit starts so pre-commit's output is visible."
+        },
+        "cmk.profileDetector.inactivityMinutes": {
+          "type": "number",
+          "default": 30,
+          "minimum": 5,
+          "description": "Minutes of inactivity before suggesting to disable a profile."
+        },
+        "cmk.mypy.dynamicTargets.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Start dmypy with a minimal mypy.targets set derived from git-changed files + open editors, and expand automatically when you open a Python file in an uncovered package. Reduces dmypy memory use on large monorepos."
+        },
+        "cmk.mypy.dynamicTargets.baseline": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Mypy targets always loaded on startup. Add the paths you work in most often (e.g. \"cmk\", \"packages/cmk-ccc/cmk\"). When a Python file is opened in a target that isn't active, the extension prompts to add it."
+        },
+        "cmk.mypy.allocator": {
+          "type": "string",
+          "enum": [
+            "default",
+            "jemalloc"
+          ],
+          "default": "default",
+          "description": "Launch dmypy under jemalloc to cap long-running RSS growth. Requires libjemalloc installed on the host (apt install libjemalloc2 / dnf install jemalloc / brew install jemalloc). If the library is not detected the extension notifies once and leaves the setting armed — install, reload, feature activates."
+        },
+        "cmk.bazel.cacheSizeWarnGiB": {
+          "type": "number",
+          "default": 50,
+          "minimum": 1,
+          "scope": "application",
+          "description": "Warn in the Cockpit when the Bazel disk_cache (path read from .bazelrc) exceeds this many GiB. Machine-wide setting; Bazel's disk cache is shared across all workspaces."
+        },
+        "cmk.bazelTests.onDemand": {
+          "type": "boolean",
+          "default": true,
+          "description": "Defer Bazel test discovery (filesystem scan of tests/**/BUILD, packages/**/BUILD, non-free/packages/**/BUILD for py_test and vitest_test rules) until a test file is opened or the CMK ▸ Bazel Tests group in the Test Explorer is expanded. Each window reload starts with discovery off and waits for a trigger again. Set to false to discover eagerly at activation."
+        },
+        "cmk.python.pylanceMemoryWarnMiB": {
+          "type": "number",
+          "default": 2048,
+          "minimum": 256,
+          "description": "Warn when the Pylance language-server process RSS exceeds this many MiB. Surfaces as a status row in IDE Health (Python section), an Issues entry, and a single per-session notification offering to restart Pylance. Linux only."
+        },
+        "cmk.bazelTests.edition": {
+          "type": "string",
+          "enum": [
+            "community",
+            "pro",
+            "ultimate",
+            "ultimatemt",
+            "cloud"
+          ],
+          "default": "pro",
+          "description": "Checkmk edition passed to bazel as --cmk_edition=<edition> when running tests via the CMK ▸ Bazel Tests Test Explorer group. On a community checkout only the community edition can be built, so this is automatically clamped to 'community' regardless of the value set here."
+        },
+        "cmk.benchmarkStartup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Record per-phase timings for the first sidebar refresh on each window load. Appends to a per-workspace history; view with CMK ▸ Show Startup Benchmarks. When recent runs are materially slower than baseline, a notification offers to view the chart."
+        },
+        "cmk.sidebar.density": {
+          "type": "string",
+          "enum": [
+            "comfortable",
+            "compact"
+          ],
+          "default": "compact",
+          "description": "Sidebar row spacing."
+        },
+        "cmk.cockpit.git.ignorePreCommit": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "Suppress the cockpit warning when the git pre-commit hook is bypassed (e.g. you intentionally moved .git/hooks/pre-commit aside)."
+        },
+        "cmk.cockpit.jemalloc.ignoreRecommendation": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "description": "Suppress the cockpit recommendation to enable jemalloc for dmypy. Persists across workspaces (user scope)."
+        },
+        "cmk.devServer.openBrowserOnStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a dev-server command (e.g. CMK ▸ Cmd: Run UI Component Library) is started, open its URL once the server responds."
+        },
+        "cmk.devServer.browser": {
+          "type": "string",
+          "enum": [
+            "builtin",
+            "external"
+          ],
+          "enumDescriptions": [
+            "Open the URL inside VS Code in the built-in Simple Browser tab.",
+            "Open the URL in your system default browser."
+          ],
+          "default": "builtin",
+          "description": "Which browser to use when a dev-server command opens its URL on start (see cmk.devServer.openBrowserOnStart)."
+        },
+        "cmk.omd.autoStartMockAuth": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Start the cmk-dev-site mock auth server (fake OIDC provider on port 8089) on activation when a local cloud/SaaS OMD site exists and the server is not already running."
+        }
+      }
+    },
+    "viewsWelcome": [
+      {
+        "view": "cmk.dashboard.badge",
+        "contents": "✓ No issues found"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "cmk.dashboard.refresh.overview",
+          "when": "view == cmk.dashboard.overview",
+          "group": "navigation"
+        },
+        {
+          "command": "cmk.dashboard.refresh.environment",
+          "when": "view == cmk.dashboard.environment",
+          "group": "navigation"
+        },
+        {
+          "command": "cmk.dashboard.refresh.activity",
+          "when": "view == cmk.dashboard.activity",
+          "group": "navigation"
+        },
+        {
+          "command": "cmk.dashboard.refresh.ideHealth",
+          "when": "view == cmk.dashboard.ideHealth",
+          "group": "navigation"
+        },
+        {
+          "command": "cmk.dashboard.refresh.profiles",
+          "when": "view == cmk.dashboard.profiles",
+          "group": "navigation"
+        },
+        {
+          "command": "cmk.dashboard.refresh.omd",
+          "when": "view == cmk.dashboard.omd",
+          "group": "navigation"
+        },
+        {
+          "command": "cmk.omdCreateSite",
+          "when": "view == cmk.dashboard.omd && cmk.devSiteInstalled",
+          "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "cmk.omdLogRefresh",
+          "when": "resourceScheme == cmk-omd-log",
+          "group": "navigation"
+        },
+        {
+          "command": "cmk.omdLogTail",
+          "when": "resourceScheme == cmk-omd-log",
+          "group": "navigation"
+        }
+      ],
+      "scm/title": [
+        {
+          "command": "cmk.pushToGerrit",
+          "group": "navigation",
+          "when": "gitOpenRepositoryCount > 0 && cmk.internalCheckout"
+        },
+        {
+          "command": "cmk.checkoutBranch",
+          "group": "navigation",
+          "when": "gitOpenRepositoryCount > 0 && cmk.internalCheckout"
+        },
+        {
+          "command": "cmk.toggleSkipPreCommit",
+          "group": "navigation",
+          "when": "gitOpenRepositoryCount > 0 && !cmk.skipPreCommitEnabled"
+        },
+        {
+          "command": "cmk.toggleSkipPreCommit.skipped",
+          "group": "navigation",
+          "when": "gitOpenRepositoryCount > 0 && cmk.skipPreCommitEnabled"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "cmk.bazelTestFile",
+          "group": "cmk@1",
+          "when": "resourceLangId == python && resourceFilename =~ /^test_/"
+        },
+        {
+          "command": "cmk.bazelTestFunction",
+          "group": "cmk@2",
+          "when": "resourceLangId == python && resourceFilename =~ /^test_/"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "cmk.pushToGerrit",
+          "when": "cmk.internalCheckout"
+        },
+        {
+          "command": "cmk.checkoutBranch",
+          "when": "cmk.internalCheckout"
+        },
+        {
+          "command": "cmk.createSandboxBranch",
+          "when": "cmk.internalCheckout"
+        },
+        {
+          "command": "cmk.buildVenv",
+          "when": "cmk.pythonInstalled"
+        },
+        {
+          "command": "cmk.buildSharedTyping",
+          "when": "cmk.frontendInstalled"
+        },
+        {
+          "command": "cmk.buildCmkFrontend",
+          "when": "cmk.frontendInstalled"
+        },
+        {
+          "command": "cmk.buildCmkFrontendVue",
+          "when": "cmk.frontendInstalled"
+        },
+        {
+          "command": "cmk.runUcl",
+          "when": "cmk.frontendInstalled"
+        },
+        {
+          "command": "cmk.refreshCompileCommands",
+          "when": "cmk.cppInstalled"
+        },
+        {
+          "command": "cmk.bazelTestFile",
+          "when": "resourceLangId == python"
+        },
+        {
+          "command": "cmk.bazelTestFunction",
+          "when": "resourceLangId == python"
+        },
+        {
+          "command": "cmk.omdStart",
+          "when": "cmk.omdAvailable"
+        },
+        {
+          "command": "cmk.omdStop",
+          "when": "cmk.omdAvailable"
+        },
+        {
+          "command": "cmk.omdRestart",
+          "when": "cmk.omdAvailable"
+        },
+        {
+          "command": "cmk.omdOpenBrowser",
+          "when": "cmk.omdAvailable"
+        },
+        {
+          "command": "cmk.omdAuth",
+          "when": "cmk.omdAvailable"
+        },
+        {
+          "command": "cmk.omdProxy",
+          "when": "cmk.omdAvailable"
+        },
+        {
+          "command": "cmk.omdMockAuth",
+          "when": "cmk.devSiteInstalled"
+        },
+        {
+          "command": "cmk.omdDeploy",
+          "when": "cmk.omdAvailable"
+        },
+        {
+          "command": "cmk.omdCreateSite"
+        },
+        {
+          "command": "cmk.rebuildExtension",
+          "when": "false"
+        },
+        {
+          "command": "cmk.applySetting",
+          "when": "false"
+        },
+        {
+          "command": "cmk.installDevSite",
+          "when": "false"
+        },
+        {
+          "command": "cmk.omdLogRefresh",
+          "when": "resourceScheme == cmk-omd-log"
+        },
+        {
+          "command": "cmk.omdLogTail",
+          "when": "resourceScheme == cmk-omd-log"
+        },
+        {
+          "command": "cmk.mypy.resetTargetsToBaseline",
+          "when": "cmk.pythonInstalled"
+        },
+        {
+          "command": "cmk.mypy.activateTargetPick",
+          "when": "cmk.pythonInstalled"
+        },
+        {
+          "command": "cmk.mypy.applyStagedTargets",
+          "when": "cmk.pythonInstalled"
+        },
+        {
+          "command": "cmk.mypy.discardStagedTargets",
+          "when": "cmk.pythonInstalled"
+        },
+        {
+          "command": "cmk.mypy.reviewDismissedPrompts",
+          "when": "cmk.pythonInstalled"
+        },
+        {
+          "command": "cmk.mypy.clearDismissedPrompts",
+          "when": "cmk.pythonInstalled"
+        },
+        {
+          "command": "cmk.mypy.restartDmypy",
+          "when": "cmk.pythonInstalled"
+        },
+        {
+          "command": "cmk.bazel.cleanDiskCache"
+        },
+        {
+          "command": "cmk.installPreCommit"
+        },
+        {
+          "command": "cmk.mypy.installJemalloc",
+          "when": "cmk.pythonInstalled"
+        },
+        {
+          "command": "cmk.mypy.enableJemalloc",
+          "when": "cmk.pythonInstalled"
+        },
+        {
+          "command": "cmk.mypy.reapplyJemalloc",
+          "when": "cmk.pythonInstalled"
+        },
+        {
+          "command": "cmk.python.restartLanguageServer",
+          "when": "cmk.pythonInstalled"
+        }
+      ]
+    }
+  },
+  "directories": {
+    "doc": "docs",
+    "lib": "lib"
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.5.0",
+    "esbuild": "^0.27.4",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.2"
+  }
+}

@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+{% macro additional_tr(data, title, key) %}
+    <tr>
+        <td {{ macros.td_first_child(width="170px") }}>{{ title }}:
+            <span style="font-weight: initial;" {{ macros.td_last_child() }}>{{ data[key] }}</span>
+        </td>
+    </tr>
+{% endmacro %}
+<table width="100%"
+       style="border-spacing: 0;
+              max-width: 600px;
+              margin: 0 auto">
+    <tr>
+        <td style="height: 20px;
+                   line-height: 20px;
+                   font-size: 0;
+                   mso-line-height-rule: exactly">&nbsp;</td>
+    </tr>
+    <tr>
+        <th colspan="2"
+            style="font-size: 18px;
+                   font-weight: 600;
+                   text-align: left">
+            <img class="section-icon"
+                 src="cid:additional.png"
+                 alt="Additional icon"
+                 width="18"
+                 height="19"
+                 style="display:inline-block;
+                        vertical-align:middle;
+                        width:18px;
+                        height:19px;
+                        border:0;
+                        background-color:#ffffff;
+                        color-scheme:light dark;
+                        supported-color-schemes:light dark;
+                        mso-line-height-rule:exactly" />
+            Additional details
+        </th>
+    </tr>
+    <tr>
+        <td>
+            <table width="100%" style="height: 54px; table-layout: fixed">
+                {% for element in data.PARAMETER_ELEMENTSS.split(' ') %}
+                    {% if element =="ack_author" %}
+                        {% if service_notification %}
+                            {{ additional_tr(data, "Acknowledgment author", "SERVICEACKAUTHOR") }}
+                        {% else %}
+                            {{ additional_tr(data, "Acknowledgment author", "HOSTACKAUTHOR") }}
+                        {% endif %}
+                    {% elif element == "ack_comment" %}
+                        {% if service_notification %}
+                            {{ additional_tr(data, "Acknowledgment comment", "SERVICEACKCOMMENT") }}
+                        {% else %}
+                            {{ additional_tr(data, "Acknowledgment comment", "HOSTACKCOMMENT") }}
+                        {% endif %}
+                    {% elif element == "notification_author" %}
+                        {{ additional_tr(data, "Notification author", "NOTIFICATIONAUTHOR") }}
+                    {% elif element == "notification_comment" %}
+                        {{ additional_tr(data, "Notification comment", "NOTIFICATIONCOMMENT") }}
+                    {% elif element == "reltime" %}
+                        {% if service_notification %}
+                            {{ additional_tr(data, "Relative time", "LASTSERVICESTATECHANGE_REL") }}
+                        {% else %}
+                            {{ additional_tr(data, "Relative time", "LASTHOSTSTATECHANGE_REL") }}
+                        {% endif %}
+                    {% elif element == "perfdata" %}
+                        {% if service_notification %}
+                            {{ additional_tr(data, "Service metrics", "SERVICEPERFDATA") }}
+                        {% else %}
+                            {{ additional_tr(data, "Host metrics", "HOSTPERFDATA") }}
+                        {% endif %}
+                    {% elif element == "notesurl" %}
+                        {{ additional_tr(data, "Custom host notes URL", "HOSTNOTESURL") }}
+                        {% if service_notification %}
+                            {{ additional_tr(data, "Custom service notes URL", "SERVICENOTESURL") }}
+                        {% endif %}
+                    {% elif element == "hostchildren" and not service_notification %}
+                        <tr>
+                            <td {{ macros.td_first_child(width="170px") }}>Affected child hosts:
+                                <span style="font-weight: initial;" {{ macros.td_last_child() }}>
+                                    {% if data.HOSTCHILDREN %}
+                                        {% for child in data.HOSTCHILDREN.split(",") %}
+                                            {{ child }}
+                                            {% if not loop.last %},{% endif %}
+                                        {% endfor %}
+                                    {% else %}
+                                        (none)
+                                    {% endif %}
+                                </span>
+                            </td>
+                        </tr>
+                    {% elif element == "context" %}
+                        <tr>
+                            <td {{ macros.td_first_child(width="170px") }}>Complete variable list:</td>
+                        </tr>
+                        <tr>
+                            <td>
+                                <table width="100%"
+                                       style="border: 1px solid #dfdfdf;
+                                              border-collapse: collapse;
+                                              table-layout: fixed;
+                                              max-width: 600px;
+                                              margin: 0 auto">
+                                    {% for key, value in data.items() %}
+                                        <tr style="border: 1px solid #dfdfdf;">
+                                            <td style="border: 1px solid #dfdfdf;
+                                                       padding-left: 16px;
+                                                       padding-top: 8px;
+                                                       font-size: 14px;
+                                                       color: #2c3844;
+                                                       width: 60%;
+                                                       word-wrap: break-word">{{ key }}</td>
+                                            <td style="border: 1px solid #dfdfdf;
+                                                       padding-left: 16px;
+                                                       padding-top: 8px;
+                                                       font-size: 14px;
+                                                       color: #2c3844;
+                                                       width: 40%;
+                                                       word-wrap: break-word">
+                                                <!--[if mso]>
+                                                    <style>
+                                                        td {
+                                                            overflow-wrap: break-word;
+                                                            word-break: break-all;
+                                                        }
+                                                    </style>
+                                                <![endif]-->
+                                                {{ value }}
+                                            </td>
+                                        </tr>
+                                    {% endfor %}
+                                </table>
+                            </td>
+                        </tr>
+                    {% endif %}
+                {% endfor %}
+            </table>
+        </td>
+    </tr>
+</table>

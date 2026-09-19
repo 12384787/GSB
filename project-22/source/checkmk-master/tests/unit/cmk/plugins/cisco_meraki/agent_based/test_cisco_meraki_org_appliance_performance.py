@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import json
+
+import pytest
+
+from cmk.agent_based.v2 import Metric, Result, State
+from cmk.plugins.cisco_meraki.agent_based.cisco_meraki_org_appliance_performance import (
+    check_appliance_performance,
+    CheckParams,
+    parse_appliance_performance,
+)
+
+
+@pytest.fixture
+def params() -> CheckParams:
+    return CheckParams(levels_upper=("fixed", (60, 80)))
+
+
+@pytest.mark.parametrize(
+    "performance, state, summary",
+    [
+        (50.0, State.OK, "Utilization: 50.00%"),
+        (70.0, State.WARN, "Utilization: 70.00% (warn/crit at 60.00%/80.00%)"),
+        (90.0, State.CRIT, "Utilization: 90.00% (warn/crit at 60.00%/80.00%)"),
+    ],
+)
+def test_check_appliance_uplinks(
+    performance: float, state: State, summary: str, params: CheckParams
+) -> None:
+    string_table = [[f"[{json.dumps({'perfScore': performance})}]"]]
+    section = parse_appliance_performance(string_table)
+    assert section
+
+    value = list(check_appliance_performance(params, section))
+    expected = [
+        Result(state=state, summary=summary),
+        Metric("utilization", performance, levels=(60.0, 80.0), boundaries=(0.0, 100.0)),
+    ]
+
+    assert value == expected

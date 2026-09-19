@@ -1,0 +1,141 @@
+#!/bin/bash
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# Find and print the absolute paths of all Python source code files
+
+usage() {
+    cat >&2 <<-HERE
+usage: $(basename "${0}") [--filter] [--with-packages]
+
+   --filter:             read file candidates from lines of stdin (one file per line)
+   --with-packages:      include Python files from packages/ directory
+HERE
+    exit 1
+}
+
+get_candidates_from_stdin() {
+    while read -r line; do
+        # gracefully ignore non-existing files
+        [ -e "${line}" ] && printf "%s\000" "${line}"
+    done
+}
+
+get_candidates_from_filesystem() {
+    local with_packages="$1"
+    cd "$(dirname "$(dirname "$(realpath "$0")")")" || exit $?
+
+    SEARCH=
+    PRUNE=
+    SEARCH+=" active_checks"
+    SEARCH+=" agents"
+    SEARCH+=" buildscripts"
+    SEARCH+=" bin"
+    PRUNE+=" -path $(realpath bin)/cmk -prune -o" # symlink to bin/check_mk + confusion with cmk/ directory
+    SEARCH+=" cmk"
+    SEARCH+=" doc"
+    PRUNE+=" -path $(realpath doc/treasures) -prune -o" # our "treasures" need much more love before they can be linted
+    SEARCH+=" locale"
+    # Do not search whole omd/ because it may contain unpacked sub-packages
+    if [ -d "omd/non-free/packages" ]; then
+        SEARCH+=" omd/non-free/packages"
+    fi
+    SEARCH+=" omd/dependency_management"
+    SEARCH+=" omd/packages/appliance"
+    SEARCH+=" omd/packages/maintenance"
+    SEARCH+=" omd/packages/omd"
+    SEARCH+=" omd/packages/check_mk"
+    SEARCH+=" scripts"
+    SEARCH+=" tests"
+    # Include packages/ directory if --with-packages is given
+    if [ "$with_packages" = "true" ] && [ -d "packages" ]; then
+        SEARCH+=" packages"
+    fi
+    if [ "$with_packages" = "true" ] && [ -d "non-free/packages" ]; then
+        SEARCH+=" non-free/packages"
+    fi
+    # The submodule is not checked out in the CI, so it should also not be checked locally.
+    # The content of that repo needs to be checked by it's own CI
+    PRUNE+=" -path $(realpath tests/qa-test-data) -prune -o"
+
+    # Resolve search paths to real paths before the search for performance reasons
+    # shellcheck disable=SC2086
+    REAL_SEARCH=$(realpath $SEARCH)
+
+    # TODO: What about conftest.py files?
+    # NOTE 1: -print0, -z and -0 are null byte delimiters used to deal with files containing whitespaces
+    # NOTE 2: We explicitly filter out the targets of symbolic links, too, otherwise we would see files twice.
+
+    # shellcheck disable=SC2086
+    find -L \
+        $REAL_SEARCH \
+        -name .mypy_cache -prune -o \
+        -name .venv -prune -o \
+        -name typeshed -prune -o \
+        -name py2 -prune -o \
+        $PRUNE \
+        -type f -print0
+}
+
+filter_for_python_files() {
+    local repo_path
+    repo_path="$(dirname "$(dirname "$(realpath "$0")")")"
+    local with_packages="$1"
+    local tmpfile
+    tmpfile=$(mktemp)
+    trap 'rm -f "$tmpfile"' EXIT
+
+    # use "-r" over "--no-run-if-empty" and "-0" over "--null" to work on alpine
+    # Exclude files below packages: The package specific jobs deal with them (unless --with-packages is given)
+    # Don't look into .werks folder: werks may contain a python shebang for documentation and should not be linted of course
+    if [ "$with_packages" = "true" ]; then
+        # Only exclude .werks, include packages/
+        grep --null --null-data -v -e "$repo_path/.werks" |
+            sort --zero-terminated >"$tmpfile"
+    else
+        # Exclude both packages/ and .werks
+        grep --null --null-data -v -e "^$repo_path/packages/" -e "$repo_path/.werks" |
+            sort --zero-terminated >"$tmpfile"
+    fi
+
+    # only output unique python files
+    {
+        # Files with Python shebang
+        xargs -r -0 grep --binary-files=without-match --files-with-matches '^#!.*python3\( -P\)\?' <"$tmpfile" || true
+        # Also output all .py files
+        xargs -r -0 printf '%s\n' <"$tmpfile" | grep '\.py$' || true
+    } | sort -u
+}
+
+main() {
+    local with_packages="false"
+    local filter_mode="false"
+
+    # Parse arguments
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --filter)
+                filter_mode="true"
+                shift
+                ;;
+            --with-packages)
+                with_packages="true"
+                shift
+                ;;
+            *)
+                usage
+                ;;
+        esac
+    done
+
+    # Execute based on mode
+    if [ "$filter_mode" = "true" ]; then
+        # in the filtering case, no match by grep is OK!
+        get_candidates_from_stdin | filter_for_python_files "$with_packages" || true
+    else
+        get_candidates_from_filesystem "$with_packages" | filter_for_python_files "$with_packages"
+    fi
+}
+
+[ -z "${MK_SOURCE_ONLY}" ] && main "$@"

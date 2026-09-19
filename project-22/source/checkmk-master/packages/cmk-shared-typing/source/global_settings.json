@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "global_settings_app",
+  "properties": {
+    "title": { "type": "string" },
+    "breadcrumb": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/global_settings_breadcrumb_item" }
+    },
+    "scope": {
+      "description": "Whether the shown settings apply to all sites or to one specific site.",
+      "anyOf": [
+        { "$ref": "#/$defs/global_settings_scope_global" },
+        { "$ref": "#/$defs/global_settings_scope_site" }
+      ]
+    },
+    "topics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/global_settings_topic" }
+    }
+  },
+  "required": ["title", "breadcrumb", "scope", "topics"],
+  "$defs": {
+    "global_settings_breadcrumb_item": {
+      "title": "GlobalSettingsBreadcrumbItem",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "link": { "type": ["string", "null"] }
+      },
+      "required": ["title", "link"]
+    },
+    "global_settings_scope_global": {
+      "type": "object",
+      "title": "global_settings_scope_global",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "global"
+        }
+      },
+      "required": ["type"]
+    },
+    "global_settings_scope_site": {
+      "type": "object",
+      "title": "global_settings_scope_site",
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "site"
+        },
+        "site_id": {
+          "type": "string"
+        }
+      },
+      "required": ["type", "site_id"]
+    },
+    "global_settings_topic": {
+      "type": "object",
+      "properties": {
+        "icon": { "$ref": "icon.json#/$defs/icon_names" },
+        "headline": { "type": "string" },
+        "subline": { "type": "string" },
+        "warning": {
+          "description": "Warning shown at the top of the topic, e.g. for internal developer settings.",
+          "type": ["string", "null"]
+        },
+        "variables": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/global_settings_variable" }
+        }
+      },
+      "required": ["icon", "headline", "subline", "warning", "variables"]
+    },
+    "global_settings_variable": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "spec": { "$ref": "vue_formspec/components.json#/$defs/components" },
+        "value": {},
+        "default_value": {},
+        "global_value": {
+          "description": "The installation-wide value a site inherits; null on the page that shows the installation's own settings.",
+          "tsType": "unknown"
+        },
+        "origin": {
+          "$ref": "#/$defs/global_settings_origin"
+        },
+        "site_overrides": {
+          "description": "Sites that configure their own explicit value for this variable.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/global_settings_site_override" }
+        },
+        "hints": {
+          "description": "Notes shown above the form of the setting.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/global_settings_hint" }
+        }
+      },
+      "required": [
+        "name",
+        "spec",
+        "value",
+        "default_value",
+        "global_value",
+        "origin",
+        "site_overrides",
+        "hints"
+      ]
+    },
+    "global_settings_origin": {
+      "title": "GlobalSettingsOrigin",
+      "description": "The layer the shown value comes from.",
+      "enum": ["factory", "global", "site"]
+    },
+    "global_settings_hint": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "description": "Trusted HTML, sanitized to the allow-list of cmk/utils/escaping.py.",
+          "type": "string"
+        },
+        "variant": { "$ref": "#/$defs/global_settings_hint_variant" },
+        "copyable": {
+          "description": "Value shown verbatim behind the text, with a control that copies it.",
+          "type": ["string", "null"]
+        }
+      },
+      "required": ["text", "variant", "copyable"]
+    },
+    "global_settings_hint_variant": {
+      "title": "GlobalSettingsHintVariant",
+      "description": "How urgent a hint is.",
+      "type": "string",
+      "enum": ["info", "warning"]
+    },
+    "global_settings_site_override": {
+      "type": "object",
+      "properties": {
+        "site_id": { "type": "string" },
+        "title": { "type": "string" },
+        "url": {
+          "description": "Link to the site-specific global settings page.",
+          "type": "string"
+        }
+      },
+      "required": ["site_id", "title", "url"]
+    }
+  }
+}

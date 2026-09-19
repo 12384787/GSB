@@ -1,0 +1,4 @@
+# Alias: Jaeger admin API port
+# Menu: Add-ons
+# Description:
+#  If receiving traces is configured, you can customize the admin API port here.

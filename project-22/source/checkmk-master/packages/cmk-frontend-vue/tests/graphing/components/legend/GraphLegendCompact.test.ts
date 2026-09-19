@@ -1,0 +1,245 @@
+/**
+ * Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+import { fireEvent, render, screen, waitFor } from '@testing-library/vue'
+
+import type { HorizontalLine, Metric } from '@/graphing/components/TimeSeriesGraph'
+import GraphLegendCompact from '@/graphing/components/legend/GraphLegendCompact.vue'
+
+const LINE_UNIT: HorizontalLine['unit'] = {
+  notation: 'decimal',
+  symbol: '%',
+  precision: { type: 'auto', digits: 2 },
+  convertible: true
+}
+
+const UNIT: Metric['metadata']['unit'] = {
+  notation: 'decimal',
+  symbol: '',
+  precision: { type: 'auto', digits: 2 },
+  convertible: true
+}
+
+function makeMetric(name: string, title: string): Metric {
+  return {
+    metadata: { name, title, unit: UNIT, color: '#ff0000', attributes: [] },
+    render: { stack: 'area', inverse: false, hidden: false },
+    data_points: [10, 20, 30]
+  }
+}
+
+function makeMetricWithStack(name: string, title: string, stack: string | null): Metric {
+  return {
+    metadata: { name, title, unit: UNIT, color: '#ff0000', attributes: [] },
+    render: { stack, inverse: false, hidden: false },
+    data_points: [1]
+  }
+}
+
+function makeBackendMetric(name: string, title: string): Metric {
+  return {
+    metadata: {
+      name,
+      title,
+      unit: UNIT,
+      color: '#ff0000',
+      attributes: [
+        { kind: 'resource', name: 'host.arch', value: 'x64' },
+        { kind: 'data_point', name: 'status', value: '304' }
+      ]
+    },
+    render: { stack: null, inverse: false, hidden: false },
+    data_points: [1]
+  }
+}
+
+// Stubs render the popup content inline; it only opens on real pointer timing.
+const TOOLTIP_STUBS = {
+  CmkTooltipProvider: { template: '<div><slot /></div>' },
+  CmkTooltip: { template: '<div><slot /></div>' },
+  CmkTooltipTrigger: { template: '<div><slot /></div>' },
+  CmkTooltipContent: { template: '<div><slot /></div>' }
+}
+
+const CPU = makeMetric('cpu', 'CPU')
+const MEM = makeMetric('mem', 'Memory')
+const WARN_LINE: HorizontalLine = {
+  name: 'scalar_of(warning,rrd_metric(h/svc/util))',
+  title: 'Warn',
+  value: 80,
+  unit: LINE_UNIT,
+  color: '#ffaa00'
+}
+
+test('renders one item per metric and per horizontal line', () => {
+  render(GraphLegendCompact, { props: { metrics: [CPU, MEM], horizontalLines: [WARN_LINE] } })
+
+  expect(screen.getByText('CPU')).toBeInTheDocument()
+  expect(screen.getByText('Memory')).toBeInTheDocument()
+  expect(screen.getByText('Warn')).toBeInTheDocument()
+})
+
+test('lists metrics in the same order as the table legend', () => {
+  const metrics = [
+    makeMetricWithStack('b', 'B', 's1'),
+    makeMetricWithStack('c', 'C', 's1'),
+    makeMetricWithStack('d', 'D', 's1'),
+    makeMetricWithStack('f', 'F', 's2'),
+    makeMetricWithStack('g', 'G', 's2'),
+    makeMetricWithStack('a', 'A', null),
+    makeMetricWithStack('e', 'E', null)
+  ]
+
+  const { container } = render(GraphLegendCompact, { props: { metrics } })
+
+  const names = Array.from(container.querySelectorAll('.graphing-graph-legend-compact__name')).map(
+    (el) => el.textContent
+  )
+  expect(names).toEqual(['E', 'A', 'G', 'F', 'D', 'C', 'B'])
+})
+
+test('long names are split into a shrinkable head and a fixed tail', () => {
+  const { container } = render(GraphLegendCompact, {
+    props: { metrics: [makeMetric('cpu', 'Total CPU utilization user')] }
+  })
+
+  const head = container.querySelector('.graphing-graph-legend-compact__name-head')!
+  const tail = container.querySelector('.graphing-graph-legend-compact__name-tail')!
+  expect(head.textContent! + tail.textContent!).toBe('Total CPU utilization user')
+  expect(tail.textContent).toBe(' user')
+})
+
+test('the full name is available as the native title of the series', () => {
+  render(GraphLegendCompact, {
+    props: { metrics: [makeMetric('cpu', 'Total CPU utilization user')] }
+  })
+
+  expect(screen.getByTitle('Total CPU utilization user')).toBeInTheDocument()
+})
+
+test('clicking a visible metric eye emits update:hiddenMetricNames with that name added', async () => {
+  const { emitted } = render(GraphLegendCompact, {
+    props: { metrics: [CPU, MEM], hiddenMetricNames: [] }
+  })
+
+  await fireEvent.click(screen.getByRole('button', { name: 'CPU' }))
+
+  expect(emitted()['update:hiddenMetricNames']).toEqual([[['cpu']]])
+})
+
+test('clicking a hidden metric eye emits update:hiddenMetricNames with that name removed', async () => {
+  const { emitted } = render(GraphLegendCompact, {
+    props: { metrics: [CPU], hiddenMetricNames: ['cpu'] }
+  })
+
+  await fireEvent.click(screen.getByRole('button', { name: 'CPU' }))
+
+  expect(emitted()['update:hiddenMetricNames']).toEqual([[[]]])
+})
+
+test('hovering a metric item emits its name', async () => {
+  const { emitted } = render(GraphLegendCompact, { props: { metrics: [CPU] } })
+  const item = screen.getByText('CPU').closest('.graphing-graph-legend-compact__item')!
+
+  await fireEvent.mouseEnter(item)
+
+  expect(emitted()['hoverMetrics']).toEqual([[['cpu']]])
+})
+
+test('leaving a metric item clears the highlight', async () => {
+  const { emitted } = render(GraphLegendCompact, { props: { metrics: [CPU] } })
+  const item = screen.getByText('CPU').closest('.graphing-graph-legend-compact__item')!
+  await fireEvent.mouseEnter(item)
+
+  await fireEvent.mouseLeave(item)
+
+  expect(emitted()['hoverMetrics']).toEqual([[['cpu']], [[]]])
+})
+
+test('hovering a horizontal line item emits nothing', async () => {
+  const { emitted } = render(GraphLegendCompact, {
+    props: { metrics: [CPU], horizontalLines: [WARN_LINE] }
+  })
+  const item = screen.getByText('Warn').closest('.graphing-graph-legend-compact__item')!
+
+  await fireEvent.mouseEnter(item)
+  await fireEvent.mouseLeave(item)
+
+  expect(emitted()['hoverMetrics']).toBeUndefined()
+})
+
+test('a metrics-backend item offers its attributes grouped by kind', () => {
+  render(GraphLegendCompact, {
+    props: { metrics: [makeBackendMetric('requests', 'Requests')] },
+    global: { stubs: TOOLTIP_STUBS }
+  })
+
+  expect(screen.getByText('Resource attributes')).toBeInTheDocument()
+  expect(screen.getByText('host.arch')).toBeInTheDocument()
+  expect(screen.getByText('x64')).toBeInTheDocument()
+  expect(screen.getByText('Data point attributes')).toBeInTheDocument()
+  expect(screen.queryByText('Scope attributes')).not.toBeInTheDocument()
+})
+
+// No stubs: only the real components show whether focus opens the popup.
+test('focusing a metrics-backend item reveals its attributes, blurring hides them', async () => {
+  render(GraphLegendCompact, { props: { metrics: [makeBackendMetric('requests', 'Requests')] } })
+  const trigger = document.querySelector('.graphing-graph-legend-compact__series--has-attributes')!
+
+  await fireEvent.focus(trigger)
+
+  await waitFor(() => expect(screen.getByText('Resource attributes')).toBeInTheDocument())
+  expect(screen.getByText('host.arch')).toBeInTheDocument()
+
+  await fireEvent.blur(trigger)
+
+  await waitFor(() => expect(screen.queryByText('Resource attributes')).not.toBeInTheDocument())
+})
+
+test('only an item that has attributes is reachable by keyboard to reveal them', () => {
+  const { container } = render(GraphLegendCompact, {
+    props: {
+      metrics: [makeBackendMetric('requests', 'Requests'), CPU],
+      horizontalLines: [WARN_LINE]
+    },
+    global: { stubs: TOOLTIP_STUBS }
+  })
+
+  const series = Array.from(container.querySelectorAll('.graphing-graph-legend-compact__series'))
+  const focusable = series.filter((element) => element.hasAttribute('tabindex'))
+
+  expect(series).toHaveLength(3)
+  expect(focusable).toHaveLength(1)
+  expect(focusable[0]).toHaveTextContent('Requests')
+})
+
+test('clicking a horizontal line eye emits update:hiddenLineNames with that name toggled', async () => {
+  const { emitted } = render(GraphLegendCompact, {
+    props: { metrics: [CPU], horizontalLines: [WARN_LINE], hiddenLineNames: [] }
+  })
+
+  await fireEvent.click(screen.getByRole('button', { name: 'Warn' }))
+
+  expect(emitted()['update:hiddenLineNames']).toEqual([
+    [['scalar_of(warning,rrd_metric(h/svc/util))']]
+  ])
+})
+
+test('a metric named as clickable offers its name as a button emitting metricClick', async () => {
+  const { emitted } = render(GraphLegendCompact, {
+    props: { metrics: [CPU, MEM], clickableMetricNames: ['cpu'] }
+  })
+
+  await fireEvent.click(screen.getByRole('button', { name: 'Show details for CPU' }))
+
+  expect(emitted()['metricClick']).toEqual([['cpu']])
+  expect(screen.queryByRole('button', { name: 'Show details for Memory' })).not.toBeInTheDocument()
+})
+
+test('metric names are plain text unless named as clickable', () => {
+  render(GraphLegendCompact, { props: { metrics: [CPU] } })
+
+  expect(screen.queryByRole('button', { name: 'Show details for CPU' })).not.toBeInTheDocument()
+})

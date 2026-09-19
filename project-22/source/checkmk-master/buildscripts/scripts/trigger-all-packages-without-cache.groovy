@@ -1,0 +1,82 @@
+#!groovy
+
+/// file: trigger-all-packages-without-cache.groovy
+
+import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
+
+void main() {
+    def package_helper = load("${checkout_dir}/buildscripts/scripts/utils/package_helper.groovy");
+    def versioning = load("${checkout_dir}/buildscripts/scripts/utils/versioning.groovy");
+
+    /// This will get us the location to e.g. "checkmk/master" or "Testing/<name>/checkmk/master"
+    def branch_base_folder = package_helper.branch_base_folder(true);
+    def safe_branch_name = versioning.safe_branch_name();
+
+    def all_editions = [];
+    def disable_cache = true;
+    /// In order to ensure a fixed order for stages executed in parallel,
+    /// we wait an increasing amount of time (N * 1s).
+    /// Without this we end up with a capped build overview matrix in the job view (Jenkins doesn't
+    /// like changing order or amount of stages, which will happen with stages started `via parallel()`
+    def timeOffsetForOrder = 0;
+
+    inside_container_minimal(safe_branch_name: safe_branch_name) {
+        all_editions = versioning.get_editions();
+    }
+    def editions_to_test = all_editions;
+
+    def job_parameters = [
+        booleanParam(name: "DISABLE_CACHE", value: disable_cache),
+        stringParam(name: 'CIPARAM_OVERRIDE_BUILD_NODE', value: params.TRIGGER_CIPARAM_OVERRIDE_BUILD_NODE),
+        stringParam(name: 'CUSTOM_GIT_REF', value: effective_git_ref),
+        stringParam(name: "CIPARAM_BISECT_COMMENT", value: params.CIPARAM_BISECT_COMMENT),
+    ];
+
+    def override_editions = params.EDITIONS.trim() ?: "";
+    if (override_editions) {
+        editions_to_test = override_editions.replaceAll(',', ' ').split(' ').grep();
+    }
+
+    print(
+        """
+        |===== CONFIGURATION ===============================
+        |branch_base_folder:.... │${branch_base_folder}│
+        |disable_cache:......... │${disable_cache} (always active)│
+        |editions:.............. │${editions_to_test}│
+        |fixed_node:............ |${params.TRIGGER_CIPARAM_OVERRIDE_BUILD_NODE}|
+        |job_parameters:........ │${job_parameters}│
+        |===================================================
+        """.stripMargin());
+
+    def success = true;
+    inside_container_minimal(safe_branch_name: safe_branch_name) {
+        for (edition in all_editions) {
+            def stepName = "Trigger ${edition}";
+            def run_condition = edition in editions_to_test;
+
+            /// this makes sure the whole parallel thread is marked as skipped
+            if (! run_condition) {
+                Utils.markStageSkippedForConditional(stepName);
+                return true;
+            }
+
+            sleep(1 * timeOffsetForOrder++);
+
+            success &= smart_stage(
+                name: stepName,
+                condition: run_condition,
+                raiseOnError: true,
+            ) {
+                def this_job_parameters = job_parameters + [stringParam(name: "EDITION", value: edition)];
+                smart_build(
+                    job: "${branch_base_folder}/nightly-${edition}/build-cmk-deliverables-no-cache",
+                    parameters: this_job_parameters,
+                );
+            }[0]
+        }
+
+        currentBuild.result = success ? "SUCCESS" : "FAILURE";
+    }
+}
+
+return this;

@@ -1,0 +1,173 @@
+/**
+ * Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+import { cmkFetch } from 'cmk-ui-library/lib/cmkFetch'
+
+export type ApiResponseBody<T> = T
+
+export interface ApiOptions {
+  headers?: [string, string][]
+  credentials?: RequestCredentials
+  exceptOnNonZeroResultCode?: boolean
+  signal?: AbortSignal
+}
+
+/**
+ * Legacy HTTP client for AJAX and page-endpoint requests.
+ *
+ * **Legacy use only.** This client pre-dates the typed REST API client and
+ * should not be used for new development. It is permitted only when sending
+ * legacy AJAX requests (responses with a `result`/`result_code` envelope) or
+ * talking to page endpoints where backwards-compatibility is required.
+ *
+ * For new REST API calls use the typed client in
+ * `cmk-ui-library/lib/rest-api-client/client.ts`.
+ */
+export class Api {
+  public constructor(
+    protected baseUrl: string | null = null,
+    protected headers: [string, string][] = []
+  ) {}
+
+  public async option(url: string, options: ApiOptions = {}): Promise<ApiResponseBody<unknown>> {
+    const params = this.prepareOptions(options, {
+      method: 'OPTION'
+    })
+
+    return this.fetch(url, params, options.exceptOnNonZeroResultCode)
+  }
+
+  public async get(url: string, options: ApiOptions = {}): Promise<ApiResponseBody<unknown>> {
+    const params = this.prepareOptions(options, {
+      method: 'GET'
+    })
+
+    return this.fetch(url, params, options.exceptOnNonZeroResultCode)
+  }
+
+  public async post(
+    url: string,
+    body: unknown | null = null,
+    options: ApiOptions = {}
+  ): Promise<ApiResponseBody<unknown>> {
+    const opts: RequestInit = {
+      method: 'POST'
+    }
+    if (body !== null) {
+      opts.body = JSON.stringify(body)
+    }
+    const params = this.prepareOptions(options, opts)
+    return this.fetch(url, params, options.exceptOnNonZeroResultCode)
+  }
+
+  public async put(
+    url: string,
+    body: unknown | null = null,
+    options: ApiOptions = {}
+  ): Promise<ApiResponseBody<unknown>> {
+    const opts: RequestInit = {
+      method: 'POST'
+    }
+    if (body !== null) {
+      opts.body = JSON.stringify(body)
+    }
+    const params = this.prepareOptions(options, opts)
+    return this.fetch(url, params, options.exceptOnNonZeroResultCode)
+  }
+
+  public async delete(url: string, options: ApiOptions = {}): Promise<ApiResponseBody<unknown>> {
+    const params = this.prepareOptions(options, {
+      method: 'DELETE'
+    })
+
+    return this.fetch(url, params, options.exceptOnNonZeroResultCode)
+  }
+
+  public async getRaw(url: string, options: ApiOptions = {}): Promise<ApiResponseBody<unknown>> {
+    const params = this.prepareOptions(options, {
+      method: 'GET'
+    })
+
+    return this.fetchRaw(url, params)
+  }
+
+  public async postRaw(
+    url: string,
+    body: unknown | null = null,
+    options: ApiOptions = {}
+  ): Promise<ApiResponseBody<unknown>> {
+    const opts: RequestInit = {
+      method: 'POST'
+    }
+    if (body !== null) {
+      opts.body = JSON.stringify(body)
+    }
+    const params = this.prepareOptions(options, opts)
+    return this.fetchRaw(url, params)
+  }
+
+  private async fetchRaw(
+    url: string,
+    options: RequestInit
+  ): Promise<ApiResponseBody<unknown> | null> {
+    if (this.baseUrl) {
+      url = this.baseUrl + url
+    }
+
+    const res = await fetch(url, options)
+
+    const json = await res.json()
+    if (!('result' in json)) {
+      return json
+    } else {
+      return json.result // only ajax call have this result field
+    }
+  }
+
+  private async fetch(
+    url: string,
+    params: RequestInit,
+    exceptOnNonZeroResultCode: boolean = false
+  ): Promise<ApiResponseBody<unknown> | null> {
+    if (this.baseUrl) {
+      url = this.baseUrl + url
+    }
+
+    const res = await cmkFetch(url, params)
+
+    if (res.response.redirected) {
+      if (res.response.url.indexOf('login.py') >= 0) {
+        throw new Error('Stale session. Please login.')
+      }
+    }
+
+    await res.raiseForStatus()
+
+    if (res.status === 204) {
+      return null
+    }
+
+    const json = await res.json()
+    if (!('result' in json)) {
+      return json
+    } else {
+      if (exceptOnNonZeroResultCode && 'result_code' in json && json.result_code !== 0) {
+        throw new Error(json.result)
+      }
+      return json.result // only ajax call have this result field
+    }
+  }
+
+  private prepareOptions(options: ApiOptions, defaults: RequestInit = {}): RequestInit {
+    const opt = Object.assign(options, defaults)
+    if (!opt.headers) {
+      opt.headers = []
+    }
+
+    opt.headers = this.headers.concat(opt.headers)
+
+    return opt
+  }
+}

@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+
+"""Zorp FW - connections
+This check displays individual connections returned by
+  zorpctl szig -r zorp.stats.active_connections
+It sums up all connections and checks against configurable maximum values.
+"""
+
+from collections.abc import Mapping
+from typing import Any
+
+from cmk.agent_based.v2 import (
+    AgentSection,
+    check_levels,
+    CheckPlugin,
+    CheckResult,
+    Result,
+    State,
+    StringTable,
+)
+from cmk.agent_based.v3_unstable import discover_one_service
+
+Section = Mapping[str, int]
+
+
+def parse_zorp_connections(string_table: StringTable) -> Section:
+    """Creates dict name -> connections
+    from string_table =
+    [["Instance <name>:", "walking"], ["zorp.stats.active_connections:", "<Number|'None'>"],
+     ["Instance <name>:", "walking"], ["zorp.stats.active_connections:", "<Number|'None'>"],
+     ...]
+    """
+    return {
+        instance[1].rstrip(":"): int(state[1]) if state[1] != "None" else 0
+        for instance, state in zip(string_table[::2], string_table[1::2])
+    }
+
+
+def check_zorp_connections(params: Mapping[str, Any], section: Section) -> CheckResult:
+    """List number of connections for each connection type and check against
+    total number of connections"""
+    if not section:
+        return
+
+    yield from (Result(state=State.OK, summary="%s: %d" % elem) for elem in section.items())
+
+    yield from check_levels(
+        sum(section.values()),
+        metric_name="connections",
+        levels_upper=params["levels"],
+        label="Total connections",
+        render_func=str,
+    )
+
+
+agent_section_zorp_connections = AgentSection(
+    name="zorp_connections",
+    parse_function=parse_zorp_connections,
+)
+
+check_plugin_zorp_connections = CheckPlugin(
+    name="zorp_connections",
+    service_name="Zorp Connections",
+    discovery_function=discover_one_service,
+    check_function=check_zorp_connections,
+    check_ruleset_name="zorp_connections",
+    check_default_parameters={
+        "levels": ("fixed", (15, 20)),
+    },
+)

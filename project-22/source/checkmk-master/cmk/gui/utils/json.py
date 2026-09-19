@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="no-any-return"
+
+# Module `json` shadows a Python standard-library module
+
+import json
+from typing import override
+
+from cmk.utils.jsontype import JsonSerializable
+
+
+class CustomObjectJSONEncoder(json.JSONEncoder):
+    """Encodes objects with a to_json() method to JSON.
+
+    Example:
+
+        json.dumps(obj, cls=CustomObjectJSONEncoder)
+    """
+
+    @override
+    def default(self, obj: object) -> JsonSerializable:
+        if hasattr(obj, "to_json") and callable(obj.to_json):
+            return obj.to_json()
+        return super().default(obj)

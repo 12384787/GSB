@@ -1,0 +1,225 @@
+<!--
+Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import { type VariantProps, cva } from 'class-variance-authority'
+import type { TranslatedString } from 'cmk-ui-library/lib/i18nString'
+
+const propsCva = cva('', {
+  variants: {
+    size: {
+      small: 'cmk-tag--size-small',
+      medium: 'cmk-tag--size-medium',
+      large: 'cmk-tag--size-large'
+    },
+    color: {
+      default: 'cmk-tag--color-default',
+      success: 'cmk-tag--color-success',
+      warning: 'cmk-tag--color-warning',
+      unknown: 'cmk-tag--color-unknown',
+      danger: 'cmk-tag--color-danger',
+      discovered: 'cmk-tag--color-discovered',
+      explicit: 'cmk-tag--color-explicit',
+      ruleset: 'cmk-tag--color-ruleset',
+      label: 'cmk-tag--color-label'
+    },
+    variant: {
+      fill: 'cmk-tag--variant-fill',
+      outline: 'cmk-tag--variant-outline',
+      weighted: 'cmk-tag--variant-weighted'
+    }
+  },
+  defaultVariants: {
+    size: 'medium',
+    color: 'default',
+    variant: 'outline'
+  }
+})
+
+export type Sizes = VariantProps<typeof propsCva>['size']
+export type Colors = VariantProps<typeof propsCva>['color']
+export type Variants = VariantProps<typeof propsCva>['variant']
+
+export interface CmkTagProps {
+  size?: Sizes
+  color?: Colors
+  variant?: Variants
+  content: TranslatedString
+  /** Native tooltip, e.g. the full text when a consumer clips the tag to its column. */
+  title?: string
+}
+
+defineProps<CmkTagProps>()
+</script>
+
+<template>
+  <span class="cmk-tag" :class="propsCva({ size, color, variant })" :title="title">
+    {{ content }}
+  </span>
+</template>
+
+<style scoped>
+.cmk-tag {
+  border-radius: 4px;
+  text-align: center;
+  margin: 0 4px;
+}
+
+.cmk-tag--size-small {
+  font-size: 10px;
+  padding: 1px 3px;
+}
+
+.cmk-tag--size-medium {
+  font-size: 12px;
+  padding: 2px 4px;
+}
+
+.cmk-tag--size-large {
+  font-size: 14px;
+  padding: 4px 5px;
+}
+
+.cmk-tag--color-danger {
+  --tag-color: var(--color-danger);
+}
+
+.cmk-tag--color-warning {
+  --tag-color: var(--color-warning);
+}
+
+.cmk-tag--color-unknown {
+  --tag-color: var(--color-unknown);
+}
+
+.cmk-tag--color-success {
+  --tag-color: var(--success);
+}
+
+.cmk-tag--color-default {
+  --tag-color: var(--font-color);
+  --tag-fill-color: var(--color-midnight-grey-50);
+}
+
+.cmk-tag--color-discovered {
+  --tag-color: var(--tag-discovered-color);
+}
+
+.cmk-tag--color-explicit {
+  --tag-color: var(--tag-explicit-color);
+}
+
+.cmk-tag--color-ruleset {
+  --tag-color: var(--tag-ruleset-color);
+}
+
+/* What the classic view gives a label that carries no source of its own, and a tag. */
+.cmk-tag--color-label {
+  --tag-color: var(--tag-label-color);
+}
+
+/* weighted variant: success -> danger gets more recognizable in color and contrast */
+.cmk-tag--variant-weighted.cmk-tag--color-default {
+  --tag-color: var(--font-color);
+  --tag-border-color: var(--color-midnight-grey-0);
+  --tag-fill-color: var(--color-midnight-grey-100);
+}
+
+.cmk-tag--variant-weighted.cmk-tag--color-success {
+  --tag-color: var(--color-corporate-green-40);
+  --tag-border-color: var(--color-corporate-green-60);
+  --tag-fill-color: var(--color-corporate-green-100);
+}
+
+.cmk-tag--variant-weighted.cmk-tag--color-warning {
+  --tag-color: var(--color-yellow-0);
+  --tag-border-color: var(--color-yellow-40);
+  --tag-fill-color: var(--color-yellow-90);
+}
+
+.cmk-tag--variant-weighted.cmk-tag--color-unknown {
+  --tag-color: var(--color-orange-0);
+  --tag-border-color: var(--color-orange-40);
+  --tag-fill-color: var(--color-orange-90);
+}
+
+.cmk-tag--variant-weighted.cmk-tag--color-danger {
+  --tag-color: var(--color-dark-red-0);
+  --tag-border-color: var(--color-dark-red-40);
+  --tag-fill-color: var(--color-dark-red-70);
+}
+
+.cmk-tag--variant-weighted.cmk-tag--color-discovered {
+  --tag-color: var(--color-orange-0);
+  --tag-border-color: var(--color-orange-40);
+  --tag-fill-color: var(--color-orange-90);
+}
+
+.cmk-tag--variant-weighted.cmk-tag--color-explicit {
+  --tag-color: var(--color-purple-0);
+  --tag-border-color: var(--color-purple-40);
+  --tag-fill-color: var(--color-purple-90);
+}
+
+.cmk-tag--variant-weighted.cmk-tag--color-ruleset {
+  --tag-color: var(--color-pink-0);
+  --tag-border-color: var(--color-pink-40);
+  --tag-fill-color: var(--color-pink-90);
+}
+
+.cmk-tag--variant-weighted.cmk-tag--color-label {
+  --tag-color: var(--color-cyan-0);
+  --tag-border-color: var(--color-cyan-40);
+  --tag-fill-color: var(--color-cyan-90);
+}
+
+.cmk-tag--variant-fill {
+  background: var(--tag-fill-color, var(--tag-color));
+  border: 1px solid var(--tag-fill-color, var(--tag-color));
+  color: var(--white);
+}
+
+.cmk-tag--variant-weighted {
+  background: var(--tag-fill-color, var(--tag-color));
+  border: 1px solid var(--tag-border-color, var(--tag-color));
+  color: var(--tag-color, var(--white));
+}
+
+.cmk-tag--variant-outline {
+  background: transparent;
+  border: 1px solid var(--tag-color);
+  color: var(--tag-color);
+}
+
+/* Special cases for better contrast with fill variant */
+.cmk-tag--variant-fill.cmk-tag--color-success {
+  color: var(--black);
+}
+
+.cmk-tag--variant-fill.cmk-tag--color-warning {
+  color: var(--black);
+}
+
+.cmk-tag--variant-fill.cmk-tag--color-discovered {
+  color: var(--black);
+}
+
+body[data-theme='facelift'] {
+  .cmk-tag--color-default {
+    --tag-color: var(--font-color);
+    --tag-fill-color: var(--color-daylight-grey-50);
+
+    &.cmk-tag--variant-fill {
+      color: var(--font-color);
+    }
+  }
+
+  .cmk-tag--variant-weighted.cmk-tag--color-default {
+    --tag-color: var(--font-color);
+    --tag-border-color: var(--color-daylight-grey-100);
+    --tag-fill-color: var(--color-daylight-grey-20);
+  }
+}
+</style>

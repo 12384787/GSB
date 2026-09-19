@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from collections.abc import Mapping, Sequence
+
+import pytest
+
+from cmk.agent_based.v2 import Result, State, StringTable
+from cmk.plugins.mongodb.agent_based.mongodb_instance import (
+    check_mongodb_instance,
+    parse_mongodb_instance,
+)
+
+
+@pytest.mark.parametrize(
+    "item, params, string_table, expected_results",
+    [
+        (
+            None,
+            {},
+            [
+                ["mode", "Primary"],
+                ["address", "idbv0068.ww-intern.de:27017"],
+                ["version", "3.0.4"],
+                ["pid", "1999"],
+            ],
+            [
+                Result(state=State.OK, summary="Mode: Primary"),
+                Result(state=State.OK, summary="Address: idbv0068.ww-intern.de:27017"),
+                Result(state=State.OK, summary="Version: 3.0.4"),
+                Result(state=State.OK, summary="Pid: 1999"),
+            ],
+        ),
+    ],
+)
+def test_check_mongodb_instance(
+    item: str,  # noqa: ARG001
+    params: Mapping[str, object],  # noqa: ARG001
+    string_table: StringTable,
+    expected_results: Sequence[object],
+) -> None:
+    """Test check function for mongodb_instance check."""
+    parsed = parse_mongodb_instance(string_table)
+    result = list(check_mongodb_instance(parsed))
+    assert result == expected_results

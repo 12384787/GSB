@@ -1,0 +1,64 @@
+# Documentation standards (monorepo-wide)
+
+These standards apply to **all** documentation across the monorepo — guides, the API reference (JSDoc/Typedoc inside `handsontable/src`), code comments, changelog entries, release notes, migration guides, and READMEs. An agent editing core JSDoc applies these without opening `docs/AGENTS.md`. The docs *site* has additional mechanics (frontmatter, sidebar, example embedding, and its own voice overrides) in `docs/AGENTS.md`.
+
+The gating policy and a digest of the most-violated rules live in the root `AGENTS.md` "Documentation standards" section (always loaded). This file is the full reference.
+
+## When documentation is required
+
+- Any change to a public API (methods, options, hooks, plugins, typings, errors) **must** update the corresponding JSDoc/Typedoc comments and guides.
+- Any change to user-facing behavior or look-and-feel **must** be documented.
+- Any breaking change **must** include a migration guide step (see below).
+
+## Documentation branch conventions
+
+- Feature docs branches: `docs/<TASK-ID>_Short-Description` (e.g., `docs/DEV-458_Clarify-undo-redo-docs`), branched from the feature branch or `develop`. `<TASK-ID>` is the ClickUp custom ID, whose prefix follows the task's space (`DEV`, `SU`, `PRO`).
+- Release docs branches: `release/x.y.z-docs`, branched from `release/x.y.z`.
+
+## Writing style rules
+
+Apply to all documentation text — guides, JSDoc comments, changelog entries, migration guides, and PR descriptions.
+
+1. **Short sentences.** Split longer sentences in two.
+2. **Active voice.** Never passive. ("Configure the parameters" not "The parameters should be configured.")
+3. **Simple verb syntax.** ("To ensure performance…" not "In order to ensure that the system will be capable of…")
+4. **American English spelling.** (`recognize`, `program`, `behavior`, not `recognise`, `programme`, `behaviour`.)
+5. **Commonized forms.** `frontend`, `backend`, `webhook`, `internet` (not `front-end`, `back end`, `web hook`, `Internet`).
+6. **Use "you" not "we".** ("In this example, you can see…" not "In this example, we can see…")
+7. **Oxford comma.** Use a comma before `and`/`or` in lists of 3 or more items. ("berries, apples, and bacon.")
+8. **No evaluative adjectives.** Eliminate "easy", "simple", "obvious", "straightforward" from explanations.
+9. **Do not assume user background knowledge.** Bridge the gap between specialists and non-specialists.
+10. **Max 3 adjectives before a noun.**
+11. **Clause separators.** Use en dashes (–) in non-site text (JSDoc, changelog, migration guides). The docs *site* uses hyphens or double hyphens instead — see `docs/AGENTS.md` 2.2.
+12. **Consistent 3rd-party naming.** Use official capitalization: `Node.js`, `webpack`, `GitLab`, `TypeScript`.
+13. **PR descriptions**: Use plain, concise language. Avoid literary wording — developers need to parse it quickly.
+14. **Sentence case headings.** Capitalize only the first word, plus proper nouns, product names, API identifiers, and acronyms. ("Definition of done (local enforcement)", not "Definition of Done (Local Enforcement)".) Applies to Markdown headings at every level and to the docs frontmatter `title:` field. Terms with fixed capitalization keep it: `Node.js`, `HyperFormula`, `HotTable`, `UndoRedo`, `Content Security Policy (CSP)`. Sentence case composes with the Diátaxis title patterns in `docs/AGENTS.md` 2.1 (verb phrase, "How to …", "Understanding …") rather than replacing them. **Not covered:** `README.md`, which is marketing-facing and uses Title Case with emoji headings by design, and agent instruction files (`AGENTS.md`, `.claude/skills/**`), whose heading style is currently mixed and out of scope for this rule.
+
+## Migration guide requirements
+
+A migration guide is required for every major release and some minor releases. Each breaking change needs a separate migration guide step that includes:
+
+1. Who the breaking change affects.
+2. A brief reason for the change (what the user gains).
+3. A brief description of the change itself.
+4. What the user needs to do (step-by-step, with substeps if needed).
+5. Code examples (before/after).
+6. Links to more detailed information (new pages, PRs).
+
+Follow the structure of previous migration guides for consistency. Migration guides live in `docs/content/guides/upgrade-and-migration/`.
+
+**Sections are numbered, and the number lives in two places.** Each step is an `## <N>. <title>`
+heading, and the paragraph just after `[[toc]]` names every section by that number ("Section 9
+concerns ..."). Two pull requests open at the same time both add the next number, so the guide is a
+reliable merge conflict on a busy release, and the conflict has two regions: the intro paragraph and
+the heading. Resolve both — renumber the later section and add its sentence to the intro. Nothing
+checks the intro against the headings, so a half-resolved merge ships an intro that describes the
+wrong section and no gate complains. Check for links to the anchor you are renumbering
+(`migrating-from-X-to-Y.md#<n>-...`) before you renumber; there are usually none, and a renumber that
+breaks one is silent too.
+
+## Trademark rules
+
+- Any documentation page mentioning "Excel" must include the Microsoft/Excel trademark disclaimer.
+- If the page also mentions "Google Sheets", use the expanded disclaimer covering both trademarks.
+- Avoid third-party trademarks in documentation unless practically necessary (e.g., to describe compatibility or integration).

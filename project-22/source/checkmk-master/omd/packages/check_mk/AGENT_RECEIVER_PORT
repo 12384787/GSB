@@ -1,0 +1,6 @@
+# Alias: TCP port number for agent-receiver server
+# Menu: Basic
+# Description:
+#  Configure the port on which agent-receiver server
+#  will listen to requests. If the port isn't
+#  available, the next available port will be chosen.

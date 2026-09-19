@@ -1,0 +1,44 @@
+diff --git a/uv/pip.bzl b/uv/pip.bzl
+index 62295ef..c910382 100644
+--- a/uv/pip.bzl
++++ b/uv/pip.bzl
+@@ -3,6 +3,9 @@
+ load("@bazel_skylib//lib:types.bzl", "types")
+ load("@bazel_skylib//rules:write_file.bzl", "write_file")
+ load("//uv/private:pip.bzl", "pip_compile_test", _pip_compile = "pip_compile")
++load("//uv/private:pip.bzl", _RequirementsInInfo = "RequirementsInInfo")
++
++RequirementsInInfo = _RequirementsInInfo
+
+ def pip_compile(
+         name,
+diff --git a/uv/private/pip.bzl b/uv/private/pip.bzl
+--- a/uv/private/pip.bzl
++++ b/uv/private/pip.bzl
+@@ -1,6 +1,12 @@
+ load("@rules_python//python:defs.bzl", "PyRuntimeInfo")
+ load(":interpreter_path.bzl", "python_interpreter_path")
+ load(":transition_to_target.bzl", "transition_to_target")
+
++RequirementsInInfo = provider(
++  fields = {
++    "srcs": "The input files for this requirements input.",
++  },
++)
++
+ _PY_TOOLCHAIN = "@bazel_tools//tools/python:toolchain_type"
+
+@@ -77,8 +83,12 @@ def _runfiles(ctx):
+     py3_runtime = _python_runtime(ctx)
+     overrides_file = [ctx.file.requirements_overrides] if ctx.attr.requirements_overrides else []
++    files = [ctx.file.requirements_in, ctx.file.requirements_txt] + overrides_file + ctx.files.data
++    if RequirementsInInfo in ctx.attr.requirements_in:
++        for src in ctx.attr.requirements_in[RequirementsInInfo].srcs:
++            files.extend(src.files.to_list())
+     runfiles = ctx.runfiles(
+-        files = [ctx.file.requirements_in, ctx.file.requirements_txt] + overrides_file + ctx.files.data,
++        files = files,
+         transitive_files = py3_runtime.files,
+     )
+     runfiles = runfiles.merge(ctx.attr._uv[0].default_runfiles)
+     return runfiles

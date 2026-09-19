@@ -1,0 +1,52 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import CmkDropdown from 'cmk-ui-library/components/CmkDropdown'
+import CmkIndent from 'cmk-ui-library/components/CmkIndent.vue'
+import type { Suggestion } from 'cmk-ui-library/components/CmkSuggestions'
+import CmkCheckbox from 'cmk-ui-library/components/user-input/CmkCheckbox.vue'
+import usei18n, { untranslated } from 'cmk-ui-library/lib/i18n'
+import { onBeforeMount, ref } from 'vue'
+
+import { dashboardAPI } from '@/dashboard/utils'
+
+const { _t } = usei18n()
+
+const showInMonitorMenu = defineModel<boolean>('showInMonitorMenu', { required: true })
+const selectedTopic = defineModel<string>('selectedTopic', { default: '' })
+
+const topics = ref<Suggestion[]>([])
+
+onBeforeMount(async () => {
+  const apiTopics = await dashboardAPI.listMainMenuTopics()
+  apiTopics.sort((a, b) => a.sortIndex - b.sortIndex)
+  topics.value = apiTopics.map((item) => ({
+    name: item.id,
+    title: untranslated(item.title)
+  }))
+  if (selectedTopic.value === '') {
+    const defaultTopic = apiTopics.find((t) => t.isDefault)
+    if (defaultTopic) {
+      selectedTopic.value = defaultTopic.id
+    }
+  }
+})
+</script>
+
+<template>
+  <CmkCheckbox v-model="showInMonitorMenu" :label="_t('Show in monitor menu')" />
+  <CmkIndent v-if="showInMonitorMenu">
+    <CmkDropdown
+      :model-value="selectedTopic"
+      :label="_t('Select option')"
+      :options="{
+        type: 'fixed',
+        suggestions: topics
+      }"
+      @update:model-value="(value) => (selectedTopic = value || selectedTopic)"
+    />
+  </CmkIndent>
+</template>

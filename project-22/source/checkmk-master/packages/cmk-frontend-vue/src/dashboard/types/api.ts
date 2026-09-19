@@ -1,0 +1,18 @@
+/**
+ * Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+import type { components } from 'cmk-shared-typing/typescript/openapi_internal'
+
+export type VisualInfoModel = components['schemas']['VisualInfoModel']
+export type VisualInfoCollectionModel = components['schemas']['VisualInfoCollectionModel']
+
+export type DataSourceCollectionModel = components['schemas']['DataSourceCollectionModel']
+export type DataSourceModel = components['schemas']['DataSourceModel']
+
+export type ViewCollectionModel = components['schemas']['ViewCollectionModel']
+export type ViewModel = components['schemas']['ViewModel']
+
+export type ComputeWidgetTitlesRequest = components['schemas']['ComputeWidgetTitlesRequest']
+export type ComputeWidgetTitlesResponse = components['schemas']['ComputeWidgetTitlesResponse']

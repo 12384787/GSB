@@ -1,0 +1,13 @@
+#!/bin/bash
+set -e
+
+# Yaml creates tags on a regular bases, there are no real "releases".
+# ATTENTION. THIS FILE WILL BE USED LATER after full test in Windows.
+TAG=0.8.0
+
+curl --silent \
+    --show-error \
+    --fail \
+    --location \
+    -o yaml-cpp-${TAG}.tar.gz \
+    https://github.com/jbeder/yaml-cpp/archive/refs/tags/${TAG}.tar.gz

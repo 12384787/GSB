@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+# Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import ipaddress
+import re
+import typing
+
+import cmk.ccc.regex
+from cmk.ccc.hostaddress import HostAddress as CheckmkHostAddress
+from cmk.rulesets.v1 import Message
+from cmk.rulesets.v1.form_specs.validators import LengthInRange, MatchRegex, ValidationError
+
+T = typing.TypeVar("T")
+
+ModelT = typing.TypeVar("ModelT")
+
+ValidatorType = typing.Callable[[ModelT], None]
+
+ID_REGEX: typing.Final = cmk.ccc.regex.regex(cmk.ccc.regex.REGEX_ID, re.ASCII)
+
+
+class EnforceSuffix:
+    def __init__(
+        self,
+        suffix: str,
+        *,
+        case: typing.Literal["ignore", "sensitive"],
+        error_msg: Message = Message("Does not end with %(suffix)s"),
+    ) -> None:
+        self.suffix = suffix
+        self.case = case
+        self.error_msg = error_msg
+
+    def __call__(self, value: str) -> None:
+        if self.case == "ignore":
+            to_check = value.lower()
+            suffix = self.suffix.lower()
+        else:
+            to_check = value
+            suffix = self.suffix
+
+        if not to_check.endswith(suffix):
+            raise ValidationError(self.error_msg % {"suffix": suffix})
+
+
+class IsInteger:
+    def __init__(
+        self,
+        error_msg: Message = Message("Number is not an integer value."),
+    ) -> None:
+        self.error_msg = error_msg
+
+    def __call__(self, value: object) -> None:
+        if not isinstance(value, int):
+            raise ValidationError(self.error_msg)
+
+
+class IsFloat:
+    def __init__(
+        self,
+        error_msg: Message = Message("Number is not a float value."),
+    ) -> None:
+        self.error_msg = error_msg
+
+    def __call__(self, value: object) -> None:
+        if not isinstance(value, float | int):
+            raise ValidationError(self.error_msg)
+
+
+def not_empty(error_msg: Message | None = None) -> LengthInRange:
+    return LengthInRange(
+        min_value=1,
+        error_msg=error_msg
+        if error_msg is not None
+        else Message("An empty value is not allowed here"),
+    )
+
+
+def id_validators(
+    error_msg: Message = Message("The ID cannot be empty."),
+) -> tuple[ValidatorType[str], ...]:
+    """Validators of the ID() valuespec: a non-empty internal identifier."""
+    return (
+        LengthInRange(min_value=1, error_msg=error_msg),
+        MatchRegex(
+            regex=ID_REGEX,
+            error_msg=Message(
+                "An identifier must only consist of letters, digits, dash and "
+                "underscore and it must start with a letter or underscore."
+            ),
+        ),
+    )
+
+
+class HostAddress:
+    """Validator that ensures the validated value is a hostname or IP address.
+
+    It does not resolve the hostname or check if the IP address is reachable.
+    """
+
+    def __init__(
+        self,
+        error_msg: Message = Message("Enter a valid IP address or host name."),
+    ) -> None:
+        self.error_msg = error_msg
+
+    def _validate_ipaddress(self, value: str) -> None:
+        ipaddress.ip_address(value)
+
+    def _validate_hostname(self, value: str) -> None:
+        total_length = len(value)
+        if value.endswith("."):
+            value = value[:-1]
+            total_length -= 1
+
+        if total_length > 253:
+            raise ValidationError(self.error_msg)
+
+        labels = value.split(".")
+
+        if any(len(label) > 63 for label in labels):
+            raise ValidationError(self.error_msg)
+
+        pattern = r"(?!-)[a-z0-9-]{1,63}(?<!-)$"
+        allowed = re.compile(pattern, re.IGNORECASE)
+
+        # TLD must not be all numeric
+        if re.match(r"[0-9]+$", labels[-1]):
+            raise ValidationError(self.error_msg)
+
+        # Check each label
+        for label in labels:
+            if (not label) or (not allowed.match(label)):
+                raise ValidationError(self.error_msg)
+
+    def __call__(self, value: str) -> None:
+        if not value:
+            raise ValidationError(self.error_msg)
+
+        try:
+            self._validate_ipaddress(value)
+            return
+        except ValueError:
+            pass
+
+        self._validate_hostname(value)
+
+
+class HostAddressList:
+    """Validator that ensures all values in a list are valid Checkmk hostnames, IP addresses, or regex patterns.
+    Regex patterns are indicated by a leading ~ character.
+    """
+
+    def __call__(self, value: typing.Sequence[str]) -> None:
+        for hostname in value:
+            if hostname:
+                if hostname.startswith("~"):
+                    try:
+                        re.compile(hostname[1:])
+                    except re.error as e:
+                        raise ValidationError(
+                            Message("Invalid regex pattern: %(error)s") % {"error": str(e)}
+                        )
+                else:
+                    try:
+                        CheckmkHostAddress(hostname)
+                    except ValueError as e:
+                        raise ValidationError(
+                            Message(str(e).title())  # astrein: disable=localization-checker
+                        )
+
+
+def validate_ip_network(value: str) -> None:
+    """Accept what the IPNetwork() valuespec accepted: an IPv4/IPv6 address or network."""
+    errors = []
+    for ip_class in (ipaddress.IPv4Network, ipaddress.IPv6Network):
+        try:
+            ip_class(value)
+            return
+        except ValueError as exc:
+            errors.append(str(exc))
+    raise ValidationError(
+        Message("Invalid host or network address. IPv4: %(e4)s, IPv6: %(e6)s")
+        % {"e4": errors[0], "e6": errors[1]}
+    )

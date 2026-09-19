@@ -1,0 +1,95 @@
+<!--
+Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import CmkChip, { type Colors, type Variants } from 'cmk-ui-library/components/CmkChip.vue'
+import CmkMultitoneIcon from 'cmk-ui-library/components/CmkIcon/CmkMultitoneIcon.vue'
+import type {
+  CmkMultitoneIconColor,
+  CmkMultitoneIconNames,
+  CustomIconColor
+} from 'cmk-ui-library/components/CmkIcon/types'
+
+const props = defineProps<{
+  active?: boolean | undefined
+  activeColor: Colors
+  icon?:
+    | {
+        name: CmkMultitoneIconNames
+        activeColor: CmkMultitoneIconColor | CustomIconColor
+      }
+    | undefined
+}>()
+
+function getColor(): Colors {
+  return props.active ? props.activeColor : 'others'
+}
+
+function getVariant(): Variants {
+  return props.active ? 'fill' : 'outline'
+}
+
+function getIconColor(): CmkMultitoneIconColor | CustomIconColor {
+  return props.active ? props.icon?.activeColor : 'font'
+}
+</script>
+
+<template>
+  <CmkChip
+    class="unified-search-filter-button__button"
+    :class="{ 'unified-search-filter-button--active': props.active }"
+    :aria-pressed="props.active"
+    :color="getColor()"
+    :variant="getVariant()"
+  >
+    <template #start
+      ><CmkMultitoneIcon
+        v-if="icon"
+        :name="icon.name"
+        :primary-color="getIconColor()"
+        class="unified-search-filter-button__icon"
+    /></template>
+    <slot />
+  </CmkChip>
+</template>
+
+<style scoped>
+.unified-search-filter-button__button {
+  padding: 0;
+  margin: 0;
+  border: 1px solid transparent;
+  border-radius: var(--border-radius);
+  background: transparent;
+  font-weight: var(--font-weight-default);
+
+  &:focus-visible {
+    border-color: var(--success);
+  }
+
+  .unified-search-filter-button__chip {
+    border-width: 1px;
+    padding: var(--dimension-3) var(--dimension-4);
+    margin: 0;
+    font-size: var(--font-size-default);
+
+    /* stylelint-disable-next-line checkmk/vue-bem-naming-convention */
+    &.cmk-badge--default {
+      border-color: var(--ux-theme-6);
+    }
+
+    .unified-search-filter-button__icon {
+      margin-right: var(--dimension-3);
+    }
+  }
+
+  &:not(.unified-search-filter-button--active) {
+    &:hover {
+      .unified-search-filter-button__chip {
+        background-color: var(--ux-theme-4);
+      }
+    }
+  }
+}
+</style>

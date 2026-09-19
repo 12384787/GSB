@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+from enum import StrEnum
+from typing import override
+
+from playwright.sync_api import expect, Locator, Page
+
+from tests.system.gui.testlib.playwright.dropdown import DropdownHelper, DropdownOptions
+from tests.system.gui.testlib.playwright.pom.sidebar.base_sidebar import SidebarHelper
+
+# A selection region restricted to one host or service offers that one field instead of the
+# 'Add filter' menu, and the field carries no accessible name of its own.
+_SINGLE_FILTER_SELECTOR = ".db-restricted-to-single-filter__container"
+
+_SUGGESTIONS_SELECTOR = "ul.cmk-suggestions"
+_SUGGESTIONS_FILTER_BOX_SELECTOR = "input[aria-label='filter']"
+
+
+class AddWidgetSidebar(SidebarHelper):
+    """Represents the sidebar to add a new widget to the dashboard.
+
+    To navigate: '{within any customized dashboard} > Add widget'.
+    """
+
+    sidebar_title = "Add widget"
+
+    @property
+    @override
+    def _sidebar_locator(self) -> Locator:
+        """Locator property for the main area of the sidebar."""
+        return self._iframe_locator.get_by_role("dialog", name="Add widget")
+
+    def _get_button_to_add_widget_by_type(self, wizard_class: type[BaseWidgetWizard]) -> Locator:
+        """Get the button to add a new widget.
+
+        Args:
+            wizard_class: the wizard configuring the widget type of the button.
+
+        Returns:
+            The locator of the button to add the given widget type.
+        """
+        return self.locator().get_by_role("button", name=wizard_class.widget_type_name)
+
+    def open_widget_wizard[W: BaseWidgetWizard](self, wizard_class: type[W]) -> W:
+        """Open the wizard to add a new widget.
+
+        Args:
+            wizard_class: the wizard configuring the type of the widget that will be added.
+
+        Returns:
+            The wizard object of the open sidebar.
+        """
+        self._get_button_to_add_widget_by_type(wizard_class).click()
+        wizard = wizard_class(WizardDialogName.ADD_WIDGET, self.page)
+        wizard.expect_to_be_visible()
+        return wizard
+
+
+class ServiceMetricDropdownOptions(DropdownOptions):
+    CPU_UTILIZATION = "CPU utilization"
+    TOTAL_EXECUTION_TIME = "Total execution time"
+
+
+class SiteFilterDropdownOptions(DropdownOptions):
+    LOCAL_SITE_GUI_E2E_CENTRAL = "Local site gui_e2e_central"
+
+
+class VisualizationType(StrEnum):
+    """Enumeration to define the type of visualization that a widget could have."""
+
+    GRAPH = "Graph"
+    METRIC = "Metric"
+    GAUGE = "Gauge"
+    BARPLOT = "Barplot"
+    SCATTERPLOT = "Scatterplot"
+    TOP_LIST = "Top list"
+
+
+class AlertsVisualizationType(StrEnum):
+    """Enumeration of the visualizations the 'Alerts & notifications' widget offers."""
+
+    PERCENTAGE_OF_SERVICE_PROBLEMS = "Percentage of service problems"
+
+
+class WizardDialogName(StrEnum):
+    ADD_WIDGET = "Add widget to dashboard"
+    EDIT_WIDGET = "Edit widget properties"
+
+
+class BaseWidgetWizard(SidebarHelper):
+    """Base class for widget wizard sidebar helpers."""
+
+    # The name the UI gives the widget type when offering it, which is not necessarily the
+    # heading the wizard itself carries.
+    widget_type_name: str
+
+    def __init__(
+        self, wizard_dialog_name: WizardDialogName, page: Page, validate_sidebar: bool = True
+    ) -> None:
+        self._wizard_dialog_name = wizard_dialog_name
+        super().__init__(page, validate_sidebar)
+
+    @property
+    @override
+    def _sidebar_locator(self) -> Locator:
+        """Locator property for the main area of the sidebar."""
+        return self._iframe_locator.get_by_role("dialog", name=self._wizard_dialog_name)
+
+    @property
+    def add_and_place_widget_button(self) -> Locator:
+        """Locator property of 'Add & place widget' button."""
+        return self.locator().get_by_role("button", name="Add & place widget")
+
+
+class MetricsAndGraphsWidgetWizard(BaseWidgetWizard):
+    """Represents the widget wizard sidebar to configure 'Metrics & graphs' widget
+
+    To navigate: '{within any customized dashboard} > Add widget > Metrics & graphs'.
+    """
+
+    widget_type_name = "Metrics & graphs"
+    sidebar_title = "Metrics & graphs"
+
+    @property
+    def _host_selection_region(self) -> Locator:
+        """Locator property of 'Host selection' region."""
+        return self.locator().get_by_role("region", name="Host selection")
+
+    @property
+    def _service_selection_region(self) -> Locator:
+        """Locator property of 'Service selection' region."""
+        return self.locator().get_by_role("region", name="Service selection")
+
+    @property
+    def _metric_selection_region(self) -> Locator:
+        """Locator property of 'Host selection' region."""
+        return self.locator().get_by_role("region", name="Metric selection")
+
+    @property
+    def _available_visualization_type_region(self) -> Locator:
+        """Locator property of 'Available visualization type' region."""
+        return self.locator().get_by_role("region", name="Available visualization type")
+
+    @property
+    def _combobox_text_input(self) -> Locator:
+        """Locator property of the text input to search a value in a combobox."""
+        return self.locator().locator("ul.cmk-suggestions").get_by_role("textbox")
+
+    @property
+    def _host_selection_add_filter_button(self) -> Locator:
+        """Locator property of the button to 'Add filter' to the 'Host selection' region."""
+        return self._host_selection_region.get_by_role("button", name="Add filter")
+
+    @property
+    def service_metric_combobox(self) -> Locator:
+        """Locator property of combobox to select the service metric of the widget."""
+        return self._metric_selection_region.get_by_role("combobox", name="Select service metric")
+
+    @property
+    def next_step_visualization_button(self) -> Locator:
+        """Locator property of 'Next step: Visualization' button."""
+        return self.locator().get_by_role("button", name="Next step: Visualization")
+
+    @property
+    def save_widget_button(self) -> Locator:
+        """Locator property of 'Save widget' button."""
+        return self.locator().get_by_role("button", name="Save widget")
+
+    @property
+    def _add_filter_section(self) -> Locator:
+        """Locator property of 'Add filter' section."""
+        return self._sidebar_locator.get_by_role("region", name="Add filter")
+
+    def _get_filter_menu_item(self, item_name: str, exact: bool) -> Locator:
+        """Get an item from filter menu.
+
+        Args:
+            item_name: the name of the item to get.
+            exact: whether the name match has to be exact or not.
+
+        Returns:
+            The locator of the filter menu item.
+        """
+        return self._add_filter_section.get_by_role("button", name=item_name, exact=exact)
+
+    def get_host_filter_container(self, filter_name: str) -> Locator:
+        """Get the locator of the container of a filter from 'Host selection' region.
+
+        Args:
+            filter_name: the name of the filter of the container.
+
+        Returns:
+            The locator of the filter container.
+        """
+        return self._host_selection_region.get_by_role("group", name=filter_name)
+
+    def get_host_filter_combobox(self, filter_name: str) -> Locator:
+        """Get the locator of the combobox to set a host filter for the widget.
+
+        Args:
+            filter_name: the name of the filter that is set by the combobox.
+
+        Returns:
+            The locator of the combobox.
+        """
+        return self.get_host_filter_container(filter_name).get_by_role("combobox")
+
+    def get_service_filter_container(self, filter_name: str) -> Locator:
+        """Get the locator of the containe of a filter from 'Service selection' region.
+
+        Args:
+            filter_name: the name of the filter of the container.
+
+        Returns:
+            The locator of the filter container.
+        """
+        return self._service_selection_region.get_by_role("group", name=filter_name)
+
+    def get_service_filter_combobox(self, filter_name: str) -> Locator:
+        """Get the locator of the combobox to set a service filter for the widget.
+
+        Args:
+            filter_name: the name of the filter that is set by the combobox.
+
+        Returns:
+            The locator of the combobox.
+        """
+        return self.get_service_filter_container(filter_name).get_by_role("combobox")
+
+    def select_visualization_type(self, visualization_type: VisualizationType) -> None:
+        """Select the type of visualization for the widget.
+
+        Args:
+            visualization_type: type of visualization to select.
+        """
+        self._available_visualization_type_region.get_by_role(
+            "button", name=visualization_type
+        ).click()
+
+    def select_dropdown_option[T: DropdownOptions](
+        self,
+        dropdown_name: str,
+        dropdown: Locator,
+        option: T,
+        text_input: Locator | None = None,
+    ) -> None:
+        """Select a dropdown option from a combobox of the wizard.
+
+        Args:
+            dropdown_name: the name of the dropdown for debugging.
+            dropdown: the locator of the dropdown.
+            option: the option to select.
+            text_input: the text input locator if search to filter options will be made.
+        """
+        dropdown_helper = DropdownHelper[T](
+            dropdown_name=dropdown_name,
+            dropdown_box=dropdown,
+            dropdown_list=self.locator().locator("ul.cmk-suggestions"),
+            text_input_filter=text_input,
+        )
+        dropdown_helper.select_option(option, search=(text_input is not None))
+
+    def select_service_metric(
+        self, metric_name: ServiceMetricDropdownOptions, search: bool = True
+    ) -> None:
+        """Select the service metric to use in the widget.
+
+        Args:
+            metric_name: name of the metric to choose.
+            search: whether search to filter options will be made or not.
+        """
+        self.select_dropdown_option(
+            "Service metric",
+            self.service_metric_combobox,
+            metric_name,
+            self._combobox_text_input if search else None,
+        )
+
+    def select_single_host(self, host_name: str) -> None:
+        """Restrict the widget to one host, in a region offering a single host.
+
+        Args:
+            host_name: the host to restrict the widget to.
+        """
+        self._select_single_object(self._host_selection_region, "host", host_name)
+
+    def select_single_service(self, service_name: str) -> None:
+        """Restrict the widget to one service, in a region offering a single service.
+
+        Args:
+            service_name: the service to restrict the widget to.
+        """
+        self._select_single_object(self._service_selection_region, "service", service_name)
+
+    def _select_single_object(self, region: Locator, object_type: str, value: str) -> None:
+        """Reveal the one field a restricted region offers and pick `value` in it."""
+        # Not an exact match: the button's icon is an <img> without alt text, which some
+        # engines still fold into the accessible name.
+        region.get_by_role("button", name=f"Add {object_type} name").click()
+        field = region.locator(_SINGLE_FILTER_SELECTOR).get_by_role("combobox")
+        expect(field, message=f"No field to name a single {object_type} appeared").to_be_visible()
+        field.click()
+
+        suggestions = self.locator().locator(_SUGGESTIONS_SELECTOR)
+        expect(suggestions, message=f"No list opened to offer {value!r}").to_be_visible()
+        # Unqueried, the field offers every host/service there is and the backend caps how
+        # many it returns, so narrow the list before picking out of it.
+        filter_box = suggestions.locator(_SUGGESTIONS_FILTER_BOX_SELECTOR)
+        expect(
+            filter_box, message=f"The field offering {value!r} never showed its filter box"
+        ).to_be_visible()
+        filter_box.fill(value)
+        option = suggestions.locator(f"[role='option'][aria-label='{value}']")
+        expect(option, message=f"No {object_type} named {value!r} was offered").to_be_visible()
+        option.click()
+        # A region that did not take the value leaves the metric list empty, which reads as a
+        # missing metric rather than a missing host or service.
+        expect(
+            field, message=f"The region still does not show {value!r} after it was picked"
+        ).to_contain_text(value)
+
+    def add_filter_to_host_selection(self, filter_name: str, sub_menu: str | None = None) -> None:
+        """Add filter to widget in host selection region.
+
+        Args:
+            filter_name: name of the filter to add.
+            exact: whether the name match has to be exact or not.
+        """
+        self._host_selection_add_filter_button.click()
+        expect(
+            self._add_filter_section, message="'Add filter' section is not visible"
+        ).to_be_visible()
+
+        filter_menu_item = self._get_filter_menu_item(filter_name, exact=True)
+
+        if sub_menu is not None and not filter_menu_item.is_visible():
+            self._add_filter_section.get_by_role("button", name=sub_menu).click()
+            expect(
+                filter_menu_item,
+                message=f"Filter menu item '{filter_name}' not visible",
+            ).to_be_visible()
+
+        filter_menu_item.click()
+
+    def remove_filter_from_host_selection(self, filter_name: str) -> None:
+        """Remove filter from host selection region.
+
+        Args:
+            filter_name: name of the filter to remove.
+        """
+        self._host_selection_region.get_by_role(
+            "button", name=f"Remove {filter_name} filter"
+        ).click()
+
+
+class AlertsAndNotificationsWidgetWizard(BaseWidgetWizard):
+    """Represents the widget wizard sidebar to configure an 'Alerts & notifications' widget.
+
+    To navigate: '{within any customized dashboard} > Add widget > Alerts & notifications'.
+    """
+
+    widget_type_name = "Alerts & notifications"
+    # The heading names the widget in the singular, unlike the tile that opens the wizard.
+    sidebar_title = "Alert & Notification"
+
+    @property
+    def _available_visualization_types_region(self) -> Locator:
+        """Locator property of 'Available visualization types' region."""
+        return self.locator().get_by_role("region", name="Available visualization types")
+
+    def select_visualization_type(self, visualization_type: AlertsVisualizationType) -> None:
+        """Select the type of visualization for the widget.
+
+        Args:
+            visualization_type: type of visualization to select.
+        """
+        self._available_visualization_types_region.get_by_role(
+            "button", name=visualization_type
+        ).click()

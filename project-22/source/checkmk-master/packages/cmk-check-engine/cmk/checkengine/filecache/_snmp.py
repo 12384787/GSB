@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+import ast
+from typing import override
+
+from cmk.checkengine.snmplib import SNMPRawData, SNMPSectionMarker
+
+from ._cache import FileCache
+
+__all__ = ["SNMPFileCache"]
+
+
+class SNMPFileCache(FileCache[SNMPRawData]):
+    @staticmethod
+    @override
+    def _from_cache_file(raw_data: bytes) -> SNMPRawData:
+        return {
+            SNMPSectionMarker(k): v for k, v in ast.literal_eval(raw_data.decode("utf-8")).items()
+        }
+
+    @staticmethod
+    @override
+    def _to_cache_file(raw_data: SNMPRawData) -> bytes:
+        return (repr({str(k): v for k, v in raw_data.items()}) + "\n").encode("utf-8")

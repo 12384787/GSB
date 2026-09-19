@@ -1,0 +1,88 @@
+<!--
+Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script lang="ts">
+import { type PanelConfigFor } from '@ucl/_ucl/components/detail-page'
+
+import codeExample from './UclCmkHelpTextCodeExample.vue?raw'
+
+export const a11yData = [
+  {
+    keys: ['Tab'],
+    description:
+      'Moves keyboard focus to the button or link element (if not disabled). While the focus outline is hidden from view, its underlying functionality remains intact.'
+  },
+  {
+    keys: [['Shift', 'Tab']],
+    description: 'Moves focus to the button from the next focusable element in reverse order.'
+  },
+  {
+    keys: ['Enter', 'Space'],
+    description: 'Opens the help text.'
+  },
+  {
+    keys: ['Escape'],
+    description: 'Closes the tooltip if it is currently open.'
+  }
+]
+
+export const panelConfig = {
+  help: {
+    type: 'string' as const,
+    title: 'Help',
+    initialState: 'This is a short, precise contextual help text.'
+  },
+  ariaLabel: {
+    type: 'string' as const,
+    title: 'Custom Aria Label',
+    initialState: 'Help regarding this setting'
+  },
+  usePortal: {
+    type: 'boolean' as const,
+    title: 'Render popup at the document root',
+    initialState: false
+  }
+} satisfies PanelConfigFor<typeof CmkHelpText>
+</script>
+
+<script setup lang="ts">
+import {
+  PanelStateCreator,
+  UclDetailPageAccessibility,
+  UclDetailPageCodeExample,
+  UclDetailPageComponent,
+  UclDetailPageHeader,
+  UclDetailPageLayout,
+  UclPropertiesPanel
+} from '@ucl/_ucl/components/detail-page'
+import CmkHelpText from 'cmk-ui-library/components/CmkHelpText.vue'
+
+defineProps<{ screenshotMode: boolean }>()
+
+const propState = new PanelStateCreator<typeof CmkHelpText>().createRef(panelConfig)
+</script>
+
+<template>
+  <UclDetailPageLayout>
+    <UclDetailPageHeader>CmkHelpText</UclDetailPageHeader>
+
+    <UclDetailPageComponent>
+      <span> Example Configuration Field </span>
+      <CmkHelpText
+        :help="propState.help"
+        :aria-label="propState.ariaLabel"
+        :use-portal="propState.usePortal"
+      />
+
+      <template #properties>
+        <UclPropertiesPanel v-model="propState" :config="panelConfig" />
+      </template>
+    </UclDetailPageComponent>
+
+    <UclDetailPageCodeExample :code="codeExample" />
+
+    <UclDetailPageAccessibility :data="a11yData" />
+  </UclDetailPageLayout>
+</template>

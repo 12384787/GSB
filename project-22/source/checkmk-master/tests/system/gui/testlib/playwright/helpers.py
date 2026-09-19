@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+# mypy: disable-error-code="type-arg"
+
+"""Wrapper for a page, with some often used functionality"""
+
+import re
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
+from pprint import pformat
+from re import Pattern
+from typing import Any, NamedTuple
+from urllib.parse import quote_plus
+
+from playwright.sync_api import Error, expect, Frame, FrameLocator, Locator, Page
+from playwright.sync_api import TimeoutError as PWTimeoutError
+
+
+def url_suffix_regex(url_suffix: str) -> Pattern[str]:
+    """Compile a regex matching a URL suffix on both new and old Checkmk sites.
+
+    Post-iframe-removal sites navigate straight to the target page, so the
+    address bar shows the suffix verbatim (``wato.py?mode=licensing``). Older
+    sites reached in mixed-version distributed tests still wrap the page in the
+    main iframe, so the top URL is the percent-encoded ``index.py?start_url=...``
+    form (``wato.py%3Fmode%3Dlicensing``). Match either form.
+    """
+    return re.compile(f"{re.escape(url_suffix)}|{re.escape(quote_plus(url_suffix))}")
+
+
+class LocatorHelper(ABC):
+    """Base class for helper classes for certain page elements"""
+
+    def __init__(self, page: Page) -> None:
+        self.page = page
+
+    def _build_locator_kwargs(
+        self,
+        *,
+        has_text: Pattern[str] | str | None = None,
+        has_not_text: Pattern[str] | str | None = None,
+        has: Locator | None = None,
+        has_not: Locator | None = None,
+    ) -> dict[str, Any]:
+        """Build kwargs for the locator method."""
+        return {
+            k: v
+            for k, v in {
+                "has_text": has_text,
+                "has_not_text": has_not_text,
+                "has": has,
+                "has_not": has_not,
+            }.items()
+            if v is not None
+        }
+
+    @property
+    def _iframe_locator(self) -> Page:
+        return self.page
+
+    @abstractmethod
+    def locator(
+        self,
+        selector: str | None = None,
+        *,
+        has_text: Pattern[str] | str | None = None,
+        has_not_text: Pattern[str] | str | None = None,
+        has: Locator | None = None,
+        has_not: Locator | None = None,
+    ) -> Locator:
+        """Return locator for the component of the page.
+
+        Arguments and keyword arguments must match to ones' of Playwright's `Locator.locator`
+        method.
+        """
+
+    def expect_to_be_visible(self) -> None:
+        expect(
+            self.locator(), message=f"{self.__class__.__name__} main element is not visible"
+        ).to_be_visible()
+
+    def expect_to_be_hidden(self) -> None:
+        expect(
+            self.locator(), message=f"{self.__class__.__name__} main element is not hidden"
+        ).to_be_hidden()
+
+    def check_success(self, message: str | Pattern) -> None:
+        """Check for a success div and its content"""
+        expect(self.locator("div.success")).to_have_text(message)
+
+    def check_error(self, message: str | Pattern) -> None:
+        """Check for an error div and its content"""
+        expect(self.locator("div.error"), "Invalid text in the error message box.").to_have_text(
+            message
+        )
+
+    def get_error_text(self) -> str | None:
+        """Get error text content"""
+        return self.locator("div.error").text_content()
+
+    def check_warning(self, message: str | Pattern) -> None:
+        """Check for a warning div and its content"""
+        expect(self.locator("div.warning")).to_have_text(message)
+
+    def get_input(self, input_name: str) -> Locator:
+        return self.locator(f'input[name="{input_name}"]')
+
+    def get_input_by_id(self, input_id: str) -> Locator:
+        return self.locator(f'input[id="{input_id}"]')
+
+    def get_suggestion(self, suggestion: str) -> Locator:
+        return self.locator("#suggestions .suggestion").filter(has_text=re.compile(suggestion))
+
+    def get_text(
+        self, text: str, is_visible: bool = True, exact: bool = True, first: bool = True
+    ) -> Locator:
+        is_visible_str = ">> visible=true" if is_visible else ""
+        wrap_text = f"'{text}'" if exact else text
+        locator = self.locator(f"text={wrap_text} {is_visible_str}")
+        return locator.first if first else locator
+
+    def get_element_including_texts(self, element_id: str, texts: list[str]) -> Locator:
+        has_text_str = "".join([f":has-text('{t}')" for t in texts])
+        return self.locator(f"#{element_id}{has_text_str}")
+
+    def get_link_from_title(self, title: str) -> Locator:
+        return self.locator(f"a[title='{title}']")
+
+    def get_attribute_label(self, attribute: str) -> Locator:
+        return self.locator(f"#attr_{attribute} label")
+
+    def get_frame_locator(self, frame_selector: str) -> FrameLocator:
+        return self.page.frame_locator(frame_selector)
+
+    def click_and_wait(
+        self,
+        locator: Frame | Locator | Page,
+        navigate: bool = False,
+        expected_locator: Locator | None = None,
+        reload_on_error: bool = False,
+        max_tries: int = 10,
+        **click_kwargs: dict[str, bool | float | int | str] | None,
+    ) -> None:
+        """Wait until the specified locator could be clicked.
+
+        After a successful click, wait until the current URL has changed and is loaded
+        or an expected locator is found.
+        """
+        latest_excp: Exception
+        _page = locator if isinstance(locator, Page) else locator.page
+        url = _page.url
+        clicked = False
+
+        for _ in range(max_tries):
+            if not clicked:
+                try:
+                    locator.click(**click_kwargs)  # type: ignore[arg-type]
+                    clicked = True
+                except PWTimeoutError as excp:
+                    latest_excp = excp
+
+            if clicked:
+                _page.wait_for_load_state(state="load")
+                try:
+                    if navigate:
+                        expect(_page).not_to_have_url(url)
+                    if expected_locator:
+                        expect(expected_locator).to_be_visible()
+                    return
+                except AssertionError as excp:
+                    latest_excp = excp
+
+            try:
+                if reload_on_error:
+                    self.page.reload(wait_until="load")
+            except Error as excp:
+                latest_excp = excp
+                continue
+
+        raise AssertionError(
+            "Current URL did not change; expected locator not found or page failed to reload."
+            f"Latest exception:\n{pformat(latest_excp)}\n"
+        )
+
+    def _unique_web_element(self, web_element: Locator) -> None:
+        """Validate the web selector under consideration is unique."""
+        expect(web_element).to_be_visible()
+        expect(web_element).to_have_count(1)
+
+
+class Keys(Enum):
+    """Keys to control the virtual keyboard in playwright."""
+
+    Enter = "Enter"
+    Escape = "Escape"
+    ArrowUp = "ArrowUp"
+    ArrowDown = "ArrowDown"
+    ArrowLeft = "ArrowLeft"
+    ArrowRight = "ArrowRight"
+
+
+class CmkCredentials(NamedTuple):
+    """Credentials to a Checkmk site."""
+
+    username: str
+    password: str
+
+
+@dataclass
+class DropdownListNameToID:
+    """Common Checkmk UI mapping between `dropdown list`s and `menu ID`s."""
+
+    Commands: str = "menu_commands"
+    Display: str = "menu_display"
+    Export: str = "menu_export"
+    Help: str = "menu_help"
+    Related: str = "menu_related"

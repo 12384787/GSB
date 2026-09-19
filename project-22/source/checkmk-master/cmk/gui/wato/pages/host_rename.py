@@ -1,0 +1,643 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+# mypy: disable-error-code="no-any-return"
+# mypy: disable-error-code="type-arg"
+
+"""Modes for renaming one or multiple existing hosts"""
+
+import socket
+from collections.abc import Collection, Iterable, Sequence
+from typing import Any, override
+
+from cmk.ccc.exceptions import MKGeneralException
+from cmk.ccc.hostaddress import HostName
+from cmk.ccc.regex import regex
+from cmk.ccc.version import Edition
+from cmk.gui import forms
+from cmk.gui.background_job.job import InitialStatusArgs, JobTarget
+from cmk.gui.breadcrumb import Breadcrumb
+from cmk.gui.config import Config
+from cmk.gui.exceptions import FinalizeRequest, MKAuthException, MKUserError
+from cmk.gui.htmllib.generator import HTMLWriter
+from cmk.gui.htmllib.html import html
+from cmk.gui.htmllib.type_defs import RequireConfirmation
+from cmk.gui.http import request
+from cmk.gui.i18n import _, ungettext
+from cmk.gui.logged_in import user
+from cmk.gui.page_menu import (
+    make_simple_form_page_menu,
+    make_simple_link,
+    PageMenu,
+    PageMenuDropdown,
+    PageMenuEntry,
+    PageMenuTopic,
+)
+from cmk.gui.pages import PageContext
+from cmk.gui.type_defs import ActionResult
+from cmk.gui.utils.confirm_with_preview import confirm_with_preview
+from cmk.gui.utils.csrf_token import check_csrf_token
+from cmk.gui.utils.roles import UserPermissionSerializableConfig
+from cmk.gui.valuespec import (
+    CascadingDropdown,
+    Checkbox,
+    Dictionary,
+    DropdownChoice,
+    Hostname,
+    ListOf,
+    RegExp,
+    TextInput,
+    Tuple,
+)
+from cmk.gui.wato.pages._html_elements import wato_html_head
+from cmk.gui.wato.pages.folders import ModeFolder
+from cmk.gui.wato.pages.hosts import ModeEditHost, page_menu_host_entries
+from cmk.gui.watolib.activate_changes import ActivateChanges
+from cmk.gui.watolib.configuration_bundle_store import is_locked_by_config_bundle
+from cmk.gui.watolib.host_rename import (
+    rename_hosts_job_entry_point,
+    RenameHostBackgroundJob,
+    RenameHostsBackgroundJob,
+    RenameHostsJobArgs,
+)
+from cmk.gui.watolib.hosts_and_folders import (
+    Folder,
+    folder_from_request,
+    folder_tree,
+    FolderTree,
+    validate_host_uniqueness,
+)
+from cmk.gui.watolib.mode import ModeRegistry, redirect, WatoMode
+from cmk.web.utils.flashed_messages import flash
+from cmk.web.utils.html import HTML
+from cmk.web.utils.icons import IconNames, StaticIcon
+from cmk.web.utils.permission_verification import PermissionName
+
+
+def register(mode_registry: ModeRegistry) -> None:
+    mode_registry.register(ModeBulkRenameHost)
+    mode_registry.register(ModeRenameHost)
+
+
+class HostRenamingException(MKGeneralException):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+class ModeBulkRenameHost(WatoMode):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "bulk_rename_host"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["hosts", "manage_hosts"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeFolder
+
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx)
+
+        if not user.may("wato.rename_hosts"):
+            raise MKGeneralException(_("You don't have the right to rename hosts"))
+
+    @override
+    def title(self) -> str:
+        return _("Bulk renaming of hosts")
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        menu = make_simple_form_page_menu(
+            _("Hosts"),
+            breadcrumb,
+            form_name="bulk_rename_host",
+            button_name="_save",
+            save_title=_("Bulk rename"),
+        )
+
+        host_renaming_job = RenameHostsBackgroundJob()
+        actions_dropdown = menu.dropdowns[0]
+        actions_dropdown.topics.append(
+            PageMenuTopic(
+                title=_("Last result"),
+                entries=[
+                    PageMenuEntry(
+                        title=_("Show last rename result"),
+                        icon_name=StaticIcon(IconNames.background_job_details),
+                        item=make_simple_link(host_renaming_job.detail_url()),
+                        is_enabled=host_renaming_job.is_available(),
+                    ),
+                ],
+            )
+        )
+
+        return menu
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        check_csrf_token()
+
+        renaming_config = self._vs_renaming_config().from_html_vars("")
+        self._vs_renaming_config().validate_value(renaming_config, "")
+        try:
+            renamings = self._collect_host_renamings(folder_tree(), renaming_config)
+        except HostRenamingException as e:
+            flash(e.message)
+            return None
+
+        message = HTMLWriter.render_b(
+            _(
+                "Do you really want to rename the following hosts? "
+                "This involves a restart of the monitoring core and blocks %(discard_changes)s "
+                "until the next activation!"
+            )
+            % {"discard_changes": HTMLWriter.render_tt("Discard Changes")}
+        )
+
+        rows = []
+        for _folder, host_name, target_name in renamings:
+            rows.append(
+                HTMLWriter.render_tr(
+                    HTMLWriter.render_td(host_name) + HTMLWriter.render_td(" → %s" % target_name)
+                )
+            )
+        message += HTMLWriter.render_table(HTML.empty().join(rows))
+
+        nr_rename = len(renamings)
+        c = _confirm(
+            _("Confirm renaming of %(nr_rename)d %(hosts)s")
+            % {"nr_rename": nr_rename, "hosts": ungettext("host", "hosts", nr_rename)},
+            message,
+        )
+        if c:
+            title = _("Renaming of %(renamings)s") % {
+                "renamings": ", ".join("%s → %s" % x[1:] for x in renamings)
+            }
+            host_renaming_job = RenameHostsBackgroundJob()
+            if (
+                result := host_renaming_job.start(
+                    JobTarget(
+                        callable=rename_hosts_job_entry_point,
+                        args=RenameHostsJobArgs(
+                            renamings=_renamings_to_job_args(renamings),
+                            custom_user_attributes=config.wato_user_attrs,
+                            user_connections=config.user_connections,
+                            site_configs=config.sites,
+                            user_permission_config=UserPermissionSerializableConfig.from_global_config(
+                                config
+                            ),
+                            pprint_value=config.wato_pprint_config,
+                            use_git=config.wato_use_git,
+                            debug=config.debug,
+                        ),
+                    ),
+                    InitialStatusArgs(
+                        title=title,
+                        lock_wato=True,
+                        stoppable=False,
+                        estimated_duration=host_renaming_job.get_status().duration,
+                        user=str(user.id) if user.id else None,
+                    ),
+                )
+            ).is_error():
+                raise MKGeneralException(str(result.error))
+
+            return redirect(host_renaming_job.detail_url())
+        if c is False:  # not yet confirmed
+            return FinalizeRequest(code=200)
+        return None  # browser reload
+
+    @staticmethod
+    def _format_renamings_warning(message: str, values: Iterable[str]) -> str:
+        values_list = "".join(f"<li>{value}</li>" for value in sorted(values))
+        return f"<b>{message}</b><ul>{values_list}</ul>"
+
+    def _validate_renamings(
+        self, tree: FolderTree, renamings: list[tuple[Folder, HostName, str]]
+    ) -> list[tuple[Folder, HostName, HostName]]:
+        """Check if the new names are valid host names and do not collide with existing hosts.
+        Return a new list of renamings."""
+        invalid_names = set()
+        name_collisions = set()
+        seen_names = set()
+        locked_by_quick_setup = set()
+        all_host_names = tree.all_hosts().keys()
+        updated_renamings = []
+        for folder, old_name, new_name in renamings:
+            if new_name in seen_names or new_name in all_host_names:
+                name_collisions.add(new_name)
+            seen_names.add(new_name)
+            try:
+                updated_renamings.append((folder, old_name, HostName(new_name)))
+            except ValueError:
+                invalid_names.add(new_name)
+
+            if (host := folder.host(old_name)) and is_locked_by_config_bundle(host.locked_by()):
+                locked_by_quick_setup.add(old_name)
+
+        warning = ""
+        if invalid_names:
+            warning += self._format_renamings_warning(
+                _("You cannot do this renaming since the following host names would be invalid:"),
+                invalid_names,
+            )
+        if name_collisions:
+            warning += self._format_renamings_warning(
+                _("You cannot do this renaming since the following host names would collide:"),
+                name_collisions,
+            )
+        if locked_by_quick_setup:
+            warning += self._format_renamings_warning(
+                _(
+                    "You cannot do this renaming since the following hosts are locked by "
+                    "Quick Setup:"
+                ),
+                locked_by_quick_setup,
+            )
+        if warning:
+            raise HostRenamingException(warning)
+
+        return updated_renamings
+
+    def _collect_host_renamings(
+        self, tree: FolderTree, renaming_config: dict[str, Any]
+    ) -> list[tuple[Folder, HostName, HostName]]:
+        unchecked = self._recurse_hosts_for_renaming(
+            folder_from_request(tree, request.var("folder"), request.get_ascii_input("host")),
+            renaming_config,
+        )
+        if not unchecked:
+            raise HostRenamingException(_("No matching host names"))
+
+        return self._validate_renamings(tree, unchecked)
+
+    def _recurse_hosts_for_renaming(
+        self, folder: Folder, renaming_config: dict[str, Any]
+    ) -> list[tuple[Folder, HostName, str]]:
+        entries = []
+        for host_name, host in folder.hosts().items():
+            target_name = self._host_renamed_into(host_name, renaming_config)
+            if target_name and host.permissions.may("write", user):
+                entries.append((folder, host_name, target_name))
+        if renaming_config["recurse"]:
+            for subfolder in folder.subfolders():
+                entries += self._recurse_hosts_for_renaming(subfolder, renaming_config)
+        return entries
+
+    def _host_renamed_into(self, hostname: str, renaming_config: dict[str, Any]) -> str | None:
+        prefix_regex = regex(renaming_config["match_hostname"])
+        if not prefix_regex.match(hostname):
+            return None
+
+        new_hostname = hostname
+        for operation in renaming_config["renamings"]:
+            if (result := self._host_renaming_operation(operation, new_hostname)) is not None:
+                new_hostname = result
+            else:
+                return None
+
+        if new_hostname != hostname:
+            return new_hostname
+        return None
+
+    def _host_renaming_operation(self, operation: Any, hostname: str) -> str | None:
+        if operation == "drop_domain":
+            return hostname.split(".", 1)[0]
+        if operation == "reverse_dns":
+            try:
+                return socket.gethostbyaddr(hostname)[0]
+            except Exception:
+                return hostname
+        if operation == ("case", "upper"):
+            return hostname.upper()
+        if operation == ("case", "lower"):
+            return hostname.lower()
+        if operation[0] == "add_suffix":
+            return hostname + operation[1]
+        if operation[0] == "add_prefix":
+            return operation[1] + hostname
+        if operation[0] == "explicit":
+            old_name, new_name = operation[1]
+            if old_name == hostname:
+                return new_name
+            return hostname
+        if operation[0] == "regex":
+            match_regex, new_name = operation[1]
+            match = regex(match_regex).match(hostname)
+            if match:
+                for nr, group in enumerate(match.groups()):
+                    new_name = new_name.replace("\\%d" % (nr + 1), group)
+                return new_name.replace("\\0", hostname)
+            return hostname
+        return None
+
+    @override
+    def page(self, config: Config) -> None:
+        with html.form_context("bulk_rename_host", method="POST"):
+            self._vs_renaming_config().render_input("", {})
+            html.hidden_fields()
+
+    def _vs_renaming_config(self) -> Dictionary:
+        return Dictionary(
+            title=_("Bulk renaming"),
+            render="form",
+            elements=[
+                (
+                    "recurse",
+                    Checkbox(
+                        title=_("Folder selection"),
+                        label=_("Include all subfolders"),
+                        default_value=True,
+                    ),
+                ),
+                (
+                    "match_hostname",
+                    RegExp(
+                        title=_("Host name matching"),
+                        help=_(
+                            "Only rename host names whose names <i>begin</i> with the regular expression entered here."
+                        ),
+                        mode=RegExp.complete,
+                    ),
+                ),
+                (
+                    "renamings",
+                    ListOf(
+                        valuespec=self._vs_host_renaming(),
+                        title=_("Renaming operations"),
+                        add_label=_("Add renaming"),
+                        allow_empty=False,
+                    ),
+                ),
+            ],
+            optional_keys=[],
+        )
+
+    def _vs_host_renaming(self) -> CascadingDropdown:
+        return CascadingDropdown(
+            orientation="horizontal",
+            choices=[
+                (
+                    "case",
+                    _("Case translation"),
+                    DropdownChoice(
+                        choices=[
+                            ("upper", _("Convert host names to upper case")),
+                            ("lower", _("Convert host names to lower case")),
+                        ]
+                    ),
+                ),
+                ("add_suffix", _("Add Suffix"), TextInput(allow_empty=False, size=38)),
+                ("add_prefix", _("Add Prefix"), TextInput(allow_empty=False, size=38)),
+                ("drop_domain", _("Drop Domain Suffix")),
+                ("reverse_dns", _("Convert IP addresses of hosts into host their DNS names")),
+                (
+                    "regex",
+                    _("Regular expression substitution"),
+                    Tuple(
+                        help=_(
+                            "Please specify a regular expression in the first field. This expression should at "
+                            "least contain one subexpression exclosed in brackets - for example <tt>vm_(.*)_prod</tt>. "
+                            "In the second field you specify the translated host name and can refer to the first matched "
+                            "group with <tt>\\1</tt>, the second with <tt>\\2</tt> and so on, for example <tt>\\1.example.org</tt>"
+                        ),
+                        elements=[
+                            RegExp(
+                                title=_("Regular expression for the beginning of the host name"),
+                                help=_("Must contain at least one subgroup <tt>(...)</tt>"),
+                                mingroups=0,
+                                maxgroups=9,
+                                size=30,
+                                allow_empty=False,
+                                mode=RegExp.prefix,
+                            ),
+                            TextInput(
+                                title=_("Replacement"),
+                                help=_(
+                                    "Use <tt>\\1</tt>, <tt>\\2</tt> etc. to replace matched subgroups, <tt>\\0</tt> to insert to original host name"
+                                ),
+                                size=30,
+                                allow_empty=False,
+                            ),
+                        ],
+                    ),
+                ),
+                (
+                    "explicit",
+                    _("Explicit renaming"),
+                    Tuple(
+                        orientation="horizontal",
+                        elements=[
+                            Hostname(title=_("current host name"), allow_empty=False),
+                            Hostname(title=_("new host name"), allow_empty=False),
+                        ],
+                    ),
+                ),
+            ],
+        )
+
+
+def _confirm(html_title: str, message: str | HTML) -> bool | None:
+    if not request.has_var("_do_confirm") and not request.has_var("_do_actions"):
+        # TODO: get the breadcrumb from all call sites
+        wato_html_head(title=html_title, breadcrumb=Breadcrumb())
+    confirm_options = [(_("Confirm"), "_do_confirm")]
+    return confirm_with_preview(message, confirm_options)
+
+
+class ModeRenameHost(WatoMode):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "rename_host"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["hosts", "manage_hosts"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeEditHost
+
+    @override
+    def _from_vars(self) -> None:
+        host_name = request.get_validated_type_input_mandatory(HostName, "host")
+
+        self._tree = folder_tree()
+        folder = folder_from_request(self._tree, request.var("folder"), host_name)
+        if not folder.has_host(host_name):
+            raise MKUserError("host", _("You called this page with an invalid host name."))
+
+        if not user.may("wato.rename_hosts"):
+            raise MKAuthException(_("You don't have the right to rename hosts"))
+
+        self._host = folder.load_host(host_name)
+        self._host.permissions.need_permission("write", user)
+
+    @override
+    def title(self) -> str:
+        return _("Rename %(host_type)s %(host_name)s") % {
+            "host_type": _("Cluster") if self._host.is_cluster() else _("Host"),
+            "host_name": self._host.name(),
+        }
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        menu = make_simple_form_page_menu(
+            _("Host"),
+            breadcrumb,
+            form_name="rename_host",
+            button_name="_save",
+            save_title=_("Rename"),
+        )
+
+        host_renaming_job = RenameHostsBackgroundJob()
+        actions_dropdown = menu.dropdowns[0]
+        actions_dropdown.topics.append(
+            PageMenuTopic(
+                title=_("Last result"),
+                entries=[
+                    PageMenuEntry(
+                        title=_("Show last rename result"),
+                        icon_name=StaticIcon(IconNames.background_job_details),
+                        item=make_simple_link(host_renaming_job.detail_url()),
+                        is_enabled=host_renaming_job.is_available(),
+                    ),
+                ],
+            )
+        )
+
+        menu.dropdowns.append(
+            PageMenuDropdown(
+                name="hosts",
+                title=_("Hosts"),
+                topics=[
+                    PageMenuTopic(
+                        title=_("For this host"),
+                        entries=list(page_menu_host_entries(self.name(), self._host)),
+                    ),
+                ],
+            )
+        )
+
+        return menu
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        renamed_host_site = self._host.site_id()
+        if ActivateChanges.get_pending_changes_info(list(config.sites)).has_changes():
+            raise MKUserError(
+                "newname",
+                _(
+                    "You cannot rename a host while you have "
+                    "pending changes on the site the host is monitored on (%(renamed_host_site)s)."
+                )
+                % {"renamed_host_site": renamed_host_site},
+            )
+        if is_locked_by_config_bundle(self._host.locked_by()):
+            raise MKUserError(
+                "host",
+                _('You cannot rename host "%(host_name)s", because it is managed by Quick Setup.')
+                % {"host_name": self._host.name()},
+            )
+
+        newname = request.get_validated_type_input_mandatory(HostName, "newname")
+        folder = folder_from_request(
+            self._tree, request.var("folder"), request.get_ascii_input("host")
+        )
+        self._check_new_host_name(self._tree, folder, "newname", newname)
+        # Creating pending entry. That makes the site dirty and that will force a sync of
+        # the config to that site before the automation is being done.
+        host_renaming_job = RenameHostBackgroundJob(self._host)
+        renamings = [(folder, self._host.name(), newname)]
+
+        if (
+            result := host_renaming_job.start(
+                JobTarget(
+                    callable=rename_hosts_job_entry_point,
+                    args=RenameHostsJobArgs(
+                        renamings=_renamings_to_job_args(renamings),
+                        custom_user_attributes=config.wato_user_attrs,
+                        user_connections=config.user_connections,
+                        site_configs=config.sites,
+                        user_permission_config=UserPermissionSerializableConfig.from_global_config(
+                            config
+                        ),
+                        pprint_value=config.wato_pprint_config,
+                        use_git=config.wato_use_git,
+                        debug=config.debug,
+                    ),
+                ),
+                InitialStatusArgs(
+                    title=_("Renaming of %(old_name)s -> %(new_name)s")
+                    % {"old_name": self._host.name(), "new_name": newname},
+                    lock_wato=True,
+                    stoppable=False,
+                    estimated_duration=host_renaming_job.get_status().duration,
+                    user=str(user.id) if user.id else None,
+                ),
+            )
+        ).is_error():
+            raise MKGeneralException(str(result.error))
+
+        return redirect(host_renaming_job.detail_url())
+
+    def _check_new_host_name(
+        self, tree: FolderTree, folder: Folder, varname: str, host_name: HostName
+    ) -> None:
+        if not host_name:
+            raise MKUserError(varname, _("Please specify a host name."))
+        if folder.has_host(host_name):
+            raise MKUserError(varname, _("A host with this name already exists in this folder."))
+        validate_host_uniqueness(tree, varname, host_name)
+        Hostname().validate_value(host_name, varname)
+
+    @override
+    def page(self, config: Config) -> None:
+        html.help(
+            _(
+                "The renaming of hosts is a complex operation since a host's name is being "
+                "used as a unique key in various places. It also involves stopping and starting "
+                "of the monitoring core. You cannot rename a host while you have pending changes."
+            )
+        )
+
+        with html.form_context(
+            "rename_host",
+            method="POST",
+            require_confirmation=RequireConfirmation(
+                html=_(
+                    "Rename host?<br>"
+                    "Info: Renaming the host includes a restart of the monitoring core. "
+                    "While this change is pending on the central site, the reverting of pending "
+                    "changes is blocked."
+                ),
+                confirmButtonText=_("Yes, rename"),
+                cancelButtonText=_("No, keep current name"),
+            ),
+        ):
+            forms.header(_("Rename host %(host_name)s") % {"host_name": self._host.name()})
+            forms.section(_("Current name"))
+            html.write_text_permissive(self._host.name())
+            forms.section(_("New name"))
+            html.text_input(varname="newname", default_value="")
+            forms.end()
+            html.set_focus("newname")
+            html.hidden_fields()
+
+
+def _renamings_to_job_args(
+    renamings: Sequence[tuple[Folder, HostName, HostName]],
+) -> Sequence[tuple[str, HostName, HostName]]:
+    return [(folder.path(), old_name, new_name) for folder, old_name, new_name in renamings]

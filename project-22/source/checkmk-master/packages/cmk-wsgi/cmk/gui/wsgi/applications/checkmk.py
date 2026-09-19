@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="comparison-overlap"
+
+
+import functools
+import http.client as http_client
+import json
+import traceback
+from collections.abc import Callable
+from typing import override
+from wsgiref.types import StartResponse, WSGIEnvironment
+
+import flask
+from werkzeug.exceptions import RequestEntityTooLarge
+
+import cmk.ccc.store
+import cmk.livestatus_client as livestatus
+from cmk import trace
+from cmk.ccc.exceptions import MKException, MKGeneralException
+from cmk.crypto import MKCryptoException
+from cmk.gui import pages, sites
+from cmk.gui.breadcrumb import Breadcrumb, BreadcrumbItem
+from cmk.gui.config import active_config
+from cmk.gui.dashboard.page_token_error import page_dashboard_token_invalid
+from cmk.gui.exceptions import (
+    FinalizeRequest,
+    HTTPRedirect,
+    MKAuthException,
+    MKConfigError,
+    MKHTTPException,
+    MKMethodNotAllowed,
+    MKNotFound,
+    MKUnauthenticatedException,
+    MKUserError,
+)
+from cmk.gui.header import make_header
+from cmk.gui.htmllib.generator import HTMLWriter
+from cmk.gui.htmllib.html import html
+from cmk.gui.http import LEGACY_CONTENT_SECURITY_POLICY, request, Response, response
+from cmk.gui.i18n import _
+from cmk.gui.log import logger
+from cmk.gui.logged_in import user
+from cmk.gui.token_auth import handle_token_page, MKTokenExpiredOrRevokedException
+from cmk.gui.wsgi.applications.utils import (
+    AbstractWSGIApp,
+    ensure_authentication,
+    fail_silently,
+    handle_unhandled_exception,
+    plain_error,
+)
+from cmk.gui.wsgi.type_defs import WSGIResponse
+from cmk.web.exceptions import MKNotFound as WebMKNotFound
+from cmk.web.utils.urls import requested_file_name
+
+tracer = trace.get_tracer()
+
+# TODO
+#  * derive all exceptions from werkzeug's http exceptions.
+
+
+def _noauth(handler: pages.PageHandler) -> Callable[[pages.PageContext], Response]:
+    #
+    # We don't have to set up anything because we assume this is only used for special calls. We
+    # however have to make sure all errors get written out in plaintext, without HTML.
+    #
+    # Currently these are:
+    #  * noauth:deploy_agent
+    #  * noauth:automation
+    #
+    @functools.wraps(handler)
+    def _call_noauth(ctx: pages.PageContext) -> Response:
+        try:
+            handler(ctx)
+        except HTTPRedirect:
+            raise
+        except Exception as e:
+            html.write_text_permissive(str(e))
+            if ctx.config.debug:
+                html.write_text_permissive(traceback.format_exc())
+
+        return response
+
+    return _call_noauth
+
+
+def _page_not_found(ctx: pages.PageContext) -> Response:
+    # TODO: This is a page handler. It should not be located in generic application
+    # object. Move it to another place
+    if ctx.request.has_var("_plain_error"):
+        html.write_text_permissive(_("Page not found"))
+    else:
+        title = _("Page not found")
+        make_header(
+            html,
+            title=title,
+            breadcrumb=Breadcrumb(
+                [
+                    BreadcrumbItem(
+                        title="Nowhere",
+                        url=None,
+                        id=None,
+                    ),
+                    BreadcrumbItem(
+                        title=title,
+                        url="javascript:document.location.reload(false)",
+                        id=None,
+                    ),
+                ]
+            ),
+            debug=ctx.config.debug,
+            lang=user.language,
+            inject_js_profiling_code=ctx.config.inject_js_profiling_code,
+            load_frontend_vue=ctx.config.load_frontend_vue,
+            custom_style_sheet=ctx.config.custom_style_sheet,
+            screenshotmode=ctx.config.screenshotmode,
+            inline_help_as_text=user.inline_help_as_text,
+            hide_suggestions=not user.get_tree_state("suggestions", "all", True),
+            user_role_ids=user.role_ids,
+        )
+        html.show_error(_("This page was not found. Sorry."))
+    html.footer()
+
+    response.status_code = http_client.NOT_FOUND
+    return response
+
+
+def _render_exception(ctx: pages.PageContext, e: Exception, title: str) -> Response:
+    status_code: int | None = e.status if isinstance(e, MKHTTPException) else None
+    if _is_ajax_request():
+        return _json_error_response(
+            f"{title}: {e}" if title else str(e), status_code=status_code if status_code else 200
+        )
+
+    if plain_error():
+        return Response(
+            response=[
+                "{}{}\n".format(("%s: " % title) if title else "", e),
+            ],
+            mimetype="text/plain",
+            status=status_code,
+        )
+
+    if not fail_silently():
+        if html.output_format != "html":
+            # A machine-readable export (csv_export, json, ...) may already have set its
+            # own Content-Type/Content-Disposition and started writing its body before
+            # failing. Neither belongs on an error response, so take full ownership of it
+            # instead of leaving them stale.
+            response.set_content_type("text/html")
+            response.headers.pop("Content-Disposition", None)
+            response.set_data(b"")
+            html.write_html(HTMLWriter.render_div(str(e), class_="error"))
+        else:
+            make_header(
+                html,
+                title=title,
+                breadcrumb=Breadcrumb(),
+                debug=ctx.config.debug,
+                lang=user.language,
+                inject_js_profiling_code=ctx.config.inject_js_profiling_code,
+                load_frontend_vue=ctx.config.load_frontend_vue,
+                custom_style_sheet=ctx.config.custom_style_sheet,
+                screenshotmode=ctx.config.screenshotmode,
+                inline_help_as_text=user.inline_help_as_text,
+                hide_suggestions=not user.get_tree_state("suggestions", "all", True),
+                user_role_ids=user.role_ids,
+            )
+            html.open_ts_container(
+                container="div",
+                function_name="insert_before",
+                arguments={"targetElementId": "main_page_content"},
+            )
+            html.show_error(str(e))
+            html.close_div()
+            html.footer()
+
+    if status_code is not None:
+        response.status_code = status_code
+    return response
+
+
+class CheckmkApp(AbstractWSGIApp):
+    """The Checkmk GUI WSGI entry point"""
+
+    __slots__ = ("testing",)
+
+    def __init__(self, debug: bool = False, testing: bool = False) -> None:
+        super().__init__(debug)
+        self.testing = testing
+
+    @tracer.instrument("CheckmkApp.wsgi_app")
+    @override
+    def wsgi_app(self, environ: WSGIEnvironment, start_response: StartResponse) -> WSGIResponse:
+        """Is called by the WSGI server to serve the current page"""
+        with cmk.ccc.store.cleanup_locks(), sites.cleanup_connections():
+            # The configuration is currently loaded in the FileBasedSession.open_session() method,
+            # because we need the configuration for the session management. Need to figure out
+            # whether we can directly hand it over to get rid of the proxy object.
+            # Flask.__call__()
+            #     Flask.wsgi_app()
+            #         self.request_context()
+            #         RequestContext.push()
+            #             FileBasedSession.open_session(app, request)
+            #     	        config.initialize()
+            #         Flask.full_dispatch_request()
+            #             Flask.finalize_request()
+            #                 Flask.make_response()
+            #                     AbstractWSGIApp.__call__()
+            #                         CheckmkApp.wsgi_app()
+            context = pages.PageContext(config=active_config, request=request)
+            return _process_request(
+                context, environ, start_response, debug=self.debug, testing=self.testing
+            )
+
+
+def _is_ajax_request() -> bool:
+    """Check if the current request is an AJAX request"""
+    return request.has_var("_ajaxid")
+
+
+def _json_error_response(error_message: str, status_code: int = 200) -> Response:
+    """Return a JSON error response for AJAX endpoints"""
+    resp = Response(
+        response=json.dumps({"result_code": 1, "result": error_message, "severity": "error"}),
+        mimetype="application/json",
+    )
+    resp.status_code = status_code
+    return resp
+
+
+def _process_request(
+    ctx: pages.PageContext,
+    environ: WSGIEnvironment,
+    start_response: StartResponse,
+    debug: bool = False,
+    testing: bool = False,
+) -> WSGIResponse:
+    resp: Response
+    try:
+        try:
+            file_name = requested_file_name(ctx.request, on_error="raise")
+        except WebMKNotFound as exc:
+            raise MKNotFound(str(exc)) from exc
+
+        if file_name is None:
+            page_handler = _page_not_found  # type: ignore[unreachable]
+        elif _handler := pages.get_page_handler(file_name):
+            page_handler = ensure_authentication(_handler)
+        elif _handler := pages.get_page_handler(f"noauth:{file_name}"):
+            page_handler = _noauth(_handler)
+        elif request.has_var("cmk-token"):
+            page_handler = handle_token_page(file_name, request)
+        else:
+            page_handler = _page_not_found
+
+        resp = page_handler(ctx)
+
+    except MKNotFound:
+        resp = _page_not_found(ctx)
+
+    except HTTPRedirect as exc:
+        return flask.redirect(exc.url)(environ, start_response)
+
+    except MKMethodNotAllowed as e:
+        resp = _render_exception(ctx, e, title=_("Method not allowed"))
+
+    except FinalizeRequest as exc:
+        # TODO: Remove all FinalizeRequest exceptions from all pages and replace it with a `return`.
+        #       It may be necessary to rewire the control-flow a bit as this exception could have
+        #       been used to short-circuit some code and jump directly to the response. This
+        #       needs to be changed as well.
+        resp = response
+        resp.status_code = exc.status
+
+    except livestatus.MKLivestatusNotFoundError as e:
+        resp = _render_exception(ctx, e, title=_("Data not found"))
+
+    except MKUserError as e:
+        resp = _render_exception(ctx, e, title=_("Invalid user input"))
+
+    except MKTokenExpiredOrRevokedException as e:
+        if e.token_type == "dashboard":
+            resp = page_dashboard_token_invalid(ctx.config)
+        else:
+            resp = _render_exception(ctx, e, title=_("Token invalid"))
+        logger.error("MKTokenExpiredOrRevokedException: %(error)s", {"error": e})
+
+    except MKUnauthenticatedException as e:
+        resp = _render_exception(ctx, e, title=_("Not authenticated"))
+
+    except MKAuthException as e:
+        resp = _render_exception(ctx, e, title=_("Permission denied"))
+
+    except livestatus.MKLivestatusException as e:
+        resp = _render_exception(ctx, e, title=_("Livestatus problem"))
+        if not _is_ajax_request():
+            resp.status_code = http_client.BAD_GATEWAY
+
+    except MKConfigError as e:
+        resp = _render_exception(ctx, e, title=_("Configuration error"))
+        logger.error("MKConfigError: %(error)s", {"error": e})
+
+    # I added MKGeneralException during a refactoring, but I did not check if it is needed.
+    except (MKException, MKCryptoException, MKGeneralException) as e:
+        resp = _render_exception(ctx, e, title=_("General error"))
+        logger.error(
+            "%(exception_type)s: %(error)s", {"exception_type": e.__class__.__name__, "error": e}
+        )
+
+    except RequestEntityTooLarge as e:
+        resp = _render_exception(ctx, e, title=_("Request too large"))
+
+    except Exception as e:
+        if isinstance(e, OSError) and "mod_wsgi" in str(e):
+            # Apache/mod_wsgi raises OSError when the request body cannot be read
+            # (e.g. client disconnected during upload).  At this point request.values
+            # is broken, so we must NOT call _is_ajax_request(), plain_error(),
+            # fail_silently(), or _render_exception() — they all re-access form data.
+            logger.error("OSError while reading request data (mod_wsgi): %(error)s", {"error": e})
+            resp = Response(status=http_client.BAD_REQUEST)
+        elif debug or testing:
+            raise
+        elif _is_ajax_request():
+            resp = _json_error_response(f"{_('Internal error')}: {e}")
+        else:
+            resp = handle_unhandled_exception(ctx.config)
+
+    # Apply the default Content-Security-Policy unless the page opted into a
+    # stricter one (CMK-31353). The CSP is owned by Python here, not the site
+    # Apache; pages migrated to the strict policy have already set their own
+    # header at this point.
+    if not resp.has_content_security_policy():
+        resp.set_content_security_policy(LEGACY_CONTENT_SECURITY_POLICY)
+
+    resp.set_caching_headers()
+    return resp(environ, start_response)

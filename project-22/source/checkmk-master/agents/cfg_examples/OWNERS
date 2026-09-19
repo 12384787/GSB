@@ -1,0 +1,20 @@
+
+
+per-file informix*=file:/component_owners/plugins_databases/OWNERS_DEFINITION
+per-file informix*=set noparent
+per-file mk_mongodb*=file:/component_owners/plugins_databases/OWNERS_DEFINITION
+per-file mk_mongodb*=set noparent
+per-file mk_oracle*=file:/component_owners/plugins_oracle/OWNERS_DEFINITION
+per-file mk_oracle*=set noparent
+per-file mk_redis*=file:/component_owners/plugins_databases/OWNERS_DEFINITION
+per-file mk_redis*=set noparent
+per-file mysql*=file:/component_owners/plugins_databases/OWNERS_DEFINITION
+per-file mysql*=set noparent
+
+# Please
+#  - don't add individual owners here but provide a reference to an OWNERS_DEFINITION file instead
+#  - consider a `per-file <PATH>=set noparent` line for each `per-file` rule
+#
+# Find information about code-owners (+ find-owners syntax) here:
+#  - https://android-review.googlesource.com/plugins/code-owners/Documentation/backend-find-owners-cookbook.html
+#  - https://android-review.googlesource.com/plugins/code-owners/Documentation/backend-find-owners.html#syntax

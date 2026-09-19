@@ -1,0 +1,33 @@
+set noparent  # don't inherit owners information from parent folders
+
+per-file auth.py=file:/component_owners/user_management_and_authentication/OWNERS_DEFINITION
+per-file auth.py=set noparent
+
+per-file authorization.py=file:/component_owners/user_management_and_authentication/OWNERS_DEFINITION
+per-file authorization.py=set noparent
+
+per-file login.py=file:/component_owners/user_management_and_authentication/OWNERS_DEFINITION
+per-file login.py=set noparent
+
+per-file session.py=file:/component_owners/user_management_and_authentication/OWNERS_DEFINITION
+per-file session.py=set noparent
+
+per-file search_menu.py=file:/component_owners/global_search/OWNERS_DEFINITION
+per-file search_menu.py=set noparent
+
+per-file pages.py=file:/component_owners/web_application_framework/OWNERS_DEFINITION
+per-file pages.py=set noparent
+
+per-file main_menu.py=file:/component_owners/navigation_and_sidebar/OWNERS_DEFINITION
+per-file main_menu.py=set noparent
+
+per-file main_menu_types.py=file:/component_owners/navigation_and_sidebar/OWNERS_DEFINITION
+per-file main_menu_types.py=set noparent
+
+# Please
+#  - don't add individual owners here but provide a reference to an OWNERS_DEFINITION file instead
+#  - consider a `per-file <PATH>=set noparent` line for each `per-file` rule
+#
+# Find information about code-owners (+ find-owners syntax) here:
+#  - https://android-review.googlesource.com/plugins/code-owners/Documentation/backend-find-owners-cookbook.html
+#  - https://android-review.googlesource.com/plugins/code-owners/Documentation/backend-find-owners.html#syntax

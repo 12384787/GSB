@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "ai_button",
+  "properties": {
+    "button_text": { "type": "string" },
+    "template": {
+      "anyOf": [{ "$ref": "#/$templates/explain_this_issue" }]
+    },
+    "teleport": { "type": "string" },
+    "user_id": { "type": "string" },
+    "hide_button": { "type": "boolean" },
+    "site_name": { "type": "string" }
+  },
+  "required": ["button_text", "template", "user_id", "site_name"],
+  "$defs": {
+    "legal": {
+      "type": "object",
+      "properties": {
+        "footer_text_template": { "type": "string" },
+        "disclaimer_title": { "type": "string" },
+        "disclaimer_body_template": { "type": "string" }
+      },
+      "required": ["footer_text_template", "disclaimer_title", "disclaimer_body_template"]
+    },
+    "ai_template": {
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "legal": { "$ref": "#/$defs/legal" }
+      },
+      "required": ["title", "legal"]
+    }
+  },
+  "$templates": {
+    "explain_this_issue": {
+      "allOf": [{ "$ref": "#/$defs/ai_template" }],
+      "type": "object",
+      "properties": {
+        "id": { "const": "explain-this-issue" },
+        "context_data": {
+          "$ref": "#/$templateData/explain_this_issue_data"
+        }
+      },
+      "required": ["id", "context_data"]
+    }
+  },
+  "$templateData": {
+    "explain_this_issue_data": {
+      "type": "object",
+      "properties": {
+        "host_name": { "type": "string" },
+        "service_name": { "type": "string" },
+        "host_state": { "enum": ["Up", "Down", "Unreachable"] },
+        "service_state": {
+          "enum": ["Unknown", "Critical", "Warning", "OK", "Pending"]
+        },
+        "is_stale": { "type": "boolean" }
+      },
+      "required": ["host_name", "host_state", "service_name", "service_state"]
+    }
+  }
+}

@@ -1,0 +1,1 @@
+https://github.com/meshery/meshery/archive/refs/heads/main.zip

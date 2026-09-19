@@ -1,0 +1,24 @@
+title: Microsoft Azure Storage Accounts: Performance
+agents: azure_v2
+catalog: cloud/azure
+license: GPLv2
+distribution: check_mk
+description:
+ This check reports metrics regarding performance of monitored
+ azure storage accounts.
+ You can configure levels for server latency, end-to-end latency
+ and availability.
+ In order to use this check, you need to configure the Azure special agent.
+
+ Azure calculates availability based on actual traffic rather than a
+ continuous "heartbeat" check. Consequently, when your storage account
+ is idle, the API returns empty values because there were no transactions
+ to measure. When no data is available, the service will go OK and show
+ the message "No data in the Azure API response due to inactivity on the
+ storage account."
+
+item:
+ The name of the resource.
+
+discovery:
+ One service is created for each storage account.

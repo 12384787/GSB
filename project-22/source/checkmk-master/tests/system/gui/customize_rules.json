@@ -1,0 +1,49 @@
+{
+  "Check period for hosts": [
+    {
+      "locator": "[role='textbox'][title='Select a time period']",
+      "action": "click"
+    },
+    {
+      "locator": "span:text-is('24X7 - Always')",
+      "action": "click"
+    }
+  ],
+  "Notification period for hosts": [
+    {
+      "locator": "[role='textbox'][title='Select a time period']",
+      "action": "click"
+    },
+    {
+      "locator": "span:text-is('24X7 - Always')",
+      "action": "click"
+    }
+  ],
+  "Service period for hosts": [
+    {
+      "locator": "[role='textbox'][title='Select a time period']",
+      "action": "click"
+    },
+    {
+      "locator": "span:text-is('24X7 - Always')",
+      "action": "click"
+    }
+  ],
+  "Recurring downtimes for hosts": [
+    {
+      "locator": "input[name*='_p_comment']",
+      "action": "fill",
+      "value": "test"
+    }
+  ],
+  "Hosts to be monitored": [
+    {
+      "locator": "form#form_rule_editor button[title='Toggle Value'] ~ div [role='combobox']",
+      "action": "click"
+    },
+    {
+      "locator": "form#form_rule_editor button[title='Toggle Value'] ~ div [role='listbox'] [role='option']:has-text('Positive match')",
+      "action": "click"
+    }
+  ]
+}

@@ -1,0 +1,108 @@
+// Copyright (C) 2025 Checkmk GmbH
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::types::SectionFilter;
+use crate::version;
+use clap::Parser;
+use std::path::PathBuf;
+
+#[derive(Parser, Default)]
+#[command(name = "mk-oracle", about = "Oracle plugin.", version = version::VERSION)]
+pub struct Args {
+    /// Enable verbose output. Use once (-v) for logging level DEBUG and twice (-vv) for logging
+    /// level TRACE.
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+
+    /// Sends log to stderr.
+    #[arg(short = 'l', long)]
+    pub display_log: bool,
+    /// Use custom log dir
+    #[arg(long)]
+    pub log_dir: Option<PathBuf>,
+
+    /// Use custom temp dir
+    #[arg(long)]
+    pub temp_dir: Option<PathBuf>,
+
+    /// Use custom state dir
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
+
+    /// All sections are generated as sync
+    #[arg(long)]
+    pub no_spool: bool,
+
+    /// Use custom config file
+    #[arg(short, long)]
+    pub config_file: Option<PathBuf>,
+
+    /// Detect Oracle SIDs on the local machine
+    #[arg(long)]
+    pub detect_sids: bool,
+
+    /// Detect the Oracle client runtime and print the environment
+    /// (LD_LIBRARY_PATH/PATH, ORACLE_HOME) the monitoring process would use
+    #[arg(long)]
+    pub find_runtime: bool,
+
+    /// Prepared runtime status, If yes skip setting PATH LD_LIBRARY_PATH, whatever
+    #[arg(long)]
+    pub runtime_ready: bool,
+
+    /// Select which sections to execute.
+    /// If not specified, all sections are executed.
+    /// Use `all` to run all sections.
+    /// Use `sync` to run only synchronous sections.
+    /// Use `async` to run only asynchronous sections
+    /// Use `async-custom-metrics` to run only asynchronous custom metrics
+    #[arg(short, long)]
+    pub filter: Option<SectionFilter>,
+
+    /// Create plugins in the given directory and exit
+    /// The directory must exist
+    /// Linux: async plugin will be created in corresponding subdir
+    /// Windows: entry will be added to the bakery file
+    #[arg(short, long)]
+    pub generate_plugins: Option<PathBuf>,
+
+    /// Migrate legacy mk_oracle config to mk-oracle.yml format.
+    /// Provide the path to the legacy config file.
+    /// Output is written to the path given by --migrate-output, or stdout.
+    #[arg(short = 'M', long = "migrate-config")]
+    pub migrate_config: Option<PathBuf>,
+
+    /// Input dir for migrated config, usually some/path/to/mk_oracle.d.
+    /// All cfg files located in the dir will be merged into the one config for migration.
+    /// Not supported on Windows.
+    #[cfg(not(windows))]
+    #[arg(long = "migrate-subdir", requires = "migrate_config")]
+    pub migrate_subdir: Option<PathBuf>,
+
+    /// Output path for migrated config (default: stdout)
+    #[arg(long = "migrate-output", requires = "migrate_config")]
+    pub migrate_output: Option<PathBuf>,
+}
+
+impl Args {
+    pub fn logging_level(&self) -> Option<log::Level> {
+        match self.verbose {
+            2.. => Some(log::Level::Trace),
+            1 => Some(log::Level::Debug),
+            _ => None,
+        }
+    }
+}

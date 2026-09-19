@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+
+"""agent_siemens_plc
+
+Checkmk special agent for monitoring Siemens PLC devices.
+"""
+
+import argparse
+import logging
+import socket
+import sys
+from collections.abc import Iterator, Sequence
+from itertools import groupby
+from typing import Any
+
+import snap7
+from snap7.type import Areas
+
+# prevent snap7 logger to log errors directly to console
+logging.getLogger("snap7").setLevel(logging.CRITICAL + 10)
+
+DATATYPES = {
+    # type-name   size(bytes) parse-function
+    # A size of None means the size is provided by configuration
+    "dint": (4, lambda data, offset, size, bit: _get_dint(data, offset)),  # noqa: ARG005
+    "real": (8, lambda data, offset, size, bit: snap7.util.get_real(data, offset)),  # noqa: ARG005
+    "bit": (1, lambda data, offset, size, bit: snap7.util.get_bool(data, offset, bit)),  # noqa: ARG005
+    # str currently handles "zeichen" (character?) formated strings. For byte coded strings
+    # we would have to use get_string(data, offset-1)) from snap7.utils
+    "str": (None, lambda data, offset, size, bit: data[offset : offset + size]),  # noqa: ARG005
+}
+
+HOSTSPEC_HELP_TEXT = """HOSTSPECS:
+  A HOSTSPEC specifies the hosts to contact and the data to fetch
+  from each host. A hostspec is built of minimum 6 ";"
+  separated items, which are:
+
+  HOST_NAME                     Logical name of the PLC
+  HOST_ADDRESS                  Host name or IP address of the PLC
+  RACK
+  SLOT
+  PORT                          The TCP port to communicate with
+  VALUES                        One or several VALUES as defined below.
+                                The values themselfs are separated by ";"
+
+VALUES:
+  A value is specified by the following single data fields, which are
+  concatenated by a ",":
+
+    AREA[:DB_NUMBER]            Identifier of the memory area to fetch (db, input,
+                                output, merker, timer or counter), plus the optional
+                                numeric identifier of the DB separeated by a ":".
+    ADDRESS                     Memory address to read
+    DATATYPE                    The datatype of the value to read
+    VALUETYPE                   The logical type of the value
+    IDENT                       An identifier of your choice. This identifier
+                                is used by the Check_MK checks to access
+                                and identify the single values. The identifier
+                                needs to be unique within a group of VALUETYPES."""
+
+
+def parse_spec(hostspec: str) -> dict[str, Any] | int:
+    """
+    >>> parse_spec('4fcm;10.2.90.20;0;2;102;merker,5.3,bit,flag,Filterturm_Sammelstoerung_Telefon')
+    {\
+'host_name': '4fcm', \
+'host_address': '10.2.90.20', \
+'rack': 0, \
+'slot': 2, \
+'port': 102, \
+'values': [{\
+'area_name': 'merker', \
+'db_number': None, \
+'byte': 5, \
+'bit': 3, \
+'datatype': 'bit', \
+'valuetype': 'flag', \
+'ident': 'Filterturm_Sammelstoerung_Telefon'}]\
+}
+    """
+    parts = hostspec.split(";")
+    values = []
+    for spec in parts[5:]:
+        p = spec.split(",")
+        if len(p) != 5:
+            sys.stderr.write("ERROR: Invalid value specified: %s\n" % spec)
+            return 1
+
+        if ":" in p[0]:
+            area_name, db_number_str = p[0].split(":")
+            db_number = int(db_number_str)
+        elif p[0] in ["merker", "input", "output", "counter", "timer"]:
+            area_name, db_number = p[0], None
+        else:
+            area_name, db_number = "db", int(p[0])
+        value = {
+            "area_name": area_name,
+            "db_number": db_number,
+        }
+
+        byte, bit = map(int, p[1].split("."))  # address
+        value.update(
+            {
+                "byte": byte,
+                "bit": bit,
+            }
+        )
+
+        if ":" in p[2]:
+            typename, size_str = p[2].split(":")
+            datatype: tuple[str, int] | str = (typename, int(size_str))
+        else:
+            datatype = p[2]
+        value.update(
+            {
+                "datatype": datatype,  # type: ignore[dict-item]
+            }
+        )
+
+        value.update(
+            {
+                "valuetype": p[3],
+                "ident": p[4],
+            }
+        )
+
+        values.append(value)
+
+    return {
+        "host_name": parts[0],
+        "host_address": parts[1],
+        "rack": int(parts[2]),
+        "slot": int(parts[3]),
+        "port": int(parts[4]),
+        "values": values,
+    }
+
+
+def parse_arguments(sys_argv: Sequence[str]) -> argparse.Namespace:
+    prog, description = __doc__.split("\n\n", maxsplit=1)
+    parser = argparse.ArgumentParser(
+        prog=prog, description=description, formatter_class=argparse.RawTextHelpFormatter
+    )
+
+    parser.add_argument(
+        "--hostspec",
+        "-s",
+        action="append",
+        type=parse_spec,
+        required=True,
+        help=(HOSTSPEC_HELP_TEXT),
+    )
+    parser.add_argument(
+        "--timeout",
+        "-t",
+        type=int,
+        default=10,
+        help=(
+            "Set the network timeout to <SEC> seconds. "
+            "Default is 10 seconds.\n"
+            "Note: the timeout is not applied to the whole check, instead it\n"
+            "is used for each network connect."
+        ),
+    )
+    parser.add_argument("--verbose", "-v", action="count", default=0)
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Debug mode: let Python exceptions raise through",
+    )
+
+    return parser.parse_args(sys_argv)
+
+
+def _get_dint(_bytearray: bytearray, byte_index: int) -> int:
+    """
+    Get int value from bytearray.
+
+    double int are represented in four bytes
+    """
+    byte3 = _bytearray[byte_index + 3]
+    byte2 = _bytearray[byte_index + 2]
+    byte1 = _bytearray[byte_index + 1]
+    byte0 = _bytearray[byte_index]
+    return byte3 + (byte2 << 8) + (byte1 << 16) + (byte0 << 32)
+
+
+def _area_name_to_area_id(area_name: str) -> Areas:
+    return {
+        "db": Areas.DB,
+        "input": Areas.PE,
+        "output": Areas.PA,
+        "merker": Areas.MK,
+        "timer": Areas.TM,
+        "counter": Areas.CT,
+    }[area_name]
+
+
+def _addresses_from_area_values(
+    values: list[dict[str, Any]],
+) -> tuple[int | None, int | None]:
+    # We want to have a minimum number of reads. We try to only use
+    # a single read and detect the memory area to fetch dynamically
+    # based on the configured values
+    start_address: int | None = None
+    end_address: int | None = None
+    for device_value in values:
+        byte = device_value["byte"]
+        if start_address is None or byte < start_address:
+            start_address = byte
+
+        datatype = device_value["datatype"]
+        if isinstance(datatype, tuple):
+            size: int | None = datatype[1]
+        else:
+            size = DATATYPES[datatype][0]
+
+        # TODO: Is the None case correct?
+        end = byte + (0 if size is None else size)
+        if end_address is None or end > end_address:
+            end_address = end
+
+    return start_address, end_address
+
+
+def _cast_values(
+    values: list[dict[str, Any]], start_address: int, area_value: bytearray
+) -> list[tuple[str, str, Any]]:
+    cast_values: list[tuple[str, str, Any]] = []
+    for device_value in values:
+        datatype = device_value["datatype"]
+        if isinstance(datatype, tuple):
+            typename, size = datatype
+            parse_func = DATATYPES[typename][1]
+        else:
+            size, parse_func = DATATYPES[datatype]
+
+        value = parse_func(  # type: ignore[no-untyped-call]
+            area_value,
+            device_value["byte"] - start_address,
+            size,
+            device_value["bit"],
+        )
+
+        cast_values.append((device_value["valuetype"], device_value["ident"], value))
+
+    return cast_values
+
+
+def _group_device_values(
+    device: dict[str, Any],
+) -> Iterator[tuple[tuple[str, int | None], Iterator[dict[str, Any]]]]:
+    """A device can have multiple sets of values. Group them by area name and db_number,
+    so that the start and end address of the memroy area can be determined and only needs
+    to be fetched once form the client.
+
+    >>> [(i, list(j)) for i, j in _group_device_values({'values': [
+    ... {'area_name': 'merker', 'db_number': None, 'arbitrary_values': 15},
+    ... {'area_name': 'timer', 'db_number': None, 'arbitrary_values': 60},
+    ... {'area_name': 'merker', 'db_number': None, 'arbitrary_values': 32}
+    ... ]})]
+    [\
+(('merker', None), [{'area_name': 'merker', 'db_number': None, 'arbitrary_values': 15}, {'area_name': 'merker', 'db_number': None, 'arbitrary_values': 32}]), \
+(('timer', None), [{'area_name': 'timer', 'db_number': None, 'arbitrary_values': 60}])\
+]
+    """
+    yield from groupby(
+        sorted(
+            device["values"],
+            key=lambda d: (
+                d["area_name"],
+                d["db_number"],
+            ),
+        ),
+        lambda d: (
+            d["area_name"],
+            d["db_number"],
+        ),
+    )
+
+
+def _snap7error(hostname: str, custom_text: str, raw_error_message: Exception) -> str:
+    error_message = str(raw_error_message).replace("b' ", "'")
+    return f"Host {hostname}: {custom_text}: {error_message}"
+
+
+def main(sys_argv: Sequence[str] | None = None) -> None:
+    args = parse_arguments(sys_argv or sys.argv[1:])
+
+    socket.setdefaulttimeout(args.timeout)
+
+    client = snap7.client.Client()
+
+    has_error = False
+    for device in args.hostspec:
+        hostname = device["host_name"]
+
+        try:
+            client.connect(device["host_address"], device["rack"], device["slot"], device["port"])
+        except Exception as e:
+            sys.stderr.write(_snap7error(hostname, "Error connecting to device", e) + "\n")
+            has_error = True
+            continue
+
+        try:
+            cpu_state = client.get_cpu_state()
+        except Exception as e:
+            cpu_state = None
+            sys.stderr.write(_snap7error(hostname, "Error reading device CPU state", e) + "\n")
+            has_error = True
+
+        parsed_area_values = []
+        for (area_name, db_number), iter_values in _group_device_values(device):
+            values = list(iter_values)
+            start_address, end_address = _addresses_from_area_values(values)
+            try:
+                area_value = client.read_area(
+                    _area_name_to_area_id(area_name),
+                    db_number,  # type: ignore[arg-type]
+                    start_address,  # type: ignore[arg-type]
+                    size=end_address - start_address,  # type: ignore[operator]
+                )
+            except Exception as e:
+                sys.stderr.write(_snap7error(hostname, "Error reading data area", e) + "\n")
+                has_error = True
+                continue
+
+            parsed_area_values.extend(_cast_values(values, start_address, area_value))  # type: ignore[arg-type]
+
+        sys.stdout.write("<<<siemens_plc_cpu_state>>>\n")
+        if cpu_state is not None:
+            sys.stdout.write(f"{cpu_state}\n")
+
+        sys.stdout.write("<<<siemens_plc>>>\n")
+        for values in parsed_area_values:  # type: ignore[assignment]
+            sys.stdout.write("{} {} {} {}\n".format(hostname, *values))
+
+    if has_error:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

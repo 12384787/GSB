@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+# Copyright (C) 2022 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+import datetime
+import enum
+from collections.abc import Mapping, Sequence
+from typing import Annotated, Literal, NewType
+
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+
+Labels = NewType("Labels", Mapping[str, str])
+
+
+class Status(enum.StrEnum):
+    success = "success"
+    error = "error"
+
+
+class ErrorType(enum.StrEnum):
+    none = ""
+    timeout = "timeout"
+    canceled = "canceled"
+    execution = "execution"
+    bad_data = "bad_data"
+    internal = "internal"
+    unavailable = "unavailable"
+    not_found = "not_found"
+
+
+class ValueType(enum.StrEnum):
+    vector = "vector"
+    scalar = "scalar"
+    matrix = "matrix"
+    string = "string"
+
+
+class ParseModel(BaseModel):
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+    )
+
+
+Point = tuple[datetime.datetime, float]
+
+
+class Scalar(ParseModel):
+    type_: Literal[ValueType.scalar] = Field(alias="resultType")
+    result: Point
+    analysis: Mapping[str, object] | None = None
+    warnings: Sequence[str] = []
+
+
+class String(ParseModel):
+    type_: Literal[ValueType.string] = Field(alias="resultType")
+    result: tuple[datetime.datetime, str]
+    analysis: Mapping[str, object] | None = None
+    warnings: Sequence[str] = []
+
+
+class Sample(ParseModel):
+    metric: Labels
+    value: Point
+
+
+class Vector(ParseModel):
+    type_: Literal[ValueType.vector] = Field(alias="resultType")
+    result: Sequence[Sample]
+    analysis: Mapping[str, object] | None = None
+    warnings: Sequence[str] = []
+
+
+class Series(ParseModel):
+    metric: Labels
+    values: Sequence[Point]
+
+
+class Matrix(ParseModel):
+    type_: Literal[ValueType.matrix] = Field(alias="resultType")
+    result: Sequence[Series]
+    analysis: Mapping[str, object] | None = None
+    warnings: Sequence[str] = []
+
+
+class ResponseSuccess(ParseModel):
+    status: Literal[Status.success]
+    data: Scalar | String | Vector | Matrix = Field(discriminator="type_")
+    warnings: Sequence[str] = []
+
+
+class ResponseError(ParseModel):
+    status: Literal[Status.error]
+    error_type: ErrorType = Field(alias="errorType")
+    error: str = ""
+    data: Scalar | String | Vector | Matrix | None = Field(None, discriminator="type_")
+
+
+Response = Annotated[ResponseSuccess | ResponseError, Field(discriminator="status")]
+
+
+# `parse_raw_response` is passed as an argument to `NodeExporter`, and thus called 10 to 20 times.
+# Thus, creating `RESPONSE_ADAPTER` at import time (not during the call to `parse_raw_response`)
+# is the way to go. This variant slightly slows done the check plugin imports. TypeAdapter is faster
+# than RootModel (see CMK-19527), thus remains unchanged.
+RESPONSE_ADAPTER: TypeAdapter[Response] = TypeAdapter(Response)
+
+
+def parse_raw_response(
+    response: bytes | str,
+) -> Response | ValidationError:
+    try:
+        return RESPONSE_ADAPTER.validate_json(response)
+    except ValidationError as e:
+        return e

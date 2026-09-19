@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+"""Raw edition and only raw edition specific registrations"""
+
+import cmk.gui.wato._notification_parameter._mail as mail
+from cmk.backup.gui.registration import backup_register
+from cmk.gui import agent_commands, login, nagvis, sidebar, visuals
+from cmk.gui import plugin_registration as plugins
+from cmk.gui.agent_commands import agent_commands_registry
+from cmk.gui.autocompleters import autocompleter_registry
+from cmk.gui.background_job.job import job_registry
+from cmk.gui.common_registration import register as common_registration
+from cmk.gui.cron import cron_job_registry
+from cmk.gui.custom_icons.registration import custom_icons_register
+from cmk.gui.customer import customer_api_registry, CustomerAPIStub
+from cmk.gui.dashboard import (
+    builtin_dashboard_extender_registry,
+    BuiltinDashboardExtender,
+    dashlet_registry,
+    noop_builtin_dashboard_extender,
+)
+from cmk.gui.data_source import data_source_registry
+from cmk.gui.features import Features as GuiFeatures
+from cmk.gui.features import features_registry
+from cmk.gui.graphing import PageHostServiceGraphPopup
+from cmk.gui.graphing import registration as graphing_registration
+from cmk.gui.help_menu import (
+    default_about_checkmk_entries,
+    default_developer_entries,
+    default_info_line,
+    default_learning_entries,
+)
+from cmk.gui.ldap_integration.register import register as ldap_registration
+from cmk.gui.logwatch import register as logwatch_registration
+from cmk.gui.main_menu import main_menu_registry
+from cmk.gui.mkeventd import registration as mkeventd_registration
+from cmk.gui.mkeventd.helpers import save_active_config
+from cmk.gui.ntop import ntop_connection_registry, NtopConnectionStub
+from cmk.gui.openapi import (
+    endpoint_family_registry,
+    endpoint_registry,
+    versioned_endpoint_registry,
+)
+from cmk.gui.openapi.endpoints import metric as metric_endpoint
+from cmk.gui.pages import page_registry, PageEndpoint
+from cmk.gui.pagetypes import builtin_pagetype_topic_registry
+from cmk.gui.painter.v0 import painter_registry
+from cmk.gui.painter_options import painter_option_registry
+from cmk.gui.parentscan.register import register as parentscan_register
+from cmk.gui.permissions import permission_registry, permission_section_registry
+from cmk.gui.quick_setup.v0_unstable._registry import quick_setup_registry
+from cmk.gui.rule_specs.legacy_converter import (
+    convert_dictionary_formspec_to_valuespec,
+)
+from cmk.gui.search.matchers import match_item_generator_registry, match_plugin_registry
+from cmk.gui.sidebar import snapin_registry
+from cmk.gui.sites import site_choices
+from cmk.gui.token_auth import token_authenticated_page_registry
+from cmk.gui.userdb import user_attribute_registry, user_connector_registry
+from cmk.gui.views import graph
+from cmk.gui.views.builtin_views import (
+    builtin_view_extender_registry,
+    BuiltinViewExtender,
+    noop_builtin_view_extender,
+)
+from cmk.gui.views.command import command_group_registry, command_registry
+from cmk.gui.views.icon import icon_and_action_registry
+from cmk.gui.views.layout import layout_registry
+from cmk.gui.views.row_post_processing import row_post_processor_registry
+from cmk.gui.views.sorter import sorter_registry
+from cmk.gui.visuals import default_site_filter_heading_info, livestatus_query_bare
+from cmk.gui.visuals.filter import filter_registry
+from cmk.gui.visuals.info import visual_info_registry
+from cmk.gui.visuals.type import visual_type_registry
+from cmk.gui.wato import default_user_menu_topics
+from cmk.gui.wato import registration as wato_registration
+from cmk.gui.wato.pages import roles
+from cmk.gui.wato.pages.folders import folder_bulk_action_registry, folder_menu_entry_registry
+from cmk.gui.watolib import network_scan
+from cmk.gui.watolib.activate_changes import (
+    activation_features_registry,
+    ActivationFeatures,
+    default_rabbitmq_definitions,
+)
+from cmk.gui.watolib.analyze_configuration import ac_test_registry
+from cmk.gui.watolib.automation_commands import automation_command_registry
+from cmk.gui.watolib.broker_certificates import (
+    broker_certificate_sync_registry,
+    DefaultBrokerCertificateSync,
+)
+from cmk.gui.watolib.config_domain_name import (
+    config_domain_registry,
+    config_variable_group_registry,
+    config_variable_registry,
+)
+from cmk.gui.watolib.config_sync import replication_path_registry
+from cmk.gui.watolib.groups_io import contact_group_usage_finder_registry
+from cmk.gui.watolib.host_attributes import (
+    host_attribute_registry,
+    host_attribute_topic_registry,
+)
+from cmk.gui.watolib.host_rename import rename_host_hook_registry
+from cmk.gui.watolib.hosts_and_folders import folder_validators_registry, host_action_menu_registry
+from cmk.gui.watolib.main_menu import main_module_registry, main_module_topic_registry
+from cmk.gui.watolib.mode import mode_registry
+from cmk.gui.watolib.notification_parameter import (
+    notification_parameter_registry,
+    NotificationParameter,
+)
+from cmk.gui.watolib.piggyback_hub import distribute_piggyback_hub_configs
+from cmk.gui.watolib.rulespecs import rulespec_group_registry, rulespec_registry
+from cmk.gui.watolib.sample_config import (
+    sample_config_generator_registry,
+    SampleConfigGeneratorGroups,
+)
+from cmk.gui.watolib.simple_config_file import config_file_registry
+from cmk.gui.watolib.sites import site_management_registry, SiteManagement
+from cmk.gui.watolib.snapshots import make_cre_snapshot_manager
+from cmk.gui.watolib.timeperiods import timeperiod_usage_finder_registry
+from cmk.gui.watolib.users import default_sites, user_features_registry, UserFeatures
+from cmk.gui.welcome.registry import welcome_card_registry, WelcomeCardUrl
+from cmk.gui_plugins.internal.feature_registration import RegistrationContext
+
+
+def register_pages() -> None:
+    page_registry.register(PageEndpoint("host_service_graph_popup", PageHostServiceGraphPopup()))
+
+
+def register_painters() -> None:
+    painter_registry.register(graph.PainterServiceGraphs)
+    painter_registry.register(graph.PainterHostGraphs)
+    painter_registry.register(graph.PainterSvcPnpgraph)
+    painter_registry.register(graph.PainterHostPnpgraph)
+
+
+def register(
+    ctx: RegistrationContext,
+) -> None:
+    edition = ctx.edition
+    features = ctx.features
+    agent_bakery_enabled = features.bakery.enabled
+    sample_config_generator_registry.register(SampleConfigGeneratorGroups)
+    network_scan.register(host_attribute_registry, automation_command_registry, cron_job_registry)
+    logwatch_registration.register(
+        page_registry, rulespec_registry, mode_registry, match_item_generator_registry
+    )
+    parentscan_register(
+        mode_registry,
+        job_registry,
+        endpoint_registry,
+        folder_menu_entry_registry,
+        host_action_menu_registry,
+        permission_registry,
+        folder_bulk_action_registry,
+    )
+    nagvis.register(permission_section_registry, permission_registry, snapin_registry)
+    roles.register(mode_registry)
+    login.register(page_registry)
+    common_registration(
+        edition=edition,
+        main_menu_registry=main_menu_registry,
+        job_registry=job_registry,
+        permission_section_registry=permission_section_registry,
+        permission_registry=permission_registry,
+        sorter_registry=sorter_registry,
+        painter_option_registry=painter_option_registry,
+        painter_registry=painter_registry,
+        page_registry=page_registry,
+        command_registry=command_registry,
+        visual_type_registry=visual_type_registry,
+        row_post_processor_registry=row_post_processor_registry,
+        visual_info_registry=visual_info_registry,
+        filter_registry=filter_registry,
+        rulespec_registry=rulespec_registry,
+        config_variable_group_registry=config_variable_group_registry,
+        mode_registry=mode_registry,
+        main_module_registry=main_module_registry,
+        config_variable_registry=config_variable_registry,
+        rulespec_group_registry=rulespec_group_registry,
+        icon_and_action_registry=icon_and_action_registry,
+        cron_job_registry=cron_job_registry,
+        dashlet_registry=dashlet_registry,
+        contact_group_usage_finder_registry=contact_group_usage_finder_registry,
+        autocompleter_registry=autocompleter_registry,
+        data_source_registry=data_source_registry,
+        config_domain_registry=config_domain_registry,
+        timeperiod_usage_finder_registry=timeperiod_usage_finder_registry,
+        automation_command_registry=automation_command_registry,
+        main_module_topic_registry=main_module_topic_registry,
+        snapin_registry=snapin_registry,
+        match_item_generator_registry=match_item_generator_registry,
+        match_plugin_registry=match_plugin_registry,
+        sample_config_generator_registry=sample_config_generator_registry,
+        host_attribute_registry=host_attribute_registry,
+        host_attribute_topic_registry=host_attribute_topic_registry,
+        replication_path_registry=replication_path_registry,
+        endpoint_registry=endpoint_registry,
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+        user_connector_registry=user_connector_registry,
+        layout_registry=layout_registry,
+        config_file_registry=config_file_registry,
+        rename_host_hook_registry=rename_host_hook_registry,
+        command_group_registry=command_group_registry,
+        folder_validators_registry=folder_validators_registry,
+        user_attribute_registry=user_attribute_registry,
+        quick_setup_registry=quick_setup_registry,
+        help_info_line=default_info_line,
+        help_learning_entries=default_learning_entries,
+        help_developer_entries=default_developer_entries,
+        help_about_checkmk_entries=default_about_checkmk_entries,
+        token_authenticated_page_registry=token_authenticated_page_registry,
+        builtin_pagetype_topic_registry=builtin_pagetype_topic_registry,
+        agent_bakery_enabled=agent_bakery_enabled,
+    )
+
+    ldap_registration(
+        mode_registry,
+        endpoint_registry,
+        versioned_endpoint_registry,
+        endpoint_family_registry,
+        ac_test_registry,
+        user_connector_registry,
+    )
+
+    features_registry.register(
+        GuiFeatures(
+            edition,
+            livestatus_only_sites_postprocess=lambda x: list(x) if x else None,
+        )
+    )
+    customer_api_registry.register(CustomerAPIStub(str(edition)))
+    ntop_connection_registry.register(NtopConnectionStub(str(edition)))
+    visuals.register(
+        page_registry,
+        visual_info_registry,
+        filter_registry,
+        autocompleter_registry,
+        site_choices,
+        default_site_filter_heading_info,
+        endpoint_family_registry,
+        versioned_endpoint_registry,
+    )
+    sidebar.register(
+        page_registry,
+        permission_section_registry,
+        snapin_registry,
+        dashlet_registry,
+        main_menu_registry,
+        view_menu_topics=sidebar.default_view_menu_topics,
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    wato_registration.register(
+        edition=edition,
+        page_registry=page_registry,
+        painter_registry=painter_registry,
+        sorter_registry=sorter_registry,
+        icon_registry=icon_and_action_registry,
+        automation_command_registry=automation_command_registry,
+        job_registry=job_registry,
+        filter_registry=filter_registry,
+        mode_registry=mode_registry,
+        quick_setup_registry=quick_setup_registry,
+        permission_section_registry=permission_section_registry,
+        permission_registry=permission_registry,
+        main_module_topic_registry=main_module_topic_registry,
+        rulespec_group_registry=rulespec_group_registry,
+        config_domain_registry=config_domain_registry,
+        config_variable_registry=config_variable_registry,
+        config_variable_group_registry=config_variable_group_registry,
+        snapin_registry=snapin_registry,
+        match_item_generator_registry=match_item_generator_registry,
+        main_menu_registry=main_menu_registry,
+        ac_test_registry=ac_test_registry,
+        contact_group_usage_finder_registry=contact_group_usage_finder_registry,
+        notification_parameter_registry=notification_parameter_registry,
+        replication_path_registry=replication_path_registry,
+        user_menu_topics=default_user_menu_topics,
+    )
+    wato_registration.register_main_modules(main_module_registry)
+    wato_registration.register_multisite_modules(main_module_registry)
+    if not agent_bakery_enabled:
+        wato_registration.register_agent_download_pages(main_module_registry)
+    user_features_registry.register(
+        UserFeatures(
+            edition=edition,
+            sites=default_sites,
+        )
+    )
+    activation_features_registry.register(
+        ActivationFeatures(
+            edition,
+            sync_file_filter_func=None,
+            snapshot_manager_factory=make_cre_snapshot_manager,
+            get_rabbitmq_definitions=default_rabbitmq_definitions,
+            distribute_piggyback_hub_configs=distribute_piggyback_hub_configs,
+        )
+    )
+    broker_certificate_sync_registry.register(DefaultBrokerCertificateSync())
+
+    site_management_registry.register(SiteManagement())
+    notification_parameter_registry.register(
+        NotificationParameter(
+            ident="mail",
+            spec=lambda: convert_dictionary_formspec_to_valuespec(
+                lambda: mail.form_spec_mail(edition)
+            ),
+            form_spec=lambda: mail.form_spec_mail(edition),
+        )
+    )
+    register_pages()
+    register_painters()
+    backup_register(
+        edition,
+        page_registry,
+        mode_registry,
+        main_module_registry,
+    )
+    mkeventd_registration.register(
+        permission_section_registry=permission_section_registry,
+        permission_registry=permission_registry,
+        data_source_registry=data_source_registry,
+        painter_registry=painter_registry,
+        command_registry=command_registry,
+        sorter_registry=sorter_registry,
+        icon_registry=icon_and_action_registry,
+        config_domain_registry=config_domain_registry,
+        sample_config_generator_registry=sample_config_generator_registry,
+        mode_registry=mode_registry,
+        main_module_registry=main_module_registry,
+        config_variable_group_registry=config_variable_group_registry,
+        config_variable_registry=config_variable_registry,
+        rulespec_group_registry=rulespec_group_registry,
+        rulespec_registry=rulespec_registry,
+        autocompleter_registry=autocompleter_registry,
+        filter_registry=filter_registry,
+        notification_parameter_registry=notification_parameter_registry,
+        snapin_registry=snapin_registry,
+        contact_group_usage_finder_registry=contact_group_usage_finder_registry,
+        timeperiod_usage_finder_registry=timeperiod_usage_finder_registry,
+        endpoint_registry=endpoint_registry,
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+        replication_path_registry=replication_path_registry,
+        builtin_pagetype_topic_registry=builtin_pagetype_topic_registry,
+        page_registry=page_registry,
+        save_active_config=save_active_config,
+    )
+    custom_icons_register(
+        mode_registry,
+        main_module_registry,
+        permission_registry,
+    )
+    _openapi_registration()
+    builtin_dashboard_extender_registry.register(
+        BuiltinDashboardExtender(str(edition), noop_builtin_dashboard_extender)
+    )
+    builtin_view_extender_registry.register(
+        BuiltinViewExtender(str(edition), noop_builtin_view_extender)
+    )
+    agent_commands.register(agent_commands_registry)
+
+    graphing_registration.register(
+        edition,
+        page_registry,
+        config_variable_registry,
+        autocompleter_registry,
+        livestatus_query=livestatus_query_bare,
+    )
+    plugins.register()
+
+    welcome_card_registry.register(
+        WelcomeCardUrl(
+            id="network_devices",
+            vars=[("mode", "newhost"), ("prefill", "snmp")],
+            filename="wato.py",
+        )
+    )
+
+
+def _openapi_registration() -> None:
+    metric_endpoint.register(endpoint_registry)

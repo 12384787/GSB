@@ -1,0 +1,525 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@cmk_requirements//:requirements.bzl", "requirement")
+load("@rules_python//python:packaging.bzl", "py_wheel")
+load("//bazel/rules:doctest.bzl", "py_doc_test")
+load("//bazel/rules:package_wheel.bzl", "package_wheel")
+load("//bazel/rules:py_cmk_test.bzl", "py_cmk_test")
+load("//bazel/rules:py_requirements_test.bzl", "py_requirements_test")
+
+exports_files(
+    [
+        "dev-requirements.in",
+        "requirements.in",
+    ],
+)
+
+py_library(
+    name = "agent_based",
+    srcs = [
+        "cmk/agent_based/internal/__init__.py",
+        "cmk/agent_based/internal/_snmp.py",
+        "cmk/agent_based/legacy/__init__.py",
+        "cmk/agent_based/legacy/_loading.py",
+        "cmk/agent_based/legacy/conversion.py",
+        "cmk/agent_based/legacy/v0_unstable.py",
+        "cmk/agent_based/prediction_backend.py",
+        "cmk/agent_based/v1/__init__.py",
+        "cmk/agent_based/v1/_check_levels.py",
+        "cmk/agent_based/v1/_checking_classes.py",
+        "cmk/agent_based/v1/_detection.py",
+        "cmk/agent_based/v1/_inventory_classes.py",
+        "cmk/agent_based/v1/_regex.py",
+        "cmk/agent_based/v1/_snmp.py",
+        "cmk/agent_based/v1/_value_store_utils.py",
+        "cmk/agent_based/v1/clusterize.py",
+        "cmk/agent_based/v1/register.py",
+        "cmk/agent_based/v1/render.py",
+        "cmk/agent_based/v1/type_defs.py",
+        "cmk/agent_based/v1/value_store.py",
+        "cmk/agent_based/v2/__init__.py",
+        "cmk/agent_based/v2/_check_levels.py",
+        "cmk/agent_based/v2/_get_average.py",
+        "cmk/agent_based/v2/_plugins.py",
+        "cmk/agent_based/v2/clusterize.py",
+        "cmk/agent_based/v2/render.py",
+        "cmk/agent_based/v3_unstable/__init__.py",
+        "cmk/agent_based/v3_unstable/_check_levels.py",
+        "cmk/agent_based/v3_unstable/_checking_classes.py",
+        "cmk/agent_based/v3_unstable/_metrics_models.py",
+        "cmk/agent_based/v3_unstable/_metrics_section.py",
+        "cmk/agent_based/v3_unstable/_naming.py",
+    ],
+    data = ["cmk/agent_based/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        requirement("pydantic"),
+    ],
+)
+
+py_library(
+    name = "bakery",
+    srcs = [
+        "cmk/bakery/internal/__init__.py",
+        "cmk/bakery/internal/_artifacts.py",
+        "cmk/bakery/internal/_common_config.py",
+        "cmk/bakery/internal/_constants.py",
+        "cmk/bakery/internal/_core_bakelet.py",
+        "cmk/bakery/internal/_types.py",
+        "cmk/bakery/v1/__init__.py",
+        "cmk/bakery/v1/_artifact_types.py",
+        "cmk/bakery/v1/_constants.py",
+        "cmk/bakery/v1/_function_types.py",
+        "cmk/bakery/v2_unstable/__init__.py",
+        "cmk/bakery/v2_unstable/_artifact_types.py",
+        "cmk/bakery/v2_unstable/_config.py",
+        "cmk/bakery/v2_unstable/_plugins.py",
+    ],
+    data = ["cmk/bakery/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        requirement("pydantic"),
+    ],
+)
+
+py_library(
+    name = "discover_plugins",
+    srcs = [
+        "cmk/discover_plugins/__init__.py",
+        "cmk/discover_plugins/_libexec.py",
+        "cmk/discover_plugins/_python_plugins.py",
+        "cmk/discover_plugins/_wellknown.py",
+    ],
+    data = ["cmk/discover_plugins/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "graphing",
+    srcs = [
+        "cmk/graphing/__init__.py",
+        "cmk/graphing/v1/__init__.py",
+        "cmk/graphing/v1/_localize.py",
+        "cmk/graphing/v1/_type_defs.py",
+        "cmk/graphing/v1/graphs.py",
+        "cmk/graphing/v1/metrics.py",
+        "cmk/graphing/v1/perfometers.py",
+        "cmk/graphing/v1/translations.py",
+        "cmk/graphing/v2_unstable/__init__.py",
+        "cmk/graphing/v2_unstable/_type_defs.py",
+        "cmk/graphing/v2_unstable/graphs.py",
+        "cmk/graphing/v2_unstable/metrics.py",
+        "cmk/graphing/v2_unstable/perfometers.py",
+    ],
+    data = [
+        "cmk/graphing/py.typed",
+    ],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "rulesets",
+    srcs = [
+        "cmk/rulesets/__init__.py",
+        "cmk/rulesets/internal/__init__.py",
+        "cmk/rulesets/internal/form_specs/__init__.py",
+        "cmk/rulesets/internal/form_specs/_extended.py",
+        "cmk/rulesets/internal/form_specs/_migrations.py",
+        "cmk/rulesets/internal/form_specs/_preconfigured.py",
+        "cmk/rulesets/internal/form_specs/_user_selection.py",
+        "cmk/rulesets/v1/__init__.py",
+        "cmk/rulesets/v1/_localize.py",
+        "cmk/rulesets/v1/form_specs/__init__.py",
+        "cmk/rulesets/v1/form_specs/_base.py",
+        "cmk/rulesets/v1/form_specs/_basic.py",
+        "cmk/rulesets/v1/form_specs/_composed.py",
+        "cmk/rulesets/v1/form_specs/_levels.py",
+        "cmk/rulesets/v1/form_specs/_migrations.py",
+        "cmk/rulesets/v1/form_specs/_preconfigured.py",
+        "cmk/rulesets/v1/form_specs/validators.py",
+        "cmk/rulesets/v1/rule_specs.py",
+    ],
+    data = ["cmk/rulesets/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "password_store",
+    srcs = [
+        "cmk/password_store/v1_unstable/__init__.py",
+        "cmk/password_store/v1_unstable/_convenience.py",
+        "cmk/password_store/v1_unstable/_impl.py",
+    ],
+    data = ["cmk/password_store/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        requirement("cryptography"),
+    ],
+)
+
+py_library(
+    name = "server_side_calls",
+    srcs = [
+        "cmk/server_side_calls/__init__.py",
+        "cmk/server_side_calls/internal/__init__.py",
+        "cmk/server_side_calls/internal/_active_checks.py",
+        "cmk/server_side_calls/internal/_special_agents.py",
+        "cmk/server_side_calls/internal/_utils.py",
+        "cmk/server_side_calls/v1/__init__.py",
+        "cmk/server_side_calls/v1/_active_checks.py",
+        "cmk/server_side_calls/v1/_special_agents.py",
+        "cmk/server_side_calls/v1/_utils.py",
+    ],
+    data = ["cmk/server_side_calls/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        requirement("pydantic"),
+    ],
+)
+
+py_library(
+    name = "server_side_programs",
+    srcs = [
+        "cmk/server_side_programs/__init__.py",
+        "cmk/server_side_programs/v1_unstable/__init__.py",
+        "cmk/server_side_programs/v1_unstable/_crash_reporting.py",
+        "cmk/server_side_programs/v1_unstable/_host_name_validation.py",
+        "cmk/server_side_programs/v1_unstable/_storage.py",
+        "cmk/server_side_programs/v1_unstable/_vcrtrace.py",
+    ],
+    data = ["cmk/server_side_programs/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        requirement("requests"),
+        requirement("urllib3"),
+        requirement("vcrpy"),
+    ],
+)
+
+py_library(
+    name = "cli",
+    srcs = ["cmk/cli/internal/__init__.py"],
+    data = ["cmk/cli/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "dcd_connectors",
+    srcs = [
+        "cmk/dcd_connectors/__init__.py",
+        "cmk/dcd_connectors/internal/__init__.py",
+        "cmk/dcd_connectors/internal/_connector_object.py",
+        "cmk/dcd_connectors/internal/_connector_specs.py",
+        "cmk/dcd_connectors/internal/_plugin.py",
+        "cmk/dcd_connectors/internal/_types.py",
+    ],
+    data = ["cmk/dcd_connectors/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "dcd_connector_parameters",
+    srcs = [
+        "cmk/dcd_connector_parameters/__init__.py",
+        "cmk/dcd_connector_parameters/internal/__init__.py",
+        "cmk/dcd_connector_parameters/internal/connector_parameter_specs.py",
+    ],
+    data = ["cmk/dcd_connector_parameters/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":rulesets",
+    ],
+)
+
+py_library(
+    name = "diagnostics",
+    srcs = glob(["cmk/diagnostics/internal/**/*.py"]),
+    data = ["cmk/diagnostics/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "inventory_ui",
+    srcs = [
+        "cmk/inventory_ui/__init__.py",
+        "cmk/inventory_ui/v1_unstable/__init__.py",
+        "cmk/inventory_ui/v1_unstable/_localize.py",
+        "cmk/inventory_ui/v1_unstable/_node.py",
+        "cmk/inventory_ui/v1_unstable/_style.py",
+        "cmk/inventory_ui/v1_unstable/_unit.py",
+    ],
+    data = ["cmk/inventory_ui/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "licensing",
+    srcs = glob(["cmk/licensing/internal/**/*.py"]),
+    data = ["cmk/licensing/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "post_rename_site",
+    srcs = [
+        "cmk/post_rename_site/internal/__init__.py",
+    ],
+    data = ["cmk/post_rename_site/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+)
+
+py_doc_test(
+    name = "doctest",
+    size = "small",
+    srcs = [
+        ":agent_based",
+        ":bakery",
+        ":cli",
+        ":dcd_connector_parameters",
+        ":dcd_connectors",
+        ":diagnostics",
+        ":discover_plugins",
+        ":graphing",
+        ":inventory_ui",
+        ":licensing",
+        ":password_store",
+        ":post_rename_site",
+        ":rulesets",
+        ":server_side_calls",
+        ":server_side_programs",
+    ],
+)
+
+py_cmk_test(
+    name = "agent_based-test",
+    size = "small",
+    srcs = glob(["tests/cmk/agent_based/**/*.py"]),
+    deps = [
+        ":agent_based",
+    ],
+)
+
+py_cmk_test(
+    name = "bakery-test",
+    size = "small",
+    srcs = glob(["tests/cmk/bakery/**/*.py"]),
+    deps = [
+        ":bakery",
+    ],
+)
+
+py_cmk_test(
+    name = "cli-test",
+    size = "small",
+    srcs = glob(["tests/cmk/cli/**/*.py"]),
+    deps = [
+        ":cli",
+    ],
+)
+
+py_cmk_test(
+    name = "dcd_connectors-test",
+    size = "small",
+    srcs = glob(["tests/cmk/dcd_connectors/**/*.py"]),
+    deps = [
+        ":dcd_connectors",
+    ],
+)
+
+py_cmk_test(
+    name = "dcd_connector_parameters-test",
+    size = "small",
+    srcs = glob(["tests/cmk/dcd_connector_parameters/**/*.py"]),
+    deps = [
+        ":dcd_connector_parameters",
+        ":rulesets",
+    ],
+)
+
+py_cmk_test(
+    name = "discover_plugins-test",
+    size = "small",
+    srcs = glob(["tests/cmk/discover_plugins/**/*.py"]),
+    deps = [
+        ":dcd_connector_parameters",
+        ":dcd_connectors",
+        ":discover_plugins",
+    ],
+)
+
+py_cmk_test(
+    name = "graphing-test",
+    size = "small",
+    srcs = glob(["tests/cmk/graphing/**/*.py"]),
+    deps = [
+        ":graphing",
+    ],
+)
+
+py_cmk_test(
+    name = "rulesets-test",
+    size = "small",
+    srcs = glob(["tests/cmk/rulesets/**/*.py"]),
+    deps = [
+        ":rulesets",
+    ],
+)
+
+py_cmk_test(
+    name = "password_store-test",
+    size = "small",
+    srcs = glob(["tests/cmk/password_store/**/*.py"]),
+    deps = [
+        ":password_store",
+        requirement("cryptography"),
+    ],
+)
+
+py_cmk_test(
+    name = "server_side_calls-test",
+    size = "small",
+    srcs = glob(["tests/cmk/server_side_calls/**/*.py"]),
+    deps = [
+        ":server_side_calls",
+    ],
+)
+
+py_cmk_test(
+    name = "server_side_programs-test",
+    size = "small",
+    srcs = glob(["tests/cmk/server_side_programs/**/*.py"]),
+    deps = [
+        ":server_side_programs",
+        requirement("requests"),
+    ],
+)
+
+py_cmk_test(
+    name = "inventory_ui-test",
+    size = "small",
+    srcs = glob(["tests/cmk/inventory_ui/**/*.py"]),
+    deps = [
+        ":inventory_ui",
+    ],
+)
+
+py_cmk_test(
+    name = "diagnostics-test",
+    size = "small",
+    srcs = glob(["tests/cmk/diagnostics/**/*.py"]),
+    deps = [
+        ":diagnostics",
+    ],
+)
+
+py_cmk_test(
+    name = "licensing-test",
+    size = "small",
+    srcs = glob(["tests/cmk/licensing/**/*.py"]),
+    deps = [
+        ":licensing",
+    ],
+)
+
+py_wheel(
+    name = "wheel",
+    distribution = "cmk-plugin-apis",
+    strip_path_prefixes = ["packages/cmk-plugin-apis"],
+    version = "1.0.0",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":agent_based",
+        ":bakery",
+        ":cli",
+        ":dcd_connector_parameters",
+        ":dcd_connectors",
+        ":diagnostics",
+        ":discover_plugins",
+        ":graphing",
+        ":inventory_ui",
+        ":licensing",
+        ":password_store",
+        ":post_rename_site",
+        ":py_typed",
+        ":rulesets",
+        ":server_side_calls",
+        ":server_side_programs",
+    ],
+)
+
+build_test(
+    name = "build_test",
+    targets = ["wheel"],
+)
+
+filegroup(
+    name = "py_typed",
+    srcs = [
+        "cmk/agent_based/py.typed",
+        "cmk/bakery/py.typed",
+        "cmk/cli/py.typed",
+        "cmk/dcd_connector_parameters/py.typed",
+        "cmk/dcd_connectors/py.typed",
+        "cmk/diagnostics/py.typed",
+        "cmk/discover_plugins/py.typed",
+        "cmk/graphing/py.typed",
+        "cmk/inventory_ui/py.typed",
+        "cmk/licensing/py.typed",
+        "cmk/password_store/py.typed",
+        "cmk/post_rename_site/py.typed",
+        "cmk/rulesets/py.typed",
+        "cmk/server_side_calls/py.typed",
+        "cmk/server_side_programs/py.typed",
+    ],
+)
+
+package_wheel(
+    name = "pkg_tar",
+    visibility = ["//visibility:public"],
+    whl = "wheel",
+)
+
+sh_library(
+    name = "helpers",
+    srcs = [
+        ".f12",
+    ],
+)
+
+py_requirements_test(
+    name = "requirements-test",
+    libs = [
+        ":agent_based",
+        ":bakery",
+        ":cli",
+        ":dcd_connector_parameters",
+        ":dcd_connectors",
+        ":diagnostics",
+        ":discover_plugins",
+        ":graphing",
+        ":inventory_ui",
+        ":licensing",
+        ":password_store",
+        ":post_rename_site",
+        ":rulesets",
+        ":server_side_calls",
+        ":server_side_programs",
+        "//packages/cmk-plugin-apis/doc:sphinx_build",
+    ],
+    requirements_in = "requirements.in",
+)

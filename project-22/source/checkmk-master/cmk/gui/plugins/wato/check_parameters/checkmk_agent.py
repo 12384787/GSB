@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from datetime import datetime
+
+from cmk.ccc.version import parse_check_mk_version
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.i18n import _
+from cmk.gui.plugins.wato.utils import (
+    CheckParameterRulespecWithoutItem,
+    rulespec_registry,
+    RulespecGroupCheckParametersApplications,
+)
+from cmk.gui.plugins.wato.utils.simple_levels import SimpleLevels
+from cmk.gui.valuespec import (
+    AbsoluteDate,
+    Age,
+    CascadingDropdown,
+    Dictionary,
+    FixedValue,
+    Hostname,
+    ListOf,
+    Migrate,
+    MonitoringState,
+    RegExp,
+    SetupSiteChoice,
+    TextInput,
+    Tuple,
+)
+
+
+def _validate_version(value: str, varprefix: str) -> None:
+    try:
+        parse_check_mk_version(value)
+    except ValueError, TypeError, KeyError:
+        raise MKUserError(varprefix, _("Can't parse version %(value)r") % {"value": value})
+
+
+def _migrate_version_spec(
+    param: str | tuple[str, str] | tuple[str, dict[str, str]],
+) -> tuple[str, dict[str, str]]:
+    """
+    >>> _migrate_version_spec(('at_least', {'build': '1.1.1'}))
+    ('at_least', {'build': '1.1.1'})
+    >>> _migrate_version_spec(("specific", "2.1.0b2"))
+    ('specific', {'literal': '2.1.0b2'})
+    >>> _migrate_version_spec("1.2.3")
+    ('specific', {'literal': '1.2.3'})
+    >>> _migrate_version_spec("site")
+    ('site', {})
+    >>> _migrate_version_spec("ignore")
+    ('ignore', {})
+
+    """
+    if isinstance(param, tuple):
+        type_, spec = param
+        if isinstance(spec, dict):
+            return type_, spec
+        return "specific", {"literal": str(spec)}
+
+    if param in ("ignore", "site"):
+        return param, {}
+    return "specific", {"literal": param}
+
+
+def _parameter_valuespec_checkmk_agent() -> Dictionary:
+    return Dictionary(
+        ignored_keys=[
+            # this keys are set as a default, and postprocessed by the backend.
+            "only_from",
+            "host_name",
+        ],
+        elements=[
+            (
+                "agent_version",
+                Migrate(
+                    valuespec=CascadingDropdown(
+                        title=_("Check version of Checkmk agent"),
+                        help=_(
+                            "Here, you can make sure that all of your Checkmk agents are running"
+                            " one specific version. Agents running"
+                            " a different version return a non-OK state."
+                        ),
+                        choices=[
+                            (
+                                "ignore",
+                                _("Ignore the version"),
+                                FixedValue(value={}, totext=""),
+                            ),
+                            (
+                                "site",
+                                _("Same version as the monitoring site"),
+                                FixedValue(value={}, totext=""),
+                            ),
+                            (
+                                "specific",
+                                _("Specific version"),
+                                Dictionary(
+                                    elements=[
+                                        (
+                                            "literal",
+                                            TextInput(allow_empty=False, title=_("Expected")),
+                                        ),
+                                    ],
+                                    optional_keys=[],
+                                ),
+                            ),
+                            (
+                                "at_least",
+                                _("At least"),
+                                Dictionary(
+                                    elements=[
+                                        (
+                                            "release",
+                                            TextInput(
+                                                title=_("Official Release version"),
+                                                allow_empty=False,
+                                            ),
+                                        ),
+                                        (
+                                            "daily_build",
+                                            TextInput(
+                                                title=_("Daily build"),
+                                                allow_empty=False,
+                                            ),
+                                        ),
+                                    ]
+                                ),
+                            ),
+                        ],
+                        default_value=("ignore", {}),
+                    ),
+                    # In the past, this was a OptionalDropdownChoice() which values could be strings:
+                    # ignore, site or a custom string representing a version number.
+                    migrate=_migrate_version_spec,
+                ),
+            ),
+            (
+                "agent_version_missmatch",
+                MonitoringState(default_value=1, title=_("State in case of wrong agent version")),
+            ),
+            (
+                "restricted_address_mismatch",
+                MonitoringState(
+                    title=_("State in case of restricted address mismatch"),
+                    help=_(
+                        "If a Checkmk site is updated to a newer version but the agents of some "
+                        "hosts are not, then the warning <i>Unexpected allowed IP ranges</i> may "
+                        "be displayed in the details of the <i>Check_MK</i> service and the "
+                        "service state changes to <i>WARN</i> (by default).<br>"
+                        "With this setting you can overwrite the default service state. This will help "
+                        "you to reduce above warnings during the update process of your Checkmk sites "
+                        "and agents."
+                    ),
+                    default_value=1,
+                ),
+            ),
+            (
+                "legacy_pull_mode",
+                MonitoringState(
+                    title=_("State in case of available but not enabled TLS"),
+                    help=_(
+                        "New agent installations that support TLS will refuse to send any data "
+                        "without TLS. However, if you upgrade an existing installation, the "
+                        "old transport mode (with optional encryption) will continue to work, "
+                        "to ease migration."
+                    )
+                    + "<br>"
+                    + _(
+                        "It is recommended to enable TLS as soon as possible by running the "
+                        "`register` command of the `cmk-agent-ctl` utility on the monitored "
+                        "host."
+                    )
+                    + "<br>"
+                    + _(
+                        "However, if that is not feasable, you can configure the legacy mode "
+                        "(which may or <b>may not</b> include encryption) to be OK using this "
+                        "setting. Note that this option may become ineffective in a future "
+                        "Checkmk version."
+                    ),
+                    default_value=1,
+                ),
+            ),
+            (
+                "error_deployment_globally_disabled",
+                MonitoringState(
+                    title=_("State if agent deployment is globally disabled"), default_value=1
+                ),
+            ),
+            (
+                "error_deployment_disabled_for_hostname",
+                MonitoringState(
+                    title=_("State if agent deployment is disabled for host"),
+                    help=_(
+                        "This is only relevant when agent updates are globally enabled."
+                        " Otherwise, configured host conditions are not tested and won't yield"
+                        " an error message."
+                    ),
+                    default_value=1,
+                ),
+            ),
+            (
+                "versions_plugins",
+                Dictionary(
+                    title=_("Agent plug-ins: versions"),
+                    optional_keys=False,
+                    elements=[
+                        (
+                            "min_versions",
+                            Tuple(
+                                title=_("Required minimal versions"),
+                                help=_(
+                                    "You can configure lower thresholds for the versions of the "
+                                    "currently deployed agent plug-ins."
+                                ),
+                                elements=[
+                                    TextInput(title=_("Warning at"), validate=_validate_version),
+                                    TextInput(title=_("Critical at"), validate=_validate_version),
+                                ],
+                            ),
+                        ),
+                        (
+                            "mon_state_unparsable",
+                            MonitoringState(
+                                title=_("Monitoring state in case of version parsing failure"),
+                                help=_(
+                                    "The monitoring state in case the version of an agent plug-in "
+                                    "is unparsable."
+                                ),
+                                default_value=3,
+                            ),
+                        ),
+                    ],
+                ),
+            ),
+            (
+                "versions_lchecks",
+                Dictionary(
+                    title=_("Local checks: versions"),
+                    optional_keys=False,
+                    elements=[
+                        (
+                            "min_versions",
+                            Tuple(
+                                title=_("Required minimal versions"),
+                                help=_(
+                                    "You can configure lower thresholds for the versions of the "
+                                    "currently deployed local checks."
+                                ),
+                                elements=[
+                                    TextInput(title=_("Warning at"), validate=_validate_version),
+                                    TextInput(title=_("Critical at"), validate=_validate_version),
+                                ],
+                            ),
+                        ),
+                        (
+                            "mon_state_unparsable",
+                            MonitoringState(
+                                title=_("Monitoring state in case of version parsing failure"),
+                                help=_(
+                                    "The monitoring state in case the version of a local check is "
+                                    "unparsable."
+                                ),
+                                default_value=3,
+                            ),
+                        ),
+                    ],
+                ),
+            ),
+            (
+                "exclude_pattern_plugins",
+                RegExp(
+                    title=_("Agent plug-ins: Regular expression to exclude plug-ins"),
+                    mode=RegExp.infix,
+                    help=_(
+                        "Plug-ins matching this pattern will be excluded from the comparison with "
+                        "the required versions specified in '%(section)s' and from the duplicates check."
+                    )
+                    % {"section": _("Agent plug-ins: versions")},
+                ),
+            ),
+            (
+                "exclude_pattern_lchecks",
+                RegExp(
+                    title=_("Local checks: Regular expression to exclude files"),
+                    mode=RegExp.infix,
+                    help=_(
+                        "Local checks matching this pattern will be excluded from the comparison "
+                        "with the required versions specified in '%(section)s' and from the duplicates check."
+                    )
+                    % {"section": _("Local checks: versions")},
+                ),
+            ),
+            (
+                "trusted_cas",
+                ListOf(
+                    valuespec=Dictionary(
+                        elements=[
+                            (
+                                "fingerprint",
+                                TextInput(
+                                    title=_("SHA-256 fingerprint"),
+                                    size=70,
+                                    allow_empty=False,
+                                    regex=r"([0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}$|[0-9A-Fa-f]{64}$",
+                                    regex_error=_(
+                                        "This is not a SHA-256 fingerprint "
+                                        "(expected 64 hexadecimal digits, colons are optional)"
+                                    ),
+                                ),
+                            ),
+                            (
+                                "site",
+                                SetupSiteChoice(
+                                    title=_("Required for the connection with site"),
+                                    help=_(
+                                        "The agent controller trusts CAs per connection, so every "
+                                        "CA has to be tied to a site: it must be trusted by the "
+                                        "controller's connection with the site you select here. "
+                                        "Hosts that have no connection with this site are not "
+                                        "affected, which lets you list the CAs of all your sites "
+                                        "in a single rule."
+                                    ),
+                                ),
+                            ),
+                            (
+                                "hostname",
+                                Hostname(
+                                    title=_("Match host name"),
+                                    help=_(
+                                        "Only require the certificate to be trusted for "
+                                        "to this specific host. Leave unchecked to require all "
+                                        "connections with the above site name to trust the "
+                                        "certificate."
+                                    ),
+                                ),
+                            ),
+                            (
+                                "trusted_from",
+                                AbsoluteDate(
+                                    title=_("Required from"),
+                                    label=datetime.now().astimezone().tzname(),
+                                    help=_(
+                                        "Until this date, the CA may be missing from the trust "
+                                        "store without affecting the service state. If you leave "
+                                        "this empty, the CA must be trusted right away."
+                                    ),
+                                ),
+                            ),
+                        ],
+                        optional_keys=["trusted_from", "hostname"],
+                    ),
+                    title=_("Expected trusted CAs of the agent controller"),
+                    help=_(
+                        "Specify the SHA-256 fingerprints of the CAs that the agent controller "
+                        "must trust, each of them together with the site whose connection has to "
+                        "trust it. The service returns a non-OK state if any of these CAs is not "
+                        "trusted, unless its <i>Required from</i> date is still in the future. CAs "
+                        "trusted by the controller but not listed here are ignored. The "
+                        "fingerprints the controller reports, grouped by connection, can be found "
+                        "in the details of this service and in the output of "
+                        "<tt>cmk-agent-ctl status</tt>. If needed, a certificate's fingerprint can "
+                        "be obtained using "
+                        "<tt>openssl x509 -in your_certificate.crt -noout -fingerprint -sha256</tt>."
+                    ),
+                    add_label=_("Add CA"),
+                    allow_empty=False,
+                ),
+            ),
+            (
+                "trusted_cas_mismatch",
+                MonitoringState(
+                    title=_("State in case of a CA not trusted by the agent controller"),
+                    help=_(
+                        "This state is used when a CA configured under <i>Expected trusted CAs of "
+                        "the agent controller</i> is missing from the trust store of the "
+                        "controller's connection with the corresponding site."
+                    ),
+                    default_value=2,
+                ),
+            ),
+            (
+                "max_time_since_last_update_check",
+                SimpleLevels(
+                    Age,
+                    title=_("Maximum time since last update check"),
+                    help=_("Choose the maximum time to allow between last-update checks"),
+                    default_levels=(2 * 3600 * 24, 30 * 3600 * 24),
+                ),
+            ),
+        ],
+    )
+
+
+rulespec_registry.register(
+    CheckParameterRulespecWithoutItem(
+        check_group_name="agent_update",
+        group=RulespecGroupCheckParametersApplications,
+        match_type="dict",
+        parameter_valuespec=_parameter_valuespec_checkmk_agent,
+        title=lambda: _("Checkmk agent installation auditing"),
+    )
+)

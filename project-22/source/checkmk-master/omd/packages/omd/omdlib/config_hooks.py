@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+# Copyright (C) 2023 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+import dataclasses
+import os
+import sys
+import traceback
+from collections.abc import Iterable, Mapping, Sequence
+from pathlib import Path
+
+from omdlib.admin_mail import ADMIN_MAIL
+from omdlib.agent_receiver import AGENT_RECEIVER, AGENT_RECEIVER_PORT
+from omdlib.ai_control_plane import AI_CONTROL_PLANE
+from omdlib.automation_helper import AUTOMATION_HELPER
+from omdlib.autostart import AUTOSTART
+from omdlib.config_api import Config, Error, Hook, PortHook
+from omdlib.core import CORE, update_cmk_core_config
+from omdlib.jaeger import (
+    TRACE_JAEGER_ADMIN_PORT,
+    TRACE_JAEGER_UI_PORT,
+    TRACE_RECEIVE,
+    TRACE_RECEIVE_ADDRESS,
+    TRACE_RECEIVE_PORT,
+    TRACE_SEND,
+    TRACE_SEND_TARGET,
+    TRACE_SERVICE_NAMESPACE,
+)
+from omdlib.liveproxyd import LIVEPROXYD
+from omdlib.livestatus import (
+    LIVESTATUS_TCP,
+    LIVESTATUS_TCP_INSTANCES,
+    LIVESTATUS_TCP_ONLY_FROM,
+    LIVESTATUS_TCP_PER_SOURCE,
+    LIVESTATUS_TCP_PORT,
+    LIVESTATUS_TCP_TLS,
+)
+from omdlib.mcp import MCP_SERVER, MCP_TRACE_FORWARD
+from omdlib.mkeventd import MKEVENTD, MKEVENTD_SNMPTRAP, MKEVENTD_SYSLOG, MKEVENTD_SYSLOG_TCP
+from omdlib.multisite import MULTISITE_AUTHORISATION, MULTISITE_COOKIE_AUTH
+from omdlib.opentelemetry import (
+    OPENTELEMETRY_COLLECTOR,
+    OPENTELEMETRY_COLLECTOR_SELF_MONITORING_PORT,
+)
+from omdlib.piggyback_hub import PIGGYBACK_HUB
+from omdlib.pnp4nagios import PNP4NAGIOS
+from omdlib.rabbitmq import (
+    RABBITMQ_DIST_PORT,
+    RABBITMQ_MANAGEMENT_PORT,
+    RABBITMQ_ONLY_FROM,
+    RABBITMQ_PORT,
+)
+from omdlib.site_paths import SitePaths
+from omdlib.sites import all_sites
+from omdlib.system_apache import (
+    APACHE_MODE,
+    APACHE_TCP_ADDR,
+    APACHE_TCP_PORT,
+)
+from omdlib.tmpfs import TMPFS
+
+from cmk.ccc.exceptions import MKTerminate
+from cmk.ccc.version import edition
+
+ConfigHookResult = tuple[int, str]
+
+
+@dataclasses.dataclass(frozen=True)
+class _SiteConfigs:
+    configs: Mapping[str, Config]
+    sites_with_unreadable_configs: Sequence[str]
+
+
+@dataclasses.dataclass(frozen=True)
+class ConfigHook:
+    name: str
+    description: str
+    alias: str
+    menu: str
+
+
+ConfigHooks = dict[str, ConfigHook]
+
+
+# Put all site configuration (explicit and defaults) into environment
+# variables beginning with CONFIG_
+def create_config_environment(config: Config) -> None:
+    for varname, value in config.items():
+        os.environ["CONFIG_" + varname] = value
+
+
+# TODO: RENAME
+def save_site_conf(site_home: str, config: Config) -> None:
+    confdir = Path(site_home, "etc/omd")
+    confdir.mkdir(exist_ok=True)
+    with (confdir / "site.conf").open(mode="w") as f:
+        for hook_name, value in sorted(config.items(), key=lambda x: x[0]):
+            f.write(f"CONFIG_{hook_name}='{value}'\n")
+    (confdir / "site.conf").chmod(0o644)
+
+
+# Get information about all hooks. Just needed for
+# the "omd config" command.
+def load_config_hooks(hook_dir: str | None) -> ConfigHooks:
+    config_hooks: ConfigHooks = {}
+    if hook_dir is None:
+        return config_hooks
+
+    for hook_name in os.listdir(hook_dir):
+        try:
+            if hook_name[0] != ".":
+                hook = _config_load_hook(hook_dir, hook_name)
+                config_hooks[hook_name] = hook
+        except MKTerminate:
+            raise
+        except Exception:
+            pass
+    return config_hooks
+
+
+def _config_load_hook(hook_dir: str, hook_name: str) -> ConfigHook:
+    alias = None
+    description = ""
+    menu = "Other"
+    description_active = False
+    with Path(hook_dir, hook_name).open() as hook_file:
+        for line in hook_file:
+            if line.startswith("# Alias:"):
+                alias = line[8:].strip()
+            elif line.startswith("# Menu:"):
+                menu = line[7:].strip()
+            elif line.startswith("# Description:"):
+                description_active = True
+            elif line.startswith("#  ") and description_active:
+                description += line[3:].strip() + "\n"
+            else:
+                description_active = False
+
+    assert alias is not None, "Implementation error, please contact support"
+    return ConfigHook(name=hook_name, alias=alias, menu=menu, description=description)
+
+
+_HOOKS: Sequence[Hook | PortHook] = [
+    ADMIN_MAIL,
+    AGENT_RECEIVER,
+    AGENT_RECEIVER_PORT,
+    AI_CONTROL_PLANE,
+    APACHE_MODE,
+    APACHE_TCP_ADDR,
+    APACHE_TCP_PORT,
+    AUTOMATION_HELPER,
+    AUTOSTART,
+    CORE,
+    LIVEPROXYD,
+    LIVESTATUS_TCP,
+    LIVESTATUS_TCP_INSTANCES,
+    LIVESTATUS_TCP_ONLY_FROM,
+    LIVESTATUS_TCP_PER_SOURCE,
+    LIVESTATUS_TCP_PORT,
+    LIVESTATUS_TCP_TLS,
+    MCP_SERVER,
+    MCP_TRACE_FORWARD,
+    MKEVENTD,
+    MKEVENTD_SNMPTRAP,
+    MKEVENTD_SYSLOG,
+    MKEVENTD_SYSLOG_TCP,
+    MULTISITE_AUTHORISATION,
+    MULTISITE_COOKIE_AUTH,
+    OPENTELEMETRY_COLLECTOR,
+    OPENTELEMETRY_COLLECTOR_SELF_MONITORING_PORT,
+    PIGGYBACK_HUB,
+    PNP4NAGIOS,
+    RABBITMQ_DIST_PORT,
+    RABBITMQ_MANAGEMENT_PORT,
+    RABBITMQ_ONLY_FROM,
+    RABBITMQ_PORT,
+    TMPFS,
+    TRACE_JAEGER_ADMIN_PORT,
+    TRACE_JAEGER_UI_PORT,
+    TRACE_RECEIVE,
+    TRACE_RECEIVE_ADDRESS,
+    TRACE_RECEIVE_PORT,
+    TRACE_SEND,
+    TRACE_SEND_TARGET,
+    TRACE_SERVICE_NAMESPACE,
+]
+
+
+def load_hook_dependencies(config: Config, config_hooks: ConfigHooks) -> dict[str, bool]:
+    return {hook_name: get_hook(hook_name).depends(config) for hook_name in config_hooks}
+
+
+def load_config(site_name: str, hook_dir: str | None, omd_path: Path = Path("/omd/")) -> Config:
+    """Load all variables from omd/sites.conf. These variables always begin with
+    CONFIG_. The reason is that this file can be sources with the shell.
+
+    Puts these variables into the config dict without the CONFIG_. Also
+    puts the variables into the process environment."""
+    site_home = SitePaths.from_site_name(site_name, omd_path).home
+    config = read_site_config(site_home)
+    site_configs = _build_site_configs(omd_path)
+    if hook_dir and os.path.exists(hook_dir):
+        for hook_name in _sort_hooks(os.listdir(hook_dir)):
+            if hook_name[0] != "." and hook_name not in config:
+                hook = get_hook(hook_name)
+                if isinstance(hook, PortHook):
+                    config[hook_name] = str(
+                        _next_free_port(
+                            hook.name, site_name, hook.default_port, site_configs.configs
+                        )
+                    )
+                else:
+                    config[hook_name] = hook.default(edition(Path(site_home)))
+    return config
+
+
+def read_site_config(site_home: str, *, print_errors: bool = True) -> Config:
+    """Read and parse the file site.conf of a site into a dictionary and returns it"""
+    config: Config = {}
+    if not (confpath := Path(site_home, "etc/omd/site.conf")).exists():
+        return {}
+
+    with confpath.open() as conf_file:
+        for line in conf_file:
+            line = line.strip()
+            if line == "" or line[0] == "#":
+                continue
+            var, value = line.split("=", 1)
+            if not var.startswith("CONFIG_"):
+                if print_errors:
+                    sys.stderr.write("Ignoring invalid variable %s.\n" % var)
+            else:
+                config[var[7:].strip()] = value.strip().strip("'")
+
+    return config
+
+
+# Always sort CORE hook to the end because it runs "cmk -U" which
+# relies on files created by other hooks.
+def _sort_hooks(hook_names: list[str]) -> Iterable[str]:
+    return sorted(hook_names, key=lambda n: (n == "CORE", n))
+
+
+def _hook_exists(hook_dir: str | None, hook_name: str) -> bool:
+    if not hook_dir:
+        return False
+    hook_file = hook_dir + hook_name
+    return os.path.exists(hook_file)
+
+
+def config_set_all(
+    site_name: str, hook_dir: str | None, config: Config, ignored_hooks: Sequence[str]
+) -> None:
+    for hook_name in _sort_hooks(list(config.keys())):
+        # Hooks may vanish after and up- or downdate
+        if not _hook_exists(hook_dir, hook_name):
+            continue
+
+        if hook_name in ignored_hooks:
+            continue
+
+        _config_set(site_name, config, hook_name)
+
+
+def report_port_allocations(omd_path: Path = Path("/omd")) -> None:
+    sites_with_unreadable_configs = _build_site_configs(omd_path).sites_with_unreadable_configs
+    if sites_with_unreadable_configs:
+        sites_str = ",".join(sites_with_unreadable_configs)
+        sys.stderr.write(
+            f"WARNING: Cannot read the configuration of site(s) {sites_str}: permission denied.\n"
+            f"         This site may allocate ports used by those sites.\n"
+        )
+
+
+def get_hook(hook_name: str) -> Hook | PortHook:
+    for hook in _HOOKS:
+        if hook.name == hook_name:
+            return hook
+    assert False, "Implementation error, please contact support"
+
+
+def _config_set(
+    site_name: str,
+    config: Config,
+    hook_name: str,
+    omd_path: Path = Path("/omd/"),
+) -> Error | None:
+    site_home = Path(SitePaths.from_site_name(site_name).home)
+
+    hook = get_hook(hook_name)
+    if isinstance(hook, PortHook):
+        site_configs = _build_site_configs(omd_path)
+        value = config[hook_name]
+        new_value = str(_next_free_port(hook_name, site_name, int(value), site_configs.configs))
+        if value != new_value:
+            sys.stderr.write(
+                f"{hook.display_name} {value} is in use. I've chosen {new_value} instead.\n"
+            )
+        config[hook_name] = new_value
+    try:
+        hook.activation(site_name, site_home, config)
+    except Exception:
+        traceback.print_exc()
+        return Error(f"Failed to activate {hook_name}.")
+
+    os.environ["CONFIG_" + hook_name] = config[hook_name]
+    return None
+
+
+def _build_site_configs(omd_path: Path = Path("/omd")) -> _SiteConfigs:
+    site_configs: dict[str, Config] = {}
+    sites_with_unreadable_configs = []
+    for sitename in all_sites(omd_path):
+        site_home = SitePaths.from_site_name(sitename, omd_path).home
+        try:
+            site_configs[sitename] = read_site_config(site_home, print_errors=False)
+        except PermissionError:
+            sites_with_unreadable_configs.append(sitename)
+        except Exception:
+            # Site config parsing may fail due to all kinds of errors, but shouldn't
+            # break the current site's command invocation.
+            continue
+    return _SiteConfigs(site_configs, sites_with_unreadable_configs)
+
+
+def _port_is_used(key: str, this_site: str, port: str, site_configs: Mapping[str, Config]) -> bool:
+    for sitename, config in site_configs.items():
+        if sitename == this_site:
+            if any(k != key and port == v for k, v in config.items()):
+                return True
+        elif any(port == v for v in config.values()):
+            return True
+    return False
+
+
+def _next_free_port(
+    key: str, this_site: str, start_port: int, site_configs: Mapping[str, Config]
+) -> int:
+    while _port_is_used(key, this_site, str(start_port), site_configs):
+        start_port += 1
+    return start_port
+
+
+def config_set_value(
+    site_name: str,
+    config: Config,
+    hook_name: str,
+    value: str,
+    save: bool = True,
+) -> Error | None:
+    config[hook_name] = value
+    error = _config_set(site_name, config, hook_name)
+
+    if hook_name in ["CORE", "MKEVENTD", "PNP4NAGIOS"]:
+        update_cmk_core_config(config)
+
+    if save:
+        save_site_conf(SitePaths.from_site_name(site_name).home, config)
+
+    return error

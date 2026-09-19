@@ -1,0 +1,11 @@
+type = "Component"
+has_support_component = true
+members_required = 2
+tier = 1
+product_managers = ["pascal.poulle@checkmk.com"]
+description = """
+- License transport between Odoo and Checkmk works
+- Limitation in Checkmk works
+- Sending license usage reports from Checkmk works
+- The process means the sales team has significantly less work with license renewals
+"""

@@ -1,0 +1,98 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+
+<script setup lang="ts">
+import CmkAlertBox from 'cmk-ui-library/components/CmkAlertBox.vue'
+import CmkCode from 'cmk-ui-library/components/CmkCode.vue'
+import type { CmkWizardStepProps } from 'cmk-ui-library/components/CmkWizard'
+import { CmkWizardButton, CmkWizardStep } from 'cmk-ui-library/components/CmkWizard'
+import CmkHeading from 'cmk-ui-library/components/typography/CmkHeading.vue'
+import CmkParagraph from 'cmk-ui-library/components/typography/CmkParagraph.vue'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import { computed, ref } from 'vue'
+
+import GenerateToken from '@/mode-host/agent-connection-test/components/GenerateToken.vue'
+
+const { _t } = usei18n()
+
+// Escape shell arguments by wrapping in single quotes and escaping single quotes.
+// This should ensure that regardless of what characters are in the given string argument,
+// they will be treated as literal text in the shell command,
+// preventing shell injection attacks.
+const escapeShellArg = (arg: string): string => {
+  return `'${arg.replace(/'/g, "'\"'\"'")}'`
+}
+
+const props = defineProps<
+  CmkWizardStepProps & {
+    relayAlias: string
+    siteName: string
+    domain: string
+    agentReceiverPort: number
+    siteVersion: string
+    certFingerprint: string
+  }
+>()
+
+const ott = ref<string | null | Error>(null)
+const hasValidToken = async () => ott.value !== null && !(ott.value instanceof Error)
+
+const installCommand = computed(() => {
+  const token = ott.value instanceof Error ? '' : (ott.value ?? '')
+  return [
+    'sudo bash install_relay.sh \\',
+    `  --relay-name ${escapeShellArg(props.relayAlias)} \\`,
+    `  --initial-tag-version ${props.siteVersion} \\`,
+    `  --target-server ${props.domain}:${props.agentReceiverPort} \\`,
+    `  --target-site-name ${props.siteName} \\`,
+    `  --cert-fingerprint ${escapeShellArg(props.certFingerprint)} \\`,
+    `  --token ${token}`
+  ].join('\n')
+})
+</script>
+
+<template>
+  <CmkWizardStep :index="index" :is-completed="isCompleted">
+    <template #header>
+      <CmkHeading type="h2"> {{ _t('Run the installation script') }}</CmkHeading>
+    </template>
+
+    <template #content>
+      <CmkParagraph>
+        {{
+          _t(
+            'On the machine on which the Relay will be running, run the command below to execute ' +
+              'the downloaded installation script with the parameters shown. The script will ' +
+              'automatically download and register the Relay to your Checkmk site and run it afterwards.'
+          )
+        }}
+      </CmkParagraph>
+      <CmkAlertBox variant="info">
+        {{ _t('Note that the installation requires root privileges.') }}
+      </CmkAlertBox>
+
+      <GenerateToken
+        v-model="ott"
+        token-generation-endpoint-uri="domain-types/relay_registration_token/collections/all"
+        :expires-in-seconds="3600"
+        :show-validity-text="true"
+        :token-generation-body="{}"
+        :description="_t('This requires the generation of a registration token.')"
+      />
+
+      <CmkCode
+        v-if="ott && !(ott instanceof Error)"
+        :code-text="installCommand"
+        data-testid="run-relay-install-script"
+      ></CmkCode>
+    </template>
+
+    <template #actions>
+      <CmkWizardButton type="next" :validation-cb="hasValidToken" />
+      <CmkWizardButton type="previous" />
+    </template>
+  </CmkWizardStep>
+</template>

@@ -1,0 +1,185 @@
+<!--
+Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import type * as FormSpec from 'cmk-shared-typing/typescript/vue_formspec_components'
+import CmkHelpText from 'cmk-ui-library/components/CmkHelpText.vue'
+import CmkSpace from 'cmk-ui-library/components/CmkSpace.vue'
+import CmkInlineValidation from 'cmk-ui-library/components/user-input/CmkInlineValidation.vue'
+import { untranslated } from 'cmk-ui-library/lib/i18n'
+import { capitalizeFirstLetter } from 'cmk-ui-library/lib/utils'
+import { ref, watch } from 'vue'
+
+import FormEditDispatcher from '@/form/private/FormEditDispatcher/FormEditDispatcher.vue'
+import FormLabel from '@/form/private/FormLabel.vue'
+import FormRequired from '@/form/private/FormRequired.vue'
+import { rendersRequiredLabelItself } from '@/form/private/requiredValidator'
+import { type ValidationMessages, groupIndexedValidations } from '@/form/private/validation'
+
+const props = defineProps<{
+  spec: FormSpec.Tuple
+  backendValidation: ValidationMessages
+}>()
+
+const data = defineModel<unknown[]>('data', { required: true })
+
+const validation = ref<Array<string>>([])
+
+type ElementIndex = number
+const elementValidation = ref<Record<ElementIndex, ValidationMessages>>({})
+
+watch(
+  [() => props.backendValidation],
+  ([newBackendValidation]) => {
+    setValidation(newBackendValidation)
+  },
+  { immediate: true }
+)
+
+function setValidation(newBackendValidation: ValidationMessages) {
+  const [_tupleValidations, _elementValidations] = groupIndexedValidations(
+    newBackendValidation,
+    props.spec.elements.length
+  )
+  validation.value = _tupleValidations
+  elementValidation.value = _elementValidations
+}
+
+const CLASS_LOOKUP: Record<FormSpec.Tuple['layout'], string> = {
+  horizontal_titles_top: 'form-tuple--horizontal-titles-top',
+  horizontal: 'form-tuple--horizontal',
+  vertical: 'form-tuple--vertical',
+  float: 'form-tuple--float'
+}
+</script>
+
+<template>
+  <CmkInlineValidation :validation="validation"></CmkInlineValidation>
+  <div class="form-tuple" :class="CLASS_LOOKUP[spec.layout]">
+    <div v-for="(element, index) in spec.elements" :key="index" class="form-tuple__item">
+      <div v-if="spec.show_titles" class="form-tuple__label">
+        <FormLabel v-if="element.title && spec.layout !== 'float'">{{
+          capitalizeFirstLetter(element.title)
+        }}</FormLabel>
+        <FormRequired
+          v-if="element.title && spec.layout !== 'float' && !rendersRequiredLabelItself(element)"
+          :spec="element"
+          :space="'before'"
+        />
+        <CmkSpace size="small" />
+        <CmkHelpText :help="untranslated(element.help)" />
+        <CmkSpace
+          v-if="spec.show_titles && element.title && spec.layout !== 'horizontal_titles_top'"
+          size="small"
+        />
+        <br v-if="spec.show_titles && element.title && spec.layout === 'horizontal_titles_top'" />
+      </div>
+      <div
+        v-if="!spec.show_titles && spec.layout !== 'horizontal_titles_top'"
+        class="form-tuple__label"
+      >
+        <CmkHelpText :help="untranslated(element.help)" />
+        <CmkSpace size="small" />
+      </div>
+      <div class="form-tuple__content">
+        <div
+          v-if="!spec.show_titles && spec.layout === 'horizontal_titles_top'"
+          class="form-tuple__horizontal-help"
+        >
+          <div class="form-tuple__label">
+            <CmkHelpText :help="untranslated(element.help)" />
+          </div>
+          <CmkSpace size="small" />
+          <FormEditDispatcher
+            v-model:data="data[index]"
+            :spec="element"
+            :backend-validation="elementValidation[index]!"
+          />
+        </div>
+        <FormEditDispatcher
+          v-else
+          v-model:data="data[index]"
+          :spec="element"
+          :backend-validation="elementValidation[index]!"
+        />
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.form-tuple {
+  display: flex;
+}
+
+/* Horizontal layouts */
+.form-tuple.form-tuple--horizontal,
+.form-tuple.form-tuple--horizontal-titles-top {
+  flex-wrap: wrap;
+}
+
+/* Horizontal layout - titles beside content */
+.form-tuple.form-tuple--horizontal .form-tuple__item {
+  display: flex;
+  align-items: flex-end;
+}
+
+.form-tuple__horizontal-help .form-tuple__label {
+  flex-shrink: 0;
+  align-content: end;
+  padding-bottom: 3px;
+}
+
+/* Float layout */
+.form-tuple.form-tuple--float {
+  flex-direction: row;
+}
+
+.form-tuple.form-tuple--float .form-tuple__label {
+  flex-shrink: 0;
+  align-content: end;
+  padding-bottom: 3px;
+}
+
+.form-tuple.form-tuple--float .form-tuple__item {
+  display: flex;
+  align-items: flex-end;
+}
+
+.form-tuple.form-tuple--horizontal .form-tuple__item:not(:first-child),
+.form-tuple.form-tuple--horizontal-titles-top .form-tuple__item:not(:first-child) {
+  margin-left: var(--spacing);
+}
+
+.form-tuple__horizontal-help {
+  display: flex;
+  align-items: flex-end;
+}
+
+.form-tuple.form-tuple--horizontal .form-tuple__label {
+  flex-shrink: 0;
+  align-content: end;
+  padding-bottom: 3px;
+}
+
+/* Vertical layout */
+.form-tuple.form-tuple--vertical {
+  flex-direction: column;
+
+  .form-tuple__item:not(:last-child) {
+    margin-bottom: var(--spacing-half);
+  }
+}
+
+.form-tuple.form-tuple--vertical .form-tuple__label {
+  flex-shrink: 0;
+  align-content: end;
+  padding-bottom: 3px;
+}
+
+.form-tuple.form-tuple--vertical .form-tuple__content {
+  flex: 1;
+}
+</style>

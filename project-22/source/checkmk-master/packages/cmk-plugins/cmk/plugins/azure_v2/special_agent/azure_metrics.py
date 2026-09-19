@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Literal
+
+type Intervals = Literal["PT1M", "PT5M", "PT1H"]
+type Aggregations = Literal["average", "minimum", "maximum", "total", "count"]
+
+
+@dataclass(frozen=True, kw_only=True)
+class DimensionFilter:
+    name: str
+    value: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class AzureMetric:
+    name: str
+    interval: Intervals
+    aggregation: Aggregations
+    dimension_filters: tuple[DimensionFilter, ...] | None = None
+    # The metric alias serves different purposes: allowing the creation of unique names for metrics
+    # that are the same metric but have different dimension filters,
+    # providing more readable names for developers,
+    # and enabling the creation of metric cache files with shorter names.
+    explicit_metric_alias: str | None = None
+    # Azure emits partial data for some metrics, (e.g. Cosmos DB partitions)
+    # as soon as it is available.
+    # This causes the most recent data point to appear near zero until all partitions report
+    # or until the value is finalized and computed.
+    # (see https://learn.microsoft.com/en-us/azure/azure-monitor/metrics/metrics-troubleshoot#chart-shows-unexpected-drop-in-values)
+    # Here you can discard the latest points (usually the last one). See also CMK-28860
+    data_point_discard: int = 0
+
+    def __post_init__(self) -> None:
+        if self.dimension_filters is not None and self.explicit_metric_alias is None:
+            raise ValueError("explicit_metric_alias must be set if dimension_filters is provided")
+
+    @property
+    def cmk_metric_alias(self) -> str:
+        if self.explicit_metric_alias is not None:
+            return self.explicit_metric_alias
+
+        return f"{self.aggregation}_{self.name.replace(' ', '_')}"
+
+
+storage_percent = AzureMetric(name="storage_percent", interval="PT1M", aggregation="average")
+cpu_percent = AzureMetric(name="cpu_percent", interval="PT1M", aggregation="average")
+memory_percent = AzureMetric(name="memory_percent", interval="PT1M", aggregation="average")
+io_consumption_percent = AzureMetric(
+    name="io_consumption_percent", interval="PT1M", aggregation="average"
+)
+serverlog_storage_percent = AzureMetric(
+    name="serverlog_storage_percent", interval="PT1M", aggregation="average"
+)
+active_connections = AzureMetric(name="active_connections", interval="PT1M", aggregation="average")
+connections_failed = AzureMetric(name="connections_failed", interval="PT1M", aggregation="total")
+network_bytes_ingress = AzureMetric(
+    name="network_bytes_ingress", interval="PT1M", aggregation="total"
+)
+network_bytes_egress = AzureMetric(
+    name="network_bytes_egress", interval="PT1M", aggregation="total"
+)
+
+cosmos_accounts_metrics = [
+    AzureMetric(name="ServiceAvailability", interval="PT1H", aggregation="minimum"),
+    AzureMetric(name="TotalRequests", interval="PT1M", aggregation="count"),
+    AzureMetric(
+        name="TotalRequests",
+        interval="PT1M",
+        aggregation="count",
+        dimension_filters=(
+            DimensionFilter(
+                name="StatusCode",
+                value="429",
+            ),
+        ),
+        explicit_metric_alias="count_TotalRequests429",
+    ),
+    AzureMetric(
+        name="TotalRequests",
+        interval="PT1M",
+        aggregation="count",
+        dimension_filters=(
+            DimensionFilter(
+                name="StatusCode",
+                value="404",
+            ),
+        ),
+        explicit_metric_alias="count_TotalRequests404",
+    ),
+    AzureMetric(name="TotalRequestUnitsPreview", interval="PT1M", aggregation="total"),
+    AzureMetric(name="NormalizedRUConsumption", interval="PT1M", aggregation="maximum"),
+    AzureMetric(name="DataUsage", interval="PT5M", aggregation="maximum", data_point_discard=1),
+    AzureMetric(name="IndexUsage", interval="PT5M", aggregation="maximum", data_point_discard=1),
+    AzureMetric(name="DocumentCount", interval="PT5M", aggregation="average", data_point_discard=1),
+]
+
+COSMOS_DATABASE_METRICS = [
+    AzureMetric(
+        name="TotalRequests",
+        interval="PT1M",
+        aggregation="count",
+        dimension_filters=(
+            DimensionFilter(
+                name="DatabaseName",
+                value="*",
+            ),
+        ),
+        explicit_metric_alias="count_TotalRequestsdb",
+    ),
+    AzureMetric(
+        name="TotalRequests",
+        interval="PT1M",
+        aggregation="count",
+        dimension_filters=(
+            DimensionFilter(
+                name="DatabaseName",
+                value="*",
+            ),
+            DimensionFilter(
+                name="CollectionName",
+                value="*",
+            ),
+        ),
+        explicit_metric_alias="count_TotalRequestsdbContainer",
+    ),
+    AzureMetric(
+        name="TotalRequests",
+        interval="PT1M",
+        aggregation="count",
+        dimension_filters=(
+            DimensionFilter(
+                name="StatusCode",
+                value="429",
+            ),
+            DimensionFilter(
+                name="DatabaseName",
+                value="*",
+            ),
+        ),
+        explicit_metric_alias="count_TotalRequests429db",
+    ),
+    AzureMetric(
+        name="TotalRequests",
+        interval="PT1M",
+        aggregation="count",
+        dimension_filters=(
+            DimensionFilter(
+                name="StatusCode",
+                value="404",
+            ),
+            DimensionFilter(
+                name="DatabaseName",
+                value="*",
+            ),
+        ),
+        explicit_metric_alias="count_TotalRequests404db",
+    ),
+    AzureMetric(
+        name="TotalRequests",
+        interval="PT1M",
+        aggregation="count",
+        dimension_filters=(
+            DimensionFilter(
+                name="StatusCode",
+                value="429",
+            ),
+            DimensionFilter(
+                name="DatabaseName",
+                value="*",
+            ),
+            DimensionFilter(
+                name="CollectionName",
+                value="*",
+            ),
+        ),
+        explicit_metric_alias="count_TotalRequests429dbContainer",
+    ),
+    AzureMetric(
+        name="TotalRequests",
+        interval="PT1M",
+        aggregation="count",
+        dimension_filters=(
+            DimensionFilter(
+                name="StatusCode",
+                value="200",
+            ),
+            DimensionFilter(
+                name="DatabaseName",
+                value="*",
+            ),
+            DimensionFilter(
+                name="CollectionName",
+                value="*",
+            ),
+        ),
+        explicit_metric_alias="count_TotalRequests404dbContainer",
+    ),
+    AzureMetric(
+        name="TotalRequestUnitsPreview",
+        interval="PT1M",
+        aggregation="total",
+        dimension_filters=(
+            DimensionFilter(
+                name="DatabaseName",
+                value="*",
+            ),
+        ),
+        explicit_metric_alias="total_TotalRequestUnitsPreviewdb",
+    ),
+    AzureMetric(
+        name="NormalizedRUConsumption",
+        interval="PT1M",
+        aggregation="maximum",
+        dimension_filters=(
+            DimensionFilter(
+                name="DatabaseName",
+                value="*",
+            ),
+        ),
+        explicit_metric_alias="maximum_NormalizedRUConsumptiondb",
+    ),
+    AzureMetric(
+        name="TotalRequestUnitsPreview",
+        interval="PT1M",
+        aggregation="total",
+        dimension_filters=(
+            DimensionFilter(
+                name="DatabaseName",
+                value="*",
+            ),
+            DimensionFilter(
+                name="CollectionName",
+                value="*",
+            ),
+        ),
+        explicit_metric_alias="total_TotalRequestUnitsPreviewdbContainer",
+    ),
+    AzureMetric(
+        name="NormalizedRUConsumption",
+        interval="PT1M",
+        aggregation="maximum",
+        dimension_filters=(
+            DimensionFilter(
+                name="DatabaseName",
+                value="*",
+            ),
+            DimensionFilter(
+                name="CollectionName",
+                value="*",
+            ),
+        ),
+        explicit_metric_alias="maximum_NormalizedRUConsumptiondbContainer",
+    ),
+    # this metric is needed to always discover the DBs and their containers,
+    # since some other metrics are only available when there is activity, this one
+    # *should be* always present
+    AzureMetric(
+        name="DataUsage",
+        interval="PT5M",
+        aggregation="count",
+        dimension_filters=(
+            DimensionFilter(
+                name="DatabaseName",
+                value="*",
+            ),
+            DimensionFilter(
+                name="CollectionName",
+                value="*",
+            ),
+        ),
+        explicit_metric_alias="count_DataUsage_discover",
+    ),
+]
+
+ALL_METRICS: dict[str, list[AzureMetric]] = {
+    # to add a new metric, just add a made up name, run the
+    # agent, and you'll get a error listing available metrics!
+    # key: list of (name(s), interval, aggregation, filter)
+    # Also remember to add the service to the WATO rule:
+    # cmk/gui/plugins/wato/special_agents/azure.py
+    "Microsoft.Network/virtualNetworkGateways": [
+        AzureMetric(name="AverageBandwidth", interval="PT5M", aggregation="average"),
+        AzureMetric(name="P2SBandwidth", interval="PT5M", aggregation="average"),
+        AzureMetric(name="TunnelIngressBytes", interval="PT5M", aggregation="count"),
+        AzureMetric(name="TunnelEgressBytes", interval="PT5M", aggregation="count"),
+        AzureMetric(name="TunnelIngressPacketDropCount", interval="PT5M", aggregation="count"),
+        AzureMetric(name="TunnelEgressPacketDropCount", interval="PT5M", aggregation="count"),
+        AzureMetric(name="P2SConnectionCount", interval="PT1M", aggregation="maximum"),
+    ],
+    "Microsoft.Sql/servers/databases": [
+        storage_percent,
+        AzureMetric(name="deadlock", interval="PT1M", aggregation="average"),
+        cpu_percent,
+        AzureMetric(name="dtu_consumption_percent", interval="PT1M", aggregation="average"),
+        AzureMetric(name="connection_successful", interval="PT1M", aggregation="average"),
+        AzureMetric(name="connection_failed", interval="PT1M", aggregation="average"),
+    ],
+    "Microsoft.Storage/storageAccounts": [
+        AzureMetric(name="UsedCapacity", interval="PT1H", aggregation="total"),
+        AzureMetric(name="Ingress", interval="PT1H", aggregation="total"),
+        AzureMetric(name="Egress", interval="PT1H", aggregation="total"),
+        AzureMetric(name="Transactions", interval="PT1H", aggregation="total"),
+        AzureMetric(name="SuccessServerLatency", interval="PT1H", aggregation="average"),
+        AzureMetric(name="SuccessE2ELatency", interval="PT1H", aggregation="average"),
+        AzureMetric(name="Availability", interval="PT1H", aggregation="average"),
+    ],
+    "Microsoft.Web/sites": [
+        AzureMetric(name="CpuTime", interval="PT1M", aggregation="total"),
+        AzureMetric(name="AverageResponseTime", interval="PT1M", aggregation="total"),
+        AzureMetric(name="Http5xx", interval="PT1M", aggregation="total"),
+    ],
+    "Microsoft.DBforMySQL/servers": [
+        cpu_percent,
+        memory_percent,
+        io_consumption_percent,
+        serverlog_storage_percent,
+        storage_percent,
+        active_connections,
+        connections_failed,
+        network_bytes_ingress,
+        network_bytes_egress,
+        AzureMetric(name="seconds_behind_master", interval="PT1M", aggregation="maximum"),
+    ],
+    "Microsoft.DBforMySQL/flexibleServers": [
+        cpu_percent,
+        memory_percent,
+        io_consumption_percent,
+        serverlog_storage_percent,
+        storage_percent,
+        active_connections,
+        AzureMetric(name="aborted_connections", interval="PT1M", aggregation="total"),
+        network_bytes_ingress,
+        network_bytes_egress,
+        AzureMetric(name="replication_lag", interval="PT1M", aggregation="maximum"),
+    ],
+    "Microsoft.DBforPostgreSQL/servers": [
+        cpu_percent,
+        memory_percent,
+        io_consumption_percent,
+        serverlog_storage_percent,
+        storage_percent,
+        active_connections,
+        connections_failed,
+        network_bytes_ingress,
+        network_bytes_egress,
+        AzureMetric(name="pg_replica_log_delay_in_seconds", interval="PT1M", aggregation="maximum"),
+    ],
+    "Microsoft.DBforPostgreSQL/flexibleServers": [
+        cpu_percent,
+        memory_percent,
+        AzureMetric(name="disk_iops_consumed_percentage", interval="PT1M", aggregation="average"),
+        storage_percent,
+        active_connections,
+        connections_failed,
+        network_bytes_ingress,
+        network_bytes_egress,
+        AzureMetric(
+            name="physical_replication_delay_in_seconds", interval="PT1M", aggregation="maximum"
+        ),
+    ],
+    "Microsoft.Network/trafficmanagerprofiles": [
+        AzureMetric(name="QpsByEndpoint", interval="PT1M", aggregation="total"),
+        AzureMetric(
+            name="ProbeAgentCurrentEndpointStateByProfileResourceId",
+            interval="PT1M",
+            aggregation="maximum",
+        ),
+    ],
+    "Microsoft.Network/loadBalancers": [
+        AzureMetric(name="ByteCount", interval="PT1M", aggregation="total"),
+        AzureMetric(name="AllocatedSnatPorts", interval="PT1M", aggregation="average"),
+        AzureMetric(name="UsedSnatPorts", interval="PT1M", aggregation="average"),
+        AzureMetric(name="VipAvailability", interval="PT1M", aggregation="average"),
+        AzureMetric(name="DipAvailability", interval="PT1M", aggregation="average"),
+    ],
+    "Microsoft.Network/applicationGateways": [
+        AzureMetric(name="HealthyHostCount", interval="PT1M", aggregation="average"),
+        AzureMetric(name="FailedRequests", interval="PT1M", aggregation="count"),
+    ],
+    "Microsoft.Network/azureFirewalls": [
+        AzureMetric(name="FirewallHealth", interval="PT1M", aggregation="average"),
+        AzureMetric(name="SNATPortUtilization", interval="PT1M", aggregation="maximum"),
+        AzureMetric(name="Throughput", interval="PT1M", aggregation="average"),
+        AzureMetric(name="FirewallLatencyPng", interval="PT1M", aggregation="average"),
+    ],
+    "Microsoft.Compute/virtualMachines": [
+        AzureMetric(name="Percentage CPU", interval="PT1M", aggregation="average"),
+        AzureMetric(name="CPU Credits Consumed", interval="PT1M", aggregation="average"),
+        AzureMetric(name="CPU Credits Remaining", interval="PT1M", aggregation="average"),
+        AzureMetric(name="Available Memory Bytes", interval="PT1M", aggregation="average"),
+        AzureMetric(name="Disk Read Operations/Sec", interval="PT1M", aggregation="average"),
+        AzureMetric(name="Disk Write Operations/Sec", interval="PT1M", aggregation="average"),
+        AzureMetric(name="Network In Total", interval="PT1M", aggregation="total"),
+        AzureMetric(name="Network Out Total", interval="PT1M", aggregation="total"),
+        AzureMetric(name="Disk Read Bytes", interval="PT1M", aggregation="total"),
+        AzureMetric(name="Disk Write Bytes", interval="PT1M", aggregation="total"),
+    ],
+    "Microsoft.Cache/Redis": [
+        AzureMetric(name="allconnectedclients", interval="PT1M", aggregation="maximum"),
+        AzureMetric(name="allConnectionsCreatedPerSecond", interval="PT1M", aggregation="maximum"),
+        AzureMetric(name="allConnectionsClosedPerSecond", interval="PT1M", aggregation="maximum"),
+        AzureMetric(name="allpercentprocessortime", interval="PT1M", aggregation="maximum"),
+        AzureMetric(name="allcachehits", interval="PT1M", aggregation="total"),
+        AzureMetric(name="allcachemisses", interval="PT1M", aggregation="total"),
+        AzureMetric(name="cachemissrate", interval="PT1M", aggregation="total"),
+        AzureMetric(name="allgetcommands", interval="PT1M", aggregation="total"),
+        AzureMetric(name="allusedmemory", interval="PT1M", aggregation="maximum"),
+        AzureMetric(name="allusedmemorypercentage", interval="PT1M", aggregation="maximum"),
+        AzureMetric(name="allusedmemoryRss", interval="PT1M", aggregation="maximum"),
+        AzureMetric(name="allevictedkeys", interval="PT1M", aggregation="total"),
+        AzureMetric(name="allexpiredkeys", interval="PT1M", aggregation="total"),
+        AzureMetric(name="LatencyP99", interval="PT1M", aggregation="maximum"),
+        AzureMetric(name="cacheLatency", interval="PT1M", aggregation="maximum"),
+        AzureMetric(name="GeoReplicationHealthy", interval="PT1M", aggregation="minimum"),
+        AzureMetric(name="GeoReplicationConnectivityLag", interval="PT1M", aggregation="maximum"),
+        AzureMetric(name="allcacheRead", interval="PT1M", aggregation="maximum"),
+        AzureMetric(name="allcacheWrite", interval="PT1M", aggregation="maximum"),
+    ],
+    "Microsoft.Network/natGateways": [
+        AzureMetric(name="DatapathAvailability", interval="PT1M", aggregation="average"),
+        AzureMetric(name="TotalConnectionCount", interval="PT1M", aggregation="total"),
+        AzureMetric(
+            name="SNATConnectionCount",
+            interval="PT1M",
+            aggregation="total",
+        ),
+        AzureMetric(
+            name="SNATConnectionCount",
+            interval="PT1M",
+            aggregation="total",
+            dimension_filters=(
+                DimensionFilter(
+                    name="ConnectionState",
+                    value="Attempted",
+                ),
+            ),
+            explicit_metric_alias="total_SNATConnectionCountAttempted",
+        ),
+        AzureMetric(
+            name="SNATConnectionCount",
+            interval="PT1M",
+            aggregation="total",
+            dimension_filters=(
+                DimensionFilter(
+                    name="ConnectionState",
+                    value="Failed",
+                ),
+            ),
+            explicit_metric_alias="total_SNATConnectionCountFailed",
+        ),
+        AzureMetric(
+            name="ByteCount",
+            interval="PT1M",
+            aggregation="total",
+            dimension_filters=(
+                DimensionFilter(
+                    name="Direction",
+                    value="Out",
+                ),
+            ),
+            explicit_metric_alias="total_ByteCountOut",
+        ),
+        AzureMetric(
+            name="ByteCount",
+            interval="PT1M",
+            aggregation="total",
+            dimension_filters=(
+                DimensionFilter(
+                    name="Direction",
+                    value="In",
+                ),
+            ),
+            explicit_metric_alias="total_ByteCountIn",
+        ),
+        AzureMetric(
+            name="ByteCount",
+            interval="PT1M",
+            aggregation="total",
+        ),
+        AzureMetric(
+            name="PacketCount",
+            interval="PT1M",
+            aggregation="total",
+            dimension_filters=(
+                DimensionFilter(
+                    name="Direction",
+                    value="In",
+                ),
+            ),
+            explicit_metric_alias="total_PacketCountIn",
+        ),
+        AzureMetric(
+            name="PacketCount",
+            interval="PT1M",
+            aggregation="total",
+            dimension_filters=(
+                DimensionFilter(
+                    name="Direction",
+                    value="Out",
+                ),
+            ),
+            explicit_metric_alias="total_PacketCountOut",
+        ),
+        AzureMetric(
+            name="PacketCount",
+            interval="PT1M",
+            aggregation="total",
+            explicit_metric_alias="total_PacketCount",
+        ),
+        AzureMetric(
+            name="PacketDropCount",
+            interval="PT1M",
+            aggregation="total",
+        ),
+    ],
+    "Microsoft.DocumentDb/databaseAccounts": cosmos_accounts_metrics,
+    "Microsoft.DocumentDB/databaseAccounts": cosmos_accounts_metrics,
+}
+
+OPTIONAL_METRICS: Mapping[str, Sequence[str]] = {
+    "Microsoft.Sql/servers/databases": [
+        "storage_percent",
+        "deadlock",
+        "dtu_consumption_percent",
+    ],
+    "Microsoft.DBforMySQL/servers": ["seconds_behind_master"],
+    "Microsoft.DBforMySQL/flexibleServers": ["replication_lag"],
+    "Microsoft.DBforPostgreSQL/servers": ["pg_replica_log_delay_in_seconds"],
+    "Microsoft.DBforPostgreSQL/flexibleServers": ["physical_replication_delay_in_seconds"],
+    "Microsoft.Network/loadBalancers": ["AllocatedSnatPorts", "UsedSnatPorts"],
+    "Microsoft.Compute/virtualMachines": [
+        "CPU Credits Consumed",
+        "CPU Credits Remaining",
+    ],
+}

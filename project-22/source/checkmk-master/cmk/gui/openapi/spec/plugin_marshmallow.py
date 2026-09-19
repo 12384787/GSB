@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+# Copyright (C) 2021 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="no-any-return"
+# mypy: disable-error-code="no-untyped-def"
+# mypy: disable-error-code="type-arg"
+
+from typing import override, TypedDict
+
+from apispec.ext.marshmallow import common, field_converter, MarshmallowPlugin
+from apispec.ext.marshmallow.openapi import OpenAPIConverter
+from apispec.ext.marshmallow.schema_resolver import SchemaResolver
+from marshmallow import fields, Schema
+from marshmallow_oneofschema import OneOfSchema
+
+from cmk.gui.fields.base import FieldWrapper, MultiNested, ValueTypedDictSchema
+
+
+def is_value_typed_dict(schema: object) -> bool:
+    is_class = isinstance(schema, type) and issubclass(schema, ValueTypedDictSchema)
+    is_instance = isinstance(schema, ValueTypedDictSchema)
+    return is_class or is_instance
+
+
+def type_and_format_of_field(field: fields.Field) -> tuple[str, str | None]:
+    """Get the type and the format of a field.
+
+    Examples:
+
+        >>> type_and_format_of_field(fields.String())
+        ('string', None)
+
+        >>> type_and_format_of_field(fields.String(metadata=dict(format="host")))
+        ('string', None)
+
+        >>> type_and_format_of_field(fields.Integer())
+        ('integer', None)
+
+    Args:
+        field:
+            A marshmallow field instance.
+
+    Returns:
+        A tuple representing the type and the format of this field.
+
+    """
+    for class_, (schema_type, schema_format) in field_converter.DEFAULT_FIELD_MAPPING.items():
+        if isinstance(field, class_):
+            if schema_type is None:
+                raise ValueError(f"No spec possible for field {field!r}.")
+            return schema_type, schema_format
+    raise ValueError(f"No fitting spec found for field {field!r}.")
+
+
+class FieldProperties(TypedDict, total=False):
+    description: str
+    format: str
+    pattern: str
+    type: str
+
+
+def field_properties(field: fields.Field) -> FieldProperties:
+    """Build the OpenAPI schema object for a field used as additionalProperties.
+
+    Note: `required` is intentionally omitted. In OpenAPI 3.x, `required` is a
+    string[] at the parent schema level listing named properties — it has no
+    meaning inside an additionalProperties schema where keys are dynamic.
+    For named-property schemas, apispec's standard schema2jsonschema handles the
+    required list correctly.
+
+    Examples:
+
+        >>> field_properties(fields.String(metadata=dict(format="email")))
+        {'type': 'string', 'format': 'email'}
+
+        >>> field_properties(fields.String(metadata=dict(format="email", description="Email")))
+        {'type': 'string', 'description': 'Email', 'format': 'email'}
+
+        >>> field_properties(fields.String(metadata=dict(format="email", description="Email"), required=True))
+        {'type': 'string', 'description': 'Email', 'format': 'email'}
+
+    Args:
+        field:
+            A marshmallow Field instance.
+
+    Returns:
+        The OpenAPI additionalProperties schema object.
+
+    """
+    type_, format_ = type_and_format_of_field(field)
+    properties: FieldProperties = {
+        "type": type_,
+    }
+    if format_ is not None:
+        properties["format"] = format_
+
+    if "description" in field.metadata:
+        properties["description"] = field.metadata["description"]
+
+    if "format" in field.metadata:
+        properties["format"] = field.metadata["format"]
+
+    if "pattern" in field.metadata:
+        properties["pattern"] = field.metadata["pattern"]
+
+    return properties
+
+
+class CheckmkOpenAPIConverter(OpenAPIConverter):
+    def ensure_title(self, schema, json_schema: dict) -> dict:
+        if "title" not in json_schema and not isinstance(schema, OneOfSchema):
+            # Don't set the title for oneOf, it would become the title for all options
+            json_schema["title"] = self.schema_name_resolver(schema)
+        return json_schema
+
+    @override
+    def schema2jsonschema(self, schema):
+        if is_value_typed_dict(schema):
+            if isinstance(schema.ValueTypedDict.value_type, FieldWrapper):
+                properties = field_properties(schema.ValueTypedDict.value_type.field)
+            elif isinstance(schema.ValueTypedDict.value_type, Schema) or (
+                isinstance(schema.ValueTypedDict.value_type, type)
+                and issubclass(schema.ValueTypedDict.value_type, Schema)
+            ):
+                schema_instance = common.resolve_schema_instance(schema.ValueTypedDict.value_type)
+                schema_key = common.make_schema_key(schema_instance)
+                if schema_key not in self.refs:
+                    component_name = self.schema_name_resolver(schema.ValueTypedDict.value_type)
+                    self.spec.components.schema(component_name, schema=schema_instance)
+                properties = self.get_ref_dict(schema_instance)  # type: ignore[no-untyped-call]
+            else:
+                raise RuntimeError(f"Unsupported value_type: {schema.ValueTypedDict.value_type}")
+
+            out = {
+                "type": "object",
+                "additionalProperties": properties,
+            }
+
+        else:
+            out = super().schema2jsonschema(schema)  # type: ignore[no-untyped-call]
+
+        return self.ensure_title(schema, out)
+
+    @override
+    def nested2properties(self, field: fields.Field, ret: dict) -> dict:
+        """Return a dictionary of properties from :class:`Nested <marshmallow.fields.Nested` fields.
+
+        Typically provides a reference object and will add the schema to the spec
+        if it is not already present
+        If a custom `schema_name_resolver` function returns `None` for the nested
+        schema a JSON schema object will be returned
+
+        Params:
+            field:
+                A marshmallow field.
+            ret:
+                A pre-prepared return value dictionary.
+
+        Returns:
+            A dict of the relevant OpenAPI subsection.
+        """
+        if isinstance(field, MultiNested):
+            schemas = [self.resolve_nested_schema(schema) for schema in field.metadata["anyOf"]]  # type: ignore[no-untyped-call]
+            ret["anyOf"] = schemas
+            return ret
+
+        return super().nested2properties(field, ret)
+
+
+class CheckmkOpenAPIResolver(SchemaResolver):
+    @override
+    def resolve_parameters(self, parameters: list[object]) -> list[object]:
+        parameters = super().resolve_parameters(parameters)  # type: ignore[no-untyped-call]
+
+        # wrap object parameters in content.application/json to keep them as str/json in swagger
+        # see: https://swagger.io/docs/specification/describing-parameters/#schema-vs-content
+        for parameter in parameters:
+            if (
+                isinstance(parameter, dict)
+                and "schema" in parameter
+                and "type" not in parameter["schema"]
+            ):
+                content = parameter.setdefault("content", {}).setdefault("application/json", {})
+                content["schema"] = parameter.pop("schema")
+
+        return parameters
+
+
+class CheckmkMarshmallowPlugin(MarshmallowPlugin):
+    Converter = CheckmkOpenAPIConverter  # type: ignore[mutable-override]
+    Resolver = CheckmkOpenAPIResolver  # type: ignore[mutable-override]

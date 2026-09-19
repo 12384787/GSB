@@ -1,0 +1,193 @@
+<!--
+Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import type {
+  ListPropDef,
+  MultiSelectPropDef,
+  PanelConfig,
+  PanelState
+} from '@ucl/_ucl/types/prop-panel.ts'
+import CmkCopy from 'cmk-ui-library/components/CmkCopy.vue'
+import CmkDropdown from 'cmk-ui-library/components/CmkDropdown'
+import CmkHelpText from 'cmk-ui-library/components/CmkHelpText.vue'
+import CmkIconButton from 'cmk-ui-library/components/CmkIconButton.vue'
+import CmkLabel from 'cmk-ui-library/components/CmkLabel.vue'
+import CmkSpace from 'cmk-ui-library/components/CmkSpace.vue'
+import CmkSwitch from 'cmk-ui-library/components/CmkSwitch.vue'
+import CmkHeading from 'cmk-ui-library/components/typography/CmkHeading.vue'
+import CmkInput from 'cmk-ui-library/components/user-input/CmkInput.vue'
+import useId from 'cmk-ui-library/lib/useId'
+import { computed, onMounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+
+import UclMultiSelect from './UclMultiSelect.vue'
+import UclStringArrayTextarea from './UclStringArrayTextarea.vue'
+
+const { config, title = 'Properties' } = defineProps<{ config: PanelConfig; title?: string }>()
+
+const state = defineModel<PanelState>({ required: true })
+
+const uid = useId()
+
+const router = useRouter()
+const route = useRoute()
+
+const url = computed(() => {
+  const urlQuery: Record<string, string | string[]> = {}
+  for (const [configKey, configValue] of Object.entries(config)) {
+    const stateValue = state.value[configKey]
+    if (configValue.initialState !== stateValue && stateValue !== undefined) {
+      if (typeof stateValue === 'boolean') {
+        urlQuery[configKey] = stateValue ? '1' : '0'
+      } else if (typeof stateValue === 'number') {
+        urlQuery[configKey] = stateValue.toString()
+      } else if (Array.isArray(stateValue)) {
+        urlQuery[configKey] = stateValue as string[]
+      } else {
+        urlQuery[configKey] = stateValue
+      }
+    }
+  }
+
+  const permaLink = router.resolve({
+    ...route,
+    query: urlQuery
+  }).href
+  return `${window.location.origin}${permaLink}`
+})
+
+onMounted(() => {
+  for (const [configKey, configValue] of Object.entries(config)) {
+    const urlValue = route.query[configKey]
+    if (urlValue !== undefined && urlValue !== null) {
+      if (configValue.type === 'boolean') {
+        state.value[configKey] = urlValue === '1' ? true : false
+      } else if (configValue.type === 'number') {
+        state.value[configKey] = parseFloat(urlValue as string)
+      } else if (configValue.type === 'string-array' || configValue.type === 'multiselect') {
+        state.value[configKey] = (Array.isArray(urlValue) ? urlValue : [urlValue]).filter(
+          (v): v is string => v !== null
+        )
+      } else {
+        state.value[configKey] = (Array.isArray(urlValue) ? urlValue[0] : urlValue) ?? ''
+      }
+    }
+  }
+})
+</script>
+
+<template>
+  <div class="ucl-properties-panel__properties-panel">
+    <CmkHeading type="h4">{{ title }}</CmkHeading>
+
+    <div class="ucl-properties-panel__copy">
+      <CmkCopy :text="url">
+        <CmkIconButton name="copied" size="medium" title="Copy permalink" />
+      </CmkCopy>
+    </div>
+
+    <CmkSpace size="small" />
+
+    <div
+      v-for="[key, def] in Object.entries(config).filter(([, def]) => !def.hiddenWhen?.(state))"
+      :key="key"
+      class="ucl-properties-panel__prop-control"
+    >
+      <div class="ucl-properties-panel__label-container">
+        <CmkLabel
+          :id="`${uid}-${key}-label`"
+          v-bind="def.type === 'multiselect' ? {} : { for: `${uid}-${key}` }"
+          >{{ def.title }}</CmkLabel
+        >
+        <CmkSpace v-if="def.help" size="small" />
+        <CmkHelpText v-if="def.help" :help="def.help" />
+      </div>
+      <CmkSwitch
+        v-if="def.type === 'boolean'"
+        :id="`${uid}-${key}`"
+        :model-value="state[key] as boolean"
+        @update:model-value="state[key] = $event"
+      />
+      <CmkInput
+        v-else-if="def.type === 'string'"
+        :id="`${uid}-${key}`"
+        field-size="fill"
+        :model-value="state[key] as string"
+        @update:model-value="state[key] = $event ?? ''"
+      />
+      <CmkInput
+        v-else-if="def.type === 'number'"
+        :id="`${uid}-${key}`"
+        type="number"
+        :model-value="state[key] as number"
+        @update:model-value="state[key] = Number($event) || 0"
+      />
+      <textarea
+        v-else-if="def.type === 'multiline-string'"
+        :id="`${uid}-${key}`"
+        rows="3"
+        class="ucl-properties-panel__textarea"
+        :value="state[key] as string"
+        @input="state[key] = ($event.target as HTMLTextAreaElement).value"
+      ></textarea>
+      <CmkDropdown
+        v-else-if="def.type === 'list'"
+        :component-id="`${uid}-${key}`"
+        :label="def.title"
+        :options="{
+          type: (def as ListPropDef).options.length > 5 ? 'filtered' : 'fixed',
+          suggestions: (def as ListPropDef).options
+        }"
+        :model-value="state[key] as string"
+        @update:model-value="$event !== null && (state[key] = $event)"
+      />
+      <UclStringArrayTextarea
+        v-else-if="def.type === 'string-array'"
+        :id="`${uid}-${key}`"
+        :model-value="state[key] as string[]"
+        @update:model-value="state[key] = $event"
+      />
+      <UclMultiSelect
+        v-else-if="def.type === 'multiselect'"
+        :aria-labelledby="`${uid}-${key}-label`"
+        :options="(def as MultiSelectPropDef).options"
+        :model-value="state[key] as string[]"
+        @update:model-value="state[key] = $event"
+      />
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.ucl-properties-panel__properties-panel {
+  border: 1px solid var(--ucl-elements-border-color);
+  border-radius: 4px;
+  padding: 16px;
+  position: relative;
+}
+
+.ucl-properties-panel__copy {
+  position: absolute;
+  right: 16px;
+  top: 14px;
+}
+
+.ucl-properties-panel__prop-control {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 12px;
+}
+
+.ucl-properties-panel__textarea {
+  flex: 1;
+
+  &:focus-visible {
+    outline: revert;
+  }
+}
+</style>

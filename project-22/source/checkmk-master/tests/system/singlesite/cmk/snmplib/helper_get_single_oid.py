@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import ast
+import sys
+from collections.abc import Callable, Mapping
+from pathlib import Path
+
+import cmk.utils.paths
+from cmk.checkengine.snmp_backends.classic import (  # astrein: disable=cmk-module-layer-violation
+    ClassicSNMPBackend,
+)
+from cmk.checkengine.snmp_backends.stored_walk import (  # astrein: disable=cmk-module-layer-violation
+    StoredWalkSNMPBackend,
+)
+from cmk.checkengine.snmplib import (
+    get_single_oid,
+    OID,
+    SNMPBackend,
+    SNMPBackendEnum,
+    SNMPDecodedString,
+    SNMPHostConfig,
+)
+
+cmk.ccc.debug.enable()
+
+params: tuple[OID, str, Mapping[str, object], str] = ast.literal_eval(sys.stdin.read())
+oid = params[0]
+backend_type = SNMPBackendEnum.deserialize(params[1])
+config = SNMPHostConfig.deserialize(params[2])
+cmk.utils.paths.snmpwalks_dir = Path(params[3])
+
+backend: Callable[[SNMPHostConfig], SNMPBackend]
+match backend_type:
+    case SNMPBackendEnum.INLINE:
+        from cmk.checkengine.snmp_backends.inline import (  # type: ignore[import-not-found,unused-ignore]  # astrein: disable=cmk-module-layer-violation
+            InlineSNMPBackend,
+        )
+
+        backend = InlineSNMPBackend
+    case SNMPBackendEnum.CLASSIC:
+        backend = ClassicSNMPBackend
+    case SNMPBackendEnum.STORED_WALK:
+        backend = StoredWalkSNMPBackend
+    case _:
+        raise ValueError(backend_type)
+
+single_oid_cache = dict[str, SNMPDecodedString | None]()
+sys.stdout.write(
+    repr(
+        (
+            get_single_oid(
+                oid,
+                single_oid_cache=single_oid_cache,
+                backend=backend(config),
+            ),
+            single_oid_cache,
+        )
+    )
+    + "\n"
+)

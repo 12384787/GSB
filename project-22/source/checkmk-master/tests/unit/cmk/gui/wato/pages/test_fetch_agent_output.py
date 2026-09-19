@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+# Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# ruff: noqa: ARG001  # Unused fixtures are needed for setup side effects
+
+from collections.abc import Iterator
+
+import pytest
+from pytest_mock import MockerFixture
+
+from livestatus import SiteConfigurations
+
+import cmk.utils.paths
+from cmk.automations.results import GetAgentOutputResult
+from cmk.ccc.hostaddress import HostName
+from cmk.ccc.site import SiteId
+from cmk.ccc.user import UserId
+from cmk.checkengine.helper_interface import AgentRawData
+from cmk.gui.logged_in import user
+from cmk.gui.wato.pages.fetch_agent_output import (
+    FetchAgentOutputRequest,
+    get_fetch_agent_job_status,
+    get_fetch_agent_output_file,
+    start_fetch_agent_job,
+)
+from cmk.gui.watolib.hosts_and_folders import folder_tree, Host
+from cmk.gui.watolib.pending_changes import NoopPendingChangesStore, PendingChanges
+from cmk.utils.automation_config import LocalAutomationConfig
+from tests.testlib.common.repo import repo_path
+
+
+def _noop_pending_changes() -> PendingChanges:
+    return PendingChanges(
+        activation_sites=SiteConfigurations({}),
+        local_site=SiteId("NO_SITE"),
+        acting_user=None,
+        store=NoopPendingChangesStore(),
+        hooks=(),
+    )
+
+
+@pytest.fixture(name="icon_dir")
+def fixture_icon_dir() -> None:
+    src_path = repo_path() / "packages/cmk-frontend/src/themes"
+    target_path = cmk.utils.paths.web_dir / "htdocs/themes"
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.symlink_to(src_path)
+
+
+@pytest.fixture(name="host")
+def fixture_host(with_admin_login: UserId, load_config: None) -> Iterator[Host]:
+    tree = folder_tree()
+    tree.invalidate_caches()
+
+    hostname = HostName("host1")
+    root = folder_tree().root_folder()
+    root.create_hosts(
+        [(hostname, {"site": SiteId("NO_SITE")}, None)],
+        pprint_value=False,
+        pending_changes=_noop_pending_changes(),
+        acting_user=user,
+    )
+    host = root.host(hostname)
+    assert host, "Test setup failed, host not created"
+    yield host
+
+
+@pytest.mark.usefixtures("inline_background_jobs", "icon_dir")
+def test_fetch_agent_job(host: Host, mocker: MockerFixture) -> None:
+    # GIVEN
+    get_agent_output_mock = mocker.patch(
+        "cmk.gui.wato.pages.fetch_agent_output.get_agent_output",
+        return_value=GetAgentOutputResult(
+            success=True,
+            service_details="x",
+            raw_agent_data=AgentRawData(b"y"),
+        ),
+    )
+
+    # WHEN
+    start_fetch_agent_job(request := FetchAgentOutputRequest(host, "agent", timeout=10, debug=True))
+
+    # THEN
+    get_agent_output_mock.assert_called_once_with(
+        LocalAutomationConfig(), "host1", "agent", timeout=10, debug=True
+    )
+    job_status = get_fetch_agent_job_status(request)
+    assert job_status.state == "finished", job_status
+    assert get_fetch_agent_output_file(request) == b"y"

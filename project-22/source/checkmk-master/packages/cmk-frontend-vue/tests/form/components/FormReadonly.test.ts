@@ -1,0 +1,585 @@
+/**
+ * Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+import { render, screen } from '@testing-library/vue'
+import type * as FormSpec from 'cmk-shared-typing/typescript/vue_formspec_components'
+
+import FormReadonly from '@/form/FormReadonly.vue'
+
+function getSpec(specType: 'integer' | 'float'): FormSpec.Integer | FormSpec.Float {
+  return {
+    type: specType,
+    title: 'fooTitle',
+    help: 'fooHelp',
+    label: 'fooLabel',
+    unit: 'fooUnit',
+    validators: [],
+    input_hint: 'fooInputHint'
+  }
+}
+
+test('FormReadonly renders integer', () => {
+  render(FormReadonly, {
+    props: {
+      spec: getSpec('integer'),
+      data: 42,
+      backendValidation: []
+    }
+  })
+  screen.getByText('42 fooUnit')
+})
+
+test('FormReadonly updates integer', async () => {
+  const props = {
+    spec: getSpec('integer'),
+    data: 42,
+    backendValidation: []
+  }
+
+  const { rerender } = render(FormReadonly, {
+    props
+  })
+  screen.getByText('42 fooUnit')
+  await rerender({ ...props, data: 41 })
+  screen.getByText('41 fooUnit')
+})
+
+test('FormReadonly renders float', () => {
+  render(FormReadonly, {
+    props: {
+      spec: getSpec('float'),
+      data: 42.23,
+      backendValidation: []
+    }
+  })
+  screen.getByText('42.23 fooUnit')
+})
+
+const stringFormSpec: FormSpec.String = {
+  type: 'string',
+  title: 'barTitle',
+  help: 'barHelp',
+  label: null,
+  validators: [],
+  input_hint: '',
+  autocompleter: null,
+  field_size: 'small'
+}
+
+test('FormReadonly renders string', () => {
+  render(FormReadonly, {
+    props: {
+      spec: stringFormSpec,
+      data: 'foo',
+      backendValidation: []
+    }
+  })
+  screen.getByText('foo')
+})
+
+const dictionaryFormSpec: FormSpec.Dictionary = {
+  type: 'dictionary',
+  title: 'fooTitle',
+  help: 'fooHelp',
+  validators: [],
+  groups: [],
+  no_elements_text: 'no_text',
+  additional_static_elements: null,
+  elements: [
+    {
+      name: 'bar',
+      render_only: false,
+      required: true,
+      default_value: 'baz',
+      parameter_form: stringFormSpec,
+      group: null
+    }
+  ]
+}
+
+test('FormReadonly renders dictionary', () => {
+  render(FormReadonly, {
+    props: {
+      spec: dictionaryFormSpec,
+      backendValidation: [],
+      data: { bar: 'baz' }
+    }
+  })
+  screen.getByText('baz')
+})
+
+test('FormReadonly renders dictionary with default value', () => {
+  render(FormReadonly, {
+    props: {
+      spec: dictionaryFormSpec,
+      backendValidation: [],
+      data: {}
+    }
+  })
+  screen.getByRole('table')
+  expect(screen.queryByText('baz')).toBeNull()
+})
+
+const singleChoiceFormSpec: FormSpec.SingleChoice = {
+  type: 'single_choice',
+  title: 'fooTitle',
+  input_hint: '',
+  help: 'fooHelp',
+  no_elements_text: 'no_text',
+  elements: [
+    { name: 'choice1', title: 'Choice 1' },
+    { name: 'choice2', title: 'Choice 2' }
+  ],
+  label: 'fooLabel',
+  frozen: false,
+  validators: []
+}
+
+test('FormReadonly renders single_choice', () => {
+  render(FormReadonly, {
+    props: {
+      spec: singleChoiceFormSpec,
+      backendValidation: [],
+      data: 'choice1'
+    }
+  })
+  screen.getByText('Choice 1')
+  expect(screen.queryByText('choice1')).toBeNull()
+})
+
+const listFormSpec: FormSpec.List = {
+  type: 'list',
+  title: 'fooTitle',
+  help: 'fooHelp',
+  validators: [],
+  element_template: stringFormSpec,
+  element_default_value: '',
+  editable_order: false,
+  add_element_label: 'Add element',
+  remove_element_label: 'Remove element',
+  no_element_label: 'No element'
+}
+
+test('FormReadonly renders list', () => {
+  render(FormReadonly, {
+    props: {
+      spec: listFormSpec,
+      backendValidation: [],
+      data: ['foo', 'bar']
+    }
+  })
+  screen.getByText('foo')
+  screen.getByText('bar')
+})
+
+const cascadingSingleChoiceFormSpec: FormSpec.CascadingSingleChoice = {
+  type: 'cascading_single_choice',
+  title: 'fooTitle',
+  label: 'fooLabel',
+  layout: 'horizontal',
+  help: 'fooHelp',
+  validators: [],
+  input_hint: null,
+  no_elements_text: '',
+  elements: [
+    {
+      name: 'stringChoice',
+      title: 'stringChoiceTitle',
+      default_value: 'bar',
+      parameter_form: stringFormSpec
+    },
+    {
+      name: 'integerChoice',
+      title: 'integerChoiceTitle',
+      default_value: 5,
+      parameter_form: getSpec('integer')
+    }
+  ]
+}
+
+test('FormReadonly renders cascading/string, 1st choice', () => {
+  render(FormReadonly, {
+    props: {
+      spec: cascadingSingleChoiceFormSpec,
+      backendValidation: [],
+      data: ['stringChoice', 'baz']
+    }
+  })
+  // Title of element choice
+  screen.getByText('stringChoiceTitle:')
+  // Value of element
+  screen.getByText('baz')
+})
+
+test('FormReadonly renders cascading/integer, 2nd choice', () => {
+  render(FormReadonly, {
+    props: {
+      spec: cascadingSingleChoiceFormSpec,
+      backendValidation: [],
+      data: ['integerChoice', 23]
+    }
+  })
+  // Title of element choice
+  screen.getByText('integerChoiceTitle:')
+  // Value of element
+  screen.getByText('23 fooUnit')
+})
+
+const booleanChoiceFormSpec: FormSpec.BooleanChoice = {
+  type: 'boolean_choice',
+  title: 'fooTitle',
+  label: 'fooLabel',
+  help: 'fooHelp',
+  text_on: 'on',
+  text_off: 'off',
+  validators: []
+}
+
+test('FormReadonly renders boolean: on', () => {
+  render(FormReadonly, {
+    props: {
+      spec: booleanChoiceFormSpec,
+      backendValidation: [],
+      data: true
+    }
+  })
+  // Title of cascading
+  screen.getByText('fooLabel: on')
+})
+
+test('FormReadonly renders boolean: off', () => {
+  render(FormReadonly, {
+    props: {
+      spec: booleanChoiceFormSpec,
+      backendValidation: [],
+      data: false
+    }
+  })
+  // Title of cascading
+  screen.getByText('fooLabel: off')
+})
+
+test('FormReadonly renders time_span: simple', () => {
+  render(FormReadonly, {
+    props: {
+      spec: {
+        type: 'time_span',
+        displayed_magnitudes: ['millisecond', 'second', 'minute'],
+        i18n: { minute: 'ut_minute', second: 'ut_second', millisecond: 'ut_ms' }
+      } as FormSpec.TimeSpan,
+      backendValidation: [],
+      data: 66.6
+    }
+  })
+  screen.getByText('1 ut_minute 6 ut_second 600 ut_ms')
+})
+
+const multilineTextFormSpec: FormSpec.MultilineText = {
+  type: 'multiline_text',
+  title: 'fooTitle',
+  help: 'fooHelp',
+  validators: [],
+  label: 'fooLabel',
+  macro_support: false,
+  monospaced: false,
+  input_hint: null
+}
+test('FormReadonly renders multiline_text', () => {
+  render(FormReadonly, {
+    props: {
+      spec: multilineTextFormSpec,
+      backendValidation: [],
+      data: 'BLABLA'
+    }
+  })
+  // Title of cascading
+  screen.getByText('BLABLA')
+})
+
+const labelsFormSpec: FormSpec.Labels = {
+  type: 'labels',
+  title: 'fooTitle',
+  help: 'fooHelp',
+  i18n: {
+    remove_label: 'i18n remove_label',
+    add_some_labels: 'Add some labels',
+    key_value_format_error: 'Key value format error',
+    max_labels_reached: 'Max labels reached',
+    uniqueness_error: 'Uniqueness error'
+  },
+  max_labels: 3,
+  autocompleter: {
+    data: { ident: '', params: {} },
+    fetch_method: 'ajax_vs_autocomplete'
+  } as FormSpec.Autocompleter,
+  label_source: 'discovered',
+  validators: []
+}
+
+test('FormReadonly renders labels', () => {
+  render(FormReadonly, {
+    props: {
+      spec: labelsFormSpec,
+      backendValidation: [],
+      data: { key1: 'value1', key2: 'value2' }
+    }
+  })
+  screen.getByText('key1: value1')
+  screen.getByText('key2: value2')
+  expect(screen.queryByText('key3: value3')).toBeNull()
+})
+
+const dualListChoiceFormSpec: FormSpec.DualListChoice = {
+  type: 'dual_list_choice',
+  title: 'fooTitle',
+  help: 'fooHelp',
+  show_toggle_all: true,
+  i18n: {
+    add: 'add',
+    remove: 'remove',
+    add_all: 'add_all',
+    remove_all: 'remove_all',
+    available_options: 'available_options',
+    selected_options: 'selected_options',
+    selected: 'selected',
+    no_elements_available: 'no_elements_available',
+    no_elements_selected: 'no_elements_selected',
+    autocompleter_loading: 'autocompleter_loading',
+    search_available_options: 'search_available_options',
+    search_selected_options: 'search_selected_options',
+    and_x_more: 'and %(count)s more'
+  },
+  validators: [],
+  elements: [
+    { name: 'choice1', title: 'Choice 1' },
+    { name: 'choice2', title: 'Choice 2' },
+    { name: 'choice3', title: 'Choice 3' }
+  ]
+}
+
+test('FormReadonly renders dual list choice', () => {
+  render(FormReadonly, {
+    props: {
+      spec: dualListChoiceFormSpec,
+      backendValidation: [],
+      data: [
+        { name: 'choice1', title: 'Choice 1' },
+        { name: 'choice2', title: 'Choice 2' }
+      ]
+    }
+  })
+  screen.getByText('Choice 1')
+  screen.getByText('Choice 2')
+  expect(screen.queryByText('Choice 3')).toBeNull()
+})
+
+test.each(['dual_list_choice', 'checkbox_list_choice'] as const)(
+  'FormReadonly interpolates the remaining selection count for %s',
+  (type) => {
+    const elements = Array.from({ length: 7 }, (_, index) => ({
+      name: `choice${index}`,
+      title: `Choice ${index}`
+    }))
+    const spec: FormSpec.DualListChoice | FormSpec.CheckboxListChoice = {
+      ...dualListChoiceFormSpec,
+      type,
+      elements
+    }
+    render(FormReadonly, {
+      props: {
+        spec,
+        backendValidation: [],
+        data: elements
+      }
+    })
+    screen.getByText('Choice 4')
+    screen.getByText('and 2 more')
+    expect(screen.queryByText('Choice 5')).toBeNull()
+  }
+)
+
+const telemetryMetricsCustomQuerySpec: FormSpec.TelemetryMetricsCustomQuery = {
+  type: 'telemetry_metrics_custom_query',
+  title: 'mbTitle',
+  help: 'mbHelp',
+  validators: [],
+  metric_name: null,
+  aggregation_lookback: 0,
+  consolidation_function: 'gauge_last',
+  aggregation_histogram_group_by: [],
+  aggregator: null,
+  aggregation_histogram_percentile: 0,
+  aggregation_histogram_threshold_for_fraction_below: 0,
+  aggregation_histogram_lower_threshold_for_fraction_between: 0,
+  aggregation_histogram_upper_threshold_for_fraction_between: 0,
+  service_name_template: ''
+}
+
+function renderTelemetryMetricsCustomQuery(
+  attributeFilter?: unknown,
+  consolidationFunction: string = 'sum_rate',
+  groupBy: unknown[] = [],
+  aggregator: unknown = null
+): void {
+  render(FormReadonly, {
+    props: {
+      spec: telemetryMetricsCustomQuerySpec,
+      backendValidation: [],
+      data: {
+        metric_name: 'metric',
+        attribute_filter: attributeFilter,
+        aggregation_lookback: 222,
+        consolidation_function: consolidationFunction,
+        aggregation_histogram_group_by: groupBy,
+        aggregator: aggregator,
+        aggregation_histogram_percentile: 95,
+        aggregation_histogram_threshold_for_fraction_below: 5,
+        aggregation_histogram_lower_threshold_for_fraction_between: 10,
+        aggregation_histogram_upper_threshold_for_fraction_between: 90,
+        service_name_template: 'svc'
+      }
+    }
+  })
+}
+
+test.each([
+  [
+    {
+      type: 'and',
+      conjuncts: [
+        { type: 'equals', key: { kind: 'resource', name: 'foo' }, value: 'bar' },
+        { type: 'equals', key: { kind: 'data_point', name: 'baz' }, value: 'tar' }
+      ]
+    },
+    '[Resource] foo is bar AND [Data point] baz is tar'
+  ],
+  [
+    {
+      type: 'or',
+      disjuncts: [
+        { type: 'equals', key: { kind: 'resource', name: 'foo' }, value: 'bar' },
+        { type: 'exists', key: { kind: 'scope', name: 'baz' } }
+      ]
+    },
+    '[Resource] foo is bar OR [Scope] baz exists'
+  ]
+])('FormReadonly renders the attribute filter as a sentence', (attributeFilter, sentence) => {
+  renderTelemetryMetricsCustomQuery(attributeFilter)
+  screen.getByText(sentence)
+})
+
+test('FormReadonly omits the attribute row and renders a compact lookback without a filter', () => {
+  renderTelemetryMetricsCustomQuery(undefined)
+  expect(screen.queryByText('Attributes:')).toBeNull()
+  screen.getByText(/3\s+m\s+42\s+s/)
+})
+
+test('FormReadonly renders the persisted consolidation function as a pill sentence', () => {
+  renderTelemetryMetricsCustomQuery(undefined)
+  screen.getByText('Consolidation:')
+  screen.getByText(/\[Sum\] rate · 3\s+m\s+42\s+s/)
+})
+
+test.each([
+  ['histogram_quantile', /\[Histogram\] p95 ·/],
+  ['histogram_fraction_below', /\[Histogram\] fraction <5 ·/],
+  ['histogram_fraction_between', /\[Histogram\] fraction 10–90 ·/]
+])(
+  'FormReadonly renders only the parameters of the picked function',
+  (consolidationFunction, sentence) => {
+    renderTelemetryMetricsCustomQuery(undefined, consolidationFunction)
+    screen.getByText(sentence)
+    expect(screen.queryByText(/Percentile/)).toBeNull()
+  }
+)
+
+test('FormReadonly falls back to the plain fields for a name outside the catalog', () => {
+  renderTelemetryMetricsCustomQuery(undefined, 'gone_from_the_catalog')
+
+  expect(screen.queryByText('Consolidation:')).toBeNull()
+  screen.getByText('Aggregation lookback:')
+  screen.getByText('Percentile (histograms):')
+  screen.getByText('95 %')
+})
+
+test('FormReadonly renders a preserve spelling as the preserve-histograms pill', () => {
+  renderTelemetryMetricsCustomQuery(undefined, 'histogram_preserve_quantile')
+
+  screen.getByText('Consolidation:')
+  screen.getByText(/\[Histogram\] preserve histograms ·/)
+})
+
+test.each([
+  ['histogram_preserve_quantile', 'p95 by [Resource] k8s.pod.name'],
+  ['histogram_preserve_fraction_below', 'fraction <5 by [Resource] k8s.pod.name'],
+  ['histogram_preserve_fraction_between', 'fraction 10–90 by [Resource] k8s.pod.name']
+])('FormReadonly renders the preserve grouping as the editor chip', (fn, clause) => {
+  renderTelemetryMetricsCustomQuery(undefined, fn, [{ kind: 'resource', key: 'k8s.pod.name' }])
+
+  screen.getByText('Group by:')
+  screen.getByText(clause)
+})
+
+test('FormReadonly renders an ungrouped preserve view with its parameter', () => {
+  renderTelemetryMetricsCustomQuery(undefined, 'histogram_preserve_quantile')
+
+  screen.getByText('Group by:')
+  screen.getByText('p95 by nothing, combine all series into one')
+})
+
+test('FormReadonly renders the aggregator stages', () => {
+  renderTelemetryMetricsCustomQuery(undefined, 'gauge_last', [], {
+    stages: [
+      {
+        aggregate_by: [{ kind: 'resource', name: 'k8s.pod.name' }],
+        aggregation_fn: { type: 'scalar', name: 'avg' }
+      }
+    ]
+  })
+
+  screen.getByText('Group by:')
+  screen.getByText('avg by [Resource] k8s.pod.name')
+})
+
+test('FormReadonly renders a chained aggregator as the editor clause plus then steps', () => {
+  renderTelemetryMetricsCustomQuery(undefined, 'gauge_last', [], {
+    stages: [
+      {
+        aggregate_by: [{ kind: 'resource', name: 'k8s.pod.name' }],
+        aggregation_fn: { type: 'scalar', name: 'avg' }
+      },
+      {
+        aggregate_by: [{ kind: 'resource', name: 'k8s.namespace.name' }],
+        aggregation_fn: { type: 'scalar', name: 'max' }
+      }
+    ]
+  })
+
+  screen.getByText('Group by:')
+  screen.getByText('avg by [Resource] k8s.pod.name, then max by [Resource] k8s.namespace.name')
+})
+
+test('FormReadonly renders a keyless aggregator stage as combining all series', () => {
+  renderTelemetryMetricsCustomQuery(undefined, 'gauge_last', [], {
+    stages: [{ aggregate_by: [], aggregation_fn: { type: 'scalar', name: 'avg' } }]
+  })
+
+  screen.getByText('Group by:')
+  screen.getByText('avg by nothing, combine all series into one')
+})
+
+test('FormReadonly renders a preserve grouping and its then step in one row', () => {
+  renderTelemetryMetricsCustomQuery(
+    undefined,
+    'histogram_preserve_quantile',
+    [{ kind: 'resource', key: 'k8s.pod.name' }],
+    { stages: [{ aggregate_by: [], aggregation_fn: { type: 'scalar', name: 'avg' } }] }
+  )
+
+  expect(screen.getAllByText('Group by:')).toHaveLength(1)
+  screen.getByText(
+    'p95 by [Resource] k8s.pod.name, then avg by nothing, combine all series into one'
+  )
+})

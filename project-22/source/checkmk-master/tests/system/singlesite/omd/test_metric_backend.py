@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+import pytest
+
+from tests.testlib.site import Site
+
+
+@pytest.mark.skip_if_edition("community", "cloud")
+def test_clickhouse_exists(site: Site) -> None:
+    assert (site.root / "bin" / "clickhouse").exists()
+
+
+@pytest.mark.skip_if_edition("community", "cloud")
+def test_clickhouse_executable(site: Site) -> None:
+    output = site.check_output(["clickhouse", "--version"])
+    assert output.startswith("ClickHouse local version")
+    assert output.endswith(" (altinity build).\n")
+
+
+@pytest.mark.skip_if_edition("community")
+def test_schema_manager_executable(site: Site) -> None:
+    output = site.check_output(["cmk-data-backend-schema-manager", "--help"])
+    assert output.startswith("usage: cmk-data-backend-schema-manager")

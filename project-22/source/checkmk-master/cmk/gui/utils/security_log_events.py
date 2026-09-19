@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+# Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Literal
+
+from cmk.ccc.user import UserId
+from cmk.gui.type_defs import AuthType
+from cmk.utils.security_event import SecurityEvent
+
+
+class TwoFactorEventType(Enum):
+    totp_add = "Authenticator application key added"
+    totp_remove = "Authenticator application key revoked"
+    webauthn_add_ = "Webauthn key added"
+    webauthn_remove = "Webauthn key revoked"
+    backup_add = "New backup codes generated, previous revoked"
+    backup_remove = "All backup codes revoked"
+    backup_used = "Backup code used for authentication"
+
+
+@dataclass
+class AuthenticationFailureEvent(SecurityEvent):
+    """Indicates a failed authentication attempt"""
+
+    def __init__(
+        self,
+        *,
+        user_error: str,
+        auth_method: AuthType | Literal["token"],
+        username: UserId | None,
+        remote_ip: str | None,
+        extra_details: dict[str, str] | None = None,
+    ) -> None:
+        details = {
+            **(extra_details or {}),
+            "user_error": user_error,  # Note: may be localized
+            "method": auth_method,
+            "user": str(username or "Unknown user"),
+            "remote_ip": remote_ip,
+        }
+        super().__init__(
+            "authentication failed",
+            details,
+            SecurityEvent.Domain.auth,
+        )
+
+
+@dataclass
+class AuthenticationSuccessEvent(SecurityEvent):
+    """Indicates a successful authentication"""
+
+    def __init__(
+        self,
+        *,
+        auth_method: AuthType,
+        username: UserId | None,
+        remote_ip: str | None,
+        extra_details: dict[str, str] | None = None,
+    ) -> None:
+        details = {
+            **(extra_details or {}),
+            "method": auth_method,
+            "user": str(username or "Unknown user"),
+            "remote_ip": remote_ip,
+        }
+        super().__init__(
+            "authentication succeeded",
+            details,
+            SecurityEvent.Domain.auth,
+        )
+
+
+@dataclass
+class AuthenticationInitiatedEvent(SecurityEvent):
+    """Indicates an authentication flow has been initiated"""
+
+    def __init__(
+        self,
+        *,
+        auth_method: AuthType | Literal["token"],
+        remote_ip: str | None,
+        extra_details: dict[str, str] | None = None,
+    ) -> None:
+        details = {
+            **(extra_details or {}),
+            "method": auth_method,
+            "user": "Unknown user",
+            "remote_ip": remote_ip,
+        }
+        super().__init__(
+            "authentication initiated",
+            details,
+            SecurityEvent.Domain.auth,
+        )
+
+
+@dataclass
+class TwoFAFailureEvent(SecurityEvent):
+    """Indicates a failed 2FA attempt"""
+
+    def __init__(
+        self, *, user_error: str, two_fa_method: str, username: UserId | None, remote_ip: str | None
+    ) -> None:
+        super().__init__(
+            "2FA authentication failed",
+            {
+                "user_error": user_error,
+                "method": two_fa_method,
+                "user": str(username or "Unknown user"),
+                "remote_ip": remote_ip,
+            },
+            SecurityEvent.Domain.auth,
+        )
+
+
+@dataclass
+class OAuthAuthorizationFailureEvent(SecurityEvent):
+    """Indicates a rejected OAuth authorization request"""
+
+    def __init__(
+        self,
+        *,
+        reason: str,
+        client_id: str | None,
+        remote_ip: str | None,
+    ) -> None:
+        super().__init__(
+            "oauth authorization request rejected",
+            {
+                "reason": reason,
+                "client_id": client_id or "Unknown client",
+                "remote_ip": remote_ip,
+            },
+            SecurityEvent.Domain.auth,
+        )
+
+
+@dataclass
+class OAuthTokenFailureEvent(SecurityEvent):
+    """Indicates a rejected OAuth token request"""
+
+    def __init__(
+        self,
+        *,
+        reason: str,
+        client_id: str | None,
+        remote_ip: str | None,
+    ) -> None:
+        super().__init__(
+            "oauth token request rejected",
+            {
+                "reason": reason,
+                "client_id": client_id or "Unknown client",
+                "remote_ip": remote_ip,
+            },
+            SecurityEvent.Domain.auth,
+        )
+
+
+@dataclass
+class UserManagementEvent(SecurityEvent):
+    """Indicates a user creation, modification or deletion"""
+
+    def __init__(
+        self,
+        *,
+        event: Literal[
+            "user created",
+            "user deleted",
+            "user modified",
+            "password changed",
+            "user quarantined",
+            "user reactivated",
+        ],
+        affected_user: UserId,
+        acting_user: UserId | None,
+        connector: str | None = None,
+        connection_id: str | None = None,
+    ) -> None:
+        details = {
+            "affected_user": str(affected_user),
+            "acting_user": str(acting_user or "Unknown user"),
+        }
+        if connector is not None:
+            details["connector"] = connector
+            details["connection_id"] = str(connection_id or "Unknown connection")
+
+        super().__init__(
+            event,
+            details,
+            SecurityEvent.Domain.user_management,
+        )
+
+
+@dataclass
+class TwoFactorEvent(SecurityEvent):
+    """Indicates a user has added, or removed two factor controls"""
+
+    def __init__(
+        self,
+        *,
+        event: TwoFactorEventType,
+        username: UserId,
+    ) -> None:
+        super().__init__(
+            event.value,
+            {
+                "user": str(username),
+            },
+            SecurityEvent.Domain.user_management,
+        )
+
+
+@dataclass
+class PermissionCheckFailureEvent(SecurityEvent):
+    """Indicates a failed permission check"""
+
+    def __init__(
+        self,
+        *,
+        permission: str,
+        username: UserId | None,
+    ) -> None:
+        super().__init__(
+            "permission check failed",
+            {"permission": str(permission), "user": username if username else "Unknown user"},
+            SecurityEvent.Domain.user_permissions,
+        )

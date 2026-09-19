@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+# Copyright (C) 2020 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+"""Fetcher config path manipulation."""
+
+import os
+import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Final, override
+
+from cmk.ccc.store import DimSerializer, ObjectStore
+
+__all__ = ["VersionedConfigPath", "ConfigCreationContext"]
+
+
+@dataclass(frozen=True)
+class ConfigCreationContext:
+    """Hold information on the currently active config and the one being created."""
+
+    path_active: Path
+    path_created: Path
+    serial_created: int
+
+
+@dataclass(frozen=True)
+class Serial:
+    value: int
+    path: Path
+
+
+def detect_latest_config_path(base: Path) -> Path:
+    """Resolve the 'latest' symlink to the latest config path.
+
+    Using this probably subject to a race condition, as the
+    CMC might choose to remove that config.
+    """
+    latest_link_path = VersionedConfigPath.make_latest_path(base)
+    return latest_link_path.resolve()
+
+
+class VersionedConfigPath:
+    @classmethod
+    def make_root_path(cls, base: Path) -> Path:
+        # Note - Security: This must remain hard-coded to a path not writable by others.
+        #                  See BNS:c3c5e9.
+        return base / "var/check_mk/core/helper_config"
+
+    @classmethod
+    def make_latest_path(cls, base: Path) -> Path:
+        return cls.make_root_path(base).joinpath("latest")
+
+    def __init__(self, base: Path, serial: int) -> None:
+        super().__init__()
+        self.base: Final = base
+        self.root: Final = self.make_root_path(base)
+        # TODO: The fact that this can be interpreted as an int
+        # is an implementation detail of _increment_to_next_serial.
+        # But fixing this would require changing a lot of code.
+        self.serial: Final = serial
+
+    @override
+    def __str__(self) -> str:
+        return str(self.root / str(self.serial))
+
+    def __fspath__(self) -> str:
+        return str(self)
+
+    @override
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self.base!r}, {self.serial!r})"
+
+    @override
+    def __eq__(self, other: object) -> bool:
+        return Path(self) == Path(other) if isinstance(other, os.PathLike) else NotImplemented
+
+    @override
+    def __hash__(self) -> int:
+        return hash(Path(self))
+
+
+def _increment_to_next_serial(base: Path) -> int:
+    root = VersionedConfigPath.make_root_path(base)
+    store = ObjectStore(root / "serial.mk", serializer=DimSerializer())
+    with store.locked():
+        old_serial: int = store.read_obj(default=0)
+        new_serial = old_serial + 1
+        store.write_obj(new_serial)
+    # TODO: The fact that this can be interpreted as an int
+    # is an implementation detail of _increment_to_next_serial.
+    # But fixing this would require changing a lot of code.
+    return new_serial
+
+
+def cleanup_old_configs(base: Path) -> None:
+    root = VersionedConfigPath.make_root_path(base)
+    if not root.exists():
+        return
+
+    current_config_path = detect_latest_config_path(base)
+
+    serials: list[Serial] = []
+    for path in root.iterdir():
+        # keep "latest" symlink and "serial.mk"
+        if path.is_symlink() or not path.is_dir():
+            continue
+        # keep the latest config
+        if path.resolve() == current_config_path:
+            continue
+        if path.name.isnumeric():
+            serials.append(Serial(int(path.name), path))
+
+    serials.sort(reverse=True, key=lambda x: x.value)
+
+    # Determine the serial of the latest (active) config so we can identify
+    # the previous config: the highest serial that is still below the active one.
+    latest_serial = int(current_config_path.name)
+    count_kept_serials = 0
+    additional_serials_to_keep = 1
+    for serial in serials:
+        if serial.value < latest_serial and count_kept_serials < additional_serials_to_keep:
+            count_kept_serials += 1
+            continue
+
+        shutil.rmtree(serial.path)
+
+
+@contextmanager
+def create(base: Path) -> Iterator[ConfigCreationContext]:
+    # NOTE:
+    # The "latest" symlink points to the last successfully created config.
+    # The "serial.mk" file contains the last serial we started to create.
+    latest_link_path = VersionedConfigPath.make_latest_path(base)
+    current_config_path = latest_link_path.resolve()
+    serial = _increment_to_next_serial(base)
+    under_construction_path = Path(VersionedConfigPath(base, serial))
+
+    with suppress(FileNotFoundError):
+        # this should not exist, but we must be robust.
+        shutil.rmtree(under_construction_path)
+    under_construction_path.mkdir(parents=True, exist_ok=False)
+
+    yield ConfigCreationContext(
+        path_active=current_config_path,
+        path_created=under_construction_path,
+        serial_created=serial,
+    )
+    # upon exiting the context, do this if and only if no exception ocurred:
+    latest_link_path.unlink(missing_ok=True)
+    latest_link_path.symlink_to(under_construction_path.name)

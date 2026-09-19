@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from typing import TypedDict
+
+from cmk.agent_based.v2 import (
+    check_levels,
+    CheckPlugin,
+    CheckResult,
+    Result,
+    State,
+)
+from cmk.agent_based.v3_unstable import discover_one_service
+from cmk.plugins.mobileiron.lib import Section
+from cmk.rulesets.v1.form_specs import SimpleLevelsConfigModel
+
+
+class Params(TypedDict):
+    policy_violation_levels: SimpleLevelsConfigModel[int]
+    ignore_compliance: bool
+
+
+def check_mobileiron_compliance(params: Params, section: Section) -> CheckResult:
+    count = section.policy_violation_count or 0
+    yield from check_levels(
+        label="Policy violation count",
+        value=count,
+        levels_upper=params["policy_violation_levels"],
+        metric_name="mobileiron_policyviolationcount",
+        render_func=lambda v: str(int(v)),
+    )
+
+    if not params["ignore_compliance"]:
+        yield Result(
+            state=State.OK if section.compliance_state else State.CRIT,
+            summary=f"Compliant: {section.compliance_state}",
+        )
+    else:
+        yield Result(
+            state=State.OK,
+            summary=f"Compliant: {section.compliance_state} (ignored)",
+        )
+
+
+check_plugin_mobileiron_compliance = CheckPlugin(
+    name="mobileiron_compliance",
+    sections=["mobileiron_section"],
+    service_name="Mobileiron compliance",
+    discovery_function=discover_one_service,
+    check_function=check_mobileiron_compliance,
+    check_ruleset_name="mobileiron_compliance",
+    check_default_parameters=Params(
+        policy_violation_levels=("fixed", (2, 3)), ignore_compliance=False
+    ),
+)

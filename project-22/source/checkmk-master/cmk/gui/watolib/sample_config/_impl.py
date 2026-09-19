@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+# Copyright (C) 2021 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import os
+import uuid
+from datetime import datetime
+from typing import override
+from uuid import uuid4, uuid5
+
+from cmk.ccc import store
+from cmk.ccc.site import omd_site, url_prefix
+from cmk.ccc.user import UserId
+from cmk.events.notify_types import (
+    EventRule,
+    MailPluginModel,
+    NotificationParameterGeneralInfos,
+    NotificationParameterID,
+    NotificationParameterItem,
+    NotificationParameterSpecs,
+    NotificationPluginNameStr,
+    NotificationRuleID,
+    NotifyPlugin,
+)
+from cmk.gui import werks
+from cmk.gui.config import active_config
+from cmk.gui.groups import GroupSpec
+from cmk.gui.log import logger
+from cmk.gui.logged_in import user
+from cmk.gui.userdb import (
+    add_internal_attributes,
+    create_cmk_automation_user,
+    distributed_saml_supported,
+    get_user_attributes,
+    load_users,
+    save_users,
+    UserSpec,
+)
+from cmk.gui.utils.htpasswd import Htpasswd
+from cmk.gui.watolib.config_domains import ConfigDomainCACertificates
+from cmk.gui.watolib.global_settings import (
+    load_configuration_settings,
+    save_global_settings_raw,
+)
+from cmk.gui.watolib.hosts_and_folders import FolderTree
+from cmk.gui.watolib.notifications import (
+    NotificationParameterConfigFile,
+    NotificationRuleConfigFile,
+)
+from cmk.gui.watolib.rulesets import FolderRulesets
+from cmk.gui.watolib.sites import site_management_registry
+from cmk.gui.watolib.tags import TagConfigFile
+from cmk.gui.watolib.utils import multisite_dir, wato_root_dir
+from cmk.inventory.config import (
+    InvCleanupParams,
+    InvCleanupParamsDefaultCombined,
+)
+from cmk.livestatus_client import SiteConfiguration, SiteConfigurations
+from cmk.ruleset_matcher.labels import BuiltinLabelsKey, update_builtin_host_labels
+from cmk.ruleset_matcher.tags import sample_tag_config, TagConfig
+from cmk.utils.encryption import raw_certificates_from_file
+from cmk.utils.log import VERBOSE
+from cmk.utils.paths import (
+    builtin_host_labels_file,
+    configuration_lockfile,
+    htpasswd_file,
+    site_cert_file,
+)
+
+from ._abc import SampleConfigGeneratorABCGroups
+from ._constants import SHIPPED_RULES, USE_NEW_DESCRIPTIONS_FOR_SETTING
+from ._registry import (
+    sample_config_generator_registry,
+    SampleConfigGenerator,
+    SampleConfigGeneratorRegistry,
+)
+
+
+# TODO: Must only be unlocked when it was not locked before. We should find a more
+# robust way for doing something like this. If it is locked before, it can now happen
+# that this call unlocks the wider locking when calling this funktion in a wrong way.
+def init_wato_datastructures(tree: FolderTree, with_wato_lock: bool = False) -> None:
+    if (
+        os.path.exists(ConfigDomainCACertificates.trusted_cas_file)
+        and not _need_to_create_sample_config()
+    ):
+        logger.log(VERBOSE, "No need to create the sample config")
+        return
+
+    def init() -> None:
+        if not os.path.exists(ConfigDomainCACertificates.trusted_cas_file):
+            ConfigDomainCACertificates().activate()
+        _create_sample_config(tree)
+
+    if with_wato_lock:
+        with store.lock_checkmk_configuration(configuration_lockfile):
+            init()
+    else:
+        init()
+
+
+def _need_to_create_sample_config() -> bool:
+    return not (
+        (multisite_dir() / "tags.mk").exists()
+        or (wato_root_dir() / "rules.mk").exists()
+        or (wato_root_dir() / "groups.mk").exists()
+        or (wato_root_dir() / "notifications.mk").exists()
+        or (wato_root_dir() / "global.mk").exists()
+    )
+
+
+def _create_sample_config(tree: FolderTree) -> None:
+    """Create a very basic sample configuration
+
+    But only if none of the files that we will create already exists. That is
+    e.g. the case after an update from an older version where no sample config
+    had been created.
+    """
+    if not _need_to_create_sample_config():
+        return
+
+    logger.debug("Start creating the sample config")
+    for generator in sample_config_generator_registry.get_generators():
+        try:
+            logger.debug("Starting [%(generator)s]", {"generator": generator.ident()})
+            generator.generate(tree)
+            logger.debug("Finished [%(generator)s]", {"generator": generator.ident()})
+        except Exception:
+            logger.exception(
+                "Exception in sample config generator [%(generator)s]",
+                {"generator": generator.ident()},
+            )
+
+    logger.log(VERBOSE, "Finished creating the sample config")
+
+
+def new_notification_rule_id() -> NotificationRuleID:
+    return NotificationRuleID(str(uuid4()))
+
+
+def new_notification_parameter_id() -> NotificationParameterID:
+    return NotificationParameterID(str(uuid4()))
+
+
+def _default_notification_parameter_id() -> NotificationParameterID:
+    return NotificationParameterID(
+        str(uuid5(uuid.UUID("f5b3b3b4-4b3b-4b3b-4b3b-4b3b4b3b4b3b"), "seed"))
+    )
+
+
+def _create_default_notify_plugin() -> NotifyPlugin:
+    method: NotificationPluginNameStr = "mail"
+    params_id: NotificationParameterID = _default_notification_parameter_id()
+    default_param: NotificationParameterSpecs = {
+        method: {
+            params_id: NotificationParameterItem(
+                general=NotificationParameterGeneralInfos(
+                    description="Default",
+                    comment="",
+                    docu_url="",
+                ),
+                parameter_properties=MailPluginModel(),
+            )
+        }
+    }
+    NotificationParameterConfigFile().save(default_param, pprint_value=True)
+    return method, params_id
+
+
+def get_default_notification_rule() -> EventRule:
+    return EventRule(
+        rule_id=new_notification_rule_id(),
+        allow_disable=True,
+        contact_all=False,
+        contact_all_with_email=False,
+        contact_object=True,
+        description="HTML email to all contacts about service/host status changes",
+        disabled=False,
+        notify_plugin=("mail", _default_notification_parameter_id()),
+        match_host_event=["?d", "?r"],
+        match_service_event=["?c", "?w", "?r"],
+    )
+
+
+class SampleConfigGeneratorGroups(SampleConfigGeneratorABCGroups):
+    @override
+    def _all_group_spec(self) -> GroupSpec:
+        return {
+            "alias": "Everything",
+        }
+
+
+class SampleConfigGeneratorInlineSNMPBackend(SampleConfigGenerator):
+    """Make the inline SNMP backend the default in the editions shipping it
+
+    The shipped default in `cmk.base.default_config` must be a backend that is
+    available in every edition, so the editions shipping the inline backend
+    configure it here.
+    """
+
+    @classmethod
+    @override
+    def ident(cls) -> str:
+        return "inline_snmp_backend"
+
+    @classmethod
+    @override
+    def sort_index(cls) -> int:
+        # must run after ConfigGeneratorBasicWATOConfig, which replaces the
+        # global settings with a freshly built set. The editions' tests for
+        # `init_wato_datastructures` pin the outcome.
+        return 12
+
+    @override
+    def generate(self, tree: FolderTree) -> None:
+        save_global_settings_raw(
+            {
+                # Load the full config (with undefined settings), so that saving
+                # does not drop them.
+                **load_configuration_settings(full_config=True),
+                "snmp_backend_default": "inline",
+            },
+            skip_cse_edition_check=True,
+        )
+
+
+class ConfigGeneratorBasicWATOConfig(SampleConfigGenerator):
+    @classmethod
+    @override
+    def ident(cls) -> str:
+        return "basic_wato_config"
+
+    @classmethod
+    @override
+    def sort_index(cls) -> int:
+        return 11
+
+    @override
+    def generate(self, tree: FolderTree) -> None:
+        save_global_settings_raw(self._initial_global_settings(), skip_cse_edition_check=True)
+
+        self._initialize_tag_config()
+
+        root_folder = tree.root_folder()
+        rulesets = FolderRulesets.load_folder_rulesets(root_folder)
+        rulesets.replace_folder_config(root_folder, SHIPPED_RULES)
+        rulesets.save_folder(pprint_value=False, debug=False)
+
+        _create_default_notify_plugin()
+        notification_rules = [get_default_notification_rule()]
+        NotificationRuleConfigFile().save(notification_rules, pprint_value=True)
+
+    def _initial_global_settings(self) -> dict[str, object]:
+        return {
+            **USE_NEW_DESCRIPTIONS_FOR_SETTING,
+            "trusted_certificate_authorities": {
+                "use_system_wide_cas": True,
+                # Add the CA of the site to the trusted CAs. This has the benefit that remote sites
+                # automatically trust central sites in distributed setups where the config is replicated.
+                "trusted_cas": (
+                    (site_cas := raw_certificates_from_file(site_cert_file))
+                    and [site_cas[-1]]
+                    or []
+                ),
+            },
+            "inventory_cleanup": InvCleanupParams(
+                for_hosts=[],
+                default=InvCleanupParamsDefaultCombined(
+                    strategy="and",
+                    file_age=400 * 86400,
+                    number_of_history_entries=100,
+                ),
+                abandoned_file_age=30 * 86400,
+            ),
+        }
+
+    def _initialize_tag_config(self) -> None:
+        tag_config = TagConfig.from_config(sample_tag_config())
+        TagConfigFile().save(tag_config.get_dict_format(), pprint_value=True)
+
+
+class ConfigGeneratorLocalSiteConnection(SampleConfigGenerator):
+    @classmethod
+    @override
+    def ident(cls) -> str:
+        return "create_local_site_connection"
+
+    @classmethod
+    @override
+    def sort_index(cls) -> int:
+        return 20
+
+    @override
+    def generate(self, tree: FolderTree) -> None:
+        site_mgmt = site_management_registry["site_management"]
+        site_mgmt.save_sites(
+            tree,
+            self._default_single_site_configuration(),
+            activate=True,
+            pprint_value=True,
+            liveproxyd_enabled=active_config.liveproxyd_enabled,
+            use_git=active_config.wato_use_git,
+            acting_user_id=user.id,
+        )
+
+    def _default_single_site_configuration(self) -> SiteConfigurations:
+        return SiteConfigurations(
+            {
+                omd_site(): SiteConfiguration(
+                    {
+                        "id": omd_site(),
+                        "alias": f"Local site {omd_site()}",
+                        "socket": ("local", None),
+                        "disable_wato": True,
+                        "disabled": False,
+                        "insecure": False,
+                        "url_prefix": url_prefix(),
+                        "multisiteurl": "",
+                        "persist": False,
+                        "replicate_ec": False,
+                        "replicate_mkps": False,
+                        "replication": None,
+                        "timeout": 5,
+                        "user_login": True,
+                        "proxy": None,
+                        "authentication_connections": (
+                            ("all", ["ldap", "saml"])
+                            if distributed_saml_supported()
+                            else ("all", ["ldap"])
+                        ),
+                        "user_attribute_sync_connections": "all",
+                        "status_host": None,
+                        "message_broker_port": 5672,
+                        "is_trusted": True,
+                    }
+                )
+            }
+        )
+
+
+class ConfigGeneratorBuiltinHostLabels(SampleConfigGenerator):
+    """Seed the common ``cmk/site`` builtin host label at site creation.
+
+    The builtin host labels file is read by the base LabelManager and rewritten before every
+    core restart/reload (config generation), but seeding the ``cmk/site`` label at site
+    creation makes it available before the first activation. The managed-services
+    ``cmk/customer`` label is seeded by a separate, edition-shipped generator.
+    """
+
+    @classmethod
+    @override
+    def ident(cls) -> str:
+        return "builtin_host_labels"
+
+    @classmethod
+    @override
+    def sort_index(cls) -> int:
+        return 25
+
+    @override
+    def generate(self, tree: FolderTree) -> None:
+        update_builtin_host_labels(
+            builtin_host_labels_file, {BuiltinLabelsKey.SITE: str(omd_site())}
+        )
+
+
+class ConfigGeneratorAcknowledgeInitialWerks(SampleConfigGenerator):
+    """This is not really the correct place for such kind of action, but the best place we could
+    find to execute it only for new created sites."""
+
+    @classmethod
+    @override
+    def ident(cls) -> str:
+        return "acknowledge_initial_werks"
+
+    @classmethod
+    @override
+    def sort_index(cls) -> int:
+        return 40
+
+    @override
+    def generate(self, tree: FolderTree) -> None:
+        werks.acknowledge_all_werks(check_permission=False)
+
+
+class ConfigGeneratorInitialAdminUser(SampleConfigGenerator):
+    """Create the configuration for the "cmkadmin" user
+
+    'omd create' already creates this user in the htpasswd file, but not in
+    the user database. So we create it here to have a complete user setup.
+    """
+
+    @classmethod
+    @override
+    def ident(cls) -> str:
+        return "create_initial_admin_user"
+
+    @classmethod
+    @override
+    def sort_index(cls) -> int:
+        return 55
+
+    @override
+    def generate(self, tree: FolderTree) -> None:
+        pw_hash = Htpasswd(htpasswd_file).get_hash(UserId("cmkadmin"))
+        if pw_hash is None:
+            raise ValueError("No password found for user 'cmkadmin'")
+
+        admin_user = UserSpec(
+            {
+                "alias": "cmkadmin",
+                "connector": "htpasswd",
+                # The password was set through 'omd create'. Get it so that it is not
+                # removed by Htpasswd.save_users().
+                "password": pw_hash,
+                "locked": False,
+                "roles": ["admin"],
+                "language": "en",
+            }
+        )
+        add_internal_attributes(admin_user)
+
+        save_users(
+            {
+                **load_users(lock=True),
+                UserId("cmkadmin"): admin_user,
+            },
+            get_user_attributes([]),
+            user_connections=[],
+            now=datetime.now(),
+            pprint_value=True,
+            call_users_saved_hook=False,
+            changed_users=[UserId("cmkadmin")],
+        )
+
+
+class ConfigGeneratorRegistrationUser(SampleConfigGenerator):
+    """Create the default Checkmk "agent registation" user"""
+
+    name = "agent_registration"
+    role = "agent_registration"
+    alias = "Check_MK Agent Registration - used for agent registration"
+
+    @classmethod
+    @override
+    def ident(cls) -> str:
+        return "create_registration_automation_user"
+
+    @classmethod
+    @override
+    def sort_index(cls) -> int:
+        return 60
+
+    @override
+    def generate(self, tree: FolderTree) -> None:
+        create_cmk_automation_user(
+            name=self.name,
+            role=self.role,
+            alias=self.alias,
+            store_secret=True,
+            user_attributes=get_user_attributes([]),
+            user_connections=[],
+            now=datetime.now(),
+            pprint_value=True,
+        )
+
+
+def register(sample_config_generator_registry_: SampleConfigGeneratorRegistry) -> None:
+    sample_config_generator_registry_.register(ConfigGeneratorBasicWATOConfig)
+    sample_config_generator_registry_.register(ConfigGeneratorLocalSiteConnection)
+    sample_config_generator_registry_.register(ConfigGeneratorBuiltinHostLabels)
+    sample_config_generator_registry_.register(ConfigGeneratorAcknowledgeInitialWerks)
+    sample_config_generator_registry_.register(ConfigGeneratorRegistrationUser)
+    sample_config_generator_registry_.register(ConfigGeneratorInitialAdminUser)

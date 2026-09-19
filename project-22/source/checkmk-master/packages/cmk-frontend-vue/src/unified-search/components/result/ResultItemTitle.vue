@@ -1,0 +1,65 @@
+<!--
+Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script lang="ts">
+import { type PropType, defineComponent, h } from 'vue'
+
+type HtmlString = string
+
+export default defineComponent({
+  props: {
+    title: { type: String as PropType<HtmlString>, required: true },
+    context: { type: String, required: true }
+  },
+  computed: {
+    processedTitle(): string {
+      // Insert <wbr/> after pipe characters to enable optional wrapping
+      return this.title.replace(/\|/g, '|<wbr/>')
+    }
+  },
+  render() {
+    return h('div', [
+      h('span', { innerHTML: this.processedTitle, class: 'title' }),
+      h('span', { class: 'context', title: this.context }, this.context)
+    ])
+  }
+})
+</script>
+
+<style scoped>
+/* stylelint-disable checkmk/vue-bem-naming-convention */
+/* stylelint-disable-next-line selector-pseudo-class-no-unknown */
+:deep(.highlight-query) {
+  display: inline;
+  background: transparent;
+  color: var(--success);
+  line-height: 14px;
+}
+
+div {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  gap: var(--dimension-2);
+}
+
+span {
+  padding: 0;
+}
+
+.title {
+  width: 100%;
+  text-align: left;
+  overflow-wrap: break-word;
+}
+
+.context {
+  width: 100%;
+  font-size: var(--font-size-small);
+  color: var(--font-color-dimmed);
+  overflow-wrap: break-word;
+}
+</style>

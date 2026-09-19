@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import ast
+import base64
+from pathlib import Path
+from typing import Any
+
+import cmk.ruleset_matcher.tuple_rulesets
+import cmk.utils.paths
+from cmk.ccc.exceptions import MKGeneralException
+from cmk.gui.i18n import _
+
+# TODO: Clean up all call sites in the GUI and only use them in Setup config file loading code
+ALL_HOSTS = cmk.ruleset_matcher.tuple_rulesets.ALL_HOSTS
+ALL_SERVICES = cmk.ruleset_matcher.tuple_rulesets.ALL_SERVICES
+NEGATE = cmk.ruleset_matcher.tuple_rulesets.NEGATE
+
+
+def wato_root_dir() -> Path:
+    return cmk.utils.paths.check_mk_config_dir / "wato"
+
+
+def multisite_dir() -> Path:
+    return cmk.utils.paths.default_config_dir / "multisite.d/wato"
+
+
+def mk_repr(x: object) -> bytes:
+    return base64.b64encode(repr(x).encode())
+
+
+def mk_eval(s: bytes | str) -> Any:  # type: ignore[explicit-any]
+    try:
+        return ast.literal_eval(base64.b64decode(s).decode())
+    except Exception:
+        raise MKGeneralException(_("Unable to parse provided data: %(data)s") % {"data": repr(s)})
+
+
+def site_neutral_path(path: Path) -> Path:
+    if path.is_relative_to(Path("/", "omd")):
+        return Path(
+            *path.parts[:2],
+            "[SITE_ID]",
+            *path.parts[4:],
+        )
+    return path

@@ -1,0 +1,105 @@
+/**
+ * Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+import { fireEvent, render, screen, waitFor } from '@testing-library/vue'
+import type * as FormSpec from 'cmk-shared-typing/typescript/vue_formspec_components'
+
+import FormSingleChoice from '@/form/private/forms/FormSingleChoice.vue'
+
+import { renderForm } from '../cmk-form-helper'
+
+const spec: FormSpec.SingleChoice = {
+  type: 'single_choice',
+  title: 'fooTitle',
+  input_hint: 'some input hint',
+  help: 'fooHelp',
+  no_elements_text: 'no_text',
+  elements: [
+    { name: 'choice1', title: 'Choice 1' },
+    { name: 'choice2', title: 'Choice 2' }
+  ],
+  label: 'fooLabel',
+  frozen: false,
+  validators: []
+}
+
+test('FormSingleChoice renders value', async () => {
+  render(FormSingleChoice, {
+    props: {
+      spec,
+      data: 'choice1',
+      backendValidation: []
+    }
+  })
+
+  const element = screen.getByLabelText<HTMLInputElement>('fooLabel')
+
+  expect(element).toHaveAccessibleName('fooLabel')
+  await waitFor(() => expect(element).toHaveTextContent('Choice 1'))
+})
+
+test('FormSingleChoice renders something when noting is selected', () => {
+  render(FormSingleChoice, {
+    props: {
+      spec,
+      data: null,
+      backendValidation: []
+    }
+  })
+
+  const element = screen.getByLabelText<HTMLInputElement>('fooLabel')
+
+  expect(element).toHaveAccessibleName('fooLabel')
+  expect(element).toHaveTextContent('some input hint(required)')
+})
+
+test('FormSingleChoice updates data', async () => {
+  const { getCurrentData } = await renderForm({
+    spec,
+    data: 'choice1',
+    backendValidation: []
+  })
+
+  const element = screen.getByLabelText<HTMLInputElement>('fooLabel')
+  await fireEvent.click(element)
+
+  await fireEvent.click(await screen.findByText('Choice 2'))
+
+  expect(getCurrentData()).toBe('"choice2"')
+})
+
+test('FormSingleChoice renders backend validation messages', async () => {
+  render(FormSingleChoice, {
+    props: {
+      spec,
+      data: 'choice1',
+      backendValidation: [
+        {
+          location: [],
+          message: 'Backend error message',
+          replacement_value: ''
+        }
+      ]
+    }
+  })
+
+  await screen.findByText('Backend error message')
+})
+
+test('FormSingleChoice displays no_elements_text when elements are empty', async () => {
+  const noElementsSpec = {
+    ...spec,
+    elements: []
+  }
+  render(FormSingleChoice, {
+    props: {
+      spec: noElementsSpec,
+      data: null,
+      backendValidation: []
+    }
+  })
+
+  await screen.findByText('no_text')
+})

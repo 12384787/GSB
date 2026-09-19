@@ -1,0 +1,77 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import CmkSpace from 'cmk-ui-library/components/CmkSpace.vue'
+import type { TranslatedString } from 'cmk-ui-library/lib/i18nString'
+
+export type StatusType = 'OK' | 'WARNING' | 'DANGER' | 'INFO' | null
+
+interface StatusMessageProps {
+  status?: StatusType
+  topic?: TranslatedString
+  text: TranslatedString
+  linkedText?: TranslatedString
+}
+
+interface StatusMessageEmits {
+  click: []
+}
+
+defineProps<StatusMessageProps>()
+defineEmits<StatusMessageEmits>()
+
+const bullet: string = '●'
+</script>
+
+<template>
+  <div class="db-status-message__container">
+    <template v-if="topic">
+      <strong>{{ topic }}:</strong>
+      <CmkSpace size="small" />
+    </template>
+    <template v-if="status">
+      <span :class="`db-status-message__bullet-${status.toLowerCase()}`">{{ bullet }}</span>
+      <CmkSpace size="small" />
+    </template>
+    <span>{{ text }}</span>
+    <template v-if="linkedText">
+      <CmkSpace size="small" />
+      <a href="#" @click.prevent="$emit('click')">{{ linkedText }}</a>
+    </template>
+  </div>
+</template>
+
+<style scoped>
+.db-status-message__container {
+  display: flex;
+  align-items: center;
+  padding: var(--dimension-4) var(--dimension-6);
+  border-radius: var(--dimension-3);
+  background-color: var(--shared-dashboard-indicator-background);
+  white-space: nowrap;
+  font-size: var(--font-size-normal);
+}
+
+.db-status-message__bullet-ok {
+  color: var(--popup-dialog-success);
+  -webkit-text-stroke: 1px var(--color-corporate-green-70);
+}
+
+.db-status-message__bullet-warning {
+  color: var(--popup-dialog-warning);
+  -webkit-text-stroke: 1px var(--color-yellow-70);
+}
+
+.db-status-message__bullet-danger {
+  color: var(--popup-dialog-danger);
+  -webkit-text-stroke: 1px var(--color-dark-red-40);
+}
+
+.db-status-message__bullet-info {
+  color: var(--popup-dialog-info);
+  -webkit-text-stroke: 1px var(--color-light-blue-50);
+}
+</style>

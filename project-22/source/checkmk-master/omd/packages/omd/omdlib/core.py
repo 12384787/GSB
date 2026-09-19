@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from omdlib.config_api import Config, Error, Hook
+
+
+def core_has_error(value: str) -> None | Error:
+    cores: list[str] = []
+    if Path("bin/cmc").exists():
+        cores.append("cmc")
+    if Path("bin/nagios").exists():
+        cores.append("nagios")
+    cores.append("none")
+    if value not in cores:
+        return Error("Allowed are: " + ", ".join(cores))
+    return None
+
+
+def core_default(_edition: object) -> str:
+    if Path("bin/cmc").exists():
+        return "cmc"
+    if Path("bin/nagios").exists():
+        return "nagios"
+    return "none"
+
+
+def _ln_sf(target: str, linkpath: Path) -> None:
+    linkpath.unlink(missing_ok=True)
+    os.symlink(target, linkpath)
+
+
+def write_core_conf(_site_name: str, site_home: Path, config: Config) -> None:
+    core = config["CORE"]
+
+    nagios_conf = site_home / "etc" / "apache" / "conf.d" / "nagios.conf"
+    microcore_mk = site_home / "etc" / "check_mk" / "conf.d" / "microcore.mk"
+    core_init = site_home / "etc" / "init.d" / "core"
+    cmc_bin = site_home / "etc" / "init.d" / "cmc"
+    nagios_bin = site_home / "etc" / "init.d" / "nagios"
+    core_config = site_home / "var" / "check_mk" / "core" / "config"
+    livestatus_log = site_home / "var" / "log" / "livestatus.log"
+    nagios_log = site_home / "var" / "log" / "nagios.log"
+
+    # cleanup the former selection
+    if nagios_conf.is_symlink():
+        nagios_conf.unlink(missing_ok=True)
+
+    if core != "cmc":
+        microcore_mk.unlink(missing_ok=True)
+        # Re-add links to logs
+        if not livestatus_log.is_symlink():
+            _ln_sf("../nagios/livestatus.log", livestatus_log)
+        if not nagios_log.is_symlink():
+            _ln_sf("../nagios/nagios.log", nagios_log)
+
+    core_init.unlink(missing_ok=True)
+
+    # now setup the new selection. Create the symlink only if its target exists.
+    if core == "nagios":
+        if nagios_bin.exists():
+            os.symlink("nagios", core_init)
+    elif core == "cmc":
+        if cmc_bin.exists():
+            os.symlink("cmc", core_init)
+        content = """\
+# Created by OMD hook CORE. Change with 'omd config'.
+monitoring_core = 'cmc'
+"""
+        with open(microcore_mk, "w") as f:
+            f.write(content)
+        # Make sure that object configuration for core is present. Remove the old one
+        # in advance to prevent problems with old configs during update when new config
+        # creation fails
+        if core_config.is_file():
+            core_config.unlink(missing_ok=True)
+        # Remove non relevant links to logs
+        if livestatus_log.is_symlink():
+            livestatus_log.unlink(missing_ok=True)
+        if nagios_log.is_symlink():
+            nagios_log.unlink(missing_ok=True)
+
+
+CORE = Hook(
+    name="CORE",
+    choices=core_has_error,
+    default=core_default,
+    activation=write_core_conf,
+)
+
+
+def update_cmk_core_config(config: Config) -> None:
+    if config["CORE"] == "none":
+        return  # No core config is needed in this case
+
+    sys.stdout.write("Updating core configuration...\n")
+    try:
+        # TODO: try to find an easier way to create the default config!
+        subprocess.check_call(["cmk", "-U"], shell=False)
+    except subprocess.SubprocessError:
+        sys.exit("Could not update core configuration. Aborting.")

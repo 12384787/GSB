@@ -1,0 +1,71 @@
+{
+  "name": "cmk-frontend-vue",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "npm": ">=10.9.0 <11.0.0",
+    "node": ">=22.0.0 <=23.0.0"
+  },
+  "dependencies": {
+    "@internationalized/date": "^3.12.0",
+    "@tanstack/vue-table": "^8.21.3",
+    "@tanstack/vue-virtual": "^3.13.24",
+    "axios": "^1.18.1",
+    "class-variance-authority": "^0.7.1",
+    "cmk-ui-library": "workspace:*",
+    "d3-array": "^3.2.4",
+    "d3-axis": "^3.0.0",
+    "d3-scale": "^4.0.2",
+    "d3-selection": "^3.0.0",
+    "d3-shape": "^3.2.0",
+    "d3-time-format": "^4.1.0",
+    "d3-transition": "^3.0.1",
+    "d3-zoom": "^3.0.0",
+    "grid-layout-plus": "^1.1.1",
+    "marked": "^17.0.6",
+    "openapi-fetch": "^0.17.0",
+    "reka-ui": "^2.9.6",
+    "sanitize-html": "^2.17.7",
+    "uuid": "^13.0.0",
+    "vue-component-type-helpers": "^3.2.6",
+    "vue-router": "^5.0.4",
+    "vue3-gettext": "4.0.0-beta.1"
+  },
+  "devDependencies": {
+    "@rushstack/eslint-patch": "^1.16.1",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/user-event": "^14.6.1",
+    "@testing-library/vue": "^8.1.0",
+    "@trivago/prettier-plugin-sort-imports": "^6.0.2",
+    "@tsconfig/node22": "^22.0.5",
+    "@types/d3-array": "^3.2.1",
+    "@types/d3-axis": "^3.0.6",
+    "@types/d3-scale": "^4.0.8",
+    "@types/d3-selection": "^3.0.11",
+    "@types/d3-shape": "^3.1.6",
+    "@types/d3-time-format": "^4.0.3",
+    "@types/d3-transition": "^3.0.9",
+    "@types/d3-zoom": "^3.0.8",
+    "@types/node": "^22.19.17",
+    "@types/sanitize-html": "^2.16.1",
+    "@typescript-eslint/parser": "^8.58.2",
+    "@vitejs/plugin-vue": "^6.0.6",
+    "@vue/tsconfig": "^0.9.1",
+    "acorn": "^8.16.0",
+    "chai": "^6.2.2",
+    "msw": "^2.13.3",
+    "npm-run-all2": "^8.0.4",
+    "prettier": "^3.8.2",
+    "rollup": "^4.60.1",
+    "sass-embedded": "^1.99.0",
+    "typescript": "^6.0.2",
+    "vite": "^7.3.2",
+    "vite-plugin-vue-devtools": "^8.1.1"
+  },
+  "msw": {
+    "workerDirectory": [
+      "ui-component-library/public/"
+    ]
+  }
+}

@@ -1,0 +1,63 @@
+load("@rules_foreign_cc//foreign_cc:defs.bzl", "configure_make")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "all_srcs",
+    srcs = glob(
+        ["**/*"],
+        exclude = ["bazel-*"],
+    ),
+)
+
+configure_make(
+    name = "freetds",
+    args = ["DESTDIR=$BUILD_TMPDIR/$INSTALL_PREFIX"],
+    # GitHub source archive (unlike the old freetds.org tarball) does not include
+    # pre-generated autotools artefacts, so we must run autogen.sh first.
+    autogen = True,
+    configure_in_place = True,
+    configure_options = [
+        "--enable-msdblib",
+        "--prefix=''",
+        "--sysconfdir=/etc/freetds",
+        "--with-tdsver=7.1",
+        "--disable-apps",
+        "--disable-server",
+        "--disable-pool",
+        "--disable-odbc",
+        "--with-openssl=$$EXT_BUILD_DEPS/openssl",
+    ],
+    env = {
+        "PKG_CONFIG_PATH": ":".join([
+            "/usr/lib/pkgconfig",
+            "/usr/lib64/pkgconfig",
+            "/usr/lib/x86_64-linux-gnu/pkgconfig",
+        ]),
+    },
+    lib_source = ":all_srcs",
+    linkopts = ["-Wl,--strip-all"],
+
+    # Those are the directories we want to copied
+    out_data_dirs = [
+        "include",
+        "lib",
+    ],
+
+    # without this bazel complains about missing .a files, lol
+    out_headers_only = True,
+    postfix_script = """
+    set -x
+    mkdir -p $$BUILD_TMPDIR/tar/freetds/lib
+    cp -a "$$BUILD_TMPDIR/$$INSTALL_PREFIX"/lib/libsybdb.so* "$$BUILD_TMPDIR"/tar/freetds/lib/
+    """,
+    targets = [
+        # Run 'all' in parallel and 'install' sequentially (-j1) to avoid a race
+        # condition in freetds's automake-generated Makefile where parallel jobs
+        # try to mkdir the same include directory simultaneously (Ubuntu 25.10+).
+        "all -j4",
+        "install -j1",
+    ],
+    visibility = ["//visibility:public"],
+    deps = ["@openssl"],
+)

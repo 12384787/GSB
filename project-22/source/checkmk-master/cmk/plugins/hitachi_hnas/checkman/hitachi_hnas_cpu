@@ -1,0 +1,17 @@
+title: Hitachi HNAS: CPU Utilization of PNodes
+agents: snmp
+catalog: hw/storagehw/hitachi
+license: GPLv2
+distribution: check_mk
+description:
+ Checks the Module CPU Utilization of the physical Nodes (PNodes) of
+ Hitachi HNAS storage systems.
+
+ {WARN} or {CRIT} is returned, if the usage is above
+ given thresholds. {OK} is returned otherwise.
+
+item:
+ The ID of the PNode.
+
+discovery:
+ One service is created for each PNode.

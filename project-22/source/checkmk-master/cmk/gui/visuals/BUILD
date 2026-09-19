@@ -1,0 +1,43 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+load("@cmk_requirements//:requirements.bzl", "requirement")
+
+py_library(
+    name = "visuals",
+    srcs = glob(include = ["**/*.py"]),
+    imports = ["../../.."],
+    visibility = [
+        "//cmk:__subpackages__",
+        "//non-free/packages:__subpackages__",
+        "//tests:__subpackages__",
+    ],
+    deps = [
+        "//cmk/gui:auth_core",
+        "//cmk/gui:config",
+        "//cmk/gui:core_toolkit",
+        "//cmk/gui:html_toolkit",
+        "//cmk/gui:page_toolkit",
+        "//cmk/gui:query_filters",
+        "//cmk/gui/openapi/framework",
+        "//cmk/gui/openapi/framework:api_config",
+        "//cmk/gui/openapi/framework:core",
+        "//cmk/gui/openapi/framework:types",
+        "//cmk/gui/openapi/restful_objects",
+        "//cmk/gui/pagetypes",
+        "//cmk/gui/plugins/visuals",
+        "//cmk/gui/userdb",
+        "//cmk/gui/utils",
+        "//cmk/gui/utils:middle",
+        "//cmk/gui/valuespec",
+        "//cmk/gui/watolib:groups_io",
+        "//cmk/utils",
+        "//packages/cmk-ccc:exceptions",
+        "//packages/cmk-ccc:plugin-registry",
+        "//packages/cmk-ccc:site",
+        "//packages/cmk-ccc:store",
+        "//packages/cmk-ccc:user",
+        "//packages/cmk-ccc:version",
+        "//packages/cmk-mkp-tool",
+        "//packages/cmk-web/cmk/web/utils",
+        requirement("pydantic"),
+    ],
+)

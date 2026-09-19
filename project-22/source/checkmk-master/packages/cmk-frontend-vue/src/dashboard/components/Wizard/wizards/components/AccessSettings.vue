@@ -1,0 +1,191 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import type { DualListElement } from 'cmk-ui-library/components/CmkDualList'
+import CmkDualList from 'cmk-ui-library/components/CmkDualList/CmkDualList.vue'
+import CmkToggleButtonGroup, {
+  type ToggleButtonOption
+} from 'cmk-ui-library/components/CmkToggleButtonGroup.vue'
+import CmkInlineValidation from 'cmk-ui-library/components/user-input/CmkInlineValidation.vue'
+import { CmkFetchError } from 'cmk-ui-library/lib/cmkFetch'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import type { TranslatedString } from 'cmk-ui-library/lib/i18nString'
+import { computed, ref } from 'vue'
+
+import type { DashboardPermissions } from '@/dashboard/types/page'
+import { type DashboardShare } from '@/dashboard/types/shared'
+
+import { getContactGroups, getSites } from '../dashboard-settings/api'
+
+const { _t } = usei18n()
+
+interface AccessSettingsProps {
+  errors: TranslatedString[]
+  permissions: DashboardPermissions
+}
+
+const props = defineProps<AccessSettingsProps>()
+
+const share = defineModel<DashboardShare>('share', { required: true })
+
+type ShareType = 'with_sites' | 'with_contact_groups' | 'with_all_users' | 'no'
+
+const isLoading = ref<boolean>(false)
+const availableElements = ref<DualListElement[]>([])
+const selectedContactGroups = ref<string[]>([])
+const selectedSites = ref<string[]>([])
+
+let contactGroups: DualListElement[] = []
+try {
+  contactGroups = await getContactGroups()
+} catch (e) {
+  if (!(e instanceof CmkFetchError && (e.statusCode === 401 || e.statusCode === 403))) {
+    throw e
+  }
+  // 401/403 are silently caught. contactGroups stays empty, so the option will be disabled below.
+}
+const isContactGroupOptionDisabled = ref<boolean>(contactGroups.length === 0)
+
+if (share.value !== 'no' && share.value.type === 'with_contact_groups') {
+  selectedContactGroups.value = share.value.contact_groups
+}
+
+if (share.value !== 'no' && share.value.type === 'with_sites') {
+  selectedSites.value = share.value.sites
+}
+
+const selectedElements = computed({
+  get(): DualListElement[] {
+    if (share.value === 'no' || share.value.type === 'with_all_users') {
+      return []
+    }
+
+    if (shareMode.value === 'with_contact_groups') {
+      return availableElements.value.filter((el) => selectedContactGroups.value.includes(el.name))
+    }
+
+    return availableElements.value.filter((el) => selectedSites.value.includes(el.name))
+  },
+
+  set(newSelected: DualListElement[]) {
+    if (shareMode.value === 'with_contact_groups') {
+      selectedContactGroups.value = newSelected.map((el) => el.name)
+      share.value = {
+        type: 'with_contact_groups',
+        contact_groups: selectedContactGroups.value
+      }
+    } else if (shareMode.value === 'with_sites') {
+      selectedSites.value = newSelected.map((el) => el.name)
+      share.value = { type: 'with_sites', sites: selectedSites.value }
+    }
+  }
+})
+
+const loadAvailableElements = async (shareMode: ShareType) => {
+  const fetchers: Record<string, () => Promise<DualListElement[]>> = {
+    with_contact_groups: getContactGroups,
+    with_sites: getSites
+  }
+
+  const fetchData = fetchers[shareMode]
+  if (!fetchData) {
+    return
+  }
+
+  isLoading.value = true
+  try {
+    availableElements.value = await fetchData()
+  } catch (e) {
+    if (!(e instanceof CmkFetchError && (e.statusCode === 401 || e.statusCode === 403))) {
+      throw e
+    }
+    availableElements.value = []
+  } finally {
+    isLoading.value = false
+  }
+}
+
+const shareMode = computed({
+  get(): string {
+    if (share.value === 'no') {
+      return 'no'
+    } else {
+      return share.value.type
+    }
+  },
+
+  set(newMode: string) {
+    switch (newMode) {
+      case 'with_sites':
+        share.value = { type: 'with_sites', sites: selectedSites.value }
+        void loadAvailableElements('with_sites')
+        break
+
+      case 'with_contact_groups':
+        share.value = { type: 'with_contact_groups', contact_groups: selectedContactGroups.value }
+        void loadAvailableElements('with_contact_groups')
+        break
+
+      case 'with_all_users':
+        share.value = { type: 'with_all_users' }
+        availableElements.value = []
+        break
+
+      default:
+        share.value = 'no'
+        availableElements.value = []
+        break
+    }
+  }
+})
+
+const displayDualList = computed((): boolean => {
+  return !isLoading.value && ['with_contact_groups', 'with_sites'].includes(shareMode.value)
+})
+
+// Only offer share targets the user may publish to (also enforced on save).
+const shareOptions = computed((): ToggleButtonOption[] => {
+  const options: ToggleButtonOption[] = [{ label: _t('Owner (private)'), value: 'no' }]
+
+  if (props.permissions.publish_to_all) {
+    options.push({ label: _t('All users'), value: 'with_all_users' })
+  }
+
+  if (
+    props.permissions.publish_to_contact_groups ||
+    props.permissions.publish_to_foreign_contact_groups
+  ) {
+    options.push({
+      label: _t('Members of contact groups'),
+      value: 'with_contact_groups',
+      disabled: isContactGroupOptionDisabled.value,
+      disabledTooltip: _t('No contact groups found')
+    })
+  }
+
+  if (props.permissions.publish_to_sites) {
+    options.push({ label: _t('Users of site'), value: 'with_sites' })
+  }
+
+  return options
+})
+
+if (shareMode.value === 'with_contact_groups' || shareMode.value === 'with_sites') {
+  await loadAvailableElements(shareMode.value as ShareType)
+}
+</script>
+
+<template>
+  <CmkToggleButtonGroup v-model="shareMode" :options="shareOptions" />
+
+  <CmkInlineValidation v-if="displayDualList && errors.length > 0" :validation="errors" />
+  <CmkDualList
+    v-if="displayDualList"
+    v-model="selectedElements"
+    :elements="availableElements"
+    :title="_t('Visual information')"
+  />
+</template>

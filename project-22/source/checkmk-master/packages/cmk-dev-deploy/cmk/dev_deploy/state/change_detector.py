@@ -1,0 +1,415 @@
+# Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+"""Change detection and categorization via git diff."""
+
+import fnmatch
+import json
+import logging
+import subprocess
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from cmk.dev_deploy.core.timeouts import GIT_QUICK
+from cmk.dev_deploy.errors import ChangeDetectionError
+from cmk.dev_deploy.manifest.reader import get_categorization_rules
+from cmk.dev_deploy.state.deploy_state import DeployState, get_untracked_files
+from cmk.dev_deploy.types import CategorizationRule, ChangeCategory, ChangeSet, DiffBaseSource
+
+logger = logging.getLogger(__name__)
+
+# Structural rules: not derivable from manifest, always present.
+# These match disjoint path prefixes that do not overlap with any
+# manifest-derived prefix.
+#
+# IGNORED rules tag paths that are explicitly known to be non-deployable
+# (changelogs, repo scaffolding, contributor docs).  They suppress both the
+# Bazel target resolution and the "uncovered by any deploy spec" warning,
+# the latter of which would otherwise fire on every werk edit.
+#
+# Note: "MODULE.bazel" as a prefix also matches "MODULE.bazel.lock" via
+# startswith(). This is a pre-existing false positive inherited from the
+# original hardcoded rules. Both files are build-system files, so the
+# miscategorization is harmless in practice.
+_STRUCTURAL_RULES: tuple[CategorizationRule, ...] = (
+    CategorizationRule("tests/", None, ChangeCategory.TEST),
+    # cmk-dev-deploy is the deploy tool itself: it runs from the repo and
+    # is never installed into a site.  Must precede the manifest-derived
+    # "packages/" rule (structural rules are applied first).
+    CategorizationRule("packages/cmk-dev-deploy/", None, ChangeCategory.IGNORED),
+    CategorizationRule("MODULE.bazel", None, ChangeCategory.BUILD),
+    CategorizationRule("bazel/", None, ChangeCategory.BUILD),
+    CategorizationRule("werks/", None, ChangeCategory.IGNORED),
+    CategorizationRule(".werks/", None, ChangeCategory.IGNORED),
+    CategorizationRule(".github/", None, ChangeCategory.IGNORED),
+    CategorizationRule(".devcontainer/", None, ChangeCategory.IGNORED),
+    CategorizationRule(".aspect/", None, ChangeCategory.IGNORED),
+    CategorizationRule(".claude/", None, ChangeCategory.IGNORED),
+    CategorizationRule(".ide/", None, ChangeCategory.IGNORED),
+    CategorizationRule(".pre-commit-scripts/", None, ChangeCategory.IGNORED),
+    CategorizationRule("docs/", None, ChangeCategory.IGNORED),
+    CategorizationRule("buildscripts/", None, ChangeCategory.IGNORED),
+    CategorizationRule("component_owners/", None, ChangeCategory.IGNORED),
+    CategorizationRule("docker_image/", None, ChangeCategory.IGNORED),
+    CategorizationRule("doc/treasures/", None, ChangeCategory.IGNORED),
+    CategorizationRule("omd/dependency_management/", None, ChangeCategory.IGNORED),
+    CategorizationRule("scripts/", None, ChangeCategory.IGNORED),
+)
+
+
+@dataclass(frozen=True)
+class _BasenameRule:
+    """Categorize a file by basename, regardless of where it lives in the tree.
+
+    Applied as a fallback after prefix-based rules have not matched, so a
+    BUILD file inside a typed package (e.g. ``packages/cmk-foo/BUILD``)
+    falls through prefix categorization (which keys on extension) into
+    this pass and gets the correct BUILD category.
+    """
+
+    category: ChangeCategory
+    basenames: frozenset[str] = frozenset()
+    suffixes: frozenset[str] = frozenset()
+    globs: tuple[str, ...] = field(default_factory=tuple)
+
+
+_BASENAME_RULES: tuple[_BasenameRule, ...] = (
+    _BasenameRule(
+        category=ChangeCategory.BUILD,
+        basenames=frozenset({"BUILD", "BUILD.bazel", "WORKSPACE", "Makefile"}),
+        suffixes=frozenset({".bzl", ".patch", ".dif", ".spec", ".wxs"}),
+        globs=("BUILD.*.bazel",),
+    ),
+)
+
+
+def _match_basename_rule(basename: str, rule: _BasenameRule) -> bool:
+    if basename in rule.basenames:
+        return True
+    if any(basename.endswith(s) for s in rule.suffixes):
+        return True
+    return any(fnmatch.fnmatchcase(basename, p) for p in rule.globs)
+
+
+# Cached combined rules: computed once on first call, reset by reset_categorization_cache().
+_cached_rules: tuple[CategorizationRule, ...] | None = None
+
+
+def _load_rules() -> tuple[CategorizationRule, ...]:
+    """Load categorization rules: structural rules + manifest-derived rules.
+
+    The combined result is cached in the module-level _cached_rules variable
+    to avoid repeated tuple concatenation on every categorize_file() call.
+
+    Structural rules have unconditional priority (applied first).  Most
+    match path prefixes disjoint from the manifest-derived ones (tests/,
+    MODULE.bazel, bazel/); where they overlap (packages/cmk-dev-deploy/
+    inside packages/), the structural rule deliberately wins.
+
+    Within manifest-derived rules, ordering is longest-prefix-first.
+    """
+    global _cached_rules
+    if _cached_rules is not None:
+        return _cached_rules
+
+    try:
+        manifest_rules = get_categorization_rules()
+    except FileNotFoundError, json.JSONDecodeError, KeyError:
+        logger.warning(
+            "Manifest unavailable or missing categorization_rules -- "
+            "using structural-only fallback (all files categorize as OTHER). "
+            "Run with --rebuild-manifest to regenerate."
+        )
+        _cached_rules = _STRUCTURAL_RULES
+        return _cached_rules
+
+    _cached_rules = _STRUCTURAL_RULES + manifest_rules
+    return _cached_rules
+
+
+def reset_categorization_cache() -> None:
+    """Reset the cached combined rules (called after manifest rebuild).
+
+    This is a public function (no underscore prefix) because it is called
+    from staleness.py after a manifest rebuild.  Naming it without an
+    underscore avoids the convention violation of importing a private name
+    across module boundaries.
+    """
+    global _cached_rules
+    _cached_rules = None
+
+
+def categorize_file(path: str) -> ChangeCategory:
+    """Categorize a file path using first-match-wins against ordered rules.
+
+    Order:
+    1. Basename rules -- match BUILD files, ``*.bzl``, vendored patches,
+       etc. globally so that an over-broad manifest prefix rule (e.g.
+       ``omd/`` -> CONFIG) does not swallow build-system files that
+       happen to live under it.
+    2. Prefix rules (structural + manifest-derived) -- everything else.
+    """
+    basename = path.rsplit("/", 1)[-1]
+    for basename_rule in _BASENAME_RULES:
+        if _match_basename_rule(basename, basename_rule):
+            return basename_rule.category
+
+    for rule in _load_rules():
+        if path.startswith(rule.prefix):
+            if rule.extensions is None:
+                return rule.category
+            suffix = "." + path.rsplit(".", 1)[-1] if "." in path else ""
+            if suffix in rule.extensions:
+                return rule.category
+
+    return ChangeCategory.OTHER
+
+
+def detect_changes(
+    build_commit: str | None,
+    repo_root: Path,
+    *,
+    target_commit: str | None = None,
+    diff_base_source: DiffBaseSource = DiffBaseSource.SITE_BUILD,
+) -> ChangeSet | None:
+    """Detect and categorize changed files between build_commit and a target.
+
+    Returns None if build_commit is None. When target_commit is None, diffs
+    against the working tree; otherwise diffs committed changes only.
+    diff_base_source records where build_commit came from, so that a commit
+    that cannot be resolved produces an error naming the actual culprit.
+    """
+    if build_commit is None:
+        return None
+
+    if not _commit_exists(build_commit, repo_root):
+        raise _missing_diff_base_error(build_commit, diff_base_source)
+    if target_commit is not None and not _commit_exists(target_commit, repo_root):
+        raise ChangeDetectionError(
+            f"--commit ref '{target_commit}' not found in this repository.",
+            recovery="Check the ref name, or fetch it first: git fetch origin",
+        )
+    tracked_changed = _git_diff_files(build_commit, repo_root, target_commit=target_commit)
+    deleted_files = _git_diff_deleted(build_commit, repo_root, target_commit=target_commit)
+
+    # Untracked files are part of what a build picks up, but no form of
+    # ``git diff`` reports them.  A commit-to-commit diff (--commit <ref>)
+    # does not look at the working tree at all, so they stay out of it.
+    untracked = () if target_commit is not None else tuple(get_untracked_files(repo_root))
+    changed_files = sorted(set(tracked_changed) | set(untracked))
+
+    if not changed_files and not deleted_files:
+        return ChangeSet(
+            build_commit=build_commit,
+            files=(),
+            deleted_files=(),
+            categories={},
+        )
+
+    # Categorize all files
+    categorized: dict[ChangeCategory, list[str]] = {}
+    for file_path in changed_files:
+        cat = categorize_file(file_path)
+        categorized.setdefault(cat, []).append(file_path)
+
+    # Convert to frozen structure
+    frozen_categories = {cat: tuple(sorted(paths)) for cat, paths in categorized.items()}
+
+    return ChangeSet(
+        build_commit=build_commit,
+        files=tuple(changed_files),
+        deleted_files=tuple(sorted(deleted_files)),
+        categories=frozen_categories,
+        untracked=untracked,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+
+def _commit_exists(commit: str, repo_root: Path) -> bool:
+    """Return True if the ref resolves to a commit in the local repository."""
+    result = subprocess.run(
+        ["git", "cat-file", "-t", commit],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(repo_root),
+        timeout=GIT_QUICK,
+    )
+    return result.returncode == 0 and result.stdout.strip() == "commit"
+
+
+def _missing_diff_base_error(commit: str, source: DiffBaseSource) -> ChangeDetectionError:
+    """Build the error for a diff base commit missing from the local repository."""
+    if source is DiffBaseSource.STATE:
+        return ChangeDetectionError(
+            f"Deploy state commit {commit[:12]} not found in this repository.",
+            recovery=(
+                "The commit recorded by the last deploy no longer exists here\n"
+                "(e.g. rebased away, or deployed from a different clone).\n"
+                "Reset the deploy state: cmk-dev-deploy --full"
+            ),
+        )
+    return ChangeDetectionError(
+        f"Site build commit {commit[:12]} not found in this repository.",
+        recovery=(
+            "The site was built from a commit you do not have locally.\n"
+            "Fetch it first: git fetch origin\n"
+            "This commit is required even with --full: every deploy diffs the\n"
+            "working tree against the site build to determine what to deploy."
+        ),
+    )
+
+
+def _git_diff_files(
+    build_commit: str,
+    repo_root: Path,
+    *,
+    target_commit: str | None = None,
+) -> list[str]:
+    """Return changed (non-deleted) file paths between build_commit and a target.
+
+    Excludes deleted files (--diff-filter=d) since those are tracked separately
+    by _git_diff_deleted().  Without this filter, deleted files appear in
+    ChangeSet.files and the wheel deployer crashes trying to copy them.
+
+    Reports tracked files only; detect_changes() unions in untracked ones.
+    """
+    cmd = ["git", "diff", "--name-only", "--no-renames", "--diff-filter=d", build_commit]
+    if target_commit is not None:
+        cmd.append(target_commit)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(repo_root),
+        timeout=GIT_QUICK,
+    )
+    if result.returncode != 0:
+        raise ChangeDetectionError(
+            f"git diff failed (exit {result.returncode}): {result.stderr.strip()}",
+            recovery="Inspect the git error above; the repository may be locked, "
+            "shallow, or corrupted.",
+        )
+    return [line for line in result.stdout.strip().splitlines() if line]
+
+
+def _git_diff_deleted(
+    build_commit: str,
+    repo_root: Path,
+    *,
+    target_commit: str | None = None,
+) -> list[str]:
+    """Return file paths deleted between build_commit and a target."""
+    cmd = [
+        "git",
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "--diff-filter=D",
+        build_commit,
+    ]
+    if target_commit is not None:
+        cmd.append(target_commit)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(repo_root),
+        timeout=GIT_QUICK,
+    )
+    if result.returncode != 0:
+        return []  # Non-fatal: deletions are best-effort
+    return [line for line in result.stdout.strip().splitlines() if line]
+
+
+# ---------------------------------------------------------------------------
+# Change filtering helpers (extracted from __main__.py)
+# ---------------------------------------------------------------------------
+
+
+def state_has_dirty_files(state: DeployState | None) -> bool:
+    """Return True if any deployer in *state* has dirty file hashes."""
+    if state is None:
+        return False
+    return any(ds.dirty_file_hashes for ds in state.deployers.values())
+
+
+def has_reverted_dirty_files(state: DeployState, repo_root: Path) -> bool:
+    """Return True if previously-dirty files are no longer dirty.
+
+    Detects the case where a user modified files, deployed, then reverted.
+    The clean version needs to be redeployed.
+    """
+    from cmk.dev_deploy.state.deploy_state import get_dirty_files
+
+    previously_dirty: set[str] = set()
+    for ds in state.deployers.values():
+        previously_dirty.update(ds.dirty_file_hashes.keys())
+    if not previously_dirty:
+        return False
+    currently_dirty = set(get_dirty_files(repo_root))
+    return bool(previously_dirty - currently_dirty)
+
+
+def filter_stale_dirty(
+    changes: ChangeSet,
+    state: DeployState,
+    repo_root: Path,
+) -> ChangeSet:
+    """Remove already-deployed dirty files from a changeset.
+
+    Dirty files that appear in ``git diff`` every run but have the same
+    content hash as the last deploy are filtered out.
+    """
+    from cmk.dev_deploy.state.deploy_state import compute_file_hash, get_dirty_files
+
+    # Reconstruct known dirty hashes from all deployers' state
+    known_dirty: dict[str, str] = {}
+    for ds in state.deployers.values():
+        known_dirty.update(ds.dirty_file_hashes)
+
+    if not known_dirty:
+        return changes
+
+    # Identify currently dirty files (staged + unstaged vs HEAD)
+    current_dirty = set(get_dirty_files(repo_root))
+
+    # Find stale dirty files: dirty AND hash matches saved state
+    stale: set[str] = set()
+    for f in changes.files:
+        if f not in current_dirty:
+            continue  # committed change, keep it
+        known_hash = known_dirty.get(f)
+        if known_hash is None:
+            continue  # new dirty file, keep it
+        abs_path = repo_root / f
+        if not abs_path.is_file():
+            continue  # deleted file, keep it
+        if compute_file_hash(abs_path) == known_hash:
+            stale.add(f)
+
+    if not stale:
+        return changes
+
+    # Build filtered changeset
+    filtered_files = tuple(f for f in changes.files if f not in stale)
+    filtered_categories: dict[ChangeCategory, tuple[str, ...]] = {}
+    for cat, cat_files in changes.categories.items():
+        kept = tuple(f for f in cat_files if f not in stale)
+        if kept:
+            filtered_categories[cat] = kept
+
+    return ChangeSet(
+        build_commit=changes.build_commit,
+        files=filtered_files,
+        categories=filtered_categories,
+        deleted_files=changes.deleted_files,
+        untracked=tuple(f for f in changes.untracked if f not in stale),
+    )

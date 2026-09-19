@@ -1,0 +1,114 @@
+/**
+ * Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+import { type MaybeRefOrGetter, toValue } from 'vue'
+
+export type Magnitude = 'day' | 'hour' | 'minute' | 'second' | 'millisecond'
+
+export const ALL_MAGNITUDES = new Map<Magnitude, number>([
+  ['day', 24 * 60 * 60],
+  ['hour', 60 * 60],
+  ['minute', 60],
+  ['second', 1],
+  ['millisecond', 0.001]
+])
+
+export function getSelectedMagnitudes(displayedMagnitudes: Array<Magnitude>): Array<Magnitude> {
+  // make sure selected magnitudes are sorted and only contain known elements
+  const result: Array<Magnitude> = []
+  ALL_MAGNITUDES.forEach((_, magnitude) => {
+    if (displayedMagnitudes.includes(magnitude)) {
+      result.push(magnitude)
+    }
+  })
+  return result
+}
+
+function getFactor(magnitude: Magnitude): number {
+  const factor = ALL_MAGNITUDES.get(magnitude)
+  if (factor === undefined) {
+    throw new Error(`can not find factor for magnitude ${magnitude}`)
+  }
+  return factor
+}
+
+export function joinToSeconds(values: Partial<Record<Magnitude, number>>): number {
+  return Object.entries(values).reduce(
+    (partial, [magnitude, value]) => partial + value * getFactor(magnitude as Magnitude),
+    0
+  )
+}
+
+/** Render a duration in seconds as e.g. '1 Hours 30 Minutes', or '' when it rounds to nothing. */
+export function formatTimeSpan(
+  value: number,
+  displayedMagnitudes: Array<Magnitude>,
+  labels: Partial<Record<Magnitude, MaybeRefOrGetter<string>>>
+): string {
+  const selectedMagnitudes = getSelectedMagnitudes(displayedMagnitudes)
+  const values = splitToUnits(value, selectedMagnitudes)
+  const parts: string[] = []
+  for (const magnitude of selectedMagnitudes) {
+    const count = values[magnitude]
+    if (count !== undefined) {
+      parts.push(`${count} ${toValue(labels[magnitude]) ?? magnitude}`)
+    }
+  }
+  return parts.join(' ')
+}
+
+export type TranslateFn = (msg: string, interpolation?: Record<string, string | number>) => string
+
+export function magnitudeLabels(_t: TranslateFn): Record<Magnitude, string> {
+  return {
+    day: _t('Days'),
+    hour: _t('Hours'),
+    minute: _t('Minutes'),
+    second: _t('Seconds'),
+    millisecond: _t('Milliseconds')
+  }
+}
+
+/** Builds a CmkTimeSpan validator rejecting durations shorter than `minimumSeconds`. */
+export function minimumSecondsValidator(
+  minimumSeconds: number,
+  displayedMagnitudes: Array<Magnitude>,
+  _t: TranslateFn
+): (seconds: number | null) => string[] {
+  return (seconds) => {
+    if (seconds === null || seconds >= minimumSeconds) {
+      return []
+    }
+    return [
+      _t('The time span must be at least %{min}.', {
+        min: formatTimeSpan(minimumSeconds, displayedMagnitudes, magnitudeLabels(_t))
+      })
+    ]
+  }
+}
+
+export function splitToUnits(
+  value: number,
+  selectedMagnitudes: Array<Magnitude>
+): Partial<Record<Magnitude, number>> {
+  const result: Partial<Record<Magnitude, number>> = {}
+  for (const [index, magnitude] of selectedMagnitudes.entries()) {
+    const factor = getFactor(magnitude)
+    if (factor <= value) {
+      let quotient = value / factor
+      if (index !== selectedMagnitudes.length - 1) {
+        // dont floor the last element
+        quotient = Math.floor(quotient)
+      } else {
+        // but round it:
+        quotient = Math.round(quotient)
+      }
+      const remainder = value % factor
+      value = remainder
+      result[magnitude] = quotient
+    }
+  }
+  return result
+}

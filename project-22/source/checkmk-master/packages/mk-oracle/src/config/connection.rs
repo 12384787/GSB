@@ -1,0 +1,468 @@
+// Copyright (C) 2025 Checkmk GmbH
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use super::defines::{defaults, keys};
+use super::grid::GridInfrastructure;
+use super::yaml::{Get, Yaml};
+use crate::types::{HostName, Port};
+use anyhow::Context;
+use anyhow::Result;
+use std::fs;
+use std::path::PathBuf;
+use std::time::Duration;
+
+#[derive(PartialEq, Debug, Clone, Default)]
+pub enum EngineTag {
+    Auto,
+    #[default]
+    Std,
+    SqlPlus,
+    Jdbc,
+}
+
+impl EngineTag {
+    fn from_string<T>(value: T) -> Option<Self>
+    where
+        T: AsRef<str>,
+    {
+        match value.as_ref() {
+            "auto" => Some(Self::Auto),
+            "std" => Some(Self::Std),
+            "jdbc" => Some(Self::Jdbc),
+            "sql_plus" => Some(Self::SqlPlus),
+            _ => None,
+        }
+    }
+}
+
+#[derive(PartialEq, Debug, Clone)]
+pub struct Connection {
+    /// The node name under Grid Infrastructure, "localhost" otherwise.
+    hostname: HostName,
+    port: Option<Port>,         // 1521 if not defined
+    timeout: Option<u64>,       // 5 if not defined
+    tns_admin: Option<PathBuf>, // config dir if not defined
+    /// The `olr.loc` path as configured, which need not exist on this node.
+    oracle_local_registry: Option<PathBuf>,
+    /// Grid Infrastructure as actually found on this node.
+    grid: Option<GridInfrastructure>,
+    engine: EngineTag, // Std if not defined
+}
+
+/// The host to connect to when the configuration names none.
+///
+/// A listener under Grid Infrastructure binds the node address, so the
+/// loopback address is not necessarily reachable. Legacy `mk_oracle` defaults
+/// the database host to the node name on such a node and to `localhost`
+/// everywhere else.
+fn default_hostname(grid: Option<&GridInfrastructure>) -> String {
+    match grid.and_then(|_| crate::platform::node_name()) {
+        Some(name) => {
+            log::info!("Grid Infrastructure node: connecting to '{name}' instead of localhost");
+            name
+        }
+        None => defaults::CONNECTION_HOST_NAME.to_string(),
+    }
+}
+
+impl Connection {
+    pub fn from_yaml(yaml: &Yaml) -> Result<Option<Self>> {
+        let conn = yaml.get(keys::CONNECTION);
+        if conn.is_badvalue() {
+            return Ok(None);
+        }
+        let oracle_local_registry = conn
+            .get_string(keys::ORACLE_LOCAL_REGISTRY)
+            .map(PathBuf::from);
+        let grid = GridInfrastructure::detect(oracle_local_registry.as_deref());
+
+        Ok(Some(Self {
+            hostname: conn
+                .get_string(keys::HOSTNAME)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| default_hostname(grid.as_ref()))
+                .to_lowercase()
+                .into(),
+            tns_admin: conn.get_string(keys::TNS_ADMIN).map(PathBuf::from),
+            oracle_local_registry,
+            grid,
+            port: conn.get_int::<u16>(keys::PORT).map(Port::from),
+            timeout: conn.get_int::<u64>(keys::TIMEOUT),
+            engine: {
+                let value: String = conn
+                    .get_string(keys::ENGINE)
+                    .unwrap_or_default()
+                    .to_lowercase();
+                EngineTag::from_string(value.as_str()).unwrap_or_default()
+            },
+        }))
+    }
+
+    pub fn hostname(&self) -> HostName {
+        self.hostname.clone()
+    }
+    pub fn port(&self) -> Port {
+        self.port
+            .clone()
+            .unwrap_or(Port::from(defaults::CONNECTION_PORT))
+    }
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout.unwrap_or(defaults::CONNECTION_TIMEOUT))
+    }
+    pub fn tns_admin(&self) -> Option<&PathBuf> {
+        self.tns_admin.as_ref()
+    }
+    pub fn oracle_local_registry(&self) -> Option<&PathBuf> {
+        self.oracle_local_registry.as_ref()
+    }
+    pub fn grid(&self) -> Option<&GridInfrastructure> {
+        self.grid.as_ref()
+    }
+    pub fn engine_tag(&self) -> &EngineTag {
+        &self.engine
+    }
+    pub fn is_local(&self) -> bool {
+        self.hostname() == HostName::from("localhost".to_owned())
+            || self.hostname() == HostName::from("127.0.0.1".to_owned())
+            || self.hostname() == HostName::from("::1".to_owned())
+    }
+}
+
+/// This function is used to set the TNS_ADMIN environment variable
+/// Location may be changed in the future
+pub fn add_tns_admin_to_env(conn: &Connection) {
+    let config = std::path::PathBuf::from(std::env::var("MK_CONFDIR").unwrap_or_default());
+    if let Some(tns_admin) = conn.tns_admin() {
+        let tns_admin = config.join(tns_admin);
+        if tns_admin.exists() && tns_admin.is_dir() {
+            log::info!("TNS_ADMIN directory '{}' ", tns_admin.display());
+            unsafe {
+                std::env::set_var("TNS_ADMIN", tns_admin);
+            }
+        } else {
+            log::warn!(
+                "TNS_ADMIN directory '{}' does not exist or is not a directory",
+                tns_admin.display()
+            );
+        }
+    } else {
+        if std::env::var("TNS_ADMIN").is_err() {
+            log::info!(
+                "No TNS_ADMIN specified, using default path: {}",
+                config.display()
+            );
+            unsafe {
+                std::env::set_var("TNS_ADMIN", config);
+            }
+        }
+    }
+}
+
+/// Sets up the wallet environment by creating a sqlnet.ora file in MK_CONFDIR with the wallet location.
+///
+/// This allows wallet authentication without requiring a pre-existing sqlnet.ora file.
+/// The default wallet directory is MK_CONFDIR/oracle_wallet.
+/// If sqlnet.ora already exists, it will not be overwritten.
+pub fn setup_wallet_environment(env_var: Option<String>) -> anyhow::Result<()> {
+    let config_dir = std::path::PathBuf::from(
+        std::env::var(env_var.unwrap_or("MK_CONFDIR".to_string())).unwrap_or_else(|_| ".".into()),
+    );
+
+    let sqlnet_path = config_dir.join("sqlnet.ora");
+    if sqlnet_path.exists() {
+        log::info!(
+            "sqlnet.ora already exists at '{}', skipping creation",
+            sqlnet_path.display()
+        );
+        return Ok(());
+    }
+
+    let wallet_path = config_dir.join("oracle_wallet");
+    let wallet_display_path = wallet_path
+        .canonicalize()
+        .unwrap_or_else(|_| wallet_path.clone());
+
+    log::info!(
+        "Setting up wallet environment with wallet location: {}",
+        wallet_display_path.display()
+    );
+
+    let sqlnet_content = format!(
+        r#"# Auto-generated by mk-oracle for wallet authentication
+NAMES.DIRECTORY_PATH = (TNSNAMES, EZCONNECT)
+WALLET_LOCATION = (SOURCE = (METHOD = FILE) (METHOD_DATA = (DIRECTORY = {})))
+SQLNET.WALLET_OVERRIDE = TRUE
+"#,
+        wallet_display_path.display()
+    );
+    fs::write(&sqlnet_path, &sqlnet_content)
+        .with_context(|| format!("Failed to write sqlnet.ora to '{}'", sqlnet_path.display()))?;
+
+    log::info!(
+        "Created sqlnet.ora at '{}' with wallet location '{}'",
+        sqlnet_path.display(),
+        wallet_display_path.display()
+    );
+
+    Ok(())
+}
+
+/// The connection used when the configuration has no `connection` block at
+/// all. It still consults the node, because Grid Infrastructure announces
+/// itself through `olr.loc` rather than through the plugin configuration.
+impl Default for Connection {
+    fn default() -> Self {
+        let grid = GridInfrastructure::detect(None);
+        Self {
+            hostname: HostName::from(default_hostname(grid.as_ref())),
+            oracle_local_registry: None,
+            grid,
+            tns_admin: None,
+            port: None,
+            timeout: None,
+            engine: EngineTag::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::yaml::test_tools::create_yaml;
+
+    mod data {
+
+        pub const CONNECTION_FULL: &str = r#"
+connection:
+  hostname: "alice"
+  port: 9999
+  timeout: 341
+  tns_admin: "/path/to/oracle/config/files/" # optional, default: agent plugin config folder. Points to the location of sqlnet.ora and tnsnames.ora
+  oracle_local_registry: "/etc/oracle/olr.loc" # optional, default: folder of oracle configuration files like oratab
+  # not defined in docu, reserved for a future use
+  service_name: service_NAME  #
+  service_type: dedicated # dedicated or shared
+  instance_name: instance_NAME
+  engine: std
+"#;
+
+        pub const CONNECTION_WITH_SID: &str = r#"
+connection:
+  hostname: "localhost"
+  port: 1521
+  sid: FREE
+"#;
+    }
+
+    #[test]
+    fn test_connection_full() {
+        assert_eq!(
+            Connection::from_yaml(&create_yaml(data::CONNECTION_FULL))
+                .unwrap()
+                .unwrap(),
+            Connection {
+                hostname: HostName::from("alice".to_string()),
+                port: Some(Port(9999)),
+                timeout: Some(341),
+                tns_admin: Some(PathBuf::from("/path/to/oracle/config/files/")),
+                oracle_local_registry: Some(PathBuf::from("/etc/oracle/olr.loc")),
+                engine: EngineTag::Std,
+                ..Default::default()
+            }
+        );
+    }
+    /// Assumes the test machine does not run Grid Infrastructure, which is
+    /// what makes the default host `localhost`.
+    #[test]
+    fn test_connection_default() {
+        assert_eq!(
+            Connection::default(),
+            Connection {
+                hostname: HostName::from("localhost".to_string()),
+                tns_admin: None,
+                oracle_local_registry: None,
+                grid: None,
+                port: None,
+                timeout: None,
+                engine: EngineTag::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_connection_with_only_sid() {
+        let conn = Connection::from_yaml(&create_yaml(data::CONNECTION_WITH_SID))
+            .unwrap()
+            .unwrap();
+        assert_eq!(conn.hostname(), HostName::from("localhost".to_string()));
+        assert_eq!(conn.port(), Port(1521));
+    }
+
+    fn create_connection_with_engine(value: &str) -> String {
+        format!(
+            r#"
+connection:
+    hostname: "localhost"
+    service_name: "will not be used"
+    engine: {value}
+"#
+        )
+    }
+
+    #[test]
+    fn test_connection_from_yaml_default() {
+        assert_eq!(
+            Connection::from_yaml(&create_connection_yaml_default())
+                .unwrap()
+                .unwrap(),
+            Connection::default()
+        );
+        assert!(Connection::from_yaml(&create_connection_yaml_no_service_name()).is_ok());
+        assert_eq!(
+            Connection::from_yaml(&create_connection_yaml_empty_host())
+                .unwrap()
+                .unwrap(),
+            Connection::default()
+        );
+        assert_eq!(
+            Connection::from_yaml(&create_connection_yaml_non_empty_host())
+                .unwrap()
+                .unwrap(),
+            Connection {
+                hostname: HostName::from("aa".to_string()),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            Connection::from_yaml(&create_yaml("nothing: ")).unwrap(),
+            None
+        );
+    }
+
+    fn create_connection_yaml_default() -> Yaml {
+        const SOURCE: &str = r#"
+connection:
+    hostname: "localhost"
+    _nothing: "nothing"
+    service_name: ''
+"#;
+        create_yaml(SOURCE)
+    }
+
+    fn create_connection_yaml_no_service_name() -> Yaml {
+        const SOURCE: &str = r#"
+connection:
+    hostname: "localhost"
+    _nothing: "nothing"
+"#;
+        create_yaml(SOURCE)
+    }
+
+    fn create_connection_yaml_empty_host() -> Yaml {
+        const SOURCE: &str = r#"
+connection:
+    hostname: ''
+"#;
+        create_yaml(SOURCE)
+    }
+
+    fn create_connection_yaml_non_empty_host() -> Yaml {
+        const SOURCE: &str = r#"
+connection:
+    hostname: 'Aa'
+"#;
+        create_yaml(SOURCE)
+    }
+
+    #[test]
+    fn test_connection_engine() {
+        let test: Vec<(&str, EngineTag)> = vec![
+            ("auto", EngineTag::Auto),
+            ("std", EngineTag::Std),
+            ("jdbc", EngineTag::Jdbc),
+            ("sql_plus", EngineTag::SqlPlus),
+            ("unknown", EngineTag::default()),
+            ("", EngineTag::default()),
+        ];
+        for (value, expected) in test {
+            let config_text = create_connection_with_engine(value);
+            let c = Connection::from_yaml(&create_yaml(&config_text))
+                .unwrap()
+                .unwrap();
+            assert_eq!(c.engine_tag(), &expected, "for value `{value}`");
+        }
+    }
+
+    #[test]
+    fn test_engine_tag() {
+        let test: Vec<(&str, Option<EngineTag>)> = vec![
+            ("auto", Some(EngineTag::Auto)),
+            ("std", Some(EngineTag::Std)),
+            ("jdbc", Some(EngineTag::Jdbc)),
+            ("sql_plus", Some(EngineTag::SqlPlus)),
+            ("unknown", None),
+            ("", None),
+        ];
+        for (value, expected) in test {
+            assert_eq!(
+                EngineTag::from_string(value),
+                expected,
+                "for value `{value}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_local() {
+        let conn_non_local = Connection {
+            hostname: HostName::from("localhost.com".to_string()),
+            ..Default::default()
+        };
+        let conn_local = Connection {
+            hostname: HostName::from("localhost".to_string()),
+            ..Default::default()
+        };
+        let conn_127 = Connection {
+            hostname: HostName::from("127.0.0.1".to_string()),
+            ..Default::default()
+        };
+        let conn_1 = Connection {
+            hostname: HostName::from("::1".to_string()),
+            ..Default::default()
+        };
+        assert!(conn_127.is_local());
+        assert!(conn_local.is_local());
+        assert!(conn_1.is_local());
+        assert!(!conn_non_local.is_local());
+    }
+
+    /// The configured path wins over the standard locations, so a path that
+    /// does not exist keeps the connection off the Grid Infrastructure
+    /// defaults no matter what the test machine has installed.
+    #[test]
+    fn test_connection_without_grid_infrastructure() {
+        let conn = Connection::from_yaml(&create_yaml(
+            r#"
+connection:
+  oracle_local_registry: "/no/such/olr.loc"
+"#,
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(conn.grid().is_none());
+        assert_eq!(conn.hostname(), HostName::from("localhost".to_string()));
+    }
+}

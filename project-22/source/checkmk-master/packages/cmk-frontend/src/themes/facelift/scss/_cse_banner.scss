@@ -1,0 +1,65 @@
+/* stylelint-disable at-rule-no-unknown */
+@use 'sass:color';
+@charset "UTF-8";
+/* stylelint-disable-next-line no-invalid-double-slash-comments */
+// Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+// This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+// conditions defined in the file COPYING, which is part of this source code package.
+/* stylelint-enable at-rule-no-unknown */
+
+/* Styles used to show the banner in Cloud */
+
+.cloud-banner {
+  display: flex;
+  align-items: center;
+  padding-left: 20px;
+  color: $font-color-white;
+
+  &:not(:last-child) {
+    padding-right: 20px;
+  }
+
+  &__message {
+    font-weight: $font-weight-default;
+  }
+
+  &__button {
+    margin-left: 10px;
+    padding: 5px 15px;
+    border-radius: $theme-border-radius;
+    background-color: $success-dimmed;
+    line-height: 1.5;
+    color: $font-color-black !important;
+    font-weight: $font-weight-bold;
+    text-decoration: none;
+    white-space: nowrap;
+
+    &:hover {
+      background-color: color.mix($black, $success-dimmed, 10%);
+    }
+
+    &:visited {
+      color: $font-color-black !important;
+    }
+  }
+}
+
+/* Cloud banner positioning for Vue dashboard pages */
+/* stylelint-disable-next-line selector-id-pattern */
+#main_page_content:has(cmk-dashboard) {
+  position: relative;
+
+  .cloud-banner {
+    position: absolute;
+    right: 3px;
+    top: 5px;
+    background: $bg-color;
+    color: $font-color !important;
+    padding-left: 2px;
+    padding-right: 10px;
+  }
+
+  &:has(> .warning) .cloud-banner {
+    margin-top: 63px;
+  }
+}

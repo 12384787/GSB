@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+import asyncio
+from ssl import SSLObject
+from typing import cast, override
+from urllib.parse import unquote
+
+import h11
+from uvicorn.protocols.http.flow_control import HIGH_WATER_LIMIT, service_unavailable
+from uvicorn.protocols.http.h11_impl import H11Protocol, RequestResponseCycle
+from uvicorn_worker import UvicornWorker
+
+from cmk.agent_receiver.lib.mtls_auth_validator import INJECTED_ISSUER_HEADER, INJECTED_UUID_HEADER
+
+
+def _cn_from_rdn_sequence(rdn_sequence: object) -> str | None:
+    # ssl.getpeercert()'s "subject"/"issuer" entries are typed as a plain
+    # dict[str, str | ...], not a TypedDict, so there is no precise upstream type to
+    # narrow to here; CPython's _ssl module always builds this as a tuple of RDNs,
+    # each itself a tuple of (attribute_type, value) pairs, so we cast straight to that.
+    for distinguished_name in cast("tuple[tuple[tuple[str, str], ...], ...]", rdn_sequence):
+        if cn := dict(distinguished_name).get("commonName"):
+            return cn
+    return None
+
+
+def _extract_client_cert_names(ssl_object: SSLObject | None) -> tuple[str | None, str | None]:
+    """Return (subject CN, issuer CN) of the client's TLS certificate, if presented."""
+    if ssl_object is None:
+        return None, None
+    try:
+        client_cert = ssl_object.getpeercert()
+    except ValueError:
+        return None, None
+    if client_cert is None:
+        return None, None
+
+    return (
+        _cn_from_rdn_sequence(client_cert.get("subject")),
+        _cn_from_rdn_sequence(client_cert.get("issuer")),
+    )
+
+
+def _headers_with_verified_identity(
+    headers: list[tuple[bytes, bytes]], client_cn: str | None, issuer_cn: str | None
+) -> list[tuple[bytes, bytes]]:
+    """Return request headers carrying the trusted verified-identity headers.
+
+    Any client-supplied copy of the injected headers is stripped first, so the
+    only verified headers downstream can see are the ones derived from the
+    validated client certificate. When no client certificate was presented the
+    headers are omitted entirely: endpoints that require them then reject the
+    request, and a client cannot spoof an identity by injecting the headers
+    itself.
+    """
+    injected_uuid_key = INJECTED_UUID_HEADER.encode()
+    injected_issuer_key = INJECTED_ISSUER_HEADER.encode()
+    sanitized = [
+        (key, value)
+        for key, value in headers
+        if key.lower() not in (injected_uuid_key, injected_issuer_key)
+    ]
+    injected: list[tuple[bytes, bytes]] = []
+    if client_cn is not None:
+        injected.append((injected_uuid_key, client_cn.encode()))
+    if issuer_cn is not None:
+        injected.append((injected_issuer_key, issuer_cn.encode()))
+    return [*injected, *sanitized]
+
+
+class _ClientCertProtocol(H11Protocol):
+    # copied from uvicorn.protocols.http.h11_impl.H11Protocol
+    @override
+    def handle_events(self) -> None:
+        while True:
+            try:
+                event = self.conn.next_event()
+            except h11.RemoteProtocolError:
+                msg = "Invalid HTTP request received."
+                self.logger.warning(msg)
+                self.send_400_response(msg)
+                return
+
+            if event is h11.NEED_DATA:
+                break
+
+            if event is h11.PAUSED:
+                # This case can occur in HTTP pipelining, so we need to
+                # stop reading any more data, and ensure that at the end
+                # of the active request/response cycle we handle any
+                # events that have been buffered up.
+                self.flow.pause_reading()
+                break
+
+            if isinstance(event, h11.Request):
+                headers = [(key.lower(), value) for key, value in event.headers]
+
+                # ==================================================================================
+                # ==================================================================================
+                # OUR CUSTOM EXTENSION
+
+                client_cn, issuer_cn = _extract_client_cert_names(
+                    self.transport.get_extra_info("ssl_object")
+                )
+                self.headers = _headers_with_verified_identity(headers, client_cn, issuer_cn)
+
+                # ==================================================================================
+                # ==================================================================================
+
+                raw_path, _, query_string = event.target.partition(b"?")
+                path = unquote(raw_path.decode("ascii"))
+                full_path = self.root_path + path
+                full_raw_path = self.root_path.encode("ascii") + raw_path
+                self.scope = {
+                    "type": "http",
+                    "asgi": {"version": self.config.asgi_version, "spec_version": "2.3"},
+                    "http_version": event.http_version.decode("ascii"),
+                    "server": self.server,
+                    "client": self.client,
+                    "scheme": self.scheme,  # type: ignore[typeddict-item]
+                    "method": event.method.decode("ascii"),
+                    "root_path": self.root_path,
+                    "path": full_path,
+                    "raw_path": full_raw_path,
+                    "query_string": query_string,
+                    "headers": self.headers,
+                    "state": self.app_state.copy(),
+                }
+                if self._should_upgrade():
+                    self.handle_websocket_upgrade(event)
+                    return
+
+                # Handle 503 responses when 'limit_concurrency' is exceeded.
+                if self.limit_concurrency is not None and (
+                    len(self.connections) >= self.limit_concurrency
+                    or len(self.tasks) >= self.limit_concurrency
+                ):
+                    app = service_unavailable
+                    message = "Exceeded concurrency limit."
+                    self.logger.warning(message)
+                else:
+                    app = self.app
+
+                # When starting to process a request, disable the keep-alive
+                # timeout. Normally we disable this when receiving data from
+                # client and set back when finishing processing its request.
+                # However, for pipelined requests processing finishes after
+                # already receiving the next request and thus the timer may
+                # be set here, which we don't want.
+                self._unset_keepalive_if_required()
+
+                self.cycle = RequestResponseCycle(
+                    scope=self.scope,
+                    conn=self.conn,
+                    transport=self.transport,
+                    flow=self.flow,
+                    logger=self.logger,
+                    access_logger=self.access_logger,
+                    access_log=self.access_log,
+                    default_headers=self.server_state.default_headers,
+                    message_event=asyncio.Event(),
+                    on_response=self.on_response_complete,
+                )
+                task = self.loop.create_task(self.cycle.run_asgi(app))
+                task.add_done_callback(self.tasks.discard)
+                self.tasks.add(task)
+
+            elif isinstance(event, h11.Data):
+                if self.conn.our_state is h11.DONE:
+                    continue
+                self.cycle.body += event.data
+                if len(self.cycle.body) > HIGH_WATER_LIMIT:
+                    self.flow.pause_reading()
+                self.cycle.message_event.set()
+
+            elif isinstance(event, h11.EndOfMessage):
+                if self.conn.our_state is h11.DONE:
+                    self.transport.resume_reading()
+                    self.conn.start_next_cycle()
+                    continue
+                self.cycle.more_body = False
+                self.cycle.message_event.set()
+                if self.conn.their_state == h11.MUST_CLOSE:
+                    break
+
+
+class ClientCertWorker(UvicornWorker):
+    CONFIG_KWARGS = {
+        **UvicornWorker.CONFIG_KWARGS,
+        "http": _ClientCertProtocol,
+    }

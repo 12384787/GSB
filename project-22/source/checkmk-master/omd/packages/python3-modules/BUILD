@@ -1,0 +1,137 @@
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@python_modules//:requirements.bzl", "all_requirements")
+load("//omd/packages/Python:version.bzl", "PYTHON_MAJOR_DOT_MINOR")
+load(":build-python3-modules.bzl", "build_python_module", "create_requirements_file")
+
+config_setting(
+    name = "git_ssl_no_verify",
+    tags = ["manual"],
+    values = {"define": "git-ssl-no-verify=true"},
+)
+
+[create_requirements_file(
+    name = module,
+    outs = [
+        "%s_requirements.txt" % module,
+    ],
+) for module in all_requirements]
+
+# Extra Bazel-fetched srcs some modules need on top of the common set below, e.g.
+# offline meson subproject sources seeded by get_extra_setup() in
+# build-python3-modules.bzl.
+_EXTRA_MODULE_SRCS = {
+    "matplotlib": [
+        "@matplotlib_freetype_src//file",
+        "@matplotlib_harfbuzz_src//file",
+        "@matplotlib_sheenbidi_src//file",
+        "@matplotlib_libraqm_src//file",
+        "@matplotlib_qhull_src//file",
+    ],
+}
+
+# Third Party packages parsed from runtime-requirements.txt
+[build_python_module(
+    name = module,
+    # @python must stay last: the genrule's EXT_DEPS_PATH extraction (see
+    # build-python3-modules.bzl) greedily matches up to the last "external" src
+    # in $(SRCS), so any extra external srcs must be inserted before it.
+    srcs = [
+        "%s_requirements.txt" % module,
+        ":git_wrapper",
+        "//:constraints.txt",
+    ] + _EXTRA_MODULE_SRCS.get(module, []) + [
+        "@freetds",
+        "@openssl",
+        "@python",
+    ],
+    outs = [
+        "compiled_%s.tar" % module,
+    ],
+    tags = ["manual"],
+    visibility = [
+        "//omd/non-free/relay:__pkg__",
+        "@net-snmp//:__pkg__",
+    ],
+) for module in all_requirements]
+
+# TODO: Switch to official release when netapp has fixed their build process
+# See: https://github.com/NetApp/ontap-rest-python/issues/46
+build_python_module(
+    name = "netapp-ontap",
+    srcs = [
+        ":git_wrapper",
+        "//:constraints.txt",
+        "@freetds",
+        "@openssl",
+        "@python",
+    ],
+    outs = [
+        "compiled_netapp-ontap.tar",
+    ],
+    requirements = "git+https://github.com/Checkmk/netapp-ontap-cmk.git@e38ce4ce357ad2ea8f47260c269757f8805bdbce",
+    tags = ["manual"],
+    visibility = ["//omd/non-free/relay:__pkg__"],
+)
+
+genrule(
+    name = "python3-modules",
+    srcs = [
+        "%s_compile" % module
+        for module in all_requirements + [
+            "netapp-ontap",
+        ]
+    ],
+    outs = [
+        "python3-modules.tar",
+    ],
+    cmd = """
+        mkdir -p python3-modules
+        for MODULE in $(SRCS); do
+            tar -xf $$MODULE -C python3-modules/
+        done
+
+        # For some highly obscure unknown reason some files end up world-writable. Fix that!
+        chmod -R o-w python3-modules/lib/python{pyMajMin}/site-packages
+
+        # Cleanup some unwanted files (example scripts)
+        find python3-modules/bin -name "*.py" ! -name snmpsimd.py -exec rm -f {{}} \\;
+
+        # These files break the integration tests on the CI server. Don't know exactly
+        # why this happens only there, but should be a working fix.
+        rm -r -f python3-modules/snmpsim
+
+        # Cleanup unneeded test files of numpy
+        rm -r -f python3-modules/lib/python{pyMajMin}/site-packages/numpy/*/tests
+
+        # Fix python interpreter for kept scripts
+        sed -E -i '1s|^#!.*/python3?$$|#!/usr/bin/env python3|' python3-modules/bin/[!_]*
+
+        # pip is using pip._vendor.distlib.scripts.ScriptMaker._build_shebang() to
+        # build the shebang of the scripts installed to bin. When executed via our CI
+        # containers, the shebang exceeds the max_shebang_length of 127 bytes. For this
+        # case, it adds a #!/bin/sh wrapper in front of the python code o_O to make it
+        # fit into the shebang. Let's also cleanup this case.
+        sed -i -z "s|^#\\!/bin/sh\\n.*exec.*python3[^\\n]*\\n[^\\n]*|#\\!/usr/bin/env python3|" python3-modules/bin/[!_]*
+
+        # Fix rpath for all .so libs
+        PATCHELF=$$PWD/$(execpath @patchelf)
+        cd python3-modules/lib/
+        for F in $$(find -name "*.so");
+            do $$PATCHELF --set-rpath \\
+            $$(echo $$F | sed 's|[^/]*/|../|g' | sed 's|\\.\\./|\\$$ORIGIN/|' | sed 's|[^/]*$$||') $$F ;
+        done
+        cd -
+
+        chmod +w python3-modules
+
+	tar cf $@ -C python3-modules .
+    """.format(pyMajMin = PYTHON_MAJOR_DOT_MINOR),
+    tags = ["manual"],
+    tools = ["@patchelf"],
+    visibility = ["//omd:__subpackages__"],
+)
+
+build_test(
+    name = "build_test",
+    targets = [":python3-modules"],
+)

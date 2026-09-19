@@ -1,0 +1,201 @@
+#!/bin/bash
+
+cd "$OMD_ROOT" || exit
+. .profile
+. lib/omd/init_profile
+. etc/omd/site.conf
+if [ "$CONFIG_APACHE_MODE" == none ]; then
+    exit 5
+fi
+
+# Start httpd in the C locale by default.
+HTTPD_LANG="C"
+
+# This will prevent initlog from swallowing up a pass-phrase prompt if
+# mod_ssl needs a pass-phrase from the user.
+INITLOG_ARGS=""
+
+PID_FILE="$OMD_ROOT"/tmp/apache/run/apache.pid
+CONFIG_FILE="$OMD_ROOT"/etc/apache/apache.conf
+
+# Preload our bundled OpenSSL into the (distribution-provided) httpd binary.
+#
+# The site apache runs the distro httpd, whose own dependencies and startup
+# pull in the system libcrypto.so.3 (via libnss_systemd, used for user/group
+# lookups) before mod_wsgi loads our Python. Both libraries share the SONAME
+# "libcrypto.so.3", so the loader reuses the already-mapped system copy for our
+# extensions too - regardless of their RPATH. On distributions that strip
+# algorithms from their OpenSSL (e.g. RHEL drops SM4) this makes our Python
+# crypto extensions fail to resolve symbols such as EVP_sm4_ecb, breaking the
+# GUI/REST API (SUP-29520).
+#
+# Preloading our libssl/libcrypto here makes our OpenSSL win that resolution.
+# It is scoped to this single exec (not exported) so it never leaks into the
+# other system tools this script invokes (ping, kill, killall, php-cgi, ...).
+# We reference the unversioned ".so" symlinks so this keeps working across an
+# OpenSSL major bump (e.g. 3 -> 4) without editing this script.
+APACHE_LD_PRELOAD="$OMD_ROOT/lib/libssl.so $OMD_ROOT/lib/libcrypto.so"
+
+apache_bin() {
+    if [ -e /usr/sbin/apache2 ]; then
+        echo /usr/sbin/apache2
+    elif [ -e /usr/sbin/httpd2-prefork ]; then
+        echo /usr/sbin/httpd2-prefork
+    elif [ -e /usr/sbin/httpd ]; then
+        echo /usr/sbin/httpd
+    else
+        echo "ERROR: Failed to locate apache binary"
+        exit 1
+    fi
+}
+
+# If you change this, you also have to change etc/apache/php-wrapper
+php_cgi_bin() {
+    if [ -e /usr/bin/php-cgi ]; then
+        echo php-cgi
+    else
+        echo "ERROR: Failed to locate php binary"
+        exit 1
+    fi
+}
+
+pidof_apache() {
+    apache_pidof "$PID_FILE" "$OMD_SITE" "$(apache_bin)"
+}
+
+apache_wait_stop() {
+    # running ?
+    pid=$(pidof_apache) || true
+    if [ -n "${pid:-}" ]; then
+        echo -n "killing ${pid:-}..."
+        kill ${pid:-}
+    else
+        echo -n '(not running)...'
+        return 0
+    fi
+
+    # wait until really stopped
+    if [ -n "${pid:-}" ]; then
+        i=0
+        while kill -0 "${pid:-}" 2>/dev/null; do
+            if [ $i = '120' ]; then
+                kill_stale_php_cgis
+                return 1
+            else
+                echo -n "."
+                i=$(($i + 1))
+                sleep 0.1
+            fi
+        done
+    fi
+
+    [ -f "$PID_FILE" ] && rm -f "$PID_FILE"
+    kill_stale_php_cgis
+    return 0
+}
+
+apache_wait_start() {
+    pid=$(pidof_apache)
+    if [ -n "$pid" ]; then
+        echo -n "(already running: $pid)..."
+        return 0
+    fi
+
+    mkdir -p "$OMD_ROOT"/tmp/apache/run
+
+    # (nearly) reproducible problems with apache at boot-time. (alloc_listener: failed to set up sockaddr for 127.0.0.1)
+    # With this ping the problem disappears.
+    # LM: We could remove this here and fix the boot order. Would be a better fix.
+    if test -f /etc/debian_version && test $(cut -f1 -d" " /proc/uptime | cut -f1 -d".") -lt 300; then
+        TRIES=10
+        IP_ADDR="$(echo "$CONFIG_APACHE_TCP_ADDR" | cut -d "[" -f 2 | cut -d "]" -f 1)"
+        while [ $TRIES -gt 0 ] && ! ping -n -q -c1 -w1 "$IP_ADDR" >/dev/null 2>&1; do
+            TRIES=$(($TRIES - 1))
+        done
+    fi
+
+    LD_PRELOAD="$APACHE_LD_PRELOAD" $(apache_bin) -f "$CONFIG_FILE"
+
+    i=0
+    while ! pidof_apache >/dev/null 2>&1; do
+        if [ $i = '10' ]; then
+            return 1
+        else
+            echo -n "."
+            i=$(($i + 1))
+            sleep 0.1
+        fi
+    done
+
+    return 0
+}
+
+kill_stale_php_cgis() {
+    i=1
+    killall -e "$(php_cgi_bin)" -u "$OMD_SITE" >/dev/null 2>&1
+    while killall -e "$(php_cgi_bin)" -u "$OMD_SITE" >/dev/null 2>&1; do
+        i=$((i + 1))
+        if [ $i -gt 50 ]; then
+            return
+        fi
+        sleep 0.1
+    done
+}
+
+do_start() {
+    echo -n "Starting apache..."
+    if apache_wait_start; then
+        __init_hook $0 $1 post 0
+        echo 'OK'
+        return 0
+    else
+        __init_hook $0 $1 post 1
+        echo 'failed'
+        return 1
+    fi
+}
+
+do_stop() {
+    echo -n "Stopping apache..."
+    if apache_wait_stop; then
+        __init_hook $0 $1 post 0
+        echo 'OK'
+        return 0
+    else
+        __init_hook $0 $1 post 1
+        echo 'failed'
+        return 1
+    fi
+}
+
+__init_hook $0 $1 pre
+case $1 in
+    start)
+        do_start
+        ;;
+    stop)
+        do_stop
+        ;;
+    restart)
+        do_stop
+        do_start
+        ;;
+    reload)
+        echo "Reloading apache"
+        LD_PRELOAD="$APACHE_LD_PRELOAD" $(apache_bin) -f "$CONFIG_FILE" -k graceful
+        __init_hook $0 $1 post $?
+        ;;
+    status)
+        PID=$(pidof_apache) || true
+        if [ -n "$PID" ]; then
+            echo "Apache is running (pid $PID)."
+            exit 0
+        else
+            echo "Apache is NOT running."
+            exit 1
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|reload|status}"
+        ;;
+esac

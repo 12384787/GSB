@@ -1,0 +1,6 @@
+# Alias: Enable automation helper
+# Menu: Basic
+# Description:
+#  This option enables the automation helper, which
+#  speeds up UI and Rest API interactions in most
+#  cases.

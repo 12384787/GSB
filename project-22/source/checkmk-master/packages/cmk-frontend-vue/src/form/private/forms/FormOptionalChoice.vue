@@ -1,0 +1,84 @@
+<!--
+Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import type * as FormSpec from 'cmk-shared-typing/typescript/vue_formspec_components'
+import CmkHelpText from 'cmk-ui-library/components/CmkHelpText.vue'
+import FormIndent from 'cmk-ui-library/components/CmkIndent.vue'
+import CmkCheckbox from 'cmk-ui-library/components/user-input/CmkCheckbox.vue'
+import CmkInlineValidation from 'cmk-ui-library/components/user-input/CmkInlineValidation.vue'
+import { untranslated } from 'cmk-ui-library/lib/i18n'
+import { immediateWatch } from 'cmk-ui-library/lib/watch'
+import { ref, watch } from 'vue'
+
+import FormEditDispatcher from '@/form/private/FormEditDispatcher/FormEditDispatcher.vue'
+import FormRequired from '@/form/private/FormRequired.vue'
+import { rendersRequiredLabelItself } from '@/form/private/requiredValidator'
+import { type ValidationMessages } from '@/form/private/validation'
+
+const props = defineProps<{
+  spec: FormSpec.OptionalChoice
+  backendValidation: ValidationMessages
+}>()
+
+const data = defineModel<unknown>('data', { required: true })
+
+const embeddedValidation = ref<ValidationMessages>([])
+const localValidation = ref<string[]>([])
+const checkboxValue = ref<boolean>(data.value !== null)
+
+immediateWatch(
+  () => props.backendValidation,
+  (newValidation: ValidationMessages) => {
+    embeddedValidation.value = []
+    localValidation.value = []
+    newValidation.forEach((msg) => {
+      if (msg.location.length === 0) {
+        localValidation.value.push(msg.message)
+      } else {
+        embeddedValidation.value.push({
+          location: msg.location.slice(1),
+          message: msg.message,
+          replacement_value: msg.replacement_value
+        })
+      }
+    })
+  }
+)
+
+watch(checkboxValue, (newValue: boolean) => {
+  if (newValue) {
+    data.value = props.spec.parameter_form_default_value
+  } else {
+    data.value = null
+  }
+})
+</script>
+
+<template>
+  <CmkCheckbox v-model="checkboxValue" :label="untranslated(spec.i18n.label)" />
+  <FormRequired
+    v-if="data !== null && !rendersRequiredLabelItself(spec.parameter_form)"
+    :spec="spec.parameter_form"
+    :space="'before'"
+  />
+  <CmkHelpText :help="untranslated(spec.title ? '' : spec.help)" />
+  <CmkInlineValidation :validation="localValidation"></CmkInlineValidation>
+  <FormIndent v-if="data !== null">
+    <FormEditDispatcher
+      v-model:data="data"
+      :spec="spec.parameter_form as FormSpec.Components"
+      :backend-validation="embeddedValidation"
+    />
+  </FormIndent>
+  <FormIndent v-if="data === null && spec.i18n.none_label">{{ spec.i18n.none_label }}</FormIndent>
+</template>
+
+<style scoped>
+/* stylelint-disable-next-line checkmk/vue-bem-naming-convention */
+span.embedded_title {
+  margin-right: 3px;
+}
+</style>

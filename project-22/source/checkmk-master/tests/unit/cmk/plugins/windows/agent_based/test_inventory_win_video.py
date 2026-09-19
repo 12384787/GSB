@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+import pytest
+
+from cmk.agent_based.v2 import InventoryResult, render, StringTable, TableRow
+from cmk.plugins.windows.agent_based.inventory_win_video import (
+    inventorize_win_video,
+    parse_win_video,
+)
+
+
+@pytest.mark.parametrize(
+    "string_table, expected_result",
+    [
+        ([], []),
+        (
+            [
+                ["Name                 ", " VirtualBox Graphics Adapter"],
+                ["Description          ", " VirtualBox Graphics Adapter"],
+                ["Caption              ", " VirtualBox Graphics Adapter"],
+                ["AdapterCompatibility ", " Oracle Corporation"],
+                ["VideoProcessor       ", ""],
+                ["DriverVersion        ", " 4.3.10.0"],
+                ["DriverDate           ", " 20140326000000.000000-000"],
+                ["MaxMemorySupported   ", ""],
+            ],
+            [
+                TableRow(
+                    path=["hardware", "video"],
+                    key_columns={
+                        "name": "VirtualBox Graphics Adapter",
+                    },
+                    inventory_columns={
+                        "driver_version": "4.3.10.0",
+                        "driver_date": "2014-03-26",
+                        "graphic_memory": None,
+                    },
+                    status_columns={},
+                ),
+            ],
+        ),
+        (
+            [
+                ["Name                 ", " VirtualBox Graphics Adapter 2"],
+                ["Description          ", " VirtualBox Graphics Adapter 2"],
+                ["Caption              ", " VirtualBox Graphics Adapter 2"],
+                ["AdapterCompatibility ", " Oracle Corporation"],
+                ["VideoProcessor       ", ""],
+                ["DriverVersion        ", " 4.3.10.0"],
+                ["DriverDate           ", " 20140326000000.000000-000"],
+                ["MaxMemorySupported   ", ""],
+                ["Name                 ", " VirtualBox Graphics Adapter 1"],
+                ["Description          ", " VirtualBox Graphics Adapter 1"],
+                ["Caption              ", " VirtualBox Graphics Adapter 1"],
+                ["AdapterCompatibility ", " Oracle Corporation"],
+                ["VideoProcessor       ", ""],
+                ["DriverVersion        ", " 4.3.10.0"],
+                ["DriverDate           ", " 20140326000000.000000-000"],
+                ["MaxMemorySupported   ", ""],
+            ],
+            [
+                TableRow(
+                    path=["hardware", "video"],
+                    key_columns={
+                        "name": "VirtualBox Graphics Adapter 2",
+                    },
+                    inventory_columns={
+                        "driver_version": "4.3.10.0",
+                        "driver_date": "2014-03-26",
+                        "graphic_memory": None,
+                    },
+                    status_columns={},
+                ),
+                TableRow(
+                    path=["hardware", "video"],
+                    key_columns={
+                        "name": "VirtualBox Graphics Adapter 1",
+                    },
+                    inventory_columns={
+                        "driver_version": "4.3.10.0",
+                        "driver_date": "2014-03-26",
+                        "graphic_memory": None,
+                    },
+                    status_columns={},
+                ),
+            ],
+        ),
+    ],
+)
+def test_inventorize_win_video(
+    monkeypatch: pytest.MonkeyPatch,
+    string_table: StringTable,
+    expected_result: InventoryResult,
+) -> None:
+    monkeypatch.setattr(render, "date", lambda s: "2014-03-26")  # noqa: ARG005
+    assert list(inventorize_win_video(parse_win_video(string_table))) == expected_result

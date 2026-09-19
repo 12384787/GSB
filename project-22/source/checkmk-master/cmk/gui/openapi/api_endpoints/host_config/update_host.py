@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+from typing import Annotated
+
+from cmk.gui.openapi.framework import (
+    ApiContext,
+    APIVersion,
+    EndpointBehavior,
+    EndpointDoc,
+    EndpointHandler,
+    EndpointMetadata,
+    EndpointPermissions,
+    PathParam,
+    VersionedEndpoint,
+)
+from cmk.gui.openapi.framework.model.converter import HostConverter, TypedPlainValidator
+from cmk.gui.openapi.framework.model.response import ApiResponse
+from cmk.gui.openapi.restful_objects.constructors import object_href
+from cmk.gui.openapi.utils import ProblemException
+from cmk.gui.watolib.hosts_and_folders import Host
+
+from ._family import HOST_CONFIG_FAMILY
+from ._utils import (
+    carry_over_unexposed_attributes,
+    host_etag,
+    make_pending_changes,
+    PERMISSIONS_UPDATE,
+    serialize_host,
+    UNREMOVABLE_HOST_ATTRIBUTES,
+    validate_host_attributes_for_quick_setup,
+)
+from .models.request_models import UpdateHost
+from .models.response_models import HostConfigModel
+
+
+def update_host_v1(
+    api_context: ApiContext,
+    body: UpdateHost,
+    host: Annotated[
+        Annotated[
+            Host,
+            TypedPlainValidator(str, HostConverter(permission_type="setup_write").host),
+        ],
+        PathParam(description="Host name", example="example.com", alias="host_name"),
+    ],
+) -> ApiResponse[HostConfigModel]:
+    """Update a host"""
+    api_context.user.need_permission("wato.edit")
+    api_context.user.need_permission("wato.edit_hosts")
+    acting_user = api_context.user
+    if api_context.etag.enabled:
+        api_context.etag.verify(host_etag(host))
+
+    if not validate_host_attributes_for_quick_setup(host, body):
+        raise ProblemException(
+            status=400,
+            title=f'The host "{host.name()}" is locked by Quick setup.',
+            detail="Cannot modify locked attributes.",
+        )
+
+    if body.attributes:
+        new_attributes = carry_over_unexposed_attributes(
+            host.attributes, body.attributes.to_internal()
+        )
+        host.edit(
+            new_attributes,
+            host.cluster_nodes(),
+            pprint_value=api_context.config.wato_pprint_config,
+            pending_changes=make_pending_changes(api_context),
+            acting_user=acting_user,
+        )
+
+    if body.update_attributes:
+        host.update_attributes(
+            body.update_attributes.to_internal(),
+            pprint_value=api_context.config.wato_pprint_config,
+            pending_changes=make_pending_changes(api_context),
+            acting_user=acting_user,
+        )
+
+    if body.remove_attributes:
+        if unexposed := sorted(set(body.remove_attributes) & set(UNREMOVABLE_HOST_ATTRIBUTES)):
+            raise ProblemException(
+                status=400,
+                title="Some attributes cannot be removed",
+                detail=f"The following attributes are not managed through the API: {', '.join(unexposed)}",
+            )
+
+        faulty_attributes = []
+        for attribute in body.remove_attributes:
+            if attribute not in host.attributes:
+                faulty_attributes.append(attribute)
+
+        host.clean_attributes(  # silently ignores missing attributes
+            body.remove_attributes,
+            pprint_value=api_context.config.wato_pprint_config,
+            pending_changes=make_pending_changes(api_context),
+            acting_user=acting_user,
+        )
+
+        if faulty_attributes:
+            raise ProblemException(
+                status=400,
+                title="Some attributes were not removed",
+                detail=f"The following attributes were not removed since they didn't exist: {', '.join(faulty_attributes)}",
+            )
+
+    return ApiResponse(
+        body=serialize_host(
+            host, api_context=api_context, compute_effective_attributes=False, compute_links=True
+        ),
+        status_code=200,
+        etag=host_etag(host),
+    )
+
+
+ENDPOINT_UPDATE_HOST = VersionedEndpoint(
+    metadata=EndpointMetadata(
+        path=object_href("host_config", "{host_name}"),
+        link_relation=".../update",
+        method="put",
+    ),
+    permissions=EndpointPermissions(required=PERMISSIONS_UPDATE),
+    doc=EndpointDoc(family=HOST_CONFIG_FAMILY.name),
+    versions={APIVersion.V1: EndpointHandler(handler=update_host_v1)},
+    behavior=EndpointBehavior(etag="both"),
+)

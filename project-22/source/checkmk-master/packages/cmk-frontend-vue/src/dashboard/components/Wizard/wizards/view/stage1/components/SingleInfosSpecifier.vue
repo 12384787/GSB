@@ -1,0 +1,84 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import CmkDropdown from 'cmk-ui-library/components/CmkDropdown'
+import CmkLabel from 'cmk-ui-library/components/CmkLabel.vue'
+import CmkHeading from 'cmk-ui-library/components/typography/CmkHeading.vue'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import type { TranslatedString } from 'cmk-ui-library/lib/i18nString'
+import { computed, watch } from 'vue'
+
+import ContentSpacer from '@/dashboard/components/ContentSpacer.vue'
+import SelectorSingleInfo from '@/dashboard/components/selectors/SelectorSingleInfo.vue'
+import { RestrictedToSingle } from '@/dashboard/types/shared.ts'
+
+const { _t } = usei18n()
+
+type SpecificObjectOption = {
+  name: RestrictedToSingle
+  title: TranslatedString
+}
+
+const SPECIFIC_OBJECT_OPTIONS: SpecificObjectOption[] = [
+  { name: RestrictedToSingle.NO, title: _t('No restrictions to specific objects') },
+  { name: RestrictedToSingle.HOST, title: _t('Restrict to a single host') },
+  { name: RestrictedToSingle.CUSTOM, title: _t('Configure restrictions manually') }
+]
+
+const props = withDefaults(
+  defineProps<{
+    contextInfos: string[]
+    readOnly?: boolean // TODO: needs to be included once component has been adapted
+  }>(),
+  {
+    readOnly: false
+  }
+)
+
+const mode = defineModel<RestrictedToSingle>('mode', { default: RestrictedToSingle.NO })
+const restrictedIds = defineModel<string[]>('restrictedIds', { default: [] })
+
+const selectedModeTitle = computed(
+  () => SPECIFIC_OBJECT_OPTIONS.find((o) => o.name === mode.value)?.title ?? null
+)
+
+const dropdownOptions = computed(() => ({
+  type: 'fixed' as const,
+  suggestions: SPECIFIC_OBJECT_OPTIONS.map((o) => ({
+    name: o.name,
+    title: o.title
+  }))
+}))
+
+watch(
+  () => mode.value,
+  (newMode) => {
+    if (newMode === RestrictedToSingle.HOST) {
+      restrictedIds.value = ['host']
+    } else if (newMode === RestrictedToSingle.NO) {
+      restrictedIds.value = []
+    }
+  }
+)
+</script>
+
+<template>
+  <div>
+    <CmkHeading type="h2">{{ _t('Specific object type') }}</CmkHeading>
+    <ContentSpacer :dimension="5" />
+    <CmkLabel v-if="props.readOnly">{{ selectedModeTitle }}</CmkLabel>
+    <CmkDropdown
+      v-else
+      v-model="mode"
+      :options="dropdownOptions"
+      :label="_t('Select specific object type')"
+    />
+    <template v-if="mode === RestrictedToSingle.CUSTOM">
+      <ContentSpacer :dimension="5" />
+      <SelectorSingleInfo v-model:selected-ids="restrictedIds" :only-ids="props.contextInfos" />
+    </template>
+  </div>
+</template>

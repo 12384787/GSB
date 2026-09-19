@@ -1,0 +1,45 @@
+load("@rules_foreign_cc//foreign_cc:defs.bzl", "configure_make")
+
+filegroup(
+    name = "all_srcs",
+    srcs = glob(["**"]),
+)
+
+configure_make(
+    name = "xmlsec1",
+    args = ["-j6"],
+    configure_command = "configure",
+    configure_in_place = True,
+    configure_options = [
+        "--with-openssl=$$EXT_BUILD_DEPS/openssl",
+        "--disable-mans",
+        "--disable-docs",
+    ],
+    copts = [
+        "-std=c89",
+        "-Wno-newline-eof",
+        "-Wno-unknown-warning",
+        "-Wno-unused-command-line-argument",
+        "-Wno-strict-prototypes",
+    ],
+    env = {
+        "PKG_CONFIG_PATH": ":".join([
+            "/usr/lib/pkgconfig",
+            "/usr/lib64/pkgconfig",
+            "/usr/lib/x86_64-linux-gnu/pkgconfig",
+        ]),
+    },
+    lib_name = "xmlsec1",
+    lib_source = ":all_srcs",
+    linkopts = ["-Wl,--strip-all"],
+    out_binaries = ["xmlsec1"],
+    # Looks like Bazel doesn't know .la files, but we need them.
+    #  see https://stackoverflow.com/questions/75282435
+    # So instead of listing library files explicitly we just deliver the
+    # whole `lib` folder, containing shared and dynamic libraries as well as
+    # .la files
+    out_data_dirs = ["lib"],
+    targets = ["install"],
+    visibility = ["//visibility:public"],
+    deps = ["@openssl"],
+)

@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from collections.abc import Callable
+
+import pytest
+
+from cmk.agent_based.v2 import (
+    CheckResult,
+    DiscoveryResult,
+    Metric,
+    Result,
+    Service,
+    State,
+)
+from cmk.plugins.hpux.agent_based.hpux_tunables import (
+    check_hpux_tunables_maxfiles_lim,
+    check_hpux_tunables_nkthread,
+    check_hpux_tunables_nproc,
+    check_hpux_tunables_semmni,
+    check_hpux_tunables_semmns,
+    check_hpux_tunables_shmseg,
+    discover_hpux_tunables_maxfiles_lim,
+    discover_hpux_tunables_nkthread,
+    discover_hpux_tunables_nproc,
+    discover_hpux_tunables_semmni,
+    discover_hpux_tunables_semmns,
+    discover_hpux_tunables_shmseg,
+    parse_hpux_tunables,
+)
+
+# Test data from the dataset
+_INFO = [
+    ["Tunable:", "maxfiles_lim"],
+    ["Usage:", "152"],
+    ["Setting:", "63488"],
+    ["Percentage:", "0.2"],
+    ["Tunable:", "nkthread"],
+    ["Usage:", "1314"],
+    ["Setting:", "8416"],
+    ["Percentage:", "15.6"],
+    ["Tunable:", "nproc"],
+    ["Usage:", "462"],
+    ["Setting:", "4200"],
+    ["Percentage:", "11.0"],
+    ["Tunable:", "semmni"],
+    ["Usage:", "41"],
+    ["Setting:", "4200"],
+    ["Percentage:", "1.0"],
+    ["Tunable:", "semmns"],
+    ["Usage:", "1383"],
+    ["Setting:", "8400"],
+    ["Percentage:", "16.5"],
+    ["Tunable:", "shmseg"],
+    ["Usage:", "3"],
+    ["Setting:", "512"],
+    ["Percentage:", "0.6"],
+]
+
+
+@pytest.mark.parametrize(
+    "discovery_function, expected_discoveries",
+    [
+        (discover_hpux_tunables_maxfiles_lim, [Service()]),
+        (discover_hpux_tunables_nkthread, [Service()]),
+        (discover_hpux_tunables_nproc, [Service()]),
+        (discover_hpux_tunables_semmni, [Service()]),
+        (discover_hpux_tunables_semmns, [Service()]),
+        (discover_hpux_tunables_shmseg, [Service()]),
+    ],
+)
+def test_discover_hpux_tunables(
+    discovery_function: Callable[[object], DiscoveryResult], expected_discoveries: list[object]
+) -> None:
+    """Test discovery functions for hpux_tunables checks."""
+    parsed = parse_hpux_tunables(_INFO)
+    result = list(discovery_function(parsed))
+    assert result == expected_discoveries
+
+
+@pytest.mark.parametrize(
+    "check_function, params, expected_results",
+    [
+        (
+            check_hpux_tunables_maxfiles_lim,
+            {"levels": (85.0, 90.0)},
+            [
+                Result(state=State.OK, summary="0.24% used (152/63488 files)"),
+                Metric("files", 152, levels=(53964.8, 57139.2), boundaries=(0, 63488)),
+            ],
+        ),
+        (
+            check_hpux_tunables_nkthread,
+            {"levels": (80.0, 85.0)},
+            [
+                Result(state=State.OK, summary="15.61% used (1314/8416 threads)"),
+                Metric("threads", 1314, levels=(6732.8, 7153.6), boundaries=(0, 8416)),
+            ],
+        ),
+        (
+            check_hpux_tunables_nproc,
+            {"levels": (90.0, 96.0)},
+            [
+                Result(state=State.OK, summary="11.00% used (462/4200 processes)"),
+                Metric("processes", 462, levels=(3780.0, 4032.0), boundaries=(0, 4200)),
+            ],
+        ),
+        (
+            check_hpux_tunables_semmni,
+            {"levels": (85.0, 90.0)},
+            [
+                Result(state=State.OK, summary="0.98% used (41/4200 semaphore_ids)"),
+                Metric("semaphore_ids", 41, levels=(3570.0, 3780.0), boundaries=(0, 4200)),
+            ],
+        ),
+        (
+            check_hpux_tunables_semmns,
+            {"levels": (85.0, 90.0)},
+            [
+                Result(state=State.OK, summary="16.46% used (1383/8400 entries)"),
+                Metric("entries", 1383, levels=(7140.0, 7560.0), boundaries=(0, 8400)),
+            ],
+        ),
+        (
+            check_hpux_tunables_shmseg,
+            {"levels": (85.0, 90.0)},
+            [
+                Result(state=State.OK, summary="0.59% used (3/512 segments)"),
+                Metric("segments", 3, levels=(435.2, 460.8), boundaries=(0, 512)),
+            ],
+        ),
+    ],
+)
+def test_check_hpux_tunables(
+    check_function: Callable[[dict[str, object], object], CheckResult],
+    params: dict[str, object],
+    expected_results: list[object],
+) -> None:
+    """Test check functions for hpux_tunables checks."""
+    parsed = parse_hpux_tunables(_INFO)
+    result = list(check_function(params, parsed))
+    assert result == expected_results

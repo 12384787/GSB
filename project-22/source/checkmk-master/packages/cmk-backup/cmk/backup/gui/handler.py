@@ -1,0 +1,2590 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+"""
+This module implements generic functionality of the Checkmk backup
+system. It is used to configure the site and system backup.
+"""
+
+import abc
+import contextlib
+import errno
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import time
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from io import TextIOWrapper
+from pathlib import Path
+from typing import assert_never, cast, Final, override
+
+import cmk.ccc.version as cmk_version
+from cmk.backup.gui.formspec_adapter import FormspecAdapter
+from cmk.backup.utils.config import Config as RawConfig
+from cmk.backup.utils.job import JobConfig, JobState, ScheduleConfig
+from cmk.backup.utils.targets import TargetId
+from cmk.backup.utils.targets.aws_s3_bucket import S3Bucket, S3Params, S3Target
+from cmk.backup.utils.targets.azure_blob_storage import (
+    BlobStorage,
+    BlobStorageParams,
+    BlobStorageTarget,
+)
+from cmk.backup.utils.targets.config import TargetConfig
+from cmk.backup.utils.targets.local import LocalTarget, LocalTargetParams
+from cmk.backup.utils.targets.protocol import Target as TargetProtocol
+from cmk.backup.utils.targets.remote_interface import (
+    RemoteStorage,
+    RemoteTarget,
+    RemoteTargetParams,
+)
+from cmk.backup.utils.type_defs import SiteBackupInfo
+from cmk.backup.utils.utils import BACKUP_INFO_FILENAME
+from cmk.ccc.exceptions import MKGeneralException
+from cmk.ccc.plugin_registry import Registry
+from cmk.ccc.site import omd_site
+from cmk.ccc.version import Edition
+from cmk.crypto.hash import HashAlgorithm
+from cmk.crypto.password import Password as PasswordType
+from cmk.crypto.pem import PEMDecodingError
+from cmk.gui import forms, key_mgmt
+from cmk.gui.breadcrumb import Breadcrumb, make_simple_page_breadcrumb
+from cmk.gui.config import active_config, Config
+from cmk.gui.exceptions import FinalizeRequest, HTTPRedirect, MKUserError
+from cmk.gui.form_specs import (
+    DisplayMode,
+    IncomingData,
+    parse_data_from_field_id,
+    RawDiskData,
+    read_data_from_frontend,
+    render_form_spec,
+)
+from cmk.gui.form_specs.generators.alternative_utils import enable_deprecated_alternative
+from cmk.gui.form_specs.generators.dict_to_catalog import create_flat_catalog_from_dictionary
+from cmk.gui.form_specs.unstable import LegacyValueSpec
+from cmk.gui.form_specs.unstable.legacy_converter import (
+    TransformDataForLegacyFormatOrRecomposeFunction,
+    Tuple,
+)
+from cmk.gui.header import make_header
+from cmk.gui.htmllib.generator import HTMLWriter
+from cmk.gui.htmllib.html import html
+from cmk.gui.http import request
+from cmk.gui.i18n import _
+from cmk.gui.logged_in import user
+from cmk.gui.main_menu import main_menu_registry
+from cmk.gui.page_menu import (
+    make_simple_form_page_menu,
+    make_simple_link,
+    PageMenu,
+    PageMenuDropdown,
+    PageMenuEntry,
+    PageMenuTopic,
+)
+from cmk.gui.pages import PageContext
+from cmk.gui.table import table_element
+from cmk.gui.type_defs import ActionResult
+from cmk.gui.utils.csrf_token import check_csrf_token
+from cmk.gui.utils.output_funnel import output_funnel
+from cmk.gui.utils.transaction_manager import transactions
+from cmk.gui.utils.user_errors import user_errors
+from cmk.gui.valuespec import AbsoluteDirname, ID, SchedulePeriod
+from cmk.gui.watolib.mode import WatoMode
+from cmk.rulesets.internal.form_specs import (
+    ListExtended,
+    SimplePassword,
+    SingleChoiceElementExtended,
+    SingleChoiceExtended,
+)
+from cmk.rulesets.v1 import Help, Label, Message, Title
+from cmk.rulesets.v1.form_specs import (
+    BooleanChoice,
+    CascadingSingleChoice,
+    CascadingSingleChoiceElement,
+    DefaultValue,
+    DictElement,
+    Dictionary,
+    FieldSize,
+    FixedValue,
+    Integer,
+    InvalidElementMode,
+    InvalidElementValidator,
+    Password,
+    String,
+    validators,
+)
+from cmk.utils import keypair_store, render
+from cmk.utils.certs import CertManagementEvent
+from cmk.utils.keypair_store import Key, KeyId, KeypairMap
+from cmk.utils.paths import omd_root
+from cmk.utils.schedule import next_scheduled_time
+from cmk.web.utils.confirm_links import make_confirm_delete_link, make_confirm_link
+from cmk.web.utils.doc_references import DocReference
+from cmk.web.utils.flashed_messages import flash
+from cmk.web.utils.html import HTML
+from cmk.web.utils.icons import IconNames, StaticIcon
+from cmk.web.utils.urls import makeactionuri, makeactionuri_contextless, makeuri_contextless
+
+DictionaryElements = Sequence[DictElement]
+
+
+def register() -> None:
+    target_type_registry.register(BackupTargetLocal)
+    target_type_registry.register(BackupTargetAWSS3Bucket)
+    target_type_registry.register(BackupTargetAzureBlobStorage)
+
+
+# .
+#   .--Config--------------------------------------------------------------.
+#   |                     ____             __ _                            |
+#   |                    / ___|___  _ __  / _(_) __ _                      |
+#   |                   | |   / _ \| '_ \| |_| |/ _` |                     |
+#   |                   | |__| (_) | | | |  _| | (_| |                     |
+#   |                    \____\___/|_| |_|_| |_|\__, |                     |
+#   |                                           |___/                      |
+#   +----------------------------------------------------------------------+
+#   | Handling of the backup configuration files. This is used to handle   |
+#   | either the global system config for the appliance and the site       |
+#   | specific configuration of the site backup.                           |
+#   '----------------------------------------------------------------------'
+
+
+_OUTER_TEXT_FIELD_SIZE = 80
+
+
+def mkbackup_path() -> Path:
+    return omd_root / "bin/mkbackup"
+
+
+def hostname() -> str:
+    return socket.gethostname()
+
+
+class BackupConfig:
+    def __init__(self, config: RawConfig) -> None:
+        self._config = config
+        self._cronjob_path = omd_root / "etc/cron.d/mkbackup"
+
+    @classmethod
+    def load(cls) -> BackupConfig:
+        return cls(RawConfig.load())
+
+    @property
+    def jobs(self) -> dict[str, Job]:
+        return {
+            job_id: Job(
+                job_id,
+                job_config,
+            )
+            for job_id, job_config in self._config.site.jobs.items()
+        }
+
+    @property
+    def site_targets(self) -> dict[TargetId, Target]:
+        return {
+            target_id: Target(
+                target_id,
+                target_config,
+            )
+            for target_id, target_config in self._config.site.targets.items()
+        }
+
+    @property
+    def cma_system_targets(self) -> dict[TargetId, Target]:
+        return {
+            target_id: Target(
+                target_id,
+                target_config,
+            )
+            for target_id, target_config in self._config.cma_system.targets.items()
+        }
+
+    @property
+    def all_targets(self) -> dict[TargetId, Target]:
+        return {
+            target_id: Target(
+                target_id,
+                target_config,
+            )
+            for target_id, target_config in self._config.all_targets.items()
+        }
+
+    def add_target(self, target: Target) -> None:
+        self._config.site.targets[target.ident] = target.config
+        self._config.save()
+
+    def delete_target(self, target_id: TargetId) -> None:
+        del self._config.site.targets[target_id]
+        self._config.save()
+
+    def add_job(self, job: Job) -> None:
+        self._config.site.jobs[job.ident] = job.config
+        self._config.save()
+        self._save_cronjobs()
+
+    def delete_job(self, job_id: str) -> None:
+        del self._config.site.jobs[job_id]
+        self._config.save()
+        self._save_cronjobs()
+
+    def _save_cronjobs(self) -> None:
+        with Path(self._cronjob_path).open("w", encoding="utf-8") as f:
+            self._write_cronjob_header(f)
+            for job in self.jobs.values():
+                cron_config = job.cron_config()
+                if cron_config:
+                    f.write("%s\n" % "\n".join(cron_config))
+
+        self._apply_cron_config()
+
+    def _write_cronjob_header(self, f: TextIOWrapper) -> None:
+        f.write("# Written by mkbackup configuration\n")
+
+    def _apply_cron_config(self) -> None:
+        completed_process = subprocess.run(
+            ["omd", "restart", "crontab"],
+            close_fds=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+        if completed_process.returncode:
+            raise MKGeneralException(
+                _("Failed to apply the cronjob config: %(output)s")
+                % {"output": completed_process.stdout}
+            )
+
+
+# .
+#   .--Jobs----------------------------------------------------------------.
+#   |                            _       _                                 |
+#   |                           | | ___ | |__  ___                         |
+#   |                        _  | |/ _ \| '_ \/ __|                        |
+#   |                       | |_| | (_) | |_) \__ \                        |
+#   |                        \___/ \___/|_.__/|___/                        |
+#   |                                                                      |
+#   +----------------------------------------------------------------------+
+#   | Backup job handling. A backup job is the entity to describe a single |
+#   | backup process which has it's own state, can be executed manually    |
+#   | and also scheduled to be executed in a predefined interval.          |
+#   '----------------------------------------------------------------------'
+
+
+# Abstract class for backup jobs (Job) and restore job (RestoreJob)
+class MKBackupJob(abc.ABC):
+    @classmethod
+    def state_name(cls, state: str | None) -> str:
+        return {
+            "started": _("Started"),
+            "running": _("Currently running"),
+            "finished": _("Ended"),
+            None: _("Never executed"),
+        }[state]
+
+    @abc.abstractmethod
+    def state_file_path(self) -> Path: ...
+
+    def cleanup(self) -> None:
+        self.state_file_path().unlink(missing_ok=True)
+
+    def state(self) -> JobState:
+        try:
+            state = JobState.model_validate_json(self.state_file_path().read_text())
+        except FileNotFoundError:
+            state = JobState(
+                state=None,
+                started=None,
+                output="",
+            )
+        except Exception as e:
+            raise MKGeneralException(
+                _('Failed to parse state file "%(path)s": %(error)s')
+                % {"path": self.state_file_path(), "error": e}
+            )
+
+        # Fix data structure when the process has been killed
+        if state.state == "running" and not os.path.exists("/proc/%d" % state.pid):  # type: ignore[str-format]
+            assert state.started is not None
+            state.state = "finished"
+            state.finished = max(state.started, self.state_file_path().stat().st_mtime)
+            state.success = False
+
+        return state
+
+    def was_started(self) -> bool:
+        return self.state_file_path().exists()
+
+    def is_running(self) -> bool:
+        if not self.was_started():
+            return False
+
+        state = self.state()
+        return state.state in ["started", "running"] and os.path.exists("/proc/%d" % state.pid)  # type: ignore[str-format]
+
+    def start(self, **env_updates: str) -> None:
+        completed_process = subprocess.run(
+            self._start_command(),
+            close_fds=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            encoding="utf-8",
+            env={
+                # we always need os.environ, otherwise, mkbackup won't start in the site context
+                **os.environ,
+                **env_updates,
+            },
+            check=False,
+        )
+        if completed_process.returncode != 0:
+            raise MKGeneralException(
+                _("Failed to start the job: %(output)s") % {"output": completed_process.stdout}
+            )
+
+    @abc.abstractmethod
+    def _start_command(self) -> Sequence[str | Path]: ...
+
+    def stop(self) -> None:
+        state = self.state()
+        assert state.pid is not None
+        pgid = os.getpgid(state.pid)
+
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except OSError as e:
+            if e.errno == errno.ESRCH:
+                pass
+            else:
+                raise
+
+        wait = 5.0  # sec
+        while os.path.exists("/proc/%d" % state.pid) and wait > 0:
+            time.sleep(0.5)
+            wait -= 0.5
+
+        # When still running after 5 seconds, enforce
+        if wait == 0:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError as e:
+                if e.errno == errno.ESRCH:
+                    pass
+                else:
+                    raise
+
+
+class Job(MKBackupJob):
+    def __init__(self, ident: str, config: JobConfig) -> None:
+        self.ident: Final = ident
+        self.config: Final = config
+
+    @property
+    def title(self) -> str:
+        return self.config["title"]
+
+    def target_ident(self) -> TargetId:
+        return self.config["target"]
+
+    def key_ident(self) -> str | None:
+        return self.config["encrypt"]
+
+    def is_encrypted(self) -> bool:
+        return self.config["encrypt"] is not None
+
+    @override
+    def state_file_path(self) -> Path:
+        return omd_root / "var/check_mk/backup" / ("%s.state" % self.ident)
+
+    @override
+    def _start_command(self) -> Sequence[str | Path]:
+        return [mkbackup_path(), "backup", "--background", self.ident]
+
+    def schedule(self) -> ScheduleConfig | None:
+        return self.config["schedule"]
+
+    def cron_config(self) -> list[str]:
+        if not (schedule := self.config["schedule"]) or schedule["disabled"]:
+            return []
+        userspec = self._cron_userspec()
+        cmdline = self._cron_cmdline()
+        return [f"{timespec} {userspec}{cmdline}" for timespec in self._cron_timespecs(schedule)]
+
+    @staticmethod
+    def _cron_timespecs(schedule: ScheduleConfig) -> Sequence[str]:
+        period = schedule["period"]
+        times = schedule["timeofday"]
+
+        if period == "day":
+            dayspec = "* * *"
+
+        elif period[0] == "week":
+            # 0-6
+            dayspec = "* * %d" % (period[1] + 1,)
+
+        elif period[0] == "month_begin":
+            # 1-28
+            dayspec = "%d * *" % period[1]
+
+        else:
+            assert_never(period)
+
+        # times: list of two element tuples (hours, minutes)
+        timespecs = []
+        for hour, minute in times:
+            timespecs.append("%d %d %s" % (minute, hour, dayspec))
+
+        return timespecs
+
+    def _cron_userspec(self) -> str:
+        if os.environ.get("OMD_SITE"):
+            return ""
+        return "root "
+
+    def _cron_cmdline(self) -> str:
+        return "mkbackup backup %s >/dev/null" % self.ident
+
+
+class ModeBackup(WatoMode[object]):
+    @override
+    def title(self) -> str:
+        return _("Site backup")
+
+    def __init__(
+        self, edition: Edition, ctx: PageContext, key_store: keypair_store.KeypairStore
+    ) -> None:
+        super().__init__(edition, ctx)
+        self.key_store = key_store
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        menu = PageMenu(
+            dropdowns=[
+                PageMenuDropdown(
+                    name="backups",
+                    title=_("Backups"),
+                    topics=[
+                        PageMenuTopic(
+                            title=_("Setup"),
+                            entries=list(self._page_menu_entries_setup()),
+                        ),
+                        PageMenuTopic(
+                            title=_("Restore from backup"),
+                            entries=[
+                                PageMenuEntry(
+                                    title=_("Restore"),
+                                    icon_name=StaticIcon(
+                                        IconNames.backup,
+                                        emblem="refresh",
+                                    ),
+                                    item=make_simple_link(
+                                        makeuri_contextless(request, [("mode", "backup_restore")])
+                                    ),
+                                    is_shortcut=True,
+                                    is_suggested=True,
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+            breadcrumb=breadcrumb,
+        )
+        menu.add_doc_reference(_("Backups"), DocReference.BACKUPS)
+        return menu
+
+    def _page_menu_entries_setup(self) -> Iterator[PageMenuEntry]:
+        yield PageMenuEntry(
+            title=_("Backup targets"),
+            icon_name=StaticIcon(IconNames.backup_targets),
+            item=make_simple_link(makeuri_contextless(request, [("mode", "backup_targets")])),
+            is_shortcut=True,
+            is_suggested=True,
+        )
+        yield PageMenuEntry(
+            title=_("Backup encryption keys"),
+            icon_name=StaticIcon(IconNames.signature_key),
+            item=make_simple_link(makeuri_contextless(request, [("mode", "backup_keys")])),
+            is_shortcut=True,
+            is_suggested=True,
+        )
+        yield PageMenuEntry(
+            title=_("Add job"),
+            icon_name=StaticIcon(IconNames.new),
+            item=make_simple_link(makeuri_contextless(request, [("mode", "edit_backup_job")])),
+            is_shortcut=True,
+            is_suggested=True,
+        )
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        if (ident := request.var("_job")) is None:
+            raise MKUserError("_job", _("Missing job ID."))
+
+        try:
+            job = BackupConfig.load().jobs[ident]
+        except KeyError:
+            raise MKUserError("_job", _("This backup job does not exist."))
+
+        action = request.var("_action")
+
+        if not transactions.check_transaction(request):
+            return HTTPRedirect(makeuri_contextless(request, [("mode", "backup")]))
+
+        if action == "delete":
+            self._delete_job(job)
+
+        elif action == "start":
+            self._start_job(job)
+
+        elif action == "stop":
+            self._stop_job(job)
+
+        elif action == "refresh" and not job.is_running():
+            flash("Backup completed")
+
+        return HTTPRedirect(makeuri_contextless(request, [("mode", "backup")]))
+
+    def _delete_job(self, job: Job) -> None:
+        if job.is_running():
+            raise MKUserError("_job", _("This job is currently running."))
+
+        job.cleanup()
+
+        with contextlib.suppress(KeyError):
+            BackupConfig.load().delete_job(job.ident)
+
+        flash(_("The job has been deleted."))
+
+    def _start_job(self, job: Job) -> None:
+        job.start()
+
+    def _stop_job(self, job: Job) -> None:
+        job.stop()
+        flash(_("The backup has been stopped."))
+
+    @override
+    def page(self, config: Config) -> None:
+        show_key_download_warning(self.key_store.load())
+        backup_jobs = sorted(BackupConfig.load().jobs.values(), key=lambda j: j.ident)
+
+        # relying on restriction that only one backup job can run at a time
+        running_job = next((job for job in backup_jobs if job.is_running()), None)
+        if running_job is not None:
+            html.vue_component(
+                "cmk-dialog",
+                data={
+                    "title": _("Backup in progress. Refresh to see the final status."),
+                    "message": _(
+                        "You can leave this page. This backup continues in the background."
+                    ),
+                    "main_button": {
+                        "title": _("Refresh status"),
+                        "action": {
+                            "type": "redirect",
+                            "url": makeactionuri_contextless(
+                                request,
+                                transactions.get(),
+                                [
+                                    ("mode", "backup"),
+                                    ("_action", "refresh"),
+                                    ("_job", running_job.ident),
+                                ],
+                            ),
+                        },
+                    },
+                },
+            )
+        self._show_job_list(backup_jobs, table_row_limit=config.table_row_limit)
+
+    def _show_job_list(self, backup_jobs: Sequence[Job], *, table_row_limit: int) -> None:
+        html.h3(_("Jobs"))
+
+        with table_element(sortable=False, searchable=False, limit=table_row_limit) as table:
+            for nr, job in enumerate(backup_jobs):
+                table.row()
+                table.cell("#", css=["narrow nowrap"])
+                html.write_text_permissive(nr)
+                table.cell(_("Actions"), css=["buttons"])
+                state = job.state()
+                job_state = state.state
+                delete_url = make_confirm_delete_link(
+                    i18n=_,
+                    url=makeactionuri_contextless(
+                        request,
+                        transactions.get(),
+                        [
+                            ("mode", "backup"),
+                            ("_action", "delete"),
+                            ("_job", job.ident),
+                        ],
+                    ),
+                    title=_("Delete job #%(nr)d") % {"nr": nr},
+                    suffix=job.title,
+                    message=_("ID: %(ident)s") % {"ident": job.ident},
+                )
+                edit_url = makeuri_contextless(
+                    request,
+                    [("mode", "edit_backup_job"), ("job", job.ident)],
+                )
+                state_url = makeuri_contextless(
+                    request,
+                    [("mode", "backup_job_state"), ("job", job.ident)],
+                )
+
+                if not job.is_running():
+                    html.icon_button(
+                        edit_url, _("Edit this backup job"), StaticIcon(IconNames.edit)
+                    )
+                    html.icon_button(
+                        delete_url, _("Delete this backup job"), StaticIcon(IconNames.delete)
+                    )
+
+                if job_state is not None:
+                    html.icon_button(
+                        state_url,
+                        _("Show current / last state of this backup job"),
+                        StaticIcon(IconNames.backup_state),
+                    )
+
+                if not job.is_running():
+                    start_url = makeactionuri_contextless(
+                        request,
+                        transactions.get(),
+                        [
+                            ("mode", "backup"),
+                            ("_action", "start"),
+                            ("_job", job.ident),
+                        ],
+                    )
+
+                    html.icon_button(
+                        start_url,
+                        _("Manually start this backup"),
+                        StaticIcon(IconNames.backup_start),
+                    )
+                else:
+                    stop_url = makeactionuri_contextless(
+                        request,
+                        transactions.get(),
+                        [
+                            ("mode", "backup"),
+                            ("_action", "stop"),
+                            ("_job", job.ident),
+                        ],
+                    )
+
+                    html.icon_button(
+                        stop_url, _("Stop this backup job"), StaticIcon(IconNames.backup_stop)
+                    )
+
+                table.cell(_("ID"), job.ident)
+                table.cell(_("Name"), job.title)
+
+                css = "state0"
+                state_txt = job.state_name(job_state)
+                if job_state == "finished":
+                    if not state.success:
+                        css = "state2"
+                        state_txt = _("Failed")
+                    else:
+                        state_txt = _("Finished")
+                elif job_state is None:
+                    css = ""
+
+                table.cell(_("State"), css=[css])
+                html.write_html(HTMLWriter.render_span(state_txt))
+
+                table.cell(_("Runtime"))
+                if state.started:
+                    html.write_text_permissive(
+                        _("Started at %(started)s")
+                        % {"started": render.date_and_time(state.started)}
+                    )
+                    duration = time.time() - state.started
+                    if job_state == "finished":
+                        assert state.finished is not None
+                        html.write_text_permissive(
+                            ", Finished at %s" % render.date_and_time(state.finished)
+                        )
+                        duration = state.finished - state.started
+
+                    if state.size is not None:
+                        size_txt = " Size: %s," % render.fmt_bytes(state.size)
+                    else:
+                        size_txt = ""
+
+                    assert state.bytes_per_second is not None
+                    html.write_text_permissive(
+                        _(" (duration: %(duration)s, %(size)s I/O: %(io_speed)s/s)")
+                        % {
+                            "duration": render.timespan(duration),
+                            "size": size_txt,
+                            "io_speed": render.fmt_bytes(state.bytes_per_second),
+                        }
+                    )
+
+                table.cell(_("Next run"))
+                schedule = job.schedule()
+                if not schedule:
+                    html.write_text_permissive(_("Only execute manually"))
+
+                elif schedule["disabled"]:
+                    html.write_text_permissive(_("Disabled"))
+
+                elif schedule["timeofday"]:
+                    # find the next time of all configured times
+                    times = []
+                    for timespec in schedule["timeofday"]:
+                        times.append(next_scheduled_time(schedule["period"], timespec))
+
+                    html.write_text_permissive(
+                        time.strftime("%Y-%m-%d %H:%M", time.localtime(min(times)))
+                    )
+
+
+class ModeEditBackupJob(WatoMode[object]):
+    def __init__(
+        self, edition: Edition, ctx: PageContext, key_store: keypair_store.KeypairStore
+    ) -> None:
+        super().__init__(edition, ctx)
+        self.key_store = key_store
+        job_ident = request.get_str_input("job")
+        self._received_data_from_frontend = False
+
+        if job_ident is not None:
+            try:
+                job = BackupConfig.load().jobs[job_ident]
+            except KeyError:
+                raise MKUserError("target", _("This backup job does not exist."))
+
+            if job.is_running():
+                raise MKUserError("_job", _("This job is currently running."))
+
+            self._new = False
+            self._ident: str | None = job_ident
+            self._job_cfg: JobConfig | dict[str, object] = job.config
+            self._title = _("Edit backup job: %(title)s") % {"title": job.title}
+        else:
+            self._new = True
+            self._ident = None
+            self._job_cfg = {}
+            self._title = _("Add backup job")
+
+    @override
+    def title(self) -> str:
+        return self._title
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        return make_simple_form_page_menu(
+            _("Job"), breadcrumb, form_name="edit_job", button_name="_save"
+        )
+
+    def fs_backup_schedule(self) -> TransformDataForLegacyFormatOrRecomposeFunction:
+        return enable_deprecated_alternative(
+            wrapped_form_spec=CascadingSingleChoice(
+                title=Title("Schedule"),
+                elements=[
+                    CascadingSingleChoiceElement(
+                        name="alternative_0",
+                        title=Title("Execute manually"),
+                        parameter_form=FixedValue(
+                            value=None,
+                            title=Title("Execute manually"),
+                            label=Label("Only execute manually"),
+                        ),
+                    ),
+                    CascadingSingleChoiceElement(
+                        name="alternative_1",
+                        title=Title("Schedule execution"),
+                        parameter_form=Dictionary(
+                            title=Title("Schedule execution"),
+                            elements={
+                                "disabled": DictElement(
+                                    required=True,
+                                    parameter_form=BooleanChoice(
+                                        title=Title("Disable"),
+                                        label=Label(
+                                            "Currently disable scheduled execution of this job"
+                                        ),
+                                    ),
+                                ),
+                                "period": DictElement(
+                                    required=True,
+                                    parameter_form=LegacyValueSpec.wrap(
+                                        SchedulePeriod(from_end=False)
+                                    ),
+                                ),
+                                "timeofday": DictElement(
+                                    required=True,
+                                    parameter_form=ListExtended(
+                                        element_template=Tuple(
+                                            layout="horizontal",
+                                            elements=[
+                                                Integer(
+                                                    title=Title("Hour"),
+                                                ),
+                                                Integer(
+                                                    title=Title("Minute"),
+                                                ),
+                                            ],
+                                        ),
+                                        title=Title("Time of day to start the backup at"),
+                                        editable_order=False,
+                                        prefill=DefaultValue([(0, 0)]),
+                                        add_element_label=Label("Add new time"),
+                                        custom_validate=[
+                                            validators.LengthInRange(
+                                                min_value=1,
+                                                error_msg=Message(
+                                                    "Please specify at least one time."
+                                                ),
+                                            )
+                                        ],
+                                    ),
+                                ),
+                            },
+                        ),
+                    ),
+                ],
+            )
+        )
+
+    def _fs_backup_job(self, backup_config: BackupConfig) -> Dictionary:
+        if self._new:
+            ident_attr = {
+                "ident": DictElement(
+                    required=True,
+                    parameter_form=LegacyValueSpec.wrap(
+                        ID(
+                            title=_("Unique ID"),
+                            help=_(
+                                "The ID of the job must be a unique text. It will be used as an internal key "
+                                "when objects refer to the job."
+                            ),
+                            allow_empty=False,
+                            size=_OUTER_TEXT_FIELD_SIZE,
+                            validate=lambda ident, varprefix: self._validate_backup_job_ident(
+                                backup_config,
+                                ident,
+                                varprefix,
+                            ),
+                        )
+                    ),
+                )
+            }
+        else:
+            ident_attr = {
+                "ident": DictElement(
+                    required=True,
+                    parameter_form=FixedValue(value=self._ident, title=Title("Unique ID")),
+                )
+            }
+
+        def target_validation(target_id: str) -> None:
+            self._validate_target(backup_config, cast(TargetId, target_id))
+
+        return Dictionary(
+            title=Title("Backup job"),
+            elements={
+                **ident_attr,
+                "title": DictElement(
+                    required=True,
+                    parameter_form=String(
+                        title=Title("Title"),
+                        custom_validate=[
+                            validators.LengthInRange(
+                                min_value=1, error_msg=Message("Text field cannot be empty")
+                            )
+                        ],
+                        field_size=FieldSize.LARGE,
+                    ),
+                ),
+                "target": DictElement(
+                    required=True,
+                    parameter_form=SingleChoiceExtended(
+                        title=Title("Target"),
+                        elements=self.backup_target_choices(backup_config),
+                        custom_validate=[target_validation],
+                        invalid_element_validation=InvalidElementValidator(
+                            mode=InvalidElementMode.COMPLAIN
+                        ),
+                    ),
+                ),
+                "schedule": DictElement(required=True, parameter_form=self.fs_backup_schedule()),
+                "compress": DictElement(
+                    required=True,
+                    parameter_form=BooleanChoice(
+                        title=Title("Compression"),
+                        help_text=Help(
+                            "Enable GZIP compression of the backed-up files. The tar archives "
+                            "created by the backup are gzipped during backup."
+                        ),
+                        label=Label("Compress the backed up files"),
+                    ),
+                ),
+                "encrypt": DictElement(
+                    required=True,
+                    parameter_form=enable_deprecated_alternative(
+                        CascadingSingleChoice(
+                            title=Title("Encryption"),
+                            help_text=Help(
+                                "Enable encryption of the backed up files. The tar archives "
+                                "created by the backup are encrypted using the specified key "
+                                "during backup. You will need the private key and the "
+                                "passphrase to decrypt the backup."
+                            ),
+                            elements=[
+                                CascadingSingleChoiceElement(
+                                    name="alternative_0",
+                                    title=Title("Do not encrypt the backup"),
+                                    parameter_form=FixedValue(
+                                        value=None,
+                                        title=Title("Do not encrypt the backup"),
+                                        label=Label(""),
+                                    ),
+                                ),
+                                CascadingSingleChoiceElement(
+                                    name="alternative_1",
+                                    title=Title("Encrypt the backup using the key:"),
+                                    parameter_form=SingleChoiceExtended(
+                                        title=Title("Encrypt the backup using the key:"),
+                                        invalid_element_validation=InvalidElementValidator(
+                                            mode=InvalidElementMode.COMPLAIN
+                                        ),
+                                        elements=self.backup_key_choices(),
+                                    ),
+                                ),
+                            ],
+                        )
+                    ),
+                ),
+                "no_history": DictElement(
+                    required=True,
+                    parameter_form=BooleanChoice(
+                        title=Title("Do not backup historical data"),
+                        help_text=Help(
+                            "You may use this option to create a much smaller partial backup of the site."
+                        ),
+                        label=Label(
+                            "Do not backup metric data (RRD files), the monitoring history and log files"
+                        ),
+                    ),
+                ),
+            },
+        )
+
+    def _validate_target(
+        self,
+        backup_config: BackupConfig,
+        target_id: TargetId | None,
+    ) -> None:
+        if not target_id:
+            raise MKUserError("", _("You need to provide an ID"))
+        backup_config.all_targets[target_id].validate()
+
+    def _validate_backup_job_ident(
+        self, backup_config: BackupConfig, value: str, varprefix: str
+    ) -> None:
+        if value == "restore":
+            raise MKUserError(varprefix, _("You need to choose another ID."))
+
+        if value in backup_config.jobs:
+            raise MKUserError(varprefix, _("This ID is already used by another backup job."))
+
+    def backup_key_choices(self) -> Sequence[SingleChoiceElementExtended]:
+        return [
+            SingleChoiceElementExtended(
+                name=ident,
+                title=Title(title),  # astrein: disable=localization-checker
+            )
+            for ident, title in self.key_store.choices()
+        ]
+
+    @classmethod
+    def backup_target_choices(
+        cls, backup_config: BackupConfig
+    ) -> Sequence[SingleChoiceElementExtended[str]]:
+        return [
+            SingleChoiceElementExtended(
+                name=target.ident,
+                title=Title(target.title),  # astrein: disable=localization-checker
+            )
+            for target in sorted(
+                backup_config.all_targets.values(),
+                key=lambda t: t.ident,
+            )
+        ]
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        check_csrf_token()
+
+        if not transactions.check_transaction(request):
+            return HTTPRedirect(makeuri_contextless(request, [("mode", "backup")]))
+
+        backup_config = BackupConfig.load()
+        flat_catalog = create_flat_catalog_from_dictionary(self._fs_backup_job(backup_config))
+        try:
+            job_config = cast(dict, parse_data_from_field_id(flat_catalog, "edit_job"))
+        except MKUserError as e:
+            self._received_data_from_frontend = True
+            raise e
+
+        if "ident" in job_config:
+            self._ident = job_config.pop("ident")
+        self._job_cfg = cast(JobConfig, job_config)
+        if self._ident is None:
+            raise MKGeneralException("Cannot create or modify job without identifier")
+
+        backup_config.add_job(
+            Job(
+                self._ident,
+                self._job_cfg,
+            )
+        )
+
+        return HTTPRedirect(makeuri_contextless(request, [("mode", "backup")]))
+
+    @override
+    def page(self, config: Config) -> None:
+        backup_config = BackupConfig.load()
+        flat_catalog = create_flat_catalog_from_dictionary(self._fs_backup_job(backup_config))
+        value_for_frontend = (
+            read_data_from_frontend("edit_job")
+            if self._received_data_from_frontend
+            else RawDiskData(self._job_cfg)
+        )
+
+        with html.form_context("edit_job", method="POST"):
+            html.prevent_password_auto_completion()
+            render_form_spec(
+                flat_catalog,
+                "edit_job",
+                value_for_frontend,
+                do_validate=self._received_data_from_frontend,
+            )
+            html.hidden_fields()
+
+
+def job_page(job: MKBackupJob, ident: str) -> None:
+    html.open_div(id_="job_details")
+    show_job_details(job)
+    html.close_div()
+    update_url = f"ajax_backup_job_state.py?job={ident}"
+    html.javascript(
+        "cmk.backup.refresh_job_details('{}', '{}', {})".format(update_url, ident, "true")
+    )
+
+
+def show_job_details(job: MKBackupJob) -> None:
+    state = job.state()
+
+    html.open_table(class_=["data", "backup_job"])
+
+    if state.state is None:
+        css = []
+        state_txt = job.state_name(state.state)
+    elif state.state != "finished":
+        css = ["state0"]
+        state_txt = job.state_name(state.state)
+    elif state.success:
+        css = ["state0"]
+        state_txt = _("Finished")
+    else:
+        css = ["state2"]
+        state_txt = _("Failed")
+
+    html.open_tr(class_=["data", "even0"])
+    html.td(_("State"), class_=["left", "legend"])
+    html.td(state_txt, class_=["state"] + css)
+    html.close_tr()
+
+    html.open_tr(class_=["data", "odd0"])
+    html.td(_("Runtime"), class_="left")
+    html.open_td()
+    if state.started:
+        html.write_text_permissive(
+            _("Started at %(started)s") % {"started": render.date_and_time(state.started)}
+        )
+        duration = time.time() - state.started
+        if state.state == "finished":
+            assert state.finished is not None
+            html.write_text_permissive(", Finished at %s" % render.date_and_time(state.started))
+            duration = state.finished - state.started
+
+        html.write_text_permissive(
+            _(" (duration: %(duration)s)") % {"duration": render.timespan(duration)}
+        )
+    html.close_td()
+    html.close_tr()
+
+    html.open_tr(class_=["data", "even0"])
+    html.td(_("Output"), class_=["left", "legend"])
+    html.open_td()
+    html.open_div(class_="log_output", style="height: 400px;", id_="progress_log")
+    html.pre(state.output)
+    html.close_div()
+    html.close_td()
+    html.close_tr()
+
+    html.close_table()
+
+
+class ModeBackupJobState(WatoMode[object]):
+    @override
+    def _from_vars(self) -> None:
+        if (job_ident := request.var("job")) is None:
+            raise MKUserError("job", _("You need to specify a backup job."))
+        try:
+            tmp = BackupConfig.load().jobs[job_ident]
+        except KeyError:
+            raise MKUserError("job", _("This backup job does not exist."))
+        self._job = tmp
+        self._ident = job_ident
+
+    @property
+    def job(self) -> MKBackupJob:
+        return self._job
+
+    @override
+    def title(self) -> str:
+        return _("Job state: %(title)s") % {"title": self._job.title}
+
+    @override
+    def page(self, config: Config) -> None:
+        job_page(self.job, self._ident)
+
+
+# .
+#   .--Target Types--------------------------------------------------------.
+#   |      _____                    _     _____                            |
+#   |     |_   _|_ _ _ __ __ _  ___| |_  |_   _|   _ _ __   ___  ___       |
+#   |       | |/ _` | '__/ _` |/ _ \ __|   | || | | | '_ \ / _ \/ __|      |
+#   |       | | (_| | | | (_| |  __/ |_    | || |_| | |_) |  __/\__ \      |
+#   |       |_|\__,_|_|  \__, |\___|\__|   |_| \__, | .__/ \___||___/      |
+#   |                    |___/                 |___/|_|                    |
+#   +----------------------------------------------------------------------+
+#   | A target type implements the handling of different protocols to use  |
+#   | for storing the backup.                                              |
+#   '----------------------------------------------------------------------'
+
+
+@dataclass(frozen=True)
+class _Backups:
+    backups: Mapping[str, SiteBackupInfo]
+    timed_out: bool
+
+    def get(self, ident: str) -> SiteBackupInfo:
+        try:
+            return self.backups[ident]
+        except KeyError as ex:
+            if self.timed_out:
+                raise MKGeneralException(
+                    "Unable to find backup. This may be because "
+                    "the listing of remote backups timed out. "
+                    "There may be too many files present at the "
+                    "remote target."
+                )
+            raise ex
+
+
+class ABCBackupTargetType(abc.ABC):
+    @abc.abstractmethod
+    def __init__(self, params: Mapping[str, object]) -> None: ...
+
+    @property
+    @abc.abstractmethod
+    def parameters(self) -> Mapping[str, object]: ...
+
+    @property
+    @abc.abstractmethod
+    def target(self) -> TargetProtocol: ...
+
+    @staticmethod
+    @abc.abstractmethod
+    def ident() -> str: ...
+
+    @staticmethod
+    @abc.abstractmethod
+    def title() -> str: ...
+
+    @classmethod
+    def form_spec(cls) -> Dictionary:
+        return Dictionary(
+            elements=cls.dictionary_elements(),
+            # TODO: migrate
+            # validate=lambda params, varprefix: cls(params).validate(varprefix),
+        )
+
+    @classmethod
+    @abc.abstractmethod
+    def dictionary_elements(cls) -> Mapping[str, DictElement]: ...
+
+    @abc.abstractmethod
+    def validate(self) -> None: ...
+
+    def backups(self) -> _Backups:
+        _check_if_target_ready(self.target)
+        backups: dict[str, SiteBackupInfo] = {}
+        time0 = time.time()
+        for ident, info in self.target.list_backups():
+            backups[ident] = info
+            if time.time() - time0 > request.request_timeout - 20:
+                return _Backups(backups, timed_out=True)
+        return _Backups(backups, timed_out=False)
+
+    @abc.abstractmethod
+    def remove_backup(self, backup_ident: str) -> None: ...
+
+    def render(self) -> HTML:
+        with output_funnel.plugged():
+            render_form_spec(
+                self.form_spec(),
+                "target_parameters",
+                RawDiskData(dict(self.parameters)),
+                display_mode=DisplayMode.READONLY,
+                do_validate=False,
+            )
+            return HTML(output_funnel.drain(), escape=False)
+
+
+class TargetTypeRegistry(Registry[type[ABCBackupTargetType]]):
+    @override
+    def plugin_name(self, instance: type[ABCBackupTargetType]) -> str:
+        return instance.ident()
+
+
+target_type_registry = TargetTypeRegistry()
+
+
+class BackupTargetLocal(ABCBackupTargetType):
+    def __init__(self, params: LocalTargetParams) -> None:
+        self._params = params
+        self._local_target = LocalTarget(TargetId(""), params)
+
+    @property
+    @override
+    def parameters(self) -> LocalTargetParams:
+        return self._params
+
+    @property
+    @override
+    def target(self) -> LocalTarget:
+        return self._local_target
+
+    @staticmethod
+    @override
+    def ident() -> str:
+        return "local"
+
+    @staticmethod
+    @override
+    def title() -> str:
+        return _("Local path")
+
+    @classmethod
+    @override
+    def dictionary_elements(cls) -> Mapping[str, DictElement]:
+        return _local_directory_configuration_elements(77)
+
+    @override
+    def validate(self) -> None:
+        _validate_local_target(
+            self.target,
+        )
+
+    @override
+    def remove_backup(self, backup_ident: str) -> None:
+        _check_if_target_ready(self.target)
+        shutil.rmtree("{}/{}".format(self.parameters["path"], backup_ident))
+
+
+class ABCBackupTargetRemote[TRemoteParams: Mapping[str, object], TRemoteStorage: RemoteStorage](
+    ABCBackupTargetType
+):
+    # align text fields with one valuespec nesting level with _OUTER_TEXT_FIELD_SIZE on the right
+    _INNER_TEXT_FIELD_SIZE = 74
+    # align password fields with one valuespec nesting level with _OUTER_TEXT_FIELD_SIZE on the
+    # right
+    _INNER_PASSWORD_FIELD_SIZE = 61
+
+    def __init__(self, params: RemoteTargetParams) -> None:
+        self._params = params
+        self._target = self._instantiate_target(params)
+
+    @property
+    @override
+    def parameters(self) -> RemoteTargetParams:
+        return self._params
+
+    @property
+    @override
+    def target(self) -> RemoteTarget[TRemoteParams, TRemoteStorage]:
+        return self._target
+
+    @classmethod
+    @override
+    def dictionary_elements(cls) -> Mapping[str, DictElement]:
+        return {
+            "remote": DictElement(
+                required=True,
+                parameter_form=Dictionary(
+                    title=Title("Remote configuration"),
+                    elements=dict(cls._remote_dictionary_elements().items()),
+                ),
+            ),
+            "temp_folder": DictElement(
+                required=True,
+                parameter_form=Dictionary(
+                    elements=_local_directory_configuration_elements(cls._INNER_TEXT_FIELD_SIZE),
+                    title=Title("Temporary local destination"),
+                    help_text=Help(
+                        "This directory will be used for temporarily storing backups before "
+                        "uploading and after downloading. You can for example use the <tt>/tmp</tt> "
+                        "directory. Please note that Checkmk will not clean up this directory."
+                    ),
+                ),
+            ),
+        }
+
+    @override
+    def remove_backup(self, backup_ident: str) -> None:
+        backup_info = self.backups().get(backup_ident)
+        for remote_key in (
+            Path(backup_ident) / BACKUP_INFO_FILENAME,
+            Path(backup_ident) / backup_info.filename,
+        ):
+            try:
+                self.target.remote_storage.remove(remote_key)
+            except Exception as e:
+                raise MKGeneralException(
+                    f"Removal of {remote_key} in remote storage failed. Original error: {e}"
+                )
+
+    @override
+    def validate(self) -> None:
+        _validate_remote_target(self.target)
+
+    @staticmethod
+    @abc.abstractmethod
+    def _instantiate_target(
+        params: RemoteTargetParams,
+    ) -> RemoteTarget[TRemoteParams, TRemoteStorage]: ...
+
+    @classmethod
+    @abc.abstractmethod
+    def _remote_dictionary_elements(cls) -> Mapping[str, DictElement]: ...
+
+
+class BackupTargetAWSS3Bucket(ABCBackupTargetRemote[S3Params, S3Bucket]):
+    @staticmethod
+    @override
+    def ident() -> str:
+        return "aws_s3_bucket"
+
+    @classmethod
+    @override
+    def title(cls) -> str:
+        return _("AWS S3 bucket")
+
+    @staticmethod
+    @override
+    def _instantiate_target(params: RemoteTargetParams[S3Params]) -> S3Target:
+        return S3Target(TargetId(""), params)
+
+    @classmethod
+    @override
+    def _remote_dictionary_elements(cls) -> Mapping[str, DictElement]:
+        return {
+            "access_key": DictElement(
+                required=True,
+                parameter_form=String(
+                    title=Title("Access key"),
+                    help_text=Help("The access key for your AWS account"),
+                    custom_validate=[
+                        validators.LengthInRange(
+                            min_value=1, error_msg=Message("Text field cannot be empty")
+                        )
+                    ],
+                ),
+            ),
+            "secret": DictElement(
+                required=True,
+                parameter_form=Password(
+                    title=Title("Secret key"),
+                    help_text=Help("The secret key for your AWS account"),
+                    custom_validate=[
+                        validators.LengthInRange(
+                            min_value=1, error_msg=Message("Text field cannot be empty")
+                        )
+                    ],
+                ),
+            ),
+            "bucket": DictElement(
+                required=True,
+                parameter_form=String(
+                    title=Title("Bucket name"),
+                    custom_validate=[
+                        validators.LengthInRange(
+                            min_value=1, error_msg=Message("Password field can not be empty")
+                        )
+                    ],
+                ),
+            ),
+            "endpoint_url": DictElement(
+                required=False,
+                parameter_form=String(
+                    title=Title("Endpoint URL (optional)"),
+                    help_text=Help(
+                        "Custom endpoint URL for S3-compatible storage services (e.g., Backblaze B2). "
+                        "Leave empty to use the default AWS S3 endpoint."
+                    ),
+                    custom_validate=[
+                        validators.Url(
+                            protocols=[validators.UrlProtocol.HTTP, validators.UrlProtocol.HTTPS]
+                        ),
+                    ],
+                ),
+            ),
+        }
+
+
+class BackupTargetAzureBlobStorage(ABCBackupTargetRemote[BlobStorageParams, BlobStorage]):
+    @staticmethod
+    @override
+    def ident() -> str:
+        return "azure_blob_storage"
+
+    @classmethod
+    @override
+    def title(cls) -> str:
+        return _("Azure Blob Storage")
+
+    @staticmethod
+    @override
+    def _instantiate_target(
+        params: RemoteTargetParams[BlobStorageParams],
+    ) -> BlobStorageTarget:
+        return BlobStorageTarget(TargetId(""), params)
+
+    @classmethod
+    @override
+    def _remote_dictionary_elements(cls) -> Mapping[str, DictElement]:
+        return {
+            "storage_account_name": DictElement(
+                required=True,
+                parameter_form=String(
+                    title=Title("Storage account name"),
+                    custom_validate=[
+                        validators.LengthInRange(
+                            min_value=1, error_msg=Message("Text field cannot be empty")
+                        )
+                    ],
+                ),
+            ),
+            "container": DictElement(
+                required=True,
+                parameter_form=String(
+                    title=Title("Container name"),
+                    custom_validate=[
+                        validators.LengthInRange(
+                            min_value=1, error_msg=Message("Text field cannot be empty")
+                        )
+                    ],
+                ),
+            ),
+            "credentials": DictElement(
+                required=True,
+                parameter_form=CascadingSingleChoice(
+                    title=Title("Credentials"),
+                    elements=[
+                        CascadingSingleChoiceElement(
+                            name="shared_key",
+                            title=Title("Storage account shared key"),
+                            parameter_form=Password(
+                                title=Title("Shared key"),
+                                custom_validate=[
+                                    validators.LengthInRange(
+                                        min_value=1,
+                                        error_msg=Message("Text field cannot be empty"),
+                                    )
+                                ],
+                            ),
+                        ),
+                        CascadingSingleChoiceElement(
+                            name="active_directory",
+                            # weblate-flags: read-only, vendor-name
+                            title=Title("Active Directory credentials"),
+                            parameter_form=Dictionary(
+                                elements={
+                                    "client_id": DictElement(
+                                        required=True,
+                                        parameter_form=String(
+                                            title=Title("Application (client) ID"),
+                                            custom_validate=[
+                                                validators.LengthInRange(
+                                                    min_value=1,
+                                                    error_msg=Message("Text field cannot be empty"),
+                                                )
+                                            ],
+                                        ),
+                                    ),
+                                    "tenant_id": DictElement(
+                                        required=True,
+                                        parameter_form=String(
+                                            title=Title("Directory (tenant) ID"),
+                                            custom_validate=[
+                                                validators.LengthInRange(
+                                                    min_value=1,
+                                                    error_msg=Message("Text field cannot be empty"),
+                                                )
+                                            ],
+                                        ),
+                                    ),
+                                    "client_secret": DictElement(
+                                        required=True,
+                                        parameter_form=Password(
+                                            title=Title("Client secret"),
+                                            custom_validate=[
+                                                validators.LengthInRange(
+                                                    min_value=1,
+                                                    error_msg=Message("Text field cannot be empty"),
+                                                )
+                                            ],
+                                        ),
+                                    ),
+                                }
+                            ),
+                        ),
+                    ],
+                ),
+            ),
+        }
+
+
+def _local_directory_configuration_elements(
+    directory_field_size: int,
+) -> Mapping[str, DictElement]:
+    return {
+        "path": DictElement(
+            required=True,
+            parameter_form=LegacyValueSpec.wrap(
+                AbsoluteDirname(
+                    title=_("Directory to save the backup to"),
+                    help=_(
+                        "This can be a local directory of your choice. You can also use this "
+                        "option if you want to save your backup to a network share using "
+                        "NFS, Samba or similar. But you will have to care about mounting the "
+                        "network share on your own."
+                    ),
+                    allow_empty=False,
+                    size=directory_field_size,
+                )
+            ),
+        ),
+        "is_mountpoint": DictElement(
+            required=True,
+            parameter_form=BooleanChoice(
+                title=Title("Mount point"),
+                label=Label("Is mount point"),
+                help_text=Help(
+                    "When this is checked, the backup ensures that the configured path "
+                    "is a mount point. If there is no active mount on the path, "
+                    "the backup fails with an error message."
+                ),
+                prefill=DefaultValue(True),
+            ),
+        ),
+    }
+
+
+def _check_if_target_ready(target: TargetProtocol) -> None:
+    try:
+        target.check_ready()
+    except MKGeneralException as e:
+        raise MKUserError("", str(e))
+
+
+def _validate_local_target(local_target: LocalTarget) -> None:
+    _check_if_target_ready(local_target)
+    _validate_local_write_access(local_target.path)
+
+
+def _validate_local_write_access(path: Path) -> None:
+    with _write_access_test_file(path) as test_file_path:
+        try:
+            test_file_path.write_bytes(b"")
+        except OSError:
+            if cmk_version.is_cma():
+                raise MKUserError(
+                    "",
+                    _(
+                        "Failed to write to the configured directory. The target directory needs "
+                        "to be writable."
+                    ),
+                )
+            raise MKUserError(
+                "",
+                _(
+                    "Failed to write to the configured directory. The site user needs to be able to "
+                    "write the target directory. The recommended way is to make it writable by the "
+                    'group "omd".'
+                ),
+            )
+
+
+def _validate_remote_target[TRemoteParams: Mapping[str, object], TRemoteStorage: RemoteStorage](
+    remote_target: RemoteTarget[TRemoteParams, TRemoteStorage],
+) -> None:
+    _check_if_target_ready(remote_target)
+    _validate_local_write_access(remote_target.local_target.path)
+
+    with _write_access_test_file(remote_target.local_target.path) as local_test_file_path:
+        local_test_file_path.write_bytes(b"")
+        remote_key = Path(local_test_file_path.name)
+        try:
+            remote_target.remote_storage.upload(local_test_file_path, remote_key)
+        except Exception as e:
+            raise MKUserError(
+                "",
+                _(
+                    "File upload test for remote storage failed. Original error message: %(exception)s"
+                )
+                % {"exception": e},
+            )
+        try:
+            remote_target.remote_storage.download(remote_key, remote_target.local_target.path)
+        except Exception as e:
+            raise MKUserError(
+                "",
+                _(
+                    "File download test for remote storage failed. Original error message: %(exception)s"
+                )
+                % {"exception": e},
+            )
+        try:
+            remote_target.remote_storage.remove(remote_key)
+        except Exception as e:
+            raise MKUserError(
+                "",
+                _(
+                    "File removal test for remote storage failed. Original error message: %(exception)s"
+                )
+                % {"exception": e},
+            )
+
+
+@contextlib.contextmanager
+def _write_access_test_file(path: Path) -> Iterator[Path]:
+    test_file_path = path / (f"write_test_{int(time.time())}")
+    try:
+        yield test_file_path
+    finally:
+        test_file_path.unlink(missing_ok=True)
+
+
+# .
+#   .--Targets-------------------------------------------------------------.
+#   |                  _____                    _                          |
+#   |                 |_   _|_ _ _ __ __ _  ___| |_ ___                    |
+#   |                   | |/ _` | '__/ _` |/ _ \ __/ __|                   |
+#   |                   | | (_| | | | (_| |  __/ |_\__ \                   |
+#   |                   |_|\__,_|_|  \__, |\___|\__|___/                   |
+#   |                                |___/                                 |
+#   +----------------------------------------------------------------------+
+#   | Specifying backup targets, the user tells the backup system which    |
+#   | destinations can be used for the backups. Each destination has it's  |
+#   | own protocol and specific parameters to specify how to backup.       |
+#   '----------------------------------------------------------------------'
+
+
+class Target:
+    def __init__(self, ident: TargetId, config: TargetConfig) -> None:
+        self.ident: Final = ident
+        self.config: Final = config
+
+    @property
+    def title(self) -> str:
+        return self.config["title"]
+
+    def _target_type(self) -> ABCBackupTargetType:
+        target_type_ident, target_params = self.config["remote"]
+        try:
+            target_type = target_type_registry[target_type_ident]
+        except KeyError:
+            raise MKUserError(
+                None,
+                _("Unknown target type: %(target_type)s. Available types: %(available_types)s.")
+                % {
+                    "target_type": target_type_ident,
+                    "available_types": ", ".join(target_type_registry),
+                },
+            )
+        return target_type(target_params)
+
+    def backups(self) -> _Backups:
+        return self._target_type().backups()
+
+    def remove_backup(self, backup_ident: str) -> None:
+        self._target_type().remove_backup(backup_ident)
+
+    def validate(self) -> None:
+        self._target_type().validate()
+
+    def render_destination(self) -> HTML:
+        return self._target_type().render()
+
+    def render_type(self) -> str:
+        return self._target_type().title()
+
+
+def _show_site_and_system_targets(backup_config: BackupConfig, *, table_row_limit: int) -> None:
+    _show_target_list(backup_config.site_targets.values(), False, table_row_limit=table_row_limit)
+    if cmk_version.is_cma():
+        _show_target_list(
+            backup_config.cma_system_targets.values(), True, table_row_limit=table_row_limit
+        )
+
+
+def _show_target_list(
+    targets: Iterable[Target], targets_are_cma: bool, *, table_row_limit: int
+) -> None:
+    html.h2(_("System global targets") if targets_are_cma else _("Targets"))
+    if targets_are_cma:
+        html.p(
+            _(
+                "These backup targets cannot be edited here. You need to open the device backup management."
+            )
+        )
+
+    with table_element(sortable=False, searchable=False, limit=table_row_limit) as table:
+        for nr, target in enumerate(sorted(targets, key=lambda t: t.ident)):
+            table.row()
+            table.cell("#", css=["narrow nowrap"])
+            html.write_text_permissive(nr)
+            table.cell(_("Actions"), css=["buttons"])
+            restore_url = makeuri_contextless(
+                request,
+                [("mode", "backup_restore"), ("target", target.ident)],
+            )
+            html.icon_button(
+                restore_url,
+                _("Restore from this backup target"),
+                StaticIcon(
+                    IconNames.backup,
+                    emblem="refresh",
+                ),
+            )
+
+            if not targets_are_cma:
+                delete_url = make_confirm_delete_link(
+                    i18n=_,
+                    url=makeactionuri_contextless(
+                        request,
+                        transactions.get(),
+                        [("mode", "backup_targets"), ("target", target.ident)],
+                    ),
+                    title=_("Delete target #%(nr)d") % {"nr": nr},
+                    suffix=target.title,
+                    message=_("ID: %(ident)s") % {"ident": target.ident},
+                )
+                edit_url = makeuri_contextless(
+                    request,
+                    [("mode", "edit_backup_target"), ("target", target.ident)],
+                )
+
+                html.icon_button(edit_url, _("Edit this backup target"), StaticIcon(IconNames.edit))
+                html.icon_button(
+                    delete_url, _("Delete this backup target"), StaticIcon(IconNames.delete)
+                )
+
+            table.cell(_("ID"), target.ident, css=["narrow nowrap"])
+            table.cell(_("Title"), target.title, css=["narrow nowrap"])
+            table.cell(_("Type"), target.render_type())
+            table.cell(_("Destination"), target.render_destination())
+
+
+class ModeBackupTargets(WatoMode[object]):
+    @override
+    def title(self) -> str:
+        return _("Site backup targets")
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        return PageMenu(
+            dropdowns=[
+                PageMenuDropdown(
+                    name="targets",
+                    title=_("Targets"),
+                    topics=[
+                        PageMenuTopic(
+                            title=_("Add target"),
+                            entries=[
+                                PageMenuEntry(
+                                    title=_("Add target"),
+                                    icon_name=StaticIcon(IconNames.new),
+                                    item=make_simple_link(
+                                        makeuri_contextless(
+                                            request,
+                                            [("mode", "edit_backup_target")],
+                                        )
+                                    ),
+                                    is_shortcut=True,
+                                    is_suggested=True,
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+            breadcrumb=breadcrumb,
+        )
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        if not transactions.check_transaction(request):
+            return HTTPRedirect(makeuri_contextless(request, [("mode", "backup_targets")]))
+
+        if not (ident := request.var("target")):
+            raise MKUserError("target", _("This backup target does not exist."))
+
+        backup_config = BackupConfig.load()
+
+        try:
+            target = backup_config.site_targets[TargetId(ident)]
+        except KeyError:
+            raise MKUserError("target", _("This backup target does not exist."))
+
+        self._verify_not_used(backup_config, target.ident)
+
+        with contextlib.suppress(KeyError):
+            backup_config.delete_target(target.ident)
+
+        flash(_("The target has been deleted."))
+        return HTTPRedirect(makeuri_contextless(request, [("mode", "backup_targets")]))
+
+    def _verify_not_used(self, backup_config: BackupConfig, target_id: TargetId) -> None:
+        if jobs := [job for job in backup_config.jobs.values() if job.target_ident() == target_id]:
+            raise MKUserError(
+                "target",
+                _("You cannot delete this target because it is used by these backup jobs: %(jobs)s")
+                % {"jobs": ", ".join(job.title for job in jobs)},
+            )
+
+    @override
+    def page(self, config: Config) -> None:
+        _show_site_and_system_targets(BackupConfig.load(), table_row_limit=config.table_row_limit)
+
+
+class ModeEditBackupTarget(WatoMode[object]):
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx)
+        target_ident = request.var("target")
+
+        self._received_data_from_frontend = False
+        if target_ident is not None:
+            target_ident = TargetId(target_ident)
+            try:
+                target = BackupConfig.load().site_targets[target_ident]
+            except KeyError:
+                raise MKUserError("target", _("This backup target does not exist."))
+
+            self._new = False
+            self._ident: TargetId | None = target_ident
+            self._target_cfg: TargetConfig | None = target.config
+            self._title = _("Edit backup target: %(title)s") % {"title": target.title}
+        else:
+            self._new = True
+            self._ident = None
+            self._target_cfg = None
+            self._title = _("Add backup target")
+
+    @override
+    def title(self) -> str:
+        return self._title
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        return make_simple_form_page_menu(
+            _("Target"), breadcrumb, form_name="edit_target", button_name="_save"
+        )
+
+    def fs_backup_target(self, backup_config: BackupConfig) -> Dictionary:
+        if self._new:
+            ident_attr = {
+                "ident": DictElement(
+                    required=True,
+                    parameter_form=LegacyValueSpec.wrap(
+                        ID(
+                            title=_("Unique ID"),
+                            help=_(
+                                "The ID of the target must be a unique text. It will be used as an internal key "
+                                "when objects refer to the target."
+                            ),
+                            allow_empty=False,
+                            size=_OUTER_TEXT_FIELD_SIZE,
+                            validate=lambda ident, varprefix: self.validate_backup_target_ident(
+                                backup_config,
+                                ident,
+                                varprefix,
+                            ),
+                        ),
+                    ),
+                )
+            }
+        else:
+            ident_attr = {
+                "ident": DictElement(
+                    required=True,
+                    parameter_form=FixedValue(value=self._ident, title=Title("Unique ID")),
+                )
+            }
+
+        return Dictionary(
+            title=Title("Backup target"),
+            elements={
+                **ident_attr,
+                "title": DictElement(
+                    required=True,
+                    parameter_form=String(
+                        title=Title("Title"),
+                        custom_validate=[
+                            validators.LengthInRange(
+                                min_value=1, error_msg=Message("Text field cannot be empty")
+                            )
+                        ],
+                    ),
+                ),
+                "remote": DictElement(
+                    required=True,
+                    parameter_form=CascadingSingleChoice(
+                        title=Title("Destination"),
+                        elements=[
+                            CascadingSingleChoiceElement(
+                                name=target_type.ident(),
+                                title=Title(  # astrein: disable=localization-checker
+                                    target_type.title()
+                                ),
+                                parameter_form=target_type.form_spec(),
+                            )
+                            for target_type in target_type_registry.values()
+                        ],
+                    ),
+                ),
+            },
+        )
+
+    def validate_backup_target_ident(
+        self, backup_config: BackupConfig, value: str, varprefix: str
+    ) -> None:
+        if TargetId(value) in backup_config.site_targets:
+            raise MKUserError(varprefix, _("This ID is already used by another backup target."))
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        check_csrf_token()
+
+        if not transactions.check_transaction(request):
+            return HTTPRedirect(makeuri_contextless(request, [("mode", "backup_targets")]))
+
+        backup_config = BackupConfig.load()
+        flat_catalog = create_flat_catalog_from_dictionary(self.fs_backup_target(backup_config))
+        self._received_data_from_frontend = True
+        try:
+            target_config = cast(dict, parse_data_from_field_id(flat_catalog, "edit_target"))
+        except MKUserError as e:
+            raise e
+
+        if "ident" in target_config:
+            self._ident = TargetId(target_config.pop("ident"))
+        self._target_cfg = FormspecAdapter.from_form_spec(target_config)
+
+        if self._ident is None:
+            raise MKGeneralException("Cannot create or modify job without identifier")
+
+        backup_config.add_target(
+            Target(
+                self._ident,
+                self._target_cfg,
+            )
+        )
+
+        return HTTPRedirect(makeuri_contextless(request, [("mode", "backup_targets")]))
+
+    @override
+    def page(self, config: Config) -> None:
+        flat_catalog = create_flat_catalog_from_dictionary(
+            self.fs_backup_target(BackupConfig.load())
+        )
+        if self._received_data_from_frontend:
+            value_for_frontend: IncomingData = read_data_from_frontend("edit_target")
+        elif self._target_cfg is None:
+            value_for_frontend = RawDiskData({})
+        else:
+            value_for_frontend = FormspecAdapter.to_form_spec(self._target_cfg)
+
+        with html.form_context("edit_target", method="POST"):
+            html.prevent_password_auto_completion()
+            render_form_spec(
+                flat_catalog,
+                "edit_target",
+                value_for_frontend,
+                do_validate=self._received_data_from_frontend,
+            )
+            forms.end()
+
+            html.hidden_fields()
+
+
+# .
+#   .--Key Management------------------------------------------------------.
+#   |             _  __            __  __                 _                |
+#   |            | |/ /___ _   _  |  \/  | __ _ _ __ ___ | |_              |
+#   |            | ' // _ \ | | | | |\/| |/ _` | '_ ` _ \| __|             |
+#   |            | . \  __/ |_| | | |  | | (_| | | | | | | |_              |
+#   |            |_|\_\___|\__, | |_|  |_|\__, |_| |_| |_|\__|             |
+#   |                      |___/          |___/                            |
+#   +----------------------------------------------------------------------+
+#   | Managing of the keys that are used for signing the agents            |
+#   '----------------------------------------------------------------------'
+
+
+class BackupKeypairStore(keypair_store.KeypairStore):
+    pass
+
+
+class ModeBackupKeyManagement(key_mgmt.ModeKeyManagement):
+    edit_mode = "backup_edit_key"
+    upload_mode = "backup_upload_key"
+    download_mode = "backup_download_key"
+
+    @override
+    def title(self) -> str:
+        return _("Keys for backups")
+
+    @override
+    def page(self, config: Config) -> None:
+        show_key_download_warning(self.key_store.load())
+        super().page(config)
+
+    @override
+    def _key_in_use(self, key: Key) -> bool:
+        key_digest = key.fingerprint(HashAlgorithm.MD5)
+        return any(
+            (job_key_fp := job.key_ident()) and key_digest == job_key_fp
+            for job in BackupConfig.load().jobs.values()
+        )
+
+    @override
+    def _table_title(self) -> str:
+        return self.title()
+
+    @override
+    def _delete_confirm_msg(self) -> str:
+        return _(
+            "<b>Beware:</b> Deleting this key means that you will not be able to encrypt or sign backups with the key. Already created backups which have been encrypted, cannot be decrypted without access to this key. So please be sure that you either have a backup or don't need this key anymore."
+        )
+
+    @override
+    def _delete_confirm_title(self, nr: int) -> str:
+        return _("Delete backup key #%(nr)d") % {"nr": nr}
+
+    @property
+    @override
+    def component_name(self) -> CertManagementEvent.ComponentType:
+        return "backup encryption keys"
+
+
+class ModeBackupEditKey(key_mgmt.ModeEditKey):
+    back_mode = "backup_keys"
+
+    @override
+    def title(self) -> str:
+        return _("Create backup key")
+
+    @override
+    def _passphrase_help(self) -> str:
+        return _(
+            "The backup key will be stored encrypted using this passphrase on your "
+            "disk. The passphrase will not be stored anywhere. The backup will use "
+            "the public key part of the key to sign or encrypt the backups. If you "
+            "encrypt a backup, you will need the private key part together with the "
+            "passphrase to decrypt the backup."
+        )
+
+    @property
+    @override
+    def component_name(self) -> CertManagementEvent.ComponentType:
+        return "backup encryption keys"
+
+
+class ModeBackupUploadKey(key_mgmt.ModeUploadKey):
+    back_mode = "backup_keys"
+
+    @override
+    def title(self) -> str:
+        return _("Upload backup key")
+
+    @override
+    def _passphrase_help(self) -> str:
+        return _(
+            "The backup key will be stored encrypted using this passphrase on your "
+            "disk. The passphrase will not be stored anywhere. The backup will use "
+            "the public key part of the key to sign or encrypt the backups. If you "
+            "encrypt a backup, you will need the private key part together with the "
+            "passphrase to decrypt the backup."
+        )
+
+    @property
+    @override
+    def component_name(self) -> CertManagementEvent.ComponentType:
+        return "backup encryption keys"
+
+
+class ModeBackupDownloadKey(key_mgmt.ModeDownloadKey):
+    back_mode = "backup_keys"
+
+    @override
+    def title(self) -> str:
+        return _("Download backup key")
+
+    @override
+    def _send_download(self, keys: KeypairMap, key_id: KeyId) -> None:
+        super()._send_download(keys, key_id)
+        keys[key_id].not_downloaded = False
+        self.key_store.save(keys)
+
+    @override
+    def _file_name(self, key_id: KeyId, key: Key) -> str:
+        return f"Check_MK-{hostname()}-{omd_site()}-backup_key-{key_id}.pem"
+
+
+def show_key_download_warning(keys: KeypairMap) -> None:
+    to_load = [k.alias for k in keys.values() if k.not_downloaded]
+    if to_load:
+        html.show_warning(
+            _(
+                "To be able to restore your encrypted backups, you need to "
+                "download and keep the backup encryption keys in a safe place. "
+                "If you lose your keys or the keys passphrases, your backup "
+                "can not be restored.<br>"
+                "The following keys have not been downloaded yet: %(keys)s"
+            )
+            % {"keys": ", ".join(to_load)}
+        )
+
+
+# .
+#   .--Restore-------------------------------------------------------------.
+#   |                  ____           _                                    |
+#   |                 |  _ \ ___  ___| |_ ___  _ __ ___                    |
+#   |                 | |_) / _ \/ __| __/ _ \| '__/ _ \                   |
+#   |                 |  _ <  __/\__ \ || (_) | | |  __/                   |
+#   |                 |_| \_\___||___/\__\___/|_|  \___|                   |
+#   |                                                                      |
+#   +----------------------------------------------------------------------+
+#   | Listing backups of targets and controlling the the restore procedure |
+#   '----------------------------------------------------------------------'
+
+
+class RestoreJob(MKBackupJob):
+    def __init__(
+        self,
+        target_ident: TargetId | None,
+        backup_ident: str | None,
+        passphrase: PasswordType | None = None,
+    ) -> None:
+        super().__init__()
+        self._target_ident = target_ident
+        self._backup_ident = backup_ident
+        self._passphrase = passphrase
+
+    def title(self) -> str:
+        return _("Restore")
+
+    @override
+    def state_file_path(self) -> Path:
+        return Path("/tmp/restore-%s.state" % os.environ["OMD_SITE"])  # nosec B108 # BNS:13b2c8
+
+    def complete(self) -> None:
+        self.cleanup()
+
+    @override
+    def _start_command(self) -> Sequence[str | Path]:
+        assert self._target_ident is not None
+        assert self._backup_ident is not None
+        return [
+            mkbackup_path(),
+            "restore",
+            "--background",
+            self._target_ident,
+            self._backup_ident,
+        ]
+
+    @override
+    def start(self, **env_updates: str) -> None:
+        if self._passphrase:
+            env_updates["MKBACKUP_PASSPHRASE"] = self._passphrase.raw
+        super().start(**env_updates)
+
+
+class ModeBackupRestore(WatoMode[object]):
+    def __init__(
+        self, edition: Edition, ctx: PageContext, key_store: keypair_store.KeypairStore
+    ) -> None:
+        super().__init__(edition, ctx)
+        self.key_store = key_store
+        self._load_target()
+        if self._target:
+            self._backups = self._target.backups()
+        else:
+            self._backups = _Backups({}, timed_out=False)
+
+    def _load_target(self) -> None:
+        ident = request.var("target")
+        if ident is None:
+            self._target_ident = None
+            self._target = None
+            return
+
+        self._target_ident = TargetId(ident)
+
+        try:
+            self._target = self._get_target(self._target_ident)
+        except KeyError:
+            raise MKUserError("target_p_target", _("This backup target does not exist."))
+
+    def _get_target(self, target_ident: TargetId) -> Target:
+        return BackupConfig.load().all_targets[target_ident]
+
+    @override
+    def title(self) -> str:
+        if not self._target:
+            return _("Site restore")
+        return _("Restore from target: %(title)s") % {"title": self._target.title}
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        return PageMenu(
+            dropdowns=[
+                PageMenuDropdown(
+                    name="restore",
+                    title=_("Restore"),
+                    topics=[
+                        PageMenuTopic(
+                            title=_("Restore job"),
+                            entries=[
+                                PageMenuEntry(
+                                    title=_("Stop"),
+                                    icon_name=StaticIcon(IconNames.backup_stop),
+                                    item=make_simple_link(
+                                        make_confirm_delete_link(
+                                            i18n=_,
+                                            url=makeactionuri(
+                                                request,
+                                                transactions.get(),
+                                                [("_action", "stop")],
+                                            ),
+                                            title=_("Stop restore of backup"),
+                                            message=_(
+                                                "<b>Beware:</b> This will leave your environment in an undefined state."
+                                            ),
+                                            confirm_button=_("Stop"),
+                                            cancel_button=_("Cancel"),
+                                        )
+                                    ),
+                                    is_shortcut=True,
+                                    is_suggested=True,
+                                    is_enabled=self._restore_is_running(),
+                                ),
+                                PageMenuEntry(
+                                    title=_("Complete the restore"),
+                                    icon_name=StaticIcon(IconNames.save),
+                                    item=make_simple_link(
+                                        makeactionuri(
+                                            request,
+                                            transactions.get(),
+                                            [("_action", "complete")],
+                                        )
+                                    ),
+                                    is_shortcut=True,
+                                    is_suggested=True,
+                                    is_enabled=self._restore_was_started(),
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+            breadcrumb=breadcrumb,
+        )
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        action = request.var("_action")
+        backup_ident = request.var("_backup")
+
+        if action is None:
+            return None  # Only choosen the target
+
+        if not transactions.check_transaction(request):
+            return HTTPRedirect(makeuri_contextless(request, [("mode", "backup_restore")]))
+
+        if action == "delete":
+            self._delete_backup(backup_ident)
+
+        elif action == "complete":
+            self._complete_restore(backup_ident)
+
+        elif action == "start":
+            return self._start_restore(backup_ident)
+
+        elif action == "stop":
+            self._stop_restore(backup_ident)
+
+        return HTTPRedirect(makeuri_contextless(request, [("mode", "backup_restore")]))
+
+    def _delete_backup(self, backup_ident: str | None) -> None:
+        if self._restore_is_running():
+            raise MKUserError(
+                None,
+                _(
+                    "A restore is currently running. You can only delete "
+                    "backups while no restore is running."
+                ),
+            )
+
+        if self._target is None:
+            raise Exception("no backup target")
+        if backup_ident not in self._backups.backups:
+            if self._backups.timed_out:
+                raise MKGeneralException(
+                    "Unable to find backup to delete. "
+                    "This may be because the listing of remote backups timed out. "
+                    "There may be too many files present at the remote target."
+                )
+            raise MKUserError(None, _("This backup does not exist."))
+
+        assert backup_ident is not None
+
+        self._target.remove_backup(backup_ident)
+        flash(_("The backup has been deleted."))
+
+    def _restore_was_started(self) -> bool:
+        return RestoreJob(self._target_ident, None).was_started()
+
+    def _restore_is_running(self) -> bool:
+        return RestoreJob(self._target_ident, None).is_running()
+
+    def _start_restore(self, backup_ident: str | None) -> ActionResult:
+        if self._target is None:
+            raise Exception("no backup target")
+        assert backup_ident is not None
+        backup_info = self._backups.get(backup_ident)
+        if (key_digest := backup_info.config["encrypt"]) is not None:
+            return self._start_encrypted_restore(backup_ident, key_digest)
+        return self._start_unencrypted_restore(backup_ident)
+
+    def _complete_restore(self, backup_ident: str | None) -> None:  # noqa: ARG002
+        RestoreJob(self._target_ident, None).complete()
+
+    def _start_encrypted_restore(self, backup_ident: str, key_digest: str) -> ActionResult:
+        try:
+            _key_id, key = self.key_store.get_key_by_digest(key_digest)
+        except KeyError:
+            raise MKUserError(
+                None,
+                _(
+                    "The key with the fingerprint %(key_digest)s which is needed to decrypt "
+                    "the backup is misssing."
+                )
+                % {"key_digest": key_digest},
+            )
+
+        key_field_id = "_key"
+        do_validate_form = False
+        if html.form_submitted("key"):
+            try:
+                fs = self._fs_key()
+                value = parse_data_from_field_id(fs, key_field_id)
+                assert isinstance(value, dict)
+                if "passphrase" in value:
+                    passphrase = PasswordType(value["passphrase"])
+
+                    # Validate the passphrase
+                    try:
+                        key.to_certificate_with_private_key(passphrase)
+                    except PEMDecodingError, ValueError:
+                        raise MKUserError("_key_p_passphrase", _("Invalid passphrase"))
+
+                    transactions.check_transaction(request)  # invalidate transid
+                    RestoreJob(self._target_ident, backup_ident, passphrase).start()
+                    flash(_("The restore has been started."))
+                    return HTTPRedirect(makeuri_contextless(request, [("mode", "backup_restore")]))
+            except MKUserError as e:
+                do_validate_form = True
+                user_errors.add(e)
+
+        # Special handling for Checkmk / CMA differences
+        title = _("Insert passphrase")
+        breadcrumb = make_simple_page_breadcrumb(main_menu_registry.menu_setup(), title)
+        make_header(
+            html,
+            title=title,
+            breadcrumb=breadcrumb,
+            page_menu=PageMenu(dropdowns=[], breadcrumb=breadcrumb),
+            debug=active_config.debug,
+            lang=user.language,
+            inject_js_profiling_code=active_config.inject_js_profiling_code,
+            load_frontend_vue=active_config.load_frontend_vue,
+            custom_style_sheet=active_config.custom_style_sheet,
+            screenshotmode=active_config.screenshotmode,
+            inline_help_as_text=user.inline_help_as_text,
+            hide_suggestions=not user.get_tree_state("suggestions", "all", True),
+            user_role_ids=user.role_ids,
+        )
+
+        html.show_user_errors()
+        html.p(
+            _(
+                "To be able to decrypt and restore the encrypted backup, you need to enter the "
+                "passphrase of the encryption key."
+            )
+        )
+        with html.form_context("key", method="POST"):
+            html.hidden_field("_action", "start")
+            html.hidden_field("_backup", backup_ident)
+            html.prevent_password_auto_completion()
+            render_form_spec(
+                self._fs_key(), key_field_id, RawDiskData({}), do_validate=do_validate_form
+            )
+            html.button("upload", _("Start restore"))
+            html.hidden_fields()
+        html.footer()
+        return FinalizeRequest(code=200)
+
+    def _fs_key(self) -> Dictionary:
+        return Dictionary(
+            title=Title("Properties"),
+            elements={
+                "passphrase": DictElement(
+                    required=True,
+                    parameter_form=SimplePassword(
+                        title=Title("Passphrase"),
+                    ),
+                )
+            },
+        )
+
+    def _start_unencrypted_restore(self, backup_ident: str) -> ActionResult:
+        RestoreJob(self._target_ident, backup_ident).start()
+        flash(_("The restore has been started."))
+        return HTTPRedirect(makeuri_contextless(request, [("mode", "backup_restore")]))
+
+    def _stop_restore(self, backup_ident: str | None) -> None:
+        RestoreJob(self._target_ident, backup_ident).stop()
+        flash(_("The restore has been stopped."))
+
+    @override
+    def page(self, config: Config) -> None:
+        if self._restore_was_started():
+            self._show_restore_progress(config)
+
+        elif self._target:
+            self._show_backup_list(table_row_limit=config.table_row_limit)
+
+        else:
+            self._show_target_list(table_row_limit=config.table_row_limit)
+
+    def _show_target_list(self, *, table_row_limit: int) -> None:
+        html.p(_("Please choose a target to perform the restore from."))
+        _show_site_and_system_targets(BackupConfig.load(), table_row_limit=table_row_limit)
+
+    def _show_backup_list(self, *, table_row_limit: int) -> None:
+        assert self._target is not None
+        if self._backups.timed_out:
+            html.show_warning(
+                "The following list is not complete "
+                "as the listing of remote backups timed "
+                "out. There may be too many files present "
+                "at the remote target. To make sure all "
+                "backups are listed, remove unneeded files "
+                "at the remote target."
+            )
+        with table_element(sortable=False, searchable=False, limit=table_row_limit) as table:
+            for backup_ident, info in sorted(self._backups.backups.items()):
+                table.row()
+                table.cell(_("Actions"), css=["buttons"])
+
+                from_info = f"{info.hostname} (Site: {info.site_id}, Version: {info.site_version})"
+                delete_url = make_confirm_delete_link(
+                    i18n=_,
+                    url=makeactionuri(
+                        request,
+                        transactions.get(),
+                        [("_action", "delete"), ("_backup", backup_ident)],
+                    ),
+                    title=_("Delete backup"),
+                    message=_("From: %(from_info)s") % {"from_info": from_info},
+                    suffix=backup_ident,
+                )
+
+                html.icon_button(delete_url, _("Delete this backup"), StaticIcon(IconNames.delete))
+
+                start_url = make_confirm_link(
+                    i18n=_,
+                    url=makeactionuri(
+                        request,
+                        transactions.get(),
+                        [("_action", "start"), ("_backup", backup_ident)],
+                    ),
+                    title=_("Start restore of backup"),
+                    suffix=backup_ident,
+                    message=_("From: %(from_info)s") % {"from_info": from_info},
+                    confirm_button=_("Start"),
+                    cancel_button=_("Cancel"),
+                )
+
+                html.icon_button(
+                    start_url,
+                    _("Start restore of this backup"),
+                    StaticIcon(
+                        IconNames.backup,
+                        emblem="refresh",
+                    ),
+                )
+
+                table.cell(_("Backup-ID"), backup_ident)
+                table.cell(_("From"), from_info)
+                table.cell(_("Finished"), render.date_and_time(info.finished))
+                table.cell(_("Size"), render.fmt_bytes(info.size))
+                table.cell(_("Encrypted"))
+                if (encrypt := info.config["encrypt"]) is not None:
+                    html.write_text_permissive(encrypt)
+                else:
+                    html.write_text_permissive(_("No"))
+
+    def _show_restore_progress(self, config: Config) -> None:
+        PageBackupRestoreState().page(config)
+
+
+class PageBackupRestoreState:
+    def __init__(self) -> None:
+        super().__init__()
+        self._job = RestoreJob(None, None)  # TODO: target_ident and backup_ident needed?
+
+    @property
+    def job(self) -> MKBackupJob:
+        return self._job
+
+    def page(self, config: Config) -> None:  # noqa: ARG002
+        job_page(self.job, "restore")

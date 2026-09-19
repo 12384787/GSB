@@ -1,0 +1,185 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import CmkAlertBox from 'cmk-ui-library/components/CmkAlertBox.vue'
+import CmkHeading from 'cmk-ui-library/components/typography/CmkHeading.vue'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import { computed, onMounted, onUnmounted, ref, useTemplateRef } from 'vue'
+
+import ContentSpacer from '@/dashboard/components/ContentSpacer.vue'
+import ActionBar from '@/dashboard/components/Wizard/components/ActionBar.vue'
+import ActionButton from '@/dashboard/components/Wizard/components/ActionButton.vue'
+import type { DataConfiguration } from '@/dashboard/components/Wizard/wizards/view/useDataConfiguration'
+import type { DashboardKey } from '@/dashboard/types/dashboard'
+import type { EmbeddedViewContent } from '@/dashboard/types/widget'
+
+// These must be kept in sync with the Python side
+interface ConfigurationErrorMessage {
+  type: 'cmk:view:configuration-error'
+  message: string
+}
+
+interface ValidationErrorMessage {
+  type: 'cmk:view:validation-error'
+}
+
+interface SaveCompletedMessage {
+  type: 'cmk:view:save-completed'
+  datasource: string
+  single_infos: string[]
+}
+
+type MessageEventData = ConfigurationErrorMessage | ValidationErrorMessage | SaveCompletedMessage
+
+interface Stage2Props {
+  dashboardKey: DashboardKey
+  dataConfiguration: DataConfiguration
+}
+
+const props = defineProps<Stage2Props>()
+const emit = defineEmits<{
+  goPrev: []
+  goNext: [content: EmbeddedViewContent]
+}>()
+
+const { _t } = usei18n()
+
+const iframeUrl = computed(() => {
+  const configuration = props.dataConfiguration
+  const params = new URLSearchParams({
+    dashboard: props.dashboardKey.name,
+    owner: props.dashboardKey.owner,
+    embedded_id: configuration.embeddedId,
+    mode: configuration.mode
+  })
+  switch (configuration.mode) {
+    case 'create':
+      params.append('datasource', configuration.datasource)
+      params.append('single_infos', configuration.restrictedToSingle.join(','))
+      break
+    case 'copy':
+      params.append('view_name', configuration.viewName)
+      break
+    case 'duplicate':
+      params.append('source_embedded_id', configuration.sourceEmbeddedId)
+      break
+    default: {
+      const unhandled: never = configuration
+      throw new Error(`Unhandled data configuration: ${JSON.stringify(unhandled)}`)
+    }
+  }
+  return `widget_edit_view.py?${params.toString()}`
+})
+const isSaving = ref(false)
+const configurationError = ref<string | undefined>()
+const viewEditor = useTemplateRef<HTMLIFrameElement>('view-editor')
+
+function saveAndContinue() {
+  if (isSaving.value || configurationError.value || !viewEditor.value) {
+    return
+  }
+  const iframeDocument = viewEditor.value.contentDocument
+  if (!iframeDocument) {
+    console.error('Could not access iframe document')
+    return
+  }
+  const elements = iframeDocument.getElementsByName('_save')
+  if (elements.length === 0) {
+    console.error('Could not find save button in iframe')
+    return
+  }
+  const saveButton = elements[0] as HTMLButtonElement
+  isSaving.value = true
+  saveButton.click()
+}
+
+function onMessageEvent(event: MessageEvent) {
+  if (event.origin !== window.location.origin) {
+    return // ignore messages from other domains
+  }
+  // there are 3 types of messages we expect, these must be in sync with widget_edit_view.py:
+  // 1. Configuration error, missing permissions or otherwise invalid url parameters
+  //    -> implementation error or the stored configured is invalid
+  // 2. Validation error, the save failed due to validation errors -> user error
+  // 3. Save completed, we can proceed to the next step
+  // We might get other messages (from other components), we'll ignore those
+  if (typeof event.data !== 'object' || event.data === null || !('type' in event.data)) {
+    return
+  }
+  // type key could still be anything else, always check its value
+  const eventData = event.data as MessageEventData
+
+  if (eventData.type === 'cmk:view:configuration-error') {
+    configurationError.value = event.data.message
+    return
+  }
+
+  if (eventData.type === 'cmk:view:validation-error') {
+    isSaving.value = false
+    // the iframe will already show the validation error
+    return
+  }
+
+  if (eventData.type === 'cmk:view:save-completed') {
+    isSaving.value = false
+    emit('goNext', {
+      type: 'embedded_view',
+      embedded_id: props.dataConfiguration.embeddedId,
+      datasource: eventData.datasource,
+      restricted_to_single: eventData.single_infos
+    } as EmbeddedViewContent)
+  }
+}
+
+onMounted(() => {
+  window.addEventListener('message', onMessageEvent)
+})
+onUnmounted(() => {
+  window.removeEventListener('message', onMessageEvent)
+})
+</script>
+
+<template>
+  <CmkHeading type="h1">
+    {{ _t('Data configuration') }}
+  </CmkHeading>
+
+  <ContentSpacer />
+
+  <ActionBar align-items="left">
+    <ActionButton
+      :label="_t('Previous step')"
+      :icon="{ name: 'continue', side: 'left', rotate: 180 }"
+      :action="() => $emit('goPrev')"
+      variant="secondary"
+    />
+    <ActionButton
+      v-if="!configurationError"
+      :label="_t('Next step: Visualization')"
+      :icon="{ name: 'continue', side: 'right' }"
+      :action="saveAndContinue"
+      variant="secondary"
+    />
+  </ActionBar>
+
+  <ContentSpacer :dimension="11" />
+
+  <CmkAlertBox v-if="configurationError" variant="error">
+    {{ configurationError }}
+  </CmkAlertBox>
+  <iframe v-else ref="view-editor" class="db-stage-contents__view-editor" :src="iframeUrl" />
+</template>
+
+<style scoped>
+.db-stage-contents__view-editor {
+  border: none;
+  width: 100%;
+
+  /* should be more than 109px = height of heading + action bar + spacers
+   we're adding a bit more because otherwise a simple scroll bar might pop up */
+  height: calc(100% - 110px);
+}
+</style>

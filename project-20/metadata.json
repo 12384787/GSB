@@ -1,0 +1,10 @@
+{
+  "number": 20,
+  "repository": "mui/mui-x",
+  "url": "https://github.com/mui/mui-x",
+  "description": "MUI X: Build complex and data-rich applications using a growing list of advanced React components, like the Data Grid, Date and Time Pickers, Charts, and more!",
+  "language": "TypeScript",
+  "stars": 5848,
+  "default_branch": "main",
+  "source_zip_url": "https://github.com/mui/mui-x/archive/refs/heads/main.zip"
+}

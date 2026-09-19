@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+"""Scrape Werks from changes listed in Checkmk repository."""
+
+import netrc
+import os
+import re
+from argparse import ArgumentParser, Namespace, RawTextHelpFormatter
+from dataclasses import dataclass, field, fields
+from functools import cache
+from pathlib import Path
+from typing import Final, override
+
+from scripts.gerrit_api.client import GerritClient, PROJECT_NAME, TChangeStatus
+from scripts.gerrit_api.helper import change_has_tests, get_jira_ticket_in_change
+from scripts.gerrit_api.werks import werk_details, WerkImpact
+
+ENV_GERRIT_USER: Final = "GERRIT_USER"
+ENV_GERRIT_HTTP_CREDS: Final = "GERRIT_HTTP_CREDS"
+GERRIT_HOST: Final = "review.lan.tribe29.com"
+# TODO: improve detection of master branch's version.
+MASTER_BRANCH: Final = "3.0.0"
+CSV_DELIMITER: Final = ", "
+JIRA_URL_PREFIX: Final = "https://jira.lan.tribe29.com/browse"
+HEADER: Final = "header"
+
+
+class TCliArgs(Namespace):
+    age: int
+    cmk_version: str
+    dir_csv: str
+    http_creds: str
+    status: str
+    username: str
+
+
+@dataclass(frozen=True)
+class CSVEntry:
+    change_url: str = field(metadata={HEADER: "Change URL"})
+    jira_url: str = field(metadata={HEADER: "JIRA ticket(s)"})
+    change_status: TChangeStatus = field(metadata={HEADER: "Change status"})
+    is_reviewed: bool | None = field(metadata={HEADER: "Peer reviewed"})
+    tested: bool = field(metadata={HEADER: "Contains tests"})
+    werk_id: str = field(metadata={HEADER: "Werk ID"})
+    werk_summary: str = field(metadata={HEADER: "Werk summary"})
+    werk_impact: WerkImpact = field(metadata={HEADER: "Impact"})
+
+    @classmethod
+    def csv_header(cls) -> str:
+        return CSV_DELIMITER.join(data_field.metadata[HEADER] for data_field in fields(cls))
+
+    @override
+    def __str__(self) -> str:
+        return CSV_DELIMITER.join(
+            str(getattr(self, data_field.name)) for data_field in fields(self)
+        )
+
+
+@cache
+def netrc_credentials() -> tuple[str, str]:
+    """Read the `login`/`password` for the gerrit host from the user's `~/.netrc`.
+
+    Return empty strings when the file is missing, unparseable, or has no entry for the host.
+    """
+    try:
+        authenticators = netrc.netrc().authenticators(GERRIT_HOST)
+    except FileNotFoundError, netrc.NetrcParseError:
+        return "", ""
+    if authenticators is None:
+        return "", ""
+    login, _account, password = authenticators
+    return login or "", password or ""
+
+
+def parsed_arguments() -> type[TCliArgs]:
+    """Parse arguments from the CLI, environment variables or `~/.netrc`."""
+    parser = ArgumentParser(description=__doc__, formatter_class=RawTextHelpFormatter)
+
+    # required arguments
+
+    def cmk_version(value: str) -> str:
+        """Validate Checkmk version provided to the script follows an expected convention."""
+        if not re.findall(r"2\.\d+\.0(?:[bp]\d+)*$", value.strip()):
+            raise ValueError
+        return value
+
+    parser.add_argument(
+        "--cmk-version",
+        dest="cmk_version",
+        metavar="2.M.0[pN,bN]",
+        type=cmk_version,
+        help="List werks corresponding to a certain Checkmk version. M, N are positive integers.",
+        required=True,
+    )
+
+    # optional arguments
+
+    def gerrit_username(value: str) -> str:
+        """Initialize username using the environment variable or `~/.netrc`, if necessary."""
+        user = value or os.getenv(ENV_GERRIT_USER, "") or netrc_credentials()[0]
+        if not user:
+            raise ValueError(
+                f"Initialize `{ENV_GERRIT_USER}` or add a `machine {GERRIT_HOST}` entry "
+                "to your `~/.netrc` to read the gerrit username!"
+            )
+        return user
+
+    parser.add_argument(
+        "--username",
+        dest="username",
+        metavar=ENV_GERRIT_USER,
+        type=gerrit_username,
+        default="",
+        help=(
+            "Provide the username corresponding to the gerrit-account. "
+            f"By default, use the one defined within environment variable `{ENV_GERRIT_USER}`, "
+            f"falling back to the `login` of the `machine {GERRIT_HOST}` entry in `~/.netrc`."
+        ),
+    )
+
+    def http_creds(value: str) -> str:
+        creds = value or os.getenv(ENV_GERRIT_HTTP_CREDS, "") or netrc_credentials()[1]
+        if not creds:
+            raise ValueError(
+                f"Initialize `{ENV_GERRIT_HTTP_CREDS}` or add a `machine {GERRIT_HOST}` entry "
+                "to your `~/.netrc` to read user specific gerrit HTTP credentials!"
+            )
+        return creds
+
+    parser.add_argument(
+        "--http-creds",
+        dest="http_creds",
+        metavar=ENV_GERRIT_HTTP_CREDS,
+        type=http_creds,
+        default="",
+        help=(
+            "Provide the user specific HTTP credentials required to access gerrit API. "
+            f"By default, these are read from the environment variable `{ENV_GERRIT_HTTP_CREDS}`, "
+            f"falling back to the `password` of the `machine {GERRIT_HOST}` entry in `~/.netrc`.\n"
+            f"Set it up using `https://{GERRIT_HOST}/settings/#HTTPCredentials`."
+        ),
+    )
+
+    parser.add_argument(
+        "--age",
+        dest="age",
+        metavar="LAST_N_DAYS",
+        type=int,
+        help="Filter and list werks added in the last `N` days.",
+    )
+
+    parser.add_argument(
+        "--status",
+        dest="status",
+        action="store",
+        type=str,
+        choices=TChangeStatus.cli_args(),
+        default=TChangeStatus.ALL,
+        help=(
+            "List werks based on status of the gerrit change. Brief summary of the types:\n"
+            "+ NEW - Werks under review or development.\n"
+            "+ MERGED - Werks already released to Checkmk version(s).\n"
+            "+ ALL - Werks with both of the above mentioned status.\n"
+            "By default, werks corresponding to `ALL` gerrit changes are listed."
+        ),
+    )
+
+    parser.add_argument(
+        "--dir-csv",
+        dest="dir_csv",
+        metavar="DIR",
+        type=str,
+        help=(
+            "Directory where the list of werks is stored as a CSV file. "
+            "By default, the directory where this script is executed from."
+        ),
+        default=str(Path().cwd()),
+    )
+
+    args, _ = parser.parse_known_args(namespace=TCliArgs)
+    return args
+
+
+def create_search_query(args: type[TCliArgs]) -> str:
+    """Prepare a search query to scrape changes in gerrit for Werks, based on the CLI arguments."""
+    age = "-age"
+    branch = "branch"
+    status = "status"
+
+    query = {
+        "project": PROJECT_NAME,
+        "path": r"^.*werks/.*md",
+        status: "",
+        branch: "",
+        age: "",
+    }
+
+    query[age] = f"{args.age}d" if args.age else ""
+    branch_version = (
+        args.cmk_version.split("p") if "p" in args.cmk_version else args.cmk_version.split("b")
+    )[0]
+
+    query[branch] = "master" if branch_version == MASTER_BRANCH else branch_version
+    query[status] = "" if args.status == TChangeStatus.ALL else args.status
+    return "+".join([f'{key}:"{query[key]}"' for key in query if query[key]])
+
+
+def collect_changes_with_werks(args: type[TCliArgs], client: GerritClient) -> list[CSVEntry]:
+    details = []
+    reverted_changes = []
+    for change in client.changes_api.get_changes(query=create_search_query(args)):
+        # ignore abandoned changes.
+        if change.status is TChangeStatus.ABANDONED:
+            continue
+
+        # do not include changes which revert a Werk.
+        # TODO: improve revert detection mechanism.
+        if change.revert_of != 0:
+            reverted_changes.append(change.revert_of)
+            continue
+
+        if (
+            # ignore changes which are reverted.
+            change.virtual_id_number in reverted_changes
+            # ignore changes which are WIP.
+            or change.work_in_progress
+        ):
+            continue
+
+        try:
+            werk = werk_details(client, change)
+        except FileNotFoundError as exc:
+            exc.add_note("Skip change...")
+            print(exc)  # noqa: T201  # It's OK for scripts to print()
+            continue
+
+        jira_urls = [
+            f"{JIRA_URL_PREFIX}/{jira_id}" for jira_id in get_jira_ticket_in_change(client, change)
+        ]
+
+        if args.cmk_version == werk.VERSION:
+            details.append(
+                CSVEntry(
+                    change_url=change.change_url,
+                    jira_url=" | ".join(jira_urls) or "None",
+                    change_status=change.status,
+                    is_reviewed=change.is_reviewed_by_peer,
+                    tested=change_has_tests(client, change),
+                    werk_id=f"https://checkmk.com/werk/{werk.ID}",
+                    werk_summary=werk.SUMMARY,
+                    werk_impact=werk.IMPACT,
+                )
+            )
+    return details
+
+
+def main() -> None:
+    args = parsed_arguments()
+    client = GerritClient(args.username, args.http_creds)
+
+    # parse changes
+    csv_entries = collect_changes_with_werks(args, client)
+    csv_entries = sorted(csv_entries, key=lambda _: _.werk_id)
+    with open(Path(args.dir_csv) / f"werks_{args.cmk_version}.csv", "w") as file:
+        print(CSVEntry.csv_header(), end="\n", file=file)
+        for entry in csv_entries:
+            print(str(entry), end="\n", file=file)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+"""agent_splunk
+
+Checkmk special agent for Splunk
+"""
+
+import argparse
+import sys
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from typing import Any, NamedTuple, ReadOnly, TypedDict
+
+import requests
+import urllib3
+
+from cmk.password_store.v1_unstable import parser_add_secret_option, resolve_secret_option
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+__version__ = "3.0.0b1"
+
+USER_AGENT = f"checkmk-special-splunk-{__version__}"
+
+PASSWORD_OPTION = "password"
+
+
+# These are silly types, just crafted to match the assumptions the code makes.
+# They are currently only used when typing function arguments.
+# We're always passing the `Any`s returned by json.loads, no actual parsing.
+# At least it makes the assumptions explicit and lets us remove the module level suppressions.
+
+
+class _Entry[C](TypedDict):
+    name: ReadOnly[object]
+    content: ReadOnly[C]
+
+
+class _LicenseState(TypedDict):
+    label: ReadOnly[str]
+    max_violations: ReadOnly[object]
+    window_period: ReadOnly[object]
+    expiration_time: ReadOnly[object]
+    quota: ReadOnly[object]
+    status: ReadOnly[object]
+
+
+class _LicenseUsage(TypedDict):
+    quota: ReadOnly[object]
+    slaves_usage_bytes: ReadOnly[object]
+
+
+class _SystemMsg(TypedDict):
+    severity: ReadOnly[object]
+    server: ReadOnly[object]
+    timeCreated_iso: ReadOnly[object]
+    message: ReadOnly[object]
+
+
+class _JobsEntry(TypedDict):
+    published: object
+    author: object
+    content: _Jobs
+
+
+class _Jobs(TypedDict):
+    request: ReadOnly[Mapping[str, object]]
+    dispatchState: ReadOnly[object]
+    isZombie: ReadOnly[object]
+
+
+class _Health(TypedDict):
+    health: ReadOnly[object]
+    features: ReadOnly[Mapping[str, Mapping[str, Mapping[str, Mapping[str, object]]]]]
+
+
+class _Alert(TypedDict):
+    triggered_alert_count: ReadOnly[object]
+
+
+class Section(NamedTuple):
+    name: str
+    uri: str
+    handler: Callable[[Any], None]  # type: ignore[explicit-any]
+
+
+def main(argv: None | Sequence[str] = None) -> None | int:
+    if argv is None:
+        argv = sys.argv[1:]
+    # Sections to query
+    # https://docs.splunk.com/Documentation/Splunk/7.2.6/RESTREF/RESTlicense#licenser.2Fpools
+    sections = [
+        Section(
+            name="license_state",
+            uri="/services/licenser/licenses",
+            handler=handle_license_state,
+        ),
+        Section(
+            name="license_usage",
+            uri="/services/licenser/usage",
+            handler=handle_license_usage,
+        ),
+        Section(
+            name="system_msg",
+            uri="/services/messages",
+            handler=handle_system_msg,
+        ),
+        Section(
+            name="jobs",
+            uri="/services/search/jobs",
+            handler=handle_jobs,
+        ),
+        Section(
+            name="health",
+            uri="/services/server/health/splunkd/details",
+            handler=handle_health,
+        ),
+        Section(
+            name="alerts",
+            uri="/services/alerts/fired_alerts",
+            handler=handle_alerts,
+        ),
+    ]
+
+    args = parse_arguments(argv)
+
+    try:
+        handle_request(args, sections)
+    except Exception as e:
+        sys.stderr.write("Unhandled exception: %s\n" % e)
+        if args.debug:
+            return 1
+    return None
+
+
+def handle_request(args: argparse.Namespace, sections: Sequence[Section]) -> object:  # type: ignore[explicit-any]
+    url_base = "%s://%s:%d" % (args.proto, args.hostname, args.port)
+    password = resolve_secret_option(args, PASSWORD_OPTION)
+
+    for section in sections:
+        if section.name in args.modules:
+            try:
+                url = url_base + section.uri
+
+                response = requests.get(
+                    url,
+                    auth=(args.user, password.reveal()),
+                    data={"output_mode": "json"},
+                    headers={"User-Agent": USER_AGENT},
+                    timeout=900,
+                )
+
+                response.raise_for_status()
+
+            except requests.exceptions.RequestException as e:
+                sys.stderr.write("Error: %s\n" % e)
+                if args.debug:
+                    raise
+                return 1
+
+            value = response.json().get("entry")
+            if value is None:
+                continue
+
+            sys.stdout.write("<<<splunk_%s>>>\n" % section.name)
+            section.handler(value)
+    return None
+
+
+def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
+    prog, description = __doc__.split("\n\n", maxsplit=1)
+    parser = argparse.ArgumentParser(
+        prog=prog, description=description, formatter_class=argparse.RawTextHelpFormatter
+    )
+
+    parser.add_argument("-u", "--user", default=None, help="Username for splunk login")
+    parser_add_secret_option(
+        parser,
+        long=f"--{PASSWORD_OPTION}",
+        required=False,
+        help="Password for splunk login",
+    )
+    parser.add_argument(
+        "-P",
+        "--proto",
+        default="https",
+        help="Use 'http' or 'https' for connection to splunk (default=https)",
+    )
+    parser.add_argument(
+        "-p", "--port", default=8089, type=int, help="Use alternative port (default: 8089)"
+    )
+    parser.add_argument(
+        "-m",
+        "--modules",
+        default="license_state license_usage system_msg jobs health alerts",
+        type=lambda x: x.split(" "),
+        help="Space-separated list of data to query. Possible values: 'license_state license_usage system_msg jobs health alerts' (default: all)",
+    )
+    parser.add_argument(
+        "--debug", action="store_true", help="Debug mode: let Python exceptions come through"
+    )
+    parser.add_argument(
+        "hostname", metavar="HOSTNAME", help="Name of the splunk instance to query."
+    )
+
+    return parser.parse_args(argv)
+
+
+def handle_license_state(value: Iterable[_Entry[_LicenseState]]) -> None:
+    for entries in value:
+        sys.stdout.write(
+            "%s %s %s %s %s %s\n"
+            % (
+                "_".join(
+                    entries["content"]["label"].split()
+                ),  # Plain text description of this license
+                entries["content"][
+                    "max_violations"
+                ],  # max number of violations allowed during window period
+                entries["content"][
+                    "window_period"
+                ],  # rolling period, in days, in which violations are aggregated
+                entries["content"]["quota"],  # Daily indexing quota, in bytes, for this license
+                entries["content"]["expiration_time"],  # time this license expires (UTC)
+                entries["content"]["status"],  # status of a license can be either VALID or EXPIRED
+            )
+        )
+
+
+def handle_license_usage(value: Iterable[_Entry[_LicenseUsage]]) -> None:
+    for entries in value:
+        sys.stdout.write(
+            "%s %s\n"
+            % (
+                entries["content"]["quota"],  # The byte quota of this license stack (sum)
+                entries["content"][
+                    "slaves_usage_bytes"
+                ],  # Slave usage b across all pools within active license group.
+            )
+        )
+
+
+def handle_system_msg(value: Iterable[_Entry[_SystemMsg]]) -> None:
+    for entries in value:
+        sys.stdout.write(
+            "%s %s %s %s %s\n"
+            % (
+                entries["name"],  # This field might contain the same text as the message field.
+                entries["content"][
+                    "severity"
+                ],  # One of the following message severity values: info/warn/error
+                entries["content"]["server"],  # Name of the server that generated the error
+                entries["content"]["timeCreated_iso"],  # ISO formatted timestamp
+                entries["content"]["message"],  # message field
+            )
+        )
+
+
+def handle_jobs(value: Iterable[_JobsEntry]) -> None:
+    for entries in value:
+        sys.stdout.write(
+            "%s %s %s %s %s\n"
+            % (
+                entries["published"],  # creation time
+                entries["author"],  # author of the search
+                # Application of the search, may be empty for internal searches
+                entries.get("content", {}).get("request", {}).get("ui_dispatch_app", "Unknown"),
+                entries["content"]["dispatchState"],  # state of the search
+                entries["content"]["isZombie"],  # zombie state (false/true)
+            )
+        )
+
+
+def handle_health(value: Sequence[_Entry[_Health]]) -> None:
+    sys.stdout.write("Overall_state %s\n" % value[0].get("content", {}).get("health"))
+
+    for func, state in value[0]["content"]["features"].items():
+        func_name = f"{func[0].upper()}{func[1:].lower()}"
+        sys.stdout.write("{} {}\n".format(func_name.replace(" ", "_"), state.get("health", {})))
+
+        if state.get("disabled", False):
+            # Some functions may have set '"disabled": True' and it seems
+            # that "features" are missing in this case
+            continue
+
+        for feature, status in state["features"].items():
+            feature_name = f"{feature[0].upper()}{feature[1:].lower()}"
+            sys.stdout.write(
+                "{} {} {}\n".format(
+                    func_name.replace(" ", "_"), feature_name.replace(" ", "_"), status["health"]
+                )
+            )
+
+
+def handle_alerts(value: Sequence[_Entry[_Alert]]) -> None:
+    sys.stdout.write("%s\n" % value[0]["content"]["triggered_alert_count"])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

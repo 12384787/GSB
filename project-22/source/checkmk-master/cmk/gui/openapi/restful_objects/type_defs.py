@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+# Copyright (C) 2020 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, Literal, NotRequired, TypedDict
+
+from marshmallow import fields, Schema
+
+from cmk.gui.http import HTTPMethod
+
+URL = str
+
+DomainType = Literal[
+    "acknowledge",
+    "activation_run",
+    "agent",
+    "agent_binary",
+    "agent_registration_token",
+    "agent_download_token",
+    "audit_log",
+    "background_job",
+    "bi_aggregation",
+    "bi_pack",
+    "bi_rule",
+    "broker_connection",
+    "comment",
+    "configuration_entity",
+    "constant",
+    "contact_group_config",
+    "custom_graph",
+    "custom_graph_metadata",
+    "custom_host_attribute",
+    "custom_service",
+    "customer",
+    "dashboard",
+    "dashboard_metadata",
+    "dashboard_relative_grid",
+    "dashboard_responsive_grid",
+    "dashboard_token",
+    "data_backend",
+    "dcd",
+    "dcd_telemetry_metrics",
+    "discovery_run",
+    "downtime",
+    "event_console",
+    "form_spec",
+    "folder",
+    "folder_config",
+    "global_setting",
+    "graph",
+    "graph_timerange",
+    "historical_event",
+    "host",
+    "host_availability",
+    "host_config",
+    "host_config_internal",
+    "hostgroup",
+    "host_group_config",
+    "host_tag_group",
+    "icon",
+    "icon_category",
+    "icon_emblem",
+    "inventory",
+    "javascript_crash_report",
+    "ldap_connection",
+    "licensing",
+    "license_response",
+    "license_usage",
+    "license_request",
+    "master_control",
+    "metric",
+    "notification_rule",
+    "notification_parameter",
+    "otel_collector",
+    "otel_collector_config",
+    "otel_collector_config_receivers",
+    "otel_collector_config_bundles",
+    "otel_collector_config_prom_scrape",
+    "pagetype_topic",
+    "password",
+    "passwordstore_password",
+    "oauth2_connection",
+    "parent_scan",
+    "relay",
+    "relay_registration_token",
+    "rule",
+    "rule_form_spec",
+    "ruleset",
+    "saml_connection",
+    "service",
+    "service_availability",
+    "service_discovery",
+    "service_discovery_run",
+    "servicegroup",
+    "service_group_config",
+    "sidebar_element",
+    "sign_key",
+    "site_connection",
+    "sla",
+    "telemetry_metrics",
+    "time_period",
+    "user",
+    "user_config",
+    "user_role",
+    "user_message",
+    "aux_tag",
+    "autocomplete",
+    "quick_setup",
+    "quick_setup_action_result",
+    "quick_setup_stage",
+    "quick_setup_stage_action_result",
+    "onboarding",
+    "view",
+    "visual_filter",
+    "visual_filter_group",
+]
+
+
+CmkEndpointName = Literal[
+    "cmk/run",
+    "cmk/run_setup",
+    "cmk/activate",
+    "cmk/acknowledge",
+    "cmk/create_agent_registration_token",
+    "cmk/create_agent_download_token",
+    "cmk/create_relay_registration_token",
+    "cmk/bake",
+    "cmk/bake_and_sign",
+    "cmk/cancel",
+    "cmk/bulk_create",
+    "cmk/bulk_delete",
+    "cmk/bulk_discovery",
+    "cmk/bulk_update",
+    "cmk/clone_dashboard_from_relative_grid",
+    "cmk/clone_dashboard_relative_grid",
+    "cmk/clone_dashboard_responsive_grid",
+    "cmk/compute",
+    "cmk/compute_dashboard_widget_titles",
+    "cmk/compute-list",
+    "cmk/compute_network_flow_autonomous_system_context",
+    "cmk/compute_network_flow_donut",
+    "cmk/compute_network_flow_donut_other_breakdown",
+    "cmk/compute_network_flow_host_context",
+    "cmk/compute_network_flow_kpi_stat_card",
+    "cmk/compute_network_flow_top_table",
+    "cmk/compute_network_flow_trend_chart",
+    "cmk/compute_shared_single_metric",
+    "cmk/compute_shared_timeline_count",
+    "cmk/compute_single_metric",
+    "cmk/compute_timeline_count",
+    "cmk/configure",
+    "cmk/create",
+    "cmk/create_aux_tag",
+    "cmk/create_host",
+    "cmk/create_for_host",
+    "cmk/create_service",
+    "cmk/create_for_service",
+    "cmk/create_cluster",
+    "cmk/create_dashboard_relative_grid",
+    "cmk/create_dashboard_responsive_grid",
+    "cmk/create_dashboard_token",
+    "cmk/discover_average_scatterplot_graphs",
+    "cmk/discover_combined_graphs",
+    "cmk/discover_custom_graphs",
+    "cmk/discover_problem_percentage_graphs",
+    "cmk/discover_single_timeseries_graphs",
+    "cmk/discover_template_graphs",
+    "cmk/download",
+    "cmk/download_by_hash",
+    "cmk/download_by_host",
+    "cmk/download_by_token",
+    "cmk/download_license_request",
+    "cmk/edit_dashboard_relative_grid",
+    "cmk/edit_dashboard_responsive_grid",
+    "cmk/edit_dashboard_token",
+    "cmk/fetch",
+    "cmk/fetch_custom_graph_data",
+    "cmk/fetch_dashboard_widget_graph_data",
+    "cmk/fetch_phase_one",
+    "cmk/list",
+    "cmk/list_widget_inventory",
+    "cmk/list_icon_categories",
+    "cmk/list_icon_emblems",
+    "cmk/move",
+    "cmk/permalink",
+    "cmk/rename",
+    "cmk/show",
+    "cmk/show_dashboard_relative_grid",
+    "cmk/show_dashboard_responsive_grid",
+    "cmk/show_site_global_setting",
+    "cmk/sign",
+    "cmk/start",
+    "cmk/translate_metric_names",
+    "cmk/host_config",
+    "cmk/folder_config",
+    "cmk/global_config",
+    "cmk/delete_bi_rule",
+    "cmk/delete_bi_aggregation",
+    "cmk/delete_bi_pack",
+    "cmk/delete_dashboard_token",
+    "cmk/delete_site_global_setting",
+    "cmk/put_bi_rule",
+    "cmk/post_bi_rule",
+    "cmk/bi_aggregation_state_post",
+    "cmk/bi_aggregation_state_get",
+    "cmk/put_bi_aggregation",
+    "cmk/post_bi_aggregation",
+    "cmk/put_bi_pack",
+    "cmk/put_bi_packs",
+    "cmk/get_bi_rule",
+    "cmk/get_bi_aggregation",
+    "cmk/get_bi_pack",
+    "cmk/get_bi_packs",
+    "cmk/pending-activation-changes",
+    "cmk/put_bi_pack",
+    "cmk/post_bi_pack",
+    "cmk/wait-for-completion",
+    "cmk/baking-status",
+    "cmk/bakery-status",
+    "cmk/service.move-monitored",
+    "cmk/service.move-undecided",
+    "cmk/service.move-ignored",
+    "cmk/service.bulk-acknowledge",
+    "cmk/link_uuid",
+    "cmk/get_graph",
+    "cmk/get_custom_graph",
+    "cmk/filter_graph",
+    "cmk/resolve_color",
+    "cmk/site_logout",
+    "cmk/site_login",
+    "cmk/update",
+    "cmk/update_site_global_setting",
+    "cmk/update_and_acknowledge",
+    "cmk/upload_license_response",
+    "cmk/change_state",
+    "cmk/get_state",
+    "cmk/verify",
+    "cmk/register",
+    "cmk/register_token",
+    "cmk/quick_setup",
+    "cmk/save_quick_setup",
+    "cmk/edit_quick_setup",
+    "cmk/delete_quick_setup",
+    "cmk/list_filter_groups",
+    "cmk/host_action_menu",
+    "cmk/service_action_menu",
+    "cmk/list_host_events",
+]
+
+RestfulEndpointName = Literal[
+    "describedby",  # sic
+    "help",
+    "icon",
+    "previous",
+    "next",
+    "self",
+    "up",
+    ".../action",
+    ".../action-param",
+    ".../add-to",  # takes params
+    ".../attachment",  # takes params
+    ".../choice",  # takes params
+    ".../clear",
+    ".../collection",
+    ".../collection_update_and_acknowledge",
+    ".../collection_change_state",
+    ".../default",
+    ".../delete",
+    ".../details",  # takes params
+    ".../domain-type",
+    ".../domain-types",
+    ".../element",
+    ".../element-type",
+    ".../fetch",
+    ".../invoke",
+    ".../modify",
+    ".../persist",
+    ".../property",
+    ".../remove-from",  # takes params
+    ".../return-type",
+    ".../services",
+    ".../service",  # takes params
+    ".../update",
+    ".../user",
+    ".../value",  # takes params
+    ".../version",
+]  # fmt: off
+
+LinkRelation = CmkEndpointName | RestfulEndpointName
+EndpointFamilyName = str
+EndpointKey = tuple[EndpointFamilyName, LinkRelation]
+TagGroup = Literal["Monitoring", "Setup", "Checkmk Internal", "Undocumented Endpoint"]
+
+PropertyFormat = Literal[
+    # String values
+    "string",
+    # The value should simply be interpreted as a string. This is also the default if
+    # the "format" json-property is omitted (or if no domain metadata is available)
+    "date-time",  # A date in ISO 8601 format of YYYY-MM-DDThh:mm:ssZ in UTC time
+    "date",  # A date in the format of YYYY-MM-DD.
+    "time",  # A time in the format of hh:mm:ss.
+    "utc-millisec",  # The difference, measured in milliseconds, between the
+    # specified time and midnight, 00:00 of January 1, 1970 UTC.
+    "big-integer(n)",  # The value should be parsed as an integer, scale n.
+    "big-integer(s,p)",  # The value should be parsed as a big decimal, scale n,
+    # precision p.
+    "blob",  # base-64 encoded byte-sequence
+    "clob",  # character large object: the string is a large array of
+    # characters, for example an HTML resource
+    # Non-string values
+    "decimal",  # the number should be interpreted as a float-point decimal.
+    "int",  # the number should be interpreted as an integer.
+]  # fmt: off
+CollectionItem = dict[str, str]
+LocationType = Literal["path", "query", "header", "cookie"]
+ResultType = Literal["object", "list", "scalar", "void"]
+
+KnownContentType = Literal[
+    "application/json",
+    "application/gzip",
+]
+AcceptFieldType = KnownContentType | list[KnownContentType]
+
+
+class LinkType(TypedDict):
+    rel: str
+    href: str
+    type: str
+    method: str
+    domainType: Literal["link"]
+    title: NotRequired[str]
+    body_params: NotRequired[dict[str, str | None]]
+
+
+class ActionObject(TypedDict):
+    id: str
+    memberType: str
+    links: list[LinkType]
+    parameters: dict[str, Any]
+
+
+class Result(TypedDict):
+    links: list[LinkType]
+    value: Any | None
+
+
+class ActionResult(TypedDict):
+    links: list[LinkType]
+    resultType: ResultType
+    result: Result
+
+
+class DomainObject(TypedDict):
+    domainType: DomainType
+    id: str
+    title: str
+    links: list[LinkType]
+    members: dict[str, Any]
+    extensions: NotRequired[dict[str, Any]]
+
+
+class CollectionObject(TypedDict):
+    id: str
+    domainType: str
+    links: list[LinkType]
+    value: Any
+    extensions: dict[str, str]
+
+
+class ObjectProperty(TypedDict, total=False):
+    id: str
+    value: Any
+    disabledReason: str
+    choices: list[Any]
+    links: list[LinkType]
+    extensions: dict[str, Any]
+
+
+Serializable = Mapping[str, Any] | CollectionObject | ObjectProperty | DomainObject | ActionResult
+ETagBehaviour = Literal["input", "output", "both"]
+
+SchemaClass = type[Schema]
+SchemaInstanceOrClass = Schema | SchemaClass
+OpenAPISchemaType = Literal["string", "array", "object", "boolean", "integer", "number"]
+
+# Used to blacklist some endpoints in certain locations
+EndpointTarget = Literal["swagger-ui", "doc"]
+
+
+def translate_to_openapi_keys(
+    name: str,
+    location: LocationType,
+    description: str | None = None,
+    required: bool = True,
+    example: str | None = None,
+    allow_empty: bool | None = False,
+    schema_enum: list[str] | None = None,
+    schema_type: OpenAPISchemaType = "string",
+    schema_string_pattern: str | None = None,
+    schema_string_format: PropertyFormat | None = None,
+    schema_num_minimum: int | None = None,
+    schema_num_maximum: int | None = None,
+) -> OpenAPIParameter:
+    """
+    Args:
+        name:
+        location:
+        description:
+        required:
+        example:
+        allow_empty:
+        schema_enum:
+        schema_type:
+        schema_string_pattern:
+        schema_string_format:
+        schema_num_minimum:
+        schema_num_maximum:
+
+    Returns:
+
+    """
+    schema: SchemaType = {"type": schema_type}
+    if schema_type == "string":
+        if schema_string_format is not None:
+            schema["format"] = schema_string_format
+        if schema_string_pattern is not None:
+            schema["pattern"] = schema_string_pattern
+    if schema_enum:
+        schema["enum"] = schema_enum
+    if schema_type in ("number", "integer"):
+        if schema_num_minimum is not None:
+            schema["minimum"] = schema_num_minimum
+        if schema_num_maximum is not None:
+            schema["maximum"] = schema_num_maximum
+    if not required and location == "path":
+        raise ValueError(f"Path parameters must be required. In {name} - {description}")
+    raw_values: OpenAPIParameter = {
+        "name": name,
+        "in": location,
+        "required": required,
+    }
+    if description is not None:
+        raw_values["description"] = description
+    if allow_empty is not None:
+        if location == "query":
+            raw_values["allowEmptyValue"] = allow_empty
+        elif allow_empty is True:
+            raise ValueError(
+                f"allowEmptyValue can only be set to true for query parameters. In {name} - {description}"
+            )
+    if example is not None:
+        raw_values["example"] = example
+    if schema:
+        raw_values["schema"] = schema
+    return raw_values
+
+
+ValidatorType = Callable[[Any], dict[str, list[str]] | None]
+
+MarshmallowFieldParams = Mapping[str, fields.Field]
+
+
+class SchemaType(TypedDict, total=False):
+    type: OpenAPISchemaType
+    format: PropertyFormat
+    pattern: str
+    enum: list[Any]
+    minimum: int | float
+    maximum: int | float
+
+
+OpenAPIParameter = TypedDict(
+    "OpenAPIParameter",
+    {
+        "name": str,
+        "description": str,
+        "in": LocationType,
+        "required": bool,
+        "allowEmptyValue": bool,
+        "example": Any,
+        "schema": SchemaType | type[Schema],
+        "content": dict[str, dict[str, object]],
+    },
+    total=False,
+)
+
+RawParameter = MarshmallowFieldParams | type[Schema]
+
+
+class PathItem(TypedDict, total=False):
+    content: dict[str, dict[str, Any]]
+    description: str
+    headers: dict[str, OpenAPIParameter]
+
+
+ResponseType = TypedDict(
+    "ResponseType",
+    {
+        "200": PathItem,
+        "204": PathItem,
+        "301": PathItem,
+        "302": PathItem,
+        "303": PathItem,
+        "400": PathItem,
+        "401": PathItem,
+        "403": PathItem,
+        "404": PathItem,
+        "405": PathItem,
+        "406": PathItem,
+        "409": PathItem,
+        "415": PathItem,
+        "412": PathItem,
+        "422": PathItem,
+        "423": PathItem,
+        "428": PathItem,
+    },
+    total=False,
+)
+
+
+class CodeSample(TypedDict, total=True):
+    label: str
+    lang: str
+    source: str
+
+
+ParameterReference = str
+
+OperationSpecType = TypedDict(
+    "OperationSpecType",
+    {
+        "x-codeSamples": list[CodeSample],
+        "operationId": str,
+        "tags": list[str],
+        "description": str,
+        "responses": ResponseType,
+        "parameters": Sequence[OpenAPIParameter],
+        "requestBody": dict[str, Any],
+        "summary": str,
+        "deprecated": bool,
+    },
+    total=False,
+)
+
+OperationObject = dict[HTTPMethod, OperationSpecType]
+
+OpenAPITag = TypedDict(
+    "OpenAPITag",
+    {
+        "name": str,
+        "description": str,
+        "externalDocs": str,
+        "x-displayName": str,
+    },
+    total=False,
+)
+
+
+ParameterKey = tuple[str, ...]
+
+ErrorStatusCodeInt = Literal[
+    400,
+    401,
+    403,
+    404,
+    405,
+    406,
+    409,
+    412,
+    415,
+    422,
+    423,
+    428,
+    429,
+    500,
+    503,
+    504,
+]
+SuccessStatusCodeInt = Literal[
+    200,
+    201,
+    204,
+]
+
+RedirectStatusCodeInt = Literal[
+    301,
+    302,
+    303,
+]
+
+StatusCodeInt = Literal[
+    SuccessStatusCodeInt,
+    ErrorStatusCodeInt,
+    RedirectStatusCodeInt,
+]
+
+StatusCode = Literal[
+    "200",
+    "201",
+    "204",
+    "301",
+    "302",
+    "303",
+    "400",
+    "401",
+    "403",
+    "404",
+    "405",
+    "406",
+    "409",
+    "412",
+    "415",
+    "422",
+    "423",
+    "428",
+    "429",
+    "500",
+    "503",
+    "504",
+]
+
+ContentType = str
+ContentObject = dict[ContentType, dict[str, Any]]

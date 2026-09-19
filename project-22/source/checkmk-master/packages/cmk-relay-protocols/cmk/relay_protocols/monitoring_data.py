@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+import re
+from enum import StrEnum
+from typing import Annotated
+
+from pydantic import Base64Bytes, BaseModel, StringConstraints
+
+REGEX_HOST_NAME = re.compile(r"^\w[-0-9a-zA-Z_.]*$", re.ASCII)
+Host = Annotated[str, StringConstraints(pattern=REGEX_HOST_NAME)]
+
+REGEX_SERVICE_NAME = re.compile(r"^[^\n;]+$")
+Service = Annotated[str, StringConstraints(min_length=1, pattern=REGEX_SERVICE_NAME)]
+
+
+class PayloadType(StrEnum):
+    FETCHER = "FETCHER"
+    ACTIVE_CHECK = "ACTIVE_CHECK"
+
+
+class MonitoringData(BaseModel):
+    serial: int
+    host: Host
+    timestamp: int
+    payload: Base64Bytes
+    service: Service
+    version: int = 1
+    payload_type: PayloadType = PayloadType.FETCHER

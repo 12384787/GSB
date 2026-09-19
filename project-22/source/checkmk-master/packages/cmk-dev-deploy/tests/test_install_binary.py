@@ -1,0 +1,106 @@
+# Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+"""Unit tests for bazel_builder helpers (binary install, bazel commands)."""
+
+import os
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from cmk.dev_deploy.core.bazel import OUTPUT_BASE_ENV, SHARED_SERVER_ENV
+from cmk.dev_deploy.deployers.bazel_builder import _build_targets, _install_binary
+
+
+class TestBuildCommand:
+    """Every configuration-creating bazel command pins the site's edition."""
+
+    def test_build_pins_edition_on_deploy_server(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(OUTPUT_BASE_ENV, "/ob")
+        monkeypatch.delenv(SHARED_SERVER_ENV, raising=False)
+        with patch("cmk.dev_deploy.deployers.bazel_builder.run_checked") as run:
+            _build_targets(["//pkg:target"], tmp_path, None, "pro")
+        cmd = run.call_args.args[0]
+        assert cmd[:2] == ["bazel", "--output_base=/ob"]
+        assert "--cmk_edition=pro" in cmd
+        assert cmd[-1] == "//pkg:target"
+
+    def test_build_with_version_flag(self, tmp_path: Path) -> None:
+        with patch("cmk.dev_deploy.deployers.bazel_builder.run_checked") as run:
+            _build_targets(["//pkg:target"], tmp_path, "2.6.0", "ultimate")
+        cmd = run.call_args.args[0]
+        assert "--cmk_edition=ultimate" in cmd
+        assert "--cmk_version=2.6.0" in cmd
+
+
+class TestInstallBinary:
+    """Tests for _install_binary with unlink-before-copy."""
+
+    def test_first_install(self, tmp_path: Path) -> None:
+        """Binary is installed when destination does not exist."""
+        src = tmp_path / "src" / "binary"
+        src.parent.mkdir()
+        src.write_bytes(b"ELF_CONTENT")
+        dest = tmp_path / "site" / "lib" / "binary"
+
+        _install_binary(src, dest, 0o755)
+
+        assert dest.read_bytes() == b"ELF_CONTENT"
+        assert os.stat(dest).st_mode & 0o777 == 0o755
+
+    def test_replaces_existing_on_fresh_inode(self, tmp_path: Path) -> None:
+        """Existing file is unlinked so the copy creates a new inode."""
+        src = tmp_path / "new_binary"
+        src.write_bytes(b"NEW_CONTENT")
+        dest = tmp_path / "old_binary"
+        dest.write_bytes(b"OLD_CONTENT")
+        _old_inode = dest.stat().st_ino
+
+        _install_binary(src, dest, 0o755)
+
+        assert dest.read_bytes() == b"NEW_CONTENT"
+        # On most filesystems the old inode is freed and a new one is
+        # allocated.  We cannot assert st_ino differs (the allocator may
+        # reuse it), but we CAN verify the content was replaced and the
+        # unlink happened by checking that holding an open fd to the old
+        # file does not see the new content.
+
+    def test_open_fd_survives_unlink(self, tmp_path: Path) -> None:
+        """A process holding an fd to the old file keeps its data."""
+        src = tmp_path / "new_binary"
+        src.write_bytes(b"NEW_CONTENT")
+        dest = tmp_path / "old_binary"
+        dest.write_bytes(b"OLD_CONTENT")
+
+        # Simulate a running process holding an fd to the old file
+        with open(dest, "rb") as old_fd:
+            _install_binary(src, dest, 0o755)
+            # The fd still reads the OLD content (old inode kept alive)
+            assert old_fd.read() == b"OLD_CONTENT"
+
+        # But the path now has the NEW content (new inode)
+        assert dest.read_bytes() == b"NEW_CONTENT"
+
+    def test_parent_dirs_created(self, tmp_path: Path) -> None:
+        """Parent directories of dest are created automatically."""
+        src = tmp_path / "binary"
+        src.write_bytes(b"CONTENT")
+        dest = tmp_path / "a" / "b" / "c" / "binary"
+
+        _install_binary(src, dest, 0o755)
+
+        assert dest.read_bytes() == b"CONTENT"
+
+    def test_mode_is_set(self, tmp_path: Path) -> None:
+        """File permissions are applied after copy."""
+        src = tmp_path / "binary"
+        src.write_bytes(b"CONTENT")
+        dest = tmp_path / "out"
+
+        _install_binary(src, dest, 0o644)
+
+        assert os.stat(dest).st_mode & 0o777 == 0o644

@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+
+"""agent_vnx_quotas
+
+Checkmk special agent for monitoring VNX quotas.
+"""
+
+import argparse
+import shlex
+import sys
+from pathlib import Path
+from typing import Any
+
+import paramiko
+
+from cmk.password_store.v1_unstable import parser_add_secret_option, resolve_secret_option
+from cmk.utils.paths import omd_root
+
+PASSWORD_OPTION = "password"
+
+
+def _get_known_hosts_file_path() -> Path:
+    return omd_root / ".ssh" / "known_hosts"
+
+
+def _assure_known_hosts_file_exists() -> None:
+    _get_known_hosts_file_path().parent.mkdir(parents=True, exist_ok=True)
+    _get_known_hosts_file_path().touch(exist_ok=True)
+
+
+def get_ssh_client() -> paramiko.SSHClient:
+    """Return a configured paramiko.SSHClient instance"""
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # nosec B507 # BNS:f159c1
+
+    _assure_known_hosts_file_exists()
+    client.load_host_keys(str(_get_known_hosts_file_path()))
+    return client
+
+
+def parse_arguments(argv: list[str]) -> argparse.Namespace:
+    prog, description = __doc__.split("\n\n", maxsplit=1)
+    parser = argparse.ArgumentParser(
+        prog=prog, description=description, formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument("--debug", action="store_true", help="Raise Python exceptions.")
+    parser.add_argument("-u", "--username", required=True, help="The username.")
+    parser_add_secret_option(
+        parser, long=f"--{PASSWORD_OPTION}", required=True, help="The password."
+    )
+    parser.add_argument("--nas-db", required=True, help="The NAS-DB name.")
+    parser.add_argument("hostname")
+    return parser.parse_args(argv)
+
+
+def get_client_connection(args: argparse.Namespace) -> paramiko.SSHClient:
+    try:
+        client = get_ssh_client()
+        client.connect(
+            args.hostname,
+            username=args.username,
+            password=resolve_secret_option(args, PASSWORD_OPTION).reveal(),
+            timeout=5,
+        )
+        return client
+
+    except Exception as e:
+        raise Exception("Failed to connect to remote host: %s" % e)
+
+
+def main(args: list[str] | None = None) -> None:
+    if args is None:
+        args = sys.argv[1:]
+
+    parsed_args = parse_arguments(args)
+    opt_debug = parsed_args.debug
+    nas_db_env = "export NAS_DB=%s; " % shlex.quote(parsed_args.nas_db)
+    queries = {
+        "quotas": nas_db_env + "/nas/bin/nas_fs -query:* "
+        "-fields:TreeQuotas -format:'%q' -query:* "
+        "-fields:rwvdms,filesystem,path,BlockUsage,BlockHardLimit "
+        "-format:'%L|%s|%s|%d|%L\\n'",
+        "fs": nas_db_env + "/nas/bin/nas_fs -query:inuse==y:IsRoot==False "
+        "-fields:Name,SizeValues -format:'%L|%s\\n'",
+    }
+
+    client = get_client_connection(parsed_args)
+
+    sys.stdout.write("<<<vnx_version:sep(124)>>>\n")
+    stdin, stdout, stderr = client.exec_command(  # nosec B601 # BNS:2aa916
+        nas_db_env + "/nas/bin/nas_version"
+    )
+    stdin.close()
+    sys.stdout.write("Version|%s\n" % stdout)
+    if opt_debug:
+        sys.stderr.write("%s\n" % repr(stderr))
+
+    stdin, stdout, stderr = client.exec_command(  # nosec B601 # BNS:2aa916
+        nas_db_env + "/nas/sbin/model"
+    )
+    stdin.close()
+    sys.stdout.write("AgentOS|%s\n" % stdout)
+    if opt_debug:
+        sys.stderr.write("%s\n" % repr(stderr))
+
+    results: dict[str, dict[str, Any]] = {}
+    for query_type, query in queries.items():
+        stdin, stdout, stderr = client.exec_command(query)  # nosec B601 # BNS:2aa916
+        results.setdefault(
+            query_type,
+            {
+                "stdin": stdin,
+                "stdout": stdout,
+                "stderr": stderr,
+            },
+        )
+        stdin.close()
+
+    for query_type, result in results.items():
+        if opt_debug:
+            sys.stderr.write("%s\n" % repr(result["stderr"]))
+
+        sys.stdout.write("<<<vnx_quotas:sep(124)>>>\n")
+        sys.stdout.write("[[[%s]]]\n" % query_type)
+        for line in result["stdout"].readlines():
+            sys.stdout.write("%s" % line)
+
+
+if __name__ == "__main__":
+    main()

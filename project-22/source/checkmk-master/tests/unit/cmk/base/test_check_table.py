@@ -1,0 +1,1009 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="comparison-overlap"
+
+import dataclasses
+from collections.abc import Mapping, Sequence
+from typing import override
+
+import pytest
+
+from cmk.base.config import (
+    EnforcedServicesTable,
+    FilterMode,
+    HostCheckTable,
+    iter_skipped_services_warnings,
+)
+from cmk.base.configlib.servicename import make_final_service_name_config
+from cmk.ccc.hostaddress import HostName
+from cmk.checkengine.checkerplugin import ConfiguredService
+from cmk.checkengine.checking import ABCCheckingConfig, ServiceConfigurer
+from cmk.checkengine.plugin_backend import get_check_plugin
+from cmk.checkengine.plugins import (
+    AutocheckEntry,
+    CheckPlugin,
+    CheckPluginName,
+    LegacyPluginLocation,
+    ParsedSectionName,
+    ServiceID,
+)
+from cmk.checkengine.specs.parameters import TimespecificParameters, TimespecificParameterSet
+from cmk.ruleset_matcher.matcher import BundledHostRulesetMatcher
+from cmk.ruleset_matcher.tags import TagGroupID, TagID
+from cmk.utils.servicename import MAX_SERVICE_NAME_LEN, ServiceName
+
+# No stub file
+from tests.testlib.unit.base_configuration_scenario import Scenario
+
+
+@dataclasses.dataclass(frozen=True)
+class CheckingConfigTest(ABCCheckingConfig):
+    rules: Mapping[HostName, Sequence[Mapping[str, object]]]
+
+    @override
+    def __call__(
+        self, host_name: HostName, item: object, service_labels: object, ruleset_name: object
+    ) -> Sequence[Mapping[str, object]]:
+        return self.rules.get(host_name, [])
+
+
+# Test-only check plug-ins. The tests below only ever read `service_name` and
+# `check_default_parameters` for `EnforcedServicesTable` lookups; they never
+# invoke `discovery_function` or `check_function`, so those are no-ops.
+def _make_plugin(
+    name: str, service_name: str, check_default_parameters: Mapping[str, object] | None
+) -> CheckPlugin:
+    return CheckPlugin(
+        name=CheckPluginName(name),
+        sections=[ParsedSectionName(name)],
+        service_name=service_name,
+        discovery_function=lambda *args, **kw: iter(()),  # noqa: ARG005
+        discovery_default_parameters=None,
+        discovery_ruleset_name=None,
+        discovery_ruleset_type="merged",
+        check_function=lambda *args, **kw: iter(()),  # noqa: ARG005
+        check_default_parameters=check_default_parameters,
+        check_ruleset_name=None,
+        cluster_check_function=None,
+        location=LegacyPluginLocation(file_name="<test>"),
+    )
+
+
+_TEST_CHECK_PLUGINS: Mapping[CheckPluginName, CheckPlugin] = {
+    CheckPluginName("smart_temp"): _make_plugin(
+        "smart_temp", "Temperature SMART %s", {"levels": (35, 40)}
+    ),
+    CheckPluginName("df"): _make_plugin("df", "Filesystem %s", None),
+}
+
+
+def test_cluster_ignores_nodes_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node = HostName("node")
+    cluster = HostName("cluster")
+
+    service_id = ServiceID(CheckPluginName("smart_temp"), "auto-clustered")
+
+    ts = Scenario()
+    ts.add_host(node)
+    ts.add_cluster(cluster, nodes=[node])
+    ts.set_ruleset(
+        "clustered_services",
+        [
+            {
+                "id": "01",
+                "condition": {
+                    "service_description": [{"$regex": "Temperature SMART auto-clustered$"}],
+                    "host_name": [node],
+                },
+                "value": True,
+            }
+        ],
+    )
+    ts.set_autochecks(node, [AutocheckEntry(*service_id, {}, {})])
+    loading_result = ts.apply(monkeypatch)
+    config_cache = loading_result.config_cache
+    service_name_config = config_cache.make_passive_service_name_config(
+        make_final_service_name_config(loading_result.loaded_config, config_cache.ruleset_matcher)
+    )
+
+    def service_description_callback(hostname: HostName, sid: ServiceID) -> ServiceName:
+        return service_name_config(
+            hostname,
+            sid,
+            (
+                None
+                if (p := get_check_plugin(sid.name, _TEST_CHECK_PLUGINS)) is None
+                else p.service_name
+            ),
+        )
+
+    # a rule for the node:
+    service_configurer = ServiceConfigurer(
+        CheckingConfigTest({node: [{"levels_for_node": (1, 2)}]}),
+        plugins=_TEST_CHECK_PLUGINS,
+        get_service_description=service_description_callback,
+        get_effective_host=config_cache.clustering.effective_host,
+        get_service_labels=config_cache.label_manager.labels_of_service,
+    )
+
+    clustered_service = config_cache.check_table(
+        cluster,
+        _TEST_CHECK_PLUGINS,
+        service_configurer=service_configurer,
+        service_name_config=service_name_config,
+        enforced_services_table=lambda hn: {},  # noqa: ARG005
+    )[service_id]
+    assert clustered_service.parameters.entries == (
+        TimespecificParameterSet({}, ()),
+        TimespecificParameterSet({"levels": (35, 40)}, ()),
+    )
+
+
+def test_check_table_enforced_vs_discovered_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smart = CheckPluginName("smart_temp")
+    node = HostName("node")
+    cluster = HostName("cluster")
+
+    ts = Scenario()
+    ts.add_host(node)
+    ts.add_cluster(cluster, nodes=[node])
+    ts.set_autochecks(
+        node,
+        [
+            AutocheckEntry(smart, "cluster-item", {"source": "autochecks"}, {}),
+            AutocheckEntry(smart, "cluster-item-overridden", {"source": "autochecks"}, {}),
+            AutocheckEntry(smart, "node-item", {"source": "autochecks"}, {}),
+        ],
+    )
+    ts.set_option(
+        "static_checks",
+        {
+            "temperature": [
+                {
+                    "id": "01",
+                    "value": ("smart_temp", "cluster-item", {"source": "enforced-on-node"}),
+                    "condition": {"host_name": [node]},
+                },
+                {
+                    "id": "02",
+                    "value": ("smart_temp", "node-item", {"source": "enforced-on-node"}),
+                    "condition": {"host_name": [node]},
+                },
+                {
+                    "id": "03",
+                    "value": (
+                        "smart_temp",
+                        "cluster-item-overridden",
+                        {"source": "enforced-on-cluster"},
+                    ),
+                    "condition": {"host_name": [cluster]},
+                },
+            ]
+        },
+    )
+    ts.set_ruleset(
+        "clustered_services",
+        [
+            {
+                "id": "04",
+                "condition": {
+                    "service_description": [{"$regex": "Temperature SMART cluster"}],
+                    "host_name": [node],
+                },
+                "value": True,
+            }
+        ],
+    )
+    loading_result = ts.apply(monkeypatch)
+    config_cache = loading_result.config_cache
+    service_name_config = config_cache.make_passive_service_name_config(
+        make_final_service_name_config(loading_result.loaded_config, config_cache.ruleset_matcher)
+    )
+    check_plugins = _TEST_CHECK_PLUGINS
+    service_configurer = config_cache.make_service_configurer(check_plugins, service_name_config)
+    enforced_services_table = EnforcedServicesTable(
+        BundledHostRulesetMatcher(
+            loading_result.loaded_config.static_checks,
+            config_cache.ruleset_matcher,
+            config_cache.label_manager.labels_of_host,
+        ),
+        service_name_config,
+        check_plugins,
+        config_cache.label_manager.labels_of_service,
+    )
+
+    node_services = config_cache.check_table(
+        node, check_plugins, service_configurer, service_name_config, enforced_services_table
+    )
+    cluster_services = config_cache.check_table(
+        cluster, check_plugins, service_configurer, service_name_config, enforced_services_table
+    )
+
+    assert len(node_services) == 1
+    assert len(cluster_services) == 2
+
+    def _source_of_item(table: HostCheckTable, item: str) -> str:
+        timespecific_params = table[ServiceID(smart, item)].parameters
+        p = timespecific_params.evaluate(lambda _: True)
+        assert p is not None
+        assert not isinstance(p, tuple | list | str | int)
+        return str(p["source"])
+
+    assert _source_of_item(node_services, "node-item") == "enforced-on-node"
+    assert _source_of_item(cluster_services, "cluster-item") == "enforced-on-node"
+    assert _source_of_item(cluster_services, "cluster-item-overridden") == "enforced-on-cluster"
+
+
+def test_check_table_enforced_services_get_ruleset_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 'Service labels' ruleset must apply to enforced services (SUP-29851).
+
+    Enforced services have no discovered labels, but ruleset-assigned labels must
+    still reach the monitoring core config via ConfiguredService.labels.
+    """
+    smart = CheckPluginName("smart_temp")
+    hostname = HostName("host")
+
+    ts = Scenario()
+    ts.add_host(hostname)
+    ts.set_option(
+        "static_checks",
+        {
+            "temperature": [
+                {
+                    "id": "01",
+                    "value": ("smart_temp", "enforced-item", {}),
+                    "condition": {"host_name": [hostname]},
+                },
+            ]
+        },
+    )
+    ts.set_ruleset(
+        "service_label_rules",
+        [
+            {
+                "id": "02",
+                "condition": {"service_description": [{"$regex": "Temperature SMART"}]},
+                "value": {"from_ruleset": "yes"},
+            }
+        ],
+    )
+    loading_result = ts.apply(monkeypatch)
+    config_cache = loading_result.config_cache
+    service_name_config = config_cache.make_passive_service_name_config(
+        make_final_service_name_config(loading_result.loaded_config, config_cache.ruleset_matcher)
+    )
+    check_plugins = _TEST_CHECK_PLUGINS
+    enforced_services_table = EnforcedServicesTable(
+        BundledHostRulesetMatcher(
+            loading_result.loaded_config.static_checks,
+            config_cache.ruleset_matcher,
+            config_cache.label_manager.labels_of_host,
+        ),
+        service_name_config,
+        check_plugins,
+        config_cache.label_manager.labels_of_service,
+    )
+
+    services = config_cache.check_table(
+        hostname,
+        check_plugins,
+        config_cache.make_service_configurer(check_plugins, service_name_config),
+        service_name_config,
+        enforced_services_table,
+    )
+
+    enforced_service = services[ServiceID(smart, "enforced-item")]
+    assert enforced_service.is_enforced
+    assert enforced_service.labels == {"from_ruleset": "yes"}
+
+
+# TODO: This misses a lot of cases
+# - different check_table arguments
+@pytest.mark.parametrize(
+    "hostname_str, filter_mode, expected_result",
+    [
+        ("empty-host", FilterMode.NONE, {}),
+        # Skip the autochecks automatically for ping hosts
+        ("ping-host", FilterMode.NONE, {}),
+        (
+            "no-autochecks",
+            FilterMode.NONE,
+            {
+                (CheckPluginName("smart_temp"), "/dev/sda"): ConfiguredService(
+                    check_plugin_name=CheckPluginName("smart_temp"),
+                    item="/dev/sda",
+                    description="Temperature SMART /dev/sda",
+                    parameters=TimespecificParameters(
+                        (
+                            TimespecificParameterSet({}, ()),
+                            TimespecificParameterSet({"levels": (35, 40)}, ()),
+                        )
+                    ),
+                    discovered_parameters={},
+                    labels={},
+                    discovered_labels={},
+                    is_enforced=True,
+                ),
+            },
+        ),
+        (
+            "ignore-not-existing-checks",
+            FilterMode.NONE,
+            {
+                (CheckPluginName("bla_blub"), "ITEM"): ConfiguredService(
+                    check_plugin_name=CheckPluginName("bla_blub"),
+                    item="ITEM",
+                    description="Unimplemented check bla_blub / ITEM",
+                    parameters=TimespecificParameters(()),
+                    discovered_parameters={},
+                    labels={},
+                    discovered_labels={},
+                    is_enforced=False,
+                ),
+                (CheckPluginName("blub_bla"), "ITEM"): ConfiguredService(
+                    check_plugin_name=CheckPluginName("blub_bla"),
+                    item="ITEM",
+                    description="Unimplemented check blub_bla / ITEM",
+                    parameters=TimespecificParameters(
+                        (
+                            TimespecificParameterSet({}, ()),
+                            TimespecificParameterSet({}, ()),
+                        )
+                    ),
+                    discovered_parameters={},
+                    labels={},
+                    discovered_labels={},
+                    is_enforced=True,
+                ),
+            },
+        ),
+        (
+            "ignore-disabled-rules",
+            FilterMode.NONE,
+            {
+                (CheckPluginName("smart_temp"), "ITEM2"): ConfiguredService(
+                    check_plugin_name=CheckPluginName("smart_temp"),
+                    item="ITEM2",
+                    description="Temperature SMART ITEM2",
+                    parameters=TimespecificParameters(
+                        (
+                            TimespecificParameterSet({}, ()),
+                            TimespecificParameterSet({"levels": (35, 40)}, ()),
+                        )
+                    ),
+                    discovered_parameters={},
+                    labels={},
+                    discovered_labels={},
+                    is_enforced=True,
+                ),
+            },
+        ),
+        (
+            "node1",
+            FilterMode.NONE,
+            {
+                (CheckPluginName("smart_temp"), "auto-not-clustered"): ConfiguredService(
+                    check_plugin_name=CheckPluginName("smart_temp"),
+                    item="auto-not-clustered",
+                    description="Temperature SMART auto-not-clustered",
+                    parameters=TimespecificParameters(
+                        (
+                            TimespecificParameterSet({}, ()),
+                            TimespecificParameterSet({"levels": (35, 40)}, ()),
+                        )
+                    ),
+                    discovered_parameters={},
+                    labels={},
+                    discovered_labels={},
+                    is_enforced=False,
+                ),
+                (CheckPluginName("smart_temp"), "static-node1"): ConfiguredService(
+                    check_plugin_name=CheckPluginName("smart_temp"),
+                    item="static-node1",
+                    description="Temperature SMART static-node1",
+                    parameters=TimespecificParameters(
+                        (
+                            TimespecificParameterSet({}, ()),
+                            TimespecificParameterSet({"levels": (35, 40)}, ()),
+                        )
+                    ),
+                    discovered_parameters={},
+                    labels={},
+                    discovered_labels={},
+                    is_enforced=True,
+                ),
+            },
+        ),
+        (
+            "cluster1",
+            FilterMode.NONE,
+            {
+                (CheckPluginName("smart_temp"), "static-cluster"): ConfiguredService(
+                    check_plugin_name=CheckPluginName("smart_temp"),
+                    item="static-cluster",
+                    description="Temperature SMART static-cluster",
+                    parameters=TimespecificParameters(
+                        (
+                            TimespecificParameterSet({}, ()),
+                            TimespecificParameterSet({"levels": (35, 40)}, ()),
+                        )
+                    ),
+                    discovered_parameters={},
+                    labels={},
+                    discovered_labels={},
+                    is_enforced=True,
+                ),
+                (CheckPluginName("smart_temp"), "auto-clustered"): ConfiguredService(
+                    check_plugin_name=CheckPluginName("smart_temp"),
+                    item="auto-clustered",
+                    description="Temperature SMART auto-clustered",
+                    parameters=TimespecificParameters(
+                        (
+                            TimespecificParameterSet({}, ()),
+                            TimespecificParameterSet({"levels": (35, 40)}, ()),
+                        )
+                    ),
+                    discovered_parameters={},
+                    labels={},
+                    discovered_labels={},
+                    is_enforced=False,
+                ),
+            },
+        ),
+        (
+            "node2",
+            FilterMode.INCLUDE_CLUSTERED,
+            {
+                (CheckPluginName("smart_temp"), "auto-clustered"): ConfiguredService(
+                    check_plugin_name=CheckPluginName("smart_temp"),
+                    item="auto-clustered",
+                    description="Temperature SMART auto-clustered",
+                    parameters=TimespecificParameters(
+                        (
+                            TimespecificParameterSet({}, ()),
+                            TimespecificParameterSet({"levels": (35, 40)}, ()),
+                        )
+                    ),
+                    discovered_parameters={},
+                    labels={},
+                    discovered_labels={},
+                    is_enforced=False,
+                )
+            },
+        ),
+        (
+            "cluster2",
+            FilterMode.INCLUDE_CLUSTERED,
+            {
+                (CheckPluginName("smart_temp"), "auto-clustered"): ConfiguredService(
+                    check_plugin_name=CheckPluginName("smart_temp"),
+                    item="auto-clustered",
+                    description="Temperature SMART auto-clustered",
+                    parameters=TimespecificParameters(
+                        (
+                            TimespecificParameterSet({}, ()),
+                            TimespecificParameterSet({"levels": (35, 40)}, ()),
+                        )
+                    ),
+                    discovered_parameters={},
+                    labels={},
+                    discovered_labels={},
+                    is_enforced=False,
+                )
+            },
+        ),
+        (
+            "node3",
+            FilterMode.INCLUDE_CLUSTERED,
+            {
+                (CheckPluginName("smart_temp"), "auto-clustered"): ConfiguredService(
+                    check_plugin_name=CheckPluginName("smart_temp"),
+                    item="auto-clustered",
+                    description="Temperature SMART auto-clustered",
+                    parameters=TimespecificParameters(
+                        (
+                            TimespecificParameterSet({}, ()),
+                            TimespecificParameterSet({"levels": (35, 40)}, ()),
+                        )
+                    ),
+                    discovered_parameters={},
+                    labels={},
+                    discovered_labels={},
+                    is_enforced=False,
+                )
+            },
+        ),
+        (
+            "node4",
+            FilterMode.INCLUDE_CLUSTERED,
+            {},
+        ),
+    ],
+)
+def test_check_table(
+    monkeypatch: pytest.MonkeyPatch,
+    hostname_str: str,
+    filter_mode: FilterMode,
+    expected_result: HostCheckTable,
+) -> None:
+    hostname = HostName(hostname_str)
+
+    ts = Scenario()
+    ts.add_host(hostname, tags={TagGroupID("criticality"): TagID("test")})
+    ts.add_host(HostName("ping-host"), tags={TagGroupID("agent"): TagID("no-agent")})
+    ts.add_host(HostName("node1"))
+    ts.add_cluster(HostName("cluster1"), nodes=[HostName("node1")])
+    ts.add_host(HostName("node2"))
+    ts.add_host(HostName("node3"))
+    ts.add_host(HostName("node4"))
+    ts.add_cluster(
+        HostName("cluster2"), nodes=[HostName("node2"), HostName("node3"), HostName("node4")]
+    )
+    ts.set_option(
+        "static_checks",
+        {
+            "temperature": [
+                {
+                    "id": "01",
+                    "condition": {"host_name": ["no-autochecks", "autocheck-overwrite"]},
+                    "value": ("smart.temp", "/dev/sda", {}),
+                },
+                {
+                    "id": "02",
+                    "condition": {"host_name": ["ignore-not-existing-checks"]},
+                    "value": ("blub.bla", "ITEM", {}),
+                },
+                {
+                    "id": "03",
+                    "condition": {"host_name": ["ignore-disabled-rules"]},
+                    "options": {"disabled": True},
+                    "value": ("smart.temp", "ITEM1", {}),
+                },
+                {
+                    "id": "04",
+                    "condition": {"host_name": ["ignore-disabled-rules"]},
+                    "value": ("smart.temp", "ITEM2", {}),
+                },
+                {
+                    "id": "05",
+                    "condition": {"host_name": ["static-check-overwrite"]},
+                    "value": ("smart.temp", "/dev/sda", {"rule": 1}),
+                },
+                {
+                    "id": "06",
+                    "condition": {"host_name": ["static-check-overwrite"]},
+                    "value": ("smart.temp", "/dev/sda", {"rule": 2}),
+                },
+                {
+                    "id": "07",
+                    "condition": {"host_name": ["node1"]},
+                    "value": ("smart.temp", "static-node1", {}),
+                },
+                {
+                    "id": "08",
+                    "condition": {"host_name": ["cluster1"]},
+                    "value": ("smart.temp", "static-cluster", {}),
+                },
+            ]
+        },
+    )
+    ts.set_ruleset(
+        "clustered_services",
+        [
+            {
+                "id": "09",
+                "condition": {
+                    "service_description": [{"$regex": "Temperature SMART auto-clustered$"}],
+                    "host_name": [
+                        HostName("node1"),
+                        HostName("node2"),
+                        HostName("node3"),
+                    ],  # no node4 here!
+                },
+                "value": True,
+            }
+        ],
+    )
+    ts.set_autochecks(
+        HostName("ping-host"),
+        [
+            AutocheckEntry(CheckPluginName("smart_temp"), "bla", {}, {}),
+        ],
+    )
+    ts.set_autochecks(
+        HostName("autocheck-overwrite"),
+        [
+            AutocheckEntry(CheckPluginName("smart_temp"), "/dev/sda", {"is_autocheck": True}, {}),
+            AutocheckEntry(CheckPluginName("smart_temp"), "/dev/sdb", {"is_autocheck": True}, {}),
+        ],
+    )
+    ts.set_autochecks(
+        HostName("ignore-not-existing-checks"),
+        [
+            AutocheckEntry(CheckPluginName("bla_blub"), "ITEM", {}, {}),
+        ],
+    )
+    ts.set_autochecks(
+        HostName("node1"),
+        [
+            AutocheckEntry(CheckPluginName("smart_temp"), "auto-clustered", {}, {}),
+            AutocheckEntry(CheckPluginName("smart_temp"), "auto-not-clustered", {}, {}),
+        ],
+    )
+    ts.set_autochecks(
+        HostName("node2"),
+        [
+            AutocheckEntry(CheckPluginName("smart_temp"), "auto-clustered", {}, {}),
+        ],
+    )
+
+    loading_result = ts.apply(monkeypatch)
+    config_cache = loading_result.config_cache
+    service_name_config = config_cache.make_passive_service_name_config(
+        make_final_service_name_config(loading_result.loaded_config, config_cache.ruleset_matcher)
+    )
+    enforced_services_table = EnforcedServicesTable(
+        BundledHostRulesetMatcher(
+            loading_result.loaded_config.static_checks,
+            config_cache.ruleset_matcher,
+            config_cache.label_manager.labels_of_host,
+        ),
+        service_name_config,
+        _TEST_CHECK_PLUGINS,
+        config_cache.label_manager.labels_of_service,
+    )
+
+    assert set(
+        config_cache.check_table(
+            hostname,
+            _TEST_CHECK_PLUGINS,
+            config_cache.make_service_configurer(_TEST_CHECK_PLUGINS, service_name_config),
+            service_name_config,
+            enforced_services_table,
+            filter_mode=filter_mode,
+        ),
+    ) == set(expected_result)
+    for key, value in config_cache.check_table(
+        hostname,
+        {},
+        config_cache.make_service_configurer({}, service_name_config),
+        service_name_config,
+        enforced_services_table,
+        filter_mode=filter_mode,
+    ).items():
+        assert key in expected_result
+        assert expected_result[key] == value
+
+
+@pytest.mark.parametrize(
+    "hostname_str, expected_result",
+    [
+        ("mgmt-board-ipmi", [(CheckPluginName("mgmt_ipmi_sensors"), "TEMP X")]),
+        ("ipmi-host", [(CheckPluginName("ipmi_sensors"), "TEMP Y")]),
+    ],
+)
+def test_check_table_of_mgmt_boards(
+    monkeypatch: pytest.MonkeyPatch, hostname_str: str, expected_result: list[ServiceID]
+) -> None:
+    hostname = HostName(hostname_str)
+
+    ts = Scenario()
+    ts.add_host(
+        HostName("mgmt-board-ipmi"),
+        tags={
+            TagGroupID("piggyback"): TagID("auto-piggyback"),
+            TagGroupID("networking"): TagID("lan"),
+            TagGroupID("address_family"): TagID("no-ip"),
+            TagGroupID("criticality"): TagID("prod"),
+            TagGroupID("snmp_ds"): TagID("no-snmp"),
+            TagGroupID("site"): TagID("heute"),
+            TagGroupID("agent"): TagID("no-agent"),
+        },
+    )
+    ts.add_host(
+        HostName("ipmi-host"),
+        tags={
+            TagGroupID("piggyback"): TagID("auto-piggyback"),
+            TagGroupID("networking"): TagID("lan"),
+            TagGroupID("agent"): TagID("cmk-agent"),
+            TagGroupID("criticality"): TagID("prod"),
+            TagGroupID("snmp_ds"): TagID("no-snmp"),
+            TagGroupID("site"): TagID("heute"),
+            TagGroupID("address_family"): TagID("ip-v4-only"),
+        },
+    )
+    ts.set_option("management_protocol", {"mgmt-board-ipmi": "ipmi"})
+
+    ts.set_autochecks(
+        HostName("mgmt-board-ipmi"),
+        [AutocheckEntry(CheckPluginName("mgmt_ipmi_sensors"), "TEMP X", {}, {})],
+    )
+    ts.set_autochecks(
+        HostName("ipmi-host"),
+        [AutocheckEntry(CheckPluginName("ipmi_sensors"), "TEMP Y", {}, {})],
+    )
+
+    loading_result = ts.apply(monkeypatch)
+    config_cache = loading_result.config_cache
+    service_name_config = config_cache.make_passive_service_name_config(
+        make_final_service_name_config(loading_result.loaded_config, config_cache.ruleset_matcher)
+    )
+
+    assert (
+        list(
+            config_cache.check_table(
+                hostname,
+                {},
+                config_cache.make_service_configurer({}, service_name_config),
+                service_name_config,
+                lambda hn: {},  # noqa: ARG005
+            ).keys()
+        )
+        == expected_result
+    )
+
+
+def test_check_table__static_checks_win(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hostname_str = "df_host"
+    hostname = HostName(hostname_str)
+    plugin_name = CheckPluginName("df")
+    item = "/snap/core/9066"
+
+    ts = Scenario()
+    ts.add_host(hostname)
+    ts.set_option(
+        "static_checks",
+        {
+            "filesystem": [
+                {
+                    "id": "01",
+                    "condition": {"host_name": [hostname_str]},
+                    "value": (plugin_name, item, {"source": "static"}),
+                }
+            ],
+        },
+    )
+    ts.set_autochecks(hostname, [AutocheckEntry(plugin_name, item, {"source": "auto"}, {})])
+    loading_result = ts.apply(monkeypatch)
+    config_cache = loading_result.config_cache
+    service_name_config = config_cache.make_passive_service_name_config(
+        make_final_service_name_config(loading_result.loaded_config, config_cache.ruleset_matcher)
+    )
+    enforced_services_table = EnforcedServicesTable(
+        BundledHostRulesetMatcher(
+            loading_result.loaded_config.static_checks,
+            config_cache.ruleset_matcher,
+            config_cache.label_manager.labels_of_host,
+        ),
+        service_name_config,
+        _TEST_CHECK_PLUGINS,
+        config_cache.label_manager.labels_of_service,
+    )
+
+    chk_table = config_cache.check_table(
+        hostname,
+        _TEST_CHECK_PLUGINS,
+        config_cache.make_service_configurer(_TEST_CHECK_PLUGINS, service_name_config),
+        service_name_config,
+        enforced_services_table,
+    )
+
+    # assert check table is populated as expected
+    assert len(chk_table) == 1
+    # assert static checks won
+    effective_params = chk_table[ServiceID(plugin_name, item)].parameters.evaluate(lambda _: True)
+    assert effective_params["source"] == "static"
+
+
+def test_check_table_skips_services_with_invalid_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Services with invalid names must never be part of the check table.
+
+    The monitoring cores reject them during config creation. If they stayed
+    in the check table, the checker would submit results for services unknown
+    to the core, rendering all services of the host stale (CMK-33390).
+    """
+    hostname = HostName("invalid-names-host")
+    smart = CheckPluginName("smart_temp")
+    # "Temperature SMART " + item exceeds MAX_SERVICE_NAME_LEN
+    too_long_item = "x" * MAX_SERVICE_NAME_LEN
+
+    empty_name_service = ConfiguredService(
+        check_plugin_name=CheckPluginName("df"),
+        item="stripped-to-nothing",
+        description="",
+        parameters=TimespecificParameters(()),
+        discovered_parameters={},
+        labels={},
+        discovered_labels={},
+        is_enforced=True,
+    )
+
+    ts = Scenario()
+    ts.add_host(hostname)
+    ts.set_autochecks(
+        hostname,
+        [
+            AutocheckEntry(smart, "ok", {}, {}),
+            AutocheckEntry(smart, too_long_item, {}, {}),
+        ],
+    )
+    loading_result = ts.apply(monkeypatch)
+    config_cache = loading_result.config_cache
+    service_name_config = config_cache.make_passive_service_name_config(
+        make_final_service_name_config(config_cache._loaded_config, config_cache.ruleset_matcher)  # noqa: SLF001
+    )
+    service_configurer = config_cache.make_service_configurer(
+        _TEST_CHECK_PLUGINS, service_name_config
+    )
+
+    def enforced_services_table(
+        hn: HostName,  # noqa: ARG001
+    ) -> Mapping[ServiceID, tuple[object, ConfiguredService]]:
+        return {empty_name_service.id(): ("enforced", empty_name_service)}
+
+    chk_table = config_cache.check_table(
+        hostname,
+        _TEST_CHECK_PLUGINS,
+        service_configurer,
+        service_name_config,
+        enforced_services_table,
+    )
+
+    assert set(chk_table) == {ServiceID(smart, "ok")}
+    assert {s.id() for s in chk_table.skipped_services} == {
+        ServiceID(smart, too_long_item),
+        empty_name_service.id(),
+    }
+
+    # the cached table must be filtered in the same way
+    assert (
+        config_cache.check_table(
+            hostname,
+            _TEST_CHECK_PLUGINS,
+            service_configurer,
+            service_name_config,
+            enforced_services_table,
+        )
+        is chk_table
+    )
+
+
+def test_service_disabled_by_rule_is_reported_as_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hostname = HostName("some-host")
+    smart = CheckPluginName("smart_temp")
+
+    ts = Scenario()
+    ts.add_host(hostname)
+    ts.set_autochecks(
+        hostname,
+        [
+            AutocheckEntry(smart, "monitored", {}, {}),
+            AutocheckEntry(smart, "disabled", {}, {}),
+        ],
+    )
+    ts.set_ruleset(
+        "ignored_services",
+        [
+            {
+                "id": "01",
+                "condition": {"service_description": [{"$regex": "Temperature SMART disabled$"}]},
+                "value": True,
+            }
+        ],
+    )
+    loading_result = ts.apply(monkeypatch)
+    config_cache = loading_result.config_cache
+    service_name_config = config_cache.make_passive_service_name_config(
+        make_final_service_name_config(loading_result.loaded_config, config_cache.ruleset_matcher)
+    )
+
+    chk_table = config_cache.check_table(
+        hostname,
+        _TEST_CHECK_PLUGINS,
+        config_cache.make_service_configurer(_TEST_CHECK_PLUGINS, service_name_config),
+        service_name_config,
+        lambda hn: {},  # noqa: ARG005
+    )
+
+    assert set(chk_table) == {ServiceID(smart, "monitored")}
+    assert [s.id() for s in chk_table.ignored_services] == [ServiceID(smart, "disabled")]
+
+
+def test_a_service_that_is_monitored_as_well_is_not_reported_as_ignored() -> None:
+    """A discovered and an enforced service share an id but not their labels.
+
+    The "Disabled services" ruleset can therefore match one and not the other.
+    The enforced one wins in the table, so the id must not be reported as
+    disabled -- the nagios host check would stop checking it.
+    """
+    service_id = ServiceID(CheckPluginName("smart_temp"), "item")
+    discovered = ConfiguredService(
+        check_plugin_name=service_id.name,
+        item=service_id.item,
+        description="Temperature SMART item",
+        parameters=TimespecificParameters(()),
+        discovered_parameters={},
+        labels={"disable-me": "yes"},
+        discovered_labels={"disable-me": "yes"},
+        is_enforced=False,
+    )
+    enforced = ConfiguredService(
+        check_plugin_name=service_id.name,
+        item=service_id.item,
+        description="Temperature SMART item",
+        parameters=TimespecificParameters(()),
+        discovered_parameters={},
+        labels={},
+        discovered_labels={},
+        is_enforced=True,
+    )
+
+    table = HostCheckTable(services=[enforced], ignored_services=[discovered])
+
+    assert not table.ignored_services
+
+
+def test_iter_skipped_services_warnings() -> None:
+    hostname = HostName("some-host")
+    too_long_name: str = "Temperature SMART " + "x" * MAX_SERVICE_NAME_LEN
+
+    valid_service = ConfiguredService(
+        check_plugin_name=CheckPluginName("cpu_loads"),
+        item=None,
+        description="CPU load",
+        parameters=TimespecificParameters(()),
+        discovered_parameters={},
+        labels={},
+        discovered_labels={},
+        is_enforced=False,
+    )
+    too_long_service = ConfiguredService(
+        check_plugin_name=CheckPluginName("smart_temp"),
+        item="item",
+        description=too_long_name,
+        parameters=TimespecificParameters(()),
+        discovered_parameters={},
+        labels={},
+        discovered_labels={},
+        is_enforced=False,
+    )
+    empty_name_service = ConfiguredService(
+        check_plugin_name=CheckPluginName("df"),
+        item="item",
+        description="",
+        parameters=TimespecificParameters(()),
+        discovered_parameters={},
+        labels={},
+        discovered_labels={},
+        is_enforced=False,
+    )
+
+    table = HostCheckTable(
+        services=[valid_service, too_long_service, empty_name_service],
+    )
+
+    assert ServiceID(CheckPluginName("cpu_loads"), None) in table
+    assert ServiceID(CheckPluginName("smart_temp"), "item") not in table
+    assert ServiceID(CheckPluginName("df"), "item") not in table
+    assert list(iter_skipped_services_warnings(hostname, table.skipped_services)) == [
+        (
+            f"Skipping invalid service exceeding the name length limit of {MAX_SERVICE_NAME_LEN} "
+            f"(plugin: smart_temp) on host: {hostname}, Service: {too_long_name}"
+        ),
+        f"Skipping invalid service with empty description (plugin: df) on host {hostname}",
+    ]

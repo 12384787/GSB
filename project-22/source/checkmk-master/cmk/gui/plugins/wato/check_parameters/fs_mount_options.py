@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+from cmk.gui.i18n import _
+from cmk.gui.plugins.wato.utils import (
+    CheckParameterRulespecWithItem,
+    rulespec_registry,
+    RulespecGroupCheckParametersStorage,
+)
+from cmk.gui.valuespec import Dictionary, ListOfStrings, Migrate, TextInput
+
+
+def _parameter_valuespec_fs_mount_options() -> Migrate:
+    return Migrate(
+        valuespec=Dictionary(
+            elements=[
+                (
+                    "expected_mount_options",
+                    ListOfStrings(
+                        title=_("Expected mount options"),
+                        help=_(
+                            "Specify all expected mount options here. If the list of "
+                            "actually found options differs from this list, the check will go "
+                            "WARNING or CRITICAL. Just the option <tt>commit</tt> is being "
+                            "ignored since it is modified by the power saving algorithms."
+                        ),
+                        valuespec=TextInput(),
+                    ),
+                ),
+            ],
+            optional_keys=[],
+        ),
+        migrate=lambda p: p if isinstance(p, dict) else {"expected_mount_options": p},
+    )
+
+
+rulespec_registry.register(
+    CheckParameterRulespecWithItem(
+        check_group_name="fs_mount_options",
+        group=RulespecGroupCheckParametersStorage,
+        item_spec=lambda: TextInput(title=_("Mount point"), allow_empty=False),
+        parameter_valuespec=_parameter_valuespec_fs_mount_options,
+        title=lambda: _("File system mount options (Linux/Unix)"),
+    )
+)

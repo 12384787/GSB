@@ -1,0 +1,14 @@
+title: Kubernetes: Pod Phase
+agents: kubernetes
+catalog: containerization/kubernetes
+license: GPLv2
+distribution: check_mk
+description:
+ This check shows the phase of a Pod, which Kubernetes defines to be a simple, high-level summary of
+ where the Pod is in its lifecycle. The service always displays an {OK} state regardless of the
+ current phase.
+
+ This check requires that Kubernetes monitoring is configured and that Checkmk can receive
+ data from the in-cluster agent.
+discovery:
+ One service is created for each Pod.

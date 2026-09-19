@@ -1,0 +1,5 @@
+#!/bin/sh
+
+/bin/sh /var/lib/cmk-agent/scripts/manage-binaries.sh remove
+/bin/sh /var/lib/cmk-agent/scripts/super-server/setup cleanup
+/bin/sh /var/lib/cmk-agent/scripts/super-server/setup trigger

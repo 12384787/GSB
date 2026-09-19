@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+import re
+from collections.abc import Collection, Iterable, Mapping, Sequence
+from logging import Logger
+from typing import Final
+
+from cmk.ccc import debug
+from cmk.gui.form_specs import get_visitor, RawDiskData, VisitorOptions
+from cmk.gui.watolib.hosts_and_folders import FolderTree
+from cmk.gui.watolib.pending_changes import PendingChanges
+from cmk.gui.watolib.rulesets import (
+    AllRulesets,
+    FolderPath,
+    Rule,
+    RuleConditions,
+    RulesetCollection,
+)
+from cmk.gui.watolib.rulespecs import rulespec_registry
+from cmk.ruleset_matcher.definition import RuleGroup
+from cmk.ruleset_matcher.matcher import RulesetName, TagCondition
+from cmk.ruleset_matcher.tags import TagGroupID
+from cmk.rulesets.v1.form_specs import FormSpec
+from cmk.utils.log import VERBOSE
+
+# 3.0: metric backend -> data backend / telemetry metrics
+REPLACED_RULESETS: Mapping[RulesetName, RulesetName] = {
+    "special_agents:custom_query_metric_backend": "special_agents:telemetry_metrics_custom_query",
+    "checkgroup_parameters:custom_query_metric_backend_monitoring": (
+        "checkgroup_parameters:telemetry_metrics_custom_query_monitoring"
+    ),
+    "static_checks:custom_query_metric_backend_monitoring": (
+        "static_checks:telemetry_metrics_custom_query_monitoring"
+    ),
+    "checkgroup_parameters:metric_backend_omd": (
+        "checkgroup_parameters:data_backend_telemetry_metrics_omd"
+    ),
+    "static_checks:metric_backend_omd": "static_checks:data_backend_telemetry_metrics_omd",
+}
+
+RULESETS_LOOSING_THEIR_ITEM: Iterable[RulesetName] = {}
+
+DEPRECATED_RULESET_PATTERNS = (re.compile("^agent_simulator$"),)
+
+# Rulesets that have been removed without previous deprecation
+REMOVED_RULESETS: Iterable[RulesetName] = {
+    "special_agents:otel"  #  2.4 -> 2.5
+}
+
+SKIP_ACTION: Final = {
+    # the valid choices for this ruleset are user-dependent (SLAs) and not even an admin can
+    # see all of them
+    RuleGroup.ExtraServiceConf("_sla_config"),
+    # Validating the ignored checks ruleset does not make sense:
+    # Invalid choices are the plugins that don't exist (anymore).
+    # These do no harm, they are dropped upon rule edit. On the other hand, the plugin
+    # could be missing only temporarily, so better not remove it.
+    "ignored_checks",
+    "snmp_exclude_sections",  # same as "ignored_checks".
+    "snmp_check_interval",  # same as "ignored_checks".
+}
+
+SKIP_PREACTION: Final = SKIP_ACTION | {
+    # validating a ruleset for static checks, where we want to replace the ruleset anyway,
+    # does not work:
+    # * the validation checks if there are checks which subscribe to that check group
+    # * when replacing a ruleset, we have no check anymore subscribing to the old name
+    # * in that case, the validation will always fail, so we skip it during update
+    # * the rule validation with the replaced ruleset will happen after the replacing anyway again
+    # see cmk.update_config.plugins.actions.rulesets._validate_rule_values
+    *{ruleset for ruleset in REPLACED_RULESETS if ruleset.startswith("static_checks:")},
+    # Same situation, without a rename: the parameters are still a positional tuple until
+    # the migrate_wmic_process_params action rewrites them, and that runs after this
+    # pre-action. Validating them here can only ever fail.
+    RuleGroup.StaticChecks("wmic_process"),
+}
+
+
+def load_and_transform(
+    tree: FolderTree,
+    logger: Logger,
+    *,
+    pending_changes: PendingChanges,
+    use_new_descriptions_for: Mapping[str, bool],
+) -> AllRulesets:
+    all_rulesets = AllRulesets.load_all_rulesets(tree)
+
+    if not use_new_descriptions_for.get("http", False):
+        _force_old_http_service_description(all_rulesets)
+
+    _delete_deprecated_wato_rulesets(
+        logger,
+        all_rulesets,
+        DEPRECATED_RULESET_PATTERNS,
+    )
+    _delete_removed_wato_rulesets(
+        logger,
+        all_rulesets,
+        REMOVED_RULESETS,
+    )
+    _transform_rulesets_loosing_item(
+        logger,
+        all_rulesets,
+        RULESETS_LOOSING_THEIR_ITEM,
+    )
+    transform_replaced_wato_rulesets(
+        tree,
+        logger,
+        all_rulesets,
+        {**REPLACED_RULESETS, **_discovery_parameter_renames()},
+    )
+    transform_wato_rulesets_params(
+        logger,
+        all_rulesets,
+        raise_errors=debug.enabled(),
+    )
+    transform_remove_null_host_tag_conditions_from_rulesets(
+        logger,
+        all_rulesets,
+        raise_errors=debug.enabled(),
+        pending_changes=pending_changes,
+    )
+    return all_rulesets
+
+
+def _discovery_parameter_renames() -> Mapping[RulesetName, RulesetName]:
+    """Map legacy top-level `inventory_*_rules` / `discovery_*` ruleset names to their
+    `discovery_parameters:<old>` equivalent, derived from the live rulespec registry.
+
+    Customer configs from before the consolidation still contain entries like
+    `inventory_df_rules = [...]`. After the rulespec rename, those entries surface as
+    "unknown rulesets" until this transform moves them under the registered
+    `discovery_parameters:inventory_df_rules` rulespec.
+    """
+    prefix = RuleGroup.DiscoveryParameters("")
+    return {
+        RulesetName(name.removeprefix(prefix)): RulesetName(name)
+        for name in rulespec_registry
+        if name.startswith(prefix)
+    }
+
+
+def _delete_deprecated_wato_rulesets(
+    logger: Logger,
+    all_rulesets: RulesetCollection,
+    deprecated_ruleset_patterns: Sequence[re.Pattern],
+) -> None:
+    for ruleset_name in list(all_rulesets.get_rulesets()):
+        if any(p.match(ruleset_name) for p in deprecated_ruleset_patterns):
+            logger.log(VERBOSE, "Removing ruleset %(ruleset_name)s", {"ruleset_name": ruleset_name})
+            all_rulesets.delete(ruleset_name)
+            continue
+
+
+def _delete_removed_wato_rulesets(
+    logger: Logger,
+    all_rulesets: RulesetCollection,
+    removed_rulesets: Iterable[RulesetName],
+) -> None:
+    for folder_path, removed_ruleset_config in all_rulesets.get_unknown_rulesets().items():
+        for ruleset_name in list(removed_ruleset_config.keys()):
+            if ruleset_name in removed_rulesets:
+                logger.log(
+                    VERBOSE,
+                    "Deleting removed ruleset %(ruleset_name)s",
+                    {"ruleset_name": ruleset_name},
+                )
+                all_rulesets.delete_unknown(folder_path, ruleset_name)
+
+
+def _transform_rulesets_loosing_item(
+    logger: Logger,
+    all_rulesets: RulesetCollection,
+    rulesets_loosing_item: Iterable[str],
+) -> None:
+    for ruleset_name in rulesets_loosing_item:
+        logger.log(
+            VERBOSE, "Fixing items for ruleset %(ruleset_name)s", {"ruleset_name": ruleset_name}
+        )
+        for _folder, _index, rule in all_rulesets.get(
+            f"checkgroup_parameters:{ruleset_name}"
+        ).get_rules():
+            rule.conditions = RuleConditions(
+                host_folder=rule.conditions.host_folder,
+                host_tags=rule.conditions.host_tags,
+                host_label_groups=rule.conditions.host_label_groups,
+                host_name=rule.conditions.host_name,
+                service_description=None,
+                service_label_groups=rule.conditions.service_label_groups,
+            )
+        for _folder, _index, rule in all_rulesets.get(f"static_checks:{ruleset_name}").get_rules():
+            rule.value = (rule.value[0], None, rule.value[2])
+
+
+def _force_old_http_service_description(all_rulesets: RulesetCollection) -> None:
+    # relevant for update to 2.4
+
+    # remove "http" from configuration/ add another update step
+    if (
+        not all_rulesets.exists("active_checks:http")
+        or (http_ruleset := all_rulesets.get("active_checks:http")).is_empty()
+    ):
+        return
+
+    for _, _, rule in http_ruleset.get_rules():
+        if rule.value["name"].startswith("^"):
+            continue
+
+        rule.value["name"] = f"^HTTP {rule.value['name']}"
+
+
+def transform_replaced_wato_rulesets(
+    tree: FolderTree,
+    logger: Logger,
+    all_rulesets: RulesetCollection,
+    replaced_rulesets: Mapping[RulesetName, RulesetName],
+) -> None:
+    _transform_replaced_unknown_rulesets(tree, logger, all_rulesets, replaced_rulesets)
+    _transform_replaced_known_rulesets(logger, all_rulesets, replaced_rulesets)
+
+
+def _transform_replaced_known_rulesets(
+    logger: Logger,
+    all_rulesets: RulesetCollection,
+    replaced_rulesets: Mapping[RulesetName, RulesetName],
+) -> None:
+    deprecated_ruleset_names: set[RulesetName] = set()
+    for ruleset_name, ruleset in all_rulesets.get_rulesets().items():
+        if ruleset_name not in replaced_rulesets:
+            continue
+
+        new_ruleset = all_rulesets.get(replaced_rulesets[ruleset_name])
+
+        logger.log(
+            VERBOSE,
+            "Replacing ruleset %(ruleset_name)s with %(new_ruleset_name)s",
+            {"ruleset_name": ruleset_name, "new_ruleset_name": new_ruleset.name},
+        )
+        for folder, _folder_index, rule in ruleset.get_rules():
+            new_ruleset.append_rule(folder, rule)
+
+        deprecated_ruleset_names.add(ruleset_name)
+    for deprecated_ruleset_name in deprecated_ruleset_names:
+        all_rulesets.delete(deprecated_ruleset_name)
+
+
+def _transform_replaced_unknown_rulesets(
+    tree: FolderTree,
+    logger: Logger,
+    all_rulesets: RulesetCollection,
+    replaced_rulesets: Mapping[RulesetName, RulesetName],
+) -> None:
+    deprecated_unknown_ruleset_names_per_folder: dict[FolderPath, set[RulesetName]] = {}
+    for folder_path, ruleset_configs in all_rulesets.get_unknown_rulesets().items():
+        folder = tree.folder(folder_path)
+        deprecated_unknown_ruleset_names_per_folder[folder_path] = set()
+        for ruleset_name, rule_specs in ruleset_configs.items():
+            if ruleset_name not in replaced_rulesets:
+                continue
+
+            new_ruleset = all_rulesets.get(replaced_rulesets[ruleset_name])
+
+            logger.log(
+                VERBOSE,
+                "Replacing ruleset %(ruleset_name)s with %(new_ruleset_name)s",
+                {"ruleset_name": ruleset_name, "new_ruleset_name": new_ruleset.name},
+            )
+            for rule_spec in rule_specs:
+                new_ruleset.append_rule(folder, Rule.from_config(folder, new_ruleset, rule_spec))
+
+            deprecated_unknown_ruleset_names_per_folder[folder_path].add(ruleset_name)
+    for (
+        folder_path,
+        deprecated_unknown_ruleset_names,
+    ) in deprecated_unknown_ruleset_names_per_folder.items():
+        for deprecated_unknown_ruleset_name in deprecated_unknown_ruleset_names:
+            all_rulesets.delete_unknown(folder_path, deprecated_unknown_ruleset_name)
+
+
+def transform_wato_rulesets_params(
+    logger: Logger,
+    all_rulesets: RulesetCollection,
+    raise_errors: bool = False,
+) -> Collection[RulesetName]:
+    migrated_rulesets = set()
+    for ruleset in all_rulesets.get_rulesets().values():
+        try:
+            value_model = ruleset.rulespec.value_model
+        except Exception:
+            logger.exception(
+                "ERROR: Failed to load Ruleset: %(ruleset_name)s. "
+                "There is likely an error in the implementation.",
+                {"ruleset_name": ruleset.name},
+            )
+            logger.exception("This is the exception: ")
+            continue
+        for folder, folder_index, rule in ruleset.get_rules():
+            try:
+                if isinstance(value_model, FormSpec):
+                    visitor = get_visitor(
+                        value_model, VisitorOptions(migrate_values=True, mask_values=False)
+                    )
+                    rule.value = visitor.to_disk(RawDiskData(rule.value))
+                else:
+                    rule.value = value_model.transform_value(rule.value)
+                migrated_rulesets.add(ruleset.name)
+            except Exception:
+                if raise_errors:
+                    raise
+                logger.exception(
+                    "ERROR: Failed to transform rule: (Ruleset: %(ruleset_name)s, "
+                    "Folder: %(folder)s, Rule: %(rule_index)d, Value: %(value)s",
+                    {
+                        "ruleset_name": ruleset.name,
+                        "folder": folder.path(),
+                        "rule_index": folder_index,
+                        "value": rule.value,
+                    },
+                )
+    return migrated_rulesets
+
+
+def _filter_out_null_host_tags(
+    host_tags: Mapping[TagGroupID, TagCondition],
+) -> dict[TagGroupID, TagCondition]:
+    filtered_host_tags: dict[TagGroupID, TagCondition] = {}
+
+    for tag_group, tag_id in host_tags.items():
+        match tag_id:
+            case {"$ne": cond} | {"$or": cond} | {"$nor": cond} | cond if cond is None:
+                continue
+            case _:
+                filtered_host_tags[tag_group] = tag_id
+
+    return filtered_host_tags
+
+
+def transform_remove_null_host_tag_conditions_from_rulesets(
+    logger: Logger,
+    all_rulesets: RulesetCollection,
+    *,
+    raise_errors: bool,
+    pending_changes: PendingChanges,
+) -> Collection[RulesetName]:
+    migrated_rulesets = set()
+    for ruleset in all_rulesets.get_rulesets().values():
+        for folder, folder_index, old_rule in ruleset.get_rules():
+            host_tags = old_rule.get_rule_conditions().host_tags
+            filtered_host_tags = _filter_out_null_host_tags(host_tags)
+            null_tag_groups = host_tags.keys() - filtered_host_tags.keys()
+
+            if not null_tag_groups:
+                continue
+
+            try:
+                logger.warning(
+                    "WARNING: Removing null host tag condition: "
+                    "rule=%(ruleset_name)s(id=%(rule_id)s), tag_groups=%(tag_groups)s",
+                    {
+                        "ruleset_name": ruleset.name,
+                        "rule_id": old_rule.id,
+                        "tag_groups": null_tag_groups,
+                    },
+                )
+
+                new_conditions = {"host_tags": {**filtered_host_tags}}
+                new_rule_conditions = RuleConditions.from_config(folder.name(), new_conditions)
+                new_rule = old_rule.clone(preserve_id=True)
+                new_rule.update_conditions(new_rule_conditions)
+
+                ruleset.edit_rule(old_rule, new_rule, pending_changes=pending_changes)
+                migrated_rulesets.add(ruleset.name)
+            except Exception:
+                if raise_errors:
+                    raise
+                logger.exception(
+                    "ERROR: Failed to transform rule: (Ruleset: %(ruleset_name)s, "
+                    "Folder: %(folder)s, Rule: %(rule_index)d, Value: %(value)s",
+                    {
+                        "ruleset_name": ruleset.name,
+                        "folder": folder.path(),
+                        "rule_index": folder_index,
+                        "value": old_rule.value,
+                    },
+                )
+    return migrated_rulesets

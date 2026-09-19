@@ -1,0 +1,162 @@
+<!--
+Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script lang="ts">
+import { type PanelConfigFor, listOptions } from '@ucl/_ucl/components/detail-page'
+import type { ListPropDef } from '@ucl/_ucl/types/prop-def'
+
+import codeExample from './UclCmkWizardCodeExample.vue?raw'
+
+export const a11yData = [
+  {
+    keys: ['Tab'],
+    description: 'Moves keyboard focus to the next wizard button or interactive element.'
+  },
+  {
+    keys: [['Shift', 'Tab']],
+    description: 'Moves focus in reverse order through the wizard buttons and interactive elements.'
+  },
+  {
+    keys: ['Enter', 'Space'],
+    description: 'Activates the focused Previous or Next button.'
+  }
+]
+
+export const panelConfig = {
+  mode: {
+    type: 'list' as const,
+    title: 'Wizard Mode',
+    options: listOptions<'guided' | 'overview'>({
+      guided: 'Guided (Step-by-Step)',
+      overview: 'Overview (Stacked)'
+    }),
+    initialState: 'guided' as 'guided' | 'overview'
+  },
+  currentStep: {
+    type: 'list' as const,
+    title: 'Current Step',
+    options: [
+      { title: 'Step 1', name: '1' },
+      { title: 'Step 2', name: '2' },
+      { title: 'Step 3', name: '3' }
+    ],
+    initialState: '1'
+  },
+  locked: {
+    type: 'boolean' as const,
+    title: 'Locked',
+    initialState: false
+  }
+} satisfies PanelConfigFor<typeof CmkWizard, 'modelValue'> & { currentStep: ListPropDef }
+</script>
+
+<script setup lang="ts">
+import {
+  PanelStateCreator,
+  UclDetailPageAccessibility,
+  UclDetailPageCodeExample,
+  UclDetailPageComponent,
+  UclDetailPageDeveloperPlayground,
+  UclDetailPageHeader,
+  UclDetailPageLayout,
+  UclPropertiesPanel
+} from '@ucl/_ucl/components/detail-page'
+import CmkWizard, {
+  CmkWizardButton,
+  CmkWizardModeToggle,
+  CmkWizardStep
+} from 'cmk-ui-library/components/CmkWizard'
+import CmkHeading from 'cmk-ui-library/components/typography/CmkHeading.vue'
+import CmkParagraph from 'cmk-ui-library/components/typography/CmkParagraph.vue'
+import { computed } from 'vue'
+
+import UclCmkWizardDev from './UclCmkWizardDev.vue'
+
+defineProps<{ screenshotMode: boolean }>()
+
+const propState = new PanelStateCreator<typeof CmkWizard, 'modelValue'>().createRef(panelConfig)
+
+const wizardStep = computed({
+  get: () => Number(propState.value.currentStep as string),
+  set: (val: number) => {
+    propState.value.currentStep = String(val)
+  }
+})
+
+const wizardMode = computed({
+  get: () => propState.value.mode as 'guided' | 'overview',
+  set: (val: 'guided' | 'overview') => {
+    propState.value.mode = val
+  }
+})
+</script>
+
+<template>
+  <UclDetailPageLayout>
+    <UclDetailPageHeader>CmkWizard</UclDetailPageHeader>
+
+    <UclDetailPageComponent>
+      <div style="width: 100%; max-width: 800px">
+        <div style="margin-bottom: var(--dimension-4)">
+          <CmkWizardModeToggle v-model="wizardMode" />
+        </div>
+
+        <CmkWizard v-model="wizardStep" :mode="wizardMode" :locked="propState.locked as boolean">
+          <CmkWizardStep :index="1" :is-completed="() => wizardStep > 1">
+            <template #header><CmkHeading type="h3">Step 1: Introduction</CmkHeading></template>
+            <template #content>
+              <CmkParagraph
+                >Welcome to the setup wizard. Please provide your initial details.</CmkParagraph
+              >
+            </template>
+            <template #actions>
+              <CmkWizardButton type="next" />
+            </template>
+            <template #recap>
+              <CmkParagraph
+                >I can also display a recap of the information provided in this step.</CmkParagraph
+              >
+            </template>
+          </CmkWizardStep>
+
+          <CmkWizardStep :index="2" :is-completed="() => wizardStep > 2">
+            <template #header><CmkHeading type="h3">Step 2: Configuration</CmkHeading></template>
+            <template #content>
+              <CmkParagraph>Adjust the parameters for your monitoring instance here.</CmkParagraph>
+            </template>
+            <template #actions>
+              <CmkWizardButton type="previous" />
+              <CmkWizardButton type="next" />
+            </template>
+          </CmkWizardStep>
+
+          <CmkWizardStep :index="3" :is-completed="() => wizardStep > 3">
+            <template #header><CmkHeading type="h3">Step 3: Review</CmkHeading></template>
+            <template #content>
+              <CmkParagraph
+                >Verify that all settings are correct before finishing the process.</CmkParagraph
+              >
+            </template>
+            <template #actions>
+              <CmkWizardButton type="previous" />
+              <CmkWizardButton type="next" label="Complete Setup" />
+            </template>
+          </CmkWizardStep>
+        </CmkWizard>
+      </div>
+
+      <template #properties>
+        <UclPropertiesPanel v-model="propState" :config="panelConfig" />
+      </template>
+    </UclDetailPageComponent>
+
+    <UclDetailPageCodeExample :code="codeExample" />
+
+    <UclDetailPageAccessibility :data="a11yData" />
+    <UclDetailPageDeveloperPlayground>
+      <UclCmkWizardDev :screenshot-mode="screenshotMode" />
+    </UclDetailPageDeveloperPlayground>
+  </UclDetailPageLayout>
+</template>

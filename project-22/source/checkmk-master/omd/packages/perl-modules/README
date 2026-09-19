@@ -1,0 +1,8 @@
+1. adding new modules
+   Add an entry to extensions.bzl in the bazel module:
+     bazel/thirdparty/modules/perl-modules/0.0.1.cmk.1/src/extensions.bzl
+   Include the CPAN URL and sha256 in the _PERL_MODULES dict.
+   Then add the module filename to the appropriate list in module_lists.bzl.
+
+2. updating modules
+   Update the URL and sha256 for the module in extensions.bzl.

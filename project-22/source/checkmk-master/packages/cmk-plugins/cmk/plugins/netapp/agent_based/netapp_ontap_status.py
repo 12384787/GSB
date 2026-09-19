@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+# Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+from collections.abc import Sequence
+
+from cmk.agent_based.v2 import (
+    AgentSection,
+    CheckPlugin,
+    CheckResult,
+    Result,
+    State,
+    StringTable,
+)
+from cmk.agent_based.v3_unstable import discover_one_service
+from cmk.plugins.netapp import models
+
+Section = Sequence[models.AlertModel]
+
+# <<<netapp_api_alerts:sep(0)>>>
+# {
+#     "name": "alert-name",
+# }
+# {
+#     "name": "alert-name",
+# }
+
+
+def format_alert(alert: models.AlertModel) -> str:
+    s = alert.name
+    if alert.acknowledge:
+        s += f", acknowledged by {alert.acknowledger}"
+    if alert.suppress:
+        s += f", suppressed by {alert.suppressor}"
+    return s
+
+
+def parse_netapp_api_status(string_table: StringTable) -> Section:
+    return [
+        alert for line in string_table for alert in [models.AlertModel.model_validate_json(line[0])]
+    ]
+
+
+agent_section_netapp_ontap_status = AgentSection(
+    name="netapp_ontap_alerts",
+    parse_function=parse_netapp_api_status,
+)
+
+
+def check_netapp_ontap_status(section: Section) -> CheckResult:
+    if not section:
+        yield Result(state=State.OK, summary="No alerts present")
+        return
+
+    handled_alerts = [alert for alert in section if alert.acknowledge or alert.suppress]
+    unhandled_alerts = [alert for alert in section if alert not in handled_alerts]
+    # show the unhandled alerts first
+    details = "\n".join(format_alert(alert) for alert in unhandled_alerts + handled_alerts)
+
+    if unhandled_alerts:
+        yield Result(
+            state=State.CRIT, summary="Unhandled alerts present, see details", details=details
+        )
+    else:
+        yield Result(
+            state=State.OK,
+            summary="Alerts present, but all acknowledged or suppressed, see details",
+            details=details,
+        )
+
+
+check_plugin_netapp_ontap_status = CheckPlugin(
+    name="netapp_ontap_status",
+    service_name="Diagnosis Status",
+    sections=["netapp_ontap_alerts"],
+    discovery_function=discover_one_service,
+    check_function=check_netapp_ontap_status,
+)

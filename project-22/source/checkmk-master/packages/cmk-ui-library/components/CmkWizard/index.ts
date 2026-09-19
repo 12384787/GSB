@@ -1,0 +1,14 @@
+/**
+ * Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+import CmkWizard from './CmkWizard.vue'
+import CmkWizardButton from './CmkWizardButton.vue'
+import CmkWizardModeToggle from './CmkWizardModeToggle.vue'
+import CmkWizardStep from './CmkWizardStep.vue'
+import type { CmkWizardStepProps } from './CmkWizardStep.vue'
+
+export default CmkWizard
+export { CmkWizardButton, CmkWizardModeToggle, CmkWizardStep }
+export type { CmkWizardStepProps }

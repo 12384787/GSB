@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+from cmk.gui.i18n import _
+from cmk.gui.plugins.wato.utils import HostRulespec, rulespec_registry
+from cmk.gui.valuespec import Dictionary, DropdownChoice, Integer, MigrateNotUpdated, TextInput
+from cmk.gui.wato import PluginCommandLine
+from cmk.gui.watolib.rulespec_groups import RulespecGroupIntegrateOtherServices
+
+
+def _valuespec_custom_checks() -> MigrateNotUpdated:
+    return MigrateNotUpdated(
+        valuespec=Dictionary(
+            title=_("Integrate Nagios plug-ins"),
+            help=_(
+                'With this rule set you can configure "classical Monitoring checks" '
+                "to be executed directly on your monitoring server. These checks "
+                "will not use Checkmk. It is also possible to configure passive "
+                "checks that are fed with data from external sources via the "
+                "command pipe of the monitoring core."
+            )
+            + _(
+                'This option can only be used with the permission "Can add or modify executables".'
+            ),
+            elements=[
+                (
+                    "service_description",
+                    TextInput(
+                        title=_("Service name"),
+                        help=_(
+                            "Please make sure that this is unique per host "
+                            "and does not collide with other services."
+                        ),
+                        allow_empty=False,
+                        default_value=_("Custom check"),
+                    ),
+                ),
+                (
+                    "command_line",
+                    PluginCommandLine(),
+                ),
+                (
+                    "command_name",
+                    TextInput(
+                        title=_("Internal command name"),
+                        help=_(
+                            "If you want, you can specify a name that will be used "
+                            "in the <tt>define command</tt> section for these checks. This "
+                            "allows you to assign a custom PNP template for the metrics "
+                            "of the checks. If you omit this, then <tt>check-mk-custom</tt> "
+                            "will be used."
+                        ),
+                        size=32,
+                    ),
+                ),
+                (
+                    "freshness",
+                    Dictionary(
+                        title=_("Check freshness"),
+                        help=_(
+                            "Freshness checking is only useful for passive checks when the staleness feature "
+                            "is not enough for you. It changes the state of a check to a configurable other state "
+                            "when the check results are not arriving in time. Staleness will still grey out the "
+                            "test after the corresponding interval. If you don't want that, you might want to adjust "
+                            "the staleness interval as well. The staleness interval is calculated from the normal "
+                            "check interval multiplied by the staleness value in the <tt>Global settings</tt>. "
+                            "The normal check interval can be configured in a separate rule for your check."
+                        ),
+                        optional_keys=False,
+                        elements=[
+                            (
+                                "interval",
+                                Integer(
+                                    title=_("Expected update interval"),
+                                    label=_("Updates are expected at least every"),
+                                    unit=_("minutes"),
+                                    minvalue=1,
+                                    default_value=10,
+                                ),
+                            ),
+                            (
+                                "state",
+                                DropdownChoice(
+                                    title=_("State in case of absent updates"),
+                                    choices=[
+                                        (0, _("OK")),
+                                        (1, _("WARN")),
+                                        (2, _("CRIT")),
+                                        (3, _("UNKNOWN")),
+                                    ],
+                                    default_value=3,
+                                ),
+                            ),
+                            (
+                                "output",
+                                TextInput(
+                                    title=_("Plug-in output in case of absent updates"),
+                                    size=40,
+                                    allow_empty=False,
+                                    default_value=_("Check result did not arrive in time"),
+                                ),
+                            ),
+                        ],
+                    ),
+                ),
+            ],
+            required_keys=["service_description"],
+        ),
+        migrate=lambda p: {k: v for k, v in p.items() if k != "has_perfdata"},
+    )
+
+
+rulespec_registry.register(
+    HostRulespec(
+        group=RulespecGroupIntegrateOtherServices,
+        match_type="all",
+        name="custom_checks",
+        valuespec=_valuespec_custom_checks,
+    )
+)

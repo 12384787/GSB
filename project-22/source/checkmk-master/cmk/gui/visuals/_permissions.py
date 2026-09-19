@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from cmk.gui.config import default_authorized_builtin_role_ids
+from cmk.gui.i18n import _
+from cmk.gui.permissions import declare_permission
+from cmk.gui.type_defs import VisualTypeName
+
+
+def declare_visual_permissions(what: VisualTypeName, what_plural: str) -> None:
+    declare_permission(
+        "general.edit_" + what,
+        _("Customize %(what_plural)s and use them") % {"what_plural": what_plural},
+        _("Allows to create own %(what_plural)s, customize built-in %(builtin)s and use them.")
+        % {"what_plural": what_plural, "builtin": what_plural},
+        ["admin", "user"],
+    )
+
+    publish_help = _("Make %(what_plural)s visible and usable for all users.") % {
+        "what_plural": what_plural
+    }
+    if what == "dashboards":
+        # Dashboards also gate public link sharing with this permission.
+        publish_help = _(
+            "Make dashboards visible and usable for all users. For dashboards this "
+            "permission additionally controls whether a dashboard may be shared via a "
+            "public link."
+        )
+    declare_permission(
+        "general.publish_" + what,
+        _("Publish %(what_plural)s") % {"what_plural": what_plural},
+        publish_help,
+        ["admin", "user"],
+    )
+
+    declare_permission(
+        "general.publish_" + what + "_to_groups",
+        _("Publish %(what_plural)s to allowed contact groups") % {"what_plural": what_plural},
+        _(
+            "Make %(what_plural)s visible and usable for users of contact groups the publishing user is a member of."
+        )
+        % {"what_plural": what_plural},
+        ["admin", "user"],
+    )
+
+    declare_permission(
+        "general.publish_" + what + "_to_foreign_groups",
+        _("Publish %(what_plural)s to foreign contact groups") % {"what_plural": what_plural},
+        _(
+            "Make %(what_plural)s visible and usable for users of contact groups the publishing user is not a member of."
+        )
+        % {"what_plural": what_plural},
+        ["admin"],
+    )
+
+    declare_permission(
+        "general.publish_" + what + "_to_sites",
+        ("Publish %s to users of selected sites") % what_plural,
+        _(
+            "Make %(what_plural)s visible and usable for users of sites the publishing user has selected."
+        )
+        % {"what_plural": what_plural},
+        ["admin"],
+    )
+
+    declare_permission(
+        "general.see_user_" + what,
+        _("See user %(what_plural)s") % {"what_plural": what_plural},
+        _("Is needed for seeing %(what_plural)s that other users have created.")
+        % {"what_plural": what_plural},
+        default_authorized_builtin_role_ids,
+    )
+
+    declare_permission(
+        "general.see_packaged_" + what,
+        _("See packaged %(what_plural)s") % {"what_plural": what_plural},
+        _("Is needed for seeing %(what_plural)s that are provided via extension packages.")
+        % {"what_plural": what_plural},
+        default_authorized_builtin_role_ids,
+    )
+
+    declare_permission(
+        "general.force_" + what,
+        _("Modify built-in %(what_plural)s") % {"what_plural": what_plural},
+        _("Make own published %(what_plural)s override built-in %(builtin)s for all users.")
+        % {"what_plural": what_plural, "builtin": what_plural},
+        ["admin"],
+    )
+
+    declare_permission(
+        "general.edit_foreign_" + what,
+        _("Edit foreign %(what_plural)s") % {"what_plural": what_plural},
+        _("Allows to edit %(what_plural)s created by other users.") % {"what_plural": what_plural},
+        ["admin"],
+    )
+
+    declare_permission(
+        "general.delete_foreign_" + what,
+        _("Delete foreign %(what_plural)s") % {"what_plural": what_plural},
+        _("Allows to delete %(what_plural)s created by other users.")
+        % {"what_plural": what_plural},
+        ["admin"],
+    )

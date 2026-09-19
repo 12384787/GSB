@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import logging
+import re
+from enum import StrEnum
+from typing import override, TypeVar
+
+from playwright.sync_api import expect, Locator, Page
+
+from tests.system.gui.testlib.playwright.dropdown import DropdownHelper, DropdownOptions
+from tests.system.gui.testlib.playwright.helpers import (
+    CmkCredentials,
+    DropdownListNameToID,
+    url_suffix_regex,
+)
+from tests.system.gui.testlib.playwright.pom.page import CmkPage
+from tests.testlib.site import Site
+
+logger = logging.getLogger(__name__)
+
+
+TOptions = TypeVar("TOptions", bound=StrEnum)
+
+
+class EncryptionType(DropdownOptions):
+    """Encryption type DropdownOptions the site connection."""
+
+    TLS = "Encrypt data using TLS"
+    NONE = "Plain text (unencrypted)"
+
+
+class ReplicationType(DropdownOptions):
+    """Replication type for the site connection."""
+
+    NO_REPLICATION = "No replication with this site"
+    PUSH_CONFIGURATION = "Push configuration to this site"
+
+
+class AuthenticationConnections(DropdownOptions):
+    """Cascading choice for the 'Authentication connections' Form Spec field."""
+
+    # "Use same as the central site" was removed from both properties (CMK-37102);
+    # "Disabled" replaced it as the non-default, no-nested-data choice.
+    DISABLED = "Disabled (Use the local users of the central site)"
+    USE_ALL = "Use all"
+    FOLLOWING_CONNECTIONS = "Use the following"
+
+
+class DistributedMonitoring(CmkPage):
+    """Represent the page `Setup -> General -> Distributed monitoring`."""
+
+    page_title = "Distributed monitoring"
+
+    @override
+    def navigate(self) -> None:
+        """Instructions to navigate to `Setup -> General -> Distributed monitoring` page."""
+        logger.info("Navigate to '%s' page", self.page_title)
+        self.main_menu.setup_menu(self.page_title).click()
+        # Distributed mixed-version tests reach this page on an older central/remote
+        # site that still wraps it in the main iframe, so the URL is percent-encoded.
+        # url_suffix_regex matches both the new and old forms.
+        self.page.wait_for_url(url=url_suffix_regex("wato.py?mode=sites"), wait_until="load")
+        self.validate_page()
+
+    @override
+    def validate_page(self) -> None:
+        logger.info("Validate that current page is '%s' page", self.page_title)
+        self.main_area.check_page_title(self.page_title)
+        expect(
+            self.add_connection_button,
+            message=f"Expected 'Add connection' button to be visible on page '{self.page_title}'",
+        ).to_be_visible()
+
+    @override
+    def _dropdown_list_name_to_id(self) -> DropdownListNameToID:
+        return DropdownListNameToID()
+
+    @property
+    def data_table(self) -> Locator:
+        """The data table containing the site connections."""
+        return self.main_area.locator("table.data")
+
+    @property
+    def add_connection_button(self) -> Locator:
+        """The button to add a new connection."""
+        return self.main_area.page_menu_bar.get_by_role("link", name="Add connection")
+
+    def _get_table_row(self, site_id: str) -> Locator:
+        """Get the table row for a specific site ID.
+
+        Args:
+            site_id: The ID of the site to find.
+        """
+        return self.data_table.get_by_role("row").filter(
+            has=self.main_area.locator().get_by_role("cell", name=site_id, exact=True)
+        )
+
+    def get_login_button(self, site_id: str) -> Locator:
+        """Get the button to login to the remote site.
+
+        Args:
+            site_id: The ID of the site to login to.
+        """
+        return self._get_table_row(site_id).get_by_role("link", name="Login")
+
+    def add_new_connection(self, remote_site: Site) -> None:
+        """Add a new connection to the remote site.
+
+        Args:
+            remote_site: The remote site to add.
+        """
+        logger.info("Add a new connection to the remote site: '%s'", remote_site)
+        self.add_connection_button.click()
+        add_site_connection_page = AddSiteConnection(self.page, navigate_to_page=False)
+        add_site_connection_page.fill_site_connection_form(remote_site)
+        add_site_connection_page.save_button.click()
+
+    def open_add_connection_form(self) -> AddSiteConnection:
+        """Open the 'Add site connection' form and return its page object."""
+        logger.info("Open the 'Add site connection' form")
+        self.add_connection_button.click()
+        return AddSiteConnection(self.page, navigate_to_page=False)
+
+    def open_edit_connection(self, site_id: str) -> AddSiteConnection:
+        """Open the edit form of an existing site connection.
+
+        The site ID cell links to `wato.py?mode=edit_site&site=<id>`.
+
+        Args:
+            site_id: The ID of the site connection to edit.
+        """
+        logger.info("Open the edit form of site connection '%s'", site_id)
+        # Pencil link in the row's Actions column (distinct from `clone=` and the
+        # link to the site-specific settings).
+        self._get_table_row(site_id).locator(f"a[href*='mode=edit_site&site={site_id}']").click()
+        # URL stays SPA-encoded; the page object's validate_page waits on the title instead.
+        return AddSiteConnection(self.page, navigate_to_page=False, edit_site_id=site_id)
+
+    def check_site_online_status(self, site_id: str, times_to_reload_page: int = 5) -> None:
+        """Check via the UI that the remote site is online.
+
+        Both the 'livestatus connection' and 'replication status' are validated.
+        The page is reloaded up to 'times_to_reload_page' times on failure,
+        as connection state of remote sites is not refreshed on Distributed monitoring page.
+
+        Args:
+            site_id: The ID of the site to check.
+            times_to_reload_page: Reload page, by default 5 times, to perform validation again.
+        """
+        logger.info("Check via the UI that the remote site '%s' is online", site_id)
+        site_live = self.data_table.locator(f"div#livestatus_status_{site_id}")
+        site_http = self.data_table.locator(f"div#replication_status_{site_id}")
+        expected_text = "Online"
+        assert_msg = f"Expected remote site '{site_id}' connection to be '{expected_text}'!"
+
+        # CMK-35636 - connection timeout encountered in CI builds, frequently.
+        # ReplicationStatusFetcher::_fetch_for_site configured to timeout in 5 seconds.
+        # worst-case scenario: Assertions is raised after 2 x 5 minutes.
+        num_attempt = 1
+        while True:
+            logger.info(
+                "Validate remote site ('%s') connection - attempt %d / %d",
+                site_id,
+                num_attempt,
+                times_to_reload_page,
+            )
+            try:
+                expect(site_live, message=assert_msg).to_have_text(expected_text)
+                expect(site_http, message=assert_msg).to_have_text(re.compile(expected_text))
+                return
+            except AssertionError as exc:
+                if num_attempt <= times_to_reload_page:
+                    self.page.reload(wait_until="domcontentloaded")
+                    num_attempt += 1
+                    continue
+                raise exc
+
+    def clean_all_site_connections(self) -> int:
+        """Delete all site connections.
+
+        Returns:
+            The number of deleted site connections.
+        """
+        logger.info("Delete all site connections")
+
+        expect(self.data_table, message="Site connections table is not shown").to_be_visible()
+        delete_buttons = self.data_table.get_by_role("link", name="Delete")
+
+        number_of_deleted_sites = delete_buttons.count()
+
+        while delete_buttons.count():
+            delete_button = delete_buttons.first
+            site_id = delete_button.locator("../..").locator("td").nth(1).text_content()
+            assert site_id is not None, "Site ID not found"
+            delete_button.click()
+            self.main_area.get_confirmation_popup_button("Delete").click()
+            expect(
+                self._get_table_row(site_id), message=f"Site connection '{site_id}' not deleted"
+            ).to_have_count(0)
+
+        return number_of_deleted_sites
+
+    def login_to_remote_site(self, remote_site: Site, credentials: CmkCredentials) -> None:
+        """Login to the remote site.
+
+        Args:
+            remote_site: The remote site to login to.
+            credentials: The credentials for the remote site.
+        """
+        logger.info("Login to the remote site")
+        self.get_login_button(remote_site.id).click()
+        login_page = LoginRemoteSite(self.page, remote_site, navigate_to_page=False)
+        login_page.fill_login_form(credentials)
+        login_page.login_button.click()
+
+    def site_specific_settings_link(self, site_id: str) -> Locator:
+        return self._get_table_row(site_id).get_by_role(
+            "link", name="Site-specific global configuration"
+        )
+
+    def is_remote_site_licensed(self, site_id: str) -> bool | None:
+        """Check if a remote site is licensed.
+
+        Returns None if the replication is disabled (and therefore the license state is unknown).
+        Returns a boolean indicating the license state otherwise.
+        """
+        self.check_site_online_status(site_id)
+        if "not enabled" in self._get_table_row(site_id).inner_text().lower():
+            logger.info(
+                'Replication disabled for remote site "%s"; licensing status unknown!', site_id
+            )
+            return None
+        remote_site_license_info = (
+            self._get_table_row(site_id).get_by_role("cell").filter(has_text="license state")
+        )
+        return "license state: licensed" in remote_site_license_info.inner_text().lower()
+
+
+class AddSiteConnection(CmkPage):
+    """Represent the page `Setup -> General -> Distributed monitoring -> Add site connection`.
+
+    The same WATO mode (`edit_site`) renders both the add form (no `site` argument)
+    and the edit form of an existing connection (`site=<id>`). When `edit_site_id`
+    is provided this page object represents the edit form of that connection,
+    where the Site ID is a read-only value rather than an input field.
+    """
+
+    page_title = "Add site connection"
+
+    def __init__(
+        self, page: Page, navigate_to_page: bool = True, edit_site_id: str | None = None
+    ) -> None:
+        """Initialize the add/edit site connection page.
+
+        Args:
+            page: The Playwright page object.
+            navigate_to_page: Whether to navigate to the add form on construction.
+            edit_site_id: If set, this page object represents the edit form of the
+                given site connection (the Site ID is then read-only).
+        """
+        self._edit_site_id = edit_site_id
+        if edit_site_id is not None:
+            self.page_title = f"Edit site connection {edit_site_id}"
+        super().__init__(page, navigate_to_page=navigate_to_page)
+
+    @override
+    def navigate(self) -> None:
+        """Instructions to navigate to
+        `Setup -> General -> Distributed monitoring -> Add site connection` page.
+        """
+        logger.info("Navigate to '%s' page", self.page_title)
+        _distributed_monitoring = DistributedMonitoring(self.page)
+        _distributed_monitoring.add_connection_button.click()
+        # An older site still wraps this page in the main iframe, so the URL is
+        # percent-encoded. url_suffix_regex matches both the new and old forms.
+        self.page.wait_for_url(url=url_suffix_regex("wato.py?mode=edit_site"), wait_until="load")
+        self.validate_page()
+
+    @override
+    def validate_page(self) -> None:
+        logger.info("Validate that current page is '%s' page", self.page_title)
+        self.main_area.check_page_title(self.page_title)
+        if self._edit_site_id is None:
+            expect(
+                self.site_id_input, message=f"Site ID input not present in '{self.page_title}' page"
+            ).to_be_visible()
+
+    @override
+    def _dropdown_list_name_to_id(self) -> DropdownListNameToID:
+        return DropdownListNameToID()
+
+    @property
+    def save_button(self) -> Locator:
+        """The button to save the new site connection."""
+        return self.main_area.get_suggestion("Save")
+
+    @property
+    def form_site(self) -> Locator:
+        """The form to add a new site connection."""
+        return self.main_area.locator()
+
+    @property
+    def site_id_input(self) -> Locator:
+        """The input field for the site ID."""
+        return self.form_site.get_by_label("Site ID")
+
+    @property
+    def site_alias_input(self) -> Locator:
+        """The input field for the site alias."""
+        return self.form_site.get_by_label("Alias")
+
+    @property
+    def connection_tcp_host_input(self) -> Locator:
+        """The input field for the site host."""
+        return self.form_site.get_by_role("group", name="TCP address to connect to").get_by_role(
+            "textbox"
+        )
+
+    @property
+    def connection_tcp_port_input(self) -> Locator:
+        """The input field for the site port."""
+        return self.form_site.get_by_label("Port:")
+
+    @property
+    def connection_encryptor_dropdown(self) -> DropdownHelper[EncryptionType]:
+        """The dropdown for the encryption setting."""
+        return DropdownHelper[EncryptionType](
+            "Encryption",
+            dropdown_box=self.form_site.get_by_role("combobox", name="Encryption"),
+            dropdown_list=self.form_site.get_by_role("listbox"),
+        )
+
+    @property
+    def url_prefix_input(self) -> Locator:
+        """The input field for the URL prefix."""
+        return self.form_site.get_by_label("URL prefix")
+
+    @property
+    def replication_type_dropdown(self) -> DropdownHelper[ReplicationType]:
+        """The dropdown for the replication setting."""
+        return DropdownHelper[ReplicationType](
+            "Enable replication",
+            dropdown_box=self.form_site.get_by_role("combobox", name="Enable replication"),
+            dropdown_list=self.form_site.get_by_role("listbox"),
+        )
+
+    @property
+    def message_broker_port_input(self) -> Locator:
+        """The input field for the message broker port."""
+        return self.form_site.get_by_label("Message broker port")
+
+    @property
+    def url_of_remote_site_input(self) -> Locator:
+        """The input field for the URL of the remote site."""
+        return self.form_site.get_by_label("URL of remote site")
+
+    @property
+    def authentication_connections_dropdown(self) -> DropdownHelper[AuthenticationConnections]:
+        """The Form Spec cascading-choice for 'Authentication connections'.
+
+        Rendered by cmk-frontend-vue as a `CmkDropdown` whose accessible name is
+        the Form Spec title ('Authentication connections').
+        """
+        return DropdownHelper[AuthenticationConnections](
+            "Authentication connections",
+            dropdown_box=self.form_site.get_by_role("combobox", name="Authentication connections"),
+            dropdown_list=self.form_site.get_by_role("listbox"),
+        )
+
+    def assert_authentication_connections_selected(self, option: AuthenticationConnections) -> None:
+        """Assert the 'Authentication connections' cascading-choice shows `option`."""
+        logger.info("Assert 'Authentication connections' is set to '%s'", option)
+        expect(
+            self.form_site.get_by_role("combobox", name="Authentication connections"),
+            message=f"'Authentication connections' is not set to '{option}'",
+        ).to_contain_text(option)
+
+    def fill_site_connection_form(self, remote_site: Site) -> None:
+        """Fill the form to add a new site connection.
+
+        Args:
+            remote_site: The remote site to add.
+        """
+        logger.info("Fill the form to add a new site connection")
+        self.site_id_input.fill(remote_site.id)
+        self.site_alias_input.fill(remote_site.alias)
+        self.connection_tcp_host_input.fill(remote_site.http_address)
+        self.connection_tcp_port_input.fill(str(remote_site.livestatus_port))
+        self.connection_encryptor_dropdown.select_option(EncryptionType.NONE)
+        self.url_prefix_input.fill(remote_site.url_prefix)
+        self.replication_type_dropdown.select_option(ReplicationType.PUSH_CONFIGURATION)
+        self.message_broker_port_input.fill(str(remote_site.message_broker_port))
+        self.url_of_remote_site_input.fill(remote_site.internal_url)
+
+
+class LoginRemoteSite(CmkPage):
+    """Represents the page `Login to remote site`."""
+
+    page_title_template = 'Login into site "{remote_site_name}"'
+
+    def __init__(self, page: Page, remote_site: Site, navigate_to_page: bool = True) -> None:
+        """Initialize the login page for the remote site.
+
+        Args:
+            page: The Playwright page object.
+            remote_site: The remote site to login to.
+            navigate_to_page: Whether to navigate to the page or not.
+        """
+        self.__remote_site_id = remote_site.id
+        self.page_title = self.page_title_template.format(remote_site_name=remote_site.alias)
+        super().__init__(page, navigate_to_page=navigate_to_page)
+
+    @override
+    def navigate(self) -> None:
+        """Instructions to navigate to
+        `Setup -> General -> Distributed monitoring -> Login` page.
+        """
+        logger.info("Navigate to '%s' page", self.page_title)
+        _distributed_monitoring = DistributedMonitoring(self.page)
+        _distributed_monitoring.get_login_button(self.__remote_site_id).click()
+        _url_pattern = re.compile(
+            re.escape("wato.py?") + r".*" + re.escape(f"_login={self.__remote_site_id}")
+        )
+        self.page.wait_for_url(url=_url_pattern, wait_until="load")
+        self.validate_page()
+
+    @override
+    def validate_page(self) -> None:
+        logger.info("Validate that current page is '%s' page", self.page_title)
+        self.main_area.check_page_title(self.page_title)
+
+    @override
+    def _dropdown_list_name_to_id(self) -> DropdownListNameToID:
+        return DropdownListNameToID()
+
+    @property
+    def form_login(self) -> Locator:
+        """The login form."""
+        return self.main_area.locator("form#form_login")
+
+    @property
+    def username_input(self) -> Locator:
+        """The input field for the username."""
+        return self.form_login.locator("input[name='_name']")
+
+    @property
+    def password_input(self) -> Locator:
+        """The input field for the password."""
+        return self.form_login.locator("input[name='_passwd']")
+
+    @property
+    def confirm_checkbox(self) -> Locator:
+        """The checkbox for the confirmation."""
+        return self.form_login.locator("label[for='cb__confirm']")
+
+    @property
+    def is_checkbox_checked(self) -> bool:
+        """The state of the confirmation checkbox."""
+        return self.form_login.locator("input[name='_confirm']").is_checked()
+
+    @property
+    def login_button(self) -> Locator:
+        """The button to login."""
+        return self.form_login.locator("#_do_login")
+
+    def fill_login_form(self, credentials: CmkCredentials) -> None:
+        """Fill the login form.
+
+        Args:
+            credentials: The credentials for the remote site.
+        """
+        logger.info("Fill the login form")
+        self.username_input.fill(credentials.username)
+        self.password_input.fill(credentials.password)
+        if not self.is_checkbox_checked:
+            self.confirm_checkbox.click()

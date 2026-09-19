@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+
+from typing import Any
+
+from cmk.gui.i18n import _
+from cmk.gui.plugins.wato.utils import (
+    CheckParameterRulespecWithItem,
+    HostRulespec,
+    rulespec_registry,
+    RulespecGroupCheckParametersDiscovery,
+    RulespecGroupCheckParametersEnvironment,
+)
+from cmk.gui.valuespec import Dictionary, DropdownChoice, Migrate, Percentage, TextInput, Tuple
+from cmk.ruleset_matcher.definition import RuleGroup
+
+
+def _valuespec_ewon_discovery_rules() -> Migrate[dict[str, Any]]:
+    return Migrate(
+        Dictionary(
+            title=_("eWON discovery"),
+            elements=[
+                (
+                    "device",
+                    DropdownChoice(
+                        help=_(
+                            "The eWon VPN routers can rely on data from a secondary device via SNMP. It doesn't however allow discovery of the device type relayed this way. To allow interpretation of the data you need to pick the device manually."
+                        ),
+                        label=_("Select device type"),
+                        choices=[
+                            (None, _("None selected")),
+                            ("oxyreduct", _("Wagner OxyReduct")),
+                        ],
+                        default_value=None,
+                    ),
+                ),
+            ],
+            optional_keys=[],
+        ),
+        migrate=lambda x: x if isinstance(x, dict) else {"device": x},
+    )
+
+
+rulespec_registry.register(
+    HostRulespec(
+        group=RulespecGroupCheckParametersDiscovery,
+        name=RuleGroup.DiscoveryParameters("ewon_discovery_rules"),
+        valuespec=_valuespec_ewon_discovery_rules,
+        match_type="dict",
+    )
+)
+
+
+def _item_spec_ewon() -> TextInput:
+    return TextInput(
+        title=_("Item name"),
+        help=_(
+            "The item name. The meaning of this depends on the proxied device: "
+            "- Wagner OxyReduct: Name of the room/protection zone"
+        ),
+    )
+
+
+def _parameter_valuespec_ewon() -> Dictionary:
+    return Dictionary(
+        title=_("Device type"),
+        help=_(
+            "The eWON router can act as a proxy to metrics from a secondary non-SNMP device. Here you can make settings to the monitoring of the proxied device."
+        ),
+        elements=[
+            (
+                "oxyreduct",
+                Dictionary(
+                    title=_("Wagner OxyReduct"),
+                    elements=[
+                        (
+                            "o2_levels",
+                            Tuple(
+                                title=_("O2 levels"),
+                                elements=[
+                                    Percentage(title=_("Warning at"), default_value=16.0),
+                                    Percentage(title=_("Critical at"), default_value=17.0),
+                                    Percentage(title=_("Warning below"), default_value=14.0),
+                                    Percentage(title=_("Critical below"), default_value=13.0),
+                                ],
+                            ),
+                        )
+                    ],
+                ),
+            )
+        ],
+        ignored_keys=["device"],
+    )
+
+
+rulespec_registry.register(
+    CheckParameterRulespecWithItem(
+        check_group_name="ewon",
+        group=RulespecGroupCheckParametersEnvironment,
+        item_spec=_item_spec_ewon,
+        match_type="dict",
+        parameter_valuespec=_parameter_valuespec_ewon,
+        title=lambda: _("eWON SNMP proxy"),
+    )
+)

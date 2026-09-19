@@ -1,0 +1,22 @@
+title: Kubernetes: Deployment Info
+agents: kubernetes
+catalog: containerization/kubernetes
+license: GPLv2
+distribution: check_mk
+description:
+ This check provides an informational overview of a Kubernetes deployment
+ by displaying
+
+ - Name
+
+ - Namespace
+
+ - Age, based on the creationTimestamp
+
+ This information is provided by the API server. The service is always {OK}.
+
+ This check requires that Kubernetes monitoring is configured and that Checkmk
+ can receive data from the in-cluster agent.
+
+discovery:
+ One service is created for each deployment.

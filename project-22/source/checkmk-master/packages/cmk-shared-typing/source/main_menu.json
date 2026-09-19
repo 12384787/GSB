@@ -1,0 +1,209 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "main_menu_config",
+  "properties": {
+    "hide_item_title": { "type": "boolean", "default": false },
+    "start": { "$ref": "#/$defs/start_item" },
+    "main": { "$ref": "#/$defs/nav_items" },
+    "user": { "$ref": "#/$defs/nav_items" }
+  },
+  "required": ["start", "main", "user"],
+  "$defs": {
+    "start_item": {
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "url": { "type": "string" },
+        "icon_path": { "type": "string" }
+      },
+      "required": ["title", "url"]
+    },
+    "nav_items": {
+      "type": "array",
+      "items": {
+        "anyOf": [{ "$ref": "#/$defs/nav_item" }, { "$ref": "#/$defs/nav_link_item" }]
+      }
+    },
+    "nav_base_item": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/nav_item_id_enum" },
+        "type": { "$ref": "#/$defs/nav_item_type" },
+        "title": { "type": "string" },
+        "sort_index": { "type": "number" },
+        "shortcut": { "$ref": "#/$defs/nav_item_shortcut" },
+        "is_user_nav": { "type": "boolean", "default": false },
+        "hint": { "type": "string" },
+        "badge": {
+          "$ref": "#/$defs/nav_item_badge"
+        }
+      },
+      "required": ["id", "title", "sort_index", "shortcut", "type"]
+    },
+    "nav_item": {
+      "allOf": [{ "$ref": "#/$defs/nav_base_item" }],
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "const": "item" },
+        "topics": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nav_item_topic" }
+        },
+        "set_focus_on_element_by_id": { "type": "string" },
+        "vue_app": { "$ref": "#/$defs/nav_item_vue_app" },
+        "header": { "$ref": "#/$defs/nav_item_header" },
+        "show_more": { "$ref": "#/$defs/nav_item_show_more" },
+        "popup_small": { "type": "boolean" }
+      }
+    },
+    "nav_link_item": {
+      "allOf": [{ "$ref": "#/$defs/nav_base_item" }],
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "const": "link" },
+        "url": { "type": "string" },
+        "target": { "type": "string" }
+      }
+    },
+    "nav_item_topic": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "icon": { "$ref": "icon.json#/$defs/dynamic_icon" },
+        "is_show_more": { "type": "boolean" },
+        "sort_index": { "type": "number" },
+        "entries": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nav_item_topic_entry" }
+        }
+      },
+      "required": ["id", "title", "entries", "sort_index"]
+    },
+    "nav_item_topic_entry": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "url": { "type": "string" },
+        "target": { "type": "string" },
+        "loading_transition": { "$ref": "loading_transition.json" },
+        "is_show_more": { "type": "boolean" },
+        "icon": { "$ref": "icon.json#/$defs/dynamic_icon" },
+        "toggle": { "$ref": "#/$defs/nav_item_topic_entry_toggle" },
+        "chip": { "$ref": "#/$defs/nav_item_topic_entry_chip" },
+        "mode": { "$ref": "#/$defs/topic_item_mode" },
+        "main_menu_search_terms": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "entries": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/nav_item_topic_entry" }
+        },
+        "sort_index": { "type": "number" }
+      },
+      "required": ["id", "title", "sort_index"]
+    },
+    "nav_item_vue_app": {
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/nav_vue_app_id_enum" },
+        "data": { "type": "object", "additionalProperties": true }
+      },
+      "required": ["id"]
+    },
+    "nav_item_header": {
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "info": { "type": "string" },
+        "show_more": { "type": "boolean" },
+        "trigger_button": {
+          "$ref": "#/$defs/nav_item_header_trigger_button"
+        }
+      },
+      "required": ["id", "data"]
+    },
+    "nav_item_header_trigger_button": {
+      "type": "object",
+      "properties": {
+        "mode": { "$ref": "#/$defs/header_trigger_mode_enum" },
+        "color": { "$ref": "#/$defs/color_enum" },
+        "target_url": { "type": "string" }
+      },
+      "required": ["mode", "target_url"]
+    },
+    "nav_item_badge": {
+      "type": "object",
+      "properties": {
+        "mode": { "$ref": "#/$defs/nav_item_badge_enum" },
+        "color": { "$ref": "#/$defs/color_enum" },
+        "url": { "type": "string" },
+        "interval_in_seconds": { "type": "number" }
+      },
+      "required": ["mode", "url"]
+    },
+    "nav_item_shortcut": {
+      "type": "object",
+      "properties": {
+        "key": { "type": "string" },
+        "alt": { "type": "boolean" },
+        "ctrl": { "type": "boolean" },
+        "shift": { "type": "boolean" },
+        "prevent_default": { "type": "boolean", "default": false }
+      },
+      "required": ["key"]
+    },
+    "nav_item_show_more": {
+      "type": "object",
+      "properties": {
+        "active": { "type": "boolean" }
+      },
+      "required": ["active"]
+    },
+    "nav_item_topic_entry_toggle": {
+      "type": "object",
+      "properties": {
+        "value": { "type": "string" },
+        "color": { "$ref": "#/$defs/color_enum" },
+        "mode": { "type": "string" },
+        "reload": { "type": "boolean" }
+      },
+      "required": ["value", "mode"]
+    },
+    "nav_item_topic_entry_chip": {
+      "type": "object",
+      "properties": {
+        "mode": { "$ref": "#/$defs/chip_mode_enum" },
+        "color": { "$ref": "#/$defs/color_enum" }
+      },
+      "required": ["mode"]
+    },
+    "nav_item_id_enum": {
+      "enum": ["search", "monitoring", "customize", "setup", "changes", "saas", "help", "user"]
+    },
+    "nav_vue_app_id_enum": {
+      "enum": ["cmk-activate-changes", "cmk-unified-search"]
+    },
+    "color_enum": {
+      "enum": ["default", "success", "warning", "danger"]
+    },
+    "chip_mode_enum": {
+      "enum": ["user-messages-hint"]
+    },
+    "nav_item_badge_enum": {
+      "enum": ["num-pending-changes"]
+    },
+    "header_trigger_mode_enum": {
+      "enum": ["unack-incomp-werks"]
+    },
+    "topic_item_mode": {
+      "enum": ["item", "multilevel", "indented"]
+    },
+    "nav_item_type": {
+      "enum": ["item", "link", "configurable"]
+    }
+  }
+}

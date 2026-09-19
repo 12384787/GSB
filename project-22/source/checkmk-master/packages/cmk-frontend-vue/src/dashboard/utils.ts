@@ -1,0 +1,657 @@
+/**
+ * Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+import type { ConfiguredFilters, ConfiguredValues } from 'cmk-ui-library/components/filter'
+import { kioskMode } from 'cmk-ui-library/lib/kiosk'
+import client, { unwrap } from 'cmk-ui-library/lib/rest-api-client/client'
+import { copyToClipboard as copyToClipboardUtil } from 'cmk-ui-library/lib/utils'
+
+import { defaultResponsiveGridLayout } from '@/dashboard/components/ResponsiveGrid/composables/utils'
+import type {
+  BadRequestBody,
+  ContentRelativeGrid,
+  ContentResponsiveGrid,
+  DashboardConstants,
+  DashboardGeneralSettings,
+  DashboardKey,
+  DashboardMainMenuTopic,
+  DashboardMetadata,
+  DashboardModel,
+  RelativeGridDashboardDomainObject,
+  RelativeGridDashboardRequest,
+  RelativeGridDashboardResponse,
+  ResponsiveGridDashboardDomainObject,
+  ResponsiveGridDashboardRequest,
+  ResponsiveGridDashboardResponse,
+  SidebarElement
+} from '@/dashboard/types/dashboard.ts'
+import { DashboardLayout, DashboardOwnerType } from '@/dashboard/types/dashboard.ts'
+import type { ContextFilter, ContextFilters, FilterOrigin } from '@/dashboard/types/filter.ts'
+import type {
+  ComputedNetworkFlowAutonomousSystemResponse,
+  ComputedNetworkFlowDonutResponse,
+  ComputedNetworkFlowHostResponse,
+  ComputedNetworkFlowKpiStatCardResponse,
+  ComputedNetworkFlowTopTableResponse,
+  ComputedNetworkFlowTrendChartResponse,
+  ComputedSingleMetricResponse,
+  ComputedTimelineCountResponse,
+  ComputedTopListResponse,
+  ComputedWidgetSpecResponse,
+  EffectiveWidgetFilterContext,
+  NetworkFlowDonutContent,
+  NetworkFlowKpiStatCardContent,
+  NetworkFlowTopTableContent,
+  NetworkFlowTrendChartContent,
+  ResponsiveGridWidgetLayouts,
+  SingleMetricContent,
+  TimelineContent,
+  TopListContent,
+  VisualContext,
+  WidgetAvailableInventory,
+  WidgetContent
+} from '@/dashboard/types/widget.ts'
+
+import type { ComputeWidgetTitlesRequest, ComputeWidgetTitlesResponse } from './types/api'
+
+const CONTENT_TYPE_HEADER = {
+  params: {
+    header: { 'Content-Type': 'application/json' }
+  }
+}
+
+type EditGridResult<Result> =
+  | { success: true; status: 200; data: Result }
+  | { success: false; status: 400; error: BadRequestBody }
+  | { success: false; status: number; error: unknown }
+
+export type EditResponsiveGridResult = EditGridResult<ResponsiveGridDashboardDomainObject>
+export type EditRelativeGridResult = EditGridResult<RelativeGridDashboardDomainObject>
+
+function processEditResponse<T>(result: {
+  data?: T
+  error?: unknown
+  response: Response
+}): EditGridResult<T> {
+  if (result.response.status === 200) {
+    return { success: true, status: 200, data: result.data! }
+  }
+  if (result.response.status === 400) {
+    return { success: false, status: 400, error: result.error as BadRequestBody }
+  }
+  return { success: false, status: result.response.status, error: result.error }
+}
+
+export const dashboardAPI = {
+  getRelativeDashboard: async (
+    dashboardName: string,
+    dashboardOwner: string
+  ): Promise<RelativeGridDashboardDomainObject> => {
+    return unwrap(
+      await client.GET('/objects/dashboard_relative_grid/{dashboard_id}', {
+        params: {
+          path: { dashboard_id: dashboardName },
+          query: {
+            owner: dashboardOwner
+          }
+        }
+      })
+    )
+  },
+  getResponsiveDashboard: async (
+    dashboardName: string,
+    dashboardOwner: string
+  ): Promise<ResponsiveGridDashboardDomainObject> => {
+    return unwrap(
+      await client.GET('/objects/dashboard_responsive_grid/{dashboard_id}', {
+        params: {
+          path: { dashboard_id: dashboardName },
+          query: {
+            owner: dashboardOwner
+          }
+        }
+      })
+    )
+  },
+  editRelativeGridDashboard: async (
+    dashboardName: string,
+    dashboardOwner: string,
+    dashboard: RelativeGridDashboardRequest
+  ): Promise<EditRelativeGridResult> => {
+    const result = await client.PUT('/objects/dashboard_relative_grid/{dashboard_id}', {
+      params: {
+        ...CONTENT_TYPE_HEADER.params,
+        path: { dashboard_id: dashboardName },
+        query: {
+          owner: dashboardOwner
+        }
+      },
+      body: dashboard
+    })
+    return processEditResponse(result)
+  },
+  editResponsiveGridDashboard: async (
+    dashboardName: string,
+    dashboardOwner: string,
+    dashboard: ResponsiveGridDashboardRequest
+  ): Promise<EditResponsiveGridResult> => {
+    const result = await client.PUT('/objects/dashboard_responsive_grid/{dashboard_id}', {
+      params: {
+        ...CONTENT_TYPE_HEADER.params,
+        path: { dashboard_id: dashboardName },
+        query: {
+          owner: dashboardOwner
+        }
+      },
+      body: dashboard
+    })
+    return processEditResponse(result)
+  },
+  createRelativeGridDashboard: async (
+    dashboard: RelativeGridDashboardRequest
+  ): Promise<RelativeGridDashboardDomainObject> => {
+    return unwrap(
+      await client.POST('/domain-types/dashboard_relative_grid/collections/all', {
+        ...CONTENT_TYPE_HEADER,
+        body: dashboard
+      })
+    )
+  },
+  createResponsiveGridDashboard: async (
+    dashboard: ResponsiveGridDashboardRequest
+  ): Promise<ResponsiveGridDashboardDomainObject> => {
+    return unwrap(
+      await client.POST('/domain-types/dashboard_responsive_grid/collections/all', {
+        ...CONTENT_TYPE_HEADER,
+        body: dashboard
+      })
+    )
+  },
+  cloneAsRelativeGridDashboard: async (
+    referenceDashboardId: string,
+    referenceDashboardOwner: string,
+    dashboardId: string,
+    generalSettings: DashboardGeneralSettings
+  ): Promise<RelativeGridDashboardDomainObject> => {
+    return unwrap(
+      await client.POST('/domain-types/dashboard_relative_grid/actions/clone/invoke', {
+        ...CONTENT_TYPE_HEADER,
+        body: {
+          dashboard_id: dashboardId,
+          reference_dashboard_id: referenceDashboardId,
+          reference_dashboard_owner: referenceDashboardOwner,
+          general_settings: generalSettings
+        }
+      })
+    )
+  },
+  cloneAsResponsiveGridDashboard: async (
+    referenceDashboardId: string,
+    referenceDashboardOwner: string,
+    dashboardId: string,
+    generalSettings: DashboardGeneralSettings
+  ): Promise<ResponsiveGridDashboardDomainObject> => {
+    return unwrap(
+      await client.POST('/domain-types/dashboard_responsive_grid/actions/clone/invoke', {
+        ...CONTENT_TYPE_HEADER,
+        body: {
+          dashboard_id: dashboardId,
+          reference_dashboard_id: referenceDashboardId,
+          reference_dashboard_owner: referenceDashboardOwner,
+          general_settings: generalSettings
+        }
+      })
+    )
+  },
+  cloneRelativeAsResponsiveGridDashboard: async (
+    referenceDashboardId: string,
+    referenceDashboardOwner: string,
+    dashboardId: string,
+    generalSettings: DashboardGeneralSettings,
+    widgetLayouts: Record<string, ResponsiveGridWidgetLayouts>
+  ): Promise<ResponsiveGridDashboardDomainObject> => {
+    return unwrap(
+      await client.POST(
+        '/domain-types/dashboard_responsive_grid/actions/clone_from_relative_grid/invoke',
+        {
+          ...CONTENT_TYPE_HEADER,
+          body: {
+            dashboard_id: dashboardId,
+            reference_dashboard_id: referenceDashboardId,
+            reference_dashboard_owner: referenceDashboardOwner,
+            general_settings: generalSettings,
+            layout: defaultResponsiveGridLayout(),
+            widget_layouts: widgetLayouts
+          }
+        }
+      )
+    )
+  },
+  getDashboardConstants: async (): Promise<DashboardConstants> => {
+    const data = unwrap(await client.GET('/objects/constant/dashboard'))
+    return data.extensions
+  },
+  listDashboardMetadata: async (): Promise<DashboardMetadata[]> => {
+    const data = unwrap(await client.GET('/domain-types/dashboard_metadata/collections/all'))
+    return data.value.map((model) => model.extensions).filter(Boolean)
+  },
+  showDashboardMetadata: async (
+    dashboardId: string,
+    dashboardOwner: string
+  ): Promise<DashboardMetadata> => {
+    const data = unwrap(
+      await client.GET('/objects/dashboard_metadata/{dashboard_id}', {
+        params: {
+          path: { dashboard_id: dashboardId },
+          query: {
+            owner: dashboardOwner
+          }
+        }
+      })
+    )
+    return data.extensions
+  },
+  listAvailableInventory: async (): Promise<WidgetAvailableInventory> => {
+    return unwrap(await client.GET('/objects/constant/widget_available_inventory/collections/all'))
+  },
+  listMainMenuTopics: async (): Promise<DashboardMainMenuTopic[]> => {
+    const response = unwrap(await client.GET('/domain-types/pagetype_topic/collections/all'))
+    return response.value.flatMap((item) => ({
+      id: item.id,
+      title: item.title,
+      sortIndex: item.extensions.sort_index,
+      isDefault: item.extensions.is_default
+    }))
+  },
+  listSidebarElements: async (): Promise<SidebarElement[]> => {
+    const response = unwrap(await client.GET('/domain-types/sidebar_element/collections/all'))
+    return response.value.map((item) => ({
+      id: item.id!,
+      title: item.title || item.id!
+    }))
+  },
+  computeWidgetAttributes: async (
+    widgetContent: WidgetContent
+  ): Promise<ComputedWidgetSpecResponse> => {
+    return unwrap(
+      await client.POST('/domain-types/dashboard/actions/compute-widget-attributes/invoke', {
+        ...CONTENT_TYPE_HEADER,
+        body: { content: widgetContent }
+      })
+    )
+  },
+  computeWidgetTitles: async (
+    request: ComputeWidgetTitlesRequest
+  ): Promise<ComputeWidgetTitlesResponse> => {
+    return unwrap(
+      await client.POST('/domain-types/dashboard/actions/compute-widget-titles/invoke', {
+        ...CONTENT_TYPE_HEADER,
+        body: request
+      })
+    )
+  },
+  computeTopListData: async (
+    content: TopListContent,
+    context: VisualContext
+  ): Promise<ComputedTopListResponse> => {
+    return unwrap(
+      await client.POST('/domain-types/dashboard/actions/compute-top-list/invoke', {
+        ...CONTENT_TYPE_HEADER,
+        body: { content, context }
+      })
+    )
+  },
+  computeSingleMetricData: async (
+    content: SingleMetricContent,
+    context: VisualContext
+  ): Promise<ComputedSingleMetricResponse> => {
+    return unwrap(
+      await client.POST('/domain-types/dashboard/actions/compute-single-metric/invoke', {
+        ...CONTENT_TYPE_HEADER,
+        body: { content, context }
+      })
+    )
+  },
+  /**
+   * The same data on a shared (token-authenticated) dashboard. The widget configuration is
+   * deliberately not sent: the endpoint re-reads the named widget from the dashboard the token
+   * was issued for, so a token holder cannot reach anything the dashboard does not show.
+   */
+  computeSharedSingleMetricData: async (
+    widgetId: string,
+    cmkToken: string
+  ): Promise<ComputedSingleMetricResponse> => {
+    return unwrap(
+      await client.POST('/domain-types/dashboard/actions/compute-shared-single-metric/invoke', {
+        ...CONTENT_TYPE_HEADER,
+        headers: { Authorization: `CMK-TOKEN ${cmkToken}` },
+        body: { widget_id: widgetId }
+      })
+    )
+  },
+  computeTimelineCountData: async (
+    content: TimelineContent,
+    context: VisualContext
+  ): Promise<ComputedTimelineCountResponse> => {
+    return unwrap(
+      await client.POST('/domain-types/dashboard/actions/compute-timeline-count/invoke', {
+        ...CONTENT_TYPE_HEADER,
+        body: { content, context }
+      })
+    )
+  },
+  /** The same count on a shared (token-authenticated) dashboard, named by widget as above. */
+  computeSharedTimelineCountData: async (
+    widgetId: string,
+    cmkToken: string
+  ): Promise<ComputedTimelineCountResponse> => {
+    return unwrap(
+      await client.POST('/domain-types/dashboard/actions/compute-shared-timeline-count/invoke', {
+        ...CONTENT_TYPE_HEADER,
+        headers: { Authorization: `CMK-TOKEN ${cmkToken}` },
+        body: { widget_id: widgetId }
+      })
+    )
+  },
+  computeNetworkFlowTopTableData: async (
+    content: NetworkFlowTopTableContent,
+    context: VisualContext
+  ): Promise<ComputedNetworkFlowTopTableResponse> => {
+    return unwrap(
+      await client.POST('/domain-types/dashboard/actions/compute-network-flow-top-table/invoke', {
+        ...CONTENT_TYPE_HEADER,
+        body: { content, context }
+      })
+    )
+  },
+  computeNetworkFlowDonutData: async (
+    content: NetworkFlowDonutContent,
+    context: VisualContext
+  ): Promise<ComputedNetworkFlowDonutResponse> => {
+    return unwrap(
+      await client.POST('/domain-types/dashboard/actions/compute-network-flow-donut/invoke', {
+        ...CONTENT_TYPE_HEADER,
+        body: { content, context }
+      })
+    )
+  },
+  computeNetworkFlowKpiStatCardData: async (
+    content: NetworkFlowKpiStatCardContent,
+    context: VisualContext
+  ): Promise<ComputedNetworkFlowKpiStatCardResponse> => {
+    return unwrap(
+      await client.POST(
+        '/domain-types/dashboard/actions/compute-network-flow-kpi-stat-card/invoke',
+        {
+          ...CONTENT_TYPE_HEADER,
+          body: { content, context }
+        }
+      )
+    )
+  },
+  computeNetworkFlowTrendChartData: async (
+    content: NetworkFlowTrendChartContent,
+    context: VisualContext,
+    // Set once the graph was zoomed or panned; without it the time filter decides the window.
+    requestedTimeRange: { start: number; end: number } | null = null
+  ): Promise<ComputedNetworkFlowTrendChartResponse> => {
+    return unwrap(
+      await client.POST('/domain-types/dashboard/actions/compute-network-flow-trend-chart/invoke', {
+        ...CONTENT_TYPE_HEADER,
+        body: {
+          content,
+          context,
+          ...(requestedTimeRange === null ? {} : { requested_time_range: requestedTimeRange })
+        }
+      })
+    )
+  },
+  computeNetworkFlowHostContext: async (ip: string): Promise<ComputedNetworkFlowHostResponse> => {
+    return unwrap(
+      await client.POST(
+        '/domain-types/dashboard/actions/compute-network-flow-host-context/invoke',
+        {
+          ...CONTENT_TYPE_HEADER,
+          body: { ip }
+        }
+      )
+    )
+  },
+  computeNetworkFlowAutonomousSystemContext: async (
+    asn: number
+  ): Promise<ComputedNetworkFlowAutonomousSystemResponse> => {
+    return unwrap(
+      await client.POST(
+        '/domain-types/dashboard/actions/compute-network-flow-autonomous-system-context/invoke',
+        {
+          ...CONTENT_TYPE_HEADER,
+          body: { asn }
+        }
+      )
+    )
+  }
+}
+
+export function createDashboardModel(
+  dashboardResp: RelativeGridDashboardResponse | ResponsiveGridDashboardResponse,
+  layoutType: DashboardLayout
+): DashboardModel {
+  let content: ContentRelativeGrid | ContentResponsiveGrid
+
+  if (layoutType === DashboardLayout.RELATIVE_GRID) {
+    content = {
+      layout: dashboardResp.layout,
+      widgets: dashboardResp.widgets
+    } as ContentRelativeGrid
+  } else {
+    content = {
+      layout: dashboardResp.layout,
+      widgets: dashboardResp.widgets
+    } as ContentResponsiveGrid
+  }
+
+  const dashboard: DashboardModel = {
+    owner: dashboardResp.owner,
+    general_settings: dashboardResp.general_settings,
+    filter_context: dashboardResp.filter_context,
+    public_token: dashboardResp.public_token,
+    type: dashboardResp.is_built_in ? DashboardOwnerType.BUILT_IN : DashboardOwnerType.CUSTOM,
+    content
+  }
+
+  return dashboard
+}
+
+export const determineWidgetEffectiveFilterContext = async (
+  widgetContent: WidgetContent,
+  filters: ConfiguredFilters,
+  constants: DashboardConstants
+): Promise<EffectiveWidgetFilterContext> => {
+  const resp = await dashboardAPI.computeWidgetAttributes(widgetContent)
+  return buildWidgetEffectiveFilterContext(
+    widgetContent,
+    filters,
+    resp.value.filter_context.uses_infos,
+    constants
+  )
+}
+
+export function configuredToContextFilters(
+  filters: ConfiguredFilters,
+  source: FilterOrigin
+): ContextFilters {
+  const entries: [string, ContextFilter][] = Object.entries(filters).map(
+    ([name, configuredValues]) => [
+      name,
+      { configuredValues: configuredValues as ConfiguredValues, source }
+    ]
+  )
+  return Object.fromEntries(entries)
+}
+
+export const buildWidgetEffectiveFilterContext = (
+  widgetContent: WidgetContent,
+  filters: ConfiguredFilters,
+  usesInfos: string[],
+  constants: DashboardConstants
+): EffectiveWidgetFilterContext => {
+  return {
+    uses_infos: usesInfos,
+    filters: filters,
+    restricted_to_single: constants.widgets[widgetContent.type]!.filter_context.restricted_to_single
+  }
+}
+
+const FILE_DASHBOARD = '/dashboard.py'
+const FILE_SHARED_DASHBOARD = '/shared_dashboard.py'
+
+export const urlHandler = {
+  /** Construct a dashboard URL with the given name and runtime filters. The current
+   * kiosk state is carried over, so navigating between dashboards keeps the main
+   * navigation and sidebar either hidden or in place.
+   * @param dashboardKey - The name and owner of the dashboard.
+   * @param runtimeFilters - A record of runtime filter key-value pairs.
+   * @returns A URL object representing the constructed dashboard URL.
+   */
+  getDashboardUrl(dashboardKey: DashboardKey, runtimeFilters: Record<string, string>): URL {
+    // replace path, remove all existing query params
+    const url = replaceFileName(window.location.origin + window.location.pathname, FILE_DASHBOARD)
+    url.searchParams.set('name', dashboardKey.name)
+    url.searchParams.set('owner', dashboardKey.owner)
+    for (const [k, v] of Object.entries(runtimeFilters)) {
+      url.searchParams.set(k, v)
+    }
+    return kioskMode.withKiosk(url, kioskMode.isActive())
+  },
+
+  /**
+   * Update query params while **preserving** the specified keys.
+   * - `preserveKeys`: keys to keep unmodified (e.g., ['name'])
+   * - `updates`: keys to add/update (others remain untouched unless updated)
+   */
+  updateWithPreserve(input: string, preserveKeys: string[], updates: Record<string, string>): URL {
+    const url = new URL(input)
+    const preserve = new Set(preserveKeys)
+
+    const toDelete: string[] = []
+    for (const key of url.searchParams.keys()) {
+      if (!preserve.has(key)) {
+        toDelete.push(key)
+      }
+    }
+    for (const key of toDelete) {
+      url.searchParams.delete(key)
+    }
+
+    for (const [k, v] of Object.entries(updates)) {
+      if (preserve.has(k)) {
+        continue
+      }
+      url.searchParams.set(k, v)
+    }
+
+    return url
+  },
+
+  /** Update the current URL in the browser's address bar.
+   * @param url - The new URL to set.
+   */
+  updateCurrentUrl(url: URL): void {
+    window.history.replaceState({}, '', url.toString())
+  },
+
+  pushCurrentUrl(url: URL): void {
+    window.history.pushState({}, '', url.toString())
+  },
+
+  /** Navigate to a new URL. Adds a proper history entry and loads the page.
+   * @param url - The dashboard URL to navigate to.
+   */
+  navigateTo(url: URL): void {
+    window.location.assign(url.toString())
+  },
+
+  /** Generate a shared dashboard link using the provided public token.
+   * @param publicToken - The public token for the shared dashboard.
+   * @returns A string representing the shared dashboard URL.
+   */
+  getSharedDashboardLink(publicToken: string): string {
+    const url = replaceFileName(
+      window.location.origin + window.location.pathname,
+      FILE_SHARED_DASHBOARD
+    )
+    url.searchParams.set('cmk-token', `0:${publicToken}`)
+    return url.toString()
+  },
+
+  /** Reload the page. */
+  reloadPage(): void {
+    window.location.reload()
+  }
+}
+
+function replaceFileName(input: string, newFileName: string): URL {
+  const fileName = newFileName.startsWith('/') ? newFileName : `/${newFileName}`
+  const url = new URL(input, window.location.origin) // default to current origin
+  const path = url.pathname
+  const idx = path.lastIndexOf('/')
+  url.pathname = idx !== -1 ? path.substring(0, idx) + fileName : fileName
+  return url
+}
+
+export async function copyToClipboard(text: string): Promise<void> {
+  try {
+    await copyToClipboardUtil(text)
+  } catch (err) {
+    console.error('Failed to copy to clipboard:', err)
+  }
+}
+
+const INITIAL_TOKEN_CHECK_DELAY_MS = 5_000
+const SUBSEQUENT_TOKEN_CHECK_INTERVAL_MS = 60_000
+
+async function checkTokenValidity(token: string): Promise<boolean> {
+  const url = `check_token_validity.py?cmk-token=${encodeURIComponent(token)}`
+  try {
+    const response = await fetch(url)
+    if (!response.ok) {
+      window.location.reload()
+      return false
+    }
+    const data = await response.json()
+    if (data.result_code !== 0) {
+      window.location.reload()
+      return false
+    }
+    return true
+  } catch {
+    window.location.reload()
+    return false
+  }
+}
+
+export function setupTokenValidityCheck(token: string): () => void {
+  let initialCheckTimeout: ReturnType<typeof setTimeout> | null = null
+  let subsequentChecksInterval: ReturnType<typeof setInterval> | null = null
+
+  initialCheckTimeout = setTimeout(() => {
+    void checkTokenValidity(token).then((isValid) => {
+      if (isValid) {
+        subsequentChecksInterval = setInterval(() => {
+          void checkTokenValidity(token)
+        }, SUBSEQUENT_TOKEN_CHECK_INTERVAL_MS)
+      }
+    })
+  }, INITIAL_TOKEN_CHECK_DELAY_MS)
+
+  return () => {
+    if (initialCheckTimeout !== null) {
+      clearTimeout(initialCheckTimeout)
+    }
+    if (subsequentChecksInterval !== null) {
+      clearInterval(subsequentChecksInterval)
+    }
+  }
+}

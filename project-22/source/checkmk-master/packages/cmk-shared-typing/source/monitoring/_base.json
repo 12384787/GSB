@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2019-09/schema",
+  "type": "object",
+  "title": "Monitoring - Base Structure",
+  "properties": {
+    "poll_interval_ms": {
+      "type": "number",
+      "default": 30000
+    },
+    "actions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/monitoring_action" },
+      "default": []
+    },
+    "row_actions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/row_action" },
+      "default": []
+    },
+    "may_ignore_hard_limit": {
+      "type": "boolean",
+      "default": false
+    },
+    "downtime_recurrences": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/downtime_recurrence" },
+      "default": []
+    },
+    "legacy_view_button": { "$ref": "page_link_button.json" },
+    "acknowledge_presets_url": {
+      "type": ["string", "null"]
+    },
+    "notification_rules_url": {
+      "type": ["string", "null"]
+    },
+    "downtime_presets_url": {
+      "type": ["string", "null"]
+    },
+    "acknowledge_defaults": { "$ref": "#/$defs/acknowledge_defaults" },
+    "downtime_presets": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/downtime_preset" },
+      "default": []
+    }
+  },
+  "$defs": {
+    "acknowledge_defaults": {
+      "type": "object",
+      "properties": {
+        "sticky": { "type": "boolean" },
+        "persistent": { "type": "boolean" },
+        "notify": { "type": "boolean" },
+        "expire_seconds": { "type": "number" }
+      },
+      "required": ["sticky", "persistent", "notify", "expire_seconds"]
+    },
+    "downtime_preset": {
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "end": {
+          "anyOf": [{ "type": "number" }, { "$ref": "#/$defs/downtime_until_keyword" }]
+        }
+      },
+      "required": ["title", "end"]
+    },
+    "downtime_until_keyword": {
+      "type": "string",
+      "enum": ["next_day", "next_week", "next_month", "next_year"]
+    },
+    "monitoring_action": {
+      "type": "object",
+      "properties": {
+        "ident": { "type": "string" },
+        "title": { "type": "string" },
+        "icon": { "type": "string" }
+      },
+      "required": ["ident", "title", "icon"]
+    },
+    "downtime_recurrence": {
+      "type": "object",
+      "properties": {
+        "recur": { "type": "string" },
+        "title": { "type": "string" }
+      },
+      "required": ["recur", "title"]
+    },
+    "edition": {
+      "type": "string",
+      "enum": ["community", "pro", "ultimate", "ultimatemt", "cloud"]
+    },
+    "row_action": {
+      "type": "object",
+      "properties": {
+        "ident": { "type": "string" },
+        "title": { "type": "string" },
+        "icon": { "type": "string" },
+        "url": { "type": "string" }
+      },
+      "required": ["ident", "title", "icon", "url"]
+    }
+  }
+}

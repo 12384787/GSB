@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import os
+import shutil
+import sys
+from pathlib import Path
+
+from omdlib.console import ok
+from omdlib.contexts import SiteContext
+from omdlib.init_scripts import call_init_scripts
+from omdlib.site_paths import SitePaths
+from omdlib.tmpfs import unmount_tmpfs_without_save
+from omdlib.user_processes import kill_site_user_processes
+
+
+def prepare_restore_as_site_user(site: SiteContext, kill: bool, verbose: bool) -> None:
+    site_home = SitePaths.from_site_name(site.name).home
+    _verify_directory_write_access(site_home)
+    if Path(site_home, "etc/init.d/").exists():
+        Path(site_home, "var/log").mkdir(parents=True, exist_ok=True)
+        if not site.is_stopped(verbose) and not kill:
+            sys.exit("Cannot restore site while it is running.")
+        sys.stdout.write("Stopping site processes...\n")
+        call_init_scripts(site_home, "stop")
+    else:
+        sys.stdout.write("Stopping site processes...\n")
+    kill_site_user_processes(site.name, verbose)
+    ok()
+
+    # We don't need to save the `tmp/` folder, since `clear_site_home` will remove it anyway.
+    unmount_tmpfs_without_save(site.name, site.tmp_dir, output=True, kill=kill)
+
+    sys.stdout.write("Deleting existing site data...")
+    clear_site_home(Path(site_home))
+    ok()
+
+
+# Scans all site directories and ensures the site user is able to write all directories.
+# This is needed to prevent eventual permission issues during the rmtree process.
+def _verify_directory_write_access(site_home: str) -> None:
+    wrong = []
+    for dirpath, dirnames, _filenames in os.walk(site_home):
+        for dirname in dirnames:
+            path = dirpath + "/" + dirname
+            if os.path.islink(path):
+                continue
+
+            if not os.access(path, os.W_OK):
+                wrong.append(path)
+
+    if wrong:
+        sys.exit(
+            "Unable to start restore because of a permission issue.\n\n"
+            "The restore needs to be able to clean the whole site to be able to restore "
+            "the backup. Missing write access on the following paths:\n\n"
+            "    %s" % "\n    ".join(wrong)
+        )
+
+
+def _restore_working_dir(site_home: Path) -> Path:
+    return site_home / ".restore_working_dir"
+
+
+def _clickhouse_dir(site_home: Path) -> Path:
+    return site_home / "var" / "clickhouse-server"
+
+
+def clear_site_home(site_home: Path) -> None:
+    restore_working_dir = _restore_working_dir(site_home)
+    clickhouse_dir = _clickhouse_dir(site_home)
+    restore_clickhouse_dir = restore_working_dir / "clickhouse-server"
+    if clickhouse_dir.exists():
+        clickhouse_dir.rename(restore_clickhouse_dir)
+    with os.scandir(site_home) as scaniter:
+        for entry in scaniter:
+            if entry.name == restore_working_dir.name:
+                continue
+            if entry.name == "tmp":
+                # tmp is excluded from backups. The content is cleared by `unmount_tmpfs_without_save`,
+                # but the directory must remain, since it may be a Docker-managed tmpfs mount point
+                # that cannot be removed (EBUSY).
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                shutil.rmtree(entry.path)
+            else:
+                os.unlink(entry.path)
+    if restore_clickhouse_dir.exists():
+        clickhouse_dir.parent.mkdir(parents=True)
+        restore_clickhouse_dir.rename(clickhouse_dir)

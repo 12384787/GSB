@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+import logging
+from http import HTTPStatus
+from pathlib import Path
+from typing import final
+
+import httpx2
+
+from cmk.agent_receiver.relay.lib.shared_types import RelayID
+from cmk.agent_receiver.relay.lib.site_auth import SiteAuth
+from cmk.relay_protocols.relays import RelayState
+
+
+@final
+class CheckmkAPIError(Exception):
+    def __init__(self, msg: str) -> None:
+        super().__init__(msg)
+        self.msg = msg
+
+
+@final
+class RelayNotFoundError(Exception):
+    def __init__(self, relay_id: str) -> None:
+        super().__init__(f"Relay {relay_id} not found")
+        self.relay_id = relay_id
+
+
+logger = logging.getLogger("agent-receiver")
+default_num_fetchers = 13
+default_log_level = "INFO"
+
+
+@final
+class RelaysRepository:
+    def __init__(
+        self,
+        *,
+        client: httpx2.Client,
+        internal_client: httpx2.Client,
+        siteid: str,
+        helper_config_dir: Path,
+    ) -> None:
+        self.client = client
+        self.internal_client = internal_client
+        self.siteid = siteid
+        self.helper_config_dir = helper_config_dir
+
+    @classmethod
+    def from_site(
+        cls,
+        *,
+        site_url: str,
+        internal_site_url: str,
+        site_name: str,
+        helper_config_dir: Path,
+    ) -> RelaysRepository:
+        """Create RelaysRepository from site configuration."""
+        # FIXME async client
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Checkmk Agent Receiver",
+        }
+        # FIXME: increased timeout due to flacky test test_tasks.py::test_max_tasks_per_relay
+        timeout = 20
+        client = httpx2.Client(base_url=site_url, headers=headers, timeout=timeout)
+        internal_client = httpx2.Client(
+            base_url=internal_site_url, headers=headers, timeout=timeout
+        )
+        return cls(
+            client=client,
+            internal_client=internal_client,
+            siteid=site_name,
+            helper_config_dir=helper_config_dir,
+        )
+
+    def add_relay(self, auth: SiteAuth, relay_id: RelayID, alias: str) -> RelayID:
+        resp = self.internal_client.post(
+            "/domain-types/relay/collections/all",
+            auth=auth,
+            json={
+                "relay_id": str(relay_id),
+                "alias": alias,
+                "siteid": self.siteid,
+                "num_fetchers": default_num_fetchers,
+                "log_level": default_log_level,
+            },
+        )
+        if resp.status_code != HTTPStatus.OK:
+            logger.error(
+                "could not register relay %(status_code)s : %(text)s",
+                {"status_code": resp.status_code, "text": resp.text},
+            )
+            raise CheckmkAPIError(resp.text)
+        assert relay_id == resp.json()["id"]
+        return relay_id
+
+    def get_all_relay_ids(self) -> list[RelayID]:
+        latest = self.helper_config_dir / "latest/relays"
+        try:
+            dirs = next(latest.walk())[1]
+            return [RelayID(x) for x in dirs]
+        except StopIteration:
+            # The folder does not exist
+            return []
+
+    def relay_exists(self, auth: SiteAuth, relay_id: RelayID) -> bool:
+        """Check if a relay exists by querying the REST API."""
+        resp = self.client.get(f"/objects/relay/{relay_id}", auth=auth)
+        if resp.status_code >= HTTPStatus.INTERNAL_SERVER_ERROR:
+            raise CheckmkAPIError(resp.text)
+        if resp.status_code == HTTPStatus.NOT_FOUND:
+            return False
+        if resp.status_code >= HTTPStatus.BAD_REQUEST:
+            raise CheckmkAPIError(resp.text)
+        return True
+
+    def relay_config_applied(self, relay_id: RelayID) -> bool:
+        """Check if a relay has its configuration applied (exists in local config folder)."""
+        relay_config_path = self.helper_config_dir / "latest/relays" / str(relay_id)
+        return relay_config_path.exists()
+
+    def get_relay_state(self, auth: SiteAuth, relay_id: RelayID) -> RelayState:
+        """Get relay state by comparing local config and CMK API.
+
+        Returns:
+            RelayState indicating the current state of the relay
+
+        Raises:
+            RelayNotFoundError: If the relay does not exist anywhere
+            CheckmkAPIError: If there is an API error
+        """
+        relay_in_config = self.relay_config_applied(relay_id)
+        relay_in_api = self.relay_exists(auth, relay_id)
+
+        if not relay_in_api and not relay_in_config:
+            raise RelayNotFoundError(relay_id)
+        if relay_in_api and not relay_in_config:
+            return RelayState.PENDING_ACTIVATION
+        if not relay_in_api and relay_in_config:
+            return RelayState.PENDING_DELETION
+        return RelayState.CONFIGURED

@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+# Copyright (C) 2022 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import json
+from collections.abc import Mapping
+from datetime import datetime
+from typing import TypedDict
+
+from pydantic import BaseModel, computed_field, Field
+
+from cmk.agent_based.v2 import (
+    AgentSection,
+    CheckPlugin,
+    CheckResult,
+    DiscoveryResult,
+    InventoryPlugin,
+    InventoryResult,
+    Result,
+    Service,
+    State,
+    StringTable,
+    TableRow,
+)
+from cmk.agent_based.v3_unstable import discover_one_service
+from cmk.plugins.cisco_meraki.lib.type_defs import PossiblyMissing
+from cmk.plugins.cisco_meraki.lib.utils import check_last_reported_ts
+from cmk.rulesets.v1.form_specs import SimpleLevelsConfigModel
+
+type Section = DeviceStatus
+
+
+class PowerSupply(BaseModel, frozen=True):
+    slot: int
+    model: str | None
+    serial: str | None
+    status: str
+
+
+class Components(BaseModel, frozen=True):
+    power_supplies: list[PowerSupply] = Field(alias="powerSupplies")
+
+
+class DeviceStatus(BaseModel, frozen=True):
+    status: str
+    last_reported: datetime | None = Field(default=None, alias="lastReportedAt")
+    components: PossiblyMissing[Components] = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def power_supplies(self) -> dict[str, PowerSupply]:
+        if not self.components:
+            return {}
+        return {str(ps.slot): ps for ps in self.components.power_supplies}
+
+
+def parse_device_status(string_table: StringTable) -> Section | None:
+    match string_table:
+        case [[payload]] if payload:
+            return DeviceStatus.model_validate(json.loads(payload)[0])
+        case _:
+            return None
+
+
+agent_section_cisco_meraki_org_device_status = AgentSection(
+    name="cisco_meraki_org_device_status",
+    parse_function=parse_device_status,
+)
+
+
+class CheckParamsDeviceStatus(TypedDict):
+    status_map: Mapping[str, int]
+    last_reported_upper_levels: SimpleLevelsConfigModel[int]
+
+
+_DEFAULT_STATUS_MAP: Mapping[str, int] = {
+    "online": State.OK.value,
+    "alerting": State.CRIT.value,
+    "offline": State.WARN.value,
+    "dormant": State.WARN.value,
+}
+
+
+def check_device_status(params: CheckParamsDeviceStatus, section: Section) -> CheckResult:
+    try:
+        raw_state = params["status_map"][section.status]
+    except KeyError:
+        raw_state = _DEFAULT_STATUS_MAP.get(section.status, State.UNKNOWN.value)
+
+    yield Result(state=State(raw_state), summary=f"Status: {section.status}")
+
+    _, levels_upper = params["last_reported_upper_levels"]
+
+    if section.last_reported:
+        yield from check_last_reported_ts(
+            last_reported_ts=section.last_reported.timestamp(),
+            levels_upper=levels_upper,
+            as_metric=True,
+        )
+
+
+check_plugin_cisco_meraki_org_device_status = CheckPlugin(
+    name="cisco_meraki_org_device_status",
+    service_name="Device Status",
+    discovery_function=discover_one_service,
+    check_function=check_device_status,
+    check_default_parameters=CheckParamsDeviceStatus(
+        status_map=_DEFAULT_STATUS_MAP,
+        last_reported_upper_levels=("no_levels", None),
+    ),
+    check_ruleset_name="cisco_meraki_org_device_status",
+)
+
+
+def discover_device_status_ps(section: Section) -> DiscoveryResult:
+    for slot in section.power_supplies:
+        yield Service(item=slot)
+
+
+class CheckParamsPowerSupply(TypedDict):
+    state_not_powering: int
+
+
+def check_device_status_ps(
+    item: str, params: CheckParamsPowerSupply, section: Section
+) -> CheckResult:
+    if (power_supply := section.power_supplies.get(item)) is None:
+        return
+
+    if power_supply.status.lower() == "powering":
+        state = State.OK
+    else:
+        state = State(params["state_not_powering"])
+
+    yield Result(state=state, summary=f"Status: {power_supply.status}")
+
+    if power_supply.model:
+        yield Result(state=State.OK, notice=f"Model: {power_supply.model}")
+
+    if power_supply.serial:
+        yield Result(state=State.OK, notice=f"Serial: {power_supply.serial}")
+
+
+check_plugin_cisco_meraki_org_device_status_ps = CheckPlugin(
+    name="cisco_meraki_org_device_status_ps",
+    service_name="Power Supply %s",
+    sections=["cisco_meraki_org_device_status"],
+    discovery_function=discover_device_status_ps,
+    check_function=check_device_status_ps,
+    check_default_parameters=CheckParamsPowerSupply(
+        state_not_powering=State.WARN.value,
+    ),
+    check_ruleset_name="cisco_meraki_org_device_status_ps",
+)
+
+
+def inventorize_power_supplies(section: Section) -> InventoryResult:
+    for power_supply in section.power_supplies.values():
+        yield TableRow(
+            path=["hardware", "components", "psus"],
+            key_columns={
+                "index": power_supply.slot,
+                "serial": power_supply.serial,
+            },
+            inventory_columns={
+                "model": power_supply.model,
+                "location": f"Slot {power_supply.slot}",
+                "manufacturer": "Cisco Meraki",
+            },
+        )
+
+
+inventory_plugin_cisco_meraki_power_supplies = InventoryPlugin(
+    name="cisco_meraki_power_supplies",
+    inventory_function=inventorize_power_supplies,
+    sections=["cisco_meraki_org_device_status"],
+)

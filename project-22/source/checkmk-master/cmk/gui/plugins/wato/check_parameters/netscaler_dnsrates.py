@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from cmk.gui.i18n import _
+from cmk.gui.plugins.wato.utils import (
+    CheckParameterRulespecWithoutItem,
+    rulespec_registry,
+    RulespecGroupCheckParametersApplications,
+)
+from cmk.gui.valuespec import Dictionary, Float, Tuple
+
+
+def _parameter_valuespec_netscaler_dnsrates() -> Dictionary:
+    return Dictionary(
+        help=_("Counter rates of DNS parameters for Citrix NetScaler load balancer appliances"),
+        elements=[
+            (
+                "query",
+                Tuple(
+                    title=_("Upper levels for total number of DNS queries"),
+                    elements=[
+                        Float(title=_("Warning at"), default_value=1500.0, unit="/sec"),
+                        Float(title=_("Critical at"), default_value=2000.0, unit="/sec"),
+                    ],
+                ),
+            ),
+            (
+                "answer",
+                Tuple(
+                    title=_("Upper levels for total number of DNS replies"),
+                    elements=[
+                        Float(title=_("Warning at"), default_value=1500.0, unit="/sec"),
+                        Float(title=_("Critical at"), default_value=2000.0, unit="/sec"),
+                    ],
+                ),
+            ),
+        ],
+    )
+
+
+rulespec_registry.register(
+    CheckParameterRulespecWithoutItem(
+        check_group_name="netscaler_dnsrates",
+        group=RulespecGroupCheckParametersApplications,
+        match_type="dict",
+        parameter_valuespec=_parameter_valuespec_netscaler_dnsrates,
+        title=lambda: _("Citrix NetScaler DNS counter rates"),
+    )
+)

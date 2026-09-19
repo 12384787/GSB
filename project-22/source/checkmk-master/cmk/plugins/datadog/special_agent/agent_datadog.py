@@ -1,0 +1,810 @@
+#!/usr/bin/env python3
+# Copyright (C) 2021 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+# mypy: disable-error-code="no-any-return"
+
+"""agent_datadog
+
+Checkmk special agent for monitoring Datadog monitors, events, and logs.
+The data is fetched from the Datadog API, https://docs.datadoghq.com/api/.
+Endpoints: Monitors (v1), Events (v1), Logs (v2).
+"""
+
+import argparse
+import datetime
+import json
+import logging
+import re
+import sys
+import time
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from http import HTTPStatus
+from pathlib import Path
+from typing import Any, Final, Protocol
+
+import pydantic
+import requests
+from dateutil import parser as dateutil_parser
+
+from cmk.ccc.store import load_text_from_file, save_text_to_file
+from cmk.ec.syslog import forward_to_unix_socket, SyslogMessage
+from cmk.password_store.v1_unstable import parser_add_secret_option, resolve_secret_option
+from cmk.server_side_programs.v1_unstable import report_agent_crashes, vcrtrace
+from cmk.utils.http_proxy_config import deserialize_http_proxy_config
+from cmk.utils.paths import omd_root, tmp_dir
+
+Tags = Sequence[str]
+
+__version__ = "3.0.0b1"
+
+AGENT = "datadog"
+
+LOGGER = logging.getLogger(f"agent_{AGENT}")
+
+
+APIKEY_OPTION = "apikey"
+APPKEY_OPTION = "appkey"
+
+
+@dataclass(frozen=True)
+class LogMessageElement:
+    name: str
+    key: str
+
+    @classmethod
+    def from_arg(cls, arg: str) -> LogMessageElement:
+        name, key = arg.split(":", maxsplit=1)
+        return cls(name, key)
+
+
+def parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
+    prog, description = __doc__.split("\n\n", maxsplit=1)
+    parser = argparse.ArgumentParser(
+        prog=prog, description=description, formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument(
+        "--debug",
+        "-d",
+        action="store_true",
+        help="Enable debug mode (keep some exceptions unhandled)",
+    )
+    parser.add_argument("--verbose", "-v", action="count", default=0)
+    parser.add_argument(
+        "--vcrtrace",
+        "--tracefile",
+        default=False,
+        action=vcrtrace(
+            # This is the result of a refactoring.
+            # I did not check if it makes sense for this special agent.
+            filter_headers=[("authorization", "****")],
+        ),
+    )
+    parser.add_argument(
+        "hostname",
+        type=str,
+        metavar="NAME",
+        help=(
+            "Name of the Checkmk host on which the agent is executed (used as filename to store "
+            "the timestamp of the last event)"
+        ),
+    )
+    parser_add_secret_option(
+        parser, long=f"--{APIKEY_OPTION}", help="Datadog API key", required=True
+    )
+    parser_add_secret_option(
+        parser, long=f"--{APPKEY_OPTION}", help="Datadog application key", required=True
+    )
+    parser.add_argument(
+        "api_host",
+        type=str,
+        metavar="ADDRESS",
+        help="Datadog API host to connect to",
+    )
+    parser.add_argument(
+        "--proxy",
+        type=str,
+        default=None,
+        metavar="PROXY",
+        help=(
+            "HTTP proxy used to connect to the Datadog API. If not set, the environment settings "
+            "will be used."
+        ),
+    )
+    parser.add_argument(
+        "--section",
+        type=str,
+        action="append",
+        dest="sections",
+        metavar="SECTION",
+        help="Sections to be produced",
+        choices=["monitors", "events", "logs"],
+        default=[],
+    )
+    parser.add_argument(
+        "--monitor_tag",
+        type=str,
+        action="append",
+        dest="monitor_tags",
+        metavar="TAG",
+        help="Restrict fetched monitors to tags",
+        default=[],
+    )
+    parser.add_argument(
+        "--monitor_monitor_tag",
+        type=str,
+        action="append",
+        dest="monitor_monitor_tags",
+        metavar="TAG",
+        help="Restrict fetched monitors to monitor tags",
+        default=[],
+    )
+    parser.add_argument(
+        "--event_max_age",
+        type=int,
+        metavar="AGE",
+        help="Restrict maximum age of fetched events (in seconds)",
+        default=600,
+    )
+    parser.add_argument(
+        "--event_tag",
+        type=str,
+        action="append",
+        dest="event_tags",
+        metavar="TAG",
+        help="Restrict fetched events to tags",
+        default=[],
+    )
+    parser.add_argument(
+        "--event_tag_show",
+        type=str,
+        action="append",
+        dest="event_tags_show",
+        metavar="REGEX",
+        help=(
+            "Any tag of a fetched event matching one of these regular expressions will be shown "
+            "in the EC"
+        ),
+        default=[],
+    )
+    parser.add_argument(
+        "--event_syslog_facility",
+        type=int,
+        metavar="FACILITY",
+        help="Syslog facility set when forwarding events to the EC",
+        default=1,
+    )
+    parser.add_argument(
+        "--event_syslog_priority",
+        type=int,
+        metavar="PRIORITY",
+        help="Syslog priority set when forwarding events to the EC",
+        default=1,
+    )
+    parser.add_argument(
+        "--event_service_level",
+        type=int,
+        metavar="SL",
+        help="Service level set when forwarding events to the EC",
+        default=0,
+    )
+    parser.add_argument(
+        "--event_add_text",
+        action="store_true",
+        help="Add text of events to data forwarded to the EC. Newline characters are replaced by '~'.",
+    )
+    parser.add_argument(
+        "--log_max_age",
+        type=int,
+        metavar="AGE",
+        help="Restrict maximum age of fetched logs (in seconds)",
+        default=600,
+    )
+    parser.add_argument("--log_query", type=str, help="filter logs by this query.", default="")
+    parser.add_argument(
+        "--log_index",
+        type=str,
+        action="append",
+        dest="log_indexes",
+        metavar="IDX",
+        help="Indexes to search",
+        default=[],
+    )
+    parser.add_argument(
+        "--log_text_element",
+        type=LogMessageElement.from_arg,
+        action="append",
+        dest="log_text",
+        metavar="name:key",
+        help="Value from message to use for event text",
+        default=[],
+    )
+    parser.add_argument(
+        "--log_syslog_facility",
+        type=int,
+        metavar="FACILITY",
+        help="Syslog facility set when forwarding logs to the EC",
+        default=1,
+    )
+    parser.add_argument(
+        "--log_service_level",
+        type=int,
+        metavar="SL",
+        help="Service level set when forwarding logs to the EC",
+        default=0,
+    )
+    return parser.parse_args(argv)
+
+
+class DatadogAPI(Protocol):
+    """
+    Notes:
+        * The DatadogAPI in rare occurrences can report a 503 which they described as follows:
+        'Service Unavailable, the server is not ready to handle the request probably because
+        it is overloaded, request should be retried after some time'
+    """
+
+    def get_request(
+        self,
+        api_endpoint: str,
+        params: Mapping[str, str | int],
+        version: str = "v1",
+    ) -> requests.Response: ...
+
+    def post_request(
+        self,
+        api_endpoint: str,
+        body: Mapping[str, str | int],
+        version: str = "v1",
+    ) -> requests.Response: ...
+
+
+class ImplDatadogAPI:
+    def __init__(
+        self,
+        api_host: str,
+        api_key: str,
+        app_key: str,
+        proxy: str | None = None,
+    ) -> None:
+        self._query_heads = {
+            "DD-API-KEY": api_key,
+            "DD-APPLICATION-KEY": app_key,
+        }
+        self._api_url = api_host.rstrip("/") + "/api"
+        self._proxy = deserialize_http_proxy_config(proxy)
+
+    def get_request(
+        self,
+        api_endpoint: str,
+        params: Mapping[str, str | int],
+        version: str = "v1",
+    ) -> requests.Response:
+        return requests.get(
+            f"{self._api_url}/{version}/{api_endpoint}",
+            headers=self._query_heads,
+            params=params,
+            proxies=self._proxy.to_requests_proxies(),
+            timeout=900,
+        )
+
+    def post_request(
+        self,
+        api_endpoint: str,
+        body: Mapping[str, Any],
+        version: str = "v1",
+    ) -> requests.Response:
+        return requests.post(
+            f"{self._api_url}/{version}/{api_endpoint}",
+            headers=self._query_heads,
+            json=body,
+            proxies=self._proxy.to_requests_proxies(),
+            timeout=900,
+        )
+
+
+class IDStore[TID: (str, int)]:
+    def __init__(self, path: Path):
+        self.path: Final = path
+
+    def write(self, ids: Iterable[TID]) -> None:
+        save_text_to_file(
+            self.path,
+            json.dumps(list(ids)),
+        )
+
+    def read(self) -> frozenset[TID]:
+        return frozenset(
+            json.loads(
+                load_text_from_file(
+                    self.path,
+                    default="[]",
+                )
+            )
+        )
+
+
+def _check_for_server_error(response: requests.Response) -> None:
+    if 500 <= response.status_code <= 599:
+        sys.exit(
+            f"Datadog server responded with an error: {response.status_code!r} {response.reason!r}"
+        )
+
+
+class MonitorsQuerier:
+    def __init__(
+        self,
+        datadog_api: DatadogAPI,
+    ) -> None:
+        self._datadog_api = datadog_api
+
+    def query_monitors(
+        self,
+        tags: Tags,
+        monitor_tags: Tags,
+        page_size: int = 100,
+    ) -> Iterator[object]:
+        """
+        Query monitors from the endpoint monitor
+        https://docs.datadoghq.com/api/latest/monitors/#get-all-monitor-details
+        """
+        current_page = 0
+        while True:
+            if monitors_in_page := self._query_monitors_page(
+                tags,
+                monitor_tags,
+                page_size,
+                current_page,
+            ):
+                yield from monitors_in_page
+                current_page += 1
+                continue
+
+            return
+
+    def _query_monitors_page(
+        self,
+        tags: Tags,
+        monitor_tags: Tags,
+        page_size: int,
+        current_page: int,
+    ) -> list[object]:
+        """
+        Query paginated monitors (endpoint monitor)
+        https://docs.datadoghq.com/api/latest/monitors/#get-all-monitor-details
+        """
+        # we use pagination to avoid running into any limits
+        params: dict[str, int | str] = {
+            "page_size": page_size,
+            "page": current_page,
+        }
+        if tags:
+            params["tags"] = ",".join(tags)
+        if monitor_tags:
+            params["monitor_tags"] = ",".join(monitor_tags)
+
+        resp = self._datadog_api.get_request(
+            "monitor",
+            params,
+        )
+        _check_for_server_error(resp)
+        resp.raise_for_status()
+
+        return resp.json()
+
+
+class Event(pydantic.BaseModel, frozen=True):
+    id: int
+    tags: Sequence[str]
+    text: str
+    date_happened: int
+    # None should not happen according to docs, but reality says something different ...
+    host: str | None = None
+    title: str
+    source: str
+
+
+class EventsQuerier:
+    def __init__(
+        self,
+        datadog_api: DatadogAPI,
+        host_name: str,
+        max_age: int,
+    ) -> None:
+        self.datadog_api: Final = datadog_api
+        self.id_store: Final = IDStore[int](
+            tmp_dir / "agents" / "agent_datadog" / f"{host_name}.json"
+        )
+        self.max_age: Final = max_age
+
+    def query_events(
+        self,
+        tags: Tags,
+    ) -> Iterator[Event]:
+        last_event_ids = self.id_store.read()
+        queried_events = list(self._execute_query(tags))
+        self.id_store.write(event.id for event in queried_events)
+        yield from (event for event in queried_events if event.id not in last_event_ids)
+
+    def _execute_query(
+        self,
+        tags: Tags,
+    ) -> Iterator[Event]:
+        """
+        Query events from the endpoint events
+        https://docs.datadoghq.com/api/latest/events/#query-the-event-stream
+        """
+        start, end = self._events_query_time_range()
+        current_page = 0
+
+        while True:
+            if raw_events_in_page := self._query_events_page_in_time_window(
+                start,
+                end,
+                current_page,
+                tags,
+            ):
+                yield from (Event.model_validate(raw_event) for raw_event in raw_events_in_page)
+                current_page += 1
+                continue
+
+            break
+
+    def _events_query_time_range(self) -> tuple[int, int]:
+        now = int(time.time())
+        return now - self.max_age, now
+
+    def _query_events_page_in_time_window(
+        self,
+        start: int,
+        end: int,
+        page: int,
+        tags: Tags,
+    ) -> list[object]:
+        """
+        Query paginated events (endpoint events)
+        https://docs.datadoghq.com/api/latest/events/#query-the-event-stream
+        """
+        params: dict[str, int | str] = {
+            "start": start,
+            "end": end,
+            "page": page,
+            "exclude_aggregate": True,
+        }
+        if tags:
+            params["tags"] = ",".join(tags)
+
+        resp = self.datadog_api.get_request(
+            "events",
+            params,
+        )
+        _check_for_server_error(resp)
+        resp.raise_for_status()
+
+        return resp.json()["events"]
+
+
+def _sanitize_event_text(text: str) -> str:
+    return text.replace("\n", " ~ ")
+
+
+def _event_to_syslog_message(
+    event: Event,
+    tag_regexes: Iterable[str],
+    facility: int,
+    severity: int,
+    service_level: int,
+    add_text: bool,
+) -> SyslogMessage:
+    LOGGER.debug(event)
+    matching_tags = ", ".join(
+        tag for tag in event.tags if any(re.match(tag_regex, tag) for tag_regex in tag_regexes)
+    )
+    tags_text = f", Tags: {matching_tags}" if matching_tags else ""
+    details_text = f", Text: {event.text}" if add_text else ""
+    return SyslogMessage(
+        facility=facility,
+        severity=severity,
+        timestamp=event.date_happened,
+        host_name=str(event.host),
+        application=event.source,
+        service_level=service_level,
+        text=_sanitize_event_text(event.title + tags_text + details_text),
+    )
+
+
+def _forward_events_to_ec(
+    events: Iterable[Event],
+    tag_regexes: Iterable[str],
+    facility: int,
+    severity: int,
+    service_level: int,
+    add_text: bool,
+) -> None:
+    forward_to_unix_socket(
+        (
+            _event_to_syslog_message(
+                event,
+                tag_regexes,
+                facility,
+                severity,
+                service_level,
+                add_text,
+            )
+            for event in events
+        ),
+        path=omd_root / "tmp/run/mkeventd/eventsocket",
+    )
+
+
+class LogAttributes(pydantic.BaseModel, frozen=True):
+    # This field is apparently optional, even though the API documentation does not say that.
+    # It was observed to be missing when setting log_query to the empty string.
+    attributes: Mapping[str, Any] = pydantic.Field(default={})
+    host: str
+    message: str | None = None
+    service: str
+    status: str
+    tags: Sequence[str]
+    timestamp: str
+
+
+class Log(pydantic.BaseModel, frozen=True):
+    attributes: LogAttributes
+    id: str
+
+
+class LogsQuerier:
+    def __init__(
+        self,
+        datadog_api: DatadogAPI,
+        max_age: int,
+        indexes: Sequence[str],
+        query: str,
+        hostname: str,
+        cooldown_too_many_requests: int = 5,
+    ) -> None:
+        self.datadog_api: Final = datadog_api
+        self.id_store: Final = IDStore[str](
+            tmp_dir / "agents" / "agent_datadog" / f"{hostname}_logs.json"
+        )
+        self.max_age: Final = max_age
+        self.indexes: Final = indexes
+        self.query: Final = query
+        self.cooldown_too_many_requests: Final = cooldown_too_many_requests
+
+    def query_logs(
+        self,
+    ) -> Iterable[Log]:
+        last_ids = self.id_store.read()
+        queried_logs = list(self._execute_query())
+        self.id_store.write(log.id for log in queried_logs)
+        yield from (log for log in queried_logs if log.id not in last_ids)
+
+    def _execute_query(
+        self,
+    ) -> Iterable[Log]:
+        """
+        Query logs from the endpoint events
+        https://docs.datadoghq.com/api/latest/logs/#search-logs
+        """
+        start, end = self._query_time_range()
+        cursor: str | None = None
+
+        while True:
+            response = self._query_logs_page_in_time_window(
+                start,
+                end,
+                self.query,
+                self.indexes,
+                cursor,
+            )
+            yield from (Log.model_validate(raw_log) for raw_log in response["data"])
+            if (meta := response.get("meta")) is None:
+                break
+
+            if "page" not in meta:
+                break
+            cursor = meta["page"].get("after")
+
+    def _query_time_range(self) -> tuple[datetime.datetime, datetime.datetime]:
+        now = datetime.datetime.now()
+        return now - datetime.timedelta(seconds=self.max_age), now
+
+    def _query_logs_page_in_time_window(
+        self,
+        start: datetime.datetime,
+        end: datetime.datetime,
+        query: str,
+        indexes: Sequence[str],
+        cursor: str | None,
+    ) -> Mapping[str, Any]:
+        body: dict[str, Any] = {
+            "filter": {
+                "from": self._datetime_to_api_compliant_str(start),
+                "to": self._datetime_to_api_compliant_str(end),
+                "query": query,
+                "indexes": indexes,
+            },
+            "page": {"limit": 200},
+            "sort": "timestamp",
+        }
+        if cursor is not None:
+            body["page"]["cursor"] = cursor
+
+        resp = self.datadog_api.post_request("logs/events/search", body, version="v2")
+        while HTTPStatus(resp.status_code) is HTTPStatus.TOO_MANY_REQUESTS:
+            LOGGER.debug(
+                "Encountered %(status)s, sleeping %(cooldown)s seconds",
+                {
+                    "status": int(HTTPStatus.TOO_MANY_REQUESTS),
+                    "cooldown": self.cooldown_too_many_requests,
+                },
+            )
+            time.sleep(self.cooldown_too_many_requests)
+            resp = self.datadog_api.post_request("logs/events/search", body, version="v2")
+
+        _check_for_server_error(resp)
+        resp.raise_for_status()
+
+        return resp.json()
+
+    @staticmethod
+    def _datetime_to_api_compliant_str(d: datetime.datetime) -> str:
+        return d.astimezone().isoformat(timespec="seconds")
+
+
+_SEVERITY_MAPPER: Mapping[str, int] = {
+    "emergency": 0,
+    "alert": 1,
+    "critical": 2,
+    "crit": 2,
+    "error": 3,
+    "warning": 4,
+    "warn": 4,
+    "notice": 5,
+    "informational": 6,
+    "info": 6,
+    "debug": 7,
+}
+
+
+def _get_nested(attributes: Mapping[str, Any], nested_keys: str) -> str | None:
+    if "." in nested_keys:
+        next_key, remainder = nested_keys.split(".", maxsplit=1)
+        return _get_nested(attributes.get(next_key, {}), remainder)
+    return attributes.get(nested_keys)
+
+
+def _sanitize_log_text(text: str) -> str:
+    return text.replace("'", "").replace("{", "").replace("}", "").replace("\n", " ~ ")
+
+
+def _log_to_syslog_message(
+    log: Log,
+    facility: int,
+    service_level: int,
+    translator: Sequence[LogMessageElement],
+) -> SyslogMessage:
+    LOGGER.debug(log)
+    attributes = dict(log.attributes)
+    text_elements = {el.name: _get_nested(attributes, el.key) for el in translator}
+    for name, value in text_elements.items():
+        if value is None:
+            LOGGER.debug("Did not find value for message element: %(name)s", {"name": name})
+    return SyslogMessage(
+        facility=facility,
+        service_level=service_level,
+        severity=_SEVERITY_MAPPER[log.attributes.status],
+        timestamp=dateutil_parser.isoparse(log.attributes.timestamp).timestamp(),
+        host_name=log.attributes.host,
+        application=log.attributes.service,
+        text=_sanitize_event_text(
+            ", ".join(
+                f"{name}={_sanitize_log_text(repr(value))}"
+                for name, value in text_elements.items()
+                if value is not None
+            )
+        ),
+    )
+
+
+def _forward_logs_to_ec(
+    logs: Iterable[Log],
+    facility: int,
+    service_level: int,
+    translator: Sequence[LogMessageElement],
+) -> None:
+    forward_to_unix_socket(
+        (
+            _log_to_syslog_message(
+                log,
+                facility,
+                service_level,
+                translator,
+            )
+            for log in logs
+        ),
+        path=omd_root / "tmp/run/mkeventd/eventsocket",
+    )
+
+
+def _monitors_section(
+    datadog_api: DatadogAPI,
+    args: argparse.Namespace,
+) -> None:
+    LOGGER.debug("Querying monitors")
+    monitors = MonitorsQuerier(datadog_api).query_monitors(
+        args.monitor_tags, args.monitor_monitor_tags
+    )
+    sys.stdout.write("<<<datadog_monitors:sep(0)>>>\n")
+    for monitor in monitors:
+        sys.stdout.write(f"{json.dumps(monitor)}\n")
+
+
+def _events_section(datadog_api: DatadogAPI, args: argparse.Namespace) -> None:
+    LOGGER.debug("Querying events")
+    events = list(
+        EventsQuerier(
+            datadog_api,
+            args.hostname,
+            args.event_max_age,
+        ).query_events(args.event_tags)
+    )
+    _forward_events_to_ec(
+        events,
+        args.event_tags_show,
+        args.event_syslog_facility,
+        args.event_syslog_priority,
+        args.event_service_level,
+        args.event_add_text,
+    )
+    sys.stdout.write(f"<<<datadog_events>>>\n{len(events)}\n")
+
+
+def _logs_section(datadog_api: DatadogAPI, args: argparse.Namespace) -> None:
+    LOGGER.debug("Querying logs")
+    logs = list(
+        LogsQuerier(
+            datadog_api,
+            args.log_max_age,
+            query=args.log_query,
+            indexes=args.log_indexes,
+            hostname=args.hostname,
+        ).query_logs()
+    )
+    _forward_logs_to_ec(
+        logs,
+        facility=args.log_syslog_facility,
+        service_level=args.log_service_level,
+        translator=args.log_text,
+    )
+    sys.stdout.write(f"<<<datadog_logs>>>\n{len(logs)}\n")
+
+
+def agent_datadog_main(args: argparse.Namespace) -> int:
+    datadog_api = ImplDatadogAPI(
+        args.api_host,
+        resolve_secret_option(args, APIKEY_OPTION).reveal(),
+        resolve_secret_option(args, APPKEY_OPTION).reveal(),
+        proxy=args.proxy,
+    )
+    for section in args.sections:
+        {"monitors": _monitors_section, "events": _events_section, "logs": _logs_section}[section](
+            datadog_api,
+            args,
+        )
+    return 0
+
+
+@report_agent_crashes(AGENT, __version__)
+def main() -> int:
+    """Main entry point to be used"""
+    return agent_datadog_main(parse_arguments(sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

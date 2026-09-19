@@ -1,0 +1,89 @@
+/**
+ * Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import {
+  type KeyShortcut,
+  type KeyShortcutHandlerCallback,
+  type KeyShortcutService
+} from 'cmk-ui-library/lib/keyShortcuts'
+import { randomId } from 'cmk-ui-library/lib/randomId'
+import { ref } from 'vue'
+
+const callbacks: {
+  [key: string]: { id: string; cb: (...args: any) => void }[]
+} = {}
+
+export class ServiceBase {
+  protected shortCutEventIds = ref<string[]>([])
+  protected shortCutsRegistered: {
+    shortcut: KeyShortcut
+    cb: KeyShortcutHandlerCallback
+  }[] = []
+
+  public constructor(
+    protected serviceId: string,
+    protected shortCutService: KeyShortcutService
+  ) {}
+
+  public registerShortCut(shortcut: KeyShortcut, cb: KeyShortcutHandlerCallback) {
+    this.shortCutsRegistered.push({ shortcut, cb })
+  }
+
+  public enableShortCuts() {
+    for (const sc of this.shortCutsRegistered) {
+      this.shortCutEventIds.value.push(this.shortCutService.on(sc.shortcut, sc.cb))
+    }
+  }
+
+  public disableShortCuts() {
+    this.shortCutService.remove(this.shortCutEventIds.value)
+    this.shortCutEventIds.value = []
+  }
+
+  protected pushCallBack(key: string, cb: (...args: any) => void) {
+    const ensuredKey = this.ensureKey(key)
+    const id = randomId()
+    callbacks[ensuredKey]?.push({ id, cb })
+    return id
+  }
+
+  protected removeCallBack(key: string, id?: string) {
+    const ensuredKey = this.ensureKey(key)
+    if (id === undefined) {
+      delete callbacks[ensuredKey]
+      return
+    }
+    const list = callbacks[ensuredKey]
+    if (list) {
+      callbacks[ensuredKey] = list.filter((c) => c.id !== id)
+    }
+  }
+
+  protected removeCallbacks() {
+    const prefix = `${this.serviceId}-`
+    for (const key of Object.keys(callbacks)) {
+      if (key.startsWith(prefix)) {
+        delete callbacks[key]
+      }
+    }
+  }
+
+  protected dispatchCallback(key: string, ...args: any) {
+    const ensuredKey = this.ensureKey(key)
+    callbacks[ensuredKey]?.forEach((c) => {
+      c.cb(...args)
+    })
+  }
+
+  private ensureKey(key: string) {
+    const ensuredKey = `${this.serviceId}-${key}`
+    if (!callbacks[ensuredKey]) {
+      callbacks[ensuredKey] = []
+    }
+
+    return ensuredKey
+  }
+}

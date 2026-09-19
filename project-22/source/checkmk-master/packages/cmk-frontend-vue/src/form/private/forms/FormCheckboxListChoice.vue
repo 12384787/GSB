@@ -1,0 +1,65 @@
+<!--
+Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import type {
+  CheckboxListChoice,
+  MultipleChoiceElement
+} from 'cmk-shared-typing/typescript/vue_formspec_components'
+import CmkCheckbox from 'cmk-ui-library/components/user-input/CmkCheckbox.vue'
+import CmkInlineValidation from 'cmk-ui-library/components/user-input/CmkInlineValidation.vue'
+import { untranslated } from 'cmk-ui-library/lib/i18n'
+
+import { type ValidationMessages, useValidation } from '../validation'
+
+const props = defineProps<{
+  spec: CheckboxListChoice
+  backendValidation: ValidationMessages
+}>()
+
+export interface CheckboxListChoiceElement {
+  name: string
+  title: string
+}
+
+const data = defineModel<CheckboxListChoiceElement[]>('data', { required: true })
+const [validation, value] = useValidation<CheckboxListChoiceElement[]>(
+  data,
+  props.spec.validators,
+  () => props.backendValidation
+)
+
+function change(element: MultipleChoiceElement, newValue: boolean) {
+  if (newValue) {
+    value.value = [...value.value, element]
+  } else {
+    value.value = value.value.filter((entry) => entry.name !== element.name)
+  }
+}
+</script>
+
+<template>
+  <div role="listbox" :aria-label="spec.title">
+    <CmkInlineValidation :validation="validation"></CmkInlineValidation>
+    <div
+      v-for="element in props.spec.elements"
+      :key="element.name"
+      class="form-checkbox-list-choice__container"
+    >
+      <CmkCheckbox
+        role="option"
+        :label="untranslated(element.title)"
+        :model-value="value.map((v) => v.name).includes(element.name)"
+        @update:model-value="(newValue) => change(element, newValue)"
+      />
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.form-checkbox-list-choice__container:not(:last-of-type) {
+  padding-bottom: 8px;
+}
+</style>

@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+# Copyright (C) 2022 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+from cmk.agent_based.v1 import check_levels as check_levels_v1
+from cmk.agent_based.v2 import (
+    AgentSection,
+    CheckPlugin,
+    CheckResult,
+    DiscoveryResult,
+    render,
+    Service,
+)
+from cmk.plugins.kube.kube_resources import (
+    check_resource,
+    MEMORY_DEFAULT_PARAMS,
+    Params,
+    parse_allocatable_resource,
+    parse_performance_usage,
+    parse_resources,
+)
+from cmk.plugins.kube.schemata.section import AllocatableResource, PerformanceUsage, Resources
+
+agent_section_kube_memory_resources_v1 = AgentSection(
+    name="kube_memory_resources_v1",
+    parse_function=parse_resources,
+    parsed_section_name="kube_memory_resources",
+)
+
+
+agent_section_kube_performance_memory_v1 = AgentSection(
+    name="kube_performance_memory_v1",
+    parse_function=parse_performance_usage,
+    parsed_section_name="kube_performance_memory",
+)
+
+
+agent_section_kube_allocatable_memory_resource_v1 = AgentSection(
+    name="kube_allocatable_memory_resource_v1",
+    parsed_section_name="kube_allocatable_memory_resource",
+    parse_function=parse_allocatable_resource,
+)
+
+agent_section_kube_performance_memory_swap_v1 = AgentSection(
+    name="kube_performance_memory_swap_v1",
+    parse_function=parse_performance_usage,
+    parsed_section_name="kube_performance_memory_swap",
+)
+
+
+def discovery_kube_memory(
+    section_kube_performance_memory: PerformanceUsage | None,  # noqa: ARG001
+    section_kube_memory_resources: Resources | None,  # noqa: ARG001
+    section_kube_allocatable_memory_resource: AllocatableResource | None,  # noqa: ARG001
+    section_kube_performance_memory_swap: PerformanceUsage | None,  # noqa: ARG001
+) -> DiscoveryResult:
+    yield Service()
+
+
+def check_kube_memory(
+    params: Params,
+    section_kube_performance_memory: PerformanceUsage | None,
+    section_kube_memory_resources: Resources | None,
+    section_kube_allocatable_memory_resource: AllocatableResource | None,
+    section_kube_performance_memory_swap: PerformanceUsage | None,
+) -> CheckResult:
+    if section_kube_memory_resources is None:
+        return
+
+    yield from check_resource(
+        params,
+        section_kube_performance_memory,
+        section_kube_memory_resources,
+        section_kube_allocatable_memory_resource,
+        "memory",
+        render.bytes,
+    )
+
+    if section_kube_performance_memory_swap is not None:
+        swap_param = params.get("swap", "no_levels")
+        yield from check_levels_v1(
+            section_kube_performance_memory_swap.resource.usage,
+            label="Swap",
+            levels_upper=swap_param[1] if swap_param != "no_levels" else None,
+            metric_name="swap_used",
+            render_func=render.bytes,
+            boundaries=(0.0, None),
+        )
+
+
+check_plugin_kube_memory = CheckPlugin(
+    name="kube_memory",
+    service_name="Memory resources",
+    sections=[
+        "kube_performance_memory",
+        "kube_memory_resources",
+        "kube_allocatable_memory_resource",
+        "kube_performance_memory_swap",
+    ],
+    discovery_function=discovery_kube_memory,
+    check_function=check_kube_memory,
+    check_ruleset_name="kube_memory",
+    check_default_parameters=MEMORY_DEFAULT_PARAMS,
+)

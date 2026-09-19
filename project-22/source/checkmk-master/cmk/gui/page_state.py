@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+"""Rendering the page state (top right of the page header)
+
+Cares about the page state rendering. Each page can produce a page state that is displayed on the
+top right of the page.
+"""
+
+# mypy: disable-error-code="comparison-overlap"
+
+from dataclasses import dataclass, field
+
+from cmk.gui.htmllib.html import html
+from cmk.gui.htmllib.type_defs import CSSSpec
+from cmk.web.utils.html import HTML
+from cmk.web.utils.icons import StaticIcon
+
+
+@dataclass
+class PageState:
+    text: str | HTML
+    icon_name: StaticIcon | None = None
+    css_classes: CSSSpec = field(default_factory=list)
+    url: str | None = None
+    tooltip_text: str = ""
+
+
+class PageStateRenderer:
+    def show(self, page_state: PageState) -> None:
+        html.open_div(class_=self._get_css_classes(page_state), title=page_state.tooltip_text)
+        if page_state.url:
+            html.open_a(page_state.url)
+            self._show_content(page_state)
+            html.close_a()
+        else:
+            self._show_content(page_state)
+        html.close_div()
+
+    def _show_content(self, page_state: PageState) -> None:
+        html.div(page_state.text, class_="text_container")
+        if page_state.icon_name:
+            html.div(
+                html.render_static_icon(page_state.icon_name, id_="page_state_icon"),
+                class_="icon_container",
+            )
+
+    def _get_css_classes(self, page_state: PageState) -> CSSSpec:
+        classes = ["page_state"]
+        if isinstance(page_state.css_classes, list):
+            classes.extend(c for c in page_state.css_classes if c is not None)  # type: ignore[redundant-expr]
+        elif page_state.css_classes is not None:  # type: ignore[unreachable]
+            classes.append(page_state.css_classes)
+        return classes

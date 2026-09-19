@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+# Copyright (C) 2022 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from cmk.gui.dashboard.type_defs import (
+    DashletConfig,
+    DashletPosition,
+    DashletRefreshAction,
+    DashletRefreshInterval,
+    DashletSize,
+)
+
+from .base import Dashlet, IFrameDashlet
+from .dashlets import (
+    copy_view_into_dashlet,
+    register_dashlets,
+    StaticTextDashlet,
+    StaticTextDashletConfig,
+    StatsDashletConfig,
+)
+from .figure_dashlet import ABCFigureDashlet
+from .registry import dashlet_registry, DashletRegistry
+
+__all__ = [
+    "DashletRefreshInterval",
+    "DashletRefreshAction",
+    "DashletSize",
+    "DashletPosition",
+    "register_dashlets",
+    "StaticTextDashletConfig",
+    "StaticTextDashlet",
+    "DashletRegistry",
+    "dashlet_registry",
+    "Dashlet",
+    "IFrameDashlet",
+    "DashletConfig",
+    "StatsDashletConfig",
+    "copy_view_into_dashlet",
+    "ABCFigureDashlet",
+]

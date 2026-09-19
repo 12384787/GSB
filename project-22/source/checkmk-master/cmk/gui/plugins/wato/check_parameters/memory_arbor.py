@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+from cmk.gui.i18n import _
+from cmk.gui.plugins.wato.utils import (
+    CheckParameterRulespecWithoutItem,
+    rulespec_registry,
+    RulespecGroupCheckParametersOperatingSystem,
+)
+from cmk.gui.valuespec import CascadingDropdown, Dictionary, Filesize, Percentage, Tuple
+
+# Beware: This is not yet implemented in the check.
+# def PredictiveMemoryChoice(what):
+#     return ( "predictive", _("Predictive levels for %s") % what,
+#         PredictiveLevels(
+#            unit = _("GB"),
+#            default_difference = (0.5, 1.0)
+#     ))
+
+
+def UsedSize() -> Tuple[tuple[int, int]]:
+    GB = 1024 * 1024 * 1024
+    return Tuple(
+        elements=[
+            Filesize(title=_("Warning at"), default_value=1 * GB),
+            Filesize(title=_("Critical at"), default_value=2 * GB),
+        ]
+    )
+
+
+def FreeSize() -> Tuple[tuple[int, int]]:
+    GB = 1024 * 1024 * 1024
+    return Tuple(
+        elements=[
+            Filesize(title=_("Warning below"), default_value=2 * GB),
+            Filesize(title=_("Critical below"), default_value=1 * GB),
+        ]
+    )
+
+
+def UsedPercentage(
+    default_percents: tuple[float, float] | None = None, of_what: str | None = None
+) -> Tuple[tuple[float, float]]:
+    if of_what:
+        unit = _("%% of %(of_what)s") % {"of_what": of_what}
+        maxvalue = None
+    else:
+        unit = "%"
+        maxvalue = 101.0
+    return Tuple(
+        elements=[
+            Percentage(
+                title=_("Warning at"),
+                default_value=default_percents and default_percents[0] or 80.0,
+                unit=unit,
+                maxvalue=maxvalue,
+            ),
+            Percentage(
+                title=_("Critical at"),
+                default_value=default_percents and default_percents[1] or 90.0,
+                unit=unit,
+                maxvalue=maxvalue,
+            ),
+        ]
+    )
+
+
+def FreePercentage(
+    default_percents: tuple[float, float] | None = None, of_what: str | None = None
+) -> Tuple[tuple[float, float]]:
+    unit = _("%% of %(of_what)s") % {"of_what": of_what} if of_what else "%"
+    return Tuple(
+        elements=[
+            Percentage(
+                title=_("Warning below"),
+                default_value=default_percents and default_percents[0] or 20.0,
+                unit=unit,
+            ),
+            Percentage(
+                title=_("Critical below"),
+                default_value=default_percents and default_percents[1] or 10.0,
+                unit=unit,
+            ),
+        ]
+    )
+
+
+def DualMemoryLevels(
+    what: str, default_percents: tuple[float, float] | None = None
+) -> CascadingDropdown:
+    return CascadingDropdown(
+        title=_("Levels for %(what)s") % {"what": what},
+        choices=[
+            (
+                "perc_used",
+                _("Percentual levels for used %(what)s") % {"what": what},
+                UsedPercentage(default_percents),
+            ),
+            (
+                "perc_free",
+                _("Percentual levels for free %(what)s") % {"what": what},
+                FreePercentage(),
+            ),
+            ("abs_used", _("Absolute levels for used %(what)s") % {"what": what}, UsedSize()),
+            ("abs_free", _("Absolute levels for free %(what)s") % {"what": what}, FreeSize()),
+            # PredictiveMemoryChoice(_("used %s") % what), # not yet implemented
+            ("ignore", _("Do not impose levels")),
+        ],
+    )
+
+
+def _parameter_valuespec_memory_arbor() -> Dictionary:
+    return Dictionary(
+        elements=[
+            ("levels_ram", DualMemoryLevels(_("RAM"))),
+            ("levels_swap", DualMemoryLevels(_("Swap"))),
+        ],
+    )
+
+
+rulespec_registry.register(
+    CheckParameterRulespecWithoutItem(
+        check_group_name="memory_arbor",
+        group=RulespecGroupCheckParametersOperatingSystem,
+        match_type="dict",
+        parameter_valuespec=_parameter_valuespec_memory_arbor,
+        title=lambda: _("Memory and swap usage on Arbor devices"),
+    )
+)

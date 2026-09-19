@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from collections.abc import Sequence
+
+import pytest
+
+from cmk.agent_based.v2 import (
+    Attributes,
+    HostLabel,
+    InventoryResult,
+    StringByteTable,
+    TableRow,
+)
+from cmk.plugins.network.agent_based.lldp_cache import (
+    host_label_lldp_cache,
+    inventorize_lldp_cache,
+    InventoryParams,
+    Lldp,
+    LldpGlobal,
+    LldpNeighbor,
+    parse_lldp_cache,
+)
+
+STRING_TABLE_1_NEIGHBOR = [
+    [
+        [
+            "1",
+            "4",  # lldpRemChassisIdSubtype   4 - mac-adrress, 5-network adress, rest
+            [99, 160, 210, 120, 34, 200],  # lldpRemChassisId
+            "3",  # lldpRemPortIdSubtype      4 - mac-adrress, 5/7-network adress, rest
+            [55, 56, 49, 56, 46, 101, 99, 50, 101, 46, 98, 97, 56, 97],  # lldpRemPortId
+            "port desc",  # lldpRemPortDesc
+            "sys name",  # lldpRemSysName
+            "sys desc",  # lldpRemSysDesc
+            "01 00",  # lldpRemSysCapSupported
+            "01 00",  # lldpRemSysCapEnabled
+        ]
+    ],  # lldp_rem_entry
+    [
+        [
+            "1",  # interface index
+            "3",  # lldpLocPortIdSubtype
+            [55, 56, 49, 56, 46, 101, 99, 50, 101, 46, 98, 97, 56, 97],  # lldpLocPortId
+        ]
+    ],  # lldp_local_port_entry
+    [
+        [
+            "4",  # lldpLocChassisIdSubtype
+            [0, 4, 96, 155, 189, 79],  # lldpLocChassisId
+            "Local Sys Name",  # lldpLocSysName
+            "Local Sys Desc",  # lldpLocSysDesc
+            "28 00 ",  # lldpLocSysCapSupported
+            "28 00 ",  # lldpLocSysCapEnabled
+        ]
+    ],  # lldp_local_info
+    [
+        [
+            "1",  # index
+            "3",  # lldpRemManAddrIfSubtype
+        ]
+    ],  # lldp_rem_man_addr_entry
+]
+
+
+STRING_TABLE_2_NEIGHBORS = [
+    [
+        [
+            "1",
+            "4",  # lldpRemChassisIdSubtype   4 - mac-adrress, 5-network adress, rest
+            [99, 160, 210, 120, 34, 200],  # lldpRemChassisId
+            "3",  # lldpRemPortIdSubtype      4 - mac-adrress, 5/7-network adress, rest
+            [55, 56, 49, 56, 46, 101, 99, 50, 101, 46, 98, 97, 56, 97],  # lldpRemPortId
+            "port desc",  # lldpRemPortDesc
+            "sys name",  # lldpRemSysName
+            "sys desc",  # lldpRemSysDesc
+            "01 00",  # lldpRemSysCapSupported
+            "01 00",  # lldpRemSysCapEnabled
+        ],
+        [
+            "1",
+            "4",  # lldpRemChassisIdSubtype   4 - mac-adrress, 5-network adress, rest
+            [99, 160, 210, 120, 34, 200],  # lldpRemChassisId
+            "3",  # lldpRemPortIdSubtype      4 - mac-adrress, 5/7-network adress, rest
+            [55, 56, 49, 56, 46, 101, 99, 50, 101, 46, 98, 97, 56, 97],  # lldpRemPortId
+            "port desc 2",  # lldpRemPortDesc
+            "sys name 2",  # lldpRemSysName
+            "sys desc 2",  # lldpRemSysDesc
+            "01 00",  # lldpRemSysCapSupported
+            "01 00",  # lldpRemSysCapEnabled
+        ],
+    ],  # lldp_rem_entry
+    [
+        [
+            "1",  # interface index
+            "3",  # lldpLocPortIdSubtype
+            [55, 56, 49, 56, 46, 101, 99, 50, 101, 46, 98, 97, 56, 97],  # lldpLocPortId
+        ]
+    ],  # lldp_local_port_entry
+    [
+        [
+            "4",  # lldpLocChassisIdSubtype
+            [0, 4, 96, 155, 189, 79],  # lldpLocChassisId
+            "Local Sys Name",  # lldpLocSysName
+            "Local Sys Desc",  # lldpLocSysDesc
+            "28 00 ",  # lldpLocSysCapSupported
+            "28 00 ",  # lldpLocSysCapEnabled
+        ]
+    ],  # lldp_local_info
+    [
+        [
+            "1",  # index
+            "3",  # lldpRemManAddrIfSubtype
+        ],
+        [
+            "1",  # index
+            "3",  # lldpRemManAddrIfSubtype
+        ],
+    ],  # lldp_rem_man_addr_entry
+]
+
+
+LLDP_GLOBAL = LldpGlobal(
+    id="00:04:60:9B:BD:4F",
+    name="Local Sys Name",
+    description="Local Sys Desc",
+    cap_supported="Phone, Repeater, Router",
+    cap_enabled="Phone, Repeater, Router",
+)
+
+LLDP_NEIGHBORS = [
+    LldpNeighbor(
+        capabilities="Phone, Router",
+        capabilities_map_supported="Phone, Router",
+        local_port="78:18:EC:2E:BA:8A",
+        local_port_index="1",
+        neighbor_address="",
+        neighbor_id="63:A0:D2:78:22:C8",
+        neighbor_name="sys name",
+        neighbor_port="78:18:EC:2E:BA:8A",
+        port_description="port desc",
+        system_description="sys desc",
+    ),
+]
+
+LLDP = Lldp(
+    lldp_global=LLDP_GLOBAL,
+    lldp_neighbors=LLDP_NEIGHBORS,
+)
+
+
+@pytest.mark.parametrize(
+    "data, expected",
+    [
+        ([], None),
+        (STRING_TABLE_1_NEIGHBOR, LLDP),
+        (
+            STRING_TABLE_2_NEIGHBORS,
+            Lldp(
+                lldp_global=LLDP_GLOBAL,
+                lldp_neighbors=LLDP_NEIGHBORS
+                + [
+                    LldpNeighbor(
+                        capabilities="Phone, Router",
+                        capabilities_map_supported="Phone, Router",
+                        local_port="78:18:EC:2E:BA:8A",
+                        local_port_index="1",
+                        neighbor_address="",
+                        neighbor_id="63:A0:D2:78:22:C8",
+                        neighbor_name="sys name 2",
+                        neighbor_port="78:18:EC:2E:BA:8A",
+                        port_description="port desc 2",
+                        system_description="sys desc 2",
+                    )
+                ],
+            ),
+        ),
+    ],
+    ids=["no data", "lldp available", "lldp with 2 neighbors"],
+)
+def test_parse_lldp_cache(data: Sequence[StringByteTable], expected: Lldp | None) -> None:
+    parsed = parse_lldp_cache(string_table=data)
+    assert parsed == expected
+
+
+@pytest.mark.parametrize(
+    "section, expected",
+    [
+        (
+            Lldp(
+                lldp_global=LLDP_GLOBAL,
+                lldp_neighbors=[],
+            ),
+            [],
+        ),
+        (
+            LLDP,
+            [
+                HostLabel("cmk/has_lldp_neighbors", "yes"),
+            ],
+        ),
+        (
+            Lldp(
+                lldp_global=LLDP_GLOBAL,
+                lldp_neighbors=LLDP_NEIGHBORS
+                + [
+                    LldpNeighbor(
+                        capabilities="Phone, Router",
+                        capabilities_map_supported="Phone, Router",
+                        local_port="78:18:EC:2E:BA:8A",
+                        local_port_index="2",
+                        neighbor_address="",
+                        neighbor_id="63:A0:D2:78:22:C8",
+                        neighbor_name="sys name 2",
+                        neighbor_port="78:18:EC:2E:BA:8A",
+                        port_description="port desc 2",
+                        system_description="sys desc 2",
+                    ),
+                ],
+            ),
+            [
+                HostLabel("cmk/has_lldp_neighbors", "yes"),
+            ],
+        ),
+    ],
+    ids=["no neighbors", "with 1 neighbor", "with 2 neighbors"],
+)
+def test_host_label_lldp_cache(section: Lldp, expected: list[HostLabel]) -> None:
+    labels = list(host_label_lldp_cache(section=section))
+    assert labels == expected
+
+
+LLDP_GLOBAL_ATTRIBUTE = Attributes(
+    path=["networking", "lldp_cache"],
+    inventory_attributes={
+        "local_id": "00:04:60:9B:BD:4F",
+        "local_name": "Local Sys Name",
+        "local_description": "Local Sys Desc",
+        "local_cap_supported": "Phone, Repeater, Router",
+        "local_cap_enabled": "Phone, Repeater, Router",
+    },
+    status_attributes={},
+)
+
+
+LLDP_NEIGHBOR_ATTRIBUTE = TableRow(
+    path=["networking", "lldp_cache", "neighbors"],
+    key_columns={
+        "local_port": "78:18:EC:2E:BA:8A",
+        "neighbor_name": "sys name",
+        "neighbor_port": "78:18:EC:2E:BA:8A",
+    },
+    inventory_columns={
+        "capabilities": "Phone, Router",
+        "capabilities_map_supported": "Phone, Router",
+        "neighbor_id": "63:A0:D2:78:22:C8",
+        "port_description": "port desc",
+        "system_description": "sys desc",
+    },
+    status_columns={},
+)
+
+
+@pytest.mark.parametrize(
+    "section, expected",
+    [
+        (
+            Lldp(lldp_global=LLDP_GLOBAL, lldp_neighbors=[]),
+            [LLDP_GLOBAL_ATTRIBUTE],
+        ),
+        (
+            LLDP,
+            [LLDP_GLOBAL_ATTRIBUTE, LLDP_NEIGHBOR_ATTRIBUTE],
+        ),
+    ],
+    ids=["no neighbors", "with neighbors"],
+)
+def test_inventorize_lldp_cache(section: Lldp, expected: InventoryResult) -> None:
+    parsed = list(inventorize_lldp_cache(params=InventoryParams(), section=section))
+    assert parsed == expected
+
+
+# Crash report ada1756a-2397-11f1-84b2-bc2411b4a7e5: Some devices report an IPv4
+# address with LLDP address family 2 (IPv6), causing a ValueError in ip_address().
+STRING_TABLE_IPV4_AS_IPV6_MGMT_ADDR: Sequence[StringByteTable] = [
+    [  # lldp_rem_entry
+        [
+            "0.1.1",
+            "4",
+            [0, 13, 185, 74, 165, 68],
+            "5",
+            [105, 103, 98, 49],
+            "",
+            "OPNsense",
+            "FreeBSD",
+            "9",
+            "\x08",
+        ]
+    ],
+    [  # lldp_local_port_entry
+        ["1", "7", [49]]
+    ],
+    [  # lldp_local_info
+        ["4", [184, 236, 163, 230, 8, 135], "GS1900", "GS1900-8", " ", " "]
+    ],
+    [  # lldp_rem_man_addr_entry — address family 2 (IPv6) but only 4 bytes (IPv4)
+        ["0.1.1.2.4.192.168.42.254", "-2"]
+    ],
+]
+
+
+def test_parse_lldp_cache_ipv4_reported_as_ipv6() -> None:
+    """Device reports IPv4 address with IPv6 address family in LLDP management address."""
+    parsed = parse_lldp_cache(string_table=STRING_TABLE_IPV4_AS_IPV6_MGMT_ADDR)
+    assert parsed is not None
+    assert len(parsed.lldp_neighbors) == 1
+    assert parsed.lldp_neighbors[0].neighbor_address == "192.168.42.254"
+
+
+# Crash report 9a097a6d-63d8-11f1-b83b-8dc04b16045e (group 4606): a neighbour advertises a
+# network-address port-id sub-type ("5") but an empty port-id ([]), which crashed the parser
+# with IndexError in _render_networkaddress.
+STRING_TABLE_EMPTY_NETWORK_ADDRESS_PORT_ID: Sequence[StringByteTable] = [
+    [  # lldp_rem_entry
+        [
+            "1",
+            "4",  # lldpRemChassisIdSubtype: mac-address
+            [99, 160, 210, 120, 34, 200],  # lldpRemChassisId
+            "5",  # lldpRemPortIdSubtype: network-address
+            [],  # lldpRemPortId: empty
+            "port desc",
+            "sys name",
+            "sys desc",
+            "01 00",
+            "01 00",
+        ]
+    ],
+    [  # lldp_local_port_entry
+        ["1", "3", [55, 56, 49, 56, 46, 101, 99, 50, 101, 46, 98, 97, 56, 97]]
+    ],
+    [  # lldp_local_info
+        ["4", [0, 4, 96, 155, 189, 79], "Local Sys Name", "Local Sys Desc", "28 00 ", "28 00 "]
+    ],
+    [  # lldp_rem_man_addr_entry
+        ["1", "3"]
+    ],
+]
+
+
+def test_parse_lldp_cache_empty_network_address_port_id() -> None:
+    """An empty network-address port-id must not crash the parser; it renders as ''."""
+    parsed = parse_lldp_cache(string_table=STRING_TABLE_EMPTY_NETWORK_ADDRESS_PORT_ID)
+    assert parsed is not None
+    assert len(parsed.lldp_neighbors) == 1
+    assert parsed.lldp_neighbors[0].neighbor_port == "n/a"
+
+
+# SUP-29056: on Cisco Nexus9000 devices a neighbour advertises a network-address port-id
+# sub-type ("5") whose address family is 2 (IPv6) but which carries a 4-byte IPv4 address.
+# Rendering it went through _render_networkaddress -> _render_ipv6_address, where ip_address()
+# raised a ValueError on the non-16-byte payload, crashing the whole section parse.  Unlike the
+# management-address branch, this chassis/port path had no length guard.
+STRING_TABLE_NETWORK_ADDRESS_IPV4_AS_IPV6_PORT_ID: Sequence[StringByteTable] = [
+    [  # lldp_rem_entry
+        [
+            "0.1.1",
+            "4",  # lldpRemChassisIdSubtype: mac-address
+            [0, 13, 185, 74, 165, 68],  # lldpRemChassisId
+            "5",  # lldpRemPortIdSubtype: network-address
+            [2, 192, 168, 1, 1],  # lldpRemPortId: family 2 (IPv6) but 4-byte IPv4 payload
+            "",
+            "NEXUS-SW",
+            "Cisco NX-OS",
+            "9",
+            "\x08",
+        ]
+    ],
+    [  # lldp_local_port_entry
+        ["1", "5", [69, 116, 104, 49]]  # lldpLocPortIdSubtype: network-address, "Eth1"
+    ],
+    [  # lldp_local_info
+        ["4", [184, 236, 163, 230, 8, 135], "Local Sys Name", "Local Sys Desc", " ", " "]
+    ],
+    [  # lldp_rem_man_addr_entry
+        ["0.1.1", "3"]
+    ],
+]
+
+
+def test_parse_lldp_cache_network_address_ipv4_as_ipv6_port_id() -> None:
+    """A network-address port-id carrying an IPv4 address with family 2 (IPv6) must not crash."""
+    parsed = parse_lldp_cache(string_table=STRING_TABLE_NETWORK_ADDRESS_IPV4_AS_IPV6_PORT_ID)
+    assert parsed is not None
+    assert len(parsed.lldp_neighbors) == 1
+    assert parsed.lldp_neighbors[0].neighbor_port == "192.168.1.1"
+
+
+@pytest.mark.parametrize(
+    "raw_bytes",
+    [
+        [],  # empty
+        [2, 10, 20],  # family IPv6, too short (odd)
+        [2, 10, 20, 30, 40, 50, 60],  # family IPv6, too short (even)
+        [2] + list(range(15)),  # family IPv6, one byte short
+    ],
+    ids=["empty", "ipv6-odd", "ipv6-even-short", "ipv6-one-short"],
+)
+def test_render_networkaddress_never_raises(raw_bytes: list[int]) -> None:
+    """Malformed network-address payloads must render gracefully, not raise."""
+    from cmk.plugins.network.agent_based.lldp_cache import _render_networkaddress
+
+    assert isinstance(_render_networkaddress(raw_bytes), str)

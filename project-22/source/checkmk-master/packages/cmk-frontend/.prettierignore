@@ -1,0 +1,10 @@
+# 3rd party
+src/js/modules/colorpicker.js
+src/jquery
+src/openapi
+
+# generated
+package-lock.json
+pnpm-lock.yaml
+
+src/js/modules/figures/cmk_stats.ts

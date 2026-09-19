@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "agent_slideout",
+  "properties": {
+    "agent_install_cmds": { "$ref": "#/$defs/agent_install_cmds" },
+    "agent_registration_cmds": {
+      "$ref": "#/$defs/agent_registration_cmds"
+    },
+    "agent_status_cmds": {
+      "$ref": "#/$defs/agent_status_cmds"
+    },
+    "host_name": { "type": "string" },
+    "all_agents_url": { "type": "string" },
+    "user_settings_url": { "type": "string" },
+    "legacy_agent_url": { "type": "string" },
+    "save_host": { "type": "boolean" },
+    "host_exists": { "type": "boolean" },
+    "unbaked_fallback": {
+      "anyOf": [{ "type": "null" }, { "$ref": "#/$defs/unbaked_fallback" }]
+    }
+  },
+  "required": [
+    "agent_install_cmds",
+    "agent_registration_cmds",
+    "agent_status_cmds",
+    "host_name",
+    "all_agents_url",
+    "user_settings_url",
+    "save_host"
+  ],
+  "$defs": {
+    "unbaked_fallback": {
+      "type": "object",
+      "properties": {
+        "intro": { "type": "string" },
+        "commands": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "required": ["intro", "commands"]
+    },
+    "agent_install_cmds": {
+      "type": "object",
+      "properties": {
+        "windows_download": { "type": "string" },
+        "windows_download_powershell": { "type": "string" },
+        "windows": { "type": "string" },
+        "windows_powershell": { "type": "string" },
+        "linux_deb": { "type": "string" },
+        "linux_rpm": { "type": "string" },
+        "linux_tgz_download": { "type": "string" },
+        "linux_tgz_extract": { "type": "string" },
+        "solaris": { "type": "string" },
+        "aix_download": { "type": "string" },
+        "aix_extract": { "type": "string" }
+      },
+      "required": ["windows_download", "windows", "linux_deb", "linux_rpm"]
+    },
+    "agent_registration_cmds": {
+      "type": "object",
+      "properties": {
+        "windows": { "type": "string" },
+        "windows_powershell": { "type": "string" },
+        "linux": { "type": "string" },
+        "solaris": { "type": "string" },
+        "aix": { "type": "string" }
+      },
+      "required": ["windows", "linux", "solaris", "aix"]
+    },
+    "agent_status_cmds": {
+      "type": "object",
+      "properties": {
+        "windows": { "type": "string" },
+        "windows_powershell": { "type": "string" },
+        "linux": { "type": "string" },
+        "solaris": { "type": "string" },
+        "aix": { "type": "string" }
+      },
+      "required": ["windows", "linux", "solaris", "aix"]
+    }
+  }
+}

@@ -1,0 +1,126 @@
+<!--
+Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+
+<script setup lang="ts">
+import CmkButton from 'cmk-ui-library/components/CmkButton'
+import CmkIcon from 'cmk-ui-library/components/CmkIcon'
+
+defineProps<{ screenshotMode: boolean }>()
+</script>
+
+<template>
+  <dl>
+    <dt><code>&lt;CmkButton variant="primary"&gt;button&lt;/CmkButton&gt;</code></dt>
+    <dd>
+      <CmkButton variant="primary">button</CmkButton>
+    </dd>
+
+    <dt><code>&lt;CmkButton variant="secondary"&gt;button&lt;/CmkButton&gt;</code></dt>
+    <dd>
+      <CmkButton variant="secondary">button</CmkButton>
+    </dd>
+
+    <dt><code>&lt;CmkButton&gt;button&lt;/CmkButton&gt;</code></dt>
+    <dd>
+      <CmkButton>button</CmkButton>
+    </dd>
+
+    <dt><code>&lt;CmkButton variant="success"&gt;button&lt;/CmkButton&gt;</code></dt>
+    <dd>
+      <CmkButton variant="success">button</CmkButton>
+    </dd>
+
+    <dt>
+      <code>&lt;CmkButton variant="success" :disabled="true"&gt;button&lt;/CmkButton&gt;</code>
+    </dt>
+    <dd>
+      <CmkButton variant="success" :disabled="true">button</CmkButton>
+    </dd>
+
+    <dt><code>&lt;CmkButton variant="warning"&gt;button&lt;/CmkButton&gt;</code></dt>
+    <dd>
+      <CmkButton variant="warning">button</CmkButton>
+    </dd>
+
+    <dt><code>&lt;CmkButton variant="danger"&gt;button&lt;/CmkButton&gt;</code></dt>
+    <dd>
+      <CmkButton variant="danger">button</CmkButton>
+    </dd>
+
+    <dt><code>&lt;CmkButton variant="info"&gt;info&lt;/CmkButton&gt;</code></dt>
+    <dd>
+      <CmkButton variant="info">info</CmkButton>
+    </dd>
+
+    <dt><code>&lt;CmkButton variant="info" :disabled="true"&gt;info&lt;/CmkButton&gt;</code></dt>
+    <dd>
+      <CmkButton variant="info" :disabled="true">info</CmkButton>
+    </dd>
+
+    <dt><code>&lt;CmkButton variant="text"&gt;button&lt;/CmkButton&gt;</code></dt>
+    <dd>
+      <CmkButton variant="text">button</CmkButton>
+    </dd>
+
+    <dt><code>&lt;CmkButton variant="ai"&gt;button&lt;/CmkButton&gt;</code></dt>
+    <dd>
+      <CmkButton variant="ai">button</CmkButton>
+    </dd>
+
+    <dt>
+      <code
+        >&lt;CmkButton variant="ai" :icon="{ name: 'sparkle' }"&gt;Explain this
+        issue&lt;/CmkButton&gt;</code
+      >
+    </dt>
+    <dd>
+      <CmkButton variant="ai" :icon="{ name: 'sparkle' }">Explain this issue</CmkButton>
+    </dd>
+
+    <dt>
+      <code
+        >&lt;CmkButton&gt;&lt;CmkIcon name="about-checkmk" variant="inline"
+        /&gt;button&lt;/CmkButton&gt;</code
+      >
+    </dt>
+    <dd>
+      <CmkButton><CmkIcon name="about-checkmk" variant="inline" />button</CmkButton>
+    </dd>
+
+    <dt>
+      <code
+        >&lt;CmkButton href="https://checkmk.com" target="_blank"&gt;link&lt;/CmkButton&gt;</code
+      >
+    </dt>
+    <dd>
+      <CmkButton href="https://checkmk.com" target="_blank">link</CmkButton>
+    </dd>
+
+    <dt>
+      <code
+        >&lt;CmkButton size="iconOnly"&gt;&lt;CmkIcon name="about-checkmk" size="small"
+        /&gt;&lt;/CmkButton&gt;</code
+      >
+    </dt>
+    <dd>
+      <CmkButton size="iconOnly">
+        <CmkIcon name="about-checkmk" size="small" />
+      </CmkButton>
+    </dd>
+  </dl>
+</template>
+
+<style scoped>
+dt {
+  margin-top: 2em;
+  margin-bottom: 0.5em;
+}
+
+dd {
+  margin: 0;
+  padding: 0;
+}
+</style>

@@ -1,0 +1,92 @@
+<!--
+Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script lang="ts">
+import { type PanelConfigFor, listOptions } from '@ucl/_ucl/components/detail-page'
+
+import codeExample from './UclCmkCatalogPanelCodeExample.vue?raw'
+
+export const a11yData = [
+  {
+    keys: ['Tab'],
+    description:
+      'Moves keyboard focus to header. While the focus outline is hidden from view, its underlying functionality remains intact.'
+  },
+  {
+    keys: [['Shift', 'Tab']],
+    description: 'Moves focus to the header from the next focusable element in reverse order.'
+  },
+  {
+    keys: ['Enter', 'Space'],
+    description:
+      'When the header button is focused, pressing Enter or Space toggles the visibility of the panel content.'
+  }
+]
+
+type CatalogPanelVariant = 'default' | 'padded'
+
+export const panelConfig = {
+  title: { type: 'string' as const, title: 'Panel Title', initialState: 'Catalog Panel' },
+  variant: {
+    type: 'list' as const,
+    title: 'Variant',
+    options: listOptions<CatalogPanelVariant>({
+      default: 'Default',
+      padded: 'Padded'
+    }),
+    initialState: 'default' as CatalogPanelVariant
+  },
+  open: { type: 'boolean' as const, title: 'Open', initialState: true }
+} satisfies PanelConfigFor<typeof CmkCatalogPanel>
+</script>
+
+<script setup lang="ts">
+import {
+  PanelStateCreator,
+  UclDetailPageAccessibility,
+  UclDetailPageCodeExample,
+  UclDetailPageComponent,
+  UclDetailPageDeveloperPlayground,
+  UclDetailPageHeader,
+  UclDetailPageLayout,
+  UclPropertiesPanel
+} from '@ucl/_ucl/components/detail-page'
+import CmkCatalogPanel from 'cmk-ui-library/components/CmkCatalogPanel.vue'
+
+import UclCmkCatalogPanelDev from './UclCmkCatalogPanelDev.vue'
+
+defineProps<{ screenshotMode: boolean }>()
+
+const propState = new PanelStateCreator<typeof CmkCatalogPanel>().createRef(panelConfig)
+</script>
+
+<template>
+  <UclDetailPageLayout>
+    <UclDetailPageHeader>CmkCatalogPanel</UclDetailPageHeader>
+
+    <UclDetailPageComponent>
+      <CmkCatalogPanel
+        :key="String(propState.open)"
+        :title="propState.title"
+        :variant="propState.variant ?? 'default'"
+        :open="propState.open"
+      >
+        This is the collapsible content inside the panel.
+      </CmkCatalogPanel>
+
+      <template #properties>
+        <UclPropertiesPanel v-model="propState" :config="panelConfig" />
+      </template>
+    </UclDetailPageComponent>
+
+    <UclDetailPageCodeExample :code="codeExample" />
+
+    <UclDetailPageAccessibility :data="a11yData" />
+
+    <UclDetailPageDeveloperPlayground>
+      <UclCmkCatalogPanelDev :screenshot-mode="screenshotMode" />
+    </UclDetailPageDeveloperPlayground>
+  </UclDetailPageLayout>
+</template>

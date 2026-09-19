@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from pathlib import Path
+
+from cmk.bi.compiler import BICompiler
+from cmk.bi.computer import BIComputer
+from cmk.bi.data_fetcher import BIStatusFetcher
+from cmk.bi.filesystem import get_default_site_filesystem
+from cmk.bi.lib import SitesCallback
+from cmk.bi.storage import AggregationNotFound, AggregationStore
+from cmk.bi.trees import (
+    BICompiledAggregation,
+    BICompiledRule,
+    get_compiled_aggregation_and_branch_by_name,
+)
+from cmk.ccc.exceptions import MKGeneralException
+from cmk.ccc.site import SiteId
+from cmk.gui import sites
+from cmk.gui.hooks import request_memoize
+from cmk.gui.i18n import _
+from cmk.livestatus_client import LivestatusResponse, Query
+
+
+class BIManager:
+    def __init__(self, run_compile_check: bool = True) -> None:
+        sites_callback = create_default_sites_callback()
+        self.compiler = BICompiler(get_bi_config_path(), sites_callback)
+
+        try:
+            if run_compile_check:
+                self.compiler.compile_if_needed()
+        finally:
+            self.compiler.load_compiled_aggregations()
+
+        self.status_fetcher = BIStatusFetcher(sites_callback)
+        self.computer = BIComputer(self.compiler.compiled_aggregations, self.status_fetcher)
+
+    def get_aggregation_by_name(self, name: str) -> tuple[BICompiledAggregation, BICompiledRule]:
+        return get_compiled_aggregation_and_branch_by_name(
+            compiled_aggregations=self.compiler.compiled_aggregations,
+            aggr_name=name,
+        )
+
+
+def get_bi_config_path() -> Path:
+    return get_default_site_filesystem().etc.config
+
+
+def create_default_sites_callback() -> SitesCallback:
+    return SitesCallback(
+        all_sites_with_id_and_online=_all_sites_with_id_and_online,
+        query=_bi_livestatus_query,
+        translate=_,
+    )
+
+
+def _all_sites_with_id_and_online() -> list[tuple[SiteId, bool]]:
+    return [
+        (site_id, site_status["state"] == "online")
+        for site_id, site_status in sites.states().items()
+    ]
+
+
+def _bi_livestatus_query(
+    query: Query,
+    only_sites: list[SiteId] | None = None,
+    fetch_full_data: bool = False,
+) -> LivestatusResponse:
+    with sites.only_sites(only_sites), sites.prepend_site():
+        try:
+            auth_domain = "bi_fetch_full_data" if fetch_full_data else "bi"
+            sites.live().set_auth_domain(auth_domain)
+            return sites.live().query(query)
+        finally:
+            sites.live().set_auth_domain("read")
+
+
+@request_memoize(maxsize=10000)
+def load_compiled_branch(aggr_id: str, branch_title: str) -> BICompiledRule:
+    if compiled_aggregation := _load_compiled_aggregation(aggr_id):
+        for branch in compiled_aggregation.branches:
+            if branch.properties.title == branch_title:
+                return branch
+    raise MKGeneralException(f"Branch {branch_title} not found in aggregation {aggr_id}")
+
+
+@request_memoize(maxsize=10000)
+def _load_compiled_aggregation(aggr_id: str) -> BICompiledAggregation | None:
+    try:
+        return AggregationStore(get_default_site_filesystem().cache).get(aggr_id)
+    except AggregationNotFound:
+        return None

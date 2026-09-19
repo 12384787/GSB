@@ -1,0 +1,51 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+load("@cmk_requirements//:requirements.bzl", "requirement")
+load("//bazel/rules:doctest.bzl", "py_doc_test")
+
+py_library(
+    name = "quick_setup",
+    srcs = glob(include = ["**/*.py"]),
+    imports = ["../../.."],
+    visibility = [
+        "//cmk:__subpackages__",
+        "//non-free/packages:__subpackages__",
+        "//tests:__subpackages__",
+    ],
+    deps = [
+        "//cmk/gui:auth_core",
+        "//cmk/gui:config",
+        "//cmk/gui:core_toolkit",
+        "//cmk/gui:html_toolkit",
+        "//cmk/gui:page_toolkit",
+        "//cmk/gui/background_job/job",
+        "//cmk/gui/fields",
+        "//cmk/gui/form_specs",
+        "//cmk/gui/utils",
+        "//cmk/gui/utils:middle",
+        "//cmk/gui/valuespec",
+        "//cmk/gui/wato:base",
+        "//cmk/gui/watolib",
+        "//cmk/gui/watolib:config_infra",
+        "//cmk/gui/watolib:passwords",
+        "//cmk/gui/watolib:registries",
+        "//cmk/utils",
+        "//packages/cmk-ccc:exceptions",
+        "//packages/cmk-ccc:site",
+        "//packages/cmk-ccc:store",
+        "//packages/cmk-ccc:version",
+        "//packages/cmk-plugin-apis:rulesets",
+        "//packages/cmk-plugins:aws",
+        "//packages/cmk-plugins:azure_deprecated",
+        "//packages/cmk-plugins:azure_v2",
+        "//packages/cmk-plugins:gcp",
+        "//packages/cmk-plugins:proxmox_ve",
+        "//packages/cmk-web/cmk/web/utils",
+        requirement("pyyaml"),
+    ],
+)
+
+py_doc_test(
+    name = "doctest",
+    size = "small",
+    srcs = [":quick_setup"],
+)

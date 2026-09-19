@@ -1,0 +1,241 @@
+#!groovy
+
+/// file: versioning.groovy
+
+import groovy.transform.Field
+
+/* groovylint-disable DuplicateListLiteral */
+// ATTENTION: The paths added here for removal MUST NOT include slashes, because
+//            the command used in the function patch_folders will then fail and
+//            paths will not be removed as expected.
+@Field
+def REPO_PATCH_RULES = [\
+"community": [\
+    "paths_to_be_removed": [\
+        "non-free", \
+        "nonfree", \
+        "enterprise", \
+        "pro", \
+        "ultimate", \
+        "ultimatemt", \
+        "cloud"], \
+    "folders_to_be_created": []], \
+"pro": [\
+    "paths_to_be_removed": [\
+        "ultimate", \
+        "ultimatemt", \
+        "cloud"], \
+    "folders_to_be_created": []], \
+"ultimatemt": [\
+    "paths_to_be_removed": [\
+        "cloud"], \
+    "folders_to_be_created": []], \
+"ultimate": [\
+    "paths_to_be_removed": [\
+        "ultimatemt", \
+        "cloud"], \
+    "folders_to_be_created": []], \
+"cloud": [\
+    "paths_to_be_removed": [\
+        "ultimatemt"], \
+    "folders_to_be_created": []], \
+];
+/* groovylint-enable DuplicateListLiteral */
+
+boolean branch_name_is_branch_version(String git_dir=".") {
+    dir(git_dir) {
+        return cmd_output("make --no-print-directory -f defines.make print-BRANCH_NAME_IS_BRANCH_VERSION") ? true : false;
+    }
+}
+
+String branch_name() {
+    if (params.CUSTOM_GIT_REF) {
+        if (branch_name_is_branch_version("${checkout_dir}")) {
+            // this is only required as "master" is called "stable branch + 0.1.0"
+            // e.g. 2.3.0 (stable) + 0.1.0 = 2.4.0
+            return env.GERRIT_BRANCH ?: get_branch_version("${checkout_dir}");
+        } else {
+            return env.GERRIT_BRANCH ?: "master";
+        }
+    } else {
+        // defined in global-defaults.yml
+        return env.GERRIT_BRANCH ?: branches_str;
+    }
+}
+
+String safe_branch_name() {
+    // "+" can't be part of a docker tag, therefore we remove this.
+    // We remove the complete "+security" to only have a regular version as part of our image tag
+    def really_safe_name = branch_name().replaceAll("/", "-").replaceAll("\\+security", "");
+    if (really_safe_name.startsWith("sec-release") || really_safe_name.startsWith("sandbox")) {
+        if (branch_name_is_branch_version("${checkout_dir}")) {
+            // this is only required as "master" is called "stable branch + 0.1.0"
+            // e.g. 2.5.0 (stable) + 0.1.0 = 2.6.0
+            really_safe_name = get_branch_version("${checkout_dir}").replaceAll("/", "-").replaceAll("\\+security", "");
+        } else {
+            really_safe_name = "master";
+        }
+    }
+    return really_safe_name;
+}
+
+String distro_code() {
+    dir("${checkout_dir}") {
+        return cmd_output("omd/distro '-'");
+    }
+}
+
+/* groovylint-disable DuplicateListLiteral */
+String get_cmk_version(String branch_name, String branch_version, String version) {
+    return (
+      // Experimental builds
+      (branch_name.startsWith('sandbox') && version in ['daily', 'git']) ? "${build_date}-${branch_name}" :
+      // Daily builds
+      (version in ['daily', 'git']) ? "${branch_version}-${build_date}" :
+      // else
+      "${version}");
+}
+/* groovylint-enable DuplicateListLiteral */
+
+String get_package_name(String base_dir, String package_type, String edition, String cmk_version) {
+    print("FN get_package_name(base_dir=${base_dir}, package_type=${package_type}, cmk_version=${cmk_version})");
+    dir(base_dir) {
+        def file_pattern = (package_type == "deb" ?
+            "check-mk-$edition-${cmk_version}_*.${package_type}" :  // FIXME do we need this?
+            "check-mk-$edition-${cmk_version}-*.${package_type}");
+        return (cmd_output("ls ${file_pattern}")
+                ?: error("Found no package matching ${file_pattern} in ${base_dir}"));
+    }
+}
+
+List<String> get_distros(Map args) {
+    def override_distros = args.override?.trim() ?: "";
+
+    /// retrieve all available distros if provided distro-list is 'all',
+    /// respect provided arguments otherwise
+    def edition = override_distros == "all" ? "all" : args.edition?.trim() ?: "all";
+    def use_case = override_distros == "all" ? "all" : args.use_case?.trim() ?: "daily";
+
+    /// return requested list if provided
+    if (override_distros && override_distros != "all") {
+        return override_distros.replaceAll(',', ' ').split(' ').grep();
+    }
+
+    /// read distros from edition.yml otherwise.
+    dir("${checkout_dir}") {
+        return cmd_output("""python3 \
+              buildscripts/scripts/get_distros.py \
+              --editions_file "${checkout_dir}/editions.yml" \
+              use_cases \
+              --edition "${edition}" \
+              --use_case "${use_case}"
+        """).split().grep();
+    }
+}
+
+List<String> get_editions() {
+    /// read editions from edition.yml
+    dir("${checkout_dir}") {
+        return cmd_output("""python3 \
+              buildscripts/scripts/get_distros.py \
+              --editions_file "${checkout_dir}/editions.yml" \
+              editions
+        """).split().grep();
+    }
+}
+
+String get_internal_artifacts_pattern() {
+    dir("${checkout_dir}") {
+        return sh(script: """python3 \
+              buildscripts/scripts/get_distros.py \
+              --editions_file "editions.yml" \
+              internal_build_artifacts \
+              --as-codename \
+              --as-rsync-exclude-pattern;
+        """, returnStdout: true).trim();
+    }
+}
+
+String get_branch_version(String git_dir=".") {
+    dir(git_dir) {
+        return (cmd_output("make --no-print-directory -f defines.make print-BRANCH_VERSION").trim()
+                ?: raise("Could not read BRANCH_VERSION from defines.make - wrong directory?"));
+    }
+}
+
+String get_git_hash(String git_dir=".") {
+    dir(git_dir) {
+        return (cmd_output("git log -n 1 --pretty=format:'%h'")
+                ?: raise("Could not read git commit hash - wrong directory?"));
+    }
+}
+
+distro_package_type = { distro ->
+    return (
+      (distro ==~ /centos.*|rh.*|sles.*|opensuse.*|alma.*/) ? "rpm" :
+      (distro ==~ /cma.*/) ? "cma" :
+      (distro ==~ /debian.*|ubuntu.*/) ? "deb" :
+      raise("Cannot associate distro ${distro}"));
+}
+
+String get_docker_tag(String git_dir=".") {
+    return "${safe_branch_name()}-${build_date}-${get_git_hash(git_dir)}";
+}
+
+String get_docker_artifact_name(String edition, String cmk_version) {
+    return "check-mk-${edition}-docker-${cmk_version}.tar.gz";
+}
+
+String select_docker_tag(String build_tag, String branch_name) {
+    // build_tag > branch_name
+    return build_tag ?: "${branch_name}-latest";
+}
+
+String print_image_tag() {
+    sh("cat /version.txt");
+}
+
+void patch_folders(String edition) {
+    REPO_PATCH_RULES[edition]["paths_to_be_removed"].each { folder ->
+        sh("find -name ${folder} -exec rm -rf {} ';' || true");
+    }
+
+    REPO_PATCH_RULES[edition]["folders_to_be_created"].each { folder ->
+        sh("mkdir -p ${folder}");
+    }
+}
+
+void set_version(String cmk_version) {
+    sh("make NEW_VERSION=${cmk_version} setversion");
+}
+
+void configure_checkout_folder(String edition, String cmk_version) {
+    assert edition in REPO_PATCH_RULES: "edition=${edition} not known";
+    patch_folders(edition);
+    set_version(cmk_version);
+}
+
+void delete_non_cre_files() {
+    find_pattern = REPO_PATCH_RULES["community"]["paths_to_be_removed"].collect({ p -> "-name ${p}"}).join(" -or ");
+    // Do not remove files in .git, .venv, .mypy_cache directories
+    sh("""
+        bash -c \"find . \\
+        -not \\( -path ./.\\* -prune \\) \\
+        \\( ${find_pattern} \\) -prune -print -exec rm -r {} \\;\"
+    """);
+}
+
+String strip_rc_number_from_version(String version) {
+    return version.split("-rc")[0];
+}
+
+boolean is_official_release(String version) {
+    // groovylint-disable IfStatementCouldBeTernary
+    if (strip_rc_number_from_version(version) ==~ /((\d+.\d+.\d+)(([pib])(\d+))?)/) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+return this;

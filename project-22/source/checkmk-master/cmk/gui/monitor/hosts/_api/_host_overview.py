@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from typing import Annotated, Self
+
+from cmk.ccc.site import SiteId
+from cmk.gui import sites
+from cmk.gui.openapi.framework import (
+    ApiContext,
+    APIVersion,
+    EndpointBehavior,
+    EndpointDoc,
+    EndpointHandler,
+    EndpointMetadata,
+    EndpointPermissions,
+    PathParam,
+    QueryParam,
+    VersionedEndpoint,
+)
+from cmk.gui.openapi.framework.model import api_field, api_model
+from cmk.gui.openapi.framework.model.common_fields import AnnotatedHostName
+from cmk.gui.openapi.framework.model.converter import SiteIdConverter, TypedPlainValidator
+from cmk.gui.openapi.utils import ProblemException
+from cmk.gui.utils.host_relation_kinds import RELATION_KINDS
+from cmk.gui.utils.host_relations import RelationDirection
+from cmk.web.utils import permission_verification as permissions
+
+from .._customer import customer_resolver
+from .._exceptions import HostNotFoundError
+from .._folder import monitor_folders
+from .._impl import LiveStatusHostRepository
+from .._models import (
+    Host,
+    HostLabelValue,
+    HostStateLabel,
+    MAX_RESOLVED_RELATIONS,
+    RelatedHost,
+    RelatedHostHealth,
+    ServiceCounts,
+    UnixTimestamp,
+)
+from .._repositories import HostRepository
+from ._family import MONITOR_HOSTS_FAMILY
+from ._modes import build_host_modes, ModeInfo
+from ._urls import host_view_link
+
+
+@api_model
+class RelatedHostHealthInfo:
+    """What the monitoring knows about a related host."""
+
+    state: HostStateLabel = api_field(description="State of the related host", example="UP")
+    service_counts: ServiceCounts = api_field(
+        description="Service counts of the related host",
+        example=ServiceCounts(total=48, ok=42, warn=3, crit=1, unknown=0, pending=2),
+    )
+
+    @classmethod
+    def from_domain(cls, health: RelatedHostHealth) -> Self:
+        return cls(
+            state=health.state_label,
+            service_counts=health.service_counts,
+        )
+
+
+@api_model
+class RelatedHostInfo:
+    """A host the shown host is related to, with everything its card renders."""
+
+    host_name: str = api_field(description="Name of the related host", example="mgmt-web-server-01")
+    kind: str = api_field(
+        description="Id of the kind of relation the two hosts have.",
+        example="management",
+    )
+    direction: RelationDirection = api_field(
+        description=(
+            "The end of the relation the related host sits at, seen from the shown host. Kept "
+            "next to the translated label so a client can tell two relations apart without "
+            "reading words."
+        ),
+        example="parent",
+    )
+    relation_type: str = api_field(
+        description=(
+            "What the related host is to the shown host, in the user's language - its management "
+            "board, for instance, or one of its OS hosts."
+        ),
+        example="Management board",
+    )
+    site_id: str = api_field(
+        description="Site the related host is monitored on", example="remote-1"
+    )
+    health: RelatedHostHealthInfo | None = api_field(
+        description=(
+            "State, service counts and last check of the related host. Null when its site is "
+            "not available, i.e. nothing about the host could be read - which is not the same as "
+            "the host being gone, and is why it is still listed."
+        ),
+        example=None,
+    )
+
+    @classmethod
+    def from_domain(cls, related: RelatedHost) -> Self:
+        return cls(
+            host_name=related.name,
+            kind=related.kind,
+            direction=related.direction,
+            # A KeyError is impossible: a relation of a kind this version does not know never
+            # reaches the domain (see cmk.gui.monitor.hosts._impl).
+            relation_type=str(RELATION_KINDS[related.kind].end(related.direction).noun),
+            site_id=related.site_id,
+            health=(
+                None
+                if related.health is None
+                else RelatedHostHealthInfo.from_domain(related.health)
+            ),
+        )
+
+
+@api_model
+class HostOverviewResponse:
+    name: str = api_field(description="Host name", example="web-server-01")
+    state: HostStateLabel = api_field(
+        description=(
+            "Host state. 'PENDING' means the host has never been checked, i.e. its state is "
+            "still pending the first check result"
+        ),
+        example="UP",
+    )
+    address: str = api_field(description="Primary IP address", example="10.0.0.1")
+    alias: str = api_field(description="Host alias", example="Web Server")
+    site_id: str = api_field(description="Site ID", example="local")
+    site_alias: str = api_field(description="Site alias", example="Local site")
+    service_counts: ServiceCounts = api_field(
+        description="Service counts",
+        example=ServiceCounts(total=48, ok=42, warn=3, crit=1, unknown=0, pending=2),
+    )
+    modes: list[ModeInfo] = api_field(
+        description=(
+            "Active host modes (e.g. scheduled downtime, acknowledgement) rendered as linked "
+            "icons. Empty when the host is in none of these modes."
+        ),
+        example=[],
+    )
+    last_check: UnixTimestamp = api_field(
+        description="Unix timestamp of the host's last check",
+        example=1752405510,
+    )
+    last_state_change: UnixTimestamp = api_field(
+        description="Unix timestamp of the host's last state change",
+        example=1752405540,
+    )
+    customer: str | None = api_field(
+        description=(
+            "Name of the customer the host belongs to, which is the customer of the site "
+            "monitoring it. Null on editions without multi-tenancy support, which assign no "
+            "customers."
+        ),
+        example="Customer A",
+    )
+    folder: str | None = api_field(
+        description=(
+            "The title Setup gives the folder the host is configured in: the titles down to it, "
+            "'Main' for the root folder. Empty when Setup knows no such folder, e.g. the host "
+            "isn't managed via Setup or a remote site owns it."
+        ),
+        example="Data center Munich / Rack 1",
+    )
+    contact_groups: list[str] = api_field(
+        description="Contact groups assigned to the host",
+        example=["all"],
+    )
+    tags: dict[str, str] = api_field(
+        description="Host tags",
+        example={"criticality": "prod"},
+    )
+    labels: dict[str, HostLabelValue] = api_field(
+        description="Host labels",
+        example={"cmk/os_family": HostLabelValue(value="linux", source="discovered")},
+    )
+    legacy_host_status_link: str = api_field(
+        description="URL to legacy host status view",
+        example="view.py?view_name=hoststatus&host=web-server-01&site=local",
+    )
+    relations: list[RelatedHostInfo] = api_field(
+        description=(
+            "The hosts this host is related to via the Setup 'Relations' feature, in the order "
+            "they were resolved. Empty when the host has no relations, or when the user may see "
+            f"none of the related hosts. At most {MAX_RESOLVED_RELATIONS} of them are listed, "
+            "see 'more_relations'."
+        ),
+        example=[],
+    )
+    more_relations: bool = api_field(
+        description=(
+            f"Whether the host has more relations than the {MAX_RESOLVED_RELATIONS} listed "
+            "above. A host reaching that many is related to far more hosts than the details are "
+            "meant to show, so they are cut rather than read and sent in full."
+        ),
+        example=False,
+    )
+
+    @classmethod
+    def from_domain(cls, host: Host, *, site_alias: str, customer: str | None) -> Self:
+        def read[T](value: T | None, name: str) -> T:
+            """The overview reads every column, so a missing one is a bug, not an omission."""
+            if value is None:
+                raise ValueError(f"host overview is missing {name!r}")
+            return value
+
+        return cls(
+            name=host.name,
+            state=host.state_label,
+            address=read(host.address, "address"),
+            alias=read(host.alias, "alias"),
+            site_id=host.site_id,
+            site_alias=site_alias,
+            service_counts=read(host.service_counts, "service_counts"),
+            modes=build_host_modes(host),
+            last_check=read(host.last_check, "last_check"),
+            last_state_change=read(host.last_state_change, "last_state_change"),
+            customer=customer,
+            folder=read(host.folder, "folder"),
+            contact_groups=read(host.contact_groups, "contact_groups"),
+            tags=read(host.tags, "tags"),
+            labels=read(host.labels, "labels"),
+            legacy_host_status_link=host_view_link("hoststatus", host),
+            relations=[RelatedHostInfo.from_domain(related) for related in host.relations],
+            more_relations=host.more_relations,
+        )
+
+
+def get_host_overview(
+    hostname: Annotated[
+        AnnotatedHostName,
+        PathParam(description="The host name", example="web-server-01"),
+    ],
+    site_id: Annotated[
+        Annotated[SiteId, TypedPlainValidator(str, SiteIdConverter.should_exist)],
+        QueryParam(description="An existing site id", example="local"),
+    ],
+    api_context: ApiContext,
+) -> HostOverviewResponse:
+    """Show the overview for a single host."""
+    host_repo = LiveStatusHostRepository(connection=sites.live(), folders=monitor_folders)
+    site_alias = api_context.config.sites[site_id]["alias"]
+
+    return _handle_get_host_overview(
+        host_repo,
+        hostname=hostname,
+        site_id=site_id,
+        site_alias=site_alias,
+        customer=customer_resolver(sites=api_context.config.sites)(site_id),
+    )
+
+
+def _handle_get_host_overview(
+    host_repo: HostRepository,
+    *,
+    hostname: str,
+    site_id: str,
+    site_alias: str,
+    customer: str | None = None,
+) -> HostOverviewResponse:
+    try:
+        host = host_repo.get_overview(hostname=hostname, site_id=site_id)
+    except HostNotFoundError:
+        raise ProblemException(
+            status=404,
+            title="The requested host was not found",
+            detail=f"The host {hostname!r} was not found on site {site_id!r}",
+        ) from None
+
+    return HostOverviewResponse.from_domain(host, site_alias=site_alias, customer=customer)
+
+
+ENDPOINT_GET_HOST_OVERVIEW = VersionedEndpoint(
+    metadata=EndpointMetadata(
+        path="/monitor/hosts/{hostname}",
+        link_relation="cmk/show",
+        method="get",
+    ),
+    permissions=EndpointPermissions(
+        # Declared for the permission tracker: inspected via user.may() during the request, but
+        # none is required.
+        required=permissions.Undocumented(
+            permissions.AnyPerm(
+                [
+                    permissions.OkayToIgnorePerm("general.see_all"),
+                    permissions.OkayToIgnorePerm("bi.see_all"),
+                    permissions.OkayToIgnorePerm("mkeventd.seeall"),
+                    # Read while titling a folder, on an installation that keeps the folders a
+                    # user may not read out of sight.
+                    permissions.OkayToIgnorePerm("wato.see_all_folders"),
+                    permissions.OkayToIgnorePerm("view.allhosts"),
+                ]
+            )
+        )
+    ),
+    doc=EndpointDoc(family=MONITOR_HOSTS_FAMILY.name),
+    behavior=EndpointBehavior(skip_locking=True),
+    versions={APIVersion.INTERNAL: EndpointHandler(handler=get_host_overview)},
+)

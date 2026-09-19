@@ -1,0 +1,15 @@
+load("//bazel/rules:py_cmk_test.bzl", "py_cmk_test")
+
+py_cmk_test(
+    name = "agents",
+    size = "small",
+    srcs = [
+        "test_nginx_status.py",
+    ],
+    tags = ["legacy-python"],
+    use_project_pytest_config = True,
+    visibility = ["//visibility:private"],
+    deps = [
+        "//cmk/plugins/nginx/agents",
+    ],
+)

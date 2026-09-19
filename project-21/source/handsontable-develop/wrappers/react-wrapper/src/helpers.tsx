@@ -1,0 +1,390 @@
+import React, {
+  ComponentType,
+  CSSProperties,
+  DependencyList,
+  EffectCallback,
+  ReactNode,
+  ReactPortal,
+  useEffect,
+} from 'react';
+import ReactDOM from 'react-dom';
+import Handsontable from 'handsontable/base';
+import { HotTableProps } from './types';
+
+let bulkComponentContainer: DocumentFragment | null = null;
+
+/**
+ * Warning message for the `autoRowSize`/`autoColumnSize` compatibility check.
+ */
+export const AUTOSIZE_WARNING = 'Your `HotTable` configuration includes `autoRowSize`/`autoColumnSize` options, which are not compatible with ' +
+  ' the component-based renderers`. Disable `autoRowSize` and `autoColumnSize` to prevent row and column misalignment.';
+
+/**
+ * Warning message for the `hot-renderer` obsolete renderer passing method.
+ */
+export const OBSOLETE_HOTRENDERER_WARNING = 'Providing a component-based renderer using `hot-renderer`-annotated component is no longer supported. ' +
+  'Pass your component using `renderer` prop of the `HotTable` or `HotColumn` component instead.';
+
+/**
+ * Warning message for the `hot-editor` obsolete editor passing method.
+ */
+export const OBSOLETE_HOTEDITOR_WARNING = 'Providing a component-based editor using `hot-editor`-annotated component is no longer supported. ' +
+  'Pass your component using `editor` prop of the `HotTable` or `HotColumn` component instead.';
+
+/**
+ * Warning message for the unexpected children of HotTable component.
+ */
+export const UNEXPECTED_HOTTABLE_CHILDREN_WARNING = 'Unexpected children nodes found in HotTable component. ' +
+    'Only HotColumn components are allowed.';
+
+/**
+ * Warning message for the unexpected children of HotColumn component.
+ */
+export const UNEXPECTED_HOTCOLUMN_CHILDREN_WARNING = 'Unexpected children nodes found in HotColumn component. ' +
+    'HotColumn components do not support any children.';
+
+/**
+ * Message for the warning thrown if the Handsontable instance has been destroyed.
+ */
+export const HOT_DESTROYED_WARNING = 'The Handsontable instance bound to this component was destroyed and cannot be' +
+  ' used properly.';
+
+/**
+ * Default classname given to the wrapper container.
+ */
+export const DEFAULT_CLASSNAME = 'hot-wrapper-editor-container';
+
+/**
+ * Classname for the stable host that holds React editor portals.
+ * Distinct from `DEFAULT_CLASSNAME` so page CSS and `querySelector` do not hit both nodes.
+ */
+export const EDITOR_PORTAL_HOST_CLASSNAME = 'hot-wrapper-editor-portal-host';
+
+/**
+ * Warning when the editor portal host cannot be moved into `rootPortalElement`.
+ */
+export const MISSING_ROOT_PORTAL_WARNING = 'The React editor portal host could not be attached to `rootPortalElement`. The editor stays on `document.body` and clicks on it may fail to commit.';
+
+/**
+ * Logs warn to the console if the `console` object is exposed.
+ *
+ * @param {...*} args Values which will be logged.
+ */
+export function warn(...args: any[]) {
+  if (typeof console !== 'undefined') {
+    console.warn(...args);
+  }
+}
+
+/**
+ * Detect if `hot-renderer` or `hot-editor` is defined, and if so, throw an incompatibility warning.
+ *
+ * @returns {boolean} 'true' if the warning was issued
+ */
+export function displayObsoleteRenderersEditorsWarning(children: ReactNode): boolean {
+  if (hasChildElementOfType(children, 'hot-renderer')) {
+    warn(OBSOLETE_HOTRENDERER_WARNING);
+    return true;
+  }
+  if (hasChildElementOfType(children, 'hot-editor')) {
+    warn(OBSOLETE_HOTEDITOR_WARNING);
+    return true;
+  }
+
+  return false
+}
+
+/**
+ * Detect if children of specified type are defined, and if so, throw an incompatibility warning.
+ *
+ * @param {ReactNode} children Component children nodes
+ * @param {ComponentType} Component Component type to check
+ * @returns {boolean} 'true' if the warning was issued
+ */
+export function displayChildrenOfTypeWarning(children: ReactNode, Component: ComponentType): boolean {
+  const childrenArray: ReactNode[] = React.Children.toArray(children);
+
+  if (childrenArray.some((child) => (child as React.ReactElement).type !== Component)) {
+    warn(UNEXPECTED_HOTTABLE_CHILDREN_WARNING);
+    return true;
+  }
+
+  return false
+}
+
+/**
+ * Detect if children is defined, and if so, throw an incompatibility warning.
+ *
+ * @param {ReactNode} children Component children nodes
+ * @returns {boolean} 'true' if the warning was issued
+ */
+export function displayAnyChildrenWarning(children: ReactNode): boolean {
+  const childrenArray: ReactNode[] = React.Children.toArray(children);
+
+  if (childrenArray.length) {
+    warn(UNEXPECTED_HOTCOLUMN_CHILDREN_WARNING);
+    return true;
+  }
+
+  return false
+}
+
+/**
+ * Check the existence of elements of the provided `type` from the `HotColumn` component's children.
+ *
+ * @param {ReactNode} children HotTable children array.
+ * @param {String} type Either `'hot-renderer'` or `'hot-editor'`.
+ * @returns {boolean} `true` if the child of that type was found, `false` otherwise.
+ */
+function hasChildElementOfType(children: ReactNode, type: 'hot-renderer' | 'hot-editor'): boolean {
+  const childrenArray: ReactNode[] = React.Children.toArray(children);
+
+  return childrenArray.some((child) => {
+      return (child as React.ReactElement).props[type] !== void 0;
+  });
+}
+
+/**
+ * Check whether the `editor` prop holds a component editor, as opposed to a boolean flag.
+ *
+ * Both editor props accept a boolean, so a truthy check alone is not enough to tell a component
+ * apart from a bare `editor={true}`.
+ *
+ * @param {HotTableProps['editor']} editor The `editor` prop.
+ * @returns {boolean} `true` when the prop carries a component to render.
+ */
+export function isComponentEditor(editor: HotTableProps['editor']): boolean {
+  return !!editor && typeof editor !== 'boolean';
+}
+
+/**
+ * Resolve the Handsontable `editor` setting from the two editor props.
+ *
+ * `editor` carries the component editor and `hotEditor` the Handsontable-native one, but both accept
+ * a boolean:
+ *
+ * - `false` disables editing.
+ * - `true` names no editor, so it is treated as if the prop were not provided. It must never reach
+ *   the core, which accepts only a string or a constructor and throws on anything else.
+ * - Any other nullish or falsy value (`null`, `0`, `''`) is also treated as "not provided", so a
+ *   column written as `editor={cond ? MyEditor : null}` inherits instead of locking.
+ *
+ * `hotEditor` is resolved before a falsy `editor`, so an editor named there still wins over a bare
+ * `editor={false}` — the behavior in every released version, where `editor={false}` fell through to
+ * the `hotEditor` value. A component `editor` outranks both: it is picked by `isComponentEditor()`
+ * before this function is reached, so `editor={MyComponent} hotEditor={false}` keeps the component.
+ *
+ * @param {HotTableProps['editor']} editor The `editor` prop.
+ * @param {HotTableProps['hotEditor']} hotEditor The `hotEditor` prop.
+ * @returns {*} The editor setting, or `undefined` when neither prop names one.
+ */
+export function resolveEditorSetting(
+  editor: HotTableProps['editor'],
+  hotEditor: HotTableProps['hotEditor']
+): Handsontable.GridSettings['editor'] | undefined {
+  if (hotEditor === false) {
+    return false;
+  }
+
+  // `true` names no editor, so it must fall through to "not provided" rather than hard-setting the
+  // default one — otherwise it would override the editor a column's `type` or the grid supplies.
+  if (hotEditor && hotEditor !== true) {
+    return hotEditor as Handsontable.GridSettings['editor'];
+  }
+
+  return editor === false ? false : undefined;
+}
+
+/**
+ * Create an editor portal.
+ *
+ * @param {Document} doc Document to be used.
+ * @param {ComponentType} Editor Editor component or render function.
+ * @param {HTMLElement} portalHost Host element to portal into. Required – do not fall back to `doc.body`.
+ * @returns {ReactPortal} The portal for the editor.
+ */
+export function createEditorPortal(
+  doc: Document | null,
+  Editor: HotTableProps['editor'] | undefined | boolean,
+  portalHost?: HTMLElement | null
+): ReactPortal | null {
+  if (!doc || !Editor || typeof Editor === 'boolean' || !portalHost) {
+    return null;
+  }
+
+  const editorElement = <Editor />;
+  const containerProps = getContainerAttributesProps({}, false);
+
+  containerProps.className = `${DEFAULT_CLASSNAME} ${containerProps.className}`;
+
+  return ReactDOM.createPortal(
+    <div {...containerProps}>
+      {editorElement}
+    </div>
+    , portalHost);
+}
+
+/**
+ * Render a cell component to an external DOM node.
+ *
+ * @param {React.ReactElement} rElement React element to be used as a base for the component.
+ * @param {Document} [ownerDocument] The owner document to set the portal up into.
+ * @param {String} portalKey The key to be used for the portal.
+ * @param {HTMLElement} [cachedContainer] The cached container to be used for the portal.
+ * @returns {{portal: ReactPortal, portalContainer: HTMLElement}} An object containing the portal and its container.
+ */
+export function createPortal(rElement: React.ReactElement, ownerDocument: Document | null = document, portalKey: string, cachedContainer?: HTMLElement): {
+  portal: ReactPortal,
+  portalContainer: HTMLElement,
+} {
+  if (!ownerDocument) {
+    ownerDocument = document;
+  }
+
+  let portalContainer = cachedContainer;
+
+  // A new container needs an anchor before React mounts into it. A cached
+  // container is already attached (typically inside its TD) and must be
+  // left in place to avoid wiping the DOM on every grid render.
+  if (!portalContainer) {
+    if (!bulkComponentContainer) {
+      bulkComponentContainer = ownerDocument.createDocumentFragment();
+    }
+    portalContainer = ownerDocument.createElement('DIV');
+    bulkComponentContainer.appendChild(portalContainer);
+  }
+
+  return {
+    portal: ReactDOM.createPortal(rElement, portalContainer, portalKey),
+    portalContainer,
+  };
+}
+
+/**
+ * Get an object containing the `id`, `className` and `style` keys, representing the corresponding props passed to the
+ * component.
+ *
+ * @param {HotTableProps} props Object containing the React element props.
+ * @param {Boolean} randomizeId If set to `true`, the function will randomize the `id` property when no `id` was present in the `prop` object.
+ * @returns An object containing the `id`, `className` and `style` keys, representing the corresponding props passed to the
+ * component.
+ */
+export function getContainerAttributesProps(props: HotTableProps, randomizeId: boolean = true): {id?: string, className: string, style: CSSProperties} {
+  return {
+    id: props.id || (randomizeId ? 'hot-' + Math.random().toString(36).substring(5) : undefined),
+    className: props.className || '',
+    style: props.style || {},
+  };
+}
+
+/**
+ * Checks if the environment that the code runs in is a browser.
+ *
+ * @returns {boolean}
+ */
+export function isCSR(): boolean {
+  return typeof window !== 'undefined';
+}
+
+function isObjectLike(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (!isObjectLike(value)) {
+    return false;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+
+  return prototype === Object.prototype || prototype === null;
+}
+
+function isArray(value: unknown): value is unknown[] {
+  return Array.isArray(value);
+}
+
+/**
+ * Deep-compare plain objects and arrays used by wrapper settings.
+ *
+ * @param {unknown} previousValue Previous value.
+ * @param {unknown} currentValue Current value.
+ * @returns {boolean} `true` if values are equivalent.
+ */
+export function areEquivalentSettingsValue(previousValue: unknown, currentValue: unknown): boolean {
+  if (previousValue === currentValue) {
+    return true;
+  }
+
+  if (previousValue instanceof RegExp || currentValue instanceof RegExp) {
+    if (!(previousValue instanceof RegExp) || !(currentValue instanceof RegExp)) {
+      return false;
+    }
+
+    return previousValue.source === currentValue.source &&
+      previousValue.flags === currentValue.flags;
+  }
+
+  if (isArray(previousValue) && isArray(currentValue)) {
+    if (previousValue.length !== currentValue.length) {
+      return false;
+    }
+
+    for (let index = 0; index < previousValue.length; index++) {
+      if (!areEquivalentSettingsValue(previousValue[index], currentValue[index])) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  if (isArray(previousValue) || isArray(currentValue)) {
+    return false;
+  }
+
+  if (!isObjectLike(previousValue) || !isObjectLike(currentValue)) {
+    return false;
+  }
+
+  if (!isPlainObject(previousValue) || !isPlainObject(currentValue)) {
+    return false;
+  }
+
+  const previousKeys = Object.keys(previousValue);
+  const currentKeys = Object.keys(currentValue);
+
+  if (previousKeys.length !== currentKeys.length) {
+    return false;
+  }
+
+  for (const key of previousKeys) {
+    if (!Object.prototype.hasOwnProperty.call(currentValue, key)) {
+      return false;
+    }
+
+    if (!areEquivalentSettingsValue(previousValue[key], currentValue[key])) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * A variant of useEffect hook that does not trigger on initial mount, only updates
+ *
+ * @param effect Effect function
+ * @param deps Effect dependencies
+ */
+export function useUpdateEffect(effect: EffectCallback, deps?: DependencyList): void {
+  const notInitialRender = React.useRef(false);
+
+  useEffect(() => {
+    if (notInitialRender.current) {
+      return effect();
+    } else {
+      notInitialRender.current = true;
+    }
+  }, deps);
+}

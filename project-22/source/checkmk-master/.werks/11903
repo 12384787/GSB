@@ -1,0 +1,11 @@
+Title: Fix crash in hearbeat CRM general
+Class: fix
+Compatible: compat
+Component: checks
+Date: 1612172375
+Edition: cre
+Knowledge: doc
+Level: 1
+Version: 2.1.0b1
+
+Fix cases where the Heartbeat CRM would crash with a TypeError.

@@ -1,0 +1,13 @@
+title: Hyper-V VMs: Age of oldest Checkpoint
+agents: windows
+catalog: os/services
+license: GPLv2
+distribution: check_mk
+description:
+ This plug-in queries a Microsoft Hyper-V server via an agent plug-in (hyperv_vms_guestinfos.ps1).
+ It creates services on the VMs (using the piggyback mechanism).
+ It shows the number of Checkpoints (Snapshots) and monitors their age.
+ Leves for {WARN} and {CRIT} can be set using the ruleset "Virtual Machine Snapshots".
+
+discovery:
+ One service is created for each system.

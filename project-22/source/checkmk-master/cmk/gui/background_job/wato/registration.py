@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from datetime import timedelta
+
+from cmk.ccc.version import Edition
+from cmk.gui.background_job.job._manager import execute_housekeeping_job
+from cmk.gui.config import Config
+from cmk.gui.cron import CronJob, CronJobRegistry
+from cmk.gui.pages import PageRegistry
+from cmk.gui.permissions import PermissionRegistry, PermissionSectionRegistry
+from cmk.gui.watolib.automation_commands import AutomationCommandRegistry
+from cmk.gui.watolib.main_menu import MainModuleRegistry
+from cmk.gui.watolib.mode import ModeRegistry
+
+from . import _modes
+from ._automation import AutomationBackgroundJobSnapshot
+from ._job_ui import register as _register_job_ui
+
+
+def register(
+    edition: Edition,
+    automation_command_registry: AutomationCommandRegistry,
+    page_registry: PageRegistry,
+    mode_registry: ModeRegistry,
+    main_module_registry: MainModuleRegistry,
+    cron_job_registry: CronJobRegistry,
+    permission_section_registry: PermissionSectionRegistry,
+    permission_registry: PermissionRegistry,
+) -> None:
+    automation_command_registry.register(AutomationBackgroundJobSnapshot)
+    cron_job_registry.register(
+        CronJob[Config](
+            name="execute_housekeeping_job",
+            callable=execute_housekeeping_job,
+            interval=timedelta(minutes=1),
+        )
+    )
+    _modes.register(edition, page_registry, mode_registry, main_module_registry)
+    _register_job_ui(permission_section_registry, permission_registry)

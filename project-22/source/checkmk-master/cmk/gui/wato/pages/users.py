@@ -1,0 +1,1783 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+"""Modes for managing users and contacts"""
+
+import base64
+import time
+import traceback
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
+from typing import cast, Literal, NamedTuple, overload, override, TypedDict
+
+from cmk.ccc.site import omd_site, SiteId
+from cmk.ccc.user import UserId
+from cmk.ccc.version import Edition
+from cmk.crypto.password import Password, PasswordPolicy
+from cmk.events.notify_types import EventRule
+from cmk.gui import forms, userdb
+from cmk.gui.background_job import job as background_job
+from cmk.gui.background_job.job import JobTarget
+from cmk.gui.background_job.wato import ActionHandler, GUIBackgroundJobManager
+from cmk.gui.breadcrumb import Breadcrumb, BreadcrumbItem
+from cmk.gui.config import active_config, Config
+from cmk.gui.customer import ABCCustomerAPI, customer_api
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.htmllib.generator import HTMLWriter
+from cmk.gui.htmllib.html import html
+from cmk.gui.http import request
+from cmk.gui.i18n import _, _u, get_language_alias, get_languages, ungettext
+from cmk.gui.ldap_integration.ldap_connector import LDAPUserConnector
+from cmk.gui.log import logger
+from cmk.gui.logged_in import user
+from cmk.gui.ntop import ntop_connection
+from cmk.gui.page_menu import (
+    make_checkbox_selection_topic,
+    make_confirmed_form_submit_link,
+    make_simple_form_page_menu,
+    make_simple_link,
+    PageMenu,
+    PageMenuDropdown,
+    PageMenuEntry,
+    PageMenuSearch,
+    PageMenuTopic,
+)
+from cmk.gui.pages import PageContext
+from cmk.gui.permissions import permission_registry
+from cmk.gui.table import show_row_count, table_element
+from cmk.gui.type_defs import ActionResult, CustomUserAttrSpec, UserSpec
+from cmk.gui.user_connection_config_types import UserConnectionConfig
+from cmk.gui.user_sites import activation_sites, get_configured_site_choices
+from cmk.gui.userdb import (
+    active_connections,
+    ConnectorType,
+    get_connection,
+    get_user_attributes,
+    get_user_attributes_by_topic,
+    load_roles,
+    new_user_template,
+    UserAttribute,
+    UserConnector,
+)
+from cmk.gui.userdb.htpasswd import hash_password
+from cmk.gui.userdb.user_sync_job import sync_entry_point, UserSyncArgs, UserSyncBackgroundJob
+from cmk.gui.utils.csrf_token import check_csrf_token
+from cmk.gui.utils.roles import UserPermissions, UserPermissionSerializableConfig
+from cmk.gui.utils.selection_id import SelectionId
+from cmk.gui.utils.transaction_manager import transactions
+from cmk.gui.valuespec import (
+    Alternative,
+    DualListChoice,
+    EmailAddress,
+    FixedValue,
+    TextInput,
+    UserID,
+)
+from cmk.gui.watolib.audit_log import make_audit_log_change_hook
+from cmk.gui.watolib.audit_log_url import make_object_audit_log_url
+from cmk.gui.watolib.config_sync import get_site_globals
+from cmk.gui.watolib.groups_io import load_contact_group_information
+from cmk.gui.watolib.hosts_and_folders import folder_preserving_link, make_action_link
+from cmk.gui.watolib.mode import mode_registry, mode_url, ModeRegistry, redirect, WatoMode
+from cmk.gui.watolib.pending_changes import (
+    index_update_change_hook,
+    PendingChanges,
+    PendingChangesStore,
+)
+from cmk.gui.watolib.sidebar_reload import sidebar_reload_change_hook
+from cmk.gui.watolib.sites import ldap_connections_are_configurable
+from cmk.gui.watolib.timeperiods import load_timeperiods
+from cmk.gui.watolib.user_scripts import load_notification_scripts
+from cmk.gui.watolib.users import (
+    create_user,
+    delete_users,
+    edit_user,
+    get_vs_user_idle_timeout,
+    make_user_object_ref,
+    user_features_registry,
+    verify_password_policy,
+)
+from cmk.livestatus_client import SiteConfigurations
+from cmk.utils import paths, render
+from cmk.web.utils.choices import Choices
+from cmk.web.utils.confirm_links import make_confirm_delete_link
+from cmk.web.utils.doc_references import DocReference
+from cmk.web.utils.flashed_messages import flash, get_flashed_messages
+from cmk.web.utils.html import HTML
+from cmk.web.utils.icons import IconNames, StaticIcon
+from cmk.web.utils.permission_verification import PermissionName
+from cmk.web.utils.urls import makeactionuri, makeuri, makeuri_contextless
+
+from ._user_security_message import (
+    SecurityNotificationEvent,
+    send_security_message,
+)
+
+
+def _iter_ntop_connections(sites: SiteConfigurations) -> Iterator[dict]:
+    seen = {
+        site_id: get_site_globals(site_id, site_config).get("ntop_connection", {})
+        for site_id, site_config in sites.items()
+    } | {omd_site(): ntop_connection().get_connection()}
+    for conn in seen.values():
+        if conn:
+            yield conn
+
+
+def register(_mode_registry: ModeRegistry) -> None:
+    _mode_registry.register(ModeUsers)
+    _mode_registry.register(ModeEditUser)
+
+
+def has_customer(
+    edition: Edition,
+    user_cxn: UserConnector | None,
+    cust_api: ABCCustomerAPI,
+    user_spec: UserSpec,
+) -> str | None:
+    if edition is not Edition.ULTIMATEMT:
+        return None
+
+    if isinstance(user_cxn, LDAPUserConnector) and user_cxn.customer_id is not None:
+        return cust_api.get_customer_name_by_id(user_cxn.customer_id)
+    return cust_api.get_customer_name(user_spec)
+
+
+class ModeUsers(WatoMode):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "users"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["users"]
+
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx)
+        self._job = UserSyncBackgroundJob()
+        self._job_snapshot = UserSyncBackgroundJob().get_status_snapshot()
+        self._can_create_and_delete_users = edition != Edition.CLOUD
+
+    @override
+    def title(self) -> str:
+        return _("Users")
+
+    @override
+    def _topic_breadcrumb_item(self) -> Iterable[BreadcrumbItem]:
+        # Since we are in the users mode, we don't need to add the
+        # "Users" topic to the breadcrumb. Else we get "Users > Users"
+        return ()
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        topics = (
+            [
+                PageMenuTopic(
+                    title=_("Add user"),
+                    entries=[
+                        PageMenuEntry(
+                            title=_("Add user"),
+                            icon_name=StaticIcon(IconNames.new),
+                            item=make_simple_link(
+                                folder_preserving_link(request, [("mode", "edit_user")])
+                            ),
+                            is_shortcut=True,
+                            is_suggested=True,
+                        ),
+                    ],
+                )
+            ]
+            if self._can_create_and_delete_users
+            else []
+        )
+
+        topics += [
+            PageMenuTopic(
+                title=_("On selected users"),
+                entries=list(self._page_menu_entries_on_selected_users(config.user_connections)),
+            ),
+            PageMenuTopic(
+                title=_("Synchronized users"),
+                entries=list(self._page_menu_entries_synchronized_users(config.user_connections)),
+            ),
+            PageMenuTopic(
+                title=_("User messages"),
+                entries=list(self._page_menu_entries_user_messages()),
+            ),
+            make_checkbox_selection_topic(self.name()),
+        ]
+        menu = PageMenu(
+            dropdowns=[
+                PageMenuDropdown(
+                    name="users",
+                    title=_("Users"),
+                    topics=topics,
+                ),
+                PageMenuDropdown(
+                    name="related",
+                    title=_("Related"),
+                    topics=[
+                        PageMenuTopic(
+                            title=_("Setup"),
+                            entries=list(self._page_menu_entries_related()),
+                        ),
+                    ],
+                ),
+            ],
+            breadcrumb=breadcrumb,
+            inpage_search=PageMenuSearch(),
+        )
+        menu.add_doc_reference(_("Users, roles and permissions"), DocReference.WATO_USER)
+        return menu
+
+    def _page_menu_entries_on_selected_users(
+        self, user_connections: Sequence[UserConnectionConfig]
+    ) -> Iterator[PageMenuEntry]:
+        if self._can_create_and_delete_users:
+            yield PageMenuEntry(
+                title=_("Delete users"),
+                shortcut_title=_("Delete selected users"),
+                icon_name=StaticIcon(IconNames.delete),
+                item=make_confirmed_form_submit_link(
+                    form_name="bulk_delete_form",
+                    button_name="_bulk_delete_users",
+                    title=_("Delete selected users"),
+                ),
+                is_shortcut=True,
+                is_suggested=True,
+            )
+
+        if user.may("wato.user_migrate") and self._can_create_and_delete_users:
+            yield PageMenuEntry(
+                title=_("Migrate users"),
+                shortcut_title=_("Migrate selected users"),
+                icon_name=StaticIcon(IconNames.migrate_users),
+                item=make_simple_link(
+                    makeuri_contextless(
+                        request,
+                        [
+                            ("selection", SelectionId.from_request(request)),
+                            ("mode", "user_migrate"),
+                        ],
+                    )
+                ),
+                is_shortcut=True,
+                is_suggested=True,
+                is_enabled=len(active_connections(user_connections)) > 1,
+                disabled_tooltip=_("There is only one active user connector available"),
+            )
+
+    def _page_menu_entries_synchronized_users(
+        self, user_connections: Sequence[UserConnectionConfig]
+    ) -> Iterator[PageMenuEntry]:
+        if _sync_possible(user_connections) and not self._job_snapshot.is_active:
+            yield PageMenuEntry(
+                title=_("Synchronize users"),
+                icon_name=StaticIcon(IconNames.replicate),
+                item=make_simple_link(makeactionuri(request, transactions.get(), [("_sync", 1)])),
+            )
+
+            yield PageMenuEntry(
+                title=_("Last synchronization result"),
+                icon_name=StaticIcon(IconNames.background_job_details),
+                item=make_simple_link(self._job.detail_url()),
+            )
+
+    def _page_menu_entries_user_messages(self) -> Iterator[PageMenuEntry]:
+        if user.may("general.message"):
+            yield PageMenuEntry(
+                title=_("Send user messages"),
+                icon_name=StaticIcon(IconNames.message),
+                item=make_simple_link("message.py"),
+            )
+
+    def _page_menu_entries_related(self) -> Iterator[PageMenuEntry]:
+        if user.may("wato.custom_attributes"):
+            yield PageMenuEntry(
+                title=_("Custom attributes"),
+                icon_name=StaticIcon(IconNames.custom_attr),
+                item=make_simple_link(folder_preserving_link(request, [("mode", "user_attrs")])),
+            )
+
+        if ldap_connections_are_configurable():
+            yield PageMenuEntry(
+                title=_("LDAP & Active Directory"),
+                icon_name=StaticIcon(IconNames.ldap),
+                item=make_simple_link(folder_preserving_link(request, [("mode", "ldap_config")])),
+            )
+
+        # The SAML2 config mode is only registered under commercial (non cloud) editions
+        if mode_registry.get("saml_config") is not None:
+            yield PageMenuEntry(
+                title=_("SAML connections"),
+                icon_name=StaticIcon(IconNames.saml),
+                item=make_simple_link(folder_preserving_link(request, [("mode", "saml_config")])),
+            )
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        check_csrf_token()
+
+        if not transactions.check_transaction(request):
+            return redirect(self.mode_url())
+
+        for message in get_flashed_messages():
+            html.show_message(message.msg)
+
+        if self._can_create_and_delete_users and (
+            delete_user := request.get_validated_type_input(UserId, "_delete")
+        ):
+            deleted_users, users_used_in_notification_rule = delete_users(
+                [delete_user],
+                user_features_registry.features().sites,
+                get_user_attributes(config.wato_user_attrs),
+                config.user_connections,
+                pending_changes=_pending_changes(
+                    config=config, local_site=omd_site(), acting_user=user.id
+                ),
+                use_git=config.wato_use_git,
+                acting_user=user,
+                pprint_value=config.wato_pprint_config,
+            )
+            if users_used_in_notification_rule:
+                self._render_related_rule_warning(users_used_in_notification_rule)
+            if deleted_users:
+                flash(
+                    _("Successfully deleted the following user '%(delete_user)s'")
+                    % {"delete_user": delete_user}
+                )
+            return redirect(self.mode_url())
+
+        if request.var("_sync"):
+            try:
+                job = UserSyncBackgroundJob()
+                if (
+                    result := job.start(
+                        JobTarget(
+                            callable=sync_entry_point,
+                            args=UserSyncArgs(
+                                add_to_changelog=True,
+                                enforce_sync=True,
+                                custom_user_attributes=config.wato_user_attrs,
+                                default_user_profile=config.default_user_profile,
+                                user_permission_config=UserPermissionSerializableConfig.from_global_config(
+                                    config
+                                ),
+                            ),
+                        ),
+                        background_job.InitialStatusArgs(
+                            title=job.gui_title(),
+                            stoppable=False,
+                            user=str(user.id) if user.id else None,
+                        ),
+                    )
+                ).is_error():
+                    raise MKUserError(None, str(result.error))
+
+                self._job_snapshot = job.get_status_snapshot()
+            except MKUserError:
+                raise
+            except Exception:
+                logger.exception("error syncing users")
+                raise MKUserError(None, traceback.format_exc().replace("\n", "<br>\n"))
+            return redirect(self.mode_url())
+
+        if self._can_create_and_delete_users and request.var("_bulk_delete_users"):
+            self._bulk_delete_users_after_confirm(
+                get_user_attributes(config.wato_user_attrs),
+                config.user_connections,
+                pending_changes=_pending_changes(
+                    config=config, local_site=omd_site(), acting_user=user.id
+                ),
+                use_git=config.wato_use_git,
+                pprint_value=config.wato_pprint_config,
+            )
+            return redirect(self.mode_url())
+
+        action_handler = ActionHandler(self.breadcrumb())
+        action_handler.handle_actions()
+        if action_handler.did_acknowledge_job():
+            self._job_snapshot = UserSyncBackgroundJob().get_status_snapshot()
+            flash(_("Synchronization job acknowledged"))
+            return redirect(self.mode_url())
+
+        return None
+
+    def _bulk_delete_users_after_confirm(
+        self,
+        user_attributes: Sequence[tuple[str, UserAttribute]],
+        user_connections: Sequence[UserConnectionConfig],
+        *,
+        pending_changes: PendingChanges,
+        use_git: bool,
+        pprint_value: bool,
+    ) -> None:
+        selected_users = []
+        users = userdb.load_users()
+        for varname, _value in request.itervars(prefix="_c_user_"):
+            if html.get_checkbox(varname):
+                user_id = UserId(
+                    base64.b64decode(varname.split("_c_user_")[-1].encode("utf-8")).decode("utf-8")
+                )
+                if user_id in users:
+                    selected_users.append(user_id)
+
+        if selected_users:
+            deleted_users, users_used_in_notification_rule = delete_users(
+                selected_users,
+                user_features_registry.features().sites,
+                user_attributes,
+                user_connections,
+                pending_changes=pending_changes,
+                use_git=use_git,
+                acting_user=user,
+                pprint_value=pprint_value,
+            )
+
+            if users_used_in_notification_rule:
+                self._render_related_rule_warning(users_used_in_notification_rule)
+
+            if deleted_users:
+                flash(
+                    _("Successfully deleted the following %(label)s: %(users)s")
+                    % {
+                        "label": ungettext("user", "users", len(deleted_users)),
+                        "users": (",").join(deleted_users),
+                    }
+                )
+
+    def _render_related_rule_warning(self, related_rules: dict[UserId, list[EventRule]]) -> None:
+        for user_id, rules in related_rules.items():
+            rule_count = len(rules)
+            rule_singular_plural = ungettext("rule", "rules", rule_count)
+            flash(
+                _(
+                    "The deleted user '%(user_id)s' is used as only specific user by %(rule_count)d notification %(rule_singular_plural)s. Please adjust the affected %(affected_rules)s."
+                )
+                % {
+                    "user_id": user_id,
+                    "rule_count": rule_count,
+                    "rule_singular_plural": rule_singular_plural,
+                    "affected_rules": html.render_a(
+                        _(" notification %(rule_singular_plural)s")
+                        % {"rule_singular_plural": rule_singular_plural},
+                        href=makeuri(
+                            request,
+                            [
+                                ("mode", "notifications"),
+                                ("search", f"\\b(?:users:|{user_id})\\b"),
+                                ("filled_in", "inpage_search_form"),
+                            ],
+                            filename="wato.py",
+                        ),
+                    ),
+                },
+                msg_type="warning",
+            )
+
+    @override
+    def page(self, config: Config) -> None:
+        if not self._job_snapshot.exists:
+            # Skip if snapshot doesnt exists
+            pass
+
+        elif self._job_snapshot.is_active:
+            # Still running
+            html.show_message(
+                _("User synchronization currently running: ") + self._job_details_link()
+            )
+            url = makeuri(request, [])
+            html.immediate_browser_redirect(2, url)
+
+        elif (
+            self._job_snapshot.status.state == background_job.JobStatusStates.FINISHED
+            and not self._job_snapshot.acknowledged_by
+        ):
+            # Just finished, auto-acknowledge
+            UserSyncBackgroundJob().acknowledge(user.id)
+            # html.show_message(_("User synchronization successful"))
+
+        elif not self._job_snapshot.acknowledged_by and self._job_snapshot.has_exception:
+            # Finished, but not OK - show info message with links to details
+            html.show_warning(
+                _("Last user synchronization ran into an exception: ") + self._job_details_link()
+            )
+
+        users = userdb.load_users()
+        with html.form_context("bulk_delete_form", method="POST"):
+            self._show_user_list(
+                users,
+                config.wato_user_attrs,
+                user_online_maxage=config.user_online_maxage,
+                table_row_limit=config.table_row_limit,
+            )
+        self._show_user_list_footer(users)
+
+    def _job_details_link(self) -> HTML:
+        return HTMLWriter.render_a("%s" % self._job.get_title(), href=self._job.detail_url())
+
+    def _job_details_url(self) -> str:
+        return makeuri_contextless(
+            request,
+            [
+                ("mode", "background_job_details"),
+                ("back_url", makeuri_contextless(request, [("mode", "users")])),
+                ("job_id", self._job_snapshot.job_id),
+            ],
+            filename="wato.py",
+        )
+
+    def _show_job_info(self) -> None:
+        if self._job_snapshot.is_active:
+            html.h3(_("Current status of synchronization process"))
+            html.browser_reload = 0.8
+        else:
+            html.h3(_("Result of last synchronization process"))
+
+        job_manager = GUIBackgroundJobManager()
+        job_manager.show_job_details_from_snapshot(job_snapshot=self._job_snapshot)
+        html.br()
+
+    def _show_user_list(
+        self,
+        users: Mapping[UserId, UserSpec],
+        custom_user_attributes: Sequence[CustomUserAttrSpec],
+        *,
+        user_online_maxage: int,
+        table_row_limit: int,
+    ) -> None:
+        user_attributes = get_user_attributes(custom_user_attributes)
+        visible_custom_attrs = [
+            (name, attr) for name, attr in user_attributes if attr.show_in_table()
+        ]
+        entries = list(users.items())
+        roles = load_roles()
+        contact_groups = load_contact_group_information()
+
+        html.div("", id_="row_info")
+
+        customer = customer_api()
+        with table_element(
+            "users",
+            None,
+            empty_text=_("No users are defined yet."),
+            limit=table_row_limit,
+        ) as table:
+            online_threshold = time.time() - user_online_maxage
+            for uid, user_spec in sorted(entries, key=lambda x: x[1].get("alias", x[0]).lower()):
+                table.row()
+
+                # Checkboxes
+                table.cell(
+                    html.render_input(
+                        "_toggle_group",
+                        type_="button",
+                        class_="checkgroup",
+                        onclick="cmk.selection.toggle_all_rows(this.form);",
+                        value="X",
+                    ),
+                    sortable=False,
+                    css=["checkbox"],
+                )
+
+                if uid != user.id:
+                    html.checkbox("_c_user_%s" % base64.b64encode(uid.encode("utf-8")).decode())
+
+                user_connection_id = user_spec.get("connector")
+                connection = get_connection(user_connection_id)
+
+                # Buttons
+                table.cell(_("Actions"), css=["buttons"])
+                if connection:  # only show edit buttons when the connector is available and enabled
+                    edit_url = folder_preserving_link(
+                        request, [("mode", "edit_user"), ("edit", uid)]
+                    )
+                    html.icon_button(edit_url, _("Properties"), StaticIcon(IconNames.edit))
+
+                    if self._can_create_and_delete_users:
+                        clone_url = folder_preserving_link(
+                            request, [("mode", "edit_user"), ("clone", uid)]
+                        )
+                        html.icon_button(
+                            clone_url, _("Create a copy of this user"), StaticIcon(IconNames.clone)
+                        )
+
+                user_alias = user_spec.get("alias", "")
+                if self._can_create_and_delete_users:
+                    delete_url = make_confirm_delete_link(
+                        i18n=_,
+                        url=make_action_link(request, [("mode", "users"), ("_delete", uid)]),
+                        title=_("Delete user"),
+                        suffix=user_alias,
+                        message=_("ID: %(uid)s") % {"uid": uid},
+                    )
+                    html.icon_button(delete_url, _("Delete"), StaticIcon(IconNames.delete))
+
+                notifications_url = folder_preserving_link(
+                    request,
+                    [
+                        ("mode", "user_notifications"),
+                        ("user", uid),
+                    ],
+                )
+                html.icon_button(
+                    notifications_url,
+                    _("Custom notification table of this user"),
+                    StaticIcon(IconNames.notifications),
+                )
+
+                # ID
+                table.cell(_("ID"), uid)
+
+                # Online/Offline
+                if user.may("wato.show_last_user_activity"):
+                    last_seen, auth_type = userdb.get_last_seen(user_spec)
+                    if last_seen >= online_threshold:
+                        title = _("Online (%(date)s %(time)s via %(auth_type)s)") % {
+                            "date": render.date(last_seen),
+                            "time": render.time_of_day(last_seen),
+                            "auth_type": auth_type,
+                        }
+                        img_txt = StaticIcon(IconNames.checkmark)
+                    elif last_seen != 0:
+                        title = _("Offline (%(date)s %(time)s via %(auth_type)s)") % {
+                            "date": render.date(last_seen),
+                            "time": render.time_of_day(last_seen),
+                            "auth_type": auth_type,
+                        }
+                        img_txt = StaticIcon(IconNames.cross_grey)
+                    elif last_seen == 0:
+                        title = _("Never")
+                        img_txt = StaticIcon(IconNames.hyphen)
+
+                    table.cell(_("Act."))
+                    html.static_icon(img_txt, title=title)  # type: ignore[possibly-undefined]
+
+                    table.cell(_("Last seen"))
+                    if last_seen != 0:
+                        html.write_text_permissive(
+                            f"{render.date(last_seen)} {render.time_of_day(last_seen)}"
+                        )
+                    else:
+                        html.write_text_permissive(_("Never"))
+
+                if cust := has_customer(
+                    edition=self._edition,
+                    user_cxn=connection,
+                    cust_api=customer,
+                    user_spec=user_spec,
+                ):
+                    table.cell(_("Customer"), cust)
+
+                # Connection
+                if connection:
+                    table.cell(
+                        _("Connection"), f"{connection.short_title()} ({user_connection_id})"
+                    )
+                    locked_attributes = userdb.locked_attributes(
+                        user_connection_id, user_attributes
+                    )
+                else:
+                    table.cell(
+                        _("Connection"),
+                        "{} ({}) ({})".format(_("UNKNOWN"), user_connection_id, _("disabled")),
+                        css=["error"],
+                    )
+                    locked_attributes = []
+
+                # Authentication
+                if user_spec.get("is_automation_user", False):
+                    auth_method: str | HTML = _("Automation")
+                elif user_spec.get("password") or "password" in locked_attributes:
+                    auth_method = _("Password")
+                    if connection and connection.type() == ConnectorType.SAML2:
+                        auth_method = connection.short_title()
+                    if userdb.is_two_factor_login_enabled(uid):
+                        auth_method += " (+2FA)"
+                else:
+                    auth_method = HTMLWriter.render_i(_("none"))
+                table.cell(_("Authentication"), auth_method)
+
+                table.cell(_("State"), sortable=False)
+                if user_spec.get("locked", False):
+                    html.static_icon(
+                        StaticIcon(IconNames.user_locked), title=_("The login is currently locked")
+                    )
+
+                if quarantine := user_spec.get("ldap_quarantine"):
+                    retention = active_config.ldap_quarantine_period
+                    quarantined_on = render.date(quarantine["quarantined_on"])
+                    if retention is not None:
+                        deletion = _("scheduled for deletion on %(date)s") % {
+                            "date": render.date(quarantine["quarantined_on"] + retention)
+                        }
+                    else:
+                        deletion = _("deletion pending on the next synchronization")
+                    html.static_icon(
+                        StaticIcon(IconNames.pending_task),
+                        title=_("Quarantined since %(date)s (source: %(source)s); %(deletion)s")
+                        % {
+                            "date": quarantined_on,
+                            "source": quarantine["connection_id"],
+                            "deletion": deletion,
+                        },
+                    )
+
+                if "disable_notifications" in user_spec and isinstance(
+                    user_spec["disable_notifications"], bool
+                ):
+                    disable_notifications_opts = {"disable": user_spec["disable_notifications"]}  # type: ignore[unreachable]
+                else:
+                    disable_notifications_opts = user_spec.get("disable_notifications", {})
+
+                if disable_notifications_opts.get("disable", False):
+                    html.static_icon(
+                        StaticIcon(IconNames.notif_disabled), title=_("Notifications are disabled")
+                    )
+
+                # Full name / Alias
+                table.cell(_("Alias"), user_alias)
+
+                # Email
+                table.cell(_("Email"), user_spec.get("email", ""))
+
+                # Roles
+                table.cell(_("Roles"))
+                if role_links := _get_user_role_links(user_spec.get("roles", []), roles):
+                    html.write_html(
+                        HTML.without_escaping(", ").join(
+                            HTMLWriter.render_a(link.alias, href=link.url) for link in role_links
+                        )
+                    )
+
+                # contact groups
+                table.cell(_("Contact groups"))
+                cgs = user_spec.get("contactgroups", [])
+                if cgs:
+                    cg_aliases = [
+                        contact_groups[c]["alias"] if c in contact_groups else c for c in cgs
+                    ]
+                    cg_urls = [
+                        folder_preserving_link(
+                            request, [("mode", "edit_contact_group"), ("edit", c)]
+                        )
+                        for c in cgs
+                    ]
+                    html.write_html(
+                        HTML.without_escaping(", ").join(
+                            HTMLWriter.render_a(content, href=url)
+                            for (content, url) in zip(cg_aliases, cg_urls)
+                        )
+                    )
+                else:
+                    html.i(_("none"))
+
+                # the visible custom attributes
+                for name, attr in visible_custom_attrs:
+                    vs = attr.valuespec()
+                    vs_title = vs.title()
+                    table.cell(_u(vs_title) if isinstance(vs_title, str) else vs_title)
+                    html.write_text_permissive(
+                        vs.value_to_html(user_spec.get(name, vs.default_value()))
+                    )
+
+        html.hidden_field("selection", SelectionId.from_request(request))
+        html.hidden_fields()
+
+    def _show_user_list_footer(self, users: dict[UserId, UserSpec]) -> None:
+        show_row_count(
+            row_count=(row_count := len(users)),
+            row_info=_("user") if row_count == 1 else _("users"),
+            selection_id="users",
+        )
+
+        if not load_contact_group_information():
+            url = "wato.py?mode=contact_groups"
+            html.open_div(class_="info")
+            html.write_text_permissive(
+                _(
+                    "Note: you haven't defined any contact groups yet. If you <a href='%(url)s'>"
+                    "create some contact groups</a> you can assign users to them und thus "
+                    "make them monitoring contacts. Only monitoring contacts can receive "
+                    "notifications."
+                )
+                % {"url": url}
+            )
+            html.write_text_permissive(
+                " you can assign users to them und thus "
+                "make them monitoring contacts. Only monitoring contacts can receive "
+                "notifications."
+            )
+            html.close_div()
+
+
+class _RoleAlias(TypedDict):
+    alias: str
+
+
+class _RoleLinkSpec(NamedTuple):
+    alias: str
+    url: str
+
+
+def _get_user_role_links(
+    user_roles: list[str], roles: Mapping[str, _RoleAlias]
+) -> Sequence[_RoleLinkSpec]:
+    return [
+        _RoleLinkSpec(
+            alias=roles[user_role]["alias"] if user_role in roles else user_role,
+            url=folder_preserving_link(request, [("mode", "edit_role"), ("edit", user_role)]),
+        )
+        for user_role in user_roles
+    ]
+
+
+# TODO: Create separate ModeCreateUser()
+# TODO: Move CME specific stuff to CME related class
+# TODO: Refactor action / page to use less hand crafted logic (valuespecs instead?)
+class ModeEditUser(WatoMode):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "edit_user"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["users"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeUsers
+
+    @overload
+    @classmethod
+    def mode_url(cls, *, edit: str) -> str: ...
+
+    @overload
+    @classmethod
+    def mode_url(cls, **kwargs: str) -> str: ...
+
+    @classmethod
+    @override
+    def mode_url(cls, **kwargs: str) -> str:
+        return super().mode_url(**kwargs)
+
+    @override
+    def _breadcrumb_url(self) -> str:
+        assert self._user_id is not None
+        return self.mode_url(edit=self._user_id)
+
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx)
+
+        # Load data that is referenced - in order to display dropdown
+        # boxes and to check for validity.
+        self._contact_groups = load_contact_group_information()
+        self._timeperiods = load_timeperiods()
+        self._roles = load_roles()
+        self._user_id: UserId | None
+
+        self._vs_customer = customer_api().vs_customer()
+
+        self._can_edit_users = edition != Edition.CLOUD
+
+    @override
+    def _from_vars(self) -> None:
+        # TODO: Should we turn the both fields below into UserId | None?
+        try:
+            self._user_id = request.get_validated_type_input(UserId, "edit", empty_is_none=True)
+        except ValueError as e:
+            raise MKUserError("edit", str(e)) from e
+        # This is needed for the breadcrumb computation:
+        # When linking from user notification rules page the request variable is "user"
+        # instead of "edit". We should also change that variable to "user" on this page,
+        # then we can simply use self._user_id.
+        if not self._user_id and request.has_var("user"):
+            try:
+                self._user_id = request.get_validated_type_input_mandatory(UserId, "user")
+            except ValueError as e:
+                raise MKUserError("user", str(e)) from e
+
+        try:
+            # cloneid is not mandatory because it is only needed in 'new' mode
+            self._cloneid = request.get_validated_type_input(UserId, "clone")
+        except ValueError as e:
+            raise MKUserError("clone", str(e)) from e
+
+        # TODO: Nuke the field below? It effectively hides facts about _user_id for mypy.
+        self._is_new_user: bool = self._user_id is None
+        self._users = userdb.load_users(lock=request.has_var("_transid"))
+        new_user = new_user_template("htpasswd", active_config.default_user_profile)
+
+        if self._user_id is not None:
+            self._user = self._users.get(self._user_id, new_user)
+        elif self._cloneid:
+            self._user = self._users.get(self._cloneid, new_user)
+        else:
+            self._user = new_user
+
+        # TODO: Move out of constructor to get rid of active_config dependency
+        self._locked_attributes = userdb.locked_attributes(
+            self._user.get("connector"), get_user_attributes(active_config.wato_user_attrs)
+        )
+
+    @override
+    def title(self) -> str:
+        if self._is_new_user:
+            return _("Add user")
+        return _("Edit user %(user_id)s") % {"user_id": self._user_id}
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        menu = make_simple_form_page_menu(
+            _("User"), breadcrumb, form_name="user", button_name="_save"
+        )
+
+        action_dropdown = menu.dropdowns[0]
+        action_dropdown.topics.append(
+            PageMenuTopic(
+                title=_("This user"),
+                entries=list(self._page_menu_entries_this_user()),
+            )
+        )
+
+        return menu
+
+    def _page_menu_entries_this_user(self) -> Iterator[PageMenuEntry]:
+        if not self._is_new_user:
+            yield PageMenuEntry(
+                title=_("Notification rules"),
+                icon_name=StaticIcon(IconNames.topic_events),
+                item=make_simple_link(
+                    folder_preserving_link(
+                        request,
+                        [
+                            ("mode", "user_notifications"),
+                            ("user", self._user_id),
+                        ],
+                    )
+                ),
+            )
+
+        if user.may("wato.auditlog") and not self._is_new_user:
+            assert self._user_id is not None
+            yield PageMenuEntry(
+                title=_("Audit log"),
+                icon_name=StaticIcon(IconNames.auditlog),
+                item=make_simple_link(
+                    make_object_audit_log_url(make_user_object_ref(self._user_id))
+                ),
+            )
+
+        if not self._is_new_user:
+            yield PageMenuEntry(
+                title=_("Remove two-factor authentication"),
+                icon_name=StaticIcon(IconNames.twofa),
+                item=make_simple_link(
+                    make_confirm_delete_link(
+                        i18n=_,
+                        url=make_action_link(
+                            request,
+                            [
+                                ("mode", "edit_user"),
+                                ("user", self._user_id),
+                                ("_disable_two_factor", "1"),
+                            ],
+                        ),
+                        title=_("Remove two-factor authentication of %(user_id)s")
+                        % {"user_id": self._user_id},
+                    )
+                ),
+                is_enabled=(
+                    userdb.is_two_factor_login_enabled(self._user_id)
+                    if self._user_id is not None
+                    else False
+                ),
+            )
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        check_csrf_token()
+
+        if not transactions.check_transaction(request):
+            return redirect(mode_url("users"))
+
+        if self._user_id is not None and request.has_var("_disable_two_factor"):
+            userdb.disable_two_factor_authentication(self._user_id)
+            return redirect(mode_url("users"))
+
+        if self._user_id is None:  # same as self._is_new_user
+            self._user_id = request.get_validated_type_input_mandatory(UserId, "user_id")
+            user_attrs: UserSpec = {}
+        else:
+            self._user_id = request.get_validated_type_input_mandatory(UserId, "edit")
+            user_attrs = self._users[self._user_id].copy()
+
+        if self._can_edit_users:
+            self._get_identity_userattrs(user_attrs)
+
+        # We always store secrets for automation users. Also in editions that are not allowed
+        # to edit users *hust* CSE *hust*
+        is_automation_user = self._user.get("is_automation_user", False)
+        if is_automation_user or self._can_edit_users:
+            self._get_security_userattrs(
+                user_attrs,
+                PasswordPolicy(
+                    config.password_policy.get("min_length"),
+                    config.password_policy.get("num_groups"),
+                    config.password_policy.get("wordlist_check", True),
+                    paths.wordlist_file,
+                ),
+            )
+
+        # Language configuration
+        language = request.get_ascii_input_mandatory("language", "")
+        if language != "_default_":
+            user_attrs["language"] = language
+        elif "language" in user_attrs:
+            del user_attrs["language"]
+
+        # Contact groups
+        cgs = []
+        for c in self._contact_groups:
+            if html.get_checkbox("cg_" + c):
+                cgs.append(c)
+        user_attrs["contactgroups"] = cgs
+
+        user_attrs["fallback_contact"] = html.get_checkbox("fallback_contact")
+
+        # Custom user attributes
+        for name, attr in (user_attributes := get_user_attributes(config.wato_user_attrs)):
+            value = attr.valuespec().from_html_vars("ua_" + name)
+            # TODO: Dynamically fiddling around with a TypedDict is a bit questionable
+            user_attrs[name] = value  # type: ignore[literal-required]
+
+        # Update or create the user
+        if self._is_new_user:
+            create_user(
+                self._user_id,
+                user_attrs,
+                user_features_registry.features().sites,
+                user_attributes,
+                config.user_connections,
+                pending_changes=_pending_changes(
+                    config=config, local_site=omd_site(), acting_user=user.id
+                ),
+                use_git=config.wato_use_git,
+                acting_user=user,
+                pprint_value=config.wato_pprint_config,
+            )
+        else:
+            edit_user(
+                self._user_id,
+                user_attrs,
+                user_features_registry.features().sites,
+                user_attributes,
+                config.user_connections,
+                pending_changes=_pending_changes(
+                    config=config, local_site=omd_site(), acting_user=user.id
+                ),
+                use_git=config.wato_use_git,
+                acting_user=user,
+                pprint_value=config.wato_pprint_config,
+            )
+
+        return redirect(mode_url("users"))
+
+    def _get_identity_userattrs(self, user_attrs: UserSpec) -> None:
+        # Full name
+        user_attrs["alias"] = request.get_str_input_mandatory("alias").strip()
+
+        # Connector
+        user_attrs["connector"] = self._user.get("connector")
+
+        # Email address
+        user_attrs["email"] = EmailAddress().from_html_vars("email")
+
+        idle_timeout = get_vs_user_idle_timeout().from_html_vars("idle_timeout")
+        user_attrs["idle_timeout"] = idle_timeout
+        if idle_timeout is None:
+            del user_attrs["idle_timeout"]
+
+        # Pager
+        user_attrs["pager"] = request.get_str_input_mandatory("pager", "").strip()
+
+        if self._edition is Edition.ULTIMATEMT:
+            customer = self._vs_customer.from_html_vars("customer")
+            self._vs_customer.validate_value(customer, "customer")
+
+            if customer != customer_api().default_customer_id():
+                user_attrs["customer"] = customer
+            elif "customer" in user_attrs:
+                del user_attrs["customer"]
+
+        if not self._is_locked("authorized_sites"):
+            # when the authorized_sites attribute is locked, the information is rendered on the page
+            # without setting its corresponding html var. On save, the value is therefore unavailable
+            # to be verified, and we can leave its existing value untouched. The length of this
+            # comment shows that the code is flawed.
+            vs_sites = self._vs_sites()
+            authorized_sites = vs_sites.from_html_vars("authorized_sites")
+            vs_sites.validate_value(authorized_sites, "authorized_sites")
+
+            if authorized_sites is not None:
+                user_attrs["authorized_sites"] = authorized_sites
+            elif "authorized_sites" in user_attrs:
+                del user_attrs["authorized_sites"]
+
+    def _increment_auth_serial(self, user_attrs: UserSpec) -> None:
+        user_attrs["serial"] = user_attrs.get("serial", 0) + 1
+
+    def _handle_auth_attributes(
+        self, user_attrs: UserSpec, password_policy: PasswordPolicy
+    ) -> None:
+        increase_serial = False
+
+        if request.var("authmethod") == "secret":  # automation secret
+            secret = request.get_str_input_mandatory("_auth_secret", "")
+            if (
+                not user_attrs.get("store_automation_secret", False)
+                and html.get_checkbox("store_automation_secret")
+                and not secret
+            ):
+                # store checkbox was checked without providing a new secret
+                raise MKUserError(
+                    "store_automation_secret",
+                    _("You need to supply a new secret in order to store it."),
+                )
+
+            user_attrs["store_automation_secret"] = (
+                html.get_checkbox("store_automation_secret") or False
+            )
+
+            if secret:
+                user_attrs["automation_secret"] = secret
+                user_attrs["is_automation_user"] = True
+                user_attrs["password"] = hash_password(Password(secret))
+                increase_serial = True  # password changed, reflect in auth serial
+
+                # automation users cannot set the passwords themselves.
+                user_attrs["last_pw_change"] = int(time.time())
+                user_attrs.pop("enforce_pw_change", None)
+
+            elif not user_attrs.get("is_automation_user", False) and "password" in user_attrs:
+                del user_attrs["password"]
+
+        else:  # password
+            password_field_name = "_password_" + self._pw_suffix()
+            password2_field_name = "_password2_" + self._pw_suffix()
+            password = request.get_validated_type_input(
+                Password, password_field_name, empty_is_none=True
+            )
+            password2 = request.get_validated_type_input(
+                Password, password2_field_name, empty_is_none=True
+            )
+
+            # We compare both passwords only, if the user has supplied
+            # the repeation! We are so nice to our power users...
+            # Note: this validation is done before the main-validiation later on
+            # It doesn't make any sense to put this block into the main validation function
+            if password2 and password != password2:
+                raise MKUserError(password2_field_name, _("Passwords don't match"))
+
+            # Detect switch from automation to password
+            if user_attrs.get("is_automation_user", False):
+                user_attrs.pop("automation_secret", None)
+                user_attrs.pop("store_automation_secret", None)
+                if "password" in user_attrs:
+                    del user_attrs["password"]  # which was the hashed automation secret!
+            user_attrs["is_automation_user"] = False
+
+            if password:
+                verify_password_policy(password, password_field_name, password_policy)
+
+                if "password" in user_attrs:
+                    send_security_message(self._user_id, SecurityNotificationEvent.password_change)
+                user_attrs["password"] = hash_password(password)
+                user_attrs["last_pw_change"] = int(time.time())
+                increase_serial = True  # password changed, reflect in auth serial
+
+            # PW change enforcement
+            user_attrs["enforce_pw_change"] = html.get_checkbox("enforce_pw_change")
+            if user_attrs["enforce_pw_change"]:
+                increase_serial = True  # invalidate all existing user sessions, enforce relogon
+
+        # Increase serial (if needed)
+        if increase_serial:
+            self._increment_auth_serial(user_attrs)
+
+    def _get_security_userattrs(
+        self, user_attrs: UserSpec, password_policy: PasswordPolicy
+    ) -> None:
+        # Locking
+        user_attrs["locked"] = html.get_checkbox("locked") or False
+        if (  # toggled for an existing user
+            self._user_id in self._users
+            and self._users[self._user_id]["locked"] != user_attrs["locked"]
+        ):
+            if user_attrs["locked"]:  # user is being locked, increase the auth serial
+                self._increment_auth_serial(user_attrs)
+            else:  # user is being unlocked, reset failed login attempts
+                user_attrs["num_failed_logins"] = 0
+
+        # Authentication: Password or Secret
+        self._handle_auth_attributes(user_attrs, password_policy)
+
+        # Roles
+        if self._edition != Edition.CLOUD:
+            user_attrs["roles"] = [
+                role for role in self._roles if html.get_checkbox("role_" + role)
+            ]
+
+    @override
+    def page(self, config: Config) -> None:
+        # Let exceptions from loading notification scripts happen now
+        load_notification_scripts()
+
+        with html.form_context("user", method="POST"):
+            self._show_form(
+                config.default_language,
+                config.wato_user_attrs,
+                config.sites,
+                UserPermissions.from_config(config, permission_registry),
+            )
+
+    def _show_form(
+        self,
+        default_language: str,
+        custom_user_attributes: Sequence[CustomUserAttrSpec],
+        sites: SiteConfigurations,
+        user_permissions: UserPermissions,
+    ) -> None:
+        html.prevent_password_auto_completion()
+        custom_user_attr_topics = get_user_attributes_by_topic(custom_user_attributes)
+        is_automation_user = self._user.get("is_automation_user", False)
+
+        if self._can_edit_users:
+            self._render_identity(custom_user_attr_topics, sites)
+            self._render_security(
+                {
+                    "password",
+                    "automation",
+                    "disable_password",
+                    "idle_timeout",
+                    "roles",
+                    "custom_user_attributes",
+                },
+                custom_user_attr_topics,
+                is_automation_user,
+                sites,
+                user_permissions,
+            )
+        elif is_automation_user:
+            self._render_security(
+                {
+                    "automation",
+                    "disable_password",
+                },
+                None,
+                is_automation_user,
+                sites,
+                user_permissions,
+            )
+
+        # Contact groups
+        forms.header(_("Contact groups"), isopen=False)
+        forms.section()
+        groups_page_url = folder_preserving_link(request, [("mode", "contact_groups")])
+        hosts_assign_url = folder_preserving_link(
+            request,
+            [
+                ("mode", "edit_ruleset"),
+                ("varname", "host_contactgroups"),
+            ],
+        )
+        services_assign_url = folder_preserving_link(
+            request,
+            [
+                ("mode", "edit_ruleset"),
+                ("varname", "service_contactgroups"),
+            ],
+        )
+
+        if not self._contact_groups:
+            html.write_text_permissive(
+                _("Please first create some <a href='%(groups_page_url)s'>contact groups</a>")
+                % {"groups_page_url": groups_page_url}
+            )
+        else:
+            entries = sorted(
+                [(group["alias"] or c, c) for c, group in self._contact_groups.items()]
+            )
+            is_member_of_at_least_one = False
+            for alias, gid in entries:
+                is_member = gid in self._user.get("contactgroups", [])
+
+                if not self._is_locked("contactgroups"):
+                    html.checkbox("cg_" + gid, gid in self._user.get("contactgroups", []))
+                else:
+                    if is_member:
+                        is_member_of_at_least_one = True
+                    html.hidden_field("cg_" + gid, "1" if is_member else "")
+
+                if not self._is_locked("contactgroups") or is_member:
+                    url = folder_preserving_link(
+                        request, [("mode", "edit_contact_group"), ("edit", gid)]
+                    )
+                    html.a(alias, href=url)
+                    html.br()
+
+            if self._is_locked("contactgroups") and not is_member_of_at_least_one:
+                html.i(_("No contact groups assigned."))
+
+        html.help(
+            _(
+                "Contact groups are used to assign monitoring "
+                "objects to users. If you haven't defined any contact groups yet, "
+                "then first <a href='%(groups_page_url)s'>do so</a>. "
+                "Hosts and services can be assigned to contact groups using this "
+                "<a href='%(hosts_assign_url)s'>rule for hosts</a> and this "
+                "<a href='%(services_assign_url)s'>rule for services</a>.<br><br>"
+                "If you do not put the user into any contact group "
+                "then no monitoring contact will be created for the user."
+            )
+            % {
+                "groups_page_url": groups_page_url,
+                "hosts_assign_url": hosts_assign_url,
+                "services_assign_url": services_assign_url,
+            }
+        )
+
+        forms.header(_("Notifications"), isopen=False)
+        forms.section(_("Fallback notifications"), simple=True)
+
+        html.checkbox(
+            "fallback_contact",
+            bool(self._user.get("fallback_contact")),
+            label=_("Receive fallback notifications"),
+        )
+
+        html.help(
+            _(
+                "In case none of your notification rules handles a certain event a notification "
+                "will be sent to this contact. This makes sure that in that case at least <i>someone</i> "
+                "gets notified. Furthermore this contact will be used for notifications to any host or service "
+                "that is not known to the monitoring. "
+                "This can happen when you forward notifications from the Event Console. "
+                "<br><br>Notification fallback can also configured in the global "
+                'setting <a href="global_settings.py?varname=notification_fallback_email">'
+                "Fallback email address for notifications</a>."
+            )
+        )
+
+        self._show_custom_user_attributes(custom_user_attr_topics.get("notify", []))
+
+        forms.header(_("Personal settings"), isopen=False)
+        select_language(self._user, default_language)
+        self._show_custom_user_attributes(custom_user_attr_topics.get("personal", []))
+        forms.header(_("Interface settings"), isopen=False)
+        self._show_custom_user_attributes(custom_user_attr_topics.get("interface", []))
+
+        # Later we could add custom macros here, which then could be used
+        # for notifications. On the other hand, if we implement some check_mk
+        # --notify, we could directly access the data in the account with the need
+        # to store values in the monitoring core. We'll see what future brings.
+        forms.end()
+        if self._is_new_user:
+            html.set_focus("user_id")
+        else:
+            html.set_focus("alias")
+        html.hidden_fields()
+
+    def _render_identity(
+        self,
+        custom_user_attr_topics: dict[str, list[tuple[str, UserAttribute]]],
+        sites: SiteConfigurations,
+    ) -> None:
+        forms.header(_("Identity"))
+
+        # ID
+        forms.section(_("Username"), simple=not self._is_new_user, is_required=True)
+        if self._is_new_user:
+            vs_user_id: TextInput | FixedValue = UserID(allow_empty=False, size=73)
+        else:
+            vs_user_id = FixedValue(value=self._user_id)
+        vs_user_id.render_input("user_id", self._user_id)
+
+        # Full name
+        forms.section(_("Full name"), is_required=True)
+        self._lockable_input("alias", self._user_id)
+        html.help(_("Full name or alias of the user"))
+
+        # Email address
+        forms.section(_("Email address"))
+        email = self._user.get("email", "")
+        if not self._is_locked("email"):
+            EmailAddress(size=73).render_input("email", email)
+        else:
+            html.write_text_permissive(email)
+            html.hidden_field("email", email)
+
+        html.help(
+            _(
+                "The email address is optional and is needed "
+                "if the user is a monitoring contact and receives notifications "
+                "via email."
+            )
+        )
+
+        forms.section(_("Pager address"))
+        self._lockable_input("pager", "")
+        html.help(_("The pager address is optional "))
+
+        if self._edition is Edition.ULTIMATEMT:
+            forms.section(self._vs_customer.title())
+            self._vs_customer.render_input("customer", customer_api().get_customer_id(self._user))
+
+            html.help(self._vs_customer.help())
+
+        vs_sites = self._vs_sites()
+        forms.section(vs_sites.title())
+        authorized_sites = self._user.get("authorized_sites", vs_sites.default_value())
+        if not self._is_locked("authorized_sites"):
+            vs_sites.render_input("authorized_sites", authorized_sites)
+        else:
+            html.write_text_permissive(vs_sites.value_to_html(authorized_sites))
+        html.help(vs_sites.help())
+
+        ident_attrs = custom_user_attr_topics.get("ident", [])
+        # ntop_alias is rendered conditionally below; split it out to avoid showing
+        # it unconditionally alongside the other identity attributes.
+        ntop_ident_attrs = [(n, a) for n, a in ident_attrs if n == "ntop_alias"]
+        self._show_custom_user_attributes([(n, a) for n, a in ident_attrs if n != "ntop_alias"])
+
+        # ntopng — show the ntop_alias field only when the global setting is enabled
+        if ntop_connection().is_available():
+            for ntop_conn in _iter_ntop_connections(sites):
+                ntop_username_attribute = ntop_conn.get("use_custom_attribute_as_ntop_username")
+                if ntop_username_attribute == "ntop_alias" and ntop_ident_attrs:
+                    self._show_custom_user_attributes(ntop_ident_attrs)
+                    return
+
+    def _render_security(
+        self,
+        options_to_render: set[
+            Literal[
+                "password",
+                "automation",
+                "disable_password",
+                "idle_timeout",
+                "roles",
+                "custom_user_attributes",
+            ]
+        ],
+        custom_user_attr_topics: dict[str, list[tuple[str, UserAttribute]]] | None,
+        is_automation: bool,
+        sites: SiteConfigurations,  # noqa: ARG002
+        user_permissions: UserPermissions,
+    ) -> None:
+        forms.header(_("Security"))
+
+        if "password" in options_to_render or "automation" in options_to_render:
+            forms.section(_("Authentication"))
+
+        if "password" in options_to_render:
+            html.radiobutton(
+                "authmethod", "password", not is_automation, _("Normal user login with password")
+            )
+            html.open_div(class_="user_security_form_container")
+            html.open_table()
+            html.open_tr()
+            html.td(_("password:"))
+            html.open_td()
+
+            if not self._is_locked("password"):
+                html.password_input("_password_" + self._pw_suffix(), autocomplete="new-password")
+                html.password_meter()
+                html.close_td()
+                html.close_tr()
+
+                html.open_tr()
+                html.td(_("repeat:"))
+                html.open_td()
+                html.password_input("_password2_" + self._pw_suffix(), autocomplete="new-password")
+                html.write_text_permissive(" (%s)" % _("optional"))
+                html.close_td()
+                html.close_tr()
+
+                html.open_tr()
+                html.td("%s:" % _("Enforce change"))
+                html.open_td()
+                # Only make password enforcement selection possible when user is allowed to change the PW
+                if self._is_new_user or (
+                    user_permissions.user_may(self._user_id, "general.edit_profile")
+                    and user_permissions.user_may(self._user_id, "general.change_password")
+                ):
+                    html.checkbox(
+                        "enforce_pw_change",
+                        bool(self._user.get("enforce_pw_change")),
+                        label=_("Change password at next login or access"),
+                    )
+                else:
+                    html.write_text_permissive(
+                        _("Not permitted to change the password. Change cannot be enforced.")
+                    )
+            else:
+                html.i(_("The password cannot be changed (it is locked by the user connector)."))
+                html.hidden_field("_password", "")
+                html.hidden_field("_password2", "")
+
+            html.close_td()
+            html.close_tr()
+            html.close_table()
+            html.close_div()
+
+        if "automation" in options_to_render:
+            html.radiobutton(
+                "authmethod", "secret", is_automation, _("Automation secret for machine accounts")
+            )
+            html.open_div(class_="user_security_form_container")
+            html.open_div()
+            html.password_input(
+                "_auth_secret",
+                "",
+                size=30,
+                id_="automation_secret",
+                placeholder="******" if "automation_secret" in self._user else "",
+                autocomplete="new-password",
+            )
+            html.write_text_permissive(" ")
+            html.open_b(style=["position: relative", "top: 4px;"])
+            html.write_text_permissive(" &nbsp;")
+            html.icon_button(
+                "javascript:cmk.wato.randomize_secret('automation_secret', '16', '%s');"
+                % _("Copied secret to clipboard"),
+                _("Create random secret and copy secret to clipboard"),
+                StaticIcon(IconNames.random),
+            )
+            html.close_b()
+            html.close_div()
+            html.open_div()
+            html.checkbox(
+                "store_automation_secret",
+                self._user.get("store_automation_secret", False),
+                label=_("Store the secret in cleartext"),
+            )
+            html.help(
+                _(
+                    "In order to reuse that secret for other rules, e.g. <i>Bi aggregations</i>, <i>Dynamic host configuration</i>"
+                )
+            )
+            html.close_div()
+            html.close_div()
+
+        if "password" in options_to_render:
+            html.help(
+                _(
+                    "If you want the user to be able to login "
+                    "then specify a password here. Users without a login make sense "
+                    "if they are monitoring contacts that are just used for "
+                    "notifications. The repetition of the password is optional. "
+                    "<br>For accounts used by automation processes (such as fetching "
+                    "data from views for further procession), set the method to "
+                    "<u>secret</u>. The secret will be stored in a local file. Processes "
+                    "with read access to that file will be able to use the graphical user interface (GUI) as "
+                    "a web service without any further configuration."
+                )
+            )
+
+        if "disable_password" in options_to_render:
+            # Locking
+            forms.section(_("Disable password"), simple=True)
+            if not self._is_locked("locked"):
+                html.checkbox(
+                    "locked",
+                    bool(self._user["locked"]),
+                    label=_("disable the login to this account"),
+                )
+            else:
+                html.write_text_permissive(
+                    _("Login disabled") if self._user["locked"] else _("Login possible")
+                )
+                html.hidden_field("locked", "1" if self._user["locked"] else "")
+            html.help(
+                _(
+                    "Disabling the password will prevent a user from logging in while "
+                    "retaining the original password. Notifications are not affected "
+                    "by this setting."
+                )
+            )
+
+        if "idle_timeout" in options_to_render:
+            forms.section(_("Idle timeout"))
+            idle_timeout = self._user.get("idle_timeout")
+            if not self._is_locked("idle_timeout"):
+                get_vs_user_idle_timeout().render_input("idle_timeout", idle_timeout)
+            else:
+                html.write_text_permissive(idle_timeout)
+                html.hidden_field("idle_timeout", idle_timeout)
+
+        if "roles" in options_to_render:
+            # Roles
+            forms.section(_("Roles"))
+            is_member_of_at_least_one = False
+            html.open_table()
+            for role_id, role in sorted(self._roles.items(), key=lambda x: (x[1]["alias"], x[0])):
+                html.open_tr()
+                html.open_td()
+                if not self._is_locked("roles"):
+                    html.checkbox("role_" + role_id, role_id in self._user.get("roles", []))
+                    url = folder_preserving_link(
+                        request, [("mode", "edit_role"), ("edit", role_id)]
+                    )
+                    html.a(role["alias"], href=url)
+                else:
+                    is_member = role_id in self._user.get("roles", [])
+                    if is_member:
+                        is_member_of_at_least_one = True
+                        url = folder_preserving_link(
+                            request, [("mode", "edit_role"), ("edit", role_id)]
+                        )
+                        html.a(role["alias"], href=url)
+                    html.hidden_field("role_" + role_id, "1" if is_member else "")
+                html.close_td()
+                html.close_tr()
+            html.close_table()
+
+            if self._is_locked("roles") and not is_member_of_at_least_one:
+                html.i(_("No roles assigned."))
+
+        if "custom_user_attributes" in options_to_render and custom_user_attr_topics:
+            self._show_custom_user_attributes(custom_user_attr_topics.get("security", []))
+
+    def _lockable_input(self, name: str, dflt: str | None) -> None:
+        # TODO: The cast is a big fat lie: value can be None, but things somehow seem to "work" even then. :-/
+        value = cast(str, self._user.get(name, dflt))
+        if self._is_locked(name):
+            html.write_text_permissive(value)
+            html.hidden_field(name, value)
+        else:
+            html.text_input(varname=name, default_value=value, size=73)
+
+    def _pw_suffix(self) -> str:
+        if self._is_new_user:
+            return "new"
+        assert self._user_id is not None
+        return base64.b64encode(self._user_id.encode("utf-8")).decode("ascii")
+
+    def _is_locked(self, attr: str) -> bool:
+        """Returns true if an attribute is locked and should be read only. Is only
+        checked when modifying an existing user"""
+        return not self._is_new_user and attr in self._locked_attributes
+
+    def _vs_sites(self) -> Alternative:
+        return Alternative(
+            title=_("Monitored sites"),
+            help=_(
+                "Select sites to monitor. This selection helps improve performance but does not affect permissions."
+            ),
+            default_value=None,
+            elements=[
+                FixedValue(
+                    value=None,
+                    title=_("All sites"),
+                    totext=_("May see all sites"),
+                ),
+                DualListChoice(
+                    title=_("Specific sites"),
+                    choices=get_configured_site_choices,
+                ),
+            ],
+        )
+
+    def _show_custom_user_attributes(self, custom_attr: list[tuple[str, UserAttribute]]) -> None:
+        for name, attr in custom_attr:
+            vs = attr.valuespec()
+            vs_title = vs.title()
+            forms.section(_u(vs_title) if isinstance(vs_title, str) else vs_title)
+            if not self._is_locked(name):
+                vs.render_input("ua_" + name, self._user.get(name, vs.default_value()))
+            else:
+                html.write_text_permissive(
+                    vs.value_to_html(self._user.get(name, vs.default_value()))
+                )
+                # Render hidden to have the values kept after saving
+                html.open_div(style="display:none")
+                vs.render_input("ua_" + name, self._user.get(name, vs.default_value()))
+                html.close_div()
+            vs_help = vs.help()
+            html.help(_u(vs_help) if isinstance(vs_help, str) else vs_help)
+
+
+def select_language(user_spec: UserSpec, default_language: str) -> None:
+    languages: Choices = [(ident, alias) for (ident, alias) in get_languages()]
+    if not languages:
+        return
+
+    current_language = user_spec.get("language", "_default_")
+    languages.insert(
+        0,
+        (
+            "_default_",
+            _("Use the default language (%(language)s)")
+            % {"language": get_language_alias(default_language)},
+        ),
+    )
+
+    forms.section(_("Language"))
+    html.dropdown("language", languages, deflt=current_language)
+    html.help(
+        HTMLWriter.render_div(
+            _(
+                "Configure the language of the user interface. Checkmk is officially supported only "
+                "for English and German."
+            )
+        )
+        + HTMLWriter.render_div(
+            _(
+                "Other language versions are offered for convenience only and anyone using Checkmk "
+                "in a non-supported language does so at their own risk. No guarantee is given for the "
+                "accuracy of the content. Checkmk accepts no liability for incorrect operation due to "
+                "incorrect translations. "
+            )
+            + HTMLWriter.render_a(
+                _("Feel free to contribute here."),
+                "https://translate.checkmk.com",
+                target="_blank",
+            )
+        )
+    )
+
+
+def _sync_possible(user_connections: Sequence[UserConnectionConfig]) -> bool:
+    """When at least one LDAP connection is defined and active a sync is possible"""
+    return any(
+        connection.type() == ConnectorType.LDAP
+        for _connection_id, connection in active_connections(user_connections)
+    )
+
+
+def _pending_changes(
+    *,
+    config: Config,
+    local_site: SiteId,
+    acting_user: UserId | None,
+) -> PendingChanges:
+    return PendingChanges(
+        activation_sites=activation_sites(config.sites),
+        local_site=local_site,
+        acting_user=acting_user,
+        store=PendingChangesStore(),
+        hooks=(
+            make_audit_log_change_hook(use_git=config.wato_use_git),
+            sidebar_reload_change_hook,
+            index_update_change_hook,
+        ),
+    )

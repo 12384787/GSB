@@ -1,0 +1,97 @@
+/**
+ * Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+import { fireEvent, render, screen } from '@testing-library/vue'
+import type { TimeSpan } from 'cmk-shared-typing/typescript/vue_formspec_components'
+
+import FormTimeSpan from '@/form/private/forms/FormTimeSpan/FormTimeSpan.vue'
+
+import { renderForm } from '../cmk-form-helper'
+
+function getSpec(
+  displayedMagnitudes: TimeSpan['displayed_magnitudes'],
+  validators: TimeSpan['validators']
+): TimeSpan {
+  return {
+    type: 'time_span',
+    title: 'utTitle',
+    help: 'ut Help',
+    displayed_magnitudes: displayedMagnitudes,
+    validators: validators,
+    label: 'utLabel',
+    input_hint: null
+  } as TimeSpan
+}
+
+test('FormTimeSpan renders value', () => {
+  render(FormTimeSpan, {
+    props: {
+      spec: getSpec(['millisecond', 'second'], []),
+      data: 66.6,
+      backendValidation: []
+    }
+  })
+  expect(screen.getByLabelText<HTMLInputElement>('Milliseconds').value).toBe('600')
+  expect(screen.getByLabelText<HTMLInputElement>('Seconds').value).toBe('66')
+})
+
+test('FormTimeSpan updates data', async () => {
+  const { getCurrentData } = await renderForm({
+    spec: getSpec(['minute', 'millisecond', 'second'], []),
+    data: 66.6,
+    backendValidation: []
+  })
+
+  const secondsInput = screen.getByLabelText<HTMLInputElement>('Seconds')
+  const minutesInput = screen.getByLabelText<HTMLInputElement>('Minutes')
+
+  expect(screen.getByLabelText<HTMLInputElement>('Milliseconds').value).toBe('600')
+  expect(secondsInput.value).toBe('6')
+  expect(minutesInput.value).toBe('1')
+
+  expect(getCurrentData()).toMatch('66.6')
+  await fireEvent.update(secondsInput, '200')
+  expect(getCurrentData()).toMatch('260.6')
+  await fireEvent.update(minutesInput, '2')
+  expect(getCurrentData()).toMatch('320.6')
+})
+
+test('FormTimeSpan shows frontend validation', async () => {
+  await renderForm({
+    spec: getSpec(
+      ['hour'],
+      [
+        {
+          type: 'number_in_range',
+          // value should be between 1 hour and 1 week
+          min_value: 1 * 60 * 60,
+          max_value: 7 * 24 * 60 * 60,
+          error_message: 'some_error_message'
+        }
+      ]
+    ),
+    data: 2 * 60 * 60,
+    backendValidation: []
+  })
+
+  const hoursInput = screen.getByLabelText<HTMLInputElement>('Hours')
+  await fireEvent.update(hoursInput, `${8 * 60 * 60}`)
+  // there is not further value interpolation in the frontend: it just shows the error message of the backend
+  screen.getByText('some_error_message')
+})
+
+test('FormTimeSpan shows error for negative values', async () => {
+  const { getCurrentData } = await renderForm({
+    spec: getSpec(['hour', 'minute'], []),
+    data: 1 * 60 * 60,
+    backendValidation: []
+  })
+
+  const minutesInput = screen.getByLabelText<HTMLInputElement>('Minutes')
+  await fireEvent.update(minutesInput, '-1')
+
+  expect(getCurrentData()).toMatch(`${1 * 60 * 60 - 60}`)
+  screen.getByText('The time span cannot be negative.')
+})

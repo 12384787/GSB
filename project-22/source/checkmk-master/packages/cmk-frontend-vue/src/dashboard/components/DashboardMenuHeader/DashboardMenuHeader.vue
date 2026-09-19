@@ -1,0 +1,342 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import axios from 'axios'
+import type { GlobalTimePickerProps } from 'cmk-shared-typing/typescript/global_time_picker.ts'
+import CmkIcon from 'cmk-ui-library/components/CmkIcon'
+import type { DateTimeRange } from 'cmk-ui-library/components/date-time/types.ts'
+import CmkHeading from 'cmk-ui-library/components/typography/CmkHeading.vue'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import { kioskMode } from 'cmk-ui-library/lib/kiosk'
+import { computed, ref } from 'vue'
+
+import { getCsrfToken } from '@/lib/csrf'
+
+import {
+  type DashboardMetadata,
+  DashboardOwnerType,
+  type DashboardTokenModel
+} from '@/dashboard/types/dashboard.ts'
+import { copyToClipboard, urlHandler } from '@/dashboard/utils.ts'
+import GlobalTimePicker from '@/graphing/GlobalTimePicker/GlobalTimePicker.vue'
+
+import DashboardSelector from './DashboardSelector.vue'
+import DropdownMenu from './DropdownMenu.vue'
+import MenuButton from './MenuButton.vue'
+import SharingStatus, { type SharingState } from './SharingStatus.vue'
+import type { SelectedDashboard } from './types'
+
+interface Props {
+  selectedDashboard: SelectedDashboard | null
+  canEditDashboard: boolean
+  linkUserGuide: string
+  isEditMode: boolean
+  publicToken: DashboardTokenModel | null
+  isEmptyDashboard: boolean
+  isDashboardLoading: boolean
+  runtimeFilters: Record<string, string>
+  globalTimePicker: GlobalTimePickerProps
+}
+
+const { _t } = usei18n()
+
+const props = defineProps<Props>()
+
+const emit = defineEmits<{
+  'open-runtime-filter': []
+  'open-filter-settings': []
+  'open-settings': []
+  'open-clone-workflow': []
+  'open-share-workflow': []
+  'open-widget-workflow': []
+  save: []
+  'enter-edit': []
+  'cancel-edit': []
+  'set-dashboard': [dashboard: DashboardMetadata]
+}>()
+
+const range = defineModel<DateTimeRange>('range', { required: true })
+
+const showDashboardDropdown = ref(false)
+
+const handleDashboardChange = (dashboard: DashboardMetadata) => {
+  emit('set-dashboard', dashboard)
+  showDashboardDropdown.value = false
+}
+
+const enterEditMode = () => {
+  emit('enter-edit')
+}
+
+const handleSave = () => {
+  emit('save')
+}
+
+const handleCancel = () => {
+  emit('cancel-edit')
+}
+
+const handleAddWidget = () => {
+  emit('open-widget-workflow')
+}
+
+const setStartUrl = async (): Promise<void> => {
+  const dashboard = props.selectedDashboard
+  if (!dashboard) {
+    console.error('No dashboard selected to set as start URL')
+    return
+  }
+  try {
+    const url = 'ajax_set_dashboard_start_url.py'
+    const response = await axios.post(url, null, {
+      params: {
+        name: dashboard.name,
+        owner: dashboard.owner,
+        _csrf_token: getCsrfToken()
+      }
+    })
+
+    if (response.data.result_code !== 0) {
+      console.error('Error setting start URL:', response.data.result)
+    } else if (window.self !== window.top) {
+      window.top!.location.reload()
+    } else {
+      window.location.reload()
+    }
+  } catch (error) {
+    console.error('Request failed:', error)
+  }
+}
+
+const isKioskMode = kioskMode.isActive()
+const navigationToggleIcon = isKioskMode ? 'toggle-off' : 'toggle-on'
+const navigationToggleLink = computed(() => {
+  if (!props.selectedDashboard) {
+    return '' // dropdown is disabled when no dashboard is selected, so this doesn't matter
+  }
+  const dashboardUrl = urlHandler.getDashboardUrl(props.selectedDashboard, props.runtimeFilters)
+  return kioskMode.toggled(dashboardUrl).toString()
+})
+
+const isBuiltInDashboard = computed(
+  () => props.selectedDashboard?.type === DashboardOwnerType.BUILT_IN
+)
+
+const isInteractionDisabled = computed(() => props.isDashboardLoading || !props.selectedDashboard)
+
+const sharingState = computed((): SharingState => {
+  if (!props.publicToken) {
+    return 'disabled'
+  }
+  return props.publicToken.is_disabled ? 'paused' : 'active'
+})
+
+const copyInternalDashboardLink = async (): Promise<void> => {
+  const url = window?.parent?.location?.href || window.location.href
+  await copyToClipboard(url)
+}
+</script>
+
+<template>
+  <div class="db-menu-header" role="toolbar" :aria-label="_t('Dashboard menu')">
+    <div class="db-menu-header__left">
+      <CmkHeading>{{ _t('Dashboard') }}</CmkHeading>
+      <DashboardSelector
+        :selected-dashboard="props.selectedDashboard"
+        :disabled="props.isDashboardLoading || props.isEditMode"
+        @dashboard-change="handleDashboardChange"
+      />
+    </div>
+    <div class="db-menu-header__center">
+      <template v-if="!isEditMode">
+        <GlobalTimePicker
+          v-model="range"
+          class="db-menu-header__time-picker"
+          :custom-time-ranges="props.globalTimePicker.custom_time_ranges"
+          :server-time-zone="props.globalTimePicker.server_time_zone"
+          :first-day-of-week="props.globalTimePicker.first_day_of_week"
+          :disabled="isInteractionDisabled"
+          variant="condensed"
+        >
+          <template #trailing>
+            <MenuButton :disabled="isInteractionDisabled" @click="emit('open-runtime-filter')">
+              <CmkIcon name="filter" size="large" />
+              <span>{{ _t('Filter') }}</span>
+            </MenuButton>
+          </template>
+        </GlobalTimePicker>
+      </template>
+    </div>
+    <div class="db-menu-header__right">
+      <template v-if="!isEditMode">
+        <SharingStatus
+          v-if="canEditDashboard && !isBuiltInDashboard"
+          :sharing-state="sharingState"
+          :shared-until="publicToken?.expires_at ? new Date(publicToken?.expires_at) : null"
+          @open-sharing-settings="emit('open-share-workflow')"
+        />
+
+        <DropdownMenu
+          :icon="{ name: 'share', primaryColor: '--db-dashboard-menu-header-share-icon-color' }"
+          :label="_t('Share')"
+          :disabled="isInteractionDisabled"
+          :options="[
+            { label: _t('Copy internal link'), action: copyInternalDashboardLink },
+            {
+              label: _t('Copy public link'),
+              hidden: isBuiltInDashboard || !canEditDashboard || !publicToken,
+              action: () => {
+                copyToClipboard(urlHandler.getSharedDashboardLink(publicToken!.token_id))
+              }
+            },
+            {
+              label: _t('Configure sharing'),
+              action: () => {
+                emit('open-share-workflow')
+              },
+              hidden: isBuiltInDashboard || !canEditDashboard
+            },
+            {
+              label: _t('Clone dashboard to generate public link'),
+              action: () => emit('open-clone-workflow'),
+              hidden: !isBuiltInDashboard || !canEditDashboard
+            }
+          ]"
+        />
+
+        <DropdownMenu
+          icon="global-settings"
+          :label="_t('Settings')"
+          :right="!(isBuiltInDashboard || canEditDashboard)"
+          :disabled="isInteractionDisabled"
+          :options="[
+            {
+              label: _t('Dashboard settings'),
+              action: () => emit('open-settings'),
+              hidden: isBuiltInDashboard || !canEditDashboard
+            },
+            {
+              label: _t('Filter settings'),
+              action: () => emit('open-filter-settings'),
+              hidden: isBuiltInDashboard || !canEditDashboard
+            },
+            { label: _t('Clone dashboard'), action: () => emit('open-clone-workflow') },
+            {
+              label: _t('Dashboard user guide'),
+              url: linkUserGuide,
+              target: '_blank',
+              icon: 'external'
+            },
+            { label: _t('Set as start URL'), action: () => setStartUrl() },
+            {
+              label: _t('Show page navigation'),
+              url: navigationToggleLink,
+              icon: navigationToggleIcon
+            }
+          ]"
+        />
+
+        <MenuButton
+          v-if="isBuiltInDashboard"
+          :disabled="isInteractionDisabled"
+          @click="emit('open-clone-workflow')"
+        >
+          <CmkIcon name="clone" size="large" />
+          <span>{{ _t('Clone') }}</span>
+        </MenuButton>
+
+        <MenuButton
+          v-else-if="canEditDashboard"
+          class="menu-btn"
+          :disabled="isInteractionDisabled"
+          @click="isEmptyDashboard ? handleAddWidget() : enterEditMode()"
+        >
+          <CmkIcon name="dashboard-grid" size="large" />
+          <span>{{ isEmptyDashboard ? _t('Add widget') : _t('Edit widgets') }}</span>
+        </MenuButton>
+      </template>
+
+      <template v-else>
+        <div class="edit-mode-actions">
+          <MenuButton variant="primary" :disabled="isInteractionDisabled" @click="handleSave">
+            {{ _t('Save') }}
+          </MenuButton>
+
+          <MenuButton :disabled="isInteractionDisabled" @click="handleCancel">
+            <CmkIcon name="cancel" />
+            {{ _t('Cancel') }}
+          </MenuButton>
+
+          <MenuButton :disabled="isInteractionDisabled" @click="handleAddWidget">
+            <CmkIcon name="plus" />
+            {{ _t('Add widget') }}
+          </MenuButton>
+        </div>
+      </template>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.db-menu-header {
+  display: flex;
+  flex-flow: row nowrap;
+  align-items: stretch;
+  gap: var(--dimension-4);
+  padding: 0 var(--dimension-4);
+  background-color: transparent;
+}
+
+.db-menu-header__left {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--dimension-4);
+  padding-top: var(--dimension-4);
+  flex: 0 0 auto;
+}
+
+.db-menu-header__center {
+  display: flex;
+  align-items: center;
+  gap: var(--dimension-4);
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.db-menu-header__right {
+  display: flex;
+  align-items: center;
+  padding-top: var(--dimension-8);
+  gap: var(--dimension-3);
+  flex: 0 0 auto;
+
+  body[data-theme='modern-dark'] & {
+    --db-dashboard-menu-header-share-icon-color: var(--color-corporate-green-50);
+  }
+
+  body[data-theme='facelift'] & {
+    --db-dashboard-menu-header-share-icon-color: var(--color-corporate-green-70);
+  }
+}
+
+.db-menu-header__time-picker {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* stylelint-disable-next-line checkmk/vue-bem-naming-convention */
+.no-underline {
+  text-decoration: none !important;
+}
+
+/* stylelint-disable-next-line checkmk/vue-bem-naming-convention */
+.edit-mode-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--dimension-4);
+}
+</style>

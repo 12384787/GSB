@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from typing import Annotated
+
+from cmk.ccc.site import omd_site, SiteId
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.logged_in import user
+from cmk.gui.openapi.framework import (
+    ApiContext,
+    APIVersion,
+    EndpointDoc,
+    EndpointHandler,
+    EndpointMetadata,
+    EndpointPermissions,
+    PathParam,
+    VersionedEndpoint,
+)
+from cmk.gui.openapi.framework.model.converter import SiteIdConverter, TypedPlainValidator
+from cmk.gui.openapi.restful_objects.constructors import object_href
+from cmk.gui.openapi.utils import RestAPIRequestGeneralException
+from cmk.gui.site_config import site_is_local
+from cmk.gui.user_sites import activation_sites
+from cmk.gui.watolib.audit_log import make_audit_log_change_hook
+from cmk.gui.watolib.hosts_and_folders import make_folder_tree
+from cmk.gui.watolib.pending_changes import (
+    index_update_change_hook,
+    PendingChanges,
+    PendingChangesStore,
+)
+from cmk.gui.watolib.site_management import (
+    add_changes_after_editing_site_connection,
+    SitesApiMgr,
+)
+from cmk.livestatus_client import SiteConfiguration
+
+from .endpoint_family import SITE_MANAGEMENT_FAMILY
+from .models.request_models import SiteConnectionEditModel
+from .models.response_models import SiteConnectionModel
+from .utils import PERMISSIONS_WITH_SAML_CONNECTION_READ
+
+
+def _preserve_non_modeled_site_config_fields(
+    site_config_spec_from_request: SiteConfiguration,
+    old_site_config: SiteConfiguration,
+) -> None:
+    """Carry over stored fields the API request/response models do not expose.
+
+    Without this, rebuilding the config from the request body would drop them.
+    """
+    if (secret := old_site_config.get("secret")) is not None:
+        site_config_spec_from_request["secret"] = secret
+
+    if (site_globals := old_site_config.get("globals")) is not None:
+        site_config_spec_from_request["globals"] = site_globals
+
+
+def edit_site_connection_v1(
+    api_context: ApiContext,
+    site_id: Annotated[
+        SiteId,
+        TypedPlainValidator(str, SiteIdConverter.should_exist),
+        PathParam(description="An existing site ID.", example="prod"),
+    ],
+    body: SiteConnectionEditModel,
+) -> SiteConnectionModel:
+    """Edit a site connection"""
+    user.need_permission("wato.sites")
+
+    site_config_spec_from_request = body.site_config.to_internal()
+    # The site ID from the path is authoritative, the one from the request body is ignored.
+    site_config_spec_from_request["id"] = site_id
+
+    sites_api_mgr = SitesApiMgr()
+    old_site_config = sites_api_mgr.get_a_site(site_id)
+    _preserve_non_modeled_site_config_fields(
+        site_config_spec_from_request,
+        old_site_config,
+    )
+
+    try:
+        sites_to_update = sites_api_mgr.get_connected_sites_to_update(
+            new_or_deleted_connection=False,
+            modified_site=site_id,
+            current_site_config=site_config_spec_from_request,
+            old_site_config=sites_api_mgr.get_a_site(site_id),
+            site_configs=sites_api_mgr.get_all_sites(),
+        )
+
+        sites_api_mgr.validate_and_save_site(
+            make_folder_tree(api_context.config),
+            site_id,
+            site_config_spec_from_request,
+            pprint_value=api_context.config.wato_pprint_config,
+            liveproxyd_enabled=api_context.config.liveproxyd_enabled,
+            use_git=api_context.config.wato_use_git,
+            acting_user_id=api_context.user.id,
+        )
+    except MKUserError as exc:
+        raise RestAPIRequestGeneralException(
+            status=400,
+            title="User Error",
+            detail=str(exc),
+        )
+
+    # Read activation sites from the post-save state. ``api_context.config.sites`` is a
+    # request-start snapshot, so changes to ``replication`` made by this edit (e.g. enabling
+    # replication on a previously non-replicated site) would otherwise not be reflected in
+    # ``activation_sites`` and ``PendingChanges._resolve_scope`` could drop the change.
+    add_changes_after_editing_site_connection(
+        site_id=site_id,
+        is_new_connection=False,
+        replication_enabled=bool(site_config_spec_from_request.get("replication")),
+        is_local_site=site_is_local(site_config_spec_from_request),
+        connected_sites=sites_to_update,
+        pending_changes=PendingChanges(
+            activation_sites=activation_sites(sites_api_mgr.get_all_sites()),
+            local_site=omd_site(),
+            acting_user=api_context.user.id,
+            store=PendingChangesStore(),
+            hooks=(
+                make_audit_log_change_hook(use_git=api_context.config.wato_use_git),
+                index_update_change_hook,
+            ),
+        ),
+    )
+
+    return SiteConnectionModel.from_internal(
+        make_folder_tree(api_context.config), sites_api_mgr.get_a_site(site_id)
+    )
+
+
+ENDPOINT_EDIT_SITE_CONNECTION = VersionedEndpoint(
+    metadata=EndpointMetadata(
+        path=object_href("site_connection", "{site_id}"),
+        link_relation="cmk/update",
+        method="put",
+    ),
+    permissions=EndpointPermissions(required=PERMISSIONS_WITH_SAML_CONNECTION_READ),
+    doc=EndpointDoc(family=SITE_MANAGEMENT_FAMILY.name),
+    versions={APIVersion.V1: EndpointHandler(handler=edit_site_connection_v1)},
+)

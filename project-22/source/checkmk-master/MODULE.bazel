@@ -1,0 +1,918 @@
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+openapi_spec_editions = use_repo_rule("//bazel/rules:openapi_spec_editions.bzl", "detect_openapi_spec_editions")
+
+repo_license = use_repo_rule("//bazel/rules:repo_license.bzl", "detect_repo_license")
+
+snap7_repository = use_repo_rule("//omd/packages/snap7:snap7_repository.bzl", "snap7_repository")
+
+windows_python_wheels = use_repo_rule("//agents/modules/windows:windows_python_wheels.bzl", "windows_python_wheels")
+
+bazel_dep(name = "asio", version = "1.34.2.cmk.1")
+bazel_dep(name = "aspect_bazel_lib", version = "2.22.5")
+bazel_dep(name = "aspect_rules_js", version = "3.4.1")
+
+# Both of the next two are pinned by a single_version_override below, which wins
+# unconditionally, so these versions have to match it or they merely mislead.
+bazel_dep(name = "aspect_rules_lint", version = "2.0.0")
+bazel_dep(name = "aspect_rules_py", version = "1.5.2")
+bazel_dep(name = "aspect_rules_ts", version = "3.10.1")
+bazel_dep(name = "aspect_rules_webpack", version = "0.18.0")
+bazel_dep(name = "bazel_skylib", version = "1.9.0")
+bazel_dep(name = "cabextract", version = "1.11")
+bazel_dep(name = "cmk", version = "0.0.0")
+bazel_dep(name = "crypt-ssleay", version = "0.72.cmk.2", repo_name = "Crypt-SSLeay")
+bazel_dep(name = "gazelle", version = "0.51.3")
+bazel_dep(name = "gcc_toolchain", version = "gcc14.4.0.glibc2.28.cmk.4")
+bazel_dep(name = "googletest", version = "1.17.0", repo_name = "gtest")
+bazel_dep(name = "lcab", version = "1.0b12.cmk.1")
+bazel_dep(name = "libgsf", version = "1.14.44.cmk.4")
+bazel_dep(name = "llvm_toolchain", version = "21.1.8.cmk.1")
+bazel_dep(name = "mod_fcgid", version = "2.3.9.cmk.1")
+bazel_dep(name = "mod_wsgi", version = "5.0.2.cmk.1")
+bazel_dep(name = "msitools", version = "0.94.cmk.8")
+bazel_dep(name = "nagios", version = "3.5.1.cmk.1")
+bazel_dep(name = "openssl", version = "3.5.7.cmk.1")
+bazel_dep(name = "osslsigncode", version = "2.10.cmk.1")
+bazel_dep(name = "package_metadata", version = "0.0.7")
+bazel_dep(name = "patch", version = "2.7.6.cmk.1")
+bazel_dep(name = "patchelf", version = "0.18.0.bcr.1")
+bazel_dep(name = "perl-modules", version = "0.0.1.cmk.2")
+bazel_dep(name = "plantuml", version = "1.2026.2.cmk.1")
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "pnp4nagios", version = "0.6.26.cmk.2")
+bazel_dep(name = "protobuf", version = "33.4")
+bazel_dep(name = "redis", version = "8.4.5.cmk.1")
+bazel_dep(name = "rules_cc", version = "0.2.25")
+bazel_dep(name = "rules_foreign_cc", version = "0.15.1")
+bazel_dep(name = "rules_go", version = "0.63.0")
+bazel_dep(name = "rules_gzip", version = "1.0.0")
+bazel_dep(name = "rules_java", version = "9.9.0")
+bazel_dep(name = "rules_multirun", version = "0.12.0")
+bazel_dep(name = "rules_multitool", version = "1.9.0")
+bazel_dep(name = "rules_mypy", version = "0.41.0")
+bazel_dep(name = "rules_nodejs", version = "6.7.5")
+bazel_dep(name = "rules_oci", version = "2.2.6")
+bazel_dep(name = "rules_distroless", version = "0.6.2")
+bazel_dep(name = "rules_pkg", version = "1.1.0")
+bazel_dep(name = "rules_proto", version = "7.1.0")
+bazel_dep(name = "rules_proto_grpc", version = "5.3.1")
+bazel_dep(name = "rules_python", version = "2.3.3")
+bazel_dep(name = "rules_rust", version = "0.74.0")
+bazel_dep(name = "rules_shell", version = "0.8.0")
+bazel_dep(name = "rules_uv", version = "0.89.2")
+bazel_dep(name = "rrdtool", version = "1.7.2.cmk.3")
+bazel_dep(name = "shunit2", version = "2.1.9pre.cmk.1")
+bazel_dep(name = "tar.bzl", version = "0.10.9")
+bazel_dep(name = "toolchains_musl", version = "0.1.20")
+bazel_dep(name = "clickhouse", version = "26.3.16.10001.altinitystable.cmk.1")
+bazel_dep(name = "rules_sphinx", version = "0.2.0")
+bazel_dep(name = "lcov", version = "2.3.2")
+bazel_dep(name = "zstd", version = "1.5.7")
+
+bazel_dep(name = "libpcap", version = "1.10.5.bcr.3", dev_dependency = True)
+
+# rules_sphinx is not yet on BCR
+archive_override(
+    module_name = "rules_sphinx",
+    integrity = "sha256-pWjims7Jpmcgt+/+6JfdNpS9/Ry67PjIZ5nlK4lTqpA=",
+    strip_prefix = "rules_sphinx-5df77a3567592ffda069b78297bdd9e5cc01ac3a",
+    urls = ["https://github.com/agoessling/rules_sphinx/archive/5df77a3567592ffda069b78297bdd9e5cc01ac3a.tar.gz"],
+)
+
+bazel_dep(name = "supply_chain_tools", dev_dependency = True)
+
+# Not yet on BCR
+archive_override(
+    module_name = "supply_chain_tools",
+    integrity = "sha256-cdWGhDFqBCMReqMiFKhxW0WFNxClmuveftNI+GtUQ48=",
+    strip_prefix = "supply-chain-01cb081215f4a9ab15228330416bb47cb0d9ce43/tools",
+    urls = ["https://github.com/bazel-contrib/supply-chain/archive/01cb081215f4a9ab15228330416bb47cb0d9ce43.tar.gz"],
+)
+
+bazel_dep(name = "bazel_env.bzl", version = "0.5.0", dev_dependency = True)
+bazel_dep(
+    name = "buildifier_prebuilt",
+    version = "8.0.0",
+    dev_dependency = True,
+)
+bazel_dep(
+    name = "cpp-httplib",
+    version = "0.30.1.cmk.2",
+    dev_dependency = True,
+    repo_name = "httplib",
+)
+bazel_dep(
+    # Hedron's Compile Commands Extractor for Bazel
+    # https://github.com/hedronvision/bazel-compile-commands-extractor
+    name = "hedron_compile_commands",
+    dev_dependency = True,
+)
+archive_override(
+    module_name = "hedron_compile_commands",
+    # No tags, no releases.  Let's go with today's head.
+    integrity = "sha256-BEsUixEeF87mHYw6ru1CBp9zJUYDgjQK/KSRn4JlCUw=",
+    strip_prefix = "bazel-compile-commands-extractor-1e08f8e0507b6b6b1f4416a9a22cf5c28beaba93",
+    urls = ["https://github.com/hedronvision/bazel-compile-commands-extractor/archive/1e08f8e0507b6b6b1f4416a9a22cf5c28beaba93.tar.gz"],
+)
+
+# Clang's resource-dir headers (stddef.h, mmintrin.h, ...), extracted from the upstream LLVM
+# release by buildscripts/scripts/extract_llvm.sh.
+bazel_dep(name = "clang-resource-headers", version = "21.1.8.cmk.1", dev_dependency = True)
+
+archive_override(
+    module_name = "rules_mypy",
+    integrity = "sha256-rf/7qI1Atf//4SlJfQWhsyAt+SaZjQoYDKRZ93TXQBQ=",
+    patch_strip = 1,
+    patches = [
+        "bazel/patches/rules_mypy.patch",
+        "bazel/patches/rules_mypy-show_column_numbers.patch",
+        "bazel/patches/rules_mypy-pyhardlink-cache-merge.patch",
+        "bazel/patches/rules_mypy-exec_cfg_types.patch",
+        "bazel/patches/rules_mypy-bin_dir_in_mypypath.patch",
+    ],
+    strip_prefix = "rules_mypy-cda38312dbdc003592818d667c68346acea5672d",  # v0.37.0
+    urls = ["https://github.com/bazel-contrib/rules_mypy/archive/cda38312dbdc003592818d667c68346acea5672d.tar.gz"],
+)
+
+single_version_override(
+    module_name = "rules_go",
+    patch_strip = 1,
+    patches = [
+        "bazel/patches/rules_go-honor-action-envs.patch",
+    ],
+)
+
+# Held at 2.0.0 by the stack of patches below. Note that this does not leave us
+# behind on aspect_rules_js: every 2.x release of rules_lint, 2.9.0 included,
+# declares a floor of aspect_rules_js 1.40.0 and relies on version resolution to
+# supply something newer, so upgrading would not change which rules_js it gets.
+single_version_override(
+    module_name = "aspect_rules_lint",
+    patch_strip = 1,
+    patches = [
+        "//bazel/patches:rules_lint-groovy.patch",
+        "//bazel/patches:rules_lint-groovy-lint.patch",
+        # Carried locally — no upstream PR yet.
+        "//bazel/patches:rules_lint-add-powershell-formatter.patch",
+        "//bazel/patches:rules_lint-include-files-with-bazel-extension.patch",
+        # https://github.com/aspect-build/rules_lint/issues/690
+        "//bazel/patches:rules_lint-fix-ruff-sarif-output.patch",
+        # https://github.com/aspect-build/rules_lint/pull/734
+        "//bazel/patches:rules_lint-clang_tidy_per_file.patch",
+        # https://github.com/aspect-build/rules_lint/pull/747
+        "//bazel/patches:rules_lint-no_copy.patch",
+        # Completes the patch above, not part of that PR (yet).
+        "//bazel/patches:rules_lint-clippy_fixer_at_exec_root.patch",
+        "//bazel/patches:rules_lint-clippy_fail_on_violation.patch",
+        # For astrein and other internal tooling.
+        "//bazel/patches:rules_lint_export_helpers.patch",
+        "//bazel/patches:rules_lint-fix_format_args_too_long.patch",
+        # https://github.com/aspect-build/rules_lint/pull/799
+        "//bazel/patches:rules_lint-stylelint-capture-stdout.patch",
+        # Carried locally — no upstream PR yet.
+        "//bazel/patches:rules_lint-clang_tidy_builtin_include_dir.patch",
+    ],
+    version = "2.0.0",
+)
+
+single_version_override(
+    module_name = "aspect_rules_py",
+    patch_strip = 1,
+    patches = [
+        # https://github.com/aspect-build/rules_py/pull/577
+        "//bazel/patches:rules_py-no_mypy_for_py_pytest_main.patch",
+    ],
+    version = "1.5.2",
+)
+
+single_version_override(
+    module_name = "libxml2",
+    patch_strip = 1,
+    patches = ["//bazel/patches:libxml2-silence_format_extra_args.patch"],
+)
+
+single_version_override(
+    module_name = "protobuf",
+    patch_strip = 1,
+    patches = ["//bazel/patches:protobuf-silence_build_warnings.patch"],
+)
+
+single_version_override(
+    module_name = "rules_cc",
+    patch_strip = 1,
+    patches = [
+        "//bazel/patches:rules_cc-publicize_unix_cc_toolchain_config.patch",
+        "//bazel/patches:rules_cc-drop_sanitize_pwd_env.patch",
+    ],
+)
+
+single_version_override(
+    module_name = "rules_foreign_cc",
+    patch_strip = 1,
+    patches = ["//omd/packages/foreign_cc:symlink.patch"],
+)
+
+single_version_override(
+    module_name = "rules_pkg",
+    patch_strip = 1,
+    patches = [
+        "//bazel/patches:rules_pkg1-pkg_deb-add-support-for-md5sums.patch",
+        "//bazel/patches:rules_pkg_expand-variables-in-package-name.diff",
+    ],
+)
+
+single_version_override(
+    module_name = "rules_python",
+    patch_strip = 1,
+    patches = [
+        "//bazel/patches:rules_python-py_wheel-filter_out_virtual_imports.patch",
+    ],
+)
+
+single_version_override(
+    module_name = "rules_rust",
+    patch_strip = 1,
+    patches = [
+        # Carried locally — no upstream PR yet.
+        "//bazel/patches:rules_rust-construct_arguments_process_wrapper.patch",
+    ],
+)
+
+single_version_override(
+    module_name = "rules_uv",
+    patch_strip = 1,
+    patches = [
+        "//bazel/patches:rules_uv_rm_venv.patch",
+        "//bazel/patches:rules_uv_quiet.patch",
+        "//bazel/patches:rules_uv_create_venv_whls.patch",
+        "//bazel/patches:rules_uv-requirements_in_info.patch",
+        "//bazel/patches:rules_uv-inject_env.patch",
+    ],
+)
+
+local_path_override(
+    module_name = "cmk",
+    path = "bazel/cmk",
+)
+
+# TODO: Duplicate from bazel_variables.bzl. won't be needed anymore when all omd packages are loaded via MODULE.bazel
+UPSTREAM_MIRROR_URL = "https://artifacts.lan.tribe29.com/repository/upstream-archives/"
+
+# matplotlib 3.11.1 vendored dependencies
+http_file(
+    name = "matplotlib_freetype_src",
+    downloaded_file_path = "freetype-2.14.3.tar.xz",
+    sha256 = "36bc4f1cc413335368ee656c42afca65c5a3987e8768cc28cf11ba775e785a5f",
+    urls = [
+        "https://download.savannah.nongnu.org/releases/freetype/freetype-2.14.3.tar.xz",
+        "https://downloads.sourceforge.net/project/freetype/freetype2/2.14.3/freetype-2.14.3.tar.xz",
+    ],
+)
+
+http_file(
+    name = "matplotlib_harfbuzz_src",
+    downloaded_file_path = "harfbuzz-14.1.0.tar.xz",
+    sha256 = "ee0eb3a1da2c5a28147f12dff55f6c7d60aeeeb29ac7ef334eabe84c8476c105",
+    urls = [
+        "https://github.com/harfbuzz/harfbuzz/releases/download/14.1.0/harfbuzz-14.1.0.tar.xz",
+        "https://github.com/mesonbuild/wrapdb/releases/download/harfbuzz_14.1.0-1/harfbuzz-14.1.0.tar.xz",
+    ],
+)
+
+http_file(
+    name = "matplotlib_sheenbidi_src",
+    downloaded_file_path = "sheenbidi-3.0.0.tar.gz",
+    sha256 = "86c56014034739ba39a24c23eb00323b0bf6f737354f665786015fca842af786",
+    url = "https://github.com/Tehreer/SheenBidi/archive/refs/tags/v3.0.0/sheenbidi-3.0.0.tar.gz",
+)
+
+http_file(
+    name = "matplotlib_libraqm_src",
+    downloaded_file_path = "libraqm-0.10.5.tar.gz",
+    sha256 = "7f3dd21b4b3bd28a36f2c911d31d91a9d69341697713923ef1aac65d56ebcafd",
+    url = "https://github.com/HOST-Oman/libraqm/archive/v0.10.5/libraqm-0.10.5.tar.gz",
+)
+
+http_file(
+    name = "matplotlib_qhull_src",
+    downloaded_file_path = "qhull-8.0.2.tgz",
+    sha256 = "8774e9a12c70b0180b95d6b0b563c5aa4bea8d5960c15e18ae3b6d2521d64f8b",
+    url = "https://github.com/qhull/qhull/archive/v8.0.2/qhull-8.0.2.tar.gz",
+)
+
+# Artifacts built and published by our own CI jobs, laid out like so:
+# <publisher>/<name>/<version>/<platform>/<arch>/<variant>/<file>
+CI_ARTIFACTS_URL = "https://ci-binary-artifacts-710145618630-eu-central-1-an.s3.eu-central-1.amazonaws.com/dl/"
+
+http_file(
+    name = "otel_collector_custom_builder",
+    executable = True,
+    sha256 = "377152923d0ce97fd14b14f8b11b1aaa151d4e64afe8976c31329173b62840e6",
+    url = "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/cmd%2Fbuilder%2Fv0.150.0/ocb_0.150.0_linux_amd64",
+)
+
+# Configure apt for relay distro packages
+apt = use_extension("@rules_distroless//apt:extensions.bzl", "apt")
+apt.install(
+    name = "relay_base_image",
+    lock = "//omd/non-free/relay:distro_packages.lock.json",
+    manifest = "//omd/non-free/relay:distro_packages.yaml",
+)
+use_repo(apt, "relay_base_image")
+
+# Configure apt for the ReviewMK job image
+apt.install(
+    name = "reviewmk_job_image",
+    lock = "//non-free/packages/cmk-dev-ai:deploy/job-image/distro_packages.lock.json",
+    manifest = "//non-free/packages/cmk-dev-ai:deploy/job-image/distro_packages.yaml",
+)
+use_repo(apt, "reviewmk_job_image")
+
+# Claude Code CLI is unfortunately not available through standard package managers, so
+# we expose it directly for the deploy target
+http_file(
+    name = "claude_code_linux_x64",
+    downloaded_file_path = "claude",
+    executable = True,
+    integrity = "sha256-JtAgNR6BEvQAZ5Dzz85DtMnfDBux0OVCNk1kFRuB1bo=",
+    urls = [
+        "https://downloads.claude.ai/claude-code-releases/2.1.263/linux-x64/claude",
+        UPSTREAM_MIRROR_URL + "/claude-code-2.1.263-linux-x64",
+    ],
+)
+
+# Java runtimes we hand to tools explicitly:
+#   remotejdk25_linux - Wiremock-based component/unit tests. Previously provided
+#                       implicitly via WORKSPACE; expose it explicitly under Bzlmod.
+#   remotejdk17_linux - CodeNarc, run by the npm-groovy-lint formatter. It insists
+#                       on exactly Java 17 and downloads a JRE from github.com at
+#                       runtime when it cannot find one, which flakes in CI.
+java_toolchains = use_extension("@rules_java//java:extensions.bzl", "toolchains")
+use_repo(
+    java_toolchains,
+    "remotejdk17_linux",
+    "remotejdk25_linux",
+)
+
+http_file(
+    name = "taplo.gz",
+    integrity = "sha256-j+GWuJTM+QcvmNThAToYAwbhfSRIMLA5hu5ejqvrYVY=",
+    urls = [
+        "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-x86_64.gz",
+        UPSTREAM_MIRROR_URL + "/taplo-linux-x86_64-0.10.0.gz",
+    ],
+)
+
+# A portable Wine build (WoW64: 64-bit, no i386 multilib on the host).
+# The build recipe, source pin and publishing job live in third_party/wine/ and
+# buildscripts/scripts/build-wine-from-source.groovy.
+http_archive(
+    name = "wine_linux_x86_64",
+    build_file = "//third_party/wine:BUILD.wine.bazel",
+    sha256 = "2894e6624bcf8714c5b4c303ca9f125e3ebdd5275e1d62308290aa4feb278e27",
+    strip_prefix = "wine-11.0-amd64-wow64",
+    urls = [
+        CI_ARTIFACTS_URL + "wine/wine/11.0/linux/amd64/wow64/wine-11.0-amd64-wow64.tar.xz",
+    ],
+)
+
+http_archive(
+    name = "oci-basic-light-win-x64",
+    # The archive holds one instantclient_<version> directory. Globbing it with
+    # ** rather than naming it keeps a version bump to the url and the checksum:
+    # a stale directory name would match nothing and produce an empty package
+    # instead of an error.
+    build_file_content = """
+filegroup(
+    name = "srcs",
+    srcs = glob(["**/*.dll"]),
+    visibility = ["//visibility:public"],
+)
+""",
+    sha256 = "fddc4c0eb1bf3c7dc3b29f2d4570aed07d707cec6917ab5f09635fc67cb02708",
+    urls = [
+        "https://download.oracle.com/otn_software/nt/instantclient/2118000/instantclient-basiclite-windows.x64-21.18.0.0.0dbru.zip",
+        UPSTREAM_MIRROR_URL + "/instantclient-basiclite-windows.x64-21.18.0.0.0dbru.zip",
+    ],
+)
+
+http_archive(
+    name = "oci-basic-light-lin-x64",
+    build_file_content = """
+filegroup(
+    name = "srcs",
+    srcs = glob([
+        "**/libclntshcore.so.21.1",
+        "**/libclntsh.so.21.1",
+        "**/libnnz21.so",
+        "**/libocci_gcc53.so.21.1",
+        "**/libocci.so.21.1",
+        "**/libociicus.so",
+        "**/libocijdbc21.so",
+        "**/liboramysql.so",
+        ]),
+    visibility = ["//visibility:public"],
+)
+""",
+    sha256 = "87208c83f23b7e6c934ca7047c00044aa1b0adc8d0dd60cb0ee16042593b4af5",
+    urls = [
+        "https://download.oracle.com/otn_software/linux/instantclient/2118000/instantclient-basiclite-linux.x64-21.18.0.0.0dbru.zip",
+        UPSTREAM_MIRROR_URL + "/instantclient-basiclite-linux.x64-21.18.0.0.0dbru.zip",
+    ],
+)
+
+http_archive(
+    # TODO: re2 is available from the central registry.  However, there seems
+    # to be versioning issues with protobuf.
+    name = "re2",
+    sha256 = "665b65b6668156db2b46dddd33405cd422bd611352c5052ab3dae6a5fbac5506",
+    strip_prefix = "re2-2022-12-01",
+    urls = [
+        "https://github.com/google/re2/archive/refs/tags/2022-12-01.tar.gz",
+        UPSTREAM_MIRROR_URL + "re2-2022-12-01.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "erlang",
+    build_file = "//omd/packages/erlang:BUILD.erlang.bazel",
+    patch_args = ["-p1"],
+    patch_tool = "patch",
+    patches = [
+        "//omd/packages/erlang/patches:0001-strip-bazel-paths-from-compile-info.dif",
+    ],
+    sha256 = "a02efb423a7ecdee661b3c3ad2661521d9c00c2dd866c004d95a87d486a03bab",
+    strip_prefix = "otp_src_26.2.5.13",
+    urls = [
+        UPSTREAM_MIRROR_URL + "otp_src_26.2.5.13.tar.gz",
+        "https://github.com/erlang/otp/releases/download/OTP-26.2.5.13/otp_src_26.2.5.13.tar.gz",
+    ],
+)
+
+http_file(
+    name = "jaeger",
+    sha256 = "1d810bf04f7e08dac796ad532fc68f1a8fceb0333d2524ae767d88533e69ed75",
+    urls = [
+        "https://github.com/jaegertracing/jaeger/releases/download/v2.18.0/jaeger-2.18.0-linux-amd64.tar.gz",
+        UPSTREAM_MIRROR_URL + "jaeger-2.18.0-linux-amd64.tar.gz",
+    ],
+)
+
+# cmk-network-flow payload: a prebuilt ntopng bundle (binary + private libs + share/
+# tree), snapshotted from ntop's rolling apt-stable build. Consumed by
+# omd/non-free/packages/cmk-network-flow/BUILD.
+http_file(
+    name = "cmk_network_flow_bundle",
+    downloaded_file_path = "cmk-network-flow-bundle.tar.gz",
+    sha256 = "28c31fbdf150227ca4be6bde78487daab6b6604734d8deae48ba29f8db2f1dee",
+    urls = [
+        UPSTREAM_MIRROR_URL + "flow-bundle-6.6.260622-slim.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "nrpe",
+    build_file = "//omd/packages/nrpe:BUILD.nrpe.bazel",
+    sha256 = "8ad2d1846ab9011fdd2942b8fc0c99dfad9a97e57f4a3e6e394a4ead99c0f1f0",
+    strip_prefix = "nrpe-3.2.1",
+    urls = [
+        "https://github.com/NagiosEnterprises/nrpe/releases/download/nrpe-3.2.1/nrpe-3.2.1.tar.gz",
+        UPSTREAM_MIRROR_URL + "nrpe-3.2.1.tar.gz",
+    ],
+)
+
+http_file(
+    name = "snap7_archive",
+    sha256 = "1f4270cde8684957770a10a1d311c226e670d9589c69841a9012e818f7b9f80e",
+    urls = [
+        # Since version 1.4.2 only 7z will be released, http_archive does not
+        # support 7z (until we update to bazel 9), so we use a repository rule
+        # to download 7zip and use it to unpack the archive.
+        "https://sourceforge.net/projects/snap7/files/1.4.2/snap7-full-1.4.2.7z",
+        UPSTREAM_MIRROR_URL + "snap7-full-1.4.2.7z",
+    ],
+)
+
+snap7_repository(
+    name = "snap7",
+    archive = "@snap7_archive//file:downloaded",
+    build_file = "//omd/packages/snap7:BUILD.snap7.bazel",
+)
+
+http_archive(
+    name = "xmlsec1",
+    build_file = "//omd/packages/xmlsec1:BUILD.xmlsec1.bazel",
+    patch_args = ["-p1"],
+    patch_tool = "patch",
+    patches = [
+        "//omd/packages/xmlsec1/patches:0001-relocatable-crypto-module-search.dif",
+    ],
+    sha256 = "d0180916ae71be28415a6fa919a0684433ec9ec3ba1cc0866910b02e5e13f5bd",
+    strip_prefix = "xmlsec1-1.3.8",
+    urls = [
+        "https://github.com/lsh123/xmlsec/releases/download/1.3.8/xmlsec1-1.3.8.tar.gz",
+        UPSTREAM_MIRROR_URL + "xmlsec1-1.3.8.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "heirloom-mailx",
+    build_file = "//omd/packages/heirloom-mailx:BUILD.heirloom-mailx.bazel",
+    patch_args = ["-p1"],
+    patch_tool = "patch",
+    patches = [
+        "//omd/packages/heirloom-mailx/patches:0001-nail-11.25-config.dif",
+        "//omd/packages/heirloom-mailx/patches:0002-mailx-12.3-pager.dif",
+        "//omd/packages/heirloom-mailx/patches:0003-mailx-12.5-lzw.dif",
+        "//omd/packages/heirloom-mailx/patches:0004-mailx-12.5-fname-null.dif",
+        "//omd/packages/heirloom-mailx/patches:0005-mailx-12.5-collect.dif",
+        "//omd/packages/heirloom-mailx/patches:0006-mailx-12.5-usage.dif",
+        "//omd/packages/heirloom-mailx/patches:0007-mailx-12.5-man-page-fixes.dif",
+        "//omd/packages/heirloom-mailx/patches:0008-mailx-12.5-outof-Introduce-expandaddr-flag.dif",
+        "//omd/packages/heirloom-mailx/patches:0009-mailx-12.5-fio.c-Unconditionally-require-wordexp-support.dif",
+        "//omd/packages/heirloom-mailx/patches:0010-mailx-12.5-globname-Invoke-wordexp-with-WRDE_NOCMD-CVE-2004-277.dif",
+        "//omd/packages/heirloom-mailx/patches:0011-mailx-12.5-unpack-Disable-option-processing-for-email-addresses.dif",
+        "//omd/packages/heirloom-mailx/patches:0012-mailx-12.5-empty-from.dif",
+        "//omd/packages/heirloom-mailx/patches:0013-mailx-12.5-nss-hostname-matching.dif",
+        "//omd/packages/heirloom-mailx/patches:0014-mailx-12.5-encsplit.dif",
+        "//omd/packages/heirloom-mailx/patches:0015-mailx-12.5-openssl.dif",
+        "//omd/packages/heirloom-mailx/patches:0016-mailx-12.5-no-SSLv3.dif",
+        "//omd/packages/heirloom-mailx/patches:0017-disable-ssl-and-kerberos.dif",
+        "//omd/packages/heirloom-mailx/patches:0018-dont-install-etc-files.dif",
+    ],
+    sha256 = "015ba4209135867f37a0245d22235a392b8bbed956913286b887c2e2a9a421ad",
+    strip_prefix = "heirloom-mailx-12.5",
+    urls = [
+        "https://anduin.linuxfromscratch.org/BLFS/mailx/heirloom-mailx_12.5.orig.tar.gz",
+        UPSTREAM_MIRROR_URL + "heirloom-mailx_12.5.orig.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "stunnel",
+    build_file = "//omd/packages/stunnel:BUILD.stunnel.bazel",
+    patch_args = ["-p1"],
+    patches = [
+        "//omd/packages/stunnel:0001-fix-hup-race-data-loss.patch",
+        "//omd/packages/stunnel:0002-fix-hup-buffer-full-livelock.patch",
+    ],
+    sha256 = "8727e53bb8b7528f850327a2a149158422c02183bc120d1d733cc65b1e2c349d",
+    strip_prefix = "stunnel-5.78",
+    urls = [
+        "https://www.stunnel.org/archive/5.x/stunnel-5.78.tar.gz",
+        UPSTREAM_MIRROR_URL + "stunnel-5.78.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "monitoring-plugins",
+    build_file = "//omd/packages/monitoring-plugins:BUILD.monitoring-plugins.bazel",
+    patch_args = ["-p1"],
+    patch_tool = "patch",
+    patches = [
+        "//omd/packages/monitoring-plugins:patches/0001-check-icmp-allows-pl-of-101.dif",
+        "//omd/packages/monitoring-plugins:patches/0003-cmk-password-store.dif",
+        "//omd/packages/monitoring-plugins:patches/0006-check_mysql-define-own-mysql-port.dif",
+        "//omd/packages/monitoring-plugins:patches/0009-check_dns-case-insensitive.dif",
+        "//omd/packages/monitoring-plugins:patches/0010-get_omd_root_in_checks.dif",
+        "//omd/packages/monitoring-plugins:patches/0011-check_http-sanitise-http-response-body.dif",
+        "//omd/packages/monitoring-plugins:patches/0012-fixup-ssl-linking.diff",
+        "//omd/packages/monitoring-plugins:patches/0013-link-root-plugins-statically.diff",
+    ],
+    sha256 = "e5dfd4ad8fde0a40da50aab3aff6d9a27020b8f283e332bc4da6ef9914f4028c",
+    strip_prefix = "monitoring-plugins-2.4.0",
+    urls = [
+        "https://www.monitoring-plugins.org/download/monitoring-plugins-2.4.0.tar.gz",
+        UPSTREAM_MIRROR_URL + "monitoring-plugins-2.4.0.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "freetds",
+    build_file = "//omd/packages/freetds:BUILD.freetds.bazel",
+    patch_args = ["-p1"],
+    patch_tool = "patch",
+    patches = [
+        "//omd/packages/freetds:patches/0001-remove-spurious-gperf-check.patch",
+        "//omd/packages/freetds:patches/0002-pregenerated-headers.patch",
+        "//omd/packages/freetds:patches/0003-skip-doc-subdirs.patch",
+        "//omd/packages/freetds:patches/0004-vendor-am-iconv-m4-macro.patch",
+        "//omd/packages/freetds:patches/0005-pregenerate-iconv_charsets.patch",
+    ],
+    sha256 = "fee2dafa7138485528ecccb727dc161c6fed576d0ab405d2ed3b3eff81fa2ca4",
+    strip_prefix = "freetds-1.4.22",
+    urls = [
+        "https://github.com/FreeTDS/freetds/archive/refs/tags/v1.4.22.tar.gz",
+        UPSTREAM_MIRROR_URL + "github.com/FreeTDS/freetds/archive/refs/tags/v1.4.22.tar.gz/freetds-1.4.22.tar.gz",
+    ],
+)
+
+http_archive(
+    name = "heirloom-pkgtools",
+    build_file = "//omd/packages/heirloom-pkgtools:BUILD.heirloom-pkgtools.bazel",
+    patch_args = ["-p1"],
+    patch_tool = "patch",
+    patches = [
+        "//omd/packages/heirloom-pkgtools/patches:0000-set-linux-paths.dif",
+        "//omd/packages/heirloom-pkgtools/patches:0001-fix-invalid-open-call.dif",
+        "//omd/packages/heirloom-pkgtools/patches:0002-scriptvfy.l.dif",
+        "//omd/packages/heirloom-pkgtools/patches:0003-binpath.dif",
+        "//omd/packages/heirloom-pkgtools/patches:0004-compute_checksum-64bit.dif",
+        "//omd/packages/heirloom-pkgtools/patches:0005-compute_checksum-64bit.dif",
+        "//omd/packages/heirloom-pkgtools/patches:0006-sbinpath.dif",
+        "//omd/packages/heirloom-pkgtools/patches:0007-stropts.dif",
+        "//omd/packages/heirloom-pkgtools/patches:0008-fix-comilation-with-openssl-1.1.0.dif",
+        "//omd/packages/heirloom-pkgtools/patches:0008-libfl.dif",
+        "//omd/packages/heirloom-pkgtools/patches:0010-fix-missing-makedev.dif",
+        "//omd/packages/heirloom-pkgtools/patches:0011-add-fcommon.dif",
+        "//omd/packages/heirloom-pkgtools/patches:0012-fix-termio-glibc-2.42.dif",
+    ],
+    sha256 = "aa94d33550847d57c62138cabd0f742d4af2f14aa2bfb9e9d4a9427bf498e6cc",
+    strip_prefix = "heirloom-pkgtools-070227",
+    urls = [
+        UPSTREAM_MIRROR_URL + "heirloom-pkgtools-070227.tar.bz2",
+        "https://sourceforge.net/projects/heirloom/files/heirloom-pkgtools/070227/heirloom-pkgtools-070227.tar.bz2",
+    ],
+)
+
+http_archive(
+    name = "rabbitmq",
+    build_file = "//omd/packages/rabbitmq:BUILD.rabbitmq.bazel",
+    sha256 = "7bfc742e3d227e8a2b1ea2a0b5ef3ba4b6a7987d5e220e0fbf0919d29b6ed43c",
+    strip_prefix = "rabbitmq_server-3.13.6",
+    urls = [
+        "https://github.com/rabbitmq/rabbitmq-server/releases/download/v3.13.6/rabbitmq-server-generic-unix-3.13.6.tar.xz",
+        UPSTREAM_MIRROR_URL + "rabbitmq-server-generic-unix-3.13.6.tar.xz",
+    ],
+)
+
+http_archive(
+    name = "robotmk",
+    build_file = "//omd/packages/robotmk:BUILD.robotmk.bazel",
+    sha256 = "613f14429ef7a76ad307d2913d3013ac24143062b700d9e84c0606798dd9d4bb",
+    urls = [
+        "https://github.com/elabit/robotmk/releases/download/v4.1.0-alpha-1/all_executables.zip",
+    ],
+)
+
+http_archive(
+    name = "python",
+    build_file = "//omd/packages/Python:BUILD.Python.bazel",
+    integrity = "sha256-O0jayPtZ9i6qZ6yDwesSvaG3oIQG3ShuJSwRpmvif4E=",
+    strip_prefix = "Python-3.14.7",
+    urls = [
+        "https://www.python.org/ftp/python/3.14.7/Python-3.14.7.tar.xz",
+        UPSTREAM_MIRROR_URL + "Python-3.14.7.tar.xz",
+    ],
+)
+
+http_archive(
+    name = "xinetd",
+    build_file = "//omd/packages/xinetd:BUILD.xinetd.bazel",
+    sha256 = "2baa581010bc70361abdfa37f121e92aeb9c5ce67f9a71913cebd69359cc9654",
+    strip_prefix = "xinetd-2.3.15.4",
+    urls = [
+        "https://github.com/openSUSE/xinetd/releases/download/2.3.15.4/xinetd-2.3.15.4.tar.xz",
+        UPSTREAM_MIRROR_URL + "xinetd-2.3.15.4.tar.xz",
+    ],
+)
+
+http_archive(
+    name = "net-snmp",
+    build_file = "//omd/packages/net-snmp:BUILD.net-snmp.bazel",
+    patch_args = ["-p1"],
+    patch_tool = "patch",
+    patches = [
+        "//omd/packages/net-snmp/patches:0001-remove-distutils.dif",
+        "//omd/packages/net-snmp/patches:0002-We-use-a-C-extension-so-we-are-better-not-zip_safe.dif",
+        "//omd/packages/net-snmp/patches:0003-Added-handling-of-opaque-floats.dif",
+        "//omd/packages/net-snmp/patches:0004-Fixed-copy-n-paste-error-regarding-the-context-engine-.dif",
+        "//omd/packages/net-snmp/patches:0005-Fixed-__snprint_value-s-return-value.dif",
+        "//omd/packages/net-snmp/patches:0006-Added-missing-initialization-of-Version-attribute.dif",
+        "//omd/packages/net-snmp/patches:0007-Fixed-reference-counting-for-netsnmp-module.dif",
+        "//omd/packages/net-snmp/patches:0008-Fixed-segfaults-in-netsnmp_-walk-getbulk-when-a-varbin.dif",  # submitted as https://github.com/net-snmp/net-snmp/pull/1027
+        "//omd/packages/net-snmp/patches:0009-Added-workaround-for-duplicate-engine-IDs.dif",
+        "//omd/packages/net-snmp/patches:0010-Emulate-Cc-behavior-in-netsnmp_walk.dif",
+        "//omd/packages/net-snmp/patches:0011-Handle-responses-with-invalid-variables-differently.dif",
+        "//omd/packages/net-snmp/patches:0012-Ensure-correct-openssl-version.dif",
+        "//omd/packages/net-snmp/patches:0013-fix-possible-TypeError-AttributeError-in-__del__.dif",
+        "//omd/packages/net-snmp/patches:0014-fix-curses-detection.dif",
+        "//omd/packages/net-snmp/patches:0015-python3-api.dif",
+        "//omd/packages/net-snmp/patches:0016-Python-Fix-snmpwalk-with-UseNumeric-1.dif",
+        "//omd/packages/net-snmp/patches:0017-no-fallthrough.dif",
+        "//omd/packages/net-snmp/patches:0018-update-user-information-for-python.dif",
+        "//omd/packages/net-snmp/patches:0019-Fix-NULL-varbind-in-get-getnext.dif",  # submitted as https://github.com/net-snmp/net-snmp/pull/1027
+        "//omd/packages/net-snmp/patches:0020-fix-bad-mib.dif",
+    ],
+    sha256 = "75b59d67e871aaaa31c8cef89ba7d06972782b97736b7e8c3399f36b50a8816f",
+    strip_prefix = "net-snmp-5.9.1",
+    urls = [
+        UPSTREAM_MIRROR_URL + "net-snmp-5.9.1.zip",
+        "https://deac-riga.dl.sourceforge.net/project/net-snmp/net-snmp/5.9.1/net-snmp-5.9.1.zip",
+    ],
+)
+
+http_archive(
+    name = "shellcheck",
+    build_file_content = """
+exports_files([
+    "shellcheck",
+])
+""",
+    sha256 = "6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87",
+    strip_prefix = "shellcheck-v0.10.0",
+    urls = [
+        "https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.x86_64.tar.xz",
+        UPSTREAM_MIRROR_URL + "/shellcheck-v0.10.0.linux.x86_64.tar.xz",
+    ],
+)
+
+http_file(
+    name = "wiremock_standalone",
+    downloaded_file_path = "wiremock-standalone-3.13.1.jar",
+    sha256 = "bdf4c705e7fd61c778e59a19f75396eac4520efeabfac97643a53979bd4d5716",
+    urls = [
+        "https://repo1.maven.org/maven2/org/wiremock/wiremock-standalone/3.13.1/wiremock-standalone-3.13.1.jar",
+        UPSTREAM_MIRROR_URL + "/wiremock-standalone-3.13.1.jar",
+    ],
+)
+
+# Per-feature python.org MSIs consumed by //agents/modules/windows:python_3_cab
+# to build python-3.cab on Linux without Wine.  Refresh via
+# agents/modules/windows/refresh_msi_pins.py <new version>.
+# cabarchive: pure-Python CAB writer used by the windows-agent python-3.cab
+# build (see //agents/modules/windows:python_3_cab) to package the produced
+# Python tree into a Microsoft Cabinet without a system gcab/makecab.exe.
+http_archive(
+    name = "cabarchive",
+    build_file = "//agents/modules/windows:cabarchive.BUILD.bazel",
+    integrity = "sha256-tQixytiQhX5V8/eiAnynvtudwF3l7/B/gon5VGIAp6o=",
+    strip_prefix = "cabarchive-0.2.5",
+    urls = [
+        "https://files.pythonhosted.org/packages/source/c/cabarchive/cabarchive-0.2.5.tar.gz",
+        UPSTREAM_MIRROR_URL + "cabarchive-0.2.5.tar.gz",
+    ],
+)
+
+http_file(
+    name = "python_msi_ucrt",
+    downloaded_file_path = "ucrt.msi",
+    sha256 = "c35e76105318b7472c6028e8d4a2f9b8ec1a3ef02897b4e49350c8adb84a2105",
+    url = "https://www.python.org/ftp/python/3.14.7/amd64/ucrt.msi",
+)
+
+http_file(
+    name = "python_msi_core",
+    downloaded_file_path = "core.msi",
+    sha256 = "3dfcfe7b42e6f2d683be427af62369761c7e6627aff6a8da2f439a9d11e62cdf",
+    url = "https://www.python.org/ftp/python/3.14.7/amd64/core.msi",
+)
+
+http_file(
+    name = "python_msi_exe",
+    downloaded_file_path = "exe.msi",
+    sha256 = "63035cb1fc01ec085c0f18e73f8c1b000ca148378f4f4b1db11f3baabcc8cf3a",
+    url = "https://www.python.org/ftp/python/3.14.7/amd64/exe.msi",
+)
+
+http_file(
+    name = "python_msi_lib",
+    downloaded_file_path = "lib.msi",
+    sha256 = "d68a92dcc61addb49e4678f60af2838d7675991341c9bf0facd2c5e7283841c3",
+    url = "https://www.python.org/ftp/python/3.14.7/amd64/lib.msi",
+)
+
+http_file(
+    name = "python_msi_pip",
+    downloaded_file_path = "pip.msi",
+    sha256 = "b9c87eee34ab2ded2702b1fb26ea031b07ffbb665617336b2a70508e660153eb",
+    url = "https://www.python.org/ftp/python/3.14.7/amd64/pip.msi",
+)
+
+# win_amd64 wheel closure for python-3.cab's .venv, fetched at the fetch phase
+# from the sha256-pinned lock.  Regenerate the lock via
+# agents/modules/windows/refresh_wheel_pins.py <new version>.
+windows_python_wheels(
+    name = "windows_python_wheels",
+    lock = "//agents/modules/windows:windows_python_wheels.lock.json",
+)
+
+http_archive(
+    name = "nagvis",
+    build_file = "//omd/packages/nagvis:BUILD.nagvis.bazel",
+    patch_args = ["-p1"],
+    patch_tool = "patch",
+    patches = [
+        "//omd/packages/nagvis/patches:0001-global.php.dif",
+        "//omd/packages/nagvis/patches:0002-cmkadmin.dif",
+    ],
+    sha256 = "21218c27662442432ba0a7fc701a051025639c9b9f6682e424b548d0dbc88c55",
+    strip_prefix = "nagvis-1.10.6",
+    urls = [
+        UPSTREAM_MIRROR_URL + "nagvis-1.10.6.tar.gz",
+        "https://github.com/NagVis/nagvis/releases/download/nagvis-1.10.6/nagvis-1.10.6.tar.gz",
+    ],
+)
+
+repo_license(name = "repo_license")
+
+openapi_spec_editions(name = "openapi_spec_editions")
+
+multitool = use_extension("@rules_multitool//multitool:extension.bzl", "multitool")
+multitool.hub(
+    hub_name = "multitool_hub",
+    lockfile = "//bazel/tools:multitool.lock.json",
+)
+use_repo(multitool, "multitool", "multitool_hub")
+
+powershell_repos = use_extension("//bazel/tools:powershell_repositories.bzl", "repos")
+use_repo(powershell_repos, "converttosarif", "psscriptanalyzer", "pwsh")
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2021",
+    versions = ["1.96.1"],
+)
+rust.repository_set(
+    name = "rust_linux_x86_64",
+    edition = "2021",
+    exec_triple = "x86_64-unknown-linux-gnu",
+    target_compatible_with = [
+        "//bazel/platforms:linker_unknown",
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_triple = "x86_64-unknown-linux-gnu",
+    versions = ["1.96.1"],
+)
+rust.repository_set(
+    name = "rust_linux_x86_64",
+    target_compatible_with = [
+        "//bazel/platforms:musl",
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_triple = "x86_64-unknown-linux-musl",
+)
+rust.repository_set(
+    name = "rust_linux_x86_64",
+    target_compatible_with = [
+        "//bazel/platforms:musl",
+        "@platforms//cpu:arm64",
+        "@platforms//os:linux",
+    ],
+    target_triple = "aarch64-unknown-linux-musl",
+)
+rust.repository_set(
+    name = "rust_linux_x86_64",
+    target_compatible_with = [
+        "//bazel/platforms:msvc",
+        "@platforms//cpu:x86_64",
+        "@platforms//os:windows",
+    ],
+    target_triple = "x86_64-pc-windows-msvc",
+)
+use_repo(rust, "rust_toolchains")
+
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+
+inject_repo(crate, "openssl")
+
+toolchains_musl = use_extension("@toolchains_musl//:toolchains_musl.bzl", "toolchains_musl")
+toolchains_musl.config(
+    extra_target_compatible_with = ["//bazel/platforms:musl"],
+)
+use_repo(toolchains_musl, "musl_toolchains_hub")
+
+register_toolchains(
+    "@multitool_hub//toolchains:all",
+    "@rust_toolchains//:all",
+    "@musl_toolchains_hub//:all",
+    "//bazel/toolchains/cc/gcc:host_gcc_toolchain",
+    "//bazel/toolchains/cc/gcc/local:linux_x86_64",
+    "//bazel/toolchains/cc/clang:x86_64_windows_msvc_toolchain",
+    # Python toolchain for the Windows exec platform (rules_pkg's build_zip).
+    # Previously provided implicitly by WORKSPACE; see the BUILD file for why.
+    "//bazel/toolchains/python:runtime_env_python_windows",
+)
+
+include("//bazel/module:py.MODULE.bazel")
+
+include("//bazel/module:rust/site.MODULE.bazel")
+
+include("//bazel/module:rust/host.MODULE.bazel")
+
+include("//bazel/module:rust/tools.MODULE.bazel")
+
+include("//bazel/module:gazelle/go.MODULE.bazel")
+
+include("//bazel/module:js.MODULE.bazel")
+
+include("//bazel/module:oci.MODULE.bazel")
+
+include("//bazel/module:gcc.MODULE.bazel")
+
+include("//bazel/module:xwin.MODULE.bazel")

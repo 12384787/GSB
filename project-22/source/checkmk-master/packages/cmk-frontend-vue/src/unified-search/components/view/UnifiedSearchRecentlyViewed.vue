@@ -1,0 +1,114 @@
+<!--
+Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import { type UnifiedSearchResultItem } from 'cmk-shared-typing/typescript/unified_search'
+import CmkButton from 'cmk-ui-library/components/CmkButton/CmkButton.vue'
+import CmkHeading from 'cmk-ui-library/components/typography/CmkHeading.vue'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import { immediateWatch } from 'cmk-ui-library/lib/watch'
+import { ref } from 'vue'
+
+import ResultItem from '@/unified-search/components/result/ResultItem.vue'
+import ResultList from '@/unified-search/components/result/ResultList.vue'
+import { HistoryEntry } from '@/unified-search/lib/searchHistory'
+import { getSearchUtils } from '@/unified-search/providers/search-utils'
+
+const { _t } = usei18n()
+
+const recentlyViewed = ref<HistoryEntry[]>([])
+
+const searchUtils = getSearchUtils()
+
+function handleItemClick(item: UnifiedSearchResultItem) {
+  searchUtils.history?.add(new HistoryEntry(searchUtils.query.toQueryLike(), item))
+  searchUtils.closeSearch()
+}
+
+const props = defineProps<{
+  historyEntries?: HistoryEntry[] | null | undefined
+  focus: number
+}>()
+
+function isFocused(idx: number): boolean {
+  return idx === props.focus
+}
+
+immediateWatch(
+  () => ({ newHistoryEntries: props.historyEntries }),
+  async ({ newHistoryEntries }) => {
+    if (newHistoryEntries) {
+      recentlyViewed.value = newHistoryEntries
+    }
+  }
+)
+</script>
+
+<template>
+  <div
+    v-if="recentlyViewed.length > 0"
+    class="recently-viewed"
+    role="region"
+    :aria-label="_t('Recently viewed')"
+  >
+    <CmkHeading type="h4" class="result-heading">
+      {{ _t('Recently viewed') }}
+      <CmkButton
+        variant="text"
+        size="small"
+        @click.stop="
+          () => {
+            searchUtils.history?.resetEntries()
+            recentlyViewed = []
+          }
+        "
+      >
+        {{ _t('Clear all') }}
+      </CmkButton>
+    </CmkHeading>
+    <ResultList>
+      <ResultItem
+        v-for="(item, idx) in recentlyViewed"
+        ref="recently-viewed-item"
+        :key="item.element.target.url"
+        :idx="idx"
+        :title="item.element.title"
+        :context="item.element.context"
+        :icon="item.element.icon"
+        :inline_buttons="item.element.inline_buttons"
+        :target="item.element.target"
+        :html="searchUtils.highlightQuery(item.element.title)"
+        :breadcrumb="searchUtils.breadcrumb(item.element.provider, item.element.topic)"
+        :focus="isFocused(idx)"
+        :zebra="true"
+        @keydown.enter="
+          () => {
+            handleItemClick(item.element)
+          }
+        "
+        @click="
+          () => {
+            handleItemClick(item.element)
+          }
+        "
+      ></ResultItem>
+    </ResultList>
+  </div>
+</template>
+
+<style scoped>
+/* stylelint-disable-next-line checkmk/vue-bem-naming-convention */
+.result-heading {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+}
+
+/* stylelint-disable-next-line checkmk/vue-bem-naming-convention */
+.recently-viewed {
+  margin: var(--spacing-double);
+}
+</style>

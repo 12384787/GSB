@@ -1,0 +1,92 @@
+// Copyright (C) 2025 Checkmk GmbH
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::config::defines::defaults::SECTION_SEPARATOR;
+use crate::config::section::names;
+use crate::ora_sql::backend::sanitize_failure_message;
+use crate::types::PiggybackHostName;
+
+const PREFIX: &str = "oracle";
+
+pub fn header(name: &str, separator: char) -> String {
+    let sep = separator as u8;
+    format!("<<<{PREFIX}_{name}:sep({sep:0>2})>>>")
+}
+
+/// One `<SID>|FAILURE|<reason>` row per SID, under the instance header.
+pub fn fatal_error_section(sids: &[String], reason: &str) -> String {
+    let reason = sanitize_failure_message(reason);
+    let mut section = header(names::INSTANCE, SECTION_SEPARATOR) + "\n";
+    for sid in sids {
+        section.push_str(&format!("{sid}|FAILURE|{reason}\n"));
+    }
+    section
+}
+
+pub fn signaling_header(name: &str) -> String {
+    format!("<<<{PREFIX}_{name}>>>")
+}
+
+/// Header of a section whose name the user defines with `header_name:`.
+///
+/// Unlike [`header`] the name is emitted verbatim, without the `oracle_`
+/// prefix, and `:sep(NN)` is added only when a separator is configured.
+///
+/// The separator is already the ASCII code the header announces (see
+/// `header_sep:`), so it is emitted as it is.
+pub fn custom_section_header(name: &str, separator: Option<u8>) -> String {
+    match separator {
+        Some(sep) => format!("<<<{name}:sep({sep:0>2})>>>"),
+        None => format!("<<<{name}>>>"),
+    }
+}
+
+pub fn piggyback_header(piggyback_host_name: &PiggybackHostName) -> String {
+    format!("<<<<{piggyback_host_name}>>>>")
+}
+
+pub fn piggyback_footer() -> String {
+    piggyback_header(&"".to_string().into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fatal_error_section_one_row_per_sid() {
+        assert_eq!(
+            fatal_error_section(&["FREE".to_string(), "XE".to_string()], "boom"),
+            "<<<oracle_instance:sep(124)>>>\nFREE|FAILURE|boom\nXE|FAILURE|boom\n"
+        );
+    }
+
+    #[test]
+    fn test_fatal_error_section_without_sids_is_header_only() {
+        assert_eq!(
+            fatal_error_section(&[], "boom"),
+            "<<<oracle_instance:sep(124)>>>\n"
+        );
+    }
+
+    #[test]
+    fn test_fatal_error_section_sanitizes_the_reason() {
+        assert_eq!(
+            fatal_error_section(&["FREE".to_string()], "cannot load /a|b\nas root\n"),
+            "<<<oracle_instance:sep(124)>>>\nFREE|FAILURE|cannot load /a b as root\n"
+        );
+    }
+}

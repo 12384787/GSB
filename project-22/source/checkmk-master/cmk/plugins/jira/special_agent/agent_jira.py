@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+
+"""agent_jira
+
+Checkmk special agent for monitoring Jira projects and custom queries.
+"""
+
+import argparse
+import json
+import logging
+import sys
+from collections.abc import Sequence
+from typing import Any
+
+from jira import JIRA
+from jira.exceptions import JIRAError
+from requests.exceptions import ConnectionError as RequestsConnectionError
+
+from cmk.password_store.v1_unstable import parser_add_secret_option, resolve_secret_option
+
+LOGGER = logging.getLogger(__name__)
+
+PASSWORD_OPTION = "password"
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+
+    args = parse_arguments(argv)
+    setup_logging(args.verbose)
+
+    try:
+        LOGGER.info("Start constructing connection settings")
+        jira = _handle_jira_connection(args)
+    except RequestsConnectionError as connection_error:
+        sys.stderr.write("Error connecting Jira server: %s\n" % connection_error)
+        if args.debug:
+            raise
+        return 1
+    except JIRAError as jira_error:
+        sys.stderr.write("Jira error %s\n" % jira_error.status_code)
+        if args.debug:
+            raise
+        return 1
+
+    try:
+        _handle_request(args, jira)
+    except Exception as unknown_error:
+        sys.stderr.write("Unhandled exception: %s\n" % unknown_error)
+        if args.debug:
+            raise
+        return 1
+
+    return 0
+
+
+def _handle_jira_connection(args: argparse.Namespace) -> JIRA:
+    jira_url = f"{args.proto}://{args.hostname}/"
+
+    return JIRA(
+        server=jira_url,
+        basic_auth=(args.user, resolve_secret_option(args, PASSWORD_OPTION).reveal()),
+        options={"verify": False},
+        max_retries=0,
+    )
+
+
+def _handle_request(args: argparse.Namespace, jira: JIRA) -> None:
+    if args.project_workflows_project:
+        LOGGER.info("Retrieving workflow data")
+        workflow_output = _handle_project(jira, args)
+        if workflow_output is not None:
+            sys.stdout.write("%s\n" % workflow_output)
+
+    if args.jql_result:
+        LOGGER.info("Retrieving custom service data")
+        custom_query_output = _handle_custom_query(jira, args)
+        if custom_query_output is not None:
+            sys.stdout.write("%s\n" % custom_query_output)
+
+
+def _handle_project(jira: JIRA, args: argparse.Namespace) -> str | None:
+    projects = [
+        {"Name": k, "Workflow": v}
+        for k, v in zip(
+            args.project_workflows_project,
+            args.project_workflows_workflows,
+        )
+    ]
+
+    # get open issues for each project and workflow
+    sys.stdout.write("<<<jira_workflow>>>\n")
+    issues_dict: dict[str, dict[str, int]] = {}
+    for project in projects:
+        project_name = project["Name"][0]
+        for workflow in project.get("Workflow", []):
+            max_results = 0
+            field = None
+            svc_desc = None
+            jql = f"project = '{project_name}' AND status = '{workflow}'"
+            issues = _handle_search_issues(
+                jira,
+                jql,
+                field,
+                max_results,
+                args,
+                project_name,
+                svc_desc,
+            )
+            if issues is None:
+                continue
+            issues_dict.setdefault(project_name, {}).update({workflow: len(issues)})
+
+    if issues_dict:
+        return json.dumps(issues_dict)
+
+    return None
+
+
+def _handle_custom_query(jira: JIRA, args: argparse.Namespace) -> str | None:
+    projects = [
+        {
+            "Description": d,
+            "Query": q,
+            "Field": f,
+            "Result": r,
+            "Limit": l,
+        }
+        for d, q, f, r, l in zip(
+            args.jql_desc,
+            args.jql_query,
+            args.jql_field,
+            args.jql_result,
+            args.jql_limit,
+        )
+    ]
+
+    sys.stdout.write("<<<jira_custom_svc>>>\n")
+    result_dict: dict[str, dict[str, Any]] = {}
+    for query in projects:
+        jql = query["Query"][0]
+        max_results = query["Limit"][0] if query["Limit"][0] != "-1" else None
+        svc_desc = query["Description"][0]
+        field = query["Field"][0]
+        project = None
+        if field == "None":
+            # count number of search results
+            max_results = 0
+            field = None
+            issues = _handle_search_issues(
+                jira,
+                jql,
+                field,
+                max_results,
+                args,
+                project,
+                svc_desc,
+            )
+            if issues is None:
+                continue
+            result_dict.setdefault(svc_desc, {}).update({"count": len(issues)})
+            continue
+
+        issues = _handle_search_issues(
+            jira,
+            jql,
+            field,
+            max_results,
+            args,
+            project,
+            svc_desc,
+        )
+        if issues is None:
+            continue
+
+        total = 0.0
+        for issue in issues:
+            search_field = getattr(issue.fields, field)
+            total += search_field if search_field and isinstance(search_field, float) else 0
+
+        if query["Result"][0] == "sum":
+            key = "sum"
+            # TODO: Why do we use a float below, but a str in the else part?
+            value: float | str = total
+        else:
+            # average
+            key = "avg"
+            value = "%.2f" % (total / len(issues))
+
+        if key == "avg":
+            result_dict.setdefault(svc_desc, {}).update(
+                {"avg_sum": total, "avg_total": len(issues)}
+            )
+
+        result_dict.setdefault(svc_desc, {}).update({key: value})
+
+    if result_dict:
+        return json.dumps(result_dict)
+
+    return None
+
+
+def _handle_search_issues(
+    jira: JIRA,
+    jql: str,
+    field: str | None,
+    max_results: int | None,
+    args: argparse.Namespace,
+    project: str | None,
+    svc_desc: str | None,
+) -> Any:
+    try:
+        return jira.search_issues(
+            jql,
+            maxResults=max_results if max_results is not None else 50,
+            json_result=False,
+            fields=field,
+            validate_query=True,
+        )
+    except JIRAError as jira_error:
+        # errors of sections are handled and shown by/in the related checks
+        msg = f"Jira error {jira_error.status_code}: {jira_error.text}"
+        key = project or svc_desc or "unknown"
+        msg_dict = {key: {"error": msg}}
+        sys.stdout.write("%s\n" % json.dumps(msg_dict))
+        if args.debug:
+            raise
+        return None
+
+
+def setup_logging(verbosity: int) -> None:
+    if verbosity >= 3:
+        lvl = logging.DEBUG
+    elif verbosity == 2:
+        lvl = logging.INFO
+    elif verbosity == 1:
+        lvl = logging.WARNING
+    else:
+        logging.disable(logging.CRITICAL)
+        lvl = logging.CRITICAL
+    # astrein: disable=logging-formatter
+    logging.basicConfig(level=lvl, format="%(asctime)s %(levelname)s %(message)s")
+
+
+def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
+    prog, description = __doc__.split("\n\n", maxsplit=1)
+    parser = argparse.ArgumentParser(prog=prog, description=description)
+
+    parser.add_argument(
+        "--debug", action="store_true", help="""Debug mode: raise Python exceptions"""
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Verbose mode (for even more output use -vvv)",
+    )
+    parser.add_argument(
+        "-P",
+        "--proto",
+        default="https",
+        required=True,
+        help="Use 'http' or 'https' for connection to Jira (default=https)",
+    )
+    parser.add_argument("-u", "--user", default=None, required=True, help="Username for Jira login")
+    parser_add_secret_option(
+        parser, long=f"--{PASSWORD_OPTION}", required=True, help="Password for Jira login"
+    )
+    parser.add_argument(
+        "--project-workflows-project", nargs=1, action="append", help="The full project name"
+    )
+    parser.add_argument(
+        "--project-workflows-workflows",
+        nargs="+",
+        action="append",
+        help="The names of workflows of the given project",
+    )
+    parser.add_argument("--jql-desc", nargs=1, action="append", help="Service name.")
+    parser.add_argument("--jql-query", nargs=1, action="append", help="JQL search string.")
+    parser.add_argument(
+        "--jql-result",
+        nargs=1,
+        action="append",
+        choices=("count", "sum", "average"),
+        help="Search result to use. You can show the number of "
+        'search results ("count") or the summed up ("sum") or '
+        'average values ("average") of a given numeric field.',
+    )
+    parser.add_argument(
+        "--jql-field",
+        nargs=1,
+        action="append",
+        help='Field for operation. Please use "None" if you use "count" as result option.',
+    )
+    parser.add_argument(
+        "--jql-limit", nargs=1, action="append", help="Maximum number of processed search results."
+    )
+    parser.add_argument("--hostname", required=True, help="Jira server to use")
+
+    return parser.parse_args(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

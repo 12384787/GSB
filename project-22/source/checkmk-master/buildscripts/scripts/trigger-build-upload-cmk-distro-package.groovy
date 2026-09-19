@@ -1,0 +1,260 @@
+#!groovy
+
+/* groovylint-disable MethodSize*/
+
+/// file: trigger-build-upload-cmk-distro-package.groovy
+
+void main() {
+    check_job_parameters([
+        "DISTRO",
+        "EDITION",
+        "FAKE_ARTIFACTS",
+        "TRIGGER_POST_SUBMIT_HEAVY_CHAIN",
+        "VERSION",
+    ]);
+
+    def single_tests = load("${checkout_dir}/buildscripts/scripts/utils/single_tests.groovy");
+    def versioning = load("${checkout_dir}/buildscripts/scripts/utils/versioning.groovy");
+    // groovylint-disable-next-line UnusedVariable
+    def artifacts_helper = load("${checkout_dir}/buildscripts/scripts/utils/upload_artifacts.groovy");
+    def package_helper = load("${checkout_dir}/buildscripts/scripts/utils/package_helper.groovy");
+
+    def safe_branch_name = versioning.safe_branch_name();
+    def branch_version = versioning.get_branch_version(checkout_dir);
+    def cmk_version_rc_aware = versioning.get_cmk_version(safe_branch_name, branch_version, params.VERSION);
+    def cmk_version = versioning.strip_rc_number_from_version(cmk_version_rc_aware);
+    /// This will get us the location to e.g. "checkmk/master" or "Testing/<name>/checkmk/master"
+    def branch_base_folder = package_helper.branch_base_folder(true);
+
+    def build_node = params.CIPARAM_OVERRIDE_BUILD_NODE;
+    def disable_cache = params.DISABLE_CACHE;
+    def disable_signing = params.DISABLE_CMK_DISTRO_PACKAGE_SIGNING;
+    def distro = params.DISTRO;
+    def fake_artifacts = params.FAKE_ARTIFACTS;
+    def force_build = params.DISABLE_JENKINS_CACHE == true;
+    def trigger_post_submit_heavy_chain = params.TRIGGER_POST_SUBMIT_HEAVY_CHAIN;
+
+    def selected_fips_distros = [];
+    def branch_name = safe_branch_name;
+
+    // Use the directory also used by tests/testlib/containers.py to have it find
+    // the downloaded package.
+    def all_editions = ["ultimate", "pro", "ultimatemt", "community", "cloud", params.EDITION].unique().sort();
+    def fips_edition = "pro";
+    def fips_job_name = "${branch_base_folder}/trigger-fips-chain";
+    def setup_values = single_tests.common_prepare(version: "daily", docker_tag: params.CIPARAM_OVERRIDE_DOCKER_TAG_BUILD);
+    def trigger_fips_chain = false;
+
+    inside_container_minimal(safe_branch_name: safe_branch_name) {
+        // run everything requiring python in this container
+        selected_fips_distros = versioning.get_distros(use_case: "fips");
+    }
+
+    // The time 1100 has been chosen to not collide with the CI maintenance window
+    if (Calendar.getInstance().get(Calendar.HOUR_OF_DAY) == 11) {
+        // it is the timeframe to trigger the FIPS jobs
+        trigger_fips_chain = true;
+
+        try {
+            def job = Jenkins.instance.getItemByFullName(fips_job_name);
+            def build = job.getLastBuild();
+
+            def buildStartTime = build.getStartTimeInMillis();
+            def now = System.currentTimeMillis();
+
+            if ((now - buildStartTime) <= 60 * 60 * 1000) {
+                // Build started within the last 60 minutes, do not build again
+                trigger_fips_chain = false;
+            }
+        }
+        catch (Exception e) {
+            println("Error: Failed to check if the ${fips_job_name} ran within the last 60min, better build it twice than never");
+        }
+    }
+
+    print(
+        """
+        |===== CONFIGURATION ===============================
+        |all_editions:............. │${all_editions}│
+        |branch_base_folder:....... │${branch_base_folder}│
+        |branch_name:.............. │${branch_name}│
+        |branch_version:........... │${branch_version}│
+        |checkout_dir:............. │${checkout_dir}│
+        |cmk_version:.............. │${cmk_version}│
+        |cmk_version_rc_aware:..... │${cmk_version_rc_aware}│
+        |disable_cache:............ │${disable_cache}│
+        |disable_signing:.......... │${disable_signing}│
+        |distro:................... │${distro}│
+        |force_build:.............. │${force_build}│
+        |safe_branch_name:......... │${safe_branch_name}│
+        |selected_fips_distros:.... │${selected_fips_distros}│
+        |trigger_fips_chain:....... │${trigger_fips_chain}│
+        |===================================================
+        """.stripMargin());
+
+    if (build_node == "fips") {
+        // Do not start builds on FIPS node
+        println("Detected build node 'fips', switching this to 'fra'.");
+        build_node = "fra";
+    }
+
+    /// In order to ensure a fixed order for stages executed in parallel,
+    /// we wait an increasing amount of time (N * 1s).
+    /// Without this we end up with a capped build overview matrix in the job view (Jenkins doesn't
+    /// like changing order or amount of stages, which will happen with stages started `via parallel()`
+    def timeOffsetForOrder = 0;
+
+    def stages = all_editions.collectEntries { edition ->
+        [("${edition}") : {
+            sleep(1 * timeOffsetForOrder++);
+
+            smart_stage(
+                name: "Trigger ${edition} package build",
+                raiseOnError: true,
+            ) {
+                smart_build(
+                    // see global-defaults.yml, needs to run in minimal container
+                    use_upstream_build: true,
+                    force_build: force_build,
+                    relative_job_name: "${branch_base_folder}/builders/trigger-cmk-distro-package",
+                    build_params: [
+                        CUSTOM_GIT_REF: effective_git_ref,
+                        VERSION: params.VERSION,
+                        EDITION: edition,
+                        DISTRO: distro,
+                        DISABLE_CACHE: params.DISABLE_CACHE,
+                        DISABLE_CMK_DISTRO_PACKAGE_SIGNING: disable_signing,
+                        CIPARAM_OVERRIDE_DOCKER_TAG_BUILD: setup_values.docker_tag,
+                        FAKE_ARTIFACTS: fake_artifacts,
+                    ],
+                    build_params_no_check: [
+                        CIPARAM_OVERRIDE_BUILD_NODE: build_node,
+                        CIPARAM_CLEANUP_WORKSPACE: params.CIPARAM_CLEANUP_WORKSPACE,
+                        CIPARAM_BISECT_COMMENT: params.CIPARAM_BISECT_COMMENT,
+                    ],
+                    no_remove_others: true, // do not delete other files in the dest dir
+                    download: false,    // use copyArtifacts to avoid nested directories
+                );
+            }
+        }]
+    }
+
+    stages += selected_fips_distros.collectEntries { fips_distro ->
+        [("${fips_edition} FIPS ${fips_distro}") : {
+            sleep(0.1 * timeOffsetForOrder++);
+
+            smart_stage(
+                name: "Trigger FIPS ${fips_edition} package build for ${fips_distro}",
+                condition: trigger_fips_chain,
+                raiseOnError: true,
+            ) {
+                smart_build(
+                    // see global-defaults.yml, needs to run in minimal container
+                    use_upstream_build: true,
+                    force_build: force_build,
+                    relative_job_name: "${branch_base_folder}/builders/trigger-cmk-distro-package",
+                    build_params: [
+                        CUSTOM_GIT_REF: effective_git_ref,
+                        VERSION: params.VERSION,
+                        EDITION: fips_edition,
+                        DISTRO: fips_distro,
+                        DISABLE_CACHE: params.DISABLE_CACHE,
+                        CIPARAM_OVERRIDE_DOCKER_TAG_BUILD: setup_values.docker_tag,
+                        FAKE_ARTIFACTS: fake_artifacts,
+                        DISABLE_CMK_DISTRO_PACKAGE_SIGNING: disable_signing,
+                    ],
+                    build_params_no_check: [
+                        CIPARAM_OVERRIDE_BUILD_NODE: build_node,
+                        CIPARAM_CLEANUP_WORKSPACE: params.CIPARAM_CLEANUP_WORKSPACE,
+                        CIPARAM_BISECT_COMMENT: params.CIPARAM_BISECT_COMMENT,
+                    ],
+                    no_remove_others: true, // do not delete other files in the dest dir
+                    download: false,    // use copyArtifacts to avoid nested directories
+                );
+            }
+        }]
+    }
+
+    inside_container_minimal(safe_branch_name: safe_branch_name) {
+        currentBuild.result = parallel(stages).values().every { it } ? "SUCCESS" : "FAILURE";
+    }
+
+    // only close the branch if the previous build passed but this failed
+    smart_stage(
+        name: "Closing branch on failure",
+        condition: env.USE_BRANCH_AUTO_CLOSING == "1" &&
+            currentBuild.result != "SUCCESS" &&
+            currentBuild.getPreviousBuild()?.result.toString() == "SUCCESS",
+    ) {
+        build(
+            job: "maintenance/sheriffing",
+            parameters: [
+                stringParam(name: "ACTION", value: "close"),
+                stringParam(name: "BRANCH", value: safe_branch_name),
+                stringParam(
+                    name: "REASON",
+                    value: "Branch ${safe_branch_name} failed to build CMK distro packages ${currentBuild.number}"
+                ),
+            ],
+            wait: false,
+        );
+    }
+
+    // only open the branch if the previous build failed but this passed
+    smart_stage(
+        name: "Opening branch after recovering",
+        condition: env.USE_BRANCH_AUTO_CLOSING == "1" &&
+            currentBuild.result == "SUCCESS" &&
+            currentBuild.getPreviousBuild()?.result.toString() != "SUCCESS",
+    ) {
+        build(
+            job: "maintenance/sheriffing",
+            parameters: [
+                stringParam(name: "ACTION", value: "open"),
+                stringParam(name: "BRANCH", value: safe_branch_name),
+                stringParam(
+                    name: "REASON",
+                    value: "Branch ${safe_branch_name} recovered to build CMK distro packages ${currentBuild.number}"
+                ),
+            ],
+            wait: false,
+        );
+    }
+
+    smart_stage(
+        name: "Trigger trigger-post-submit-tests-heavy",
+        condition: trigger_post_submit_heavy_chain && currentBuild.result == "SUCCESS",
+    ) {
+        build(
+            job: "${branch_base_folder}/trigger-post-submit-tests-heavy",
+            parameters: [
+                stringParam(name: "CUSTOM_GIT_REF", value: effective_git_ref),
+                stringParam(name: "CIPARAM_OVERRIDE_BUILD_NODE", value: params.CIPARAM_OVERRIDE_BUILD_NODE),
+                stringParam(name: "CIPARAM_CLEANUP_WORKSPACE", value: params.CIPARAM_CLEANUP_WORKSPACE),
+                stringParam(name: "CIPARAM_BISECT_COMMENT", value: params.CIPARAM_BISECT_COMMENT),
+                booleanParam(name: "DISABLE_CMK_DISTRO_PACKAGE_SIGNING", value: disable_signing),
+            ],
+            wait: false,
+        );
+    }
+
+    smart_stage(
+        name: "Trigger trigger-fips-chain",
+        condition: trigger_fips_chain && currentBuild.result == "SUCCESS",
+    ) {
+        build(
+            job: fips_job_name,
+            parameters: [
+                stringParam(name: "EDITION", value: "pro"),
+                stringParam(name: "CUSTOM_GIT_REF", value: effective_git_ref),
+                stringParam(name: "CIPARAM_OVERRIDE_BUILD_NODE", value: ""),
+                stringParam(name: "CIPARAM_CLEANUP_WORKSPACE", value: CIPARAM_CLEANUP_WORKSPACE),
+                stringParam(name: "CIPARAM_BISECT_COMMENT", value: CIPARAM_BISECT_COMMENT),
+                booleanParam(name: "DISABLE_CMK_DISTRO_PACKAGE_SIGNING", value: disable_signing),
+            ],
+            wait: false,
+        );
+    }
+}
+
+return this;

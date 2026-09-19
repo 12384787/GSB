@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Handsontable mobile selection handles fixture</title>
+  <link rel="stylesheet" href="/handsontable/styles/handsontable.min.css">
+  <script>
+    const params = new URLSearchParams(location.search);
+
+    window.htTheme = ({ main: 'main', horizon: 'horizon', classic: 'classic' })[params.get('theme') ?? 'main'];
+    if (!window.htTheme) {
+      throw new Error('Unknown ?theme= value: ' + JSON.stringify(params.get('theme')));
+    }
+
+    window.htBundle = ({ umd: 'handsontable.js', 'full-min': 'handsontable.full.min.js' })[
+      params.get('bundle') ?? 'umd'
+    ];
+    if (!window.htBundle) {
+      throw new Error('Unknown ?bundle= value: ' + JSON.stringify(params.get('bundle')));
+    }
+
+    window.htDirection = ({ ltr: 'ltr', rtl: 'rtl' })[params.get('direction') ?? 'ltr'];
+    if (!window.htDirection) {
+      throw new Error('Unknown ?direction= value: ' + JSON.stringify(params.get('direction')));
+    }
+
+    // Frozen panes are opt-in: index 0 is an ordinary edge without them, and a freeze line with
+    // them, which is exactly the distinction the handle-position specs cover.
+    window.htFrozen = ({ '0': 0, '1': 1 })[params.get('frozen') ?? '0'];
+    if (window.htFrozen === undefined) {
+      throw new Error('Unknown ?frozen= value: ' + JSON.stringify(params.get('frozen')));
+    }
+
+    // The bottom frozen pane is driven separately, because the bottom handle hangs past the
+    // opposite corner and so meets a different clone than the top handle does.
+    window.htFrozenBottom = ({ '0': 0, '2': 2 })[params.get('frozenBottom') ?? '0'];
+    if (window.htFrozenBottom === undefined) {
+      throw new Error('Unknown ?frozenBottom= value: ' + JSON.stringify(params.get('frozenBottom')));
+    }
+
+    // Headers are on by default. Turning them off removes the `top` and `inline_start` clones, which
+    // is what leaves row 0 and column 0 as ordinary edges with nothing to hide the handle.
+    window.htHeaders = ({ on: true, off: false })[params.get('headers') ?? 'on'];
+    if (window.htHeaders === undefined) {
+      throw new Error('Unknown ?headers= value: ' + JSON.stringify(params.get('headers')));
+    }
+
+    // A tall data set is needed for the bottom frozen pane and for the scrolled cases.
+    window.htRows = ({ short: 5, tall: 40 })[params.get('rows') ?? 'short'];
+    if (window.htRows === undefined) {
+      throw new Error('Unknown ?rows= value: ' + JSON.stringify(params.get('rows')));
+    }
+
+    // Written into <head> so the themed stylesheet is present before first render.
+    document.write('<link rel="stylesheet" href="/handsontable/styles/ht-theme-' + window.htTheme + '.min.css">');
+  </script>
+  <style> body { font-family: sans-serif; margin: 1rem; } </style>
+</head>
+<body>
+  <!--
+    Fixture for the mobile selection handles regression spec (DEV-2165). The
+    page must be visited with mobile emulation (touch + mobile user agent) —
+    Handsontable creates the selection handles only when it detects a mobile
+    browser at grid construction time.
+  -->
+  <div id="grid" data-testid="grid"></div>
+
+  <script>
+    document.write(`<script src="/handsontable/dist/${window.htBundle}"><\/script>`);
+  </script>
+  <script>
+    const container = document.querySelector('[data-testid="grid"]');
+
+    container.className = `ht-theme-${window.htTheme}`;
+
+    const testIdRenderer = function(instance, td, row, col, prop, value, cellProperties) {
+      Handsontable.renderers.TextRenderer.apply(this, arguments);
+      td.setAttribute('data-testid', `cell-${row}-${col}`);
+    };
+
+    window.hot = new Handsontable(container, {
+      data: Array.from({ length: window.htRows }, (_, row) => (
+        ['A', 'B', 'C', 'D', 'E'].map(column => column + (row + 1))
+      )),
+      width: 350,
+      height: 300,
+      colHeaders: window.htHeaders,
+      rowHeaders: window.htHeaders,
+      fixedRowsTop: window.htFrozen,
+      fixedColumnsStart: window.htFrozen,
+      fixedRowsBottom: window.htFrozenBottom,
+      layoutDirection: window.htDirection,
+      renderer: testIdRenderer,
+      licenseKey: 'non-commercial-and-evaluation',
+    });
+  </script>
+</body>
+</html>

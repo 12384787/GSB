@@ -1,0 +1,41 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+load("@cmk_requirements//:requirements.bzl", "requirement")
+
+py_library(
+    name = "parentscan",
+    srcs = glob(include = ["**/*.py"]),
+    imports = ["../../.."],
+    visibility = [
+        "//cmk:__subpackages__",
+        "//non-free/packages:__subpackages__",
+        "//tests:__subpackages__",
+    ],
+    deps = [
+        "//cmk/automations",
+        "//cmk/gui:config",
+        "//cmk/gui:core_toolkit",
+        "//cmk/gui:html_toolkit",
+        "//cmk/gui:page_toolkit",
+        "//cmk/gui/background_job/job",
+        "//cmk/gui/fields",
+        "//cmk/gui/fields:base",
+        "//cmk/gui/openapi:utils",
+        "//cmk/gui/openapi/restful_objects",
+        "//cmk/gui/openapi/restful_objects:type_defs",
+        "//cmk/gui/utils",
+        "//cmk/gui/utils:middle",
+        "//cmk/gui/wato",
+        "//cmk/gui/watolib",
+        "//cmk/gui/watolib:registries",
+        "//cmk/utils",
+        "//packages/cmk-ccc:exceptions",
+        "//packages/cmk-ccc:hostaddress",
+        "//packages/cmk-ccc:resulttype",
+        "//packages/cmk-ccc:site",
+        "//packages/cmk-ccc:store",
+        "//packages/cmk-livestatus-client",
+        "//packages/cmk-web/cmk/web/utils",
+        requirement("marshmallow-oneofschema"),
+        requirement("pydantic"),
+    ],
+)

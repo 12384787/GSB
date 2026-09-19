@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import re
+
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.htmllib.html import html
+from cmk.gui.i18n import _
+from cmk.gui.logged_in import user
+from cmk.gui.utils.doc_reference_urls import doc_reference_url
+from cmk.web.utils.doc_references import DocReference, DocReferenceUtm
+
+
+def validate_regex(value: str, varname: str | None) -> None:
+    try:
+        re.compile(value)
+    except re.error:
+        raise MKUserError(
+            varname,
+            _(
+                "Your search statement is not valid. You need to provide a %(regex_link)s (regex). For example "
+                "you need to use <tt>\\\\</tt> instead of <tt>\\</tt> if you want to search for a "
+                "single backslash."
+            )
+            % {
+                "regex_link": html.render_a(
+                    "regular expression",
+                    href=doc_reference_url(
+                        user.language,
+                        DocReferenceUtm(campaign="error_help", content="regex"),
+                        DocReference.REGEXES,
+                    ),
+                    target="_blank",
+                )
+            },
+        )
+
+    # livestatus uses re2 and re can not validate posix pattern, so we have to
+    # check for lookaheads here
+    lookahead_pattern = r"\((\?!|\?=|\?<)"
+
+    if re.search(lookahead_pattern, value):
+        raise MKUserError(
+            varname, _("Your search statement is not valid. You cannot use a look-ahead here.")
+        )

@@ -1,0 +1,105 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import CmkLabel from 'cmk-ui-library/components/CmkLabel.vue'
+import CmkCheckbox from 'cmk-ui-library/components/user-input/CmkCheckbox.vue'
+import CmkInput from 'cmk-ui-library/components/user-input/CmkInput.vue'
+import CmkLabelRequired from 'cmk-ui-library/components/user-input/CmkLabelRequired.vue'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import useId from 'cmk-ui-library/lib/useId'
+import { computed } from 'vue'
+
+import type { EventConsoleConfig } from './otelTypes'
+
+const { _t } = usei18n()
+
+const resourceAttributeId = useId()
+
+const props = defineProps<{
+  encryptionAllowed: boolean
+  eventConsoleAllowed: boolean
+  showErrors: boolean
+  tlsRequired?: boolean
+}>()
+
+const encryption = defineModel<boolean>('encryption', { required: true })
+const eventConsole = defineModel<EventConsoleConfig | null>('eventConsole', { required: true })
+
+const tlsErrors = computed((): string[] => {
+  if (!props.tlsRequired) {
+    return []
+  }
+  return [_t('TLS encryption must be enabled when using basic authentication.')]
+})
+
+const eventConsoleErrors = computed((): string[] => {
+  if (!props.showErrors) {
+    return []
+  }
+  if (eventConsole.value !== null && !eventConsole.value.resourceAttribute.trim()) {
+    return [
+      _t(
+        'You must set a resource attribute (e.g., service.name) so the system can determine the host name.'
+      )
+    ]
+  }
+  return []
+})
+</script>
+
+<template>
+  <template v-if="encryptionAllowed">
+    <CmkLabel
+      :help="
+        _t(
+          `Serves the OTLP endpoint over TLS using the site's certificate. The client must trust the site CA at ~/etc/ssl/ca.pem. The certificate's server name matches the site ID, so set server_name_override (or the SDK equivalent) to the site ID.<br><br>Required when basic authentication is enabled.`
+        )
+      "
+      >{{ _t('Encryption') }}</CmkLabel
+    >
+    <CmkCheckbox
+      v-model="encryption"
+      :label="_t('Encrypt communication with TLS')"
+      :external-errors="tlsErrors"
+    />
+  </template>
+
+  <template v-if="eventConsoleAllowed">
+    <CmkLabel>{{ _t('Event Console') }}</CmkLabel>
+    <CmkCheckbox
+      :model-value="eventConsole !== null"
+      :label="_t('Send log messages to event console')"
+      @update:model-value="eventConsole = $event ? { resourceAttribute: '' } : null"
+    />
+    <template v-if="eventConsole !== null">
+      <span />
+      <div class="mode-otel-collector-connection-options__sub-field">
+        <CmkLabel :for="resourceAttributeId">
+          {{ _t('Resource attribute for host name lookup') }} <CmkLabelRequired />
+        </CmkLabel>
+        <CmkInput
+          :id="resourceAttributeId"
+          v-model="eventConsole.resourceAttribute"
+          type="text"
+          field-size="medium"
+          placeholder="service.name"
+          :external-errors="eventConsoleErrors"
+        />
+      </div>
+    </template>
+  </template>
+</template>
+
+<style scoped>
+.mode-otel-collector-connection-options__sub-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing) var(--dimension-6);
+  margin-left: var(--spacing);
+  border-left: var(--button-form-border-color) 1px solid;
+  padding-left: var(--spacing);
+}
+</style>

@@ -1,0 +1,11 @@
+# Alias: TCP host address for Apache
+# Menu: Web GUI
+# Description:
+#  Configure the TCP host address for the Apache webserver
+#  process of this site.
+#
+#  It might be useful to change the host address the site
+#  Apache webserver listes to.
+#
+#  After changing this variable, the man Apache webserver
+#  must be restarted.

@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+import re
+
+import bs4
+import pytest
+from pytest import MonkeyPatch
+
+from cmk.gui.htmllib.html import html
+from cmk.gui.http import request, response
+from cmk.gui.logged_in import LoggedInNobody
+from cmk.gui.table import table_element
+from cmk.gui.utils.output_funnel import output_funnel
+from cmk.web.utils.html import HTML
+from tests.unit.cmk.gui.compare_html import compare_html
+
+
+def read_out_simple_table(text: str) -> list[list[str]]:
+    assert isinstance(text, str)
+    # Get the contents of the table as a list of lists
+    data = []
+    # TODO: Typing chaos ahead! Clarify PageElement/Tag/NavigableString
+    for row in bs4.BeautifulSoup(text, "lxml").find_all("tr"):
+        columns = row.find_all("th")
+        if not columns:
+            columns = row.find_all("td")
+        row_data = []
+        for cell in columns:
+            cell_str = re.sub(r"\s", "", re.sub(r"<[^<]*>", "", cell.text))
+            row_data.append(cell_str)
+        data.append(row_data)
+    return data
+
+
+def read_out_csv(text: str, separator: str) -> list[list[str]]:
+    # Get the contents of the table as a list of lists
+    data = []
+    for row in text.split("\n"):
+        columns = row.split(separator)
+        data.append([re.sub(r"\s", "", re.sub(r"<[^<]*>", "", cell)) for cell in columns])
+    return [row for row in data if not all(cell == "" for cell in row)]
+
+
+@pytest.mark.usefixtures("request_context")
+def test_basic() -> None:
+    table_id = 0
+    title = " TEST "
+
+    with output_funnel.plugged():
+        with table_element(
+            "%d" % table_id, title, searchable=False, sortable=False, limit=100
+        ) as table:
+            table.row()
+            table.cell("A", "1")
+            table.cell("B", "2")
+            table.row()
+            table.cell("A", "1")
+            table.cell("C", "4")
+
+        written_text = "".join(output_funnel.drain())
+    assert read_out_simple_table(written_text) == [["A", "B"], ["1", "2"], ["1", "4"]]
+
+
+@pytest.mark.usefixtures("request_context")
+def test_cell_content_escaping() -> None:
+    with output_funnel.plugged():
+        with table_element("ding", "TITLE", searchable=False, sortable=False, limit=100) as table:
+            table.row()
+            table.cell("A", "<script>alert('A')</script>")
+            table.cell("B", HTML.without_escaping("<script>alert('B')</script>"))
+            table.cell("C", "<b>C</b>")
+
+        written_text = output_funnel.drain()
+
+    assert "&lt;script&gt;alert(&#x27;A&#x27;)&lt;/script&gt;" in written_text
+    assert "<script>alert('B')</script>" in written_text
+    assert "<b>C</b>" in written_text
+
+
+@pytest.mark.usefixtures("request_context")
+def test_cell_title_escaping() -> None:
+    with output_funnel.plugged():
+        with table_element("ding", "TITLE", searchable=False, sortable=False, limit=100) as table:
+            table.row()
+            table.cell("<script>alert('A')</script>")
+            table.cell(HTML.without_escaping("<script>alert('B')</script>"))
+            table.cell("<b>C</b>")
+
+        written_text = output_funnel.drain()
+
+    assert "&lt;script&gt;alert(&#x27;A&#x27;)&lt;/script&gt;" in written_text
+    assert "<script>alert('B')</script>" in written_text
+    assert "<b>C</b>" in written_text
+
+
+@pytest.mark.usefixtures("request_context")
+def test_plug() -> None:
+    table_id = 0
+    title = " TEST "
+
+    with output_funnel.plugged():
+        with table_element(
+            "%d" % table_id, title, searchable=False, sortable=False, limit=100
+        ) as table:
+            table.row()
+            table.cell("A", "1")
+            html.write_text_permissive("a")
+            table.cell("B", "2")
+            html.write_text_permissive("b")
+            table.row()
+            table.cell("A", "1")
+            html.write_text_permissive("a")
+            table.cell("C", "4")
+            html.write_text_permissive("c")
+
+        written_text = "".join(output_funnel.drain())
+    assert read_out_simple_table(written_text) == [["A", "B"], ["1a", "2b"], ["1a", "4c"]]
+
+
+@pytest.mark.usefixtures("request_context")
+def test_context() -> None:
+    table_id = 0
+    rows = [(i, i**3) for i in range(10)]
+    header = ["Number", "Cubical"]
+    with output_funnel.plugged():
+        with table_element(
+            table_id="%d" % table_id, searchable=False, sortable=False, limit=100
+        ) as table:
+            for row in rows:
+                table.row()
+                for h, r in zip(header, row):
+                    table.cell(h, r)
+
+        written_text = "".join(output_funnel.drain())
+    data: list[list[str]] | list[tuple[int, ...]] = read_out_simple_table(written_text)
+    assert data.pop(0) == header
+    data = [tuple(map(int, row)) for row in data if row and row[0]]
+    assert data == rows
+
+
+@pytest.mark.usefixtures("request_context")
+def test_action_message() -> None:
+    table_id = 0
+    message = "TEST MESSAGE"
+
+    with output_funnel.plugged():
+        with table_element(
+            "%d" % table_id, searchable=False, sortable=False, limit=100, action_message=message
+        ) as table1:
+            table1.row()
+            table1.cell("A", "1")
+            table1.cell("B", "2")
+
+        written_text = "".join(output_funnel.drain())
+
+    soup = bs4.BeautifulSoup(written_text, "lxml")
+    thead = soup.find("thead")
+    assert thead is not None, "No <thead> found in table output"
+
+    thead_children = thead.find_all(recursive=False)
+    assert len(thead_children) == 3, f"Expected only 3 children in <thead>: {thead_children!r}"
+
+    action_row = thead_children[0]
+    assert action_row.name == "tr"
+
+    action_row_id = action_row.get("id")
+    assert isinstance(action_row_id, str) and action_row_id.startswith(
+        f"{table_id}_action_message_"
+    ), f"Unexpected id: {action_row_id!r}"
+
+    th = action_row.find("th")
+    assert th is not None, "No <th> found in action message row"
+
+    colspan = th.get("colspan")
+    assert colspan == "2", f"Unexpected colspan: {colspan!r}"
+
+    div = action_row.find("div", class_="action_message_success")
+    assert div is not None, "No action_message_success div found"
+    assert div.get_text(strip=True) == message
+
+    assert thead_children[1].name == "script"  # script to remove action message
+    assert thead_children[2].name == "tr"  # normal header row
+
+
+@pytest.mark.usefixtures("request_context")
+def test_nesting() -> None:
+    table_id = 0
+    title = " TEST "
+
+    with output_funnel.plugged():
+        with table_element(
+            "%d" % table_id, title, searchable=False, sortable=False, limit=100
+        ) as table1:
+            table1.row()
+            table1.cell("A", "1")
+            table1.cell("B", "")
+            with table_element(
+                "%d" % (table_id + 1), title + "2", searchable=False, sortable=False, limit=100
+            ) as table2:
+                table2.row()
+                table2.cell("_", "+")
+                table2.cell("|", "-")
+
+        written_text = "".join(output_funnel.drain())
+    assert compare_html(
+        written_text,
+        """<h3 class="table">  TEST </h3>
+                            <script type="text/javascript">\ncmk.utils.update_row_info(\'1 row\');\n</script>
+                            <table class="data oddeven">
+                            <thead>
+                            <tr>  <th>   A  </th>  <th>   B  </th> </tr>
+                            </thead>
+                            <tr class="data even0">  <td>   1  </td>  <td>
+                                <h3 class="table"> TEST 2</h3>
+                                <script type="text/javascript">\ncmk.utils.update_row_info(\'1 row\');\n</script>
+                                <table class="data oddeven">
+                                <thead>
+                                <tr><th>_</th><th>|</th></tr>
+                                </thead>
+                                <tr class="data even0"><td>+</td><td>-</td></tr>
+                                </table>  </td>
+                            </tr>
+                            </table>""",
+    ), written_text
+
+
+@pytest.mark.usefixtures("request_context")
+def test_nesting_context() -> None:
+    table_id = 0
+    title = " TEST "
+
+    with output_funnel.plugged():
+        with table_element(
+            table_id="%d" % table_id, title=title, searchable=False, sortable=False, limit=100
+        ) as table1:
+            table1.row()
+            table1.cell("A", "1")
+            table1.cell("B", "")
+            with table_element(
+                "%d" % (table_id + 1), title + "2", searchable=False, sortable=False, limit=100
+            ) as table2:
+                table2.row()
+                table2.cell("_", "+")
+                table2.cell("|", "-")
+
+        written_text = "".join(output_funnel.drain())
+    assert compare_html(
+        written_text,
+        """<h3 class="table">  TEST </h3>
+                            <script type="text/javascript">\ncmk.utils.update_row_info(\'1 row\');\n</script>
+                            <table class="data oddeven">
+                            <thead>
+                            <tr>  <th>   A  </th>  <th>   B  </th> </tr>
+                            </thead>
+                            <tr class="data even0">  <td>   1  </td>  <td>
+                                <h3 class="table"> TEST 2</h3>
+                                <script type="text/javascript">\ncmk.utils.update_row_info(\'1 row\');\n</script>
+                                <table class="data oddeven">
+                                <thead>
+                                <tr><th>_</th><th>|</th></tr>
+                                </thead>
+                                <tr class="data even0"><td>+</td><td>-</td></tr>
+                                </table>  </td>
+                            </tr>
+                            </table>""",
+    ), written_text
+
+
+@pytest.mark.usefixtures("request_context", "patch_theme")
+@pytest.mark.parametrize("sortable", [True, False])
+@pytest.mark.parametrize("searchable", [True, False])
+@pytest.mark.parametrize("limit", [100, 2])
+@pytest.mark.parametrize("output_format", ["html", "csv"])
+def test_table_cubical(
+    monkeypatch: MonkeyPatch,
+    sortable: bool,
+    searchable: bool,
+    limit: int,
+    output_format: str,
+) -> None:
+    monkeypatch.setattr(LoggedInNobody, "save_tableoptions", lambda s: None)  # noqa: ARG005
+
+    # Test data
+    rows = [(i, i**3) for i in range(10)]
+    header = ["Number", "Cubical"]
+
+    # Table options
+    table_id = 0
+    title = " TEST "
+    separator = ";"
+    request.set_var("_%s_sort" % table_id, "1,0")
+    request.set_var("_%s_actions" % table_id, "1")
+
+    def _render_table() -> None:
+        with table_element(
+            table_id="%d" % table_id,
+            title=title,
+            sortable=sortable,
+            searchable=searchable,
+            limit=limit,
+            output_format=output_format,
+        ) as table:
+            for row in rows:
+                table.row()
+                for h, r in zip(header, row):
+                    table.cell(h, r)
+
+    # Data assertions
+    assert output_format in ["html", "csv"], "Fetch is not yet implemented"
+    data: list[list[str]] | list[tuple[int, ...]]
+    if output_format == "html":
+        with output_funnel.plugged():
+            _render_table()
+            written_text = "".join(output_funnel.drain())
+
+        data = read_out_simple_table(written_text)
+        assert data.pop(0) == header, "Wrong header"
+    elif output_format == "csv":
+        _render_table()
+        data = read_out_csv(response.get_data(as_text=True), separator)
+        limit = len(data)
+        assert data.pop(0) == header, "Wrong header"
+    else:
+        raise Exception("Not yet implemented")
+
+    # Reconstruct table data
+    data = [tuple(map(int, row)) for row in data if row and row[0]]
+    limit = min(len(rows), limit)
+
+    # Assert data correctness
+    assert len(data) <= limit, f"Wrong number of rows: Got {len(data)}, should be <= {limit}"
+    assert data == rows[:limit], f"Incorrect data: {data}\n\nVS\n{rows[:limit]}"

@@ -1,0 +1,105 @@
+# Adapted from https://github.com/1e100/bazel_doctest/tree/master
+"""Implements Python doctest support for Bazel."""
+
+load("@rules_python//python:defs.bzl", "PyInfo", "py_test")
+
+DOCTEST_TPL = r"""
+import sys, doctest
+
+def load_tests(loader, tests, ignore):
+{}
+    return tests
+
+
+if __name__ == "__main__":
+    import unittest
+
+    # Handle result here because no doctest is not an error.
+    result = unittest.main(exit=False).result
+    if result.wasSuccessful():
+        sys.exit(0)
+    else:
+        sys.exit(1)
+"""
+
+# TODO: Make `ELLIPSIS` optional?
+ADD_TESTS_TPL = r"""
+    try:
+        tests.addTests(doctest.DocTestSuite('{test}', optionflags=doctest.ELLIPSIS))
+    except SystemExit:
+        print('ERROR: "{test}" failed to load:  Early exit.')
+        sys.exit(1)
+"""
+
+def _import_roots(src, workspace_name):
+    roots = []
+    for imp in src[PyInfo].imports.to_list():
+        if imp == workspace_name:
+            roots.append("")
+        elif imp.startswith(workspace_name + "/"):
+            roots.append(imp[len(workspace_name) + 1:])
+    return roots
+
+def _file_to_module(file, import_roots):
+    if file.basename == "__init__.py":
+        path = file.dirname
+    else:
+        path = file.path[:-len(file.extension) - 1]
+
+    best_root = None
+    for root in import_roots:
+        if (root == "" or path.startswith(root + "/")) and (best_root == None or len(root) > len(best_root)):
+            best_root = root
+    if best_root:
+        path = path[len(best_root) + 1:]
+    return path.replace("/", ".")
+
+def _impl(ctx):
+    modules = []
+    for src in ctx.attr.srcs:
+        import_roots = _import_roots(src, ctx.workspace_name)
+        modules.extend([
+            ADD_TESTS_TPL.format(test = _file_to_module(file, import_roots))
+            for file in src.files.to_list()
+            if file.is_source and file.extension == "py"
+        ])
+    runner = ctx.actions.declare_file(ctx.attr.name)
+    content = DOCTEST_TPL.format("\n".join(modules))
+    ctx.actions.write(
+        runner,
+        content = content,
+    )
+    return [
+        DefaultInfo(files = depset([runner])),
+    ]
+
+_runner = rule(
+    implementation = _impl,
+    attrs = {
+        "srcs": attr.label_list(
+            mandatory = True,
+            providers = [DefaultInfo, PyInfo],
+            doc = "List of Python targets potentially containing doctests.",
+        ),
+    },
+)
+
+# Deliberately using the required _test convention
+# so that this is easy to search for.
+def py_doc_test(name, srcs, deps = [], tags = [], **kwargs):
+    runner_py = name + "-doctest-runner.py"
+    _runner(
+        name = runner_py,
+        srcs = srcs,
+        testonly = True,
+    )
+    py_test(
+        name = name,
+        srcs = [runner_py],
+        deps = srcs + deps,
+        main = runner_py,
+        # "doctest" allows running all doctests via --test_tag_filters;
+        # the generated runner is not worth type checking.
+        tags = tags + ["doctest", "no-mypy"],
+        **kwargs
+    )

@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+# Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+
+"""Parent scan
+
+For the monitoring to be able to determine the UNREACH state, it must know which path it can use to
+contact each individual host. For this purpose, one or more so-called parent hosts can be specified
+for each host. Parents can be set up automatically via the Parent scan.
+
+Additional information about the parents and the parent scan can be found in the
+[Checkmk documentation](https://docs.checkmk.com/latest/en/hosts_structure.html#parents).
+"""
+
+from collections.abc import Mapping
+from typing import Any, assert_never
+
+from cmk.gui.background_job.job import BackgroundJob
+from cmk.gui.config import active_config
+from cmk.gui.http import Response
+from cmk.gui.logged_in import user
+from cmk.gui.openapi.restful_objects import constructors, Endpoint
+from cmk.gui.openapi.restful_objects.registry import EndpointRegistry
+from cmk.gui.openapi.restful_objects.type_defs import DomainType
+from cmk.gui.openapi.utils import serve_json
+from cmk.gui.parentscan.background_job import (
+    ParentScanBackgroundJob,
+    ParentScanSettings,
+    start_parent_scan,
+    WhereChoices,
+)
+from cmk.gui.parentscan.rest_api.request_schemas import ParentScan
+from cmk.gui.parentscan.rest_api.response_schemas import BackgroundJobStatusObject
+from cmk.gui.watolib.hosts_and_folders import folder_tree
+from cmk.web.utils import permission_verification as permissions
+
+
+@Endpoint(
+    constructors.domain_type_action_href("parent_scan", "start"),
+    "cmk/start",
+    method="post",
+    additional_status_codes=[409],
+    request_schema=ParentScan,
+    response_schema=BackgroundJobStatusObject,
+    permissions_required=permissions.AllPerm(
+        [
+            permissions.Perm("wato.hosts"),
+            permissions.Perm("wato.parentscan"),
+        ]
+    ),
+)
+def start_parent_scan_background_job(params: Mapping[str, Any]) -> Response:
+    """Start the parent scan background job"""
+    user.need_permission("wato.hosts")
+    user.need_permission("wato.parentscan")
+    body = params["body"]
+    body_gateway = body["gateway_hosts"]
+    where: WhereChoices
+    match body_gateway["option"]:
+        case "create_in_folder":
+            where = "gateway_folder"
+            alias = body_gateway["hosts_alias"]
+            gateway_folder_path = body_gateway["folder"].path()
+        case "create_in_host_location":
+            where = "there"
+            alias = body["gateway_hosts"]["hosts_alias"]
+            gateway_folder_path = None
+        case "no_gateway_hosts":
+            where = "nowhere"
+            alias = ""
+            gateway_folder_path = None
+        case other:
+            assert_never(other)
+
+    parent_scan_job = ParentScanBackgroundJob()
+    tree = folder_tree()
+    if (
+        result := start_parent_scan(
+            hosts=[tree.load_host(name) for name in body["host_names"]],
+            job=parent_scan_job,
+            settings=ParentScanSettings(
+                where=where,
+                alias=alias,
+                timeout=body["performance"]["responses_timeout"],
+                probes=body["performance"]["hop_probes"],
+                max_ttl=body["performance"]["max_gateway_distance"],
+                force_explicit=body["configuration"]["force_explicit_parents"],
+                ping_probes=body["performance"]["ping_probes"],
+                gateway_folder_path=gateway_folder_path,
+            ),
+            site_configs=active_config.sites,
+            pprint_value=active_config.wato_pprint_config,
+            debug=active_config.debug,
+            use_git=active_config.wato_use_git,
+        )
+    ).is_error():
+        raise result.error
+    return _serve_background_job(parent_scan_job, "parent_scan")
+
+
+def _serve_background_job(job: BackgroundJob, domain_type: DomainType) -> Response:
+    job_id = job.get_job_id()
+    status = job.get_status()
+    return serve_json(
+        constructors.domain_object(
+            domain_type=domain_type,
+            identifier=job_id,
+            title=f"Background job {job_id} {'is active' if job.is_active() else 'is finished'}",
+            extensions={
+                "active": job.is_active(),
+                "state": status.state,
+                "logs": {
+                    "result": status.loginfo["JobResult"],
+                    "progress": status.loginfo["JobProgressUpdate"],
+                },
+            },
+            deletable=False,
+            editable=False,
+        )
+    )
+
+
+def register(endpoint_registry: EndpointRegistry) -> None:
+    endpoint_registry.register(start_parent_scan_background_job)

@@ -1,0 +1,789 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+"""Mange custom attributes of users and hosts"""
+
+import abc
+import re
+from collections.abc import Collection, Iterable, Sequence
+from datetime import datetime
+from typing import override
+
+from cmk.ccc.site import omd_site, SiteId
+from cmk.ccc.user import UserId
+from cmk.ccc.version import Edition
+from cmk.gui import forms
+from cmk.gui.breadcrumb import Breadcrumb
+from cmk.gui.config import Config
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.htmllib.html import html
+from cmk.gui.http import request
+from cmk.gui.i18n import _
+from cmk.gui.logged_in import user
+from cmk.gui.page_menu import (
+    make_simple_form_page_menu,
+    make_simple_link,
+    PageMenu,
+    PageMenuDropdown,
+    PageMenuEntry,
+    PageMenuSearch,
+    PageMenuTopic,
+)
+from cmk.gui.pages import PageContext
+from cmk.gui.table import table_element
+from cmk.gui.type_defs import ActionResult, CustomAttrSpec, CustomHostAttrSpec, CustomUserAttrSpec
+from cmk.gui.user_sites import activation_sites
+from cmk.gui.userdb import get_user_attributes
+from cmk.gui.utils.transaction_manager import transactions
+from cmk.gui.watolib.audit_log import make_audit_log_change_hook
+from cmk.gui.watolib.config_domain_name import CORE
+from cmk.gui.watolib.custom_attributes import (
+    load_custom_attrs_from_mk_file,
+    save_custom_attrs_to_mk_file,
+    update_host_custom_attrs,
+    update_user_custom_attrs,
+)
+from cmk.gui.watolib.host_attributes import host_attribute_topic_registry
+from cmk.gui.watolib.hosts_and_folders import (
+    folder_preserving_link,
+    FolderTree,
+    make_folder_tree,
+)
+from cmk.gui.watolib.mode import mode_url, ModeRegistry, redirect, WatoMode
+from cmk.gui.watolib.pending_changes import (
+    Change,
+    ChangeScope,
+    index_update_change_hook,
+    PendingChanges,
+    PendingChangesStore,
+)
+from cmk.gui.watolib.sidebar_reload import sidebar_reload_change_hook
+from cmk.gui.watolib.users import remove_custom_attribute_from_all_users, user_features_registry
+from cmk.livestatus_client import SiteConfigurations
+from cmk.web.utils.choices import Choices
+from cmk.web.utils.confirm_links import make_confirm_delete_link
+from cmk.web.utils.icons import IconNames, StaticIcon
+from cmk.web.utils.permission_verification import PermissionName
+from cmk.web.utils.urls import makeactionuri, makeuri, makeuri_contextless
+
+
+def register(mode_registry: ModeRegistry) -> None:
+    mode_registry.register(ModeEditCustomUserAttr)
+    mode_registry.register(ModeEditCustomHostAttr)
+    mode_registry.register(ModeCustomUserAttrs)
+    mode_registry.register(ModeCustomHostAttrs)
+
+
+def custom_attr_types() -> Choices:
+    return [
+        ("TextAscii", _("Simple Text")),
+    ]
+
+
+# TODO: Refactor to be valuespec based
+class ModeEditCustomAttr[T: CustomAttrSpec](WatoMode):
+    @override
+    def _from_vars(self) -> None:
+        self._name = request.get_ascii_input("edit")  # missing -> new custom attr
+        self._new = self._name is None
+
+        # TODO: Inappropriate Intimacy: custom host attributes should not now about
+        #       custom user attributes and vice versa. The only reason they now about
+        #       each other now is that they are stored in one file.
+        self._all_attrs = load_custom_attrs_from_mk_file(lock=request.has_var("_transid"))
+
+        if not self._new:
+            matching_attrs = [a for a in self._attrs if a["name"] == self._name]
+            if not matching_attrs:
+                raise MKUserError(None, _("The attribute does not exist."))
+            self._attr: T = matching_attrs[0]
+        else:
+            self._attr = self._default_value
+
+    @property
+    @abc.abstractmethod
+    def _type(self) -> str:
+        raise NotImplementedError
+
+    @property
+    @abc.abstractmethod
+    def _attrs(self) -> list[T]: ...
+
+    @property
+    @abc.abstractmethod
+    def _topics(self) -> Choices:
+        raise NotImplementedError
+
+    @property
+    @abc.abstractmethod
+    def _default_value(self) -> T: ...
+
+    @property
+    @abc.abstractmethod
+    def _macro_help(self) -> str:
+        raise NotImplementedError
+
+    @property
+    @abc.abstractmethod
+    def _macro_label(self) -> str:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def _update_config(
+        self, tree: FolderTree, custom_attributes: Sequence[T], *, pprint_value: bool
+    ) -> None:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def _show_in_table_option(self) -> None:
+        """Option to show the custom attribute in overview tables of the setup menu."""
+        raise NotImplementedError
+
+    def _render_table_option(self, section_title: str, label: str, help_text: str) -> None:
+        """Helper method to implement _show_in_table_option."""
+        forms.section(section_title)
+        html.help(help_text)
+        html.checkbox("show_in_table", self._attr["show_in_table"] or False, label=label)
+
+    @abc.abstractmethod
+    @override
+    def title(self) -> str:
+        raise NotImplementedError
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        return make_simple_form_page_menu(
+            _("Attribute"), breadcrumb, form_name="attr", button_name="_save"
+        )
+
+    def _add_extra_attrs_from_html_vars(self) -> None:
+        pass
+
+    def _add_extra_form_sections(self) -> None:
+        pass
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        if not transactions.check_transaction(request):
+            return None
+
+        title = request.get_str_input_mandatory("title").strip()
+        if not title:
+            raise MKUserError("title", _("Please specify a title."))
+
+        for this_attr in self._attrs:
+            if title == this_attr["title"] and self._name != this_attr["name"]:
+                raise MKUserError(
+                    "alias",
+                    _("This alias is already used by the attribute %(name)s.")
+                    % {"name": this_attr["name"]},
+                )
+
+        topic = request.get_str_input_mandatory("topic", "").strip()
+        help_txt = request.get_str_input_mandatory("help", "").strip()
+        show_in_table = html.get_checkbox("show_in_table")
+        add_custom_macro = html.get_checkbox("add_custom_macro")
+
+        if self._new:
+            self._name = request.get_ascii_input_mandatory("name", "").strip()
+            if not self._name:
+                raise MKUserError("name", _("Please specify a name for the new attribute."))
+            if " " in self._name:
+                raise MKUserError("name", _("Sorry, spaces are not allowed in attribute names."))
+            if not re.match("^[-a-z0-9A-Z_]*$", self._name):
+                raise MKUserError(
+                    "name",
+                    _(
+                        "Invalid attribute name. Only the characters a-z, A-Z, 0-9, _ and - are allowed."
+                    ),
+                )
+            if [a for a in self._attrs if a["name"] == self._name]:
+                raise MKUserError("name", _("Sorry, there is already an attribute with that name."))
+
+            ty = request.get_ascii_input_mandatory("type", "").strip()
+            if ty not in [t[0] for t in custom_attr_types()]:
+                raise MKUserError("type", _("The choosen attribute type is invalid."))
+
+            self._attr["name"] = self._name
+            self._attr["type"] = "TextAscii"
+            self._attr["title"] = title
+            self._attr["topic"] = topic
+            self._attr["help"] = help_txt
+            self._attr["show_in_table"] = show_in_table
+            self._attr["add_custom_macro"] = add_custom_macro
+
+            self._attrs.append(self._attr)
+
+            _pending_changes(
+                config.sites,
+                use_git=config.wato_use_git,
+                local_site=omd_site(),
+                user_id=user.id,
+            ).add(
+                Change(
+                    action_name="edit-%sattr" % self._type,
+                    text=_("Create new %(type)s attribute %(name)s")
+                    % {"type": self._type, "name": self._name},
+                    domains=[CORE],
+                ),
+                ChangeScope.all_activation_sites(),
+            )
+        else:
+            _pending_changes(
+                config.sites,
+                use_git=config.wato_use_git,
+                local_site=omd_site(),
+                user_id=user.id,
+            ).add(
+                Change(
+                    action_name="edit-%sattr" % self._type,
+                    text=_("Modified %(type)s attribute %(name)s")
+                    % {"type": self._type, "name": self._name},
+                    domains=[CORE],
+                ),
+                ChangeScope.all_activation_sites(),
+            )
+            self._attr["title"] = title
+            self._attr["topic"] = topic
+            self._attr["help"] = help_txt
+            self._attr["show_in_table"] = show_in_table
+            self._attr["add_custom_macro"] = add_custom_macro
+
+        self._add_extra_attrs_from_html_vars()
+
+        save_custom_attrs_to_mk_file(self._all_attrs)
+        self._update_config(
+            make_folder_tree(config), self._attrs, pprint_value=config.wato_pprint_config
+        )
+
+        return redirect(mode_url(self._type + "_attrs"))
+
+    @override
+    def page(self, config: Config) -> None:
+        # TODO: remove subclass specific things specifict things (everything with _type == 'user')
+        with html.form_context("attr"):
+            forms.header(_("Properties"))
+            forms.section(_("Name"), simple=not self._new, is_required=True)
+            html.help(
+                _(
+                    "The name of the attribute is used as an internal key. It cannot be "
+                    "changed later."
+                )
+            )
+            if self._new:
+                html.text_input(varname="name", default_value=self._attr["name"], size=61)
+                html.set_focus("name")
+            else:
+                html.write_text_permissive(self._name)
+                html.set_focus("title")
+
+            forms.section(_("Title") + "<sup>*</sup>", is_required=True)
+            html.help(_("The title is used to label this attribute."))
+            html.text_input(varname="title", default_value=self._attr["title"], size=61)
+
+            forms.section(_("Topic"))
+            html.help(_("The attribute is added to this section in the edit dialog."))
+            html.dropdown("topic", self._topics, deflt=self._attr["topic"])
+
+            forms.section(_("Help text") + "<sup>*</sup>")
+            html.help(_("You might want to add some helpful description for the attribute."))
+            html.text_area("help", self._attr["help"])
+
+            forms.section(_("Data type"))
+            html.help(_("The type of information to be stored in this attribute."))
+            if self._new:
+                html.dropdown("type", custom_attr_types(), deflt=self._attr["type"])
+            else:
+                html.write_text_permissive(dict(custom_attr_types())[self._attr["type"]])
+
+            self._add_extra_form_sections()
+            self._show_in_table_option()
+
+            forms.section(_("Add to monitoring configuration"))
+            html.help(self._macro_help)
+            html.checkbox(
+                "add_custom_macro",
+                self._attr["add_custom_macro"] or False,
+                label=self._macro_label,
+            )
+
+            forms.end()
+            html.show_localization_hint()
+            html.hidden_fields()
+
+
+class ModeEditCustomUserAttr(ModeEditCustomAttr[CustomUserAttrSpec]):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "edit_user_attr"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["users", "custom_attributes"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeCustomUserAttrs
+
+    @property
+    @override
+    def _type(self) -> str:
+        return "user"
+
+    @property
+    @override
+    def _attrs(self) -> list[CustomUserAttrSpec]:
+        return self._all_attrs["user"]
+
+    @property
+    @override
+    def _topics(self) -> Choices:
+        return [
+            ("ident", _("Identity")),
+            ("security", _("Security")),
+            ("notify", _("Notifications")),
+            ("personal", _("Personal settings")),
+        ]
+
+    @property
+    @override
+    def _default_value(self) -> CustomUserAttrSpec:
+        return CustomUserAttrSpec(
+            {
+                "type": "TextAscii",
+                "name": "",
+                "title": "",
+                "topic": "personal",
+                "help": "",
+                "show_in_table": False,
+                "add_custom_macro": False,
+                "user_editable": True,
+            }
+        )
+
+    @property
+    @override
+    def _macro_help(self) -> str:
+        return _(
+            "The attribute can be added to the contact definition in order to use it for notifications."
+        )
+
+    @property
+    @override
+    def _macro_label(self) -> str:
+        return _("Make this variable available in notifications")
+
+    @override
+    def _update_config(
+        self,
+        tree: FolderTree,
+        custom_attributes: Sequence[CustomUserAttrSpec],
+        *,
+        pprint_value: bool,
+    ) -> None:
+        update_user_custom_attrs(get_user_attributes(custom_attributes), datetime.now())
+
+    @override
+    def _show_in_table_option(self) -> None:
+        self._render_table_option(
+            _("Show in user table"),
+            _("Show this attribute in the user table of the setup menu"),
+            _(
+                "This attribute is only visibile in the edit user "
+                "page by default. This option displays it in the user "
+                "overview table of the setup menu as well."
+            ),
+        )
+
+    @override
+    def _add_extra_attrs_from_html_vars(self) -> None:
+        self._attr["user_editable"] = html.get_checkbox("user_editable")
+
+    @override
+    def _add_extra_form_sections(self) -> None:
+        forms.section(_("Editable by users"))
+        html.help(_("It is possible to let users edit their custom attributes."))
+        html.checkbox(
+            "user_editable",
+            self._attr.get("user_editable", True) or False,
+            label=_("Users can change this attribute in their personal settings"),
+        )
+
+    @override
+    def title(self) -> str:
+        if self._new:
+            return _("Add user attribute")
+        return _("Edit user attribute")
+
+
+class ModeEditCustomHostAttr(ModeEditCustomAttr[CustomHostAttrSpec]):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "edit_host_attr"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["hosts", "manage_hosts", "custom_attributes"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeCustomHostAttrs
+
+    @property
+    @override
+    def _type(self) -> str:
+        return "host"
+
+    @property
+    @override
+    def _attrs(self) -> list[CustomHostAttrSpec]:
+        return self._all_attrs["host"]
+
+    @property
+    @override
+    def _topics(self) -> Choices:
+        return host_attribute_topic_registry.get_choices()
+
+    @property
+    @override
+    def _default_value(self) -> CustomHostAttrSpec:
+        return CustomHostAttrSpec(
+            {
+                "type": "TextAscii",
+                "name": "",
+                "title": "",
+                "topic": "custom_attributes",
+                "help": "",
+                "show_in_table": False,
+                "add_custom_macro": False,
+            }
+        )
+
+    @property
+    @override
+    def _macro_help(self) -> str:
+        return _(
+            "The attribute can be added to the host definition in order to use it as custom host attribute "
+            "(sometimes called monitoring macro) in different places, for example as in check commands or "
+            "notifications. You can also only display this attribute in the status GUI when enabling this "
+            "option."
+        )
+
+    @property
+    @override
+    def _macro_label(self) -> str:
+        return _(
+            "Make this custom attribute available to check commands, notifications and the status GUI"
+        )
+
+    @override
+    def _update_config(
+        self,
+        tree: FolderTree,
+        custom_attributes: Sequence[CustomHostAttrSpec],
+        *,
+        pprint_value: bool,
+    ) -> None:
+        update_host_custom_attrs(tree, custom_attributes, pprint_value=pprint_value)
+
+    @override
+    def _show_in_table_option(self) -> None:
+        self._render_table_option(
+            _("Show in host tables"),
+            _("Show this attribute in host tables of the setup menu"),
+            _(
+                "This attribute is only visibile in the edit host and folder "
+                "pages by default. This option displays it in host overview "
+                "tables of the setup menu as well."
+            ),
+        )
+
+    @override
+    def title(self) -> str:
+        if self._new:
+            return _("Add host attribute")
+        return _("Edit host attribute")
+
+
+class ModeCustomAttrs[T_CustomAttrSpec: CustomAttrSpec](WatoMode):
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx)
+        # TODO: Inappropriate Intimacy: custom host attributes should not now about
+        #       custom user attributes and vice versa. The only reason they now about
+        #       each other now is that they are stored in one file.
+        self._all_attrs = load_custom_attrs_from_mk_file(lock=request.has_var("_transid"))
+
+    @property
+    @abc.abstractmethod
+    def _type(self) -> str:
+        raise NotImplementedError
+
+    @property
+    @abc.abstractmethod
+    def _attrs(self) -> list[T_CustomAttrSpec]: ...
+
+    @abc.abstractmethod
+    @override
+    def title(self) -> str:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def _update_config(
+        self, tree: FolderTree, custom_attributes: Sequence[T_CustomAttrSpec], *, pprint_value: bool
+    ) -> None:
+        raise NotImplementedError
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        return PageMenu(
+            dropdowns=[
+                PageMenuDropdown(
+                    name="attributes",
+                    title=_("Attributes"),
+                    topics=[
+                        PageMenuTopic(
+                            title=_("Create"),
+                            entries=[
+                                PageMenuEntry(
+                                    title=_("Add attribute"),
+                                    icon_name=StaticIcon(IconNames.new),
+                                    item=make_simple_link(
+                                        folder_preserving_link(
+                                            request,
+                                            [("mode", "edit_%s_attr" % self._type)],
+                                        )
+                                    ),
+                                    is_shortcut=True,
+                                    is_suggested=True,
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+                PageMenuDropdown(
+                    name="related",
+                    title=_("Related"),
+                    topics=[
+                        PageMenuTopic(
+                            title=_("Setup"),
+                            entries=list(self._page_menu_entries_related()),
+                        ),
+                    ],
+                ),
+            ],
+            breadcrumb=breadcrumb,
+            inpage_search=PageMenuSearch(),
+        )
+
+    @abc.abstractmethod
+    def _page_menu_entries_related(self) -> Iterable[PageMenuEntry]:
+        raise NotImplementedError
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        if not transactions.check_transaction(request):
+            request.del_var("_transid")
+            return redirect(makeuri(request=request, addvars=list(request.itervars())))
+
+        if not request.var("_delete"):
+            request.del_var("_transid")
+            return redirect(makeuri(request=request, addvars=list(request.itervars())))
+
+        delname = request.get_ascii_input_mandatory("_delete")
+        for index, attr in enumerate(self._attrs):
+            if attr["name"] == delname:
+                self._attrs.pop(index)
+        save_custom_attrs_to_mk_file(self._all_attrs)
+        pending_changes = _pending_changes(
+            config.sites,
+            use_git=config.wato_use_git,
+            local_site=omd_site(),
+            user_id=user.id,
+        )
+        remove_custom_attribute_from_all_users(
+            delname,
+            user_features_registry.features().sites,
+            get_user_attributes(config.wato_user_attrs),
+            config.user_connections,
+            pending_changes=pending_changes,
+            use_git=config.wato_use_git,
+            pprint_value=config.wato_pprint_config,
+        )
+        self._update_config(
+            make_folder_tree(config), self._attrs, pprint_value=config.wato_pprint_config
+        )
+        pending_changes.add(
+            Change(
+                action_name="edit-%sattrs" % self._type,
+                text=_("Deleted attribute %(delname)s") % {"delname": delname},
+                domains=[CORE],
+            ),
+            ChangeScope.all_activation_sites(),
+        )
+        return redirect(self.mode_url())
+
+    @override
+    def page(self, config: Config) -> None:
+        if not self._attrs:
+            html.div(_("No custom attributes are defined yet."), class_="info")
+            return
+
+        with table_element(self._type + "attrs", limit=config.table_row_limit) as table:
+            for nr, custom_attr in enumerate(sorted(self._attrs, key=lambda x: x["title"])):
+                table.row()
+                table.cell("#", css=["narrow nowrap"])
+                html.write_text_permissive(nr)
+
+                table.cell(_("Actions"), css=["buttons"])
+                edit_url = folder_preserving_link(
+                    request,
+                    [("mode", "edit_%s_attr" % self._type), ("edit", custom_attr["name"])],
+                )
+                delete_url = make_confirm_delete_link(
+                    i18n=_,
+                    url=makeactionuri(
+                        request, transactions.get(), [("_delete", custom_attr["name"])]
+                    ),
+                    title=_("Delete custom attribute #%(nr)d") % {"nr": nr},
+                    suffix=custom_attr["title"],
+                    message=_("Name: %(name)s") % {"name": custom_attr["name"]},
+                )
+                html.icon_button(edit_url, _("Properties"), StaticIcon(IconNames.edit))
+                html.icon_button(delete_url, _("Delete"), StaticIcon(IconNames.delete))
+
+                table.cell(_("Name"), custom_attr["name"])
+                table.cell(_("Title"), custom_attr["title"])
+                table.cell(_("Type"), dict(custom_attr_types())[custom_attr["type"]])
+
+
+class ModeCustomUserAttrs(ModeCustomAttrs[CustomUserAttrSpec]):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "user_attrs"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["users", "custom_attributes"]
+
+    @property
+    @override
+    def _type(self) -> str:
+        return "user"
+
+    @property
+    @override
+    def _attrs(self) -> list[CustomUserAttrSpec]:
+        return self._all_attrs["user"]
+
+    @override
+    def _update_config(
+        self,
+        tree: FolderTree,
+        custom_attributes: Sequence[CustomUserAttrSpec],
+        *,
+        pprint_value: bool,
+    ) -> None:
+        update_user_custom_attrs(get_user_attributes(custom_attributes), datetime.now())
+
+    @override
+    def title(self) -> str:
+        return _("Custom user attributes")
+
+    @override
+    def _page_menu_entries_related(self) -> Iterable[PageMenuEntry]:
+        yield PageMenuEntry(
+            title=_("Users"),
+            icon_name=StaticIcon(IconNames.users),
+            item=make_simple_link(
+                makeuri_contextless(
+                    request,
+                    [("mode", "users")],
+                    filename="wato.py",
+                )
+            ),
+        )
+
+
+class ModeCustomHostAttrs(ModeCustomAttrs[CustomHostAttrSpec]):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "host_attrs"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["hosts", "manage_hosts", "custom_attributes"]
+
+    @property
+    @override
+    def _type(self) -> str:
+        return "host"
+
+    @property
+    @override
+    def _attrs(self) -> list[CustomHostAttrSpec]:
+        return self._all_attrs["host"]
+
+    @override
+    def _update_config(
+        self,
+        tree: FolderTree,
+        custom_attributes: Sequence[CustomHostAttrSpec],
+        *,
+        pprint_value: bool,
+    ) -> None:
+        update_host_custom_attrs(tree, custom_attributes, pprint_value=pprint_value)
+
+    @override
+    def title(self) -> str:
+        return _("Custom host attributes")
+
+    def get_attributes(self) -> list[CustomHostAttrSpec]:
+        return self._attrs
+
+    @override
+    def _page_menu_entries_related(self) -> Iterable[PageMenuEntry]:
+        yield PageMenuEntry(
+            title=_("Hosts"),
+            icon_name=StaticIcon(IconNames.folder),
+            item=make_simple_link(
+                makeuri_contextless(
+                    request,
+                    [("mode", "folder")],
+                    filename="wato.py",
+                )
+            ),
+        )
+
+
+def _pending_changes(
+    sites: SiteConfigurations,
+    *,
+    use_git: bool,
+    local_site: SiteId,
+    user_id: UserId | None,
+) -> PendingChanges:
+    return PendingChanges(
+        activation_sites=activation_sites(sites),
+        local_site=local_site,
+        acting_user=user_id,
+        store=PendingChangesStore(),
+        hooks=(
+            make_audit_log_change_hook(use_git=use_git),
+            sidebar_reload_change_hook,
+            index_update_change_hook,
+        ),
+    )

@@ -1,0 +1,11 @@
+title: Viprinet: Firmware Status
+agents: snmp
+catalog: hw/network/viprinet
+license: GPLv2
+distribution: check_mk
+description:
+ This check displays the current firmware version and
+ if firmware updates are available
+
+discovery:
+ One service is created.

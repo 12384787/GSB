@@ -1,0 +1,930 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+
+import contextlib
+import logging
+import os
+import shutil
+import signal
+import subprocess
+import traceback
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Literal, NewType, override
+
+from pydantic import BaseModel
+
+import cmk.utils.paths
+from cmk.ccc import store
+from cmk.ccc.exceptions import MKGeneralException
+from cmk.ccc.hostaddress import HostName
+from cmk.ccc.site import omd_site, SiteId
+from cmk.crypto.certificate import Certificate, CertificatePEM, NegativeSerialException
+from cmk.crypto.hash import HashAlgorithm
+from cmk.gui.background_job.job import (
+    BackgroundJob,
+    BackgroundProcessInterface,
+    InitialStatusArgs,
+    JobTarget,
+)
+from cmk.gui.config import active_config, get_default_config
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.i18n import _
+from cmk.gui.log import logger
+from cmk.gui.logged_in import user
+from cmk.gui.site_config import is_distributed_setup_remote_site
+from cmk.gui.type_defs import GlobalSettings, TrustedCertificateAuthorities
+from cmk.gui.watolib import bakery, config_domain_name
+from cmk.gui.watolib.check_mk_automations import get_configuration, reload, restart
+from cmk.gui.watolib.config_domain_name import (
+    ABCConfigDomain,
+    ConfigDomainName,
+    DomainRequest,
+    finalize_specifically_set_settings,
+    generate_hosts_to_update_settings,
+    SerializedSettings,
+)
+from cmk.gui.watolib.piggyback_hub import validate_piggyback_hub_config
+from cmk.gui.watolib.utils import multisite_dir, wato_root_dir
+from cmk.livestatus_client import SiteConfigurations
+from cmk.utils.certs import (
+    cert_dir,
+    CertManagementEvent,
+    CN_TEMPLATE,
+    RemoteSiteCertsStore,
+    SiteCA,
+)
+from cmk.utils.config_warnings import ConfigurationWarnings
+from cmk.utils.encryption import raw_certificates_from_file
+from cmk.utils.security_event import log_security_event
+from cmk.web.utils.html import HTML
+
+ProcessId = NewType("ProcessId", int)
+
+
+def should_be_negative_serial_exception_be_ignored(exception: NegativeSerialException) -> bool:
+    # We ignore CAs with negative serials and we warn about them, except these, see CMK-16410
+    return (
+        exception.fingerprint
+        in (
+            "88:49:7F:01:60:2F:31:54:24:6A:E2:8C:4D:5A:EF:10:F1:D8:7E:BB:76:62:6F:4A:E0:B7:F9:5B:A7:96:87:99",  # EC-ACC
+        )
+    )
+
+
+@dataclass
+class ConfigDomainCoreSettings:
+    hosts_to_update: list[HostName] = field(default_factory=list)
+
+    def validate(self) -> None:
+        for hostname in self.hosts_to_update:
+            if not isinstance(hostname, str):
+                raise MKGeneralException(f"Invalid hostname type in ConfigDomain: {self}")
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+
+@lru_cache
+def _core_config_default_globals(
+    config_var_names: Sequence[str], *, debug: bool
+) -> Mapping[str, object]:
+    return get_configuration(config_var_names, debug=debug).result
+
+
+def _hang_up(pid_file: Path) -> None:
+    if pid := pid_from_file(pid_file):
+        os.kill(pid, signal.SIGHUP)
+
+
+def reload_stunnel() -> None:
+    _hang_up(cmk.utils.paths.omd_root / "tmp" / "run" / "stunnel-server.pid")
+
+
+def reload_agent_receiver() -> None:
+    _hang_up(cmk.utils.paths.omd_root / "tmp" / "run" / "agent-receiver.pid")
+
+
+class ConfigDomainCore(ABCConfigDomain):
+    @classmethod
+    @override
+    def ident(cls) -> ConfigDomainName:
+        return config_domain_name.CORE
+
+    @override
+    def config_dir(self) -> Path:
+        return wato_root_dir()
+
+    @override
+    def create_artifacts(self, settings: SerializedSettings | None = None) -> ConfigurationWarnings:
+        # see if we can / should move something from activate() here
+        return []
+
+    @override
+    def activate(self, settings: SerializedSettings | None = None) -> ConfigurationWarnings:
+        # Agents have to be baked from the new configuration, but before the core picks
+        # it up, matching the point at which cmk/base used to do this.
+        bakery.try_bake_agents_on_activation(
+            call_site="Activate Changes",
+            use_git=active_config.wato_use_git,
+            debug=active_config.debug,
+        )
+
+        return {"restart": restart, "reload": reload}[active_config.wato_activation_method](
+            self._parse_settings(settings).hosts_to_update, debug=active_config.debug
+        ).config_warnings
+
+    def _parse_settings(
+        self, activate_settings: SerializedSettings | None
+    ) -> ConfigDomainCoreSettings:
+        if activate_settings is None:
+            activate_settings = {}
+
+        return ConfigDomainCoreSettings(
+            hosts_to_update=list(activate_settings.get("hosts_to_update", []))
+        )
+
+    @override
+    def default_globals(self) -> Mapping[str, Any]:
+        return _core_config_default_globals(
+            tuple(self._get_global_config_var_names()), debug=active_config.debug
+        )
+
+    @classmethod
+    @override
+    def get_domain_request(cls, settings: list[SerializedSettings]) -> DomainRequest:
+        # The incremental activate only works, if all changes use the hosts_to_update option
+        hosts_to_update: set[HostName] = set()
+        for setting in settings:
+            if not setting.get("hosts_to_update"):
+                return DomainRequest(cls.ident(), generate_hosts_to_update_settings([]))
+            hosts_to_update.update(setting["hosts_to_update"])
+
+        return DomainRequest(cls.ident(), generate_hosts_to_update_settings(list(hosts_to_update)))
+
+
+class ConfigDomainGUI(ABCConfigDomain):
+    needs_sync = True
+    needs_activation = False
+
+    @classmethod
+    @override
+    def ident(cls) -> ConfigDomainName:
+        return config_domain_name.GUI
+
+    @override
+    def config_dir(self) -> Path:
+        return multisite_dir()
+
+    @override
+    def create_artifacts(self, settings: SerializedSettings | None = None) -> ConfigurationWarnings:
+        # see if we can / should move something from activate() here
+        return []
+
+    @override
+    def activate(self, settings: SerializedSettings | None = None) -> ConfigurationWarnings:
+        warnings: ConfigurationWarnings = []
+
+        if active_config.wato_use_git and shutil.which("git") is None:
+            raise MKUserError(
+                "",
+                _(
+                    "'git' command was not found on this system, but it is required for versioning the configuration. "
+                    "Please either install 'git' or disable git configuration tracking in Setup."
+                ),
+            )
+
+        if settings and settings.get("need_apache_reload", False):
+            completed_process = subprocess.run(
+                ["omd", "reload", "apache"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+                encoding="utf-8",
+                check=False,
+            )
+
+            if completed_process.returncode:
+                warnings.append(completed_process.stdout)
+
+        return warnings
+
+    @override
+    def default_globals(self) -> GlobalSettings:
+        return get_default_config()
+
+    @classmethod
+    @override
+    def get_domain_request(cls, settings: list[SerializedSettings]) -> DomainRequest:
+        setting = SerializedSettings()
+        for s in settings:
+            setting.update(s)
+        return DomainRequest(cls.ident(), setting)
+
+
+class ConfigDomainCACertificates(ABCConfigDomain):
+    needs_sync = True
+    needs_activation = True
+    always_activate = True  # Execute this on all sites on all activations
+
+    trusted_cas_file = cmk.utils.paths.trusted_ca_file
+
+    # This is a list of directories that may contain .pem files of trusted CAs.
+    # The contents of all .pem files will be contantenated together and written
+    # to "trusted_cas_file". This is done by the function update_trusted_cas().
+    # On a system only a single directory, the first existing one is processed.
+    system_wide_trusted_ca_search_paths = [
+        "/etc/ssl/certs",  # Ubuntu/Debian/SLES
+        "/etc/pki/tls/certs",  # CentOS/RedHat
+    ]
+
+    @classmethod
+    @override
+    def ident(cls) -> ConfigDomainName:
+        return config_domain_name.CA_CERTIFICATES
+
+    @override
+    def config_dir(self) -> Path:
+        return multisite_dir()
+
+    @override
+    @contextlib.contextmanager
+    def settings_change(
+        self,
+        sites: SiteConfigurations,
+        before: Mapping[SiteId, GlobalSettings],
+        after: Mapping[SiteId, GlobalSettings],
+    ) -> Iterator[None]:
+        yield
+        self._log_trust_changes(before, after)
+
+    def _log_trust_changes(
+        self,
+        before: Mapping[SiteId, GlobalSettings],
+        after: Mapping[SiteId, GlobalSettings],
+    ) -> None:
+        added: dict[bytes, Certificate] = {}
+        removed: dict[bytes, Certificate] = {}
+        for site_id, settings in after.items():
+            cas_before = before[site_id]["trusted_certificate_authorities"]["trusted_cas"]
+            cas_after = settings["trusted_certificate_authorities"]["trusted_cas"]
+            if cas_before == cas_after:
+                continue
+            certs_before = self._certs_by_fingerprint(cas_before)
+            certs_after = self._certs_by_fingerprint(cas_after)
+            added |= {f: certs_after[f] for f in certs_after.keys() - certs_before.keys()}
+            removed |= {f: certs_before[f] for f in certs_before.keys() - certs_after.keys()}
+
+        for cert in added.values():
+            self._log_trust_change("certificate added", cert)
+        for cert in removed.values():
+            self._log_trust_change("certificate removed", cert)
+
+    @classmethod
+    def _certs_by_fingerprint(cls, trusted_cas: Sequence[str]) -> Mapping[bytes, Certificate]:
+        return {
+            cert.fingerprint(HashAlgorithm.Sha256): cert for cert in cls._load_certs(trusted_cas)
+        }
+
+    @staticmethod
+    def _log_trust_change(
+        event: Literal["certificate added", "certificate removed"],
+        cert: Certificate,
+    ) -> None:
+        log_security_event(
+            CertManagementEvent(
+                event=event,
+                component="trusted certificate authorities",
+                actor=user.id,
+                cert=cert,
+            )
+        )
+
+    @override
+    def config_file(self, site_specific: bool) -> Path:
+        return self.config_dir() / (
+            "ca-certificates_sitespecific.mk" if site_specific else "ca-certificates.mk"
+        )
+
+    @override
+    def save(
+        self,
+        settings: GlobalSettings,
+        site_specific: bool = False,
+        custom_site_path: str | None = None,
+    ) -> None:
+        super().save(settings, site_specific=site_specific, custom_site_path=custom_site_path)
+
+        # default_globals() is keyed by config variable, so the fallback has to be
+        # the *value* of our one variable, not the whole mapping.
+        current_config = settings.get(
+            "trusted_certificate_authorities",
+            self.default_globals()["trusted_certificate_authorities"],
+        )
+
+        # We need to activate this immediately to make syncs to distributed
+        # setup remote sites possible right after changing the option
+        #
+        # Since this can be called from any Setup page it is not possible to report
+        # errors to the user here. The self._update_trusted_cas() method logs the
+        # errors - this must be enough for the moment.
+        if not site_specific and custom_site_path is None:
+            self._update_trusted_cas(current_config)
+            self.update_remote_sites_cas(current_config["trusted_cas"])
+
+    @override
+    def create_artifacts(self, settings: SerializedSettings | None = None) -> ConfigurationWarnings:
+        try:
+            warnings = self._update_trusted_cas(active_config.trusted_certificate_authorities)
+            reload_stunnel()
+        except Exception:
+            logger.exception("error updating trusted CAs")
+            return [
+                f"Failed to create trusted CA file '{self.trusted_cas_file}': {traceback.format_exc()}"
+            ]
+        return warnings
+
+    @override
+    def activate(self, settings: SerializedSettings | None = None) -> ConfigurationWarnings:
+        return []
+
+    def _update_trusted_cas(
+        self, current_config: TrustedCertificateAuthorities
+    ) -> ConfigurationWarnings:
+        trusted_cas: list[str] = []
+        errors: ConfigurationWarnings = []
+
+        if current_config["use_system_wide_cas"]:
+            trusted, errors = self._get_system_wide_trusted_ca_certificates()
+            trusted_cas += trusted
+
+        trusted_cas += current_config["trusted_cas"]
+
+        store.save_text_to_file(
+            self.trusted_cas_file,
+            # we sort to have a deterministic output, s.t. for example liveproxyd can reliably check
+            # if the file changed
+            "\n".join(sorted(trusted_cas)),
+        )
+        return errors
+
+    # this is only a non-member classmethod, because it used in update config to 2.2
+    @classmethod
+    def update_remote_sites_cas(cls, trusted_cas: Sequence[str]) -> None:
+        remote_cas_store = RemoteSiteCertsStore(cmk.utils.paths.remote_sites_cas_dir)
+        for site, cert in cls._remote_sites_cas(trusted_cas).items():
+            remote_cas_store.save(site, cert)
+
+    @staticmethod
+    def _load_certs(trusted_cas: Sequence[str]) -> Iterable[Certificate]:
+        for cert_str in trusted_cas:
+            try:
+                yield Certificate.load_pem(CertificatePEM(cert_str))
+            except NegativeSerialException as e:
+                if not should_be_negative_serial_exception_be_ignored(e):
+                    logger.warning(
+                        "There is a certificate %(subject)r with a negative serial number in the trusted certificate authorities! Ignoring that...",
+                        {"subject": e.subject},
+                    )
+
+    @staticmethod
+    def _remote_sites_cas(trusted_cas: Sequence[str]) -> Mapping[SiteId, Certificate]:
+        return {
+            site_id: cert
+            for cert in sorted(
+                ConfigDomainCACertificates._load_certs(trusted_cas),
+                key=lambda cert: cert.not_valid_after,
+            )
+            if (
+                (cns := cert.subject.rfc4514_string())
+                # TODO: use certificate's subject alternative name instead of "parsing" the CN
+                and (site_id := CN_TEMPLATE.extract_site(cns))
+            )
+        }
+
+    # this is only a non-member, because it used in update config to 2.2
+    @staticmethod
+    def is_valid_cert(raw_cert: str) -> bool:
+        try:
+            Certificate.load_pem(CertificatePEM(raw_cert))
+            return True
+        except ValueError:
+            return False
+
+    def _get_system_wide_trusted_ca_certificates(self) -> tuple[list[str], list[str]]:
+        trusted_cas: set[str] = set()
+        errors: list[str] = []
+        for p in self.system_wide_trusted_ca_search_paths:
+            cert_path = Path(p)
+
+            if not cert_path.is_dir():
+                continue
+
+            for entry in cert_path.iterdir():
+                if entry.suffix not in [".pem", ".crt"]:
+                    continue
+
+                cert_file_path = entry.absolute()
+                try:
+                    raw_certs = raw_certificates_from_file(cert_file_path)
+                except OSError as e:
+                    logger.error(
+                        "Failed to add certificate '%(cert_file_path)s' to trusted CA certificates with error '%(error)s'.",
+                        {"cert_file_path": cert_file_path, "error": e},
+                    )
+                    continue
+
+                for raw_cert in raw_certs:
+                    try:
+                        if self.is_valid_cert(raw_cert):
+                            trusted_cas.add(raw_cert)
+                            continue
+                    except NegativeSerialException as e:
+                        if should_be_negative_serial_exception_be_ignored(e):
+                            continue
+
+                    logger.exception(
+                        "Skipping invalid certificates in file %(cert_file_path)s",
+                        {"cert_file_path": cert_file_path},
+                    )
+                    errors.append(
+                        f"Failed to add invalid certificate in '{cert_file_path}' to trusted CA certificates. "
+                        "See web.log for details."
+                    )
+
+            break
+
+        return list(trusted_cas), errors
+
+    @override
+    def default_globals(self) -> GlobalSettings:
+        return {
+            "trusted_certificate_authorities": {
+                "use_system_wide_cas": True,
+                "trusted_cas": [],
+            }
+        }
+
+
+class ConfigDomainSiteCertificate(ABCConfigDomain):
+    @classmethod
+    @override
+    def ident(cls) -> ConfigDomainName:
+        return config_domain_name.SITE_CERTIFICATE
+
+    @override
+    def config_dir(self) -> Path:
+        return multisite_dir() / "site_certificate"
+
+    @override
+    def create_artifacts(self, settings: SerializedSettings | None = None) -> ConfigurationWarnings:
+        SiteCA.load(cert_dir(cmk.utils.paths.omd_root)).create_site_certificate(
+            omd_site(),
+            additional_sans=active_config.site_subject_alternative_names,
+        )
+        return []
+
+    @override
+    def activate(self, settings: SerializedSettings | None = None) -> ConfigurationWarnings:
+        reload_stunnel()
+        reload_agent_receiver()
+
+        return []
+
+    @override
+    def default_globals(self) -> GlobalSettings:
+        return {"site_subject_alternative_names": []}
+
+
+def pid_from_file(pid_file: Path) -> ProcessId | None:
+    """Read a process id from a given pid file"""
+    try:
+        return ProcessId(int(store.load_object_from_file(pid_file, default=None)))
+    except Exception:
+        return None
+
+
+def _all_sites(omd_path: Path) -> Iterable[str]:
+    basedir = omd_path / "sites"
+    return sorted([p.name for p in basedir.iterdir() if p.is_dir()])
+
+
+def _read_site_config(config_path: Path) -> Mapping[str, str]:
+    config: dict[str, str] = {}
+    with config_path.open() as conf_file:
+        for line in conf_file:
+            line = line.strip()
+            if line == "" or line[0] == "#":
+                continue
+            var, value = line.split("=", 1)
+            if var.startswith("CONFIG_"):
+                config[var[7:].strip()] = value.strip().strip("'")
+    return config
+
+
+def _build_site_configs(omd_path: Path = Path("/omd")) -> dict[str, Mapping[str, str]]:
+    site_configs: dict[str, Mapping[str, str]] = {}
+    for sitename in _all_sites(omd_path):
+        # Some sites will not have a configuration file: For example, sites created with
+        # `omd create --no-init`. These sites will choose a new ports, once they are
+        # initialized, so treating them as if they don't exist is the correct thing to do.
+        # There is a secondary error, if the configuration is not word-readable. That error is
+        # logged by `omd config change`, so we don't log it here again.
+        with contextlib.suppress(Exception):
+            site_configs[sitename] = _read_site_config(
+                omd_path / f"sites/{sitename}/etc/omd/site.conf"
+            )
+    return site_configs
+
+
+def _port_in_use_by(
+    value: int, this_site: str, site_configs: Mapping[str, Mapping[str, str]]
+) -> tuple[str, str] | None:
+    for sitename, config in site_configs.items():
+        if sitename == this_site:
+            for k, v in config.items():
+                if k != "LIVESTATUS_TCP_PORT" and v == str(value):
+                    return k, sitename
+        else:
+            for k, v in config.items():
+                if v == str(value):
+                    return k, sitename
+    return None
+
+
+def validate_port_not_in_use(value: int, omd_path: Path = Path("/omd")) -> None:
+    if conflict := _port_in_use_by(value, omd_site(), _build_site_configs(omd_path)):
+        key, site = conflict
+        raise MKUserError(
+            "",
+            _("Port %(value)d is already in use by site '%(site)s' (key: %(key)s).")
+            % {"value": value, "site": site, "key": key},
+        )
+
+
+class ConfigDomainOMD(ABCConfigDomain):
+    needs_sync = True
+    needs_activation = True
+    omd_config_dir = cmk.utils.paths.omd_root / "etc/omd"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._logger: logging.Logger = logger.getChild("config.omd")
+
+    @classmethod
+    @override
+    def ident(cls) -> ConfigDomainName:
+        return config_domain_name.OMD
+
+    @classmethod
+    @override
+    def hint(cls) -> HTML:
+        return HTML.without_escaping(
+            _(
+                "Changing this setting triggers a full restart of all affected sites during activate changes."
+            )
+        )
+
+    @override
+    def config_dir(self) -> Path:
+        return self.omd_config_dir
+
+    @override
+    def default_globals(self) -> GlobalSettings:
+        settings = self._from_omd_config(self._load_site_config())
+        # site.conf holds the *current* omd config, not the factory default (it gets
+        # fully rewritten on every "omd config change"). This is a known bug coming from
+        # omd owning the active settings that can be changed via its CLI without
+        # exposing their defaults. This will be fixed in CMK-38451.
+        # MCP-related settings set here manually for a minimal and backportable fix.
+        settings["site_mcp_server"] = False
+        settings["site_mcp_trace_forward"] = False
+        return settings
+
+    @override
+    @contextlib.contextmanager
+    def settings_change(
+        self,
+        sites: SiteConfigurations,
+        before: Mapping[SiteId, GlobalSettings],
+        after: Mapping[SiteId, GlobalSettings],
+    ) -> Iterator[None]:
+        validate_piggyback_hub_config(sites, after)
+        yield
+
+    @override
+    def create_artifacts(self, settings: SerializedSettings | None = None) -> ConfigurationWarnings:
+        # see if we can / should move something from activate() here
+        return []
+
+    @override
+    def activate(self, settings: SerializedSettings | None = None) -> ConfigurationWarnings:
+        current_settings = self._load_site_config()
+
+        omd_settings = finalize_specifically_set_settings(
+            self._to_omd_config(self.load()), self._to_omd_config(self.load_site_globals())
+        )
+
+        if "LIVESTATUS_TCP_PORT" in omd_settings:
+            validate_port_not_in_use(int(omd_settings["LIVESTATUS_TCP_PORT"]))
+
+        config_change_commands: list[str] = []
+        self._logger.debug("Set omd config: %(omd_settings)r", {"omd_settings": omd_settings})
+
+        for key, val in omd_settings.items():
+            if key not in current_settings:
+                continue  # Skip settings unknown to current OMD
+
+            if current_settings[key] == val:
+                continue  # Skip unchanged settings
+
+            config_change_commands.append(f"{key}={val}")
+
+        if not config_change_commands:
+            self._logger.debug("Got no config change commands...")
+            return []
+
+        self._logger.debug('Executing "omd config change"')
+        self._logger.debug("  Commands: %(commands)r", {"commands": config_change_commands})
+
+        # We need a background job on remote sites to wait for the restart, so
+        # that the central site can gather the result of the activation.
+        # On a central site, the waiting for the end of the restart is already
+        # taken into account by the activate changes background job within
+        # async_progress.js. Just execute the omd config change command
+        if is_distributed_setup_remote_site(active_config.sites):
+            job = OMDConfigChangeBackgroundJob()
+            if (
+                result := job.start(
+                    JobTarget(
+                        callable=omd_config_change_job_entry_point,
+                        args=OMDConfigChangeJobArgs(
+                            commands=config_change_commands,
+                        ),
+                    ),
+                    InitialStatusArgs(
+                        title=job.gui_title(),
+                        lock_wato=False,
+                        stoppable=False,
+                        user=str(user.id) if user.id else None,
+                    ),
+                )
+            ).is_error():
+                raise result.error
+        else:
+            _do_config_change(config_change_commands, self._logger)
+
+        return []
+
+    def _load_site_config(self) -> dict[str, object]:
+        return self._load_omd_config(self.omd_config_dir / "site.conf")
+
+    def _load_omd_config(self, file_path: Path) -> dict[str, object]:
+        if not file_path.exists():
+            return {}
+
+        settings = dict[str, object]()
+        try:
+            with file_path.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+
+                    if line == "" or line.startswith("#"):
+                        continue
+
+                    var, value = line.split("=", 1)
+
+                    if not var.startswith("CONFIG_"):
+                        continue
+
+                    key = var[7:].strip()
+                    val = value.strip().strip("'")
+
+                    settings[key] = val
+        except Exception as e:
+            raise MKGeneralException(
+                _("Cannot read configuration file %(file_path)s: %(e)s")
+                % {"file_path": file_path, "e": e}
+            )
+
+        return settings
+
+    # Convert the raw OMD configuration settings to the Setup config format.
+    # The format that is understood by the valuespecs. Since some valuespecs
+    # affect multiple OMD config settings, these need to be converted here.
+    #
+    # Sadly we can not use the Transform() valuespecs, because each configvar
+    # only get's the value associated with it's config key.
+    def _from_omd_config(self, omd_config: dict[str, Any]) -> dict[str, object]:
+        settings: dict[str, Any] = {}
+
+        for key, value in omd_config.items():
+            if value == "on":
+                settings[key] = True
+            elif value == "off":
+                settings[key] = False
+            else:
+                settings[key] = value
+
+        if "LIVESTATUS_TCP" in settings:
+            if settings["LIVESTATUS_TCP"]:
+                settings["LIVESTATUS_TCP"] = {
+                    "port": int(settings["LIVESTATUS_TCP_PORT"]),
+                    "tls": settings["LIVESTATUS_TCP_TLS"],
+                }
+                del settings["LIVESTATUS_TCP_PORT"]
+                del settings["LIVESTATUS_TCP_TLS"]
+
+                # Be compatible to older sites that don't have the key in their config yet
+                settings.setdefault("LIVESTATUS_TCP_ONLY_FROM", "0.0.0.0")
+
+                if settings["LIVESTATUS_TCP_ONLY_FROM"] != "0.0.0.0":
+                    settings["LIVESTATUS_TCP"]["only_from"] = settings[
+                        "LIVESTATUS_TCP_ONLY_FROM"
+                    ].split()
+
+                del settings["LIVESTATUS_TCP_ONLY_FROM"]
+                del settings["LIVESTATUS_TCP_INSTANCES"]
+                del settings["LIVESTATUS_TCP_PER_SOURCE"]
+            else:
+                settings["LIVESTATUS_TCP"] = None
+
+        if "NSCA" in settings:
+            if settings["NSCA"]:
+                settings["NSCA"] = int(settings["NSCA_TCP_PORT"])
+            else:
+                settings["NSCA"] = None
+
+        if "MKEVENTD" in settings:
+            if settings["MKEVENTD"]:
+                settings["MKEVENTD"] = []
+
+                for proto in ["SNMPTRAP", "SYSLOG", "SYSLOG_TCP"]:
+                    if settings["MKEVENTD_%s" % proto]:
+                        settings["MKEVENTD"].append(proto)
+            else:
+                settings["MKEVENTD"] = None
+
+        if "TRACE_RECEIVE" in settings:
+            if settings["TRACE_RECEIVE"]:
+                settings["TRACE_RECEIVE"] = {
+                    "address": settings["TRACE_RECEIVE_ADDRESS"],
+                    "port": int(settings["TRACE_RECEIVE_PORT"]),
+                }
+                del settings["TRACE_RECEIVE_ADDRESS"]
+                del settings["TRACE_RECEIVE_PORT"]
+            else:
+                settings["TRACE_RECEIVE"] = None
+
+        if "TRACE_SEND" in settings:
+            if settings["TRACE_SEND"]:
+                target = settings.pop("TRACE_SEND_TARGET", "")
+                if target == "local_site":
+                    settings["TRACE_SEND"] = target
+                else:
+                    settings["TRACE_SEND"] = (
+                        "other_collector",
+                        {
+                            "url": target,
+                        },
+                    )
+            else:
+                settings["TRACE_SEND"] = "no_tracing"
+
+        # Convert from OMD key (to lower, add "site_" prefix)
+        return {"site_%s" % key.lower(): val for key, val in settings.items()}
+
+    # Bring the Setup internal representation int OMD configuration settings.
+    # Counterpart of the _from_omd_config() method.
+    def _to_omd_config(self, settings: GlobalSettings) -> GlobalSettings:
+        # Convert to OMD key
+        settings = {key.upper()[5:]: val for key, val in settings.items()}
+
+        if "LIVESTATUS_TCP" in settings:
+            if settings["LIVESTATUS_TCP"] is not None:
+                settings["LIVESTATUS_TCP_PORT"] = "%s" % settings["LIVESTATUS_TCP"]["port"]
+                settings["LIVESTATUS_TCP_TLS"] = settings["LIVESTATUS_TCP"].get("tls", False)
+
+                if "only_from" in settings["LIVESTATUS_TCP"]:
+                    settings["LIVESTATUS_TCP_ONLY_FROM"] = " ".join(
+                        settings["LIVESTATUS_TCP"]["only_from"]
+                    )
+                else:
+                    settings["LIVESTATUS_TCP_ONLY_FROM"] = "0.0.0.0"
+
+                settings["LIVESTATUS_TCP_INSTANCES"] = settings["LIVESTATUS_TCP"]["instances"]
+                settings["LIVESTATUS_TCP_PER_SOURCE"] = settings["LIVESTATUS_TCP"]["per_source"]
+                settings["LIVESTATUS_TCP"] = "on"
+            else:
+                settings["LIVESTATUS_TCP"] = "off"
+
+        if "NSCA" in settings:
+            if settings["NSCA"] is not None:
+                settings["NSCA_TCP_PORT"] = "%s" % settings["NSCA"]
+                settings["NSCA"] = "on"
+            else:
+                settings["NSCA"] = "off"
+
+        if "MKEVENTD" in settings:
+            if settings["MKEVENTD"] is not None:
+                for proto in ["SNMPTRAP", "SYSLOG", "SYSLOG_TCP"]:
+                    settings["MKEVENTD_%s" % proto] = proto in settings["MKEVENTD"]
+
+                settings["MKEVENTD"] = "on"
+
+            else:
+                settings["MKEVENTD"] = "off"
+
+        if "TRACE_RECEIVE" in settings:
+            if settings["TRACE_RECEIVE"] is not None:
+                settings["TRACE_RECEIVE_ADDRESS"] = settings["TRACE_RECEIVE"]["address"]
+                settings["TRACE_RECEIVE_PORT"] = str(settings["TRACE_RECEIVE"]["port"])
+                settings["TRACE_RECEIVE"] = "on"
+            else:
+                settings["TRACE_RECEIVE"] = "off"
+
+        if "TRACE_SEND" in settings:
+            if settings["TRACE_SEND"] != "no_tracing":
+                if settings["TRACE_SEND"] == "local_site":
+                    settings["TRACE_SEND_TARGET"] = settings["TRACE_SEND"]
+                elif (
+                    isinstance(settings["TRACE_SEND"], tuple)
+                    and settings["TRACE_SEND"][0] == "other_collector"
+                ):
+                    settings["TRACE_SEND_TARGET"] = settings["TRACE_SEND"][1]["url"]
+                else:
+                    raise ValueError(f"Unhandled value: {settings['TRACE_SEND']}")
+                settings["TRACE_SEND"] = "on"
+            else:
+                settings["TRACE_SEND"] = "off"
+
+        omd_config = dict[str, object]()
+        for key, value in settings.items():
+            if isinstance(value, bool):
+                omd_config[key] = "on" if value else "off"
+            else:
+                omd_config[key] = "%s" % value
+
+        return omd_config
+
+
+class OMDConfigChangeJobArgs(BaseModel, frozen=True):
+    commands: Sequence[str]
+
+
+def omd_config_change_job_entry_point(
+    job_interface: BackgroundProcessInterface, args: OMDConfigChangeJobArgs
+) -> None:
+    OMDConfigChangeBackgroundJob().do_execute(args.commands, job_interface)
+
+
+class OMDConfigChangeBackgroundJob(BackgroundJob):
+    job_prefix = "omd-config-change"
+
+    @classmethod
+    @override
+    def gui_title(cls) -> str:
+        return _("Apply OMD config changes")
+
+    def __init__(self) -> None:
+        super().__init__(self.job_prefix)
+
+    def do_execute(
+        self, config_change_commands: Sequence[str], job_interface: BackgroundProcessInterface
+    ) -> None:
+        _do_config_change(config_change_commands, self._logger)
+        job_interface.send_result_message(_("OMD config changes have been applied."))
+
+
+def _do_config_change(config_change_commands: Sequence[str], omd_logger: logging.Logger) -> None:
+    completed_process = subprocess.run(
+        ["omd", "config", "change"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        close_fds=True,
+        encoding="utf-8",
+        input="\n".join(config_change_commands),
+        check=False,
+    )
+
+    omd_logger.debug("  Exit code: %(exit_code)d", {"exit_code": completed_process.returncode})
+    omd_logger.debug("  Output: %(output)r", {"output": completed_process.stdout})
+    if completed_process.returncode:
+        raise MKGeneralException(
+            _(
+                "Failed to activate changed site "
+                "configuration.\nExit code: %(exit_code)d\nConfig: %(config)s\nOutput: %(output)s"
+            )
+            % {
+                "exit_code": completed_process.returncode,
+                "config": config_change_commands,
+                "output": completed_process.stdout,
+            }
+        )

@@ -1,0 +1,184 @@
+#!groovy
+
+/// file: common.groovy
+
+// Runs provided command in a shell and returns the JSON parsed stdout output
+load_json = { json_file ->
+    def cmd_stdout_result = cmd_output("cat ${json_file}");
+    (new groovy.json.JsonSlurperClassic()).parseText(cmd_stdout_result);
+}
+
+cleanup_directory = { directory ->
+    assert directory.startsWith(env.HOME);
+    sh("rm -rf '${directory}/'*");
+    sh("mkdir -p '${directory}'");
+}
+
+check_job_parameters = { param_list ->
+    print("""
+        ||== REQUIRED JOB PARAMETERS ===============================================================
+        ${ param_list.collect({ param_or_tuple ->
+            def (param_name, must_be_nonempty) = (param_or_tuple instanceof java.util.ArrayList) ? param_or_tuple : [param_or_tuple, false];
+            if (!params.containsKey(param_name)) {
+                raise("Expected job parameter ${param_name} not defined!");
+            }
+            def param_value = params[param_name];
+            if (must_be_nonempty && (param_value instanceof java.lang.String) && !param_value) {
+                raise("Job parameter ${param_name} is expected to be nonempty!");
+            }
+            "||  ${param_name.padRight(32)} ${"(${param_value.getClass().name.tokenize('.').last()})".padRight(12)} = |${param_value}|"
+        }).join("\n")}
+        ||==========================================================================================
+        """.stripMargin());
+}
+
+check_environment_variables = { param_list ->
+    println("""
+        ||== USED ENVIRONMENT VARIABLES ============================================================
+        ${ param_list.collect({ param ->
+            "||  ${param.padRight(45)} = |${env[param]}|"
+        }).join("\n")}
+        ||==========================================================================================
+        """.stripMargin());
+}
+
+assert_no_modified_lock_files = { repo_root ->
+    dir(repo_root) {
+        assert sh(script: "tests/run_tests.sh test-find-modified-lock-files", returnStatus: true) == 0;
+    }
+}
+
+provide_clone = { repo_name, credentials_id ->
+    dir("${WORKSPACE}/${repo_name}") {
+        checkout([$class: "GitSCM",
+            userRemoteConfigs: [[
+                credentialsId: credentials_id,
+                url: "ssh://jenkins@review.lan.tribe29.com:29418/${repo_name}",
+            ]],
+            branches: [new hudson.plugins.git.BranchSpec("FETCH_HEAD")],
+            extensions: [
+                [$class: 'CloneOption',
+                 timeout: 20,
+            ]],
+        ]);
+    }
+}
+
+withCredentialFileAtLocation = { Map args, Closure body ->
+    body.resolveStrategy = Closure.OWNER_FIRST;
+    body.delegate = [:];
+
+    if (!args.creds) {
+        body();
+        return;
+    }
+
+    def cp_cmd = onWindows ? "pwsh -c cp" : "cp"
+    def rm_cmd = onWindows ? "pwsh -c rm -Force" : "rm -f"
+
+    def bindings = [];
+    for (int i = 0; i < args.creds.size(); i++) {
+        bindings += file(
+            credentialsId: args.creds.get(i).credentialsId,
+            variable: "SECRET_LOCATION_${i}",
+        );
+    }
+
+    try {
+        withCredentials(bindings) {
+            args.creds.eachWithIndex { entry, index ->
+                def this_var_name = "SECRET_LOCATION_${index}";
+                cmd_output("${cp_cmd} \$${this_var_name} ${entry.location}");
+            };
+            body();
+        }
+        return true;
+    } finally {
+        args.creds.each { entry ->
+            cmd_output("${rm_cmd} ${entry.location}");
+        };
+    }
+};
+
+withCredentialUsernamePasswordAtLocation = { Map args, Closure body ->
+    body.resolveStrategy = Closure.OWNER_FIRST;
+    body.delegate = [:];
+
+    if (!args.creds) {
+        body();
+        return;
+    }
+
+    def rm_cmd = onWindows ? "pwsh -c rm -Force" : "rm -f"
+
+    def bindings = [];
+    for (int i = 0; i < args.creds.size(); i++) {
+        bindings += usernamePassword(
+            credentialsId: args.creds.get(i).credentialsId,
+            usernameVariable: "CRED_USER_${i}",
+            passwordVariable: "CRED_PASSWORD_${i}",
+        );
+    }
+
+    try {
+        withCredentials(bindings) {
+            args.creds.eachWithIndex { entry, index ->
+                def this_user_name = "CRED_USER_${index}";
+                def this_password_name = "CRED_PASSWORD_${index}";
+                sh("""
+                    echo "\$${this_user_name}:\$${this_password_name}" > ${entry.location}
+                """);
+            }
+            body();
+        }
+        return true;
+    } finally {
+        args.creds.each { entry ->
+            cmd_output("${rm_cmd} ${entry.location}");
+        }
+    }
+};
+
+withCredentialEnv = { Map args, Closure body ->
+    body.resolveStrategy = Closure.OWNER_FIRST;
+    body.delegate = [:];
+
+    if (!args.creds) {
+        body();
+        return;
+    }
+
+    withCredentials(args.creds) {
+        body();
+    }
+}
+
+withGerritSshKey = { Closure body ->
+    withCredentials([sshUserPrivateKey(
+        credentialsId: "jenkins-gerrit-fips-compliant-ssh-key",
+        keyFileVariable: "GERRIT_SSH_KEY",
+        usernameVariable: "GERRIT_USER",
+    )]) {
+        body();
+    }
+}
+
+withGerritHttpCredentials = { Closure body ->
+    withCredentials([usernamePassword(
+        credentialsId: "sheriff_http_credentials_for_gerrit",
+        usernameVariable: "GERRIT_USER",
+        passwordVariable: "GERRIT_PASSWORD",
+    )]) {
+        body();
+    }
+}
+
+withNexusCredentials = { Closure body ->
+    withCredentials([usernamePassword(
+        credentialsId: "nexus",
+        usernameVariable: "NEXUS_USERNAME",
+        passwordVariable: "NEXUS_PASSWORD",
+    )]) {
+        body();
+    }
+}

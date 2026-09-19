@@ -1,0 +1,2201 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+# mypy: disable-error-code="type-arg"
+
+"""Mode for managing sites"""
+
+import socket
+import traceback
+from collections.abc import Collection, Iterable, Iterator, Mapping
+from typing import Any, assert_never, cast, overload, override
+from urllib.parse import urlparse
+
+import cmk.gui.sites
+import cmk.gui.watolib.audit_log as _audit_log
+import cmk.utils.paths
+from cmk.ccc.exceptions import MKGeneralException, MKTerminate, MKTimeout
+from cmk.ccc.regex import SITE_ID_PATTERN
+from cmk.ccc.site import omd_site, SiteId
+from cmk.ccc.user import UserId
+from cmk.ccc.version import Edition
+from cmk.gui import forms
+from cmk.gui.breadcrumb import Breadcrumb
+from cmk.gui.config import Config
+from cmk.gui.exceptions import FinalizeRequest, MKUserError
+from cmk.gui.form_specs import (
+    create_validation_error_for_mk_user_error,
+    DisplayMode,
+    FormSpecAdapter,
+    parse_data_from_field_id,
+    RawDiskData,
+    read_data_from_frontend,
+    render_form_spec,
+)
+from cmk.gui.form_specs.generators.dict_to_catalog import create_flat_catalog_from_dictionary
+from cmk.gui.form_specs.unstable import id_validators, not_empty
+from cmk.gui.form_specs.unstable.legacy_converter import (
+    Tuple,
+)
+from cmk.gui.htmllib.generator import HTMLWriter
+from cmk.gui.htmllib.html import html
+from cmk.gui.htmllib.tag_rendering import render_end_tag
+from cmk.gui.http import request
+from cmk.gui.i18n import _
+from cmk.gui.log import logger
+from cmk.gui.logged_in import user
+from cmk.gui.page_menu import (
+    make_simple_form_page_menu,
+    make_simple_link,
+    PageMenu,
+    PageMenuDropdown,
+    PageMenuEntry,
+    PageMenuSearch,
+    PageMenuTopic,
+)
+from cmk.gui.pages import AjaxPage, PageContext, PageEndpoint, PageRegistry, PageResult
+from cmk.gui.site_config import (
+    distributed_setup_remote_sites,
+    is_replication_enabled,
+    site_is_local,
+)
+from cmk.gui.sites import SiteStatus
+from cmk.gui.table import Table, table_element
+from cmk.gui.type_defs import ActionResult
+from cmk.gui.user_sites import activation_sites
+from cmk.gui.userdb import distributed_saml_supported
+from cmk.gui.utils.compatibility import make_site_version_info
+from cmk.gui.utils.csrf_token import check_csrf_token
+from cmk.gui.utils.transaction_manager import transactions
+from cmk.gui.utils.user_errors import user_errors
+from cmk.gui.wato.pages._html_elements import wato_html_head
+from cmk.gui.watolib.activate_changes import get_free_message
+from cmk.gui.watolib.automation_commands import OMDStatus
+from cmk.gui.watolib.automations import (
+    do_site_login,
+    MKAutomationException,
+    remote_automation_config_from_site_config,
+)
+from cmk.gui.watolib.broker_certificates import trigger_remote_certs_creation
+from cmk.gui.watolib.broker_connections import BrokerConnectionsConfigFile
+from cmk.gui.watolib.config_domain_name import (
+    ABCConfigDomain,
+    config_variable_registry,
+)
+from cmk.gui.watolib.config_domains import ConfigDomainGUI
+from cmk.gui.watolib.config_sync import (
+    populate_saml_site_endpoint_urls,
+)
+from cmk.gui.watolib.global_settings import (
+    load_configuration_settings,
+    make_pending_changes,
+    save_global_settings,
+)
+from cmk.gui.watolib.hosts_and_folders import (
+    Folder,
+    folder_preserving_link,
+    FolderSiteStats,
+    FolderTree,
+    make_action_link,
+    make_folder_tree,
+)
+from cmk.gui.watolib.mode import mode_url, ModeRegistry, redirect, WatoMode
+from cmk.gui.watolib.pending_changes import Change, ChangeScope, PendingChanges
+from cmk.gui.watolib.site_management import (
+    add_changes_after_editing_broker_connection,
+    add_changes_after_editing_site_connection,
+)
+from cmk.gui.watolib.sites import (
+    is_livestatus_encrypted,
+    ldap_connections_are_configurable,
+    PingResult,
+    ReplicationStatus,
+    ReplicationStatusFetcher,
+    site_globals_editable,
+    site_management_registry,
+    STATIC_PERMISSIONS_SITES,
+)
+from cmk.licensing.license_distribution_registry import distribute_license_to_remotes
+from cmk.licensing.registry import get_license_state
+from cmk.livestatus_client import (
+    BrokerConnection,
+    BrokerConnections,
+    BrokerSite,
+    ConnectionId,
+    NetworkSocketDetails,
+    SiteConfiguration,
+    SiteConfigurations,
+    TLSParams,
+)
+from cmk.messaging import check_remote_connection, ConnectionFailed, ConnectionOK, ConnectionRefused
+from cmk.rulesets.internal.form_specs import (
+    SingleChoiceElementExtended,
+    SingleChoiceExtended,
+)
+from cmk.rulesets.v1 import Help, Label, Message, Title
+from cmk.rulesets.v1.form_specs import (
+    BooleanChoice,
+    CascadingSingleChoice,
+    CascadingSingleChoiceElement,
+    DefaultValue,
+    DictElement,
+    Dictionary,
+    FieldSize,
+    FixedValue,
+    Integer,
+    MonitoredHost,
+    String,
+    validators,
+)
+from cmk.utils.encryption import CertificateDetails, fetch_certificate_details
+from cmk.utils.paths import omd_root
+from cmk.web.utils.confirm_links import make_confirm_delete_link
+from cmk.web.utils.doc_references import DocReference
+from cmk.web.utils.flashed_messages import flash
+from cmk.web.utils.html import HTML
+from cmk.web.utils.icons import IconNames, StaticIcon
+from cmk.web.utils.permission_verification import PermissionName
+from cmk.web.utils.urls import makeactionuri, makeactionuri_contextless, makeuri_contextless
+
+
+def register(page_registry: PageRegistry, mode_registry: ModeRegistry) -> None:
+    page_registry.register(PageEndpoint("wato_ajax_fetch_site_status", PageAjaxFetchSiteStatus()))
+    mode_registry.register(ModeEditSite)
+    mode_registry.register(ModeEditBrokerConnection)
+    mode_registry.register(ModeDistributedMonitoring)
+    mode_registry.register(ModeSiteLivestatusEncryption)
+
+
+class StatusHostFormSpecAdapter(FormSpecAdapter[tuple[SiteId, str] | None, CascadingSingleChoice]):
+    """Serialize the status host between its model and form representation.
+
+    The model (and on-disk) shape is ``tuple[SiteId, str] | None``; only the
+    form UI works with the cascading choice tuple ``("disabled", None)`` /
+    ``("enabled", (site_id, host_name))``.
+    """
+
+    def __init__(self, configured_sites: SiteConfigurations) -> None:
+        self._configured_sites = configured_sites
+
+    @override
+    def form_spec(self) -> CascadingSingleChoice:
+        status_host_docu_url = "https://checkmk.com/checkmk_multisite_statushost.html"
+        site_elements: list[SingleChoiceElementExtended[str]] = [
+            SingleChoiceElementExtended(  # astrein: disable=localization-checker
+                name=str(sk),
+                title=Title(si.get("alias", sk)),  # astrein: disable=localization-checker
+            )
+            for sk, si in self._configured_sites.items()
+        ]
+        return CascadingSingleChoice(
+            title=Title("Status host"),
+            elements=[
+                CascadingSingleChoiceElement(
+                    name="disabled",
+                    title=Title("No status host"),
+                    parameter_form=FixedValue(
+                        value=None, title=Title("No status host"), label=Label("")
+                    ),
+                ),
+                CascadingSingleChoiceElement(
+                    name="enabled",
+                    title=Title("Use the following status host"),
+                    parameter_form=Tuple(
+                        title=Title("Use the following status host"),
+                        layout="horizontal",
+                        elements=[
+                            SingleChoiceExtended[str](
+                                title=Title("Site:"),
+                                elements=site_elements,
+                            ),
+                            MonitoredHost(),
+                        ],
+                    ),
+                ),
+            ],
+            help_text=Help(  # astrein: disable=localization-checker
+                _(
+                    "By specifying a status host for each non-local connection, "
+                    "you prevent the graphical user interface (GUI) from running into timeouts when remote sites do not respond. "
+                    "You need to add the remote monitoring servers as hosts to your local monitoring "
+                    "site and use their host state as the reachability state of the remote site. Please "
+                    'refer to the <a href="%(status_host_docu_url)s" target="_blank">User Guide</a> for details.'
+                )
+                % {"status_host_docu_url": status_host_docu_url}
+            ),
+        )
+
+    @override
+    def from_form_spec(self, data: object) -> tuple[SiteId, str] | None:
+        match data:
+            case ("disabled", None):
+                return None
+            case ("enabled", (site_id, host_name)):
+                return SiteId(str(site_id)), str(host_name)
+            case _:
+                raise ValueError(f"Invalid status host form data: {data!r}")
+
+    @override
+    def to_form_spec(self, model: tuple[SiteId, str] | None) -> tuple[str, object]:
+        if model is None:
+            return "disabled", None
+        return "enabled", model
+
+
+class ModeEditSite(WatoMode):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "edit_site"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return STATIC_PERMISSIONS_SITES
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeDistributedMonitoring
+
+    @overload
+    @classmethod
+    def mode_url(cls, *, site: str) -> str: ...
+
+    @overload
+    @classmethod
+    def mode_url(cls, **kwargs: str) -> str: ...
+
+    @classmethod
+    @override
+    def mode_url(cls, **kwargs: str) -> str:
+        return super().mode_url(**kwargs)
+
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx)
+        self._site_mgmt = site_management_registry["site_management"]
+
+        _site_id_return = request.get_ascii_input("site")
+        self._site_id = None if _site_id_return is None else SiteId(_site_id_return)
+        _clone_id_return = request.get_ascii_input("clone")
+        self._clone_id = None if _clone_id_return is None else SiteId(_clone_id_return)
+        self._new = self._site_id is None
+
+        if get_license_state(omd_root).blocks_distributed_setup_changes_free() and (
+            self._new or self._site_id != omd_site()
+        ):
+            raise MKUserError(None, get_free_message())
+
+        self._configured_sites = self._site_mgmt.load_sites()
+        self._status_host_adapter = StatusHostFormSpecAdapter(self._configured_sites)
+
+        if self._clone_id:
+            try:
+                self._site = self._configured_sites[self._clone_id]
+            except KeyError:
+                raise MKUserError(None, _("The requested site does not exist"))
+
+        elif self._new:
+            self._site = SiteConfiguration(
+                id=SiteId(""),
+                alias="",
+                url_prefix="",
+                disabled=False,
+                insecure=False,
+                multisiteurl="",
+                persist=False,
+                proxy={},
+                message_broker_port=5672,
+                authentication_connections=(
+                    ("all", ["ldap", "saml"]) if distributed_saml_supported() else ("all", ["ldap"])
+                ),
+                user_attribute_sync_connections="all",
+                status_host=None,
+                replicate_mkps=True,
+                replicate_ec=True,
+                socket=(
+                    "tcp",
+                    NetworkSocketDetails(
+                        address=("", 6557),
+                        tls=(
+                            "encrypted",
+                            TLSParams(verify=True),
+                        ),
+                    ),
+                ),
+                timeout=5,
+                disable_wato=True,
+                user_login=True,
+                replication=None,
+                is_trusted=False,
+            )
+
+        else:
+            assert self._site_id is not None
+            try:
+                self._site = self._configured_sites[self._site_id]
+            except KeyError:
+                raise MKUserError(None, _("The requested site does not exist"))
+
+    @override
+    def title(self) -> str:
+        if self._new:
+            return _("Add site connection")
+        return _("Edit site connection %(site_id)s") % {"site_id": self._site_id}
+
+    @override
+    def _breadcrumb_url(self) -> str:
+        assert self._site_id is not None
+        return self.mode_url(site=self._site_id)
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        menu = make_simple_form_page_menu(
+            _("Connection"), breadcrumb, form_name="site", button_name="_save"
+        )
+        if not self._new and isinstance(self._site_id, str):
+            menu.dropdowns.insert(
+                1,
+                _page_menu_dropdown_site_details(
+                    self._site_id, self._site, self._configured_sites, self.name()
+                ),
+            )
+        return menu
+
+    def _site_from_form_spec(self, config: Config) -> SiteConfiguration:
+        flat_catalog = self._flat_catalog(config)
+        raw_site_spec = parse_data_from_field_id(flat_catalog, "_edit_site_id")
+        assert isinstance(raw_site_spec, dict)
+
+        if "status_host" in raw_site_spec:
+            raw_site_spec["status_host"] = self._status_host_adapter.from_form_spec(
+                raw_site_spec["status_host"]
+            )
+
+        site_spec = cast(SiteConfiguration, raw_site_spec)
+        if self._new:
+            self._site_id = site_spec["id"]
+
+        return site_spec
+
+    def save_site_changes(
+        self,
+        tree: FolderTree,
+        site_spec: SiteConfiguration,
+        configured_sites: SiteConfigurations,
+        *,
+        pprint_value: bool,
+        use_git: bool,
+        liveproxyd_enabled: bool,
+    ) -> ActionResult:
+        if not transactions.check_transaction(request):
+            return redirect(mode_url("sites"))
+
+        # Take over all unknown elements from existing site specs, like for
+        # example, the replication secret
+        if self._site_id is None:
+            raise MKUserError(None, _("Site ID must be set"))
+
+        # TODO: Isn't the loop below simply the same as:
+        # site_spec = configured_sites.get(self._site_id, site_spec) | site_spec
+        for key, value in configured_sites.get(self._site_id, {}).items():
+            # We need to review whether or not we still want to allow setting arbritrary keys
+            site_spec.setdefault(key, value)  # type: ignore[misc]
+
+        self._site_mgmt.validate_configuration(self._site_id, site_spec, configured_sites)
+
+        sites_to_update = site_management_registry["site_management"].get_connected_sites_to_update(
+            new_or_deleted_connection=self._new,
+            modified_site=self._site_id,
+            current_config=site_spec,
+            old_config=self._site,
+            site_configs=configured_sites,
+        )
+
+        self._site = configured_sites[self._site_id] = site_spec
+        self._site_mgmt.save_sites(
+            tree,
+            configured_sites,
+            activate=True,
+            pprint_value=pprint_value,
+            liveproxyd_enabled=liveproxyd_enabled,
+            use_git=use_git,
+            acting_user_id=user.id,
+        )
+
+        msg = add_changes_after_editing_site_connection(
+            site_id=self._site_id,
+            is_new_connection=self._new,
+            replication_enabled=is_replication_enabled(site_spec),
+            is_local_site=site_is_local(site_spec),
+            connected_sites=sites_to_update,
+            pending_changes=_pending_changes(
+                configured_sites,
+                use_git=use_git,
+                local_site=omd_site(),
+                user_id=user.id,
+            ),
+        )
+
+        flash(msg)
+        return redirect(mode_url("sites"))
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        site_spec = self._site_from_form_spec(config)
+        return self.save_site_changes(
+            make_folder_tree(config),
+            site_spec,
+            self._configured_sites,
+            pprint_value=config.wato_pprint_config,
+            use_git=config.wato_use_git,
+            liveproxyd_enabled=config.liveproxyd_enabled,
+        )
+
+    @override
+    def page(self, config: Config) -> None:
+        flat_catalog = self._flat_catalog(config)
+        with html.form_context("site"):
+            if request.has_var("_edit_site_id"):
+                # Re-render after a failed save: restore submitted values and show
+                # inline validation errors so the user doesn't lose their input.
+                render_form_spec(
+                    flat_catalog,
+                    "_edit_site_id",
+                    read_data_from_frontend("_edit_site_id"),
+                    do_validate=True,
+                )
+            else:
+                self._site.pop("secret", None)
+                self._site.pop("globals", None)
+                render_form_spec(
+                    flat_catalog,
+                    "_edit_site_id",
+                    # Inject computed SAML SP endpoint URLs for the read-only
+                    # display fields.
+                    RawDiskData(self._form_data_for_render()),
+                    do_validate=False,
+                )
+            forms.end()
+            html.hidden_fields()
+
+    def _form_data_for_render(self) -> dict:
+        """Build the form-input dict for the site-edit dialog.
+
+        Translates the on-disk shapes of `status_host` and
+        `authentication_connections` into the cascading-choice tuples the
+        form spec expects, and fills SAML endpoint URLs so the read-only
+        display widgets show meaningful values.
+        """
+        data: dict = dict(populate_saml_site_endpoint_urls(self._site, empty_marker=""))
+        if "status_host" in data:
+            data["status_host"] = self._status_host_adapter.to_form_spec(data["status_host"])
+        # Both keys are always present (cmk-update-config migrates legacy
+        # specs). The on-disk ("all", [types]) form already matches the form
+        # choice tuple.
+        value = data["authentication_connections"]
+        if value == "disabled":
+            data["authentication_connections"] = ("disabled", True)
+        elif isinstance(value, list):
+            data["authentication_connections"] = ("list", value)
+        value = data["user_attribute_sync_connections"]
+        if isinstance(value, list):
+            data["user_attribute_sync_connections"] = ("list", value)
+        return data
+
+    def _flat_catalog(self, config: Config):  # type: ignore[no-untyped-def]
+        basic = self._basic_elements(config)
+        livestatus = self._livestatus_elements()
+        replication = self._replication_elements()
+        user_config = self._user_config_elements()
+        spec = Dictionary(elements={**basic, **livestatus, **replication, **user_config})
+        headers = [
+            (_("Basic settings"), list(basic.keys())),
+            (_("Status connection"), list(livestatus.keys())),
+            (_("Configuration connection"), list(replication.keys())),
+        ]
+        if user_config:
+            headers.append((_("User configuration"), list(user_config.keys())))
+        return create_flat_catalog_from_dictionary(spec, headers=headers)
+
+    def _basic_elements(self, config: Config) -> dict[str, DictElement]:  # noqa: ARG002
+        if self._new:
+            id_form_spec: FixedValue | String = String(
+                title=Title("Site ID"),
+                help_text=Help(
+                    "The site ID must be identical (case sensitive) with the instance's exact name."
+                ),
+                field_size=FieldSize.LARGE,
+                custom_validate=[
+                    not_empty(Message("Site ID cannot be empty")),
+                    validators.MatchRegex(
+                        regex=SITE_ID_PATTERN,
+                        error_msg=Message(
+                            "The site id must begin with a letter or underscore, may contain only "
+                            "letters, digits and underscores and must be 1 to 16 characters long."
+                        ),
+                    ),
+                    create_validation_error_for_mk_user_error(self._validate_site_id),
+                ],
+            )
+        else:
+            id_form_spec = FixedValue(value=self._site_id, title=Title("Site ID"))
+
+        return {
+            "id": DictElement(required=True, parameter_form=id_form_spec),
+            "alias": DictElement(
+                required=True,
+                parameter_form=String(
+                    title=Title("Alias"),
+                    help_text=Help("An alias or description of the site."),
+                    field_size=FieldSize.LARGE,
+                    custom_validate=[
+                        validators.LengthInRange(
+                            min_value=1, error_msg=Message("Text field cannot be empty")
+                        )
+                    ],
+                ),
+            ),
+        }
+
+    @staticmethod
+    def _validate_multisiteurl(value: str) -> None:
+        if value:
+            validators.Url([validators.UrlProtocol.HTTP, validators.UrlProtocol.HTTPS])(value)
+
+    def _validate_site_id(self, value: str) -> None:
+        if value in self._site_mgmt.load_sites():
+            raise MKUserError("id", _("This ID is already being used by another connection."))
+
+        # Checkmk creates NagVis backends for all sites: For each site it creates two backends:
+        # a) [site_id]    - Livestatus connection to the sites core
+        # b) [site_id]_bi - Bacned to Checkmk BI for displaying aggregation states
+        #
+        # In case one tries to add a site with a Site-ID "[central_site]_bi" this will result
+        # in a name conflict between the central site BI backend and the remote site livestatus
+        # backend. See CMK-6968.
+        if value == "%s_bi" % omd_site():
+            raise MKUserError(
+                None,
+                _(
+                    "You cannot connect remote sites named <tt>[central_site]_bi</tt>. You will "
+                    "have to rename your remote site to be able to connect it with this site."
+                ),
+            )
+
+    def _livestatus_elements(self) -> dict[str, DictElement]:
+        proxy_docu_url = "https://checkmk.com/checkmk_multisite_modproxy.html"
+
+        return {
+            "socket": DictElement(
+                required=True,
+                parameter_form=self._site_mgmt.connection_method_form_spec(),
+            ),
+            "proxy": DictElement(
+                required=True,
+                parameter_form=self._site_mgmt.livestatus_proxy_form_spec(),
+            ),
+            "timeout": DictElement(
+                required=True,
+                parameter_form=Integer(
+                    title=Title("Connect timeout"),
+                    unit_symbol="Seconds",
+                    help_text=Help(
+                        "This sets the time that the GUI waits for a connection "
+                        "to the site to be established before the site is "
+                        "considered to be unreachable. It is highly recommended to set a value "
+                        "as low as possible here because this setting directly affects the GUI "
+                        "response time when the destination is not reachable. When using the "
+                        "Livestatus proxy daemon the GUI connects to the local proxy, in this "
+                        "situation a lower value, like 2 seconds is recommended."
+                    ),
+                    custom_validate=[
+                        validators.NumberInRange(
+                            min_value=0, error_msg=Message("Integer field cannot be empty")
+                        )
+                    ],
+                ),
+            ),
+            "persist": DictElement(
+                required=True,
+                parameter_form=BooleanChoice(
+                    title=Title("Persistent connection"),
+                    label=Label("Use persistent connections"),
+                    help_text=Help(
+                        "If you enable persistent connections then the GUI will try to keep open "
+                        "the connection to the remote sites. This brings a great speed up in high-latency "
+                        "situations but locks a number of threads in the Livestatus module of the target site."
+                    ),
+                ),
+            ),
+            "url_prefix": DictElement(
+                required=True,
+                parameter_form=String(
+                    title=Title("URL prefix"),
+                    field_size=FieldSize.LARGE,
+                    help_text=Help(  # astrein: disable=localization-checker
+                        _(
+                            "The URL prefix will be prepended to links of add-ons like NagVis "
+                            "when a link to such applications points to a host or "
+                            "service on that site. You can either use an absolute URL prefix like <tt>http://some.host/mysite/</tt> "
+                            "or a relative URL like <tt>/mysite/</tt>. When using relative prefixes you need a mod_proxy "
+                            "configuration in your local system Apache that proxies such URLs to the according remote site. "
+                            'Please refer to the <a href="%(proxy_docu_url)s" target="_blank">User Guide</a> for details. '
+                            "The prefix should end with a slash. Omit the <tt>/nagvis/</tt> from the prefix."
+                        )
+                        % {"proxy_docu_url": proxy_docu_url}
+                    ),
+                ),
+            ),
+            "status_host": DictElement(
+                required=True,
+                parameter_form=self._status_host_adapter.form_spec(),
+            ),
+            "disabled": DictElement(
+                required=True,
+                parameter_form=BooleanChoice(
+                    title=Title("Disable in status GUI"),
+                    label=Label("Temporarily disable this connection"),
+                    help_text=Help(
+                        "If you disable a connection, then no data of this site will be shown in the status GUI. "
+                        "The replication is not affected by this, however."
+                    ),
+                ),
+            ),
+        }
+
+    def _replication_elements(self) -> dict[str, DictElement]:
+        elements: dict[str, DictElement] = {
+            "replication": DictElement(
+                required=True,
+                parameter_form=SingleChoiceExtended[None | str](
+                    elements=[
+                        SingleChoiceElementExtended(
+                            name=None, title=Title("No replication with this site")
+                        ),
+                        SingleChoiceElementExtended(
+                            name="slave", title=Title("Push configuration to this site")
+                        ),
+                    ],
+                    title=Title("Enable replication"),
+                    help_text=Help(
+                        "Replication allows you to manage several monitoring sites with a "
+                        "logically centralized setup. Remote sites receive their configuration "
+                        "from the central sites. <br><br>Note: Remote sites "
+                        "do not need any replication configuration. They will be remote-controlled "
+                        "by the central sites."
+                    ),
+                ),
+            ),
+            "message_broker_port": DictElement(
+                required=True,
+                parameter_form=Integer(
+                    title=Title("Message broker port"),
+                    prefill=DefaultValue(5672),
+                    custom_validate=[validators.NetworkPort()],
+                ),
+            ),
+            "multisiteurl": DictElement(
+                required=True,
+                parameter_form=String(
+                    title=Title("URL of remote site"),
+                    field_size=FieldSize.LARGE,
+                    help_text=Help(
+                        "URL of the remote Checkmk including <tt>/check_mk/</tt>. "
+                        "This URL is in many cases the same as the URL-Prefix but with <tt>check_mk/</tt> "
+                        "appended, but it must always be an absolute URL. Please note, that "
+                        "that URL will be fetched by the Apache server of the local "
+                        "site itself, whilst the URL-Prefix is used by your local Browser."
+                    ),
+                    custom_validate=[self._validate_multisiteurl],
+                ),
+            ),
+            "disable_wato": DictElement(
+                required=True,
+                parameter_form=BooleanChoice(
+                    title=Title("Disable remote configuration"),
+                    label=Label("Disable configuration via Setup on this site"),
+                    help_text=Help(
+                        "It is recommended to disable access to Setup completely on the remote site. "
+                        "Otherwise a user who does not know about the replication could make local "
+                        "changes that are overridden at the next configuration activation."
+                    ),
+                ),
+            ),
+            "insecure": DictElement(
+                required=True,
+                parameter_form=BooleanChoice(
+                    title=Title("Ignore TLS errors"),
+                    label=Label("Ignore SSL certificate errors"),
+                    help_text=Help(
+                        "This might be needed to make the synchronization accept problems with "
+                        "SSL certificates when using an SSL secured connection."
+                    ),
+                ),
+            ),
+            "user_login": DictElement(
+                required=True,
+                parameter_form=BooleanChoice(
+                    title=Title("Direct login to web GUI allowed"),
+                    label=Label(
+                        "Users are allowed to directly log in into the web GUI of this site"
+                    ),
+                    help_text=Help(
+                        "When enabled, this site is marked for synchronization every time a web GUI "
+                        "related option is changed and users are allowed to log in "
+                        "to the web GUI of this site. "
+                        "The access to the Rest API is unaffected by this option though."
+                    ),
+                ),
+            ),
+            "is_trusted": DictElement(
+                required=True,
+                parameter_form=BooleanChoice(
+                    title=Title("Trust this site completely"),
+                    label=Label("Trust this site completely"),
+                    help_text=Help(
+                        "When this option is enabled the central site might get compromised by a rogue remote site. "
+                        "If you disable this option, some features, such as HTML rendering in service descriptions for the services monitored on this remote site, will no longer work. "
+                        "In case the sites are managed by different groups of people, especially when belonging to different organizations, we recommend to disable this setting."
+                    ),
+                ),
+            ),
+        }
+
+        elements["replicate_ec"] = DictElement(
+            required=True,
+            parameter_form=BooleanChoice(
+                title=Title("Replicate Event Console config"),
+                label=Label("Replicate Event Console configuration to this site"),
+                help_text=Help(
+                    "This option enables the distribution of global settings and rules of the Event Console "
+                    "to the remote site. Any change in the local Event Console settings will mark the site "
+                    "as <i>need sync</i>. A synchronization will automatically reload the Event Console of "
+                    "the remote site."
+                ),
+            ),
+        )
+        elements["replicate_mkps"] = DictElement(
+            required=True,
+            parameter_form=BooleanChoice(
+                title=Title("Replicate extensions"),
+                label=Label("Replicate extensions (MKPs and files in <tt>~/local/</tt>)"),
+                help_text=Help(
+                    "If you enable the replication of MKPs then during each <i>Activate changes</i> MKPs "
+                    "that are installed on your central site and all other files below the <tt>~/local/</tt> "
+                    "directory will be also transferred to the remote site. Note: <b>all other MKPs and files "
+                    "below <tt>~/local/</tt> on the remote site will be removed</b>."
+                ),
+            ),
+        )
+        return elements
+
+    def _user_config_elements(self) -> dict[str, DictElement]:
+        if not ldap_connections_are_configurable():
+            return {}
+        return {
+            "authentication_connections": DictElement(
+                required=True,
+                parameter_form=self._site_mgmt.authentication_connections_form_spec(),
+            ),
+            "user_attribute_sync_connections": DictElement(
+                required=True,
+                parameter_form=self._site_mgmt.user_attribute_sync_connections_form_spec(),
+            ),
+        }
+
+
+class ModeEditBrokerConnection(WatoMode):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "edit_broker_connection"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return STATIC_PERMISSIONS_SITES
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeDistributedMonitoring
+
+    @overload
+    @classmethod
+    def mode_url(cls, *, site: str) -> str: ...
+
+    @overload
+    @classmethod
+    def mode_url(cls, **kwargs: str) -> str: ...
+
+    @classmethod
+    @override
+    def mode_url(cls, **kwargs: str) -> str:
+        return super().mode_url(**kwargs)
+
+    @property
+    def _is_new(self) -> bool:
+        return self._edit_id is None
+
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx)
+        self._site_mgmt = site_management_registry["site_management"]
+
+        self._connection: BrokerConnection | None = None
+
+        self._edit_id: ConnectionId | None = (
+            ConnectionId(connection_id)
+            if (connection_id := request.get_ascii_input("edit_connection_id"))
+            else None
+        )
+
+        self._clone_id: ConnectionId | None = (
+            ConnectionId(connection_id)
+            if (connection_id := request.get_ascii_input("clone_connection_id"))
+            else None
+        )
+
+        self._connections: BrokerConnections = BrokerConnectionsConfigFile().load_for_reading()
+
+        for el_id in [self._edit_id, self._clone_id]:
+            if not el_id:
+                continue
+            try:
+                self._connection = self._connections[el_id]
+            except IndexError:
+                raise MKUserError(
+                    None, _("The requested connection %(el_id)s does not exist") % {"el_id": el_id}
+                )
+
+    @override
+    def title(self) -> str:
+        if self._is_new:
+            return _("Add message broker connection")
+        return _("Edit message broker connection %(edit_id)s") % {"edit_id": self._edit_id}
+
+    @override
+    def _breadcrumb_url(self) -> str:
+        assert self._edit_id is not None
+        return self.mode_url(site=self._edit_id)
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        return make_simple_form_page_menu(
+            _("Connection"), breadcrumb, form_name="broker_connection", button_name="_save"
+        )
+
+    def _validate_connection_id(self, connection_id: str) -> None:
+        if self._site_mgmt.broker_connection_id_exists(connection_id):
+            raise MKUserError(
+                None,
+                _("Connection ID %(connection_id)s already exists.")
+                % {"connection_id": connection_id},
+            )
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        if not transactions.check_transaction(request):
+            return redirect(mode_url("sites"))
+
+        flat_catalog = self._flat_catalog(config)
+        raw_site_spec = parse_data_from_field_id(flat_catalog, "_edit_broker_connection_id")
+        assert isinstance(raw_site_spec, dict)
+
+        try:
+            source_site, dest_site = (
+                SiteId(raw_site_spec["connecter"]),
+                SiteId(raw_site_spec["connectee"]),
+            )
+        except KeyError:
+            raise MKUserError(
+                None, _("The sites initiating and accepting the connection must be specified.")
+            )
+
+        connection = BrokerConnection(
+            connecter=BrokerSite(site_id=source_site),
+            connectee=BrokerSite(site_id=dest_site),
+        )
+
+        self._site_mgmt.validate_and_save_broker_connection(
+            raw_site_spec["unique_id"],
+            connection,
+            is_new=self._is_new,
+            pprint_value=config.wato_pprint_config,
+        )
+        msg = add_changes_after_editing_broker_connection(
+            connection_id=raw_site_spec["unique_id"],
+            is_new_broker_connection=self._is_new,
+            sites=[source_site, dest_site],
+            pending_changes=_pending_changes(
+                config.sites,
+                use_git=config.wato_use_git,
+                local_site=omd_site(),
+                user_id=user.id,
+            ),
+        )
+
+        flash(msg)
+        return redirect(mode_url("sites"))
+
+    @override
+    def page(self, config: Config) -> None:
+        connection_vs = (
+            {
+                "unique_id": self._edit_id if self._edit_id else "",
+                "connecter": self._connection.connecter.site_id,
+                "connectee": self._connection.connectee.site_id,
+            }
+            if self._connection
+            else {}
+        )
+        flat_catalog = self._flat_catalog(config)
+        with html.form_context("broker_connection"):
+            render_form_spec(
+                flat_catalog,
+                "_edit_broker_connection_id",
+                RawDiskData(connection_vs),
+                do_validate=False,
+            )
+            forms.end()
+            html.hidden_fields()
+
+    def _flat_catalog(self, config: Config):  # type: ignore[no-untyped-def]
+        basic = self._basic_elements(config)
+        spec = Dictionary(
+            elements=basic,
+            help_text=Help(
+                "You can define pairs of sites here that will be able to directly "
+                "communicate, without routing the messages via the central site. "
+                "Messages themselves will be sent in both directions: from the "
+                "initiating peer to the accepting peer and vice versa. "
+                "Note that the order in which you choose the sites here still might matter, "
+                "depending on your network restrictions: "
+                "The initiating peer must be able to establish a TCP connection to the accepting "
+                "peer."
+            ),
+        )
+        headers = [(_("Connection"), list(basic.keys()))]
+        return create_flat_catalog_from_dictionary(spec, headers=headers)
+
+    def _basic_elements(self, config: Config) -> dict[str, DictElement]:
+        replicated_sites_elements: list[SingleChoiceElementExtended[str]] = [
+            SingleChoiceElementExtended(  # astrein: disable=localization-checker
+                name=str(sk),
+                title=Title(si.get("alias", sk)),  # astrein: disable=localization-checker
+            )
+            for sk, si in distributed_setup_remote_sites(config.sites).items()
+        ]
+
+        if self._edit_id:
+            unique_id_form_spec: FixedValue | String = FixedValue(
+                value=self._edit_id, title=Title("Unique ID")
+            )
+        else:
+            unique_id_form_spec = String(
+                title=Title("Unique ID"),
+                field_size=FieldSize.LARGE,
+                custom_validate=[
+                    *id_validators(Message("Unique ID cannot be empty")),
+                    create_validation_error_for_mk_user_error(self._validate_connection_id),
+                ],
+            )
+
+        return {
+            "unique_id": DictElement(required=True, parameter_form=unique_id_form_spec),
+            "connecter": DictElement(
+                required=True,
+                parameter_form=SingleChoiceExtended[str](
+                    title=Title("Initiating peer"),
+                    elements=replicated_sites_elements,
+                    help_text=Help("Select the site that is establishing the TCP connection."),
+                ),
+            ),
+            "connectee": DictElement(
+                required=True,
+                parameter_form=SingleChoiceExtended[str](
+                    title=Title("Accepting peer"),
+                    elements=replicated_sites_elements,
+                    help_text=Help("Select the site that is accepting the TCP connection."),
+                ),
+            ),
+        }
+
+
+class ModeDistributedMonitoring(WatoMode):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "sites"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return STATIC_PERMISSIONS_SITES
+
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx)
+        self._site_mgmt = site_management_registry["site_management"]
+
+    @override
+    def title(self) -> str:
+        return _("Distributed monitoring")
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        page_menu: PageMenu = PageMenu(
+            dropdowns=[
+                PageMenuDropdown(
+                    name="connections",
+                    title=_("Connections"),
+                    topics=[
+                        PageMenuTopic(
+                            title=_("Connections"),
+                            entries=[
+                                PageMenuEntry(
+                                    title=_("Add connection"),
+                                    icon_name=StaticIcon(IconNames.new),
+                                    item=make_simple_link(
+                                        makeuri_contextless(request, [("mode", "edit_site")]),
+                                    ),
+                                    is_shortcut=True,
+                                    is_suggested=True,
+                                ),
+                                PageMenuEntry(
+                                    title=_("Add peer-to-peer message broker connection"),
+                                    icon_name=StaticIcon(IconNames.new),
+                                    item=make_simple_link(
+                                        makeuri_contextless(
+                                            request, [("mode", "edit_broker_connection")]
+                                        ),
+                                    ),
+                                    is_shortcut=False,
+                                    is_suggested=True,
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+            breadcrumb=breadcrumb,
+            inpage_search=PageMenuSearch(),
+        )
+        page_menu.add_doc_reference(title=self.title(), doc_ref=DocReference.DISTRIBUTED_MONITORING)
+        return page_menu
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        check_csrf_token()
+
+        delete_id = request.get_ascii_input("_delete")
+        if delete_id and transactions.check_transaction(request):
+            return self._action_delete(
+                make_folder_tree(config),
+                SiteId(delete_id),
+                pprint_value=config.wato_pprint_config,
+                pending_changes=_pending_changes(
+                    config.sites,
+                    use_git=config.wato_use_git,
+                    local_site=omd_site(),
+                    user_id=user.id,
+                ),
+                liveproxyd_enabled=config.liveproxyd_enabled,
+                use_git=config.wato_use_git,
+            )
+
+        delete_folders_id = request.get_ascii_input("_delete_folders")
+        if delete_folders_id and transactions.check_transaction(request):
+            return self._action_delete_folders(
+                make_folder_tree(config),
+                SiteId(delete_folders_id),
+                pprint_value=config.wato_pprint_config,
+                pending_changes=_pending_changes(
+                    config.sites,
+                    use_git=config.wato_use_git,
+                    local_site=omd_site(),
+                    user_id=user.id,
+                ),
+            )
+
+        delete_connection_id = request.get_ascii_input("_delete_connection_id")
+        if delete_connection_id and transactions.check_transaction(request):
+            return self._action_delete_broker_connection(
+                ConnectionId(delete_connection_id),
+                pprint_value=config.wato_pprint_config,
+                pending_changes=_pending_changes(
+                    config.sites,
+                    use_git=config.wato_use_git,
+                    local_site=omd_site(),
+                    user_id=user.id,
+                ),
+            )
+
+        logout_id = request.get_ascii_input("_logout")
+        if logout_id:
+            return self._action_logout(
+                make_folder_tree(config),
+                SiteId(logout_id),
+                pprint_value=config.wato_pprint_config,
+                pending_changes=_pending_changes(
+                    config.sites,
+                    use_git=config.wato_use_git,
+                    local_site=omd_site(),
+                    user_id=user.id,
+                ),
+                liveproxyd_enabled=config.liveproxyd_enabled,
+                use_git=config.wato_use_git,
+            )
+
+        login_id = request.get_ascii_input("_login")
+        if login_id:
+            return self._action_login(
+                make_folder_tree(config),
+                SiteId(login_id),
+                debug=config.debug,
+                pprint_value=config.wato_pprint_config,
+                use_git=config.wato_use_git,
+                liveproxyd_enabled=config.liveproxyd_enabled,
+            )
+
+        if trigger_certs_site_id := request.get_ascii_input("_trigger_certs_creation"):
+            return self._action_trigger_certs(SiteId(trigger_certs_site_id), debug=config.debug)
+
+        return None
+
+    def _action_trigger_certs(self, trigger_certs_site_id: SiteId, *, debug: bool) -> ActionResult:
+        configured_sites = self._site_mgmt.load_sites()
+        site = configured_sites[trigger_certs_site_id]
+        trigger_remote_certs_creation(trigger_certs_site_id, site, force=True, debug=debug)
+        flash(
+            _("Remote broker certificates created for site %(trigger_certs_site_id)s.")
+            % {"trigger_certs_site_id": trigger_certs_site_id}
+        )
+        return redirect(mode_url("sites"))
+
+    def _action_delete(
+        self,
+        tree: FolderTree,
+        delete_id: SiteId,
+        *,
+        pprint_value: bool,
+        pending_changes: PendingChanges,
+        liveproxyd_enabled: bool,
+        use_git: bool,
+    ) -> ActionResult:
+        # TODO: Can we delete this ancient code? The site attribute is always available
+        # these days and the following code does not seem to have any effect.
+        configured_sites = self._site_mgmt.load_sites()
+        # The last connection can always be deleted. In that case we
+        # fall back to non-distributed-Setup and the site attribute
+        # will be removed.
+        test_sites = dict(configured_sites.items())
+        del test_sites[delete_id]
+
+        # Prevent deletion of the local site. This does not make sense, even on
+        # standalone sites or distributed remote sites.
+        if delete_id == omd_site():
+            raise MKUserError(None, _("You cannot delete the connection to the local site."))
+
+        # Make sure that site is not being used by hosts and folders
+        folder_site_stats = FolderSiteStats.build(tree.root_folder())
+
+        if delete_id in folder_site_stats.hosts:
+            search_url = makeactionuri_contextless(
+                request,
+                transactions.get(),
+                [
+                    ("host_search_change_site", "on"),
+                    ("host_search_site", delete_id),
+                    ("host_search", "1"),
+                    ("folder", ""),
+                    ("mode", "search"),
+                    ("filled_in", "edit_host"),
+                ],
+            )
+            raise MKUserError(
+                None,
+                _(
+                    "You cannot delete this connection. It still has hosts related to the site "
+                    'assigned to it. You can use the <a href="%(search_url)s">host '
+                    "search</a> to get a list of the hosts."
+                )
+                % {"search_url": search_url},
+            )
+
+        folders_related_to_site = folder_site_stats.folders.get(delete_id, set())
+        empty_folders = {folder for folder in folders_related_to_site if folder.is_empty()}
+        non_empty_folders = folders_related_to_site - empty_folders
+
+        if non_empty_folders:
+            raise MKUserError(
+                None,
+                _(
+                    "You cannot delete this connection. It still has non-empty "
+                    "folders/hosts assigned to it: %(folders)s"
+                    "You need to first navigate to each folder and move/remove the nested "
+                    "folders/hosts."
+                )
+                % {"folders": self._build_urls_for_folders(non_empty_folders)},
+            )
+
+        if empty_folders:
+            delete_folders_url = makeactionuri_contextless(
+                request, transactions.get(), [("_delete_folders", delete_id), ("mode", "sites")]
+            )
+            raise MKUserError(
+                None,
+                _(
+                    "You cannot delete this connection. It still has empty folders assigned "
+                    "to it: %(folders)s. "
+                    'If you want us to remove these automatically, click <a href="%(delete_url)s">delete</a>.'
+                )
+                % {
+                    "folders": self._build_urls_for_folders(empty_folders),
+                    "delete_url": delete_folders_url,
+                },
+            )
+
+        self._site_mgmt.delete_site(
+            tree,
+            delete_id,
+            pprint_value=pprint_value,
+            pending_changes=pending_changes,
+            liveproxyd_enabled=liveproxyd_enabled,
+            use_git=use_git,
+            acting_user_id=user.id,
+        )
+        return redirect(mode_url("sites"))
+
+    def _action_delete_folders(
+        self,
+        tree: FolderTree,
+        delete_id: SiteId,
+        *,
+        pprint_value: bool,
+        pending_changes: PendingChanges,
+    ) -> ActionResult:
+        folder_site_stats = FolderSiteStats.build(tree.root_folder())
+        folders_related_to_site = folder_site_stats.folders.get(delete_id, set())
+        empty_folders = {folder for folder in folders_related_to_site if folder.is_empty()}
+
+        if not empty_folders:
+            raise MKUserError(
+                None,
+                _("No empty folders for %(delete_id)s available to delete.")
+                % {"delete_id": delete_id},
+            )
+
+        for empty_folder in empty_folders:
+            if (parent := empty_folder.parent()) is not None:
+                parent.delete_subfolder(
+                    empty_folder.name(),
+                    pprint_value=pprint_value,
+                    pending_changes=pending_changes,
+                    acting_user=user,
+                )
+
+        return redirect(mode_url("sites"))
+
+    def _action_delete_broker_connection(
+        self,
+        delete_connection_id: ConnectionId,
+        *,
+        pprint_value: bool,
+        pending_changes: PendingChanges,
+    ) -> ActionResult:
+        source_site, dest_site = self._site_mgmt.delete_broker_connection(
+            delete_connection_id, pprint_value=pprint_value
+        )
+        add_changes_after_editing_broker_connection(
+            connection_id=delete_connection_id,
+            is_new_broker_connection=False,
+            sites=[source_site, dest_site],
+            pending_changes=pending_changes,
+        )
+        return redirect(mode_url("sites"))
+
+    def _action_logout(
+        self,
+        tree: FolderTree,
+        logout_id: SiteId,
+        *,
+        pprint_value: bool,
+        pending_changes: PendingChanges,
+        liveproxyd_enabled: bool,
+        use_git: bool,
+    ) -> ActionResult:
+        configured_sites = self._site_mgmt.load_sites()
+        site = configured_sites[logout_id]
+        if "secret" in site:
+            del site["secret"]
+        self._site_mgmt.save_sites(
+            tree,
+            configured_sites,
+            activate=True,
+            pprint_value=pprint_value,
+            liveproxyd_enabled=liveproxyd_enabled,
+            use_git=use_git,
+            acting_user_id=user.id,
+        )
+        pending_changes.add(
+            Change(
+                action_name="edit-site",
+                text=_("Logged out of remote site %(site_alias)s")
+                % {"site_alias": HTMLWriter.render_tt(site["alias"])},
+                domains=[ConfigDomainGUI().ident()],
+            ),
+            ChangeScope.local_site(),
+        )
+        flash(_("Logged out."))
+        return redirect(mode_url("sites"))
+
+    def _action_login(
+        self,
+        tree: FolderTree,
+        login_id: SiteId,
+        *,
+        debug: bool,
+        pprint_value: bool,
+        use_git: bool,
+        liveproxyd_enabled: bool,
+    ) -> ActionResult:
+        configured_sites = self._site_mgmt.load_sites()
+        if request.get_ascii_input("_cancel"):
+            return redirect(mode_url("sites"))
+
+        if not transactions.check_transaction(request):
+            return None
+
+        site = configured_sites[login_id]
+        error = None
+        # Fetch name/password of admin account
+        if request.has_var("_name"):
+            name = request.get_validated_type_input_mandatory(UserId, "_name")
+            passwd = request.get_ascii_input_mandatory("_passwd", "").strip()
+            try:
+                if not html.get_checkbox("_confirm"):
+                    raise MKUserError(
+                        "_confirm",
+                        _(
+                            "You need to confirm that you want to "
+                            "overwrite the remote site configuration."
+                        ),
+                    )
+
+                secret = do_site_login(site, name, passwd, debug=debug)
+
+                site["secret"] = secret
+                self._site_mgmt.save_sites(
+                    tree,
+                    configured_sites,
+                    activate=True,
+                    pprint_value=pprint_value,
+                    liveproxyd_enabled=liveproxyd_enabled,
+                    use_git=use_git,
+                    acting_user_id=user.id,
+                )
+                message = _("Successfully logged into remote site %(site_alias)s.") % {
+                    "site_alias": HTMLWriter.render_tt(site["alias"])
+                }
+                trigger_remote_certs_creation(login_id, site, force=False, debug=debug)
+                distribute_license_to_remotes(
+                    logger,
+                    remote_automation_configs=[remote_automation_config_from_site_config(site)],
+                )
+
+                _audit_log.log_audit(
+                    action="edit-site",
+                    message=message,
+                    user_id=user.id,
+                    use_git=use_git,
+                )
+                flash(message)
+                return redirect(mode_url("sites"))
+
+            except MKAutomationException as e:
+                error = _("Cannot connect to remote site: %(e)s") % {"e": e}
+
+            except MKUserError as e:
+                user_errors.add(e)
+                error = str(e)
+
+            except Exception as e:
+                logger.exception("error logging in")
+                if debug:
+                    raise
+                error = (
+                    _("Internal error: %(error)s\n%(traceback)s")
+                    % {"error": e, "traceback": traceback.format_exc()}
+                ).replace("\n", "\n<br>")
+                user_errors.add(MKUserError("_name", error))
+
+        wato_html_head(
+            title=_('Login into site "%(site_alias)s"') % {"site_alias": site["alias"]},
+            breadcrumb=self.breadcrumb(),
+        )
+        if error:
+            html.show_error(error)
+
+        html.p(
+            _(
+                "One manual login as administrator to the graphical user interface (GUI) of the remote site"
+                ' "%(site_alias)s" is required to initialize the connection.'
+                " The credentials will only be used for the initial handshake and not be stored."
+                " If the login is successful, then both sides will exchange a login secret"
+                " which will be used for subsequent remote calls."
+            )
+            % {"site_alias": HTMLWriter.render_tt(site["alias"])}
+        )
+
+        with html.form_context("login", method="POST"):
+            forms.header(_("Login credentials"))
+            forms.section(_("Administrator name"))
+            html.text_input(varname="_name")
+            html.set_focus("_name")
+            forms.section(_("Administrator password"))
+            html.password_input("_passwd")
+            forms.section(_("Confirm overwrite"))
+            html.checkbox(
+                "_confirm", False, label=_("Confirm overwrite of the remote site configuration")
+            )
+            forms.end()
+            html.button("_do_login", _("Login"))
+            html.button("_cancel", _("Cancel"))
+            html.hidden_field("_login", login_id)
+            html.hidden_fields()
+        html.footer()
+        return FinalizeRequest(code=200)
+
+    @override
+    def page(self, config: Config) -> None:
+        sites = sort_sites(site_configs := self._site_mgmt.load_sites())
+
+        if get_license_state(omd_root).blocks_distributed_setup_changes_free():
+            html.show_message(get_free_message(format_html=True))
+
+        html.div("", id_="message_container")
+        with table_element(
+            "sites",
+            _("Connections"),
+            empty_text=_(
+                "You have not configured any local or remote sites. The graphical user interface (GUI) will "
+                "implicitly add the data of the local monitoring site. If you add remote "
+                "sites, please do not forget to add your local monitoring site also, if "
+                "you want to display its data."
+            ),
+            limit=config.table_row_limit,
+        ) as table:
+            for site_id, site in sites:
+                table.row()
+
+                self._show_buttons(table, site_id, site, site_configs)
+                self._show_basic_settings(table, site_id, site, config)
+                self._show_status_connection_config(table, site_id, site)
+                self._show_status_connection_status(table, site_id, site)
+                self._show_config_connection_config(table, site_id, site)
+                self._show_config_connection_status(table, site_id, site)
+                self._show_message_broker_connection(table, site_id, site)
+
+        # Message broker connections table
+        connections = self._site_mgmt.get_broker_connections()
+        if connections:
+            with table_element(
+                "brokers_connections",
+                _("Peer-to-peer message broker connections"),
+                empty_text=_("You have not configured any peer-to-peer connections."),
+                limit=config.table_row_limit,
+            ) as table:
+                for conn_id, connection in connections.items():
+                    table.row()
+
+                    self._show_buttons_connection(table, conn_id)
+                    self._show_basic_settings_connection(table, conn_id, connection)
+
+        html.javascript("cmk.sites.fetch_site_status();")
+
+    def _build_url_for_folder(self, folder: Folder) -> str:
+        url = makeuri_contextless(request, [("folder", folder.path()), ("mode", "folder")])
+        return f"<a href='{url}'>{folder.path()}</a>"
+
+    def _build_urls_for_folders(self, folders: Iterable[Folder]) -> str:
+        items = "".join(f"<li>{self._build_url_for_folder(folder)}</li>" for folder in folders)
+        return f"<ul>{items}</ul>"
+
+    def _show_buttons_connection(self, table: Table, connection_id: str) -> None:
+        table.cell(_("Actions"), css=["buttons"])
+        edit_url = folder_preserving_link(
+            request,
+            [("mode", "edit_broker_connection"), ("edit_connection_id", connection_id)],
+        )
+        html.icon_button(edit_url, _("Properties"), StaticIcon(IconNames.edit))
+
+        clone_url = folder_preserving_link(
+            request,
+            [("mode", "edit_broker_connection"), ("clone_connection_id", connection_id)],
+        )
+        html.icon_button(
+            clone_url,
+            _("Clone this connection in order to create a new one"),
+            StaticIcon(IconNames.clone),
+        )
+
+        delete_url = make_confirm_delete_link(
+            i18n=_,
+            url=makeactionuri(
+                request, transactions.get(), [("_delete_connection_id", connection_id)]
+            ),
+            title=_("Delete peer-to-peer connection to site"),
+            message=_("ID: %(connection_id)s") % {"connection_id": connection_id},
+        )
+        html.icon_button(delete_url, _("Delete"), StaticIcon(IconNames.delete))
+
+    def _show_buttons(
+        self,
+        table: Table,
+        site_id: SiteId,
+        site: SiteConfiguration,
+        site_configs: SiteConfigurations,
+    ) -> None:
+        table.cell(_("Actions"), css=["buttons"])
+        edit_url = folder_preserving_link(request, [("mode", "edit_site"), ("site", site_id)])
+        html.icon_button(edit_url, _("Properties"), StaticIcon(IconNames.edit))
+
+        clone_url = folder_preserving_link(request, [("mode", "edit_site"), ("clone", site_id)])
+        html.icon_button(
+            clone_url,
+            _("Clone this connection in order to create a new one"),
+            StaticIcon(IconNames.clone),
+        )
+
+        # Prevent deletion of the local site. This does not make sense, even on
+        # standalone sites or distributed remote sites.
+        if site_id == omd_site():
+            html.empty_icon_button()
+        else:
+            delete_url = make_confirm_delete_link(
+                i18n=_,
+                url=makeactionuri(request, transactions.get(), [("_delete", site_id)]),
+                title=_("Delete connection to site"),
+                suffix=site.get("alias", ""),
+                message=_("ID: %(site_id)s") % {"site_id": site_id},
+            )
+            html.icon_button(delete_url, _("Delete"), StaticIcon(IconNames.delete))
+
+        if site_globals_editable(site_configs, site):
+            globals_url = makeuri_contextless(
+                request, [("site", site_id)], filename="site_specific_settings.py"
+            )
+
+            has_site_globals = bool(site.get("globals"))
+            title = _("Site-specific global configuration")
+            if has_site_globals:
+                icon = StaticIcon(IconNames.site_globals_modified)
+                title += " (%s)" % (
+                    _("%(count)d specific settings") % {"count": len(site.get("globals", {}))}
+                )
+            else:
+                icon = StaticIcon(IconNames.site_globals)
+
+            html.icon_button(globals_url, title, icon)
+
+    def _show_basic_settings_connection(
+        self, table: Table, connection_id: str, connection: BrokerConnection
+    ) -> None:
+        table.cell(_("ID"), connection_id)
+        table.cell(_("Initiating peer"), connection.connecter.site_id)
+        table.cell(_("Accepting peer"), connection.connectee.site_id)
+
+    def _show_basic_settings(
+        self,
+        table: Table,
+        site_id: SiteId,
+        site: SiteConfiguration,
+        config: Config,  # noqa: ARG002
+    ) -> None:
+        table.cell(_("ID"), site_id)
+        table.cell(_("Alias"), site.get("alias", ""))
+
+    def _show_status_connection_config(
+        self, table: Table, site_id: SiteId, site: SiteConfiguration
+    ) -> None:
+        table.cell(_("Status connection"))
+        render_form_spec(
+            self._site_mgmt.connection_method_form_spec(),
+            "_connection_display_%s" % site_id,
+            RawDiskData(site["socket"]),
+            do_validate=False,
+            display_mode=DisplayMode.READONLY,
+        )
+
+    def _show_status_connection_status(
+        self,
+        table: Table,
+        site_id: SiteId,
+        site: SiteConfiguration,  # noqa: ARG002
+    ) -> None:
+        table.cell("")
+
+        encrypted_url = folder_preserving_link(
+            request, [("mode", "site_livestatus_encryption"), ("site", site_id)]
+        )
+        html.icon_button(
+            encrypted_url,
+            _("Show details about Livestatus encryption"),
+            StaticIcon(IconNames.encrypted),
+        )
+
+        # The status is fetched asynchronously for all sites. Show a temporary loading icon.
+        html.open_div(id_="livestatus_status_%s" % site_id, class_="connection_status")
+        html.static_icon(
+            StaticIcon(IconNames.reload),
+            title=_("Fetching Livestatus status"),
+            css_classes=["reloading", "replication_status_loading"],
+        )
+        html.close_div()
+
+    def _show_config_connection_config(
+        self,
+        table: Table,
+        site_id: SiteId,  # noqa: ARG002
+        site: SiteConfiguration,
+    ) -> None:
+        table.cell(_("Configuration connection"))
+        if not is_replication_enabled(site):
+            html.write_text_permissive(_("Not enabled"))
+            return
+
+        html.write_text_permissive(_("Enabled"))
+        parts = []
+        if site.get("replicate_ec"):
+            parts.append("EC")
+        if site.get("replicate_mkps"):
+            parts.append("MKPs")
+        if parts:
+            html.write_text_permissive(" (%s)" % ", ".join(parts))
+
+    def _show_config_connection_status(
+        self, table: Table, site_id: SiteId, site: SiteConfiguration
+    ) -> None:
+        table.cell("")
+
+        if is_replication_enabled(site):
+            if site.get("secret"):
+                logout_url = make_confirm_delete_link(
+                    i18n=_,
+                    url=make_action_link(request, [("mode", "sites"), ("_logout", site_id)]),
+                    title=_("Log out of site"),
+                    suffix=site["alias"],
+                    message=_("ID: %(site_id)s") % {"site_id": site_id},
+                    confirm_button=_("Log out"),
+                )
+                html.icon_button(logout_url, _("Logout"), StaticIcon(IconNames.autherr))
+            else:
+                login_url = make_action_link(request, [("mode", "sites"), ("_login", site_id)])
+                html.icon_button(login_url, _("Login"), StaticIcon(IconNames.authok))
+
+        html.open_div(id_="replication_status_%s" % site_id, class_="connection_status")
+        if is_replication_enabled(site):
+            # The status is fetched asynchronously for all sites. Show a temporary loading icon.
+            html.static_icon(
+                StaticIcon(IconNames.reload),
+                title=_("Fetching replication status"),
+                css_classes=["reloading", "replication_status_loading"],
+            )
+        html.close_div()
+
+    def _show_message_broker_connection(
+        self, table: Table, site_id: SiteId, site: SiteConfiguration
+    ) -> None:
+        table.cell("Remote message broker")
+        if is_replication_enabled(site):
+            trigger_url = make_action_link(
+                request, [("mode", "sites"), ("_trigger_certs_creation", site_id)]
+            )
+            html.open_ts_container(
+                container="div",
+                function_name="lock_and_redirect",
+                arguments={"redirect_url": trigger_url},
+            )
+            html.icon_button(
+                url="javascript:void(0)",
+                title=_("Recreate certificates"),
+                icon=StaticIcon(IconNames.recreate_broker_certificate),
+                class_=["lockable"],
+            )
+            html.write_text_permissive(_("Recreate certificates"))
+            html.write_html(render_end_tag("div"))
+
+        html.open_div(id_=f"message_broker_status_{site_id}", class_="connection_status")
+        if is_replication_enabled(site):
+            # The status is fetched asynchronously for all sites. Show a temporary loading icon.
+            html.static_icon(
+                StaticIcon(IconNames.reload),
+                title=_("Fetching message broker status"),
+                css_classes=["reloading", "replication_status_loading"],
+            )
+        html.close_div()
+
+
+class PageAjaxFetchSiteStatus(AjaxPage):
+    """AJAX handler for asynchronous fetching of the site status"""
+
+    @override
+    def page(self, ctx: PageContext) -> PageResult:
+        user.need_permission("wato.sites")
+
+        site_states = {}
+
+        sites = site_management_registry["site_management"].load_sites()
+
+        replication_sites = []
+        remote_status: dict[SiteId, ReplicationStatus] = {}
+        for site_id, site_config in sites.items():
+            if not is_replication_enabled(site_config):
+                continue
+            try:
+                replication_sites.append(
+                    (site_id, remote_automation_config_from_site_config(site_config))
+                )
+            except MKGeneralException as e:
+                remote_status[site_id] = ReplicationStatus(
+                    site_id=site_id, success=False, response=e
+                )
+
+        remote_status.update(
+            ReplicationStatusFetcher().fetch(replication_sites, debug=ctx.config.debug)
+        )
+
+        for site_id, site in sites.items():
+            site_id_str: str = site_id
+
+            site_states[site_id_str] = {
+                "livestatus": self._render_status_connection_status(site_id, site),
+                "replication": self._render_configuration_connection_status(
+                    site_id, site, remote_status
+                ),
+                "message_broker": self._render_message_broker_status(site_id, site, remote_status),
+            }
+
+        return site_states
+
+    def _render_configuration_connection_status(
+        self,
+        site_id: SiteId,
+        site: SiteConfiguration,
+        replication_status: Mapping[SiteId, ReplicationStatus],
+    ) -> str | HTML:
+        """Check whether or not the replication connection is possible.
+
+        This deals with these situations:
+        - No connection possible
+        - connection possible but site down
+        - Not logged in
+        - And of course: Everything is fine
+        """
+        if not is_replication_enabled(site):
+            return ""
+
+        status = replication_status[site_id]
+        if status.success:
+            assert not isinstance(status.response, Exception)
+            icon = StaticIcon(IconNames.checkmark)
+            msg = _("Online (%(version_info)s)") % {
+                "version_info": make_site_version_info(
+                    status.response.version,
+                    status.response.edition,
+                    status.response.license_state,
+                )
+            }
+        else:
+            assert isinstance(status.response, Exception)
+            icon = StaticIcon(IconNames.cross)
+            msg = "%s" % status.response
+
+        return html.render_static_icon(icon, title=msg) + HTMLWriter.render_span(
+            msg, style="vertical-align:middle"
+        )
+
+    def _render_status_connection_status(self, site_id: SiteId, site: SiteConfiguration) -> HTML:
+        site_status: SiteStatus = cmk.gui.sites.states().get(site_id, SiteStatus({}))
+        if site.get("disabled", False) is True:
+            status = status_msg = "disabled"
+        else:
+            status = status_msg = site_status.get("state", "unknown")
+
+        if "exception" in site_status:
+            message = "%s" % site_status["exception"]
+        else:
+            message = status_msg.title()
+
+        icon = StaticIcon(IconNames.checkmark if status == "online" else IconNames.cross)
+        return html.render_static_icon(icon, title=message) + HTMLWriter.render_span(
+            message, style="vertical-align:middle"
+        )
+
+    def _render_message_broker_status(
+        self,
+        site_id: SiteId,
+        site: SiteConfiguration,
+        remote_omd_status: Mapping[SiteId, ReplicationStatus],
+    ) -> str | HTML:
+        if not is_replication_enabled(site) or not isinstance(
+            ping_response := remote_omd_status[site_id].response, PingResult
+        ):
+            return ""
+
+        icon, message = self._get_connection_status_icon_message(
+            site_id, site, ping_response.omd_status
+        )
+        return html.render_static_icon(icon, title=message) + HTMLWriter.render_span(
+            message, style="vertical-align:middle"
+        )
+
+    def _get_connection_status_icon_message(
+        self,
+        remote_site_id: SiteId,
+        site: SiteConfiguration,
+        remote_omd_status: OMDStatus,
+    ) -> tuple[StaticIcon, str]:
+        if (remote_host := urlparse(site["multisiteurl"]).hostname) is None:
+            return StaticIcon(IconNames.cross), _(
+                "Offline: No valid URL for graphical user interface (GUI) configured"
+            )
+
+        if remote_omd_status["rabbitmq"] == 5:
+            return StaticIcon(IconNames.disabled), _("Disabled")
+
+        remote_port = site["message_broker_port"]
+        try:
+            connection_status = check_remote_connection(
+                omd_root, remote_host, remote_port, remote_site_id
+            )
+        except MKTerminate, MKTimeout:
+            raise
+        except Exception as e:
+            return StaticIcon(IconNames.alert), _("Unknown error: %(e)s") % {"e": e}
+
+        match connection_status:
+            case ConnectionOK():
+                return StaticIcon(IconNames.checkmark), _("Online")
+            case ConnectionFailed(error):
+                return StaticIcon(IconNames.cross), _(
+                    "Failed to establish connection: %(error)s"
+                ) % {"error": error}
+            case ConnectionRefused.WRONG_SITE:
+                return StaticIcon(IconNames.cross), _(
+                    "Connection to port %(remote_port)s refused. You are probably connecting to the wrong site."
+                ) % {"remote_port": remote_port}
+            case ConnectionRefused.SELF_SIGNED:
+                return StaticIcon(IconNames.cross), _(
+                    "Connection to port %(remote_port)s refused. The site is using a self-signed certificate. Are you logged in?"
+                ) % {"remote_port": remote_port}
+            case ConnectionRefused.CERTIFICATE_VERIFY_FAILED:
+                return StaticIcon(IconNames.cross), _(
+                    "Connection to port %(remote_port)s refused: Invalid certificate"
+                ) % {"remote_port": remote_port}
+            case ConnectionRefused.CLOSED:
+                return StaticIcon(IconNames.cross), _("Not available")
+
+                return "cross", _("Connection to port %(remote_port)s refused") % {  # type: ignore[unreachable]
+                    "remote_port": remote_port
+                }
+            case _:
+                assert_never(_)
+
+
+class ModeSiteLivestatusEncryption(WatoMode):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "site_livestatus_encryption"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return STATIC_PERMISSIONS_SITES
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeEditSite
+
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx)
+        self._site_id = SiteId(request.get_ascii_input_mandatory("site"))
+        self._site_mgmt = site_management_registry["site_management"]
+        self._configured_sites = self._site_mgmt.load_sites()
+        try:
+            self._site = self._configured_sites[self._site_id]
+        except KeyError:
+            raise MKUserError("site", _("This site does not exist."))
+
+    @override
+    def title(self) -> str:
+        return _("Livestatus encryption of %(site_id)s") % {"site_id": self._site_id}
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        return PageMenu(
+            dropdowns=[
+                _page_menu_dropdown_site_details(
+                    self._site_id, self._site, self._configured_sites, self.name()
+                ),
+            ],
+            breadcrumb=breadcrumb,
+        )
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        if not transactions.check_transaction(request):
+            return None
+
+        action = request.get_ascii_input_mandatory("_action")
+        if action != "trust":
+            return None
+
+        digest_sha256 = request.get_ascii_input("_digest")
+
+        try:
+            cert_details = self._fetch_certificate_details()
+        except Exception as e:
+            logger.exception("Failed to fetch peer certificate")
+            html.show_error(_("Failed to fetch peer certificate (%(e)s)") % {"e": e})
+            return None
+
+        cert_pem = None
+        for cert_detail in cert_details:
+            if cert_detail.digest_sha256 == digest_sha256:
+                cert_pem = cert_detail.verify_result.cert_pem
+
+        if cert_pem is None:
+            raise MKGeneralException(_("Failed to find matching certificate in chain"))
+
+        config_variable = config_variable_registry["trusted_certificate_authorities"]
+
+        global_settings = load_configuration_settings()
+        trusted = global_settings.get(
+            "trusted_certificate_authorities",
+            ABCConfigDomain.get_all_default_globals()["trusted_certificate_authorities"],
+        )
+        trusted_cas = trusted.setdefault("trusted_cas", [])
+
+        if (cert_str := cert_pem.decode()) in trusted_cas:
+            raise MKUserError(
+                None,
+                _('The CA is already a <a href="%(url)s">trusted CA</a>.')
+                % {"url": "global_settings.py?varname=trusted_certificate_authorities"},
+            )
+
+        trusted_cas.append(cert_str)
+
+        _pending_changes(
+            config.sites,
+            use_git=config.wato_use_git,
+            local_site=omd_site(),
+            user_id=user.id,
+        ).add(
+            Change(
+                action_name="edit-configvar",
+                text=_(
+                    "Added CA with fingerprint %(digest_sha256)s to trusted certificate authorities"
+                )
+                % {"digest_sha256": digest_sha256},
+                domains=[config_variable.primary_domain().ident()],
+                force_restart=config_variable.need_restart() or None,
+            ),
+            ChangeScope.all_activation_sites(),
+        )
+        save_global_settings(
+            {**global_settings, "trusted_certificate_authorities": trusted}, config.sites
+        )
+
+        flash(
+            _("Added CA with fingerprint %(digest_sha256)s to trusted certificate authorities")
+            % {"digest_sha256": digest_sha256}
+        )
+        return None
+
+    @override
+    def page(self, config: Config) -> None:
+        if not is_livestatus_encrypted(self._site):
+            html.show_message(
+                _("The Livestatus connection to this site is configured not to be encrypted.")
+            )
+            return
+
+        assert (
+            isinstance(self._site["socket"], tuple)
+            and self._site["socket"][1] is not None
+            and "tls" in self._site["socket"][1]
+        )
+        if cast(NetworkSocketDetails, self._site["socket"][1])["tls"][1]["verify"] is False:
+            html.show_warning(
+                _("Encrypted connections to this site are made without certificate verification.")
+            )
+
+        try:
+            cert_details = list(self._fetch_certificate_details())
+        except Exception as e:
+            logger.exception("Failed to fetch peer certificate")
+            html.show_error(_("Failed to fetch peer certificate (%(e)s)") % {"e": e})
+            return
+
+        html.h3(_("Certificate details"))
+        html.open_table(class_=["data", "headerleft"])
+
+        server_cert = cert_details[0]
+        title: str
+        css_class: None | str
+        value: Any  # TODO: Should be HTMLContent! Bugs ahead...
+        for title, css_class, value in [
+            (_("Issued to"), None, server_cert.issued_to),
+            (_("Issued by"), None, server_cert.issued_by),
+            (_("Valid from"), None, server_cert.valid_from),
+            (_("Valid till"), None, server_cert.valid_till),
+            (_("Signature algorithm"), None, server_cert.signature_algorithm),
+            (_("Fingerprint (SHA256)"), None, server_cert.digest_sha256),
+            (_("Serial number"), None, server_cert.serial_number),
+            (
+                _("Trusted"),
+                self._cert_trusted_css_class(server_cert),
+                self._render_cert_trusted(server_cert),
+            ),
+        ]:
+            html.open_tr()
+            html.th(title)
+            html.td(value, class_=css_class)
+            html.close_tr()
+        html.close_table()
+
+        with table_element(
+            "certificate_chain", _("Certificate chain"), limit=config.table_row_limit
+        ) as table:
+            for cert_detail in reversed(cert_details[1:]):
+                table.row()
+                table.cell(_("Actions"), css=["buttons"])
+                if cert_detail.is_ca:
+                    url = makeactionuri(
+                        request,
+                        transactions.get(),
+                        [
+                            ("_action", "trust"),
+                            ("_digest", cert_detail.digest_sha256),
+                        ],
+                    )
+                    html.icon_button(
+                        url=url, title=_("Add to trusted CAs"), icon=StaticIcon(IconNames.trust)
+                    )
+                table.cell(_("Issued to"), cert_detail.issued_to)
+                table.cell(_("Issued by"), cert_detail.issued_by)
+                table.cell(_("Is CA"), _("Yes") if cert_detail.is_ca else _("No"))
+                table.cell(_("Fingerprint (SHA256)"), cert_detail.digest_sha256)
+                table.cell(_("Valid till"), cert_detail.valid_till)
+                table.cell(
+                    _("Trusted"),
+                    self._render_cert_trusted(cert_detail),
+                    css=[self._cert_trusted_css_class(cert_detail)],
+                )
+
+    def _render_cert_trusted(self, cert: CertificateDetails) -> str:
+        if cert.verify_result.is_valid:
+            return _("Yes")
+
+        return _("No (error: %(error)s, code: %(code)d, depth: %(depth)d)") % {
+            "error": cert.verify_result.error_message,
+            "code": cert.verify_result.error_number,
+            "depth": cert.verify_result.error_depth,
+        }
+
+    def _cert_trusted_css_class(self, cert: CertificateDetails) -> str:
+        return "state state0" if cert.verify_result.is_valid else "state state2"
+
+    def _fetch_certificate_details(self) -> Iterable[CertificateDetails]:
+        user.need_permission("general.server_side_requests")
+        assert isinstance(self._site["socket"], tuple) and self._site["socket"][1] is not None
+        family_spec, address_spec = self._site["socket"]
+        address_family = socket.AF_INET if family_spec == "tcp" else socket.AF_INET6
+        address = cast(NetworkSocketDetails, address_spec)["address"]
+        return fetch_certificate_details(cmk.utils.paths.trusted_ca_file, address_family, address)
+
+
+def _page_menu_dropdown_site_details(
+    site_id: str, site: SiteConfiguration, site_configs: SiteConfigurations, current_mode: str
+) -> PageMenuDropdown:
+    return PageMenuDropdown(
+        name="connections",
+        title=_("Connections"),
+        topics=[
+            PageMenuTopic(
+                title=_("This connection"),
+                entries=list(
+                    _page_menu_entries_site_details(site_id, site, site_configs, current_mode)
+                ),
+            ),
+        ],
+    )
+
+
+def _page_menu_entries_site_details(
+    site_id: str, site: SiteConfiguration, site_configs: SiteConfigurations, current_mode: str
+) -> Iterator[PageMenuEntry]:
+    if site_globals_editable(site_configs, site):
+        yield PageMenuEntry(
+            title=_("Global settings"),
+            icon_name=StaticIcon(IconNames.configuration),
+            item=make_simple_link(
+                makeuri_contextless(
+                    request, [("site", site_id)], filename="site_specific_settings.py"
+                ),
+            ),
+        )
+
+    if current_mode != "edit_site":
+        yield PageMenuEntry(
+            title=_("Edit connection"),
+            icon_name=StaticIcon(IconNames.edit),
+            item=make_simple_link(
+                makeuri_contextless(request, [("mode", "edit_site"), ("site", site_id)]),
+            ),
+        )
+
+    if current_mode != "site_livestatus_encryption":
+        yield PageMenuEntry(
+            title=_("Status encryption"),
+            icon_name=StaticIcon(IconNames.encrypted),
+            item=make_simple_link(
+                makeuri_contextless(
+                    request,
+                    [("mode", "site_livestatus_encryption"), ("site", site_id)],
+                )
+            ),
+        )
+
+
+def sort_sites(sites: SiteConfigurations) -> list[tuple[SiteId, SiteConfiguration]]:
+    """Sort given sites argument by local, followed by remote sites"""
+    return sorted(
+        sites.items(),
+        key=lambda sid_s: (
+            is_replication_enabled(sid_s[1]),
+            sid_s[1]["alias"],
+            sid_s[0],
+        ),
+    )
+
+
+def _pending_changes(
+    sites: SiteConfigurations,
+    *,
+    use_git: bool,
+    local_site: SiteId,
+    user_id: UserId | None,
+) -> PendingChanges:
+    return make_pending_changes(
+        activation_sites=activation_sites(sites),
+        local_site=local_site,
+        acting_user=user_id,
+        use_git=use_git,
+    )

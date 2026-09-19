@@ -1,0 +1,25 @@
+{
+  // Compiler options shared by all Checkmk Vue packages live in cmk-ui-library's base
+  // config; this file only owns this package's project shape.
+  "extends": "cmk-ui-library/tsconfig.vue-base.json",
+  "include": ["env.d.ts", "src/**/*", "src/**/*.vue"],
+  "exclude": ["src/**/__tests__/*"],
+  "compilerOptions": {
+    "composite": true,
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+    "paths": {
+      "@/*": ["./src/*"],
+      "@ucl/*": ["./ui-component-library/*"],
+      "*": [
+        // @types/* first: "Bundler" resolution resolves a typeless
+        // package to its .js and stops, so the @types package would
+        // never be reached if it came second. "node" resolution used
+        // to fail on the .js and fall through on its own.
+        "./node_modules/@types/*",
+        "./node_modules/*",
+        "../../bazel-bin/packages/cmk-frontend-vue/node_modules/@types/*",
+        "../../bazel-bin/packages/cmk-frontend-vue/node_modules/*"
+      ]
+    }
+  }
+}

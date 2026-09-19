@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+# mypy: disable-error-code="no-any-return"
+
+from collections.abc import Mapping
+from typing import Any, override
+
+from cmk.ccc.site import url_prefix
+from cmk.gui.breadcrumb import Breadcrumb
+from cmk.gui.config import Config
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.header import make_header
+from cmk.gui.htmllib.foldable_container import foldable_container
+from cmk.gui.htmllib.html import html
+from cmk.gui.http import request
+from cmk.gui.i18n import _
+from cmk.gui.logged_in import user
+from cmk.gui.pages import PageContext
+from cmk.gui.sidebar import footnotelinks, PageHandlers, SidebarSnapin
+from cmk.web.utils.urls import makeuri_contextless
+
+# Relative prefix used for the "Edit" footnote link (from check_mk/ to nagvis/).
+_NAGVIS_URL_PREFIX = "../nagvis/"
+
+
+def _is_nagvis_url(nagvis_url: str, site_url_prefix: str) -> bool:
+    """Only allow embedding of NagVis pages into the chrome wrapper.
+
+    The "Edit" link is a relative path (``../nagvis/``), while the map links
+    returned by the NagVis getMaps API are site-absolute paths
+    (``/<site>/nagvis/...``).
+    """
+    return nagvis_url.startswith((_NAGVIS_URL_PREFIX, f"{site_url_prefix}nagvis/"))
+
+
+def _nagvis_page_url(nagvis_url: str) -> str:
+    return makeuri_contextless(request, [("url", nagvis_url)], filename="nagvis.py")
+
+
+class NagVisMaps(SidebarSnapin):
+    @staticmethod
+    @override
+    def type_name() -> str:
+        return "nagvis_maps"
+
+    @classmethod
+    @override
+    def title(cls) -> str:
+        return _("NagVis maps")
+
+    @classmethod
+    @override
+    def description(cls) -> str:
+        return _("List of available NagVis maps")
+
+    @classmethod
+    @override
+    def refresh_regularly(cls) -> bool:
+        return False
+
+    @override
+    def show(self, config: Config) -> None:
+        html.div(_("Loading maps..."), class_="loading")
+        html.javascript("cmk.sidebar.fetch_nagvis_snapin_contents()")
+
+    @override
+    def page_handlers(self) -> PageHandlers:
+        return {
+            "ajax_nagvis_maps_snapin": self._ajax_show_nagvis_maps_snapin,
+            "nagvis": self._show_nagvis_page,
+        }
+
+    def _show_nagvis_page(self, ctx: PageContext) -> None:
+        """Embed a NagVis page into the Checkmk chrome."""
+        nagvis_url = ctx.request.get_url_input("url", _NAGVIS_URL_PREFIX)
+        if not _is_nagvis_url(nagvis_url, url_prefix()):
+            raise MKUserError("url", _("Not a NagVis URL"))
+
+        make_header(
+            html,
+            title=_("NagVis"),
+            breadcrumb=Breadcrumb(),
+            show_top_heading=False,
+            enable_main_page_scrollbar=False,
+            debug=ctx.config.debug,
+            lang=user.language,
+            inject_js_profiling_code=ctx.config.inject_js_profiling_code,
+            load_frontend_vue=ctx.config.load_frontend_vue,
+            custom_style_sheet=ctx.config.custom_style_sheet,
+            screenshotmode=ctx.config.screenshotmode,
+            inline_help_as_text=user.inline_help_as_text,
+            hide_suggestions=not user.get_tree_state("suggestions", "all", True),
+            user_role_ids=user.role_ids,
+        )
+        html.iframe("", src=nagvis_url, class_="fullpage")
+        html.footer()
+
+    def _ajax_show_nagvis_maps_snapin(self, ctx: PageContext) -> None:
+        api_request = ctx.request.get_request()
+        if api_request["type"] == "table":
+            self._show_table(api_request)
+        elif api_request["type"] == "tree":
+            self._show_tree(api_request)
+        elif api_request["type"] == "error":
+            html.show_error(api_request["message"])
+        else:
+            raise NotImplementedError
+
+        self._show_footnote_links()
+
+    def _show_table(self, api_request: Mapping[str, Any]) -> None:
+        html.open_table(class_="allhosts")
+        html.open_tbody()
+
+        for map_cfg in api_request["maps"]:
+            html.open_tr()
+            html.open_td()
+            html.div(
+                "",
+                class_=[
+                    "statebullet",
+                    self._state_class(map_cfg),
+                ]
+                + self._sub_state_class(map_cfg)
+                + self._stale_class(map_cfg),
+                title=self._state_title(map_cfg),
+            )
+            html.a(map_cfg["alias"], href=_nagvis_page_url(map_cfg["url"]), class_="link")
+            html.close_td()
+            html.close_tr()
+
+        html.close_tbody()
+        html.close_table()
+
+    def _state_class(self, map_cfg: Mapping[str, Any]) -> str:
+        return {
+            "OK": "state0",
+            "UP": "state0",
+            "WARNING": "state1",
+            "CRITICAL": "state2",
+            "DOWN": "state2",
+            "UNREACHABLE": "state2",
+            "PENDING": "statep",
+        }.get(map_cfg["summary_state"], "state3")
+
+    def _sub_state_class(self, map_cfg: Mapping[str, Any]) -> list[str]:
+        if map_cfg["summary_in_downtime"]:
+            return ["stated"]
+        if map_cfg["summary_problem_has_been_acknowledged"]:
+            return ["statea"]
+        return []
+
+    def _stale_class(self, map_cfg: Mapping[str, Any]) -> list[str]:
+        if map_cfg["summary_stale"]:
+            return ["stale"]
+        return []
+
+    def _state_title(self, map_cfg: Mapping[str, Any]) -> str:
+        title = map_cfg["summary_state"]
+
+        if map_cfg["summary_in_downtime"]:
+            title += " (Downtime)"
+        if map_cfg["summary_problem_has_been_acknowledged"]:
+            title += " (Acknowledged)"
+
+        if map_cfg["summary_stale"]:
+            title += " (Stale)"
+
+        if "summary_output" in map_cfg:
+            # Added in NagVis 1.9.35 (with Checkmk 2.2.0b8)
+            title += f" - {map_cfg['summary_output']}"
+
+        return title
+
+    def _show_footnote_links(self) -> None:
+        footnotelinks([(_("Edit"), _nagvis_page_url(_NAGVIS_URL_PREFIX))])
+
+    def _show_tree(self, api_request: Mapping[str, Any]) -> None:
+        html.open_ul()
+        self._show_tree_nodes(api_request["maps"]["maps"], api_request["maps"]["childs"])
+        html.close_ul()
+
+    def _show_tree_nodes(
+        self,
+        maps: Mapping[str, Mapping[str, Any]],
+        children: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    ) -> None:
+        for map_name, map_cfg in maps.items():
+            html.open_li()
+            if map_name in children:
+                with foldable_container(
+                    treename="nagvis",
+                    id_=map_name,
+                    isopen=user.get_tree_state("nagvis", map_name, False),
+                    title=map_cfg["alias"],
+                    title_url=_nagvis_page_url(map_cfg["url"]),
+                    indent=False,
+                ):
+                    self._show_tree_nodes(children[map_name], children)
+            else:
+                html.a(map_cfg["alias"], href=_nagvis_page_url(map_cfg["url"]), class_="link")
+            html.close_li()

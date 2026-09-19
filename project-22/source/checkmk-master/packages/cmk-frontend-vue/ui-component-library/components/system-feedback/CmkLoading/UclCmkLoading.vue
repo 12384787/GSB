@@ -1,0 +1,64 @@
+<!--
+Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script lang="ts">
+import { type PanelConfigFor } from '@ucl/_ucl/components/detail-page'
+
+import codeExample from './UclCmkLoadingCodeExample.vue?raw'
+
+export const panelConfig = {
+  height: {
+    type: 'string' as const,
+    title: 'Dot Height',
+    help: 'Adjust the height of the loading dots using any valid CSS unit (e.g., px, em, rem). 8px is default and recommended for most use cases.',
+    initialState: '8px'
+  }
+} satisfies PanelConfigFor<typeof CmkLoading>
+</script>
+
+<script setup lang="ts">
+import {
+  PanelStateCreator,
+  UclDetailPageAccessibility,
+  UclDetailPageCodeExample,
+  UclDetailPageComponent,
+  UclDetailPageHeader,
+  UclDetailPageLayout,
+  UclPropertiesPanel
+} from '@ucl/_ucl/components/detail-page'
+import CmkLoading from 'cmk-ui-library/components/CmkLoading.vue'
+
+defineProps<{ screenshotMode: boolean }>()
+
+const propState = new PanelStateCreator<typeof CmkLoading>().createRef(panelConfig)
+</script>
+
+<template>
+  <UclDetailPageLayout>
+    <UclDetailPageHeader>CmkLoading</UclDetailPageHeader>
+
+    <UclDetailPageComponent>
+      <div
+        style="
+          min-height: 80px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          width: 100%;
+        "
+      >
+        <CmkLoading :height="propState.height" />
+      </div>
+
+      <template #properties>
+        <UclPropertiesPanel v-model="propState" :config="panelConfig" />
+      </template>
+    </UclDetailPageComponent>
+
+    <UclDetailPageCodeExample :code="codeExample" />
+
+    <UclDetailPageAccessibility :data="[]" />
+  </UclDetailPageLayout>
+</template>

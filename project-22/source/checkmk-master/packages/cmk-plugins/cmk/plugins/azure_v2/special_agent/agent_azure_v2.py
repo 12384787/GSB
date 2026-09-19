@@ -1,0 +1,2990 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+# mypy: disable-error-code="no-any-return"
+# mypy: disable-error-code="no-untyped-call"
+# mypy: disable-error-code="no-untyped-def"
+# mypy: disable-error-code="type-arg"
+
+"""agent_azure_v2
+
+Checkmk special agent for monitoring Azure cloud applications.
+Resources and resourcegroups are all treated lowercase because of:
+https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/frequently-asked-questions#are-resource-group-names-case-sensitive
+"""
+
+import argparse
+import asyncio
+import contextlib
+import datetime
+import enum
+import json
+import logging
+import re
+import string
+import sys
+from abc import ABC, abstractmethod
+from collections import defaultdict
+from collections.abc import Coroutine, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from enum import Enum
+from multiprocessing import Lock
+from typing import Any, Final, Literal, override, Required, TypedDict
+
+import requests
+from pydantic import BaseModel, RootModel
+
+from cmk.password_store.v1_unstable import parser_add_secret_option, resolve_secret_option
+from cmk.plugins.azure_v2.lib import (
+    compute_unique_name_hash,
+    get_params_from_azure_id,
+    RESOURCE_TYPE_ABBREVIATIONS,
+    short_resource_type,
+)
+from cmk.plugins.azure_v2.special_agent._data_cache import DataCache
+from cmk.plugins.azure_v2.special_agent.azure_api_client import (
+    ApiError,
+    ApiErrorAuthorizationRequestDenied,
+    ApiErrorMissingData,
+    ApiLoginFailed,
+    BaseAsyncApiClient,
+    get_graph_authority_urls,
+    get_mgmt_authority_urls,
+    NoConsumptionAPIError,
+    RateLimitException,
+    SharedSessionApiClient,
+    to_requests_proxies,
+)
+from cmk.plugins.azure_v2.special_agent.azure_metrics import (
+    Aggregations,
+    ALL_METRICS,
+    AzureMetric,
+    COSMOS_DATABASE_METRICS,
+    DimensionFilter,
+    Intervals,
+    OPTIONAL_METRICS,
+)
+from cmk.server_side_programs.v1_unstable import report_agent_crashes, vcrtrace
+
+type ResourceId = str
+
+__version__ = "3.0.0b1"
+
+AGENT = "azure_v2"
+
+LOGGER = logging.getLogger(f"agent_{AGENT}")
+
+NOW = datetime.datetime.now(tz=datetime.UTC)
+
+SECRET_OPTION = "secret"
+
+
+class ResourceTypeNotKnownError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, kw_only=True)
+class UniqueHostnamesConfig:
+    enabled: Literal["short"] | Literal["long"] | Literal[False] = False
+    exclude_vms: bool = False
+
+    def __bool__(self):
+        return bool(self.enabled)
+
+    def enabled_for_resource_type(self, type: str):  # noqa: A002
+        if type.lower() == "microsoft.compute/virtualmachines" and self.exclude_vms:
+            return False
+        return bool(self.enabled)
+
+
+class FetchedResource(Enum):
+    """Available Azure resources, with section name.
+    The host name abbreviations are maintained in cmk.plugins.azure_v2.lib.constants.
+    """
+
+    # fmt: off
+    VIRTUAL_MACHINES            = ("Microsoft.Compute/virtualMachines",            "virtualmachines")
+    VAULTS                      = ("Microsoft.RecoveryServices/vaults",            "vaults")
+    APP_GATEWAYS                = ("Microsoft.Network/applicationGateways",        "applicationgateways")
+    LOAD_BALANCERS              = ("Microsoft.Network/loadBalancers",              "loadbalancers")
+    VIRTUAL_NETWORK_GATEWAYS    = ("Microsoft.Network/virtualNetworkGateways",     "virtualnetworkgateways")
+    REDIS                       = ("Microsoft.Cache/Redis",                        "redis")
+    COSMOSDB                    = ("Microsoft.DocumentDB/databaseAccounts",        "databaseaccounts")
+    # made-up resource type for cosmosdb databases:
+    COSMOSDB_DATABASE           = ("Microsoft.DocumentDB/databaseAccounts/cosmos_database", "databaseaccounts")
+    FIREWALLS                   = ("Microsoft.Network/azureFirewalls",             "azurefirewalls")
+    MYSQL_FLEXIBLE_SERVERS      = ("Microsoft.DBforMySQL/flexibleServers",         "flexibleservers")
+    POSTGRESQL_FLEXIBLE_SERVERS = ("Microsoft.DBforPostgreSQL/flexibleServers",    "flexibleservers")
+    VIRTUAL_NETWORKS            = ("Microsoft.Network/virtualNetworks",            "virtualnetworks")
+    NAT_GATEWAYS                = ("Microsoft.Network/natGateways",                "natgateways")
+    SQL_DATABASES               = ("Microsoft.Sql/servers/databases",              "databases")
+    STORAGE_ACCOUNTS            = ("Microsoft.Storage/storageAccounts",            "storageaccounts")
+    WEB_SITES                   = ("Microsoft.Web/sites",                          "sites")
+    MYSQL_SERVERS               = ("Microsoft.DBforMySQL/servers",                 "servers")
+    POSTGRESQL_SERVERS          = ("Microsoft.DBforPostgreSQL/servers",            "servers")
+    TRAFFIC_MANAGER             = ("Microsoft.Network/trafficManagerProfiles",     "trafficmanagerprofiles")
+    # fmt: on
+
+    def __init__(self, resource_type: str, section_name: str) -> None:
+        self.resource_type = resource_type
+        self.section_name = section_name
+        # Direct mapping access: a fetched resource type missing from the
+        # shared mapping must fail at import time, not when hostnames are
+        # computed.
+        self.abbreviation = RESOURCE_TYPE_ABBREVIATIONS[resource_type]
+
+    @classmethod
+    def from_type(cls, resource_type: str) -> FetchedResource | None:
+        for member in cls:
+            # lower, because we've seen
+            # e.g. "Microsoft.DocumentDB/databaseAccounts" and "Microsoft.DocumentDb/databaseAccounts"
+            if member.resource_type.lower() == resource_type.lower():
+                return member
+        return None
+
+    @property
+    def section(self) -> str:
+        return self.section_name
+
+    @property
+    def type(self) -> str:
+        return self.resource_type
+
+
+BULK_QUERIED_RESOURCES = {
+    FetchedResource.VIRTUAL_MACHINES.type,
+    FetchedResource.APP_GATEWAYS.type,
+    FetchedResource.LOAD_BALANCERS.type,
+    FetchedResource.FIREWALLS.type,
+}
+
+SUPPORTED_FLEXIBLE_DATABASE_SERVER_RESOURCE_TYPES = frozenset(
+    {
+        FetchedResource.MYSQL_FLEXIBLE_SERVERS.type,
+        FetchedResource.POSTGRESQL_FLEXIBLE_SERVERS.type,
+    }
+)
+
+
+class _AzureEntity(ABC):
+    def __init__(
+        self, entity_name: str, section: str, unique_hostnames_config: UniqueHostnamesConfig
+    ) -> None:
+        self.info: dict[str, Any]
+
+        self.section = section
+        self._entity_name = entity_name
+        self.unique_hostnames_config = unique_hostnames_config
+
+    @property
+    def piggytarget(self) -> str:
+        if (type := self.info.get("type")) is not None:  # noqa: A001
+            use_unique_hostnames = self.unique_hostnames_config.enabled_for_resource_type(type)
+        else:
+            use_unique_hostnames = bool(self.unique_hostnames_config)
+        return self._unique_name() if use_unique_hostnames else self._entity_name
+
+    def _compute_unique_name(self, uniqueness_keys: Sequence[str], prefix: str) -> str:
+        """
+        The concept of "unique name" should be only known and used by a resource object.
+        The rest of the code must trust the piggytarget property.
+
+        We compute unique names to avoid conflicts in host names in Azure,
+        since we can have the same resource-type with the same name in different
+        resource-groups or subscriptions. We can also have the same subscription-name
+        in the same tenant.
+        """
+        hashed = compute_unique_name_hash(uniqueness_keys)
+
+        if self.unique_hostnames_config.enabled == "long":
+            return f"azr_{prefix}_{self._entity_name}_{hashed}"
+        if self.unique_hostnames_config.enabled == "short":
+            return f"{self._entity_name}_{hashed}"
+        # Should hopefully never happen.
+        raise RuntimeError("_compute_unique_name() called, but safe hostnames were disabled")
+
+    @abstractmethod
+    def _unique_name(self) -> str:
+        raise NotImplementedError
+
+    def dumpinfo(self) -> Sequence[tuple]:
+        # TODO: Hmmm, should the variable-length tuples actually be lists?
+        lines: list[tuple[str | int, ...]] = [("Resource",), (json.dumps(self.info),)]
+        return lines
+
+
+class AzureSubscription(_AzureEntity):
+    def __init__(
+        self,
+        id: str,  # noqa: A002
+        name: str,
+        tags: Mapping[str, str],
+        unique_hostnames_config: UniqueHostnamesConfig,
+        tenant_id: str,
+        tenant_name: str | None = None,
+    ) -> None:
+        super().__init__(
+            entity_name=name,
+            section="subscription",
+            unique_hostnames_config=unique_hostnames_config,
+        )
+        self.id: Final[str] = id
+        self.tags: Final[Mapping[str, str]] = tags
+        self.name: Final[str] = name
+        self.tenant_id: Final[str] = tenant_id
+        self.tenant_name: Final[str | None] = tenant_name
+
+        self.info = {
+            "name": name,
+            "tags": tags,
+            "id": id,
+            "type": "subscription",  # This doesn't exist, but sure.
+            "group": "",
+            "tenant_id": tenant_id,
+            "tenant_name": tenant_name,
+            "subscription_name": name,
+        }
+
+    @override
+    def _unique_name(self) -> str:
+        return self._compute_unique_name((self.id,), "subscription")
+
+
+class AzureTenant(_AzureEntity):
+    def __init__(self, id: str, name: str) -> None:  # noqa: A002
+        super().__init__(
+            entity_name=name or id,
+            section="tenant",
+            unique_hostnames_config=UniqueHostnamesConfig(enabled=False),
+        )
+        self.id: Final[str] = id
+        self.name: Final[str] = name
+        self.info = {
+            "id": id,
+            "name": name,
+            "type": "tenant",
+            "group": "",
+            "tenant_id": id,
+            "tenant_name": name,
+        }
+
+    @property
+    @override
+    def piggytarget(self) -> str:
+        raise NotImplementedError(
+            "The tenant host is the source host in CheckMk, it is not a piggyback host "
+            "therefore this method should not be called for the AzureTenant object"
+        )
+
+    @override
+    def _unique_name(self) -> str:
+        raise NotImplementedError(
+            "The tenant host is the source host in CheckMk, it is not a piggyback host "
+            "therefore this method should not be called for the AzureTenant object"
+        )
+
+
+class AzureResourceGroup(_AzureEntity):
+    def __init__(
+        self,
+        info: Mapping[str, Any],
+        tag_key_pattern: TagsOption,
+        subscription: AzureSubscription,
+        unique_hostnames_config: UniqueHostnamesConfig,
+    ) -> None:
+        section = info["type"].split("/")[-1].lower()
+        super().__init__(
+            entity_name=info["name"].lower(),
+            section=section,
+            unique_hostnames_config=unique_hostnames_config,
+        )
+        self.tags = filter_tags(info.get("tags", {}), tag_key_pattern)
+        self.info = {
+            **info,
+            "tenant_id": subscription.tenant_id,
+            "tenant_name": subscription.tenant_name,
+            "subscription_name": subscription.name,
+            "subscription": subscription.id,
+            "group": info["name"].lower(),
+        }
+        self.subscription = subscription
+
+    @override
+    def _unique_name(self) -> str:
+        return self._compute_unique_name(
+            # adding type because a resource-group can have the same name of a subscription
+            # the type add more uniqueness
+            (
+                self.subscription.id,
+                self.info["type"],  # "Microsoft.Resources/resourceGroups"
+            ),
+            "rg",
+        )
+
+
+class TagsImportPatternOption(enum.Enum):
+    ignore_all = "IGNORE_ALL"
+    import_all = "IMPORT_ALL"
+
+
+TagsOption = str | Literal[TagsImportPatternOption.ignore_all, TagsImportPatternOption.import_all]
+
+
+def _chunks[T](list_: Sequence[T], length: int = 50) -> Sequence[Sequence[T]]:
+    return [list_[i : i + length] for i in range(0, len(list_), length)]
+
+
+def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
+    prog, description = __doc__.split("\n\n", maxsplit=1)
+    parser = argparse.ArgumentParser(
+        prog=prog, description=description, formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument(
+        "--debug",
+        "-d",
+        action="store_true",
+        help="Enable debug mode (keep some exceptions unhandled)",
+    )
+    parser.add_argument("--verbose", "-v", action="count", default=0)
+    parser.add_argument(
+        "--vcrtrace",
+        "--tracefile",
+        default=False,
+        action=vcrtrace(
+            # This is the result of a refactoring.
+            # I did not check if it makes sense for this special agent.
+            filter_headers=[("authorization", "****")],
+        ),
+    )
+    parser.add_argument(
+        "--dump-config",
+        action="store_true",
+        help="""Dump parsed configuration and exit""",
+    )
+    parser.add_argument(
+        "--timeout",
+        default=10,
+        type=int,
+        help="""Timeout for individual processes in seconds (default 10)""",
+    )
+
+    group_subscription = parser.add_mutually_exclusive_group(required=False)
+
+    group_subscription.add_argument(
+        "--no-subscriptions",
+        action="store_true",
+        help="Do not monitor subscriptions",
+    )
+    group_subscription.add_argument(
+        "--subscription",
+        dest="subscriptions",
+        action="append",
+        default=[],
+        help="Azure subscription IDs",
+    )
+    group_subscription.add_argument(
+        "--all-subscriptions",
+        action="store_true",
+        help="Monitor all available Azure subscriptions",
+    )
+    group_subscription.add_argument(
+        "--subscriptions-require-tag",
+        default=[],
+        metavar="TAG",
+        action="append",
+        help="""Only monitor subscriptions that have the specified TAG.
+              To require multiple tags, provide the option more than once.""",
+    )
+    group_subscription.add_argument(
+        "--subscriptions-require-tag-value",
+        default=[],
+        metavar=("TAG", "VALUE"),
+        nargs=2,
+        action="append",
+        help="""Only monitor subscriptions that have the specified TAG set to VALUE.
+             To require multiple tags, provide the option more than once.""",
+    )
+
+    # REQUIRED
+    parser.add_argument("--client", required=True, help="Azure client ID")
+    parser.add_argument("--tenant", required=True, help="Azure tenant ID")
+    parser_add_secret_option(
+        parser, long=f"--{SECRET_OPTION}", help="Azure authentication secret", required=True
+    )
+    parser.add_argument(
+        "--cache-id",
+        required="--connection-test" not in sys.argv,
+        help="Unique id for this special agent configuration",
+    )
+
+    parser.add_argument(
+        "--tenant-name",
+        type=str,
+        required="--connection-test" not in sys.argv,
+        metavar="TENANT_NAME",
+        help="Azure tenant name to add to inventory and labels of created resources",
+    )
+
+    parser.add_argument(
+        "--proxy",
+        type=str,
+        default=None,
+        metavar="PROXY",
+        help=(
+            "HTTP proxy used to connect to the Azure API. If not set, the environment settings "
+            "will be used."
+        ),
+    )
+
+    # CONSTRAIN DATA TO REQUEST
+    parser.add_argument(
+        "--require-tag",
+        default=[],
+        metavar="TAG",
+        action="append",
+        help="""Only monitor resources that have the specified TAG.
+              To require multiple tags, provide the option more than once.""",
+    )
+    parser.add_argument(
+        "--require-tag-value",
+        default=[],
+        metavar=("TAG", "VALUE"),
+        nargs=2,
+        action="append",
+        help="""Only monitor resources that have the specified TAG set to VALUE.
+             To require multiple tags, provide the option more than once.""",
+    )
+    parser.add_argument(
+        "--explicit-config",
+        default=[],
+        action="append",
+        help="""list of arguments providing the configuration in <key>=<value> format.
+             If omitted, all groups and all resources of the services specified in --services are
+             fetched.
+             If specified, every 'group=<name>' argument starts a new group configuration,
+             and every 'resource=<name>' arguments specifies a resource.""",
+    )
+    parser.add_argument(
+        "--service",
+        default=[],
+        action="append",
+        help="The services to monitor",
+        dest="services",
+    )
+    parser.add_argument(
+        "--unique-hostnames",
+        default=None,
+        choices=["short", "long"],
+        required=False,
+        # TODO: Update help text for short/long
+        help="Create unique host names for piggyback hosts to avoid conflicts in entity names in Azure. "
+        "This option will append the last part of the subscription ID to host names. Example: 'my-vm-1a2b3c4d'",
+    )
+    parser.add_argument(
+        "--unique-hostnames-exclude-vms",
+        default=False,
+        action="store_true",
+        help="When used with --unique-hostnames, exclude virtual machines from unique hostname generation. ",
+    )
+    parser.add_argument(
+        "--authority",
+        default="global",
+        choices=["global", "china"],
+        required=True,
+        help="Authority to be used",
+    )
+
+    group_import_tags = parser.add_mutually_exclusive_group()
+    group_import_tags.add_argument(
+        "--ignore-all-tags",
+        action="store_const",
+        const=TagsImportPatternOption.ignore_all,
+        dest="tag_key_pattern",
+        help="By default, all Azure tags are written to the agent output, validated to meet the "
+        "Checkmk label requirements and added as host labels to their respective piggyback host "
+        "and/or as service labels to the respective service using the syntax "
+        "'cmk/azure/tag/{key}:{value}'. With this option you can disable the import of Azure "
+        "tags.",
+    )
+    group_import_tags.add_argument(
+        "--import-matching-tags-as-labels",
+        dest="tag_key_pattern",
+        help="You can restrict the imported tags by specifying a pattern which the agent searches "
+        "for in the key of the tag.",
+    )
+    group_import_tags.set_defaults(tag_key_pattern=TagsImportPatternOption.import_all)
+
+    parser.add_argument(
+        "--connection-test",
+        action="store_true",
+        help="Run a connection test through the Management API only. No further agent code is "
+        "executed.",
+    )
+
+    return parser.parse_args(argv)
+
+
+# The following *Config objects provide a Configuration instance as described in
+# CMK-513 (comment-12620).
+# For now the passed commandline arguments are used to create it.
+
+
+class GroupConfig:
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        if not name:
+            raise ValueError("falsey group name: %r" % name)
+        self.name = name
+        self.resources: list = []
+
+    @property
+    def fetchall(self):
+        return not self.resources
+
+    def add_key(self, key: str, value: str) -> None:
+        if key == "resources":
+            self.resources = value.split(",")
+            return
+        raise ValueError("unknown config key: %s" % key)
+
+    @override
+    def __str__(self) -> str:
+        if self.fetchall:
+            return "[%s]\n  <fetchall>" % self.name
+        return "[%s]\n" % self.name + "\n".join("resource: %s" % r for r in self.resources)
+
+
+class ExplicitConfig:
+    def __init__(self, raw_list: Sequence[str]) -> None:
+        super().__init__()
+        self.groups: dict = {}
+        self.current_group = None
+        for item in raw_list:
+            if "=" not in item:
+                raise ValueError("must be in <key>=<value> format: %r" % item)
+            key, value = item.split("=", 1)
+            self.add_key(key, value)
+
+    @property
+    def fetchall(self) -> bool:
+        return not self.groups
+
+    def add_key(self, key: str, value: str) -> None:
+        if key == "group":
+            group_name = value.lower()
+            self.current_group = self.groups.setdefault(group_name, GroupConfig(group_name))
+            return
+        if self.current_group is None:
+            raise RuntimeError("missing arg: group=<name>")
+        self.current_group.add_key(key, value)  # type: ignore[unreachable]
+
+    def is_configured(self, resource: AzureResource) -> bool:
+        if self.fetchall:
+            return True
+        group_config = self.groups.get(resource.group)
+        if group_config is None:
+            return False
+        if group_config.fetchall:
+            return True
+        return resource.info["name"] in group_config.resources
+
+    @override
+    def __str__(self) -> str:
+        if self.fetchall:
+            return "[<fetchall>]"
+        return "\n".join(str(group) for group in self.groups.values())
+
+
+class TagBasedConfig:
+    def __init__(self, required: Sequence[str], key_values: Sequence[Sequence[str]]) -> None:
+        super().__init__()
+        self._required = required
+        self._values = key_values
+
+    def is_configured(self, resource: AzureResource | AzureSubscription) -> bool:
+        if not all(k in resource.tags for k in self._required):
+            return False
+        return all(resource.tags.get(key) == val for key, val in self._values)
+
+    @override
+    def __str__(self) -> str:
+        lines = []
+        if self._required:
+            lines.append("required tags: %s" % ", ".join(self._required))
+        for key, val in self._values:
+            lines.append(f"required value for {key!r}: {val!r}")
+        return "\n".join(lines)
+
+
+class Selector:
+    def __init__(self, args: argparse.Namespace) -> None:
+        super().__init__()
+        self._explicit_config = ExplicitConfig(raw_list=args.explicit_config)
+        self._tag_based_config = TagBasedConfig(args.require_tag, args.require_tag_value)
+
+    def do_monitor(self, resource: AzureResource) -> bool:
+        return self._explicit_config.is_configured(
+            resource
+        ) and self._tag_based_config.is_configured(resource)
+
+    @override
+    def __str__(self) -> str:
+        lines = [
+            "Explicit configuration:\n  %s" % str(self._explicit_config).replace("\n", "\n  "),
+            "Tag based configuration:\n  %s" % str(self._tag_based_config).replace("\n", "\n  "),
+        ]
+        return "\n".join(lines)
+
+
+class _Section:
+    LOCK = Lock()
+
+    def __init__(
+        self,
+        name: str,
+        piggytargets: Iterable[str],
+        separator: int,
+        options: Sequence[str],
+    ) -> None:
+        super().__init__()
+        self._sep = chr(separator)
+        self._piggytargets = list(piggytargets)
+        self._cont: list = []
+        section_options = ":".join(["sep(%d)" % separator, *options])
+        self._title = f"<<<{name.replace('-', '_')}:{section_options}>>>\n"
+
+    def _formatline(self, tokens):
+        return self._sep.join(map(str, tokens)) + "\n"
+
+    def add(self, info: str | Sequence[object] | Sequence[Sequence[object]]) -> None:
+        if not info:
+            return
+        if isinstance(info, str):
+            self._cont.append(info + "\n")
+            return
+
+        if isinstance(info[0], list | tuple):  # we got a list of list of lines
+            for row in info:
+                self._cont.append(self._formatline(row))
+        else:  # we got a list of lines
+            self._cont.append(self._formatline(info))
+
+    def write(self, write_empty: bool = False) -> None:
+        if not (write_empty or self._cont):
+            return
+        with self.LOCK:
+            for piggytarget in self._piggytargets:
+                sys.stdout.write(f"<<<<{piggytarget}>>>>\n")
+                sys.stdout.write(self._title)
+                sys.stdout.writelines(self._cont)
+            sys.stdout.write("<<<<>>>>\n")
+            sys.stdout.flush()
+
+    @override
+    def __repr__(self) -> str:
+        return (
+            f"Section(\n"
+            f"    title={self._title},\n"
+            f"    piggytargets={self._piggytargets},\n"
+            f"    separator={self._sep},\n"
+            f"    content={self._cont}"
+            f")"
+        )
+
+    @override
+    def __eq__(self, value):
+        if not isinstance(value, _Section):
+            return False
+        return (
+            self._title == value._title
+            and self._piggytargets == value._piggytargets
+            and self._sep == value._sep
+            and self._cont == value._cont
+        )
+
+
+class AzureSection(_Section):
+    def __init__(
+        self, name: str, piggytargets: Iterable[str] | None = None, separator: int = 124
+    ) -> None:
+        super().__init__(
+            "azure_v2_%s" % name, piggytargets or ("",), separator=separator, options=[]
+        )
+
+
+class _AzureBaseLabelsSection(AzureSection):
+    def _apply_default_label(self, labels: Mapping[str, str]) -> Mapping[str, str]:
+        return {"cloud": "azure", **labels}
+
+    def _initialize_data(self, labels: Mapping[str, str], tags: Mapping[str, str]) -> None:
+        super().add(json.dumps(labels))  # first line: labels
+        super().add(json.dumps(tags))  # second line: tags
+
+    @override
+    def add(self, info: str | Sequence[object] | Sequence[Sequence[object]]) -> None:
+        raise NotImplementedError("Use constructor to add labels and tags")
+
+
+class AzureLabelsSection(_AzureBaseLabelsSection):
+    def __init__(
+        self,
+        piggytarget: str,
+        *,
+        labels: Mapping[str, str],
+        tags: Mapping[str, str],
+    ) -> None:
+        super().__init__("labels", [piggytarget], separator=0)
+        self._initialize_data(self._apply_default_label(labels), tags)
+
+
+class AzureTenantLabelsSection(_AzureBaseLabelsSection):
+    def __init__(
+        self,
+        *,
+        labels: Mapping[str, str] = {},
+        tags: Mapping[str, str] = {},
+    ) -> None:
+        super().__init__("labels", separator=0)
+        self._initialize_data(self._apply_default_label(labels), tags)
+
+    @override
+    def _apply_default_label(self, labels: Mapping[str, str]) -> Mapping[str, str]:
+        return super()._apply_default_label({"entity": "tenant", **labels})
+
+
+class AzureResourceSection(AzureSection):
+    def __init__(self, resource: _AzureEntity) -> None:
+        super().__init__(resource.section, [resource.piggytarget])
+
+
+class IssueCollector:
+    def __init__(self) -> None:
+        super().__init__()
+        self._list: list[tuple[str, str]] = []
+
+    def add(self, issue_type: str, issued_by: str, issue_msg: str) -> None:
+        issue = {"type": issue_type, "issued_by": issued_by, "msg": issue_msg}
+        self._list.append(("issue", json.dumps(issue)))
+
+    def dumpinfo(self) -> list[tuple[str, str]]:
+        return self._list
+
+    def __len__(self) -> int:
+        return len(self._list)
+
+
+class _MetadataItem(BaseModel):
+    class _Name(BaseModel):
+        value: str
+
+    name: _Name
+    value: str
+
+
+class _MetadataList(RootModel[Sequence[_MetadataItem]]):
+    pass
+
+
+def _parse_metrics_metadata(
+    metadata: Sequence[Mapping[str, str | object]],
+) -> Mapping[str, str]:
+    """
+    Metadata are in the form:
+    [
+        {
+            "name": {
+                "value": "databasename",
+                "localizedValue": "databasename"
+            },
+            "value": "SampleDB"
+        },
+        ...
+    ]
+    """
+
+    validated_metadata = _MetadataList.model_validate(metadata)
+    return {item.name.value: item.value for item in validated_metadata.root}
+
+
+def create_metric_dict(
+    metric: Mapping[str, Any],
+    aggregation: Aggregations,
+    interval_id: Intervals,
+    metric_definition: AzureMetric,
+) -> Sequence[Mapping[str, Any]]:
+    name = metric["name"]["value"]
+    metriclist: list[Mapping[str, Any]] = []
+
+    timeseries = metric.get("timeseries")
+    if not timeseries:
+        return metriclist
+
+    for measurement in reversed(timeseries):
+        dataset = measurement.get("data", ())
+        if not dataset:
+            continue
+
+        metric_dict = {
+            "name": name,
+            "aggregation": aggregation,
+            "value": None,
+            "unit": metric["unit"].lower(),
+            "timestamp": None,
+            "interval_id": interval_id,
+            "interval": None,
+            "cmk_metric_alias": metric_definition.cmk_metric_alias,
+            "metadata_mapping": None,
+        }
+
+        if metadata := measurement.get("metadatavalues"):
+            metric_dict["metadata_mapping"] = _parse_metrics_metadata(metadata)
+
+        with contextlib.suppress(IndexError, TypeError):
+            metric_dict["interval"] = str(
+                datetime.datetime.strptime(dataset[-1]["timeStamp"], "%Y-%m-%dT%H:%M:%SZ")
+                - datetime.datetime.strptime(dataset[-2]["timeStamp"], "%Y-%m-%dT%H:%M:%SZ")
+            )
+
+        data_point_discard = metric_definition.data_point_discard
+        for data in reversed(dataset):
+            LOGGER.debug("data: %(data)s", {"data": data})
+            metric_dict["value"] = data.get(aggregation)
+            if metric_dict["value"] is not None:
+                if data_point_discard > 0:
+                    data_point_discard -= 1
+                    continue
+
+                metric_dict["timestamp"] = data["timeStamp"]
+                metriclist.append(metric_dict)
+                break
+
+        if not metadata:
+            # no need to loop over other timeseries. With no metadata
+            # there should be only one timeseries, and in this way we also stick
+            # with the previous behavior
+            break
+
+    return metriclist
+
+
+def get_attrs_from_uri(uri: str) -> Mapping[str, str]:
+    """The uri contains info on subscription, resource group, provider."""
+    attrs = {}
+    segments = uri.split("/")
+    for idx, segment in enumerate(segments):
+        if segment in ("subscriptions", "providers"):
+            attrs[segment[:-1]] = segments[idx + 1]
+        if segment.lower() == "resourcegroups":
+            # we have seen "resouceGroups" and "resourcegroups"
+            attrs["group"] = segments[idx + 1]
+    return attrs
+
+
+def filter_tags(tags: Mapping[str, str], pattern: TagsOption) -> Mapping[str, str]:
+    if pattern == TagsImportPatternOption.import_all:
+        return tags
+    if pattern == TagsImportPatternOption.ignore_all:
+        return {}
+    return {key: value for key, value in tags.items() if re.search(pattern, key)}
+
+
+class AzureResource(_AzureEntity):
+    def __init__(
+        self,
+        info: dict[str, Any],
+        tag_key_pattern: TagsOption,
+        subscription: AzureSubscription,
+        unique_hostnames_config: UniqueHostnamesConfig,
+    ) -> None:
+        self.name = info["name"]
+        section = short_resource_type(info["type"])
+
+        super().__init__(
+            entity_name=self.name, section=section, unique_hostnames_config=unique_hostnames_config
+        )
+        self.tags = filter_tags(info.get("tags", {}), tag_key_pattern)
+        self.info = {
+            **info,
+            "tags": self.tags,
+            "tenant_id": subscription.tenant_id,
+            "tenant_name": subscription.tenant_name,
+            "subscription_name": subscription.name,
+            "subscription": subscription.id,
+        }
+        self.info.update(get_attrs_from_uri(info["id"]))
+        self.subscription = subscription
+        self.group = self.info["group"].lower()
+        self.metrics: list = []
+
+        # resource-specific labels
+        self.labels: dict[str, str | bool] = {}
+        if region := self.info.get("location"):
+            self.labels["region"] = region
+
+    @override
+    def _unique_name(self) -> str:
+        resource_type = self.info.get("type", "")
+        fetched = FetchedResource.from_type(resource_type)
+
+        if fetched is None:
+            raise ResourceTypeNotKnownError(
+                f"Unsupported resource type for unique name generation: {resource_type}"
+            )
+
+        return self._compute_unique_name(
+            (
+                self.subscription.id,
+                self.group,
+                self.info["type"],
+            ),
+            fetched.abbreviation,
+        )
+
+    @override
+    def dumpinfo(self) -> Sequence[tuple]:
+        # TODO: Hmmm, should the variable-length tuples actually be lists?
+        lines: list[tuple[str | int, ...]] = [("Resource",), (json.dumps(self.info),)]
+        if self.metrics:
+            lines += [("metrics following", len(self.metrics))]
+            lines += [(json.dumps(m),) for m in self.metrics]
+        return lines
+
+
+def filter_keys(mapping: Mapping, keys: Iterable[str]) -> Mapping:
+    items = ((k, mapping.get(k)) for k in keys)
+    return {k: v for k, v in items if v is not None}
+
+
+async def get_frontend_ip_configs(
+    mgmt_client: BaseAsyncApiClient, resource: Mapping
+) -> dict[str, dict[str, object]]:
+    async def _get_public_ip_addresses(
+        mgmt_client: BaseAsyncApiClient, group: str, name: str
+    ) -> Mapping[str, Any]:
+        return await mgmt_client.get_async(
+            f"resourceGroups/{group}/providers/Microsoft.Network/publicIPAddresses/{name}",
+            params={"api-version": "2024-05-01"},
+        )
+
+    frontend_ip_configs: dict[str, dict[str, object]] = {}
+
+    for ip_config in resource["properties"]["frontendIPConfigurations"]:
+        ip_config_data = {
+            **filter_keys(ip_config, ("id", "name")),
+            **filter_keys(
+                ip_config["properties"],
+                ("privateIPAllocationMethod", "privateIPAddress"),
+            ),
+        }
+        if "publicIPAddress" in ip_config.get("properties"):
+            public_ip_id = ip_config["properties"]["publicIPAddress"]["id"]
+
+            _, group, ip_name = get_params_from_azure_id(
+                public_ip_id, resource_types=["publicIPAddresses"]
+            )
+            public_ip = await _get_public_ip_addresses(mgmt_client, group, ip_name)
+            dns_settings = public_ip["properties"].get("dnsSettings")
+
+            public_ip_keys = ("ipAddress", "publicIPAllocationMethod")
+            ip_config_data["public_ip_address"] = {
+                "dns_fqdn": dns_settings["fqdn"] if dns_settings else "",
+                **filter_keys(public_ip, ("name", "location")),
+                **filter_keys(public_ip["properties"], public_ip_keys),
+            }
+
+        frontend_ip_configs[ip_config_data["id"]] = ip_config_data
+
+    return frontend_ip_configs
+
+
+def _get_routing_rules(request_routing_rules: Mapping) -> Sequence[Mapping]:
+    routing_rule_keys = ("httpListener", "backendAddressPool", "backendHttpSettings")
+    return [
+        {
+            "name": r["name"],
+            **filter_keys(r["properties"], routing_rule_keys),
+        }
+        for r in request_routing_rules
+    ]
+
+
+def _get_http_listeners(http_listeners: Mapping) -> Mapping[str, Mapping]:
+    listener_keys = (
+        "port",
+        "protocol",
+        "hostNames",
+        "frontendIPConfiguration",
+        "frontendPort",
+    )
+    return {
+        l["id"]: {
+            "id": l["id"],
+            "name": l["name"],
+            **filter_keys(l["properties"], listener_keys),
+        }
+        for l in http_listeners
+    }
+
+
+async def _collect_app_gateways_resources(
+    mgmt_client: BaseAsyncApiClient,
+    monitored_resources: Mapping[ResourceId, AzureResource],
+) -> Sequence[AzureResource]:
+    app_gateways = await mgmt_client.get_async(
+        "providers/Microsoft.Network/applicationGateways",
+        key="value",
+        params={"api-version": "2024-05-01"},
+    )
+
+    applications_gateways: list[AzureResource] = []
+    for app_gateway in app_gateways:
+        try:
+            resource = monitored_resources[app_gateway["id"].lower()]
+        except KeyError:
+            # this can happen because the resource has been filtered out
+            # (for example because it is not in the monitored group configured via --explicit-config)
+            LOGGER.info(
+                "Application gateway not found in monitored resources: %(gateway_id)s",
+                {"gateway_id": app_gateway["id"]},
+            )
+            continue
+
+        resource.info["properties"] = {}
+        resource.info["properties"]["operational_state"] = app_gateway["properties"][
+            "operationalState"
+        ]
+        resource.info["properties"]["routing_rules"] = _get_routing_rules(
+            app_gateway["properties"]["requestRoutingRules"]
+        )
+        resource.info["properties"]["http_listeners"] = _get_http_listeners(
+            app_gateway["properties"]["httpListeners"]
+        )
+
+        if (
+            waf_config := app_gateway["properties"].get("webApplicationFirewallConfiguration")
+        ) is not None:
+            resource.info["properties"]["waf_enabled"] = waf_config["enabled"]
+
+        frontend_ports = {
+            p["id"]: {"port": p["properties"]["port"]}
+            for p in app_gateway["properties"]["frontendPorts"]
+        }
+        resource.info["properties"]["frontend_ports"] = frontend_ports
+
+        backend_settings = {
+            c["id"]: {
+                "name": c["name"],
+                **filter_keys(c["properties"], ("port", "protocol")),
+            }
+            for c in app_gateway["properties"]["backendHttpSettingsCollection"]
+        }
+        resource.info["properties"]["backend_settings"] = backend_settings
+
+        backend_pools = {p["id"]: p for p in app_gateway["properties"]["backendAddressPools"]}
+        resource.info["properties"]["backend_address_pools"] = backend_pools
+
+        frontend_ip_configs = await get_frontend_ip_configs(mgmt_client, app_gateway)
+        resource.info["properties"]["frontend_api_configs"] = frontend_ip_configs
+
+        applications_gateways.append(resource)
+
+    return applications_gateways
+
+
+async def _collect_load_balancers_resources(
+    mgmt_client: BaseAsyncApiClient,
+    monitored_resources: Mapping[ResourceId, AzureResource],
+) -> Sequence[AzureResource]:
+    load_balancers_response = await mgmt_client.get_async(
+        "providers/Microsoft.Network/loadBalancers",
+        key="value",
+        params={"api-version": "2024-05-01"},
+    )
+
+    load_balancers_resources: list[AzureResource] = []
+    for load_balancer in load_balancers_response:
+        try:
+            resource = monitored_resources[load_balancer["id"].lower()]
+        except KeyError:
+            # this can happen because the resource has been filtered out
+            # (for example because it is not in the monitored group configured via --explicit-config)
+            LOGGER.info(
+                "Load balancer not found in monitored resources: %(balancer_id)s",
+                {"balancer_id": load_balancer["id"]},
+            )
+            continue
+
+        try:
+            frontend_ip_configs, inbound_nat_rules, backend_pools = await asyncio.gather(
+                get_frontend_ip_configs(mgmt_client, load_balancer),
+                get_inbound_nat_rules(mgmt_client, load_balancer),
+                get_backend_address_pools(mgmt_client, load_balancer),
+            )
+        except Exception:
+            raise ApiErrorMissingData(
+                f"Failed to collect data for load balancer: {load_balancer['id']}"
+            )
+
+        resource.info["properties"] = {}
+        resource.info["properties"]["frontend_ip_configs"] = frontend_ip_configs
+        resource.info["properties"]["inbound_nat_rules"] = inbound_nat_rules
+        resource.info["properties"]["backend_pools"] = {p["id"]: p for p in backend_pools}
+
+        outbound_rule_keys = ("protocol", "idleTimeoutInMinutes", "backendAddressPool")
+        outbound_rules = [
+            {"name": r["name"], **filter_keys(r["properties"], outbound_rule_keys)}
+            for r in load_balancer["properties"].get("outboundRules", [])
+        ]
+        resource.info["properties"]["outbound_rules"] = outbound_rules
+
+        load_balancers_resources.append(resource)
+
+    return load_balancers_resources
+
+
+async def _collect_firewalls_resources(
+    mgmt_client: BaseAsyncApiClient,
+    monitored_resources: Mapping[ResourceId, AzureResource],
+) -> Sequence[AzureResource]:
+    firewalls_response = await mgmt_client.get_async(
+        "providers/Microsoft.Network/azureFirewalls",
+        key="value",
+        params={"api-version": "2025-01-01"},
+    )
+
+    firewalls_resources: list[AzureResource] = []
+    for firewall in firewalls_response:
+        try:
+            resource = monitored_resources[firewall["id"].lower()]
+        except KeyError:
+            # this can happen because the resource has been filtered out
+            # (for example because it is not in the monitored group configured via --explicit-config)
+            LOGGER.info(
+                "Azure Firewall not found in monitored resources: %(firewall_id)s",
+                {"firewall_id": firewall["id"]},
+            )
+            continue
+
+        firewalls_resources.append(resource)
+
+    return firewalls_resources
+
+
+async def _get_standard_network_interface_config(
+    mgmt_client: BaseAsyncApiClient, nic_id: str
+) -> Mapping[str, Mapping]:
+    _, group, nic_name, ip_conf_name = get_params_from_azure_id(
+        nic_id, resource_types=["networkInterfaces", "ipConfigurations"]
+    )
+    return await mgmt_client.get_async(
+        f"resourceGroups/{group}/providers/Microsoft.Network/networkInterfaces/{nic_name}/ipConfigurations/{ip_conf_name}",
+        params={"api-version": "2022-01-01"},
+    )
+
+
+async def _get_vmss_network_interface_config(
+    mgmt_client: BaseAsyncApiClient, nic_id: str
+) -> Mapping[str, Mapping]:
+    async def _nic_vmss_ip_conf_view(group, vmss, virtual_machine_index, nic_name, ip_conf_name):
+        return await mgmt_client.get_async(
+            f"resourceGroups/{group}/providers/microsoft.Compute/virtualMachineScaleSets/"
+            f"{vmss}/virtualMachines/{virtual_machine_index}/networkInterfaces/{nic_name}/ipConfigurations/{ip_conf_name}",
+            params={"api-version": "2024-07-01"},
+        )
+
+    _, group, vmss, vm_index, nic_name, ip_conf_name = get_params_from_azure_id(
+        nic_id,
+        resource_types=[
+            "virtualMachineScaleSets",
+            "virtualMachines",
+            "networkInterfaces",
+            "ipConfigurations",
+        ],
+    )
+    return await _nic_vmss_ip_conf_view(group, vmss, vm_index, nic_name, ip_conf_name)
+
+
+async def get_network_interface_config(
+    mgmt_client: BaseAsyncApiClient, nic_id: str
+) -> Mapping[str, Mapping]:
+    if "virtualMachineScaleSets" in nic_id:
+        return await _get_vmss_network_interface_config(mgmt_client, nic_id)
+
+    return await _get_standard_network_interface_config(mgmt_client, nic_id)
+
+
+async def get_inbound_nat_rules(
+    mgmt_client: BaseAsyncApiClient, load_balancer: Mapping
+) -> list[dict[str, object]]:
+    nat_rule_keys = ("frontendPort", "backendPort", "frontendIPConfiguration")
+
+    inbound_nat_rules: list[dict[str, object]] = []
+    for inbound_nat_rule in load_balancer["properties"]["inboundNatRules"]:
+        nat_rule_data = {
+            "name": inbound_nat_rule["name"],
+            **filter_keys(inbound_nat_rule["properties"], nat_rule_keys),
+        }
+
+        if "backendIPConfiguration" in inbound_nat_rule.get("properties"):
+            ip_config_id = inbound_nat_rule["properties"]["backendIPConfiguration"]["id"]
+
+            if (
+                backend_address_data := await get_backend_address_data(mgmt_client, ip_config_id)
+            ) is not None:
+                nat_rule_data["backend_ip_config"] = backend_address_data
+
+        inbound_nat_rules.append(nat_rule_data)
+
+    return inbound_nat_rules
+
+
+async def get_backend_address_data(
+    mgmt_client: BaseAsyncApiClient, ip_config_id: str
+) -> Mapping[str, object] | None:
+    backend_address_keys = ("privateIPAddress", "privateIPAllocationMethod", "primary")
+    nic_config = await get_network_interface_config(mgmt_client, ip_config_id)
+
+    if "name" in nic_config and "properties" in nic_config:
+        return {
+            "name": nic_config["name"],
+            **filter_keys(nic_config["properties"], backend_address_keys),
+        }
+    return None
+
+
+async def get_backend_address_pools(
+    mgmt_client: BaseAsyncApiClient, load_balancer: Mapping
+) -> list[dict[str, object]]:
+    backend_pools: list[dict[str, object]] = []
+
+    for backend_pool in load_balancer["properties"]["backendAddressPools"]:
+        backend_addresses = []
+        for backend_address in backend_pool["properties"].get("loadBalancerBackendAddresses", []):
+            if "networkInterfaceIPConfiguration" in backend_address.get("properties"):
+                ip_config_id = backend_address["properties"]["networkInterfaceIPConfiguration"][
+                    "id"
+                ]
+
+                if (
+                    backend_address_data := await get_backend_address_data(
+                        mgmt_client, ip_config_id
+                    )
+                ) is None:
+                    continue
+                backend_addresses.append(backend_address_data)
+
+        backend_pools.append(
+            {
+                "id": backend_pool["id"],
+                "name": backend_pool["name"],
+                "addresses": backend_addresses,
+            }
+        )
+
+    return backend_pools
+
+
+async def get_remote_peerings(
+    mgmt_client: BaseAsyncApiClient, resource: dict
+) -> Sequence[Mapping[str, object]]:
+    # retrieve the current subscription ID from the virtual network gateway ID
+    vnet_gateway_subscription, *_ = get_params_from_azure_id(resource["id"])
+
+    peering_keys = ("name", "peeringState", "peeringSyncLevel")
+    vnet_peerings = []
+    for vnet_peering in resource["properties"].get("remoteVirtualNetworkPeerings", []):
+        vnet_peering_id = vnet_peering["id"]
+        peering_subscription, group, providers, vnet_id, vnet_peering_id = get_params_from_azure_id(
+            vnet_peering_id,
+            resource_types=[
+                "providers",
+                "virtualNetworks",
+                "virtualNetworkPeerings",
+            ],
+        )
+        # skip vNet peerings that belong to another Azure subscription
+        if peering_subscription != vnet_gateway_subscription:
+            continue
+
+        peering_view = await mgmt_client.get_async(
+            f"resourceGroups/{group}/providers/{providers}/virtualNetworks/{vnet_id}/virtualNetworkPeerings/{vnet_peering_id}",
+            params={
+                "api-version": "2024-10-01",
+            },
+        )
+
+        vnet_peering = {
+            **filter_keys(peering_view, peering_keys),
+            **filter_keys(peering_view["properties"], peering_keys),
+        }
+        vnet_peerings.append(vnet_peering)
+
+    return vnet_peerings
+
+
+async def get_vnet_gw_health(
+    mgmt_client: BaseAsyncApiClient, resource: Mapping
+) -> Mapping[str, object]:
+    health_keys = ("availabilityState", "summary", "reasonType", "occuredTime")
+
+    _, group, providers, vnet_gw = get_params_from_azure_id(
+        resource["id"], resource_types=["providers", "virtualNetworkGateways"]
+    )
+
+    health_view = await mgmt_client.get_async(
+        f"resourceGroups/{group}/providers/{providers}/virtualNetworkGateways/{vnet_gw}/providers/Microsoft.ResourceHealth/availabilityStatuses/current",
+        params={
+            "api-version": "2025-04-01",
+        },
+    )
+
+    return filter_keys(health_view["properties"], health_keys)
+
+
+async def process_virtual_net_gw(
+    api_client: BaseAsyncApiClient, resource: AzureResource
+) -> AzureResource:
+    gw_keys = (
+        "bgpSettings",
+        "disableIPSecReplayProtection",
+        "gatewayType",
+        "vpnType",
+        "activeActive",
+        "enableBgp",
+    )
+
+    gw_view = await api_client.get_async(
+        f"resourceGroups/{resource.info['group']}/providers/Microsoft.Network/virtualNetworkGateways/{resource.info['name']}",
+        params={
+            "api-version": "2024-05-01",
+        },
+    )
+
+    resource.info["specific_info"] = filter_keys(gw_view["properties"], gw_keys)
+
+    vnet_peerings, vnet_health = await asyncio.gather(
+        get_remote_peerings(api_client, gw_view),
+        get_vnet_gw_health(api_client, gw_view),
+    )
+    resource.info["properties"] = {
+        "remote_vnet_peerings": vnet_peerings,
+        "health": vnet_health,
+    }
+
+    return resource
+
+
+def _collect_async_metrics_tasks(
+    metrics_definitions: Sequence[AzureMetric],
+    subscription: AzureSubscription,
+    location: str,
+    resource_ids: Sequence[str],
+    resource_type: str,
+    api_client: BaseAsyncApiClient,
+    args: argparse.Namespace,
+    err: IssueCollector,
+) -> set[Coroutine]:
+    grouped_metrics: defaultdict[
+        tuple[Intervals, Aggregations, tuple[DimensionFilter, ...] | None], list[AzureMetric]
+    ] = defaultdict(list)
+    for metric_definition in metrics_definitions:
+        # LOGGER.error("Processing metric definition: %s", metric_definition)
+        grouped_metrics[
+            (
+                metric_definition.interval,
+                metric_definition.aggregation,
+                metric_definition.dimension_filters,
+            )
+        ].append(metric_definition)
+
+    tasks = set()
+    for (interval, aggregation, dimension_filters), definitions in grouped_metrics.items():
+        # chunk of 4 because the list of metrics will be _part_ of the cache-file-name
+        # we don't want something too long here
+        for definitions_chunk in _chunks(definitions, 4):
+            cache = MetricCache(
+                group_metrics_definition=CacheMetricsGroupDefinition(
+                    interval=interval,
+                    aggregation=aggregation,
+                    dimension_filters=dimension_filters,
+                    metrics=definitions_chunk,
+                    resource_type=resource_type,
+                    region=location,
+                ),
+                subscription=subscription.id,
+                cache_id=args.cache_id,
+                ref_time=NOW,
+                debug=args.debug,
+            )
+
+            tasks.add(
+                cache.get_data(
+                    api_client,
+                    location,
+                    resource_ids,
+                    resource_type,
+                    err,
+                    use_cache=cache.cache_interval > 60,
+                )
+            )
+
+    return tasks
+
+
+async def process_cosmosdb(
+    api_client: BaseAsyncApiClient,
+    resource: AzureResource,
+    subscription: AzureSubscription,
+    args: argparse.Namespace,
+) -> list[AzureResource]:
+    resource.labels["cosmosdb_account"] = resource.name
+    resources = [resource]  # always include the main cosmosdb account resource
+
+    # to collect cosmos databases (will become piggybacked hosts)
+    # we query a cosmos db account metrics with a dimension filter 'DatabaseName = *'
+    # so that we obtain *every* database inside the account (together with their metrics)
+
+    tasks = _collect_async_metrics_tasks(
+        COSMOS_DATABASE_METRICS,
+        subscription,
+        resource.info["location"],
+        [resource.info["id"]],
+        resource.info["type"],
+        api_client,
+        args,
+        err := IssueCollector(),
+    )
+
+    cosmosdb_databases: dict[str, AzureResource] = {}  # db_name : resource
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            if args.debug:
+                raise result
+            err.add("exception", "cosmosdb metric collection", str(result))
+            # TODO: Is this code really executed *within* an exception handler? It doesn't look like
+            # that...
+            LOGGER.exception(result)  # noqa: LOG004
+            continue
+
+        # resource id is always the cosmos account
+        # metrics contain the database name (and other information) in the metadata mapping
+        for resource_id, metrics in result.items():
+            for metric in metrics:
+                if not (metadata := metric.get("metadata_mapping")):
+                    # this should never happen because of the dimension filter we use '<SomeDimension> = *'
+                    LOGGER.error("Skipping metric without metadata: %(metric)s", {"metric": metric})
+                    continue
+
+                if any(value == "<empty>" for value in metadata.values()):
+                    # we can safely ignore metrics with dimensions set to <empty>,
+                    # these are "grouped" metrics, and, as of now, we are not interested in
+                    # these aggregations and we also keep the agent output cleaner
+                    continue
+
+                if not (database_name := metadata.get("databasename")):
+                    # this should never happen because of the dimension filter,
+                    # right now we should always have the database name in the metadata
+                    LOGGER.error(
+                        "Skipping metric without database name in metadata: %(metric)s",
+                        {"metric": metric},
+                    )
+                    continue
+
+                if (db_resource := cosmosdb_databases.get(database_name)) is not None:
+                    LOGGER.info(
+                        "\n\n\nFound metric for existing database: %(database_name)s, metric: %(metric)s",
+                        {"database_name": database_name, "metric": metric},
+                    )
+                    # db already present, just append the metric
+                    db_resource.metrics.append(metric)
+                    continue
+
+                # create a new resource for the database
+                db_resource_info = {
+                    "id": database_name,  # id = name of the database
+                    # name: <cosmosdb account name>_<database name>
+                    "name": f"{resource.name}_{database_name}",
+                    # fake type to fake the section (last part after /),
+                    # this will also be the label "entity"
+                    "type": "Microsoft.DocumentDB/databaseAccounts/cosmos_database",
+                    # data from cosmos account:
+                    "location": resource.info.get("location"),
+                    "group": resource.info.get("group"),
+                }
+
+                db_resource = AzureResource(
+                    db_resource_info,
+                    TagsImportPatternOption.import_all,
+                    resource.subscription,
+                    args.unique_hostnames_config,
+                )
+                db_resource.metrics.append(metric)
+                db_resource.labels["cosmosdb_account"] = resource.name
+
+                cosmosdb_databases[database_name] = db_resource
+                resources.append(db_resource)
+
+    if err:
+        LOGGER.error(
+            "Errors occurred during cosmosdb metrics collection.\n %(errors)s",
+            {"errors": err.dumpinfo()},
+        )
+        agent_info_section = AzureSection("agent_info")
+        agent_info_section.add(err.dumpinfo())
+        agent_info_section.write()
+
+    return resources
+
+
+class AzureAsyncCache(DataCache):
+    # Semaphore introduced to not reach the maximum number of open files error.
+    # A sempahore should be enough, no need for locks here
+    # since the files are saved per subscription/region/resource type
+    # and the queries are also done per region and resource type
+    _open_cache_semaphore = asyncio.Semaphore(10)
+
+    @override
+    async def get_cached_data(self):
+        async with AzureAsyncCache._open_cache_semaphore:
+            return super().get_cached_data()
+
+    @override
+    async def _write_to_cache(self, data):
+        async with AzureAsyncCache._open_cache_semaphore:
+            super()._write_to_cache(data)
+
+    @override
+    def get_validity_from_args(self, *args: Any) -> bool:
+        return True
+
+    @override
+    async def get_data(self, *args, **kwargs):
+        use_cache = kwargs.pop("use_cache", True)
+        if use_cache and self.get_validity_from_args(*args) and self._cache_is_valid():
+            try:
+                LOGGER.debug("Reading data from cache: %(key)s", {"key": self._key})
+                if cached_data := await self.get_cached_data():
+                    # if not empty
+                    return cached_data
+                LOGGER.debug(
+                    "Cache file is empty, getting live data from cache: %(key)s", {"key": self._key}
+                )
+            except OSError, ValueError:
+                LOGGER.exception("Getting live data (failed to read from cache).")
+                if self.debug:
+                    raise
+
+        live_data = await self.get_live_data(*args)
+        try:
+            await self._write_to_cache(live_data)
+        except OSError, TypeError:
+            LOGGER.exception("Failed to write data to cache file")
+            if self.debug:
+                raise
+        return live_data
+
+
+class UsageDetailsCache(AzureAsyncCache):
+    # Microsoft.CostManagement API has a very strict (not well documented) rate limit
+    # this is an attempt to handle it
+    # with this lock we actually sequentialize the requests to the API "between subscriptions"
+    # the lock gives the time to recover from a reached-rate-limit, retry the query,
+    # and move to the next subscription
+    _cost_query_lock = asyncio.Lock()
+
+    def __init__(
+        self,
+        *,
+        subscription: str,
+        cache_id: str,
+        debug: bool = False,
+    ) -> None:
+        self._subscription = subscription
+        metric_names = "usage_details"
+        super().__init__(
+            host_name=cache_id,  # we have no host name.
+            agent=f"agent_{AGENT}",
+            key=f"{subscription[:6]}-{metric_names}",
+            debug=debug,
+        )
+
+    @property
+    @override
+    def cache_interval(self) -> int:
+        return 60 * 60 * 4
+
+    async def _get_live_data(self, *args: Any) -> Any:
+        mgmt_client: BaseAsyncApiClient = args[0]
+
+        yesterday = (NOW - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        body = {
+            "type": "ActualCost",
+            "dataSet": {
+                "granularity": "None",
+                "aggregation": {
+                    "totalCost": {"name": "Cost", "function": "Sum"},
+                    "totalCostUSD": {"name": "CostUSD", "function": "Sum"},
+                },
+                "grouping": [
+                    {"type": "Dimension", "name": "ResourceType"},
+                    {"type": "Dimension", "name": "ResourceGroupName"},
+                ],
+                "include": ["Tags"],
+            },
+            "timeframe": "Custom",
+            "timePeriod": {
+                "from": f"{yesterday}T00:00:00+00:00",
+                "to": f"{yesterday}T23:59:59+00:00",
+            },
+        }
+
+        LOGGER.debug(
+            "Getting live data for usage details. - sub: %(subscription)s",
+            {"subscription": self._subscription},
+        )
+        json_data = await mgmt_client.request_async(
+            "POST",
+            "/providers/Microsoft.CostManagement/query",
+            body=body,
+            params={"api-version": "2025-03-01"},
+            custom_headers={"ClientType": "monitoring-client-type"},
+            raise_for_rate_limit=True,
+        )
+
+        # since data is nested in "properties" and "columns" we need to
+        # paginate here in a specific way
+
+        data = mgmt_client.lookup_json_data(json_data, "properties")
+        columns = mgmt_client.lookup_json_data(data, "columns")
+        rows = mgmt_client.lookup_json_data(data, "rows")
+
+        while next_link := data.get("nextLink"):
+            new_json_data = await mgmt_client.request_async(
+                "POST", full_uri=next_link, body=body, raise_for_rate_limit=True
+            )
+            data = mgmt_client.lookup_json_data(new_json_data, "properties")
+            rows += mgmt_client.lookup_json_data(data, "rows")
+
+        common_metadata = {k: v for k, v in json_data.items() if k != "properties"}
+        return _process_query_id(columns, rows, common_metadata)
+
+    @override
+    async def get_live_data(self, *args: Any) -> Any:
+        async with UsageDetailsCache._cost_query_lock:
+            while True:
+                try:
+                    return await self._get_live_data(*args)
+                except RateLimitException as exc:
+                    retry_after_str = exc.context.get(
+                        "x-ms-ratelimit-microsoft.costmanagement-entity-retry-after", None
+                    )
+                    remaining_tenant_requests_str = exc.context.get(
+                        "x-ms-ratelimit-remaining-microsoft.costmanagement-tenant-requests", None
+                    )
+                    if retry_after_str is None or remaining_tenant_requests_str is None:
+                        raise ApiError(
+                            "Rate limit information not available in the response headers."
+                        ) from exc
+
+                    retry_after = int(retry_after_str)
+                    if isinstance(remaining_tenant_requests_str, str):  # make mypy happy
+                        remaining_tenant_requests = int(
+                            remaining_tenant_requests_str.removeprefix("DefaultQuota:")
+                        )
+
+                    if remaining_tenant_requests <= 0 or retry_after > 10:  # type: ignore[possibly-undefined]
+                        LOGGER.warning(
+                            "Rate limit exceeded for Microsoft.CostManagement API. "
+                            "Received a 'retry after' of %(retry_after)d seconds. "
+                            "Remaining requests: %(remaining_requests)s - Sub: %(subscription)s",
+                            {
+                                "retry_after": retry_after,
+                                "remaining_requests": remaining_tenant_requests,
+                                "subscription": self._subscription,
+                            },
+                        )
+                        raise ApiError("Rate limit exceeded for Microsoft.CostManagement API.")
+                    LOGGER.warning(
+                        "Rate limit exceeded for Microsoft.CostManagement API. "
+                        "Received a 'retry after' of %(retry_after)d seconds. "
+                        "Remaining requests: %(remaining_requests)s - Sub: %(subscription)s",
+                        {
+                            "retry_after": retry_after,
+                            "remaining_requests": remaining_tenant_requests,
+                            "subscription": self._subscription,
+                        },
+                    )
+                    await asyncio.sleep(retry_after + 1)
+
+
+@dataclass(frozen=True, kw_only=True)
+class CacheMetricsGroupDefinition:
+    interval: Intervals
+    aggregation: Aggregations
+    dimension_filters: tuple[DimensionFilter, ...] | None
+    metrics: Sequence[AzureMetric]
+    resource_type: str
+    region: str
+
+
+class MetricCache(AzureAsyncCache):
+    @override
+    def get_validity_from_args(self, *args: Any) -> bool:
+        return True
+
+    def __init__(
+        self,
+        *,
+        group_metrics_definition: CacheMetricsGroupDefinition,
+        subscription: str,
+        cache_id: str,
+        ref_time: datetime.datetime,
+        debug: bool = False,
+    ) -> None:
+        self.group_metrics_definitions = group_metrics_definition
+        self.metrics_definitions = {
+            metric.name: metric for metric in group_metrics_definition.metrics
+        }
+
+        key_prefix = self.get_cache_key_prefix(
+            self.group_metrics_definitions.resource_type,
+            self.group_metrics_definitions.region,
+            subscription,
+        )
+
+        # 'replace' to not create random directories, use metric aliases
+        key_suffix = ".".join(
+            [
+                metric.cmk_metric_alias.replace("/", "")
+                for metric in self.metrics_definitions.values()
+            ]
+        )
+        super().__init__(
+            host_name=cache_id,  # we have no host name
+            agent=f"agent_{AGENT}",
+            key=f"{key_prefix}_{key_suffix}",
+            debug=debug,
+        )
+        self.timedelta = {
+            "PT1M": datetime.timedelta(minutes=1),
+            "PT5M": datetime.timedelta(minutes=5),
+            "PT1H": datetime.timedelta(hours=1),
+        }[group_metrics_definition.interval]
+        # For 1-min metrics, the start time should be at least 4 minutes before because of the
+        # ingestion time of Azure metrics (we had to change from 3 minutes to 5 minutes because we
+        # were missing some metrics with 3 minutes).
+        # For some 1-hour metrics, the ingestion time can be up to 6 hours (i.e. the SuccessServerLatency),
+        # that's the reason why we use 'ref_time - 6' here.
+        # More info on Azure Monitor Ingestion time:
+        # https://docs.microsoft.com/en-us/azure/azure-monitor/logs/data-ingestion-time
+        self.start_time = (ref_time - 6 * self.timedelta).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.end_time = ref_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @staticmethod
+    def get_cache_key_prefix(resource_type: str, region: str, subscription: str) -> str:
+        valid_chars = f"-_.() {string.ascii_letters}{string.digits}"
+        subdir = "".join(c if c in valid_chars else "_" for c in f"{region}_{resource_type}")
+        # only use first 5 chars for subscription to avoid too long paths, and simplify
+        return f"{subscription[:6]}_{subdir}"
+
+    @property
+    @override
+    def cache_interval(self) -> int:
+        return self.timedelta.seconds
+
+    @staticmethod
+    def _get_available_metrics_from_exception(
+        desired_names: str, api_error: ApiError, resource_type: str
+    ) -> str | None:
+        match = re.match(
+            r"Failed to find metric configuration for provider.*Valid metrics: ([\w,]*)",
+            api_error.args[0],
+        )
+        if not match:
+            raise api_error
+
+        available_names = match.groups()[0]
+        retry_names = set(desired_names.split(",")) & set(available_names.split(","))
+        if not retry_names:
+            LOGGER.debug(
+                "None of the expected metrics are available for %(resource_type)s",
+                {"resource_type": resource_type},
+            )
+            return None
+
+        return ",".join(sorted(retry_names))
+
+    async def _get_metrics(self, api_client, region, resource_ids, params):
+        regional_url = api_client.build_regional_url(region, "/metrics:getBatch")
+
+        async def _query_metrics(specific_params):
+            return await api_client.request_async(
+                "POST",
+                full_uri=regional_url,
+                body={"resourceids": resource_ids},
+                params=specific_params,
+                key="values",
+            )
+
+        params["api-version"] = "2023-10-01"
+        try:
+            return await _query_metrics(params)
+        except ApiError as exc:
+            if retry_names := self._get_available_metrics_from_exception(
+                params["metricnames"], exc, params["metricnamespace"]
+            ):
+                params["metricnames"] = retry_names
+                return await _query_metrics(params)
+            return []
+
+    @override
+    async def get_live_data(self, *args: Any) -> Any:
+        mgmt_client: BaseAsyncApiClient = args[0]
+        region: str = args[1]
+        resource_ids: Sequence[str] = args[2]
+        resource_type: str = args[3]
+        err: IssueCollector = args[4]
+
+        params = {
+            "starttime": self.start_time,
+            "endtime": self.end_time,
+            "interval": self.group_metrics_definitions.interval,
+            # NB: Azure API won't have requests with more than 20 metric names at once
+            "metricnames": ",".join(self.metrics_definitions),
+            "metricnamespace": resource_type,
+            "aggregation": self.group_metrics_definitions.aggregation,
+        }
+
+        if self.group_metrics_definitions.dimension_filters:
+            # build the filter for the azure getBatch api
+            filter = " and ".join(  # noqa: A001
+                f"{df.name} eq '{df.value}'"
+                for df in self.group_metrics_definitions.dimension_filters
+            )
+            params["filter"] = filter
+
+        raw_metrics = []
+        for chunk in _chunks(resource_ids):
+            raw_metrics += await self._get_metrics(mgmt_client, region, chunk, params)
+
+        metrics: defaultdict[str, list] = defaultdict(list)
+
+        for resource_metrics in raw_metrics:
+            resource_id = resource_metrics["resourceid"]
+
+            for raw_metric in resource_metrics["value"]:
+                if not (
+                    metric_definition := self.metrics_definitions.get(raw_metric["name"]["value"])
+                ):
+                    LOGGER.error(
+                        "Skipping unexpected metric %(metric_name)s for resource %(resource_id)s",
+                        {
+                            "metric_name": raw_metric["name"]["value"],
+                            "resource_id": resource_id,
+                        },
+                    )
+                    continue
+
+                parsed_metric = create_metric_dict(
+                    raw_metric,
+                    self.group_metrics_definitions.aggregation,
+                    self.group_metrics_definitions.interval,
+                    metric_definition,
+                )
+                if parsed_metric:
+                    metrics[resource_id].extend(parsed_metric)
+                else:
+                    metric_name = raw_metric["name"]["value"]
+                    if metric_name in OPTIONAL_METRICS.get(resource_type, []):
+                        continue
+
+                    msg = f"metric not found: {metric_name} ({self.group_metrics_definitions.aggregation}), ({self.group_metrics_definitions.dimension_filters})"
+                    err.add("info", resource_id, msg)
+                    LOGGER.info(msg)
+
+        return metrics
+
+
+async def process_users(graph_api_client: BaseAsyncApiClient) -> AzureSection:
+    users_count = await graph_api_client.request_async(
+        "GET",
+        uri_end="users",
+        params={"$top": 1, "$count": "true"},
+        key="@odata.count",
+        custom_headers={"ConsistencyLevel": "eventual"},
+    )
+    section = AzureSection("ad")
+    section.add(["users_count", users_count])
+
+    return section
+
+
+async def process_organization(graph_api_client: BaseAsyncApiClient) -> AzureSection:
+    orgs = await graph_api_client.get_async("organization", key="value")
+    section = AzureSection("ad")
+    section.add(["ad_connect", json.dumps(orgs, sort_keys=True)])
+
+    return section
+
+
+async def process_app_registrations(graph_api_client: BaseAsyncApiClient) -> AzureSection:
+    apps = await graph_api_client.get_async(
+        "applications", key="value", next_page_key="@odata.nextLink"
+    )
+
+    key_subset = {"id", "appId", "displayName", "passwordCredentials", "keyCredentials"}
+    apps = [
+        {k: app[k] for k in key_subset}
+        for app in apps
+        if app["passwordCredentials"] or app["keyCredentials"]
+    ]
+
+    section = AzureSection("app_registration", separator=0)
+    for app_reg in apps:
+        section.add([json.dumps(app_reg, sort_keys=True)])
+
+    return section
+
+
+async def process_metrics(
+    mgmt_client: BaseAsyncApiClient,
+    subscription: AzureSubscription,
+    monitored_resources: Mapping[ResourceId, AzureResource],
+    args: argparse.Namespace,
+) -> None:
+    errors = await _gather_metrics(mgmt_client, subscription, monitored_resources, args)
+
+    if not errors:
+        return
+
+    agent_info_section = AzureSection("agent_info")
+    agent_info_section.add(errors.dumpinfo())
+    agent_info_section.write()
+
+
+# TODO: to test
+async def _gather_metrics(
+    mgmt_client: BaseAsyncApiClient,
+    subscription: AzureSubscription,
+    monitored_resources: Mapping[str, AzureResource],
+    args: argparse.Namespace,
+) -> IssueCollector:
+    """
+    Gather metrics for all monitored resources.
+
+    Metrics are collected per resource type, location, metric aggregation and time resolution.
+    One query collects metrics of all resources of a given type/location.
+    """
+    err = IssueCollector()
+
+    grouped_resource_ids = defaultdict(list)
+    for resource_id, resource in monitored_resources.items():
+        grouped_resource_ids[(resource.info["type"], resource.info["location"])].append(resource_id)
+
+    tasks = set()
+    for (resource_type, resource_location), resource_ids in grouped_resource_ids.items():
+        metric_definitions = ALL_METRICS.get(resource_type, [])
+
+        new_tasks = _collect_async_metrics_tasks(
+            metric_definitions,
+            subscription,
+            resource_location,
+            resource_ids,
+            resource_type,
+            mgmt_client,
+            args,
+            err,
+        )
+        tasks.update(new_tasks)
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            if args.debug:
+                raise result
+            err.add("exception", "metric collection", str(result))
+            # TODO: Is this code really executed *within* an exception handler? It doesn't look like
+            # that...
+            LOGGER.exception(result)  # noqa: LOG004
+            continue
+
+        for resource_id, metrics in result.items():
+            if (resource_metric := monitored_resources.get(resource_id)) is not None:
+                resource_metric.metrics += metrics
+            else:
+                LOGGER.info(
+                    "Resource %(resource_id)s found in metrics cache no longer monitored",
+                    {"resource_id": resource_id},
+                )
+
+    return err
+
+
+def get_resource_host_labels_section(
+    resource: AzureResource,
+    monitored_groups: Mapping[str, AzureResourceGroup],
+) -> AzureLabelsSection:
+    subscription = resource.subscription
+    labels = {
+        "name": resource.name,
+        "resource_group": resource.group,
+        "resource": resource.section,
+        "entity": "resource",
+        "subscription_name": subscription.name,
+        "subscription": subscription.id,
+        **resource.labels,
+    }
+    resource_tags = dict(resource.tags)
+
+    # merge resource tags with group tags, resource tags have precedence
+    if group := monitored_groups.get(resource.group):
+        for tag_name, tag_value in group.tags.items():
+            if tag_name not in resource.tags:
+                resource_tags[tag_name] = tag_value
+
+    if (tenant_name := resource.subscription.tenant_name) is not None:
+        labels["tenant_name"] = tenant_name
+
+    return AzureLabelsSection(resource.piggytarget, labels=labels, tags=resource_tags)
+
+
+def write_resource_groups_sections(resource_groups: Mapping[str, AzureResourceGroup]) -> None:
+    # for inventory purposes
+    for group_name, resource in resource_groups.items():
+        section = AzureResourceSection(resource)
+        section.add(resource.dumpinfo())
+        section.write()
+
+
+async def get_resource_groups(
+    mgmt_client: BaseAsyncApiClient,
+    monitored_groups: Sequence[str],
+    subscription: AzureSubscription,
+    args: argparse.Namespace,
+) -> Mapping[str, AzureResourceGroup]:
+    resource_groups = await mgmt_client.get_async(
+        "resourcegroups", key="value", params={"api-version": "2019-05-01"}
+    )
+
+    groups = {}
+    for group in resource_groups:
+        if (name := group["name"]) and name.lower() in monitored_groups:
+            groups[name.lower()] = AzureResourceGroup(
+                group,
+                args.tag_key_pattern,
+                subscription,
+                args.unique_hostnames_config,
+            )
+
+    return groups
+
+
+def write_group_info(
+    monitored_groups: Mapping[str, AzureResourceGroup],
+    monitored_resources: Sequence[AzureResource],  # noqa: ARG001
+    subscription: AzureSubscription,
+) -> None:
+    labels = {
+        "subscription_name": subscription.name,
+        "subscription": subscription.id,
+        "entity": "resource_group",
+    }
+
+    if subscription.tenant_name is not None:
+        labels["tenant_name"] = subscription.tenant_name
+
+    for group_name, group in monitored_groups.items():
+        labels["resource_group"] = group_name
+
+        if (region := group.info.get("location")) is not None:
+            labels["region"] = region
+        else:
+            # Since we're mutating per loop, if this doesn't exist in an iteration,
+            # we need to remember to nix it, otherwise we might wrongly show the region
+            # of the previous group.
+            labels.pop("region", None)
+
+        AzureLabelsSection(
+            group.piggytarget,
+            labels=labels,
+            tags=group.tags,
+        ).write()
+
+
+def write_subscription_labels(subscription: AzureSubscription) -> None:
+    labels = {
+        "subscription_name": subscription.name,
+        "subscription": subscription.id,
+        "entity": "subscription",
+    }
+
+    if subscription.tenant_name:
+        labels["tenant_name"] = subscription.tenant_name
+
+    AzureLabelsSection(
+        subscription.piggytarget,
+        labels=labels,
+        tags=subscription.tags,
+    ).write()
+
+
+def write_subscription_info_section(
+    subscription: AzureSubscription,
+    rate_limit: int | None,
+    monitored_groups: Mapping[str, AzureResourceGroup],
+    resources: Sequence[AzureResource],
+) -> None:
+    section = AzureSection("subscription_info", [subscription.piggytarget])
+    section.add(("monitored-groups", json.dumps([*monitored_groups])))
+    section.add(("remaining-reads", json.dumps(rate_limit)))
+    section.add(("monitored-resources", json.dumps([r.info["name"] for r in resources])))
+    section.write()
+
+
+def write_subscription_section(subscription: AzureSubscription) -> None:
+    section = AzureResourceSection(subscription)
+    section.add(subscription.dumpinfo())
+    section.write()
+
+
+def write_to_agent_info_section(message: str, component: str, status: int) -> None:
+    value = json.dumps((status, f"{component}: {message}"))
+    section = AzureSection("agent_info")
+    section.add(("agent-bailout", value))
+    section.write()
+
+
+def write_exception_to_agent_info_section(exception: BaseException, component: str) -> None:
+    LOGGER.warning(
+        "Writing exception for component %(component)s:\n %(exception)s",
+        {"component": component, "exception": exception},
+    )
+
+    # those exceptions are quite noisy. try to make them more concise:
+    msg = str(exception).split("Trace ID", 1)[0]
+    msg = msg.split(":", 2)[-1].strip(" ,")
+
+    if "does not have authorization to perform action" in msg:
+        msg += "HINT: Make sure you have a proper role asigned to your client!"
+
+    write_to_agent_info_section(msg, component, 2)
+
+
+async def main_graph_client(args: argparse.Namespace, monitored_services: set[str]) -> None:
+    tasks_map = {
+        "users_count": process_users,
+        "ad_connect": process_organization,
+        "app_registrations": process_app_registrations,
+    }
+    if not any(service in monitored_services for service in tasks_map):
+        return
+
+    def _handle_graph_client_exception(exc: Exception, debug: bool) -> None:
+        if isinstance(exc, ApiLoginFailed | ApiErrorAuthorizationRequestDenied):
+            # We are not raising the exception in debug mode.
+            # Having no permissions for the graph API is a legit configuration
+            write_exception_to_agent_info_section(exc, "Graph client (async)")
+        elif debug:
+            raise exc
+        else:
+            write_exception_to_agent_info_section(exc, "Graph client (async)")
+
+    try:
+        async with BaseAsyncApiClient(
+            get_graph_authority_urls(args.authority),
+            to_requests_proxies(args.proxy),
+            tenant=args.tenant,
+            client=args.client,
+            # revealing later would be better, but I'm keeping this simple for now
+            secret=resolve_secret_option(args, SECRET_OPTION).reveal(),
+        ) as graph_client:
+            tasks = {
+                task_call(graph_client)
+                for service, task_call in tasks_map.items()
+                if service in monitored_services
+            }
+
+            for coroutine in asyncio.as_completed(tasks):
+                try:
+                    section = await coroutine
+                    section.write()
+                except Exception as exc:
+                    _handle_graph_client_exception(exc, args.debug)
+
+    except Exception as exc:
+        _handle_graph_client_exception(exc, args.debug)
+
+
+def _process_query_id(columns, rows, common_metadata):
+    processed_query = []
+    column_names = [c["name"] for c in columns]
+    for index, row in enumerate(rows):
+        processed_row = common_metadata.copy()
+        # each entry should have a different name because the agent expects this value to be
+        # different for each resource but in case of a query the "name" is the id of the
+        # query so we replace it with a different name for each query result
+        processed_row["name"] = f"{processed_row['name']}-{index}"
+        processed_row["properties"] = dict(zip(column_names, row))
+        processed_query.append(processed_row)
+    return processed_query
+
+
+async def get_usage_data(
+    client: BaseAsyncApiClient, subscription: AzureSubscription, args: argparse.Namespace
+) -> Sequence[dict[str, Any]]:
+    NO_CONSUMPTION_API = (
+        "offer MS-AZR-0145P",
+        "offer MS-AZR-0146P",
+        "offer MS-AZR-159P",
+        "offer MS-AZR-0036P",
+        "offer MS-AZR-0143P",
+        "offer MS-AZR-0015P",
+        "offer MS-AZR-0144P",
+        "Customer does not have the privilege to see the cost",
+    )
+
+    LOGGER.debug("get usage details")
+
+    try:
+        usage_data = await UsageDetailsCache(
+            subscription=subscription.id,
+            cache_id=args.cache_id,
+            debug=args.debug,
+        ).get_data(client, use_cache=True)
+    except ApiError as exc:
+        if any(s in exc.args[0] for s in NO_CONSUMPTION_API):
+            raise NoConsumptionAPIError
+        raise
+
+    LOGGER.debug("yesterdays usage details: %(count)d", {"count": len(usage_data)})
+    return usage_data
+
+
+def write_usage_section(
+    usage_data: Sequence[dict[str, Any]],
+    monitored_groups: Mapping[str, AzureResourceGroup],
+    subscription: AzureSubscription,
+    tag_key_pattern: TagsOption,
+    unique_hostnames_config: UniqueHostnamesConfig,
+) -> None:
+    """
+    Usage (Cost) services go under the resource group AND the related subscription
+    """
+
+    if not usage_data:
+        AzureSection(
+            "usagedetails",
+            [*[el.piggytarget for el in monitored_groups.values()], subscription.piggytarget],
+        ).write(write_empty=True)
+
+    for usage in usage_data:
+        # this is a made-up resource to fit in our model
+        usage["type"] = "Microsoft.Consumption/usageDetails"
+        usage["group"] = usage["properties"]["ResourceGroupName"]
+
+        usage_resource = AzureResource(
+            usage, tag_key_pattern, subscription, unique_hostnames_config
+        )
+
+        # usage data end up in both the resource group host and the subscription host
+        piggytargets = [subscription.piggytarget]
+        if usage_group := monitored_groups.get(usage["group"].lower()):
+            piggytargets += [usage_group.piggytarget]
+
+        section = AzureSection(usage_resource.section, piggytargets)
+        section.add(usage_resource.dumpinfo())
+        section.write()
+
+
+# TODO: test
+async def process_usage_details(
+    mgmt_client: BaseAsyncApiClient,
+    subscription: AzureSubscription,
+    monitored_groups: Mapping[str, AzureResourceGroup],
+    args: argparse.Namespace,
+) -> None:
+    try:
+        usage_data = await get_usage_data(mgmt_client, subscription, args)
+        if not usage_data:
+            write_to_agent_info_section(
+                "Azure API did not return any usage details",
+                "Usage client",
+                0,
+            )
+            return
+
+        write_usage_section(
+            usage_data,
+            monitored_groups,
+            subscription,
+            args.tag_key_pattern,
+            args.unique_hostnames_config,
+        )
+
+    except NoConsumptionAPIError:
+        LOGGER.debug("Azure offer doesn't support querying the cost API")
+        return
+
+    except Exception as exc:
+        # here we do not raise the exception in debug mode because, like we do in other spots,
+        # because the Rate Api Error can be expected for this API in big setups,
+        # and we don't want to create crash reports for this
+        # if args.debug:
+        #     raise
+        write_exception_to_agent_info_section(exc, "Usage client")
+        write_usage_section(
+            [],
+            monitored_groups,
+            subscription,
+            args.tag_key_pattern,
+            args.unique_hostnames_config,
+        )
+
+
+async def process_resource_health(
+    mgmt_client: BaseAsyncApiClient,
+    monitored_resources: Mapping[ResourceId, AzureResource],
+    groups_with_monitored_resources: Mapping[str, AzureResourceGroup],
+    debug: bool,
+) -> Sequence[AzureSection]:
+    multi_response = await asyncio.gather(
+        *(
+            mgmt_client.get_async(
+                f"/resourceGroups/{resource_group}/providers/Microsoft.ResourceHealth/availabilityStatuses",
+                params={
+                    "api-version": "2025-05-01",
+                    "$top": "1000",  # retrieves up to 1000 (still not clear what) per request
+                },
+                key="value",
+            )
+            for resource_group in groups_with_monitored_resources
+        ),
+        return_exceptions=True,
+    )
+
+    health_values: list[ResourceHealth] = []
+    for response in multi_response:
+        if isinstance(response, BaseException):
+            if debug:
+                raise response
+            write_exception_to_agent_info_section(response, "Resource Health client")
+            continue
+        health_values.extend(response)
+
+    return _get_resource_health_sections(health_values, monitored_resources)
+
+
+# TODO: test
+async def _collect_virtual_machines_resources(
+    api_client: BaseAsyncApiClient,
+    monitored_resources: Mapping[ResourceId, AzureResource],
+) -> Sequence[AzureResource]:
+    response = await api_client.get_async(
+        "providers/Microsoft.Compute/virtualMachines",
+        params={
+            "api-version": "2024-11-01",
+            "statusOnly": "true",  # fetching only run time status
+        },
+        key="value",
+    )
+
+    virtual_machines: list[AzureResource] = []
+    for vm in response:
+        try:
+            resource = monitored_resources[vm["id"].lower()]
+        except KeyError:
+            # this can happen because the resource has been filtered out
+            # (for example because it is not in the monitored group configured via --explicit-config)
+            LOGGER.info(
+                "Virtual machine not found in monitored resources: %(vm_id)s", {"vm_id": vm["id"]}
+            )
+            continue
+
+        try:
+            statuses = vm.pop("properties")["instanceView"]["statuses"]
+        except KeyError:
+            raise ApiErrorMissingData("Virtual machine instance's statuses must be present")
+
+        resource.info["specific_info"] = {"statuses": statuses}
+        # for backward compatibility
+        resource.labels["vm_instance"] = True
+
+        virtual_machines.append(resource)
+
+    return virtual_machines
+
+
+# TODO: test
+async def process_vault(
+    api_client: BaseAsyncApiClient,
+    resource: AzureResource,
+) -> AzureResource:
+    vault_properties = (
+        "friendlyName",
+        "backupManagementType",
+        "protectedItemType",
+        "lastBackupTime",
+        "lastBackupStatus",
+        "protectionState",
+        "protectionStatus",
+        "policyName",
+        "isArchiveEnabled",
+    )
+
+    response = await api_client.get_async(
+        f"resourceGroups/{resource.info['group']}/providers/Microsoft.RecoveryServices/vaults/{resource.info['name']}/backupProtectedItems",
+        params={
+            "api-version": "2025-02-01",
+        },
+        key="value",
+    )
+
+    resource.info["properties"] = {"backup_containers": []}
+    try:
+        properties = [filter_keys(b["properties"], vault_properties) for b in response]
+        resource.info["properties"]["backup_containers"].extend(properties)
+    except IndexError:
+        LOGGER.info(
+            "No backup items found for vault %(vault_name)s, writing empty properties",
+            {"vault_name": resource.info["name"]},
+        )
+    except KeyError:
+        write_exception_to_agent_info_section(
+            ApiErrorMissingData(
+                f"Vault properties must be present, subscription: {resource.subscription}"
+            ),
+            "Vaults",
+        )
+        raise ApiErrorMissingData("Vault properties must be present")
+
+    return resource
+
+
+class ResourceHealth(TypedDict, total=False):
+    id: Required[str]
+    properties: Required[Mapping[str, str]]
+
+
+def _unknown_resource_health_data(resource: AzureResource) -> Mapping[str, object]:
+    resource_id = resource.info["id"]
+    return {
+        "id": f"{resource_id}/providers/Microsoft.ResourceHealth/availabilityStatuses/current",
+        "name": "/".join(resource_id.split("/")[-2:]),
+        "availabilityState": "Unknown",
+        "summary": "No health status returned by the Azure Resource Health API",
+        "reasonType": "",
+        "tags": resource.tags,
+    }
+
+
+def _get_resource_health_sections(
+    resource_health_view: Sequence[ResourceHealth], resources: Mapping[ResourceId, AzureResource]
+) -> Sequence[AzureSection]:
+    health_section: defaultdict[str, list[str]] = defaultdict(list)
+
+    for health in resource_health_view:
+        health_id = health["id"]
+        resource_id = "/".join(health_id.split("/")[:-4])
+
+        try:
+            resource = resources[resource_id.lower()]
+        except KeyError:
+            # resource not monitored
+            continue
+
+        health_data = {
+            "id": health_id,
+            "name": "/".join(health_id.split("/")[-6:-4]),
+            **filter_keys(
+                health["properties"],
+                ("availabilityState", "summary", "reasonType", "occuredTime"),
+            ),
+            "tags": resource.tags,
+        }
+
+        health_section[resource.piggytarget].append(json.dumps(health_data))
+
+    for resource in resources.values():
+        if resource.piggytarget in health_section:
+            continue
+        # when not health data in the API, put Unknown:
+        health_section[resource.piggytarget].append(
+            json.dumps(_unknown_resource_health_data(resource))
+        )
+
+    sections = []
+    for resource_piggytarget, values in health_section.items():
+        section = AzureSection(
+            "resource_health",
+            piggytargets=[resource_piggytarget],
+            separator=0,
+        )
+        for value in values:
+            section.add([value])
+        sections.append(section)
+
+    return sections
+
+
+async def _test_connection(args: argparse.Namespace) -> int:
+    """We test the connection only via the Management API client, not via the Graph API client.
+    The Graph API client is used for three specific services, which are disabled in the default
+    setup when configured via the UI.
+    The Management API client is used for all other services, so we assume here that this is the
+    connection that's essential for the vast majority of setups."""
+
+    try:
+        async with BaseAsyncApiClient(
+            get_mgmt_authority_urls(args.authority, ""),
+            to_requests_proxies(args.proxy),
+            tenant=args.tenant,
+            client=args.client,
+            # revealing later would be better, but I'm keeping this simple for now
+            secret=resolve_secret_option(args, SECRET_OPTION).reveal(),
+        ) as api_client:
+            if args.subscriptions:
+                response = await api_client.request_async(
+                    method="GET",
+                    full_uri="https://management.azure.com/subscriptions",
+                    params={"api-version": "2022-12-01"},
+                    key="value",
+                )
+                available = {item["subscriptionId"] for item in response}
+                for sub_id in args.subscriptions:
+                    if sub_id not in available:
+                        sys.stderr.write(
+                            f"Subscription {sub_id!r} not found in Azure. "
+                            "Check the subscription ID and client permissions.\n"
+                        )
+                        return 2
+    except (ApiLoginFailed, ValueError) as exc:
+        error_msg = f"Connection failed with: {exc}\n"
+        sys.stderr.write(error_msg)
+        return 2
+    except requests.exceptions.ProxyError as exc:
+        error_msg = f"Connection failed due to a proxy error: {exc}\n"
+        sys.stderr.write(error_msg)
+        return 2
+    return 0
+
+
+def _gather_sections_from_resources(
+    resources: list[AzureResource],
+    monitored_groups: Mapping[str, AzureResourceGroup],
+) -> Sequence[AzureSection]:
+    sections: list[AzureSection] = []
+    for resource in resources:
+        section = AzureResourceSection(resource)
+        section.add(resource.dumpinfo())
+        sections.append(section)
+        sections.append(get_resource_host_labels_section(resource, monitored_groups))
+
+    return sections
+
+
+async def process_bulk_resources(
+    mgmt_client: BaseAsyncApiClient,
+    args: argparse.Namespace,
+    groups_with_monitored_resources: Mapping[str, AzureResourceGroup],
+    monitored_services: set[str],
+    monitored_resources: Mapping[ResourceId, AzureResource],
+    subscription: AzureSubscription,  # noqa: ARG001
+) -> Sequence[AzureSection]:
+    tasks = set()
+    if FetchedResource.VIRTUAL_MACHINES.type in monitored_services:
+        tasks.add(_collect_virtual_machines_resources(mgmt_client, monitored_resources))
+    if FetchedResource.APP_GATEWAYS.type in monitored_services:
+        tasks.add(_collect_app_gateways_resources(mgmt_client, monitored_resources))
+    if FetchedResource.LOAD_BALANCERS.type in monitored_services:
+        tasks.add(_collect_load_balancers_resources(mgmt_client, monitored_resources))
+    if FetchedResource.FIREWALLS.type in monitored_services:
+        tasks.add(_collect_firewalls_resources(mgmt_client, monitored_resources))
+
+    processed_resources: list[AzureResource] = []
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for resources_async in results:
+        if isinstance(resources_async, BaseException):
+            if args.debug:
+                raise resources_async
+            write_exception_to_agent_info_section(resources_async, "Process bulk resources (async)")
+            continue
+
+        processed_resources.extend(resources_async)
+
+    return _gather_sections_from_resources(processed_resources, groups_with_monitored_resources)
+
+
+# TODO: test
+async def process_single_resources(
+    mgmt_client: BaseAsyncApiClient,
+    args: argparse.Namespace,
+    subscription: AzureSubscription,
+    groups_with_monitored_resources: Mapping[str, AzureResourceGroup],
+    monitored_resources: Mapping[ResourceId, AzureResource],
+) -> Sequence[AzureSection]:
+    processed_resources: list[AzureResource] = []
+    tasks: set[Coroutine[Any, Any, AzureResource] | Coroutine[Any, Any, list[AzureResource]]] = (
+        set()
+    )
+
+    for _resource_id, resource in monitored_resources.items():
+        resource_type = resource.info["type"]
+        if resource_type in BULK_QUERIED_RESOURCES:
+            continue
+
+        if resource_type == FetchedResource.VAULTS.type:
+            tasks.add(process_vault(mgmt_client, resource))
+        elif resource_type == FetchedResource.VIRTUAL_NETWORK_GATEWAYS.type:
+            tasks.add(process_virtual_net_gw(mgmt_client, resource))
+        elif resource_type.lower() == FetchedResource.COSMOSDB.type.lower():
+            tasks.add(process_cosmosdb(mgmt_client, resource, subscription, args))
+        else:
+            # simple resource without further processing
+            if resource_type in SUPPORTED_FLEXIBLE_DATABASE_SERVER_RESOURCE_TYPES:
+                resource.section = "servers"  # use the same section as for single servers
+            processed_resources.append(resource)
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for resource_async in results:
+        if isinstance(resource_async, BaseException):
+            if args.debug:
+                raise resource_async
+            write_exception_to_agent_info_section(
+                resource_async,
+                f"Process single resources (async), subscription: {subscription.name}",
+            )
+            continue
+
+        # All functions return either a single resource or a list of resources (process_cosmosdb)
+        if isinstance(resource_async, AzureResource):
+            processed_resources.append(resource_async)
+        else:
+            assert isinstance(resource_async, list)
+            processed_resources.extend(resource_async)
+
+    return _gather_sections_from_resources(processed_resources, groups_with_monitored_resources)
+
+
+async def process_resources(
+    mgmt_client: BaseAsyncApiClient,
+    args: argparse.Namespace,
+    subscription: AzureSubscription,
+    selected_resources: Sequence[AzureResource],
+    monitored_services: set[str],
+    monitored_groups: Mapping[str, AzureResourceGroup],
+) -> None:
+    # lower, because I've seen things like
+    # Microsoft.DocumentDB/databaseAccounts AND
+    # Microsoft.DocumentDb/databaseAccounts
+    monitored_services_lower = {s.lower() for s in monitored_services}
+    monitored_resources_by_id = {
+        r.info["id"].lower(): r
+        for r in selected_resources
+        if r.info["type"].lower() in monitored_services_lower
+    }
+    resources_groups = {r.group for r in monitored_resources_by_id.values()}
+    groups_with_monitored_resources = {
+        group_name: group
+        for group_name, group in monitored_groups.items()
+        if group_name in resources_groups
+    }
+
+    # metrics must be gathered before the actual section writing
+    # (which happens in the concurrent tasks below)
+    await process_metrics(mgmt_client, subscription, monitored_resources_by_id, args)
+
+    tasks = {
+        process_resource_health(
+            mgmt_client,
+            monitored_resources_by_id,
+            groups_with_monitored_resources,
+            args.debug,
+        ),
+        process_bulk_resources(
+            mgmt_client,
+            args,
+            groups_with_monitored_resources,
+            monitored_services,
+            monitored_resources_by_id,
+            subscription,
+        ),
+        process_single_resources(
+            mgmt_client,
+            args,
+            subscription,
+            groups_with_monitored_resources,
+            monitored_resources_by_id,
+        ),
+    }
+
+    for coroutine in asyncio.as_completed(tasks):
+        try:
+            for section in await coroutine:
+                section.write()
+        except Exception as e:
+            if args.debug:
+                raise
+            write_exception_to_agent_info_section(
+                e, f"Management client (async)  subscription: {subscription.name}"
+            )
+
+
+async def _collect_resources(
+    mgmt_client: BaseAsyncApiClient,
+    subscription: AzureSubscription,
+    args: argparse.Namespace,
+    selector: Selector,
+) -> tuple[Sequence[AzureResource], list[str]]:
+    resources = await mgmt_client.get_async(
+        "resources", key="value", params={"api-version": "2019-05-01"}
+    )
+
+    all_resources = (
+        AzureResource(
+            r,
+            args.tag_key_pattern,
+            subscription,
+            args.unique_hostnames_config,
+        )
+        for r in resources
+    )
+
+    # Selected resources are all the resources that match the selector.
+    # They are NOT the "monitored resources", which also depend on the *services* selected via command line call.
+    # Here, we need all these resources to be able to create the `monitored_groups` sections.
+    # -> I don't know if this is actually intended (we are populating the agent information `monitored-resources`
+    #    with resources not really monitored), but the agent behaved like this before.
+    selected_resources = [r for r in all_resources if selector.do_monitor(r)]
+    monitored_groups = sorted({r.group for r in selected_resources})
+
+    return selected_resources, monitored_groups
+
+
+def write_tenant_info(tenant: AzureTenant) -> None:
+    labels: dict[str, str] = {"tenant_name": tenant.name}
+    AzureTenantLabelsSection(labels=labels).write()
+
+
+def write_tenant_section(tenant: AzureTenant) -> None:
+    section = AzureSection("tenant")
+    section.add(tenant.dumpinfo())
+    section.write()
+
+
+async def main_subscription(
+    args: argparse.Namespace,
+    selector: Selector,
+    subscription: AzureSubscription,
+    monitored_services: set[str],
+) -> None:
+    try:
+        async with SharedSessionApiClient(
+            get_mgmt_authority_urls(args.authority, subscription.id),
+            to_requests_proxies(args.proxy),
+            tenant=args.tenant,
+            client=args.client,
+            # revealing later would be better, but I'm keeping this simple for now
+            secret=resolve_secret_option(args, SECRET_OPTION).reveal(),
+        ) as mgmt_client:
+            # monitored_groups_list is a list of resource groups that match the selector
+            # that means also groups without any monitored resources
+            # we need this to show resource groups as hosts (e.g. with their costs)
+            selected_resources, monitored_groups_list = await _collect_resources(
+                mgmt_client, subscription, args, selector
+            )
+
+            # resource_groups is a Mapping lower_name: AzureResourceGroup
+            resource_groups: Mapping[str, AzureResourceGroup] = await get_resource_groups(
+                mgmt_client, monitored_groups_list, subscription, args
+            )
+            write_group_info(resource_groups, selected_resources, subscription)
+            write_resource_groups_sections(resource_groups)
+            write_subscription_labels(subscription)
+            write_subscription_section(subscription)
+
+            tasks = {
+                process_usage_details(mgmt_client, subscription, resource_groups, args)
+                if "usage_details" in monitored_services
+                else None,
+                process_resources(
+                    mgmt_client,
+                    args,
+                    subscription,
+                    selected_resources,
+                    monitored_services,
+                    resource_groups,
+                ),
+            }
+            tasks.discard(None)
+            await asyncio.gather(*tasks)  # type: ignore[arg-type]
+
+            write_subscription_info_section(
+                subscription, mgmt_client.ratelimit, resource_groups, selected_resources
+            )
+
+    except Exception as exc:
+        if args.debug:
+            raise
+        write_exception_to_agent_info_section(
+            exc, f"Management client, subscription: {subscription.name}"
+        )
+
+
+async def _get_subscriptions(args: argparse.Namespace) -> set[AzureSubscription]:
+    if args.no_subscriptions:
+        LOGGER.info("No subscriptions selected")
+        return set()
+
+    try:
+        async with BaseAsyncApiClient(
+            get_mgmt_authority_urls(args.authority, ""),
+            to_requests_proxies(args.proxy),
+            args.tenant,
+            args.client,
+            # revealing later would be better, but I'm keeping this simple for now
+            resolve_secret_option(args, SECRET_OPTION).reveal(),
+        ) as api_client:
+            response = await api_client.request_async(
+                method="GET",
+                full_uri="https://management.azure.com/subscriptions",
+                params={"api-version": "2022-12-01"},
+            )
+            subscriptions = {
+                item["subscriptionId"]: AzureSubscription(
+                    id=item["subscriptionId"],
+                    name=item["displayName"],
+                    tags=item.get("tags", {}),
+                    unique_hostnames_config=args.unique_hostnames_config,
+                    tenant_id=args.tenant,
+                    tenant_name=args.tenant_name,
+                )
+                for item in response.get("value", [])
+            }
+    except Exception as exc:
+        if args.debug:
+            raise
+        write_exception_to_agent_info_section(exc, "Management client - get subscriptions")
+        return set()
+
+    if args.all_subscriptions:
+        LOGGER.info(
+            "Using all subscriptions from API: %(subscriptions)s",
+            {"subscriptions": ",".join(subscriptions.keys())},
+        )
+        return set(subscriptions.values())
+
+    if args.subscriptions_require_tag or args.subscriptions_require_tag_value:
+        tag_based_config = TagBasedConfig(
+            args.subscriptions_require_tag, args.subscriptions_require_tag_value
+        )
+        monitored_subscriptions = {
+            subscription
+            for subscription in list(subscriptions.values())
+            if tag_based_config.is_configured(subscription)
+        }
+        LOGGER.info(
+            "Using tag matching subscriptions: %(subscriptions)s",
+            {
+                "subscriptions": ",".join(
+                    subscription.id for subscription in monitored_subscriptions
+                )
+            },
+        )
+        return monitored_subscriptions
+
+    monitored_subscriptions = set()
+    for subscription in args.subscriptions:
+        if subscription not in subscriptions:
+            raise ApiError(
+                f"Subscription {subscription} not found in Azure API, please check the client permissions."
+            )
+
+        monitored_subscriptions.add(subscriptions[subscription])
+
+    LOGGER.info(
+        "Using requested subscriptions %(subscriptions)s",
+        {"subscriptions": ",".join(subscription.id for subscription in monitored_subscriptions)},
+    )
+
+    return monitored_subscriptions
+
+
+async def collect_info(
+    args: argparse.Namespace, selector: Selector, subscriptions: set[AzureSubscription]
+) -> None:
+    monitored_services = set(args.services)
+    tenant = AzureTenant(args.tenant, args.tenant_name)
+    write_tenant_info(tenant)
+    write_tenant_section(tenant)
+    AzureSection("agent_info").write(write_empty=True)
+    await asyncio.gather(
+        main_graph_client(args, monitored_services),
+        *{
+            main_subscription(args, selector, subscription, monitored_services)
+            for subscription in subscriptions
+        },
+    )
+
+
+async def main_async(args: argparse.Namespace, selector: Selector) -> int:
+    if args.connection_test:
+        return await _test_connection(args)
+
+    # slight hack, piggyback on args to avoid having to thread this around everywhere
+    assert args.unique_hostnames in ("short", "long", None)
+    args.unique_hostnames_config = UniqueHostnamesConfig(
+        enabled=args.unique_hostnames or False,
+        exclude_vms=args.unique_hostnames_exclude_vms,
+    )
+
+    subscriptions = await _get_subscriptions(args)
+    await collect_info(args, selector, subscriptions)
+    LOGGER.debug("%(selector)s", {"selector": selector})
+    return 0
+
+
+def _setup_logging(verbose: int) -> None:
+    logging.basicConfig(  # astrein: disable=logging-formatter
+        level={0: logging.WARNING, 1: logging.INFO, 2: logging.DEBUG}.get(verbose, logging.DEBUG),
+        format="%(levelname)s %(asctime)s %(name)s - %(funcName)s: %(message)s",
+        force=True,
+    )
+
+    if verbose == 2:
+        # if verbose >= 3, be verbose (show all messages from other modules)
+        # if verbose == 2, be verbose, but silence msrest, urllib3 and requests_oauthlib
+        # for the others, keep the logging level as set
+        logging.getLogger("msrest").setLevel(logging.WARNING)
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
+        logging.getLogger("requests_oauthlib").setLevel(logging.WARNING)
+
+
+def _debug_args(args: argparse.Namespace) -> None:
+    # secret is looking after itself.
+    for key, value in vars(args).items():
+        LOGGER.debug("argparse: %(key)s = %(value)r", {"key": key, "value": value})
+
+
+def agent_azure_main(args: argparse.Namespace) -> int:
+    selector = Selector(args)
+    if args.dump_config:
+        sys.stdout.write("Configuration:\n%s\n" % selector)
+        return 0
+
+    _setup_logging(args.verbose)
+    _debug_args(args)
+
+    return asyncio.run(main_async(args, selector))
+
+
+@report_agent_crashes(AGENT, __version__)
+def main() -> int:
+    return agent_azure_main(parse_arguments(sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

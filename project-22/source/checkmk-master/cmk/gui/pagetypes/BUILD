@@ -1,0 +1,39 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+load("@cmk_requirements//:requirements.bzl", "requirement")
+
+py_library(
+    name = "pagetypes",
+    srcs = glob(include = ["**/*.py"]),
+    imports = ["../../.."],
+    visibility = [
+        "//cmk:__subpackages__",
+        "//non-free/packages/cmk-network-flow:__pkg__",
+        "//tests:__subpackages__",
+    ],
+    deps = [
+        "//cmk/gui:auth_core",
+        "//cmk/gui:config",
+        "//cmk/gui:core_toolkit",
+        "//cmk/gui:html_toolkit",
+        "//cmk/gui:main_menu_match_items",
+        "//cmk/gui:page_toolkit",
+        "//cmk/gui/openapi/framework",
+        "//cmk/gui/openapi/framework:core",
+        "//cmk/gui/openapi/framework:types",
+        "//cmk/gui/openapi/restful_objects",
+        "//cmk/gui/search:matchers",
+        "//cmk/gui/search:permissions",
+        "//cmk/gui/utils:middle",
+        "//cmk/gui/valuespec",
+        "//cmk/gui/watolib:groups_io",
+        "//cmk/utils:paths",
+        "//packages/cmk-ccc:exceptions",
+        "//packages/cmk-ccc:plugin-registry",
+        "//packages/cmk-ccc:store",
+        "//packages/cmk-ccc:user",
+        "//packages/cmk-ccc:version",
+        "//packages/cmk-shared-typing:cmk_shared_typing_py",
+        "//packages/cmk-web/cmk/web/utils",
+        requirement("pydantic"),
+    ],
+)

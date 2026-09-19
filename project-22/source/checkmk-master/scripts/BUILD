@@ -1,0 +1,67 @@
+load("@aspect_rules_py//py:defs.bzl", "py_binary")
+load("@cmk_requirements//:requirements.bzl", "requirement")
+load("//bazel/rules:py_requirements_test.bzl", "py_requirements_test")
+
+exports_files([
+    "cmk-dev-deploy.py",
+    "requirements.in",
+])
+
+sh_binary(
+    name = "in_bazel",
+    srcs = ["in_bazel.sh"],
+)
+
+sh_binary(
+    # target only for linters, call the script directly
+    name = "lint",
+    srcs = ["lint.sh"],
+)
+
+py_binary(
+    name = "sarif_preparse",
+    srcs = ["sarif_preparse.py"],
+    main = "sarif_preparse.py",
+    deps = [requirement("sarif-tools")],
+)
+
+sh_library(
+    name = "scripts_sh",
+    srcs = [
+        "check-current-commit",
+        "create_cognito_config_cloud.sh",
+        "fake-artifacts",
+        "find-python-files",
+        "find-shell-files",
+        "run-in-docker.sh",
+        "run-mypy",
+        "run-unittests",
+        "run-uvenv",
+    ],
+)
+
+py_binary(
+    name = "decent_output",
+    srcs = ["decent_output.py"],
+    main = "decent_output.py",
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "scripts_py",
+    srcs = [
+        "prune_compilation_db.py",
+        "update_python_libs.py",
+    ],
+    deps = [requirement("sarif-tools")],
+)
+
+py_requirements_test(
+    name = "requirements-test",
+    libs = [
+        ":sarif_preparse",
+        ":scripts_py",
+        ":decent_output",
+    ],
+    requirements_in = "requirements.in",
+)

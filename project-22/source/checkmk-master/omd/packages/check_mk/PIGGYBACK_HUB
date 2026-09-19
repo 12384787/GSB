@@ -1,0 +1,8 @@
+# Alias: Start daemon for the piggyback-hub
+# Menu: Distributed Monitoring
+# Description:
+#  This option enables the piggyback-hub.
+#  It will distribute piggybacked sections to other remote sites
+#  that are part of the same distributed setup.
+#  It is strongly recommended to use the web interface for configuration.
+#  Changes made via the web interface may overwrite changes made here.

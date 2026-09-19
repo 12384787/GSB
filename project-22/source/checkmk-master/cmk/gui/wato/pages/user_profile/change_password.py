@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import contextlib
+import time
+from collections.abc import Sequence
+from datetime import datetime
+from typing import override
+
+from cmk.ccc.version import Edition
+from cmk.crypto.password import Password, PasswordPolicy
+from cmk.gui import forms, userdb
+from cmk.gui.breadcrumb import make_simple_page_breadcrumb
+from cmk.gui.config import Config
+from cmk.gui.exceptions import MKAuthException, MKUserError
+from cmk.gui.header import make_header
+from cmk.gui.htmllib.html import html
+from cmk.gui.http import Request
+from cmk.gui.i18n import _
+from cmk.gui.logged_in import user
+from cmk.gui.main_menu import main_menu_registry
+from cmk.gui.pages import Page, PageContext, PageEndpoint, PageRegistry
+from cmk.gui.permissions import permission_registry
+from cmk.gui.session import session
+from cmk.gui.site_config import is_distributed_setup_remote_site
+from cmk.gui.userdb import get_connection, get_user_attributes, UserAttribute
+from cmk.gui.userdb.htpasswd import hash_password
+from cmk.gui.utils.roles import UserPermissions
+from cmk.gui.utils.security_log_events import UserManagementEvent
+from cmk.gui.utils.transaction_manager import transactions
+from cmk.gui.utils.user_errors import user_errors
+from cmk.gui.wato.pages._user_security_message import (
+    SecurityNotificationEvent,
+    send_security_message,
+)
+from cmk.gui.watolib.mode import redirect
+from cmk.gui.watolib.users import (
+    get_enabled_remote_sites_for_logged_in_user,
+    verify_password_policy,
+)
+from cmk.utils import paths
+from cmk.utils.security_event import log_security_event
+from cmk.web.utils.flashed_messages import flash, get_flashed_messages
+from cmk.web.utils.urls import makeuri_contextless
+
+from .page_menu import user_profile_page_menu
+from .verify_requirements import verify_requirements
+
+
+def register(edition: Edition, page_registry: PageRegistry) -> None:
+    page_registry.register(PageEndpoint("user_change_pw", UserChangePasswordPage(edition)))
+
+
+class UserChangePasswordPage(Page):
+    def __init__(self, edition: Edition) -> None:
+        self._edition = edition
+
+    def _page_title(self) -> str:
+        return _("Change password")
+
+    @classmethod
+    def _current_pw_field(cls) -> str:
+        return "_cur_password"
+
+    @classmethod
+    def _new_pw_field(cls) -> str:
+        return "_password"
+
+    @classmethod
+    def _repeat_pw_field(cls) -> str:
+        return "_password2"
+
+    def _action(self, request: Request, config: Config) -> None:
+        if is_distributed_setup_remote_site(config.sites):
+            raise MKAuthException(_("Changing your password is not allowed on remote sites."))
+
+        assert user.id is not None
+
+        users = userdb.load_users(lock=True)
+        user_spec = users[user.id]
+
+        cur_password = request.get_validated_type_input(
+            Password, self._current_pw_field(), empty_is_none=True
+        )
+        password = request.get_validated_type_input(
+            Password, self._new_pw_field(), empty_is_none=True
+        )
+        password2 = request.get_validated_type_input(
+            Password, self._repeat_pw_field(), empty_is_none=True
+        )
+
+        # Force change pw mode
+        if not cur_password:
+            raise MKUserError(
+                self._current_pw_field(), _("You need to provide your current password.")
+            )
+
+        if not password:
+            raise MKUserError(self._new_pw_field(), _("You need to change your password."))
+
+        if cur_password == password:
+            raise MKUserError(
+                self._new_pw_field(), _("The new password must differ from your current one.")
+            )
+
+        now = datetime.now()
+        if (
+            userdb.check_credentials(
+                user.id,
+                cur_password,
+                (user_attributes := get_user_attributes(config.wato_user_attrs)),
+                config.user_connections,
+                now,
+                config.default_user_profile,
+                pprint_value=config.wato_pprint_config,
+                debug=config.debug,
+            )
+            is False
+        ):
+            raise MKUserError(self._current_pw_field(), _("Your old password is wrong."))
+
+        if password2 and password != password2:
+            raise MKUserError(self._repeat_pw_field(), _("New passwords don't match."))
+
+        verify_password_policy(
+            password,
+            "password",
+            PasswordPolicy(
+                config.password_policy.get("min_length"),
+                config.password_policy.get("num_groups"),
+                config.password_policy.get("wordlist_check", True),
+                paths.wordlist_file,
+            ),
+        )
+        user_spec["password"] = hash_password(password)
+        user_spec["last_pw_change"] = int(time.time())
+        send_security_message(user.id, SecurityNotificationEvent.password_change)
+
+        # In case the user was enforced to change it's password, remove the flag
+        with contextlib.suppress(KeyError):
+            del user_spec["enforce_pw_change"]
+
+        # Increase serial to invalidate old authentication cookies
+        if "serial" not in user_spec:
+            user_spec["serial"] = 1
+        else:
+            user_spec["serial"] += 1
+
+        userdb.save_users(
+            users,
+            user_attributes,
+            config.user_connections,
+            now=now,
+            pprint_value=config.wato_pprint_config,
+            call_users_saved_hook=True,
+            changed_users=[user.id],
+        )
+        connection_id = user_spec.get("connector", None)
+        connection = get_connection(connection_id)
+        log_security_event(
+            UserManagementEvent(
+                event="password changed",
+                affected_user=user.id,
+                acting_user=user.id,
+                connector=connection.type() if connection else None,
+                connection_id=connection_id,
+            )
+        )
+        session.check_and_update_session_state()
+
+        flash(_("Successfully changed password."))
+
+        # Set the new cookie to prevent logout for the current user
+        session.update_cookie()
+
+        # In distributed setups with remote sites where the user can login, start the
+        # user profile replication now which will redirect the user to the destination
+        # page after completion. Otherwise directly open up the destination page.
+        origtarget = request.get_str_input_mandatory("_origtarget", "user_change_pw.py")
+        if get_enabled_remote_sites_for_logged_in_user(user, config.sites):
+            raise redirect(
+                makeuri_contextless(
+                    request, [("back", origtarget)], filename="user_profile_replicate.py"
+                )
+            )
+        raise redirect(origtarget)
+
+    @override
+    def page(self, ctx: PageContext) -> None:
+        verify_requirements(
+            UserPermissions.from_config(ctx.config, permission_registry),
+            "general.change_password",
+            ctx.config.wato_enabled,
+        )
+        title = self._page_title()
+        breadcrumb = make_simple_page_breadcrumb(main_menu_registry.menu_user(), self._page_title())
+        make_header(
+            html,
+            title=title,
+            breadcrumb=breadcrumb,
+            page_menu=user_profile_page_menu(self._edition, ctx.config.sites, breadcrumb),
+            show_main_navigation=session.session_info.session_state == "logged_in",
+            debug=ctx.config.debug,
+            lang=user.language,
+            inject_js_profiling_code=ctx.config.inject_js_profiling_code,
+            load_frontend_vue=ctx.config.load_frontend_vue,
+            custom_style_sheet=ctx.config.custom_style_sheet,
+            screenshotmode=ctx.config.screenshotmode,
+            inline_help_as_text=user.inline_help_as_text,
+            hide_suggestions=not user.get_tree_state("suggestions", "all", True),
+            user_role_ids=user.role_ids,
+        )
+
+        if is_distributed_setup_remote_site(ctx.config.sites):
+            self._show_remote_site_notice()
+            html.footer()
+            return
+
+        if transactions.check_transaction(ctx.request):
+            try:
+                self._action(ctx.request, ctx.config)
+            except MKUserError as e:
+                user_errors.add(e)
+
+        for message in get_flashed_messages():
+            html.show_message(message.msg)
+
+        html.show_user_errors()
+
+        self._show_form(ctx.request, get_user_attributes(ctx.config.wato_user_attrs))
+
+    def _show_remote_site_notice(self) -> None:
+        assert user.id is not None
+        user_spec = userdb.load_user(user.id)
+        if user_spec.get("connector", "htpasswd") == "htpasswd":
+            html.show_warning(
+                _(
+                    "Your password can only be changed on the central site. "
+                    "Please log in to the central Checkmk site to change your password."
+                )
+            )
+        else:
+            html.show_warning(
+                _("Your password is managed by another system and cannot be changed in Checkmk.")
+            )
+
+    def _show_form(
+        self, request: Request, user_attributes: Sequence[tuple[str, UserAttribute]]
+    ) -> None:
+        assert user.id is not None
+
+        users = userdb.load_users()
+
+        user_spec = users.get(user.id)
+        if user_spec is None:
+            html.show_warning(_("Sorry, your user account does not exist."))
+            html.footer()
+            return
+
+        locked_attributes = userdb.locked_attributes(user_spec.get("connector"), user_attributes)
+        if "password" in locked_attributes:
+            raise MKUserError(
+                self._current_pw_field(),
+                _("You cannot change your password, because it is managed by another system."),
+            )
+
+        with html.form_context("profile", method="POST"):
+            html.prevent_password_auto_completion()
+            html.open_div(class_="wato")
+            forms.header(self._page_title())
+
+            forms.section(_("Current password"))
+            html.password_input(self._current_pw_field(), autocomplete="new-password")
+
+            forms.section(_("New password"))
+            html.password_input(self._new_pw_field(), autocomplete="new-password")
+            html.password_meter()
+
+            forms.section(_("New password confirmation"))
+            html.password_input(self._repeat_pw_field(), autocomplete="new-password")
+
+            html.hidden_field("_origtarget", request.get_str_input("_origtarget"))
+
+            forms.end()
+            html.close_div()
+            html.hidden_fields()
+        html.footer()

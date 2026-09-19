@@ -1,0 +1,7 @@
+# Alias: Send traces to this collector
+# Menu: Add-ons
+# Description:
+#  If sending traces is configured, they are sent to the address of the collector configured here.
+#  The most basic approach is to send traces to the site's local Jaeger instance, which needs to be
+#  enabled with the TRACE_RECEIVE setting To do so, configure "local_site" here. Alternatively
+#  you can configure the URL of a custom OTLP endpoint here.

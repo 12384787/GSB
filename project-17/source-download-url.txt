@@ -1,0 +1,1 @@
+https://github.com/itchyny/gojq/archive/refs/heads/main.zip

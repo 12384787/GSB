@@ -1,0 +1,44 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+
+py_library(
+    name = "sidebar",
+    srcs = glob(
+        include = [
+            "*.py",
+            "_openapi/**/*.py",
+        ],
+    ),
+    imports = ["../../.."],
+    visibility = [
+        "//cmk:__subpackages__",
+        "//non-free/packages/cmk-data-backend:__pkg__",
+        "//omd/packages/appliance:__pkg__",
+        "//tests:__subpackages__",
+    ],
+    deps = [
+        "//cmk/gui:auth_core",
+        "//cmk/gui:config",
+        "//cmk/gui:core_toolkit",
+        "//cmk/gui:html_toolkit",
+        "//cmk/gui:main_navigation",
+        "//cmk/gui:messaging",
+        "//cmk/gui:page_toolkit",
+        "//cmk/gui:werks",
+        "//cmk/gui/dashboard",
+        "//cmk/gui/dashboard:type_defs",
+        "//cmk/gui/openapi/framework",
+        "//cmk/gui/openapi/framework:core",
+        "//cmk/gui/openapi/framework:types",
+        "//cmk/gui/openapi/restful_objects",
+        "//cmk/gui/pagetypes",
+        "//cmk/gui/plugins/sidebar",
+        "//cmk/gui/product_usage_analytics",
+        "//cmk/gui/sidebar/_snapin",
+        "//cmk/gui/userdb",
+        "//cmk/gui/utils",
+        "//cmk/gui/utils:middle",
+        "//cmk/gui/watolib",
+        "//packages/cmk-shared-typing:cmk_shared_typing_py",
+        "//packages/cmk-web/cmk/web/utils",
+    ],
+)

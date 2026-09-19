@@ -1,0 +1,5 @@
+# Alias: Restrict interfaces on which RabbitMQ listens
+# Menu: Basic
+# Description:
+#  Configure the IP addresses of the interfaces on which the RabbitMQ Instance will listen for connections. The setting
+#  "::" makes the port available to all IPv4 and IPv6 clients.

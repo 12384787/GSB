@@ -1,0 +1,178 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+
+<script setup lang="ts">
+import type { Site } from 'cmk-shared-typing/typescript/changes'
+import CmkBadge from 'cmk-ui-library/components/CmkBadge.vue'
+import CmkProgressbar from 'cmk-ui-library/components/progress/CmkProgressbar.vue'
+import CmkCheckbox from 'cmk-ui-library/components/user-input/CmkCheckbox.vue'
+
+import SiteStatusIcons from './SiteStatusIcons.vue'
+
+const statusColor = (status: string): 'success' | 'warning' | 'danger' | 'default' => {
+  const mapping: Record<string, 'success' | 'warning' | 'danger' | 'default'> = {
+    online: 'success',
+    disabled: 'warning',
+    down: 'danger',
+    unknown: 'default',
+    unreach: 'danger',
+    dead: 'danger',
+    waiting: 'warning',
+    missing: 'warning'
+  }
+  return mapping[status] ?? 'warning'
+}
+
+defineProps<{
+  site: Site
+  idx: number
+  activating: boolean
+  checked: boolean
+  isRecentlyActivated: boolean
+  hideCheckbox?: boolean
+  hasActivationIssues: boolean
+  hasStatusProblems: boolean
+  hasForeignChangesWithoutPermission: boolean
+  selectionDisabled: boolean
+}>()
+
+const emit = defineEmits<{
+  updateChecked: [string, boolean]
+}>()
+</script>
+
+<template>
+  <div
+    :num="idx"
+    class="cmk-changes-sites-item-wrapper"
+    :class="{ 'cmk-changes-site-status-item-disabled': selectionDisabled }"
+  >
+    <div class="cmk-changes-sites-item">
+      <div class="cmk-changes-sites-item-start">
+        <CmkCheckbox
+          v-if="!hideCheckbox"
+          :model-value="checked"
+          :disabled="selectionDisabled"
+          @update:model-value="
+            (val) => {
+              emit('updateChecked', site.siteId, val)
+            }
+          "
+        />
+        <CmkBadge :color="statusColor(site.onlineStatus)" size="small">{{
+          site.onlineStatus
+        }}</CmkBadge>
+        <div class="cmk-changes-sites-item-name">{{ site.siteName }}</div>
+      </div>
+      <div v-if="!activating && !isRecentlyActivated" class="cmk-changes-sites-item-end">
+        <SiteStatusIcons
+          :activation-issues="hasActivationIssues"
+          :has-foreign-changes-without-permission="hasForeignChangesWithoutPermission"
+          :site-problems="hasStatusProblems"
+        />
+        <CmkBadge color="default" size="small">{{ site.changes }}</CmkBadge>
+      </div>
+      <div
+        v-if="
+          isRecentlyActivated &&
+          site.lastActivationStatus !== undefined &&
+          site.lastActivationStatus !== null
+        "
+        class="cmk-changes-sites-item-end"
+      >
+        <div>
+          {{ site.lastActivationStatus.status_text }}
+        </div>
+      </div>
+      <div v-if="activating && !isRecentlyActivated && checked" class="cmk-changes-sites-item-end">
+        <div class="cmk-progress-bar-site-activation-in-progress">
+          <CmkProgressbar max="unknown"></CmkProgressbar>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+/* stylelint-disable checkmk/vue-bem-naming-convention */
+.cmk-changes-sites-item-wrapper {
+  background: var(--even-tr-bg-color);
+  padding: var(--dimension-3);
+  box-sizing: border-box;
+}
+
+.cmk-changes-sites-item {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+
+  .cmk-changes-sites-item-start {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: var(--spacing-half);
+
+    .cmk-changes-sites-item-name {
+      text-overflow: ellipsis;
+      overflow: hidden;
+      max-width: 250px;
+      white-space: nowrap;
+    }
+  }
+
+  .cmk-changes-sites-item-end {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+}
+
+.cmk-progress-bar-site-activation-in-progress {
+  width: 150px;
+}
+
+.cmk-div-site-activate-error {
+  background: rgb(234 57 8 / 15%);
+}
+
+.cmk-div-site-activate-warning {
+  background-color: color-mix(in srgb, var(--color-yellow-50) 25%, transparent);
+}
+
+.cmk-div-site-activate-warning,
+.cmk-div-site-activate-error {
+  display: flex;
+  padding: var(--dimension-2) var(--dimension-4);
+  justify-content: left;
+  align-items: center;
+  gap: var(--dimension-3);
+  align-self: stretch;
+  border-radius: var(--border-radius);
+  margin: 0 var(--dimension-3);
+}
+
+.cmk-div-warning-or-error-message {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dimension-3);
+  padding: var(--dimension-3) 0;
+  font-weight: var(--font-weight-bold);
+}
+
+.grey-text {
+  color: var(--font-color-dimmed);
+  font-weight: var(--font-weight-default);
+}
+
+.red-text {
+  color: var(--color-danger);
+}
+
+.cmk-changes-site-status-item-disabled {
+  opacity: 0.5;
+}
+</style>

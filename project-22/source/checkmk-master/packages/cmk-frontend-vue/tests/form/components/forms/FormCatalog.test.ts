@@ -1,0 +1,325 @@
+/**
+ * Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+import userEvent from '@testing-library/user-event'
+import { render, screen } from '@testing-library/vue'
+import type {
+  Catalog,
+  DictionaryElement,
+  Dictionary as DictionarySpec,
+  String as StringSpec
+} from 'cmk-shared-typing/typescript/vue_formspec_components'
+
+import FormCatalog from '@/form/private/forms/FormCatalog/FormCatalog.vue'
+
+import { renderForm } from '../cmk-form-helper'
+
+type PartialExcept<T, K extends keyof T> = Pick<T, K> & Partial<Omit<T, K>>
+
+function getStringFormspec(
+  title: string,
+  options?: Partial<Omit<DictionarySpec, 'type'>>
+): StringSpec {
+  return {
+    type: 'string',
+    title: title,
+    label: null,
+    help: `ut help ${title}`,
+    validators: [],
+    input_hint: `ut input hint ${title}`,
+    field_size: 'small',
+    autocompleter: null,
+    ...options
+  }
+}
+
+function getDictionaryFormspec(
+  dictionaryOptions: Partial<DictionarySpec>,
+  elements: Array<PartialExcept<DictionaryElement, 'name' | 'parameter_form'>>
+): DictionarySpec {
+  return {
+    type: 'dictionary',
+    title: 'dictionary title',
+    help: 'dictionary help',
+    groups: [],
+    validators: [],
+    no_elements_text: 'ut no elements text',
+    additional_static_elements: null,
+    elements: elements.map((element) => {
+      return {
+        required: false,
+        render_only: false,
+        default_value: '',
+        group: null,
+        ...element
+      }
+    }),
+    ...dictionaryOptions
+  }
+}
+
+function renderSimpleCatalog() {
+  return render(FormCatalog, {
+    props: {
+      spec: {
+        type: 'catalog',
+        title: 'catalog title',
+        help: 'catalog help',
+        validators: [],
+        elements: [
+          {
+            name: 'main_topic',
+            title: 'topic_title',
+            elements: [
+              {
+                type: 'topic_element',
+                name: 'dict_key',
+                required: true,
+                default_value: {},
+                parameter_form: getDictionaryFormspec(
+                  {
+                    title: 'dict_title'
+                    // this title will be moved into the catalog and displayed there a stitle
+                  },
+                  [
+                    {
+                      name: 'ut_string_1',
+                      parameter_form: getStringFormspec('title of string input'),
+                      group: null
+                    }
+                  ]
+                )
+              }
+            ],
+            locked: null
+          }
+        ]
+      },
+      data: { main_topic: { dict_key: { some_ut_key: {} } } }, // TODO: some_ut_key is required. should it be?
+      backendValidation: []
+    }
+  })
+}
+
+test('FormCatalog open/close topic', async () => {
+  renderSimpleCatalog()
+
+  // Sync barrier
+  await screen.findByText('dict_title')
+
+  const headline = await screen.findByText('topic_title')
+  await userEvent.click(headline)
+  expect(await screen.queryByText('dict_title')).not.toBeVisible()
+
+  await userEvent.click(headline)
+  expect(await screen.findByText('dict_title')).toBeVisible()
+})
+
+test.skip('FormCatalog collapse/open all - skipped until the toggle gets a better implementation', async () => {
+  renderSimpleCatalog()
+  await screen.findByText('dict_title')
+
+  await userEvent.click(screen.getByText('Collapse all'))
+  expect(await screen.queryByText('dict_title')).not.toBeVisible()
+
+  await userEvent.click(screen.getByText('Open all'))
+  expect(await screen.findByText('dict_title')).toBeVisible()
+})
+
+test('FormCatalog default value', async () => {
+  function getDefinition(stringIdent: string) {
+    return {
+      spec: {
+        type: 'catalog',
+        title: 'catalog title',
+        help: 'catalog help',
+        validators: [],
+        elements: [
+          {
+            name: 'topic_name',
+            title: 'topic_title',
+            elements: [
+              {
+                name: 'some_ut_key',
+                type: 'topic_element',
+                required: true,
+                default_value: {},
+                parameter_form: getDictionaryFormspec(
+                  {
+                    title: 'ut embedded dictionary title'
+                    // this title will be moved into the catalog and displayed there a title
+                  },
+                  [
+                    {
+                      name: stringIdent,
+                      required: true,
+                      parameter_form: getStringFormspec('title of string input'),
+                      default_value: 'ut_string_1 default value'
+                    }
+                  ]
+                )
+              }
+            ],
+            locked: null
+          }
+        ]
+      } as Catalog,
+      data: { topic_name: { some_ut_key: {} } },
+      backendValidation: []
+    }
+  }
+  const { getCurrentData, rerender } = await renderForm(getDefinition('ut_string_1_name_default'))
+
+  // wait until everything is rendered:
+  await screen.findByText('title of string input')
+
+  expect(getCurrentData()).toBe(
+    '{"topic_name":{"some_ut_key":{"ut_string_1_name_default":"ut_string_1 default value"}}}'
+  )
+
+  await rerender(getDefinition('some_other_string_indent'))
+
+  expect(getCurrentData()).toBe(
+    '{"topic_name":{"some_ut_key":{"some_other_string_indent":"ut_string_1 default value"}}}'
+  )
+})
+
+test('FormCatalog backend validation', async () => {
+  const spec = {
+    spec: {
+      type: 'catalog',
+      title: 'catalog title',
+      help: 'catalog help',
+      validators: [],
+      elements: [
+        {
+          name: 'topic_name',
+          title: 'topic_title',
+          elements: [
+            {
+              name: 'ut_topic_element_1',
+              type: 'topic_element',
+              default_value: {},
+              required: true,
+              parameter_form: getDictionaryFormspec({}, [
+                {
+                  name: 'ut_topic_1_dict_1',
+                  parameter_form: getStringFormspec('ut_topic_1_dict_1_key_1')
+                }
+              ])
+            },
+            {
+              name: 'ut_topic_element_2',
+              type: 'topic_element',
+              default_value: {},
+              required: true,
+              parameter_form: getDictionaryFormspec({}, [
+                {
+                  name: 'ut_topic_2_dict_1',
+                  parameter_form: getStringFormspec('ut_topic_2_dict_1_key_1')
+                }
+              ])
+            }
+          ],
+          locked: null
+        }
+      ]
+    } as Catalog,
+    data: {
+      topic_name: {
+        ut_topic_element_1: { ut_topic_1_dict_1: '' },
+        ut_topic_element_2: { ut_topic_2_dict_1: '' }
+      }
+    },
+    backendValidation: [
+      {
+        location: ['topic_name', 'ut_topic_element_1', 'ut_topic_1_dict_1'],
+        message: 'ut_error_1',
+        replacement_value: ''
+      },
+      {
+        location: ['topic_name', 'ut_topic_element_2', 'ut_topic_2_dict_1'],
+        message: 'ut_error_2',
+        replacement_value: ''
+      }
+    ]
+  }
+  await renderForm(spec)
+  expect(await screen.findAllByText('ut_error_1')).toHaveLength(1)
+  expect(await screen.findAllByText('ut_error_2')).toHaveLength(1)
+})
+
+test('FormCatalog locked topic', async () => {
+  const spec = {
+    spec: {
+      type: 'catalog',
+      title: 'catalog title',
+      help: 'catalog help',
+      validators: [],
+      elements: [
+        {
+          name: 'topic_name',
+          title: 'topic_title',
+          elements: [
+            {
+              name: 'some_ut_key',
+              type: 'topic_element',
+              required: true,
+              default_value: {},
+              parameter_form: getDictionaryFormspec(
+                {
+                  title: 'ut embedded dictionary title'
+                  // this title will be moved into the catalog and displayed there a title
+                },
+                [
+                  {
+                    name: 'ut_string_1_name',
+                    required: true,
+                    parameter_form: getStringFormspec('title of string input'),
+                    default_value: 'ut_string_1 default value'
+                  }
+                ]
+              )
+            }
+          ],
+          locked: null
+        },
+        {
+          name: 'topic_name_locked',
+          title: 'topic_title_locked',
+          elements: [
+            {
+              name: 'some_ut_key_locked',
+              type: 'topic_element',
+              required: true,
+              default_value: {},
+              parameter_form: getDictionaryFormspec(
+                {
+                  title: 'ut embedded dictionary title locked'
+                  // this title will be moved into the catalog and displayed there a title
+                },
+                [
+                  {
+                    name: 'ut_string_1_name_locked',
+                    required: true,
+                    parameter_form: getStringFormspec('title of string input locked'),
+                    default_value: 'ut_string_1 default value_locked'
+                  }
+                ]
+              )
+            }
+          ],
+          locked: { message: 'This topic is locked' }
+        }
+      ]
+    } as Catalog,
+    data: { topic_name: { some_ut_key: {} } },
+    backendValidation: []
+  }
+  await renderForm(spec)
+  await screen.getByText('This topic is locked')
+  expect(screen.queryByText('ut embedded dictionary title')).toBeInTheDocument()
+  expect(screen.queryByText('ut embedded dictionary title locked')).not.toBeInTheDocument()
+})

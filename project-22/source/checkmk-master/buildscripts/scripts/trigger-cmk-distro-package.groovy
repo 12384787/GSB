@@ -1,0 +1,182 @@
+#!groovy
+
+/// file: trigger-cmk-distro-package.groovy
+
+/// Triggers builds of all artifacts required to build a distribution package
+/// (.rpm, .dep, etc.) for a given edition/distribution at a given git hash
+/// triggers the actual package build after all required artifacts are available
+/// and finally triggers the signing job. If any of these steps fail no onwards
+/// jobs are started to save resources
+
+// groovylint-disable MethodSize
+void main() {
+    check_job_parameters([
+        "CIPARAM_OVERRIDE_DOCKER_TAG_BUILD",
+        "DISABLE_CACHE",
+        ["DISTRO", true],
+        ["EDITION", true],
+        "FAKE_ARTIFACTS",
+        ["VERSION", true],
+    ]);
+
+    def versioning = load("${checkout_dir}/buildscripts/scripts/utils/versioning.groovy");
+    def package_helper = load("${checkout_dir}/buildscripts/scripts/utils/package_helper.groovy");
+
+    def safe_branch_name = versioning.safe_branch_name();
+    def branch_base_folder = package_helper.branch_base_folder(false);
+    def branch_version = versioning.get_branch_version(checkout_dir);
+    def causes = currentBuild.getBuildCauses();
+    def cmk_version_rc_aware = versioning.get_cmk_version(safe_branch_name, branch_version, version);
+    def cmk_version = versioning.strip_rc_number_from_version(cmk_version_rc_aware);
+
+    def disable_cache = params.DISABLE_CACHE;
+    def disable_signing = params.DISABLE_CMK_DISTRO_PACKAGE_SIGNING;
+    def distro = params.DISTRO;
+    def edition = params.EDITION;
+    def fake_artifacts = params.FAKE_ARTIFACTS;
+    def force_build = params.DISABLE_JENKINS_CACHE == true;
+    def version = params.VERSION;
+
+    def bazel_log_prefix = "bazel_log_";
+    def signing_build_instance = null;
+    def cmk_distro_package_build_instance = null;
+    def triggerd_by = "";
+
+    for (cause in causes) {
+        if (cause.upstreamProject != null) {
+            triggerd_by += cause.upstreamProject + "/" + cause.upstreamBuild + "\n";
+        }
+    }
+
+    print(
+        """
+        |===== CONFIGURATION ===============================
+        |checkout_dir:............. │${checkout_dir}│
+        |disable_cache:............ │${disable_cache}│
+        |disable_signing:.......... │${disable_signing}│
+        |distro:................... │${distro}│
+        |edition:.................. │${edition}│
+        |fake_artifacts:........... │${fake_artifacts}│
+        |force_build:.............. │${force_build}│
+        |safe_branch_name:......... │${safe_branch_name}│
+        |triggerd_by:.............. │${triggerd_by}│
+        |===================================================
+        """.stripMargin());
+
+    // this is a quick fix for FIPS based tests, see CMK-20851
+    if (params.CIPARAM_OVERRIDE_BUILD_NODE == "fips") {
+        // Builds can not be done on FIPS node
+        error("Package builds can not be done on FIPS node");
+    }
+
+    // to get the same path hash as the sub jobs triggered by this job, the "Prepare workspace" has to be done here
+    // as the sub jobs do this task as well and here a different Windows build would be requested compared to the sub jobs
+    stage("Prepare workspace") {
+        inside_container_minimal(safe_branch_name: safe_branch_name) {
+            dir("${checkout_dir}") {
+                versioning.configure_checkout_folder(edition, cmk_version);
+            }
+        }
+    }
+
+    inside_container_minimal(safe_branch_name: safe_branch_name) {
+        def stages = [:];
+
+        if (!fake_artifacts) {
+            stages += package_helper.provide_agent_binaries(
+                version: version,
+                cmk_version: cmk_version,
+                edition: edition,
+                disable_cache: disable_cache,
+                bisect_comment: params.CIPARAM_BISECT_COMMENT,
+                move_artifacts: false,
+            );
+        }
+
+        // execute Windows agent, windows modules, linux agent and BOM in parallel
+        currentBuild.result = parallel(stages).values().every { it } ? "SUCCESS" : "FAILURE";
+
+        smart_stage(
+            name: "Trigger Build package",
+            condition: currentBuild.result == "SUCCESS",
+            raiseOnError: true,
+        ) {
+            cmk_distro_package_build_instance = smart_build(
+                // see global-defaults.yml, needs to run in minimal container
+                use_upstream_build: true,
+                force_build: force_build,
+                relative_job_name: "${branch_base_folder}/builders/build-cmk-distro-package",
+                build_params: [
+                    CUSTOM_GIT_REF: effective_git_ref,
+                    VERSION: version,
+                    EDITION: edition,
+                    DISTRO: distro,
+                    DISABLE_CACHE: disable_cache,
+                    DISABLE_CMK_DISTRO_PACKAGE_SIGNING: disable_signing,
+                    FAKE_ARTIFACTS: fake_artifacts,
+                    CIPARAM_OVERRIDE_DOCKER_TAG_BUILD: params.CIPARAM_OVERRIDE_DOCKER_TAG_BUILD,
+                ],
+                build_params_no_check: [
+                    CIPARAM_OVERRIDE_BUILD_NODE: params.CIPARAM_OVERRIDE_BUILD_NODE,
+                    CIPARAM_CLEANUP_WORKSPACE: params.CIPARAM_CLEANUP_WORKSPACE,
+                    CIPARAM_BISECT_COMMENT: params.CIPARAM_BISECT_COMMENT,
+                ],
+                no_remove_others: true, // do not delete other files in the dest dir
+                download: disable_signing,  // if signing is disabled (true), download the artifacts at this point in time
+                dest: "${checkout_dir}",
+            );
+        }
+
+        smart_stage(
+            name: "Trigger Sign package",
+            condition: currentBuild.result == "SUCCESS" && disable_signing == false,
+            raiseOnError: true,
+        ) {
+            signing_build_instance = smart_build(
+                // see global-defaults.yml, needs to run in minimal container
+                use_upstream_build: true,
+                force_build: force_build,
+                relative_job_name: "${branch_base_folder}/builders/sign-cmk-distro-package",
+                build_params: [
+                    CUSTOM_GIT_REF: effective_git_ref,
+                    VERSION: version,
+                    EDITION: edition,
+                    DISTRO: distro,
+                    DISABLE_CACHE: disable_cache,
+                    FAKE_ARTIFACTS: fake_artifacts,
+                ],
+                build_params_no_check: [
+                    CIPARAM_OVERRIDE_BUILD_NODE: params.CIPARAM_OVERRIDE_BUILD_NODE,
+                    CIPARAM_CLEANUP_WORKSPACE: params.CIPARAM_CLEANUP_WORKSPACE,
+                    CIPARAM_BISECT_COMMENT: params.CIPARAM_BISECT_COMMENT,
+                ],
+                no_remove_others: true, // do not delete other files in the dest dir
+                download: true,
+                dest: "${checkout_dir}",
+            );
+        }
+    }
+
+    def archive_condition = signing_build_instance && signing_build_instance.result.toString() == "SUCCESS";
+    // if signing is disabled (true), the artifacts are downloaded from the Trigger CMK build job
+    if (disable_signing) {
+        archive_condition = cmk_distro_package_build_instance && cmk_distro_package_build_instance.result.toString() == "SUCCESS";
+    }
+
+    smart_stage(
+        name: "Archive stuff",
+        condition: archive_condition,
+        raiseOnError: true,
+    ) {
+        dir("${checkout_dir}") {
+            show_duration("archiveArtifacts") {
+                archiveArtifacts(
+                    artifacts: "*.deb, *.rpm, *.cma, ${bazel_log_prefix}*, bill-of-materials.*",
+                    fingerprint: true,
+                );
+            }
+        }
+    }
+}
+
+return this;

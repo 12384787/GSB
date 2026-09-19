@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+"""Mode for trying out the logwatch patterns"""
+
+import re
+from collections.abc import Collection, Iterable, Mapping, Sequence
+from typing import override
+
+from cmk.ccc.hostaddress import HostName
+from cmk.ccc.site import SiteId
+from cmk.checkengine.plugins import CheckPluginName
+from cmk.gui import forms
+from cmk.gui.breadcrumb import Breadcrumb
+from cmk.gui.config import Config
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.htmllib.generator import HTMLWriter
+from cmk.gui.htmllib.html import html
+from cmk.gui.http import request
+from cmk.gui.i18n import _
+from cmk.gui.page_menu import (
+    make_simple_link,
+    PageMenu,
+    PageMenuDropdown,
+    PageMenuEntry,
+    PageMenuTopic,
+)
+from cmk.gui.search.matchers import (
+    ABCMatchItemGenerator,
+    MatchItem,
+    MatchItemGeneratorRegistry,
+    MatchItems,
+)
+from cmk.gui.table import Foldable, table_element
+from cmk.gui.utils.roles import UserPermissions
+from cmk.gui.wato.pages.rulesets import ModeEditRuleset
+from cmk.gui.watolib.automations import (
+    make_automation_config,
+)
+from cmk.gui.watolib.check_mk_automations import (
+    analyse_service,
+    analyze_service_rule_matches,
+    get_service_name,
+)
+from cmk.gui.watolib.config_hostname import ConfigHostname
+from cmk.gui.watolib.hosts_and_folders import (
+    folder_from_request,
+    folder_preserving_link,
+    folder_tree,
+)
+from cmk.gui.watolib.mode import ModeRegistry, WatoMode
+from cmk.gui.watolib.rulesets import Rule, rules_grouped_by_folder, SingleRulesetRecursively
+from cmk.gui.watolib.utils import mk_repr
+from cmk.livestatus_client import SiteConfiguration
+from cmk.utils.automation_config import LocalAutomationConfig, RemoteAutomationConfig
+from cmk.web.utils.html import HTML
+from cmk.web.utils.icons import IconNames, StaticIcon
+from cmk.web.utils.permission_verification import PermissionName
+from cmk.web.utils.urls import makeuri_contextless
+
+
+def _level_state(level: str) -> int:
+    return {"W": 1, "C": 2, "O": 0}.get(level, 0)
+
+
+def _level_name(level: str) -> str:
+    return {"W": "WARN", "C": "CRIT", "O": "OK"}.get(level, "OK")
+
+
+def _logwatch_level_name(level: str) -> str:
+    return {"O": "OK", "W": "WARN", "C": "CRIT", "I": "IGNORE"}[level]
+
+
+def register(
+    mode_registry: ModeRegistry,
+    match_item_generator_registry: MatchItemGeneratorRegistry,
+) -> None:
+    mode_registry.register(ModePatternEditor)
+    match_item_generator_registry.register(
+        MatchItemGeneratorLogfilePatternAnalyzer("logfile_pattern_analyzer", provider="setup")
+    )
+
+
+class ModePatternEditor(WatoMode):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "pattern_editor"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["pattern_editor"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeEditRuleset
+
+    @override
+    def breadcrumb(self) -> Breadcrumb:
+        # The ModeEditRuleset.breadcrumb_item does not know anything about the fact that this mode
+        # is a child of the logwatch_rules ruleset. It can not construct the correct link to the
+        # logwatch_rules ruleset in the breadcrumb. We hand over the ruleset variable name that we
+        # are interested in to the mode. It's a bit hacky to do it this way, but it's currently the
+        # only way to get these information to the modes breadcrumb method.
+        with request.stashed_vars():
+            request.set_var("varname", "logwatch_rules")
+            request.del_var("host")
+            request.del_var("service")
+            return super().breadcrumb()
+
+    @override
+    def _from_vars(self) -> None:
+        try:
+            self._hostname = HostName(self._vs_host().from_html_vars("host"))
+        except ValueError as e:
+            raise MKUserError("host", str(e))
+        self._vs_host().validate_value(self._hostname, "host")
+
+        # TODO: validate all fields
+        self._item = request.get_str_input_mandatory("file", "")
+        self._match_txt = request.get_str_input_mandatory("match", "")
+
+        self._tree = folder_tree()
+        self._host = folder_from_request(self._tree, request.var("folder"), self._hostname).host(
+            self._hostname
+        )
+
+        if self._hostname and not self._host:
+            raise MKUserError(None, _("This host does not exist."))
+
+        if self._item and not self._hostname:
+            raise MKUserError(None, _("You need to specify a host name to test file matching."))
+
+    @staticmethod
+    def title_pattern_analyzer() -> str:
+        return _("Log file pattern analyzer")
+
+    @override
+    def title(self) -> str:
+        if not self._hostname and not self._item:
+            return self.title_pattern_analyzer()
+        if not self._hostname:
+            return _("Log file patterns of log file %(item)s on all hosts") % {"item": self._item}
+        if not self._item:
+            return _("Log file patterns of host %(hostname)s") % {"hostname": self._hostname}
+        return _("Log file patterns of log file %(item)s on host %(hostname)s") % {
+            "item": self._item,
+            "hostname": self._hostname,
+        }
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        return PageMenu(
+            dropdowns=[
+                PageMenuDropdown(
+                    name="related",
+                    title=_("Related"),
+                    topics=[
+                        PageMenuTopic(
+                            title=_("Monitoring"),
+                            entries=list(self._page_menu_entries_related()),
+                        ),
+                    ],
+                ),
+            ],
+            breadcrumb=breadcrumb,
+        )
+
+    def _page_menu_entries_related(self) -> Iterable[PageMenuEntry]:
+        if not self._host:
+            return
+
+        yield PageMenuEntry(
+            title=_("Host log files"),
+            icon_name=StaticIcon(IconNames.logwatch),
+            item=make_simple_link(
+                makeuri_contextless(request, [("host", self._hostname)], filename="logwatch.py")
+            ),
+        )
+
+        if self._item:
+            yield PageMenuEntry(
+                title=("Show log file"),
+                icon_name=StaticIcon(IconNames.logwatch),
+                item=make_simple_link(
+                    makeuri_contextless(
+                        request,
+                        [("host", self._hostname), ("file", self._item)],
+                        filename="logwatch.py",
+                    )
+                ),
+            )
+
+    @override
+    def page(self, config: Config) -> None:
+        html.help(
+            _(
+                "On this page you can test the defined log file patterns against a custom text, "
+                "for example a line from a log file. Using this dialog it is possible to analyze "
+                "and debug your whole set of log file patterns."
+            )
+        )
+
+        self._show_try_form()
+        self._show_patterns(site_configs=config.sites, debug=config.debug)
+
+    def _show_try_form(self) -> None:
+        with html.form_context("try"):
+            forms.header(_("Try pattern match"))
+            forms.section(_("Host name"))
+            self._vs_host().render_input("host", self._hostname)
+            forms.section(_("Log file"))
+            html.help(_("Here, you need to insert the original file or path name."))
+            html.text_input(varname="file", size=80)
+            forms.section(_("Text to match"))
+            html.help(
+                _(
+                    "You can insert some text (e.g. a line of the log file) to test the patterns defined "
+                    "for this log file. All patterns for this log file are listed below. Matching patterns "
+                    'will be highlighted after clicking the "Try out" button.'
+                )
+            )
+            html.text_input(varname="match", cssclass="match", size=100)
+            forms.end()
+            html.button("_try", _("Try out"))
+            request.del_var("folder")  # Never hand over the folder here
+            html.hidden_fields()
+
+    def _vs_host(self) -> ConfigHostname:
+        return ConfigHostname()
+
+    def _show_patterns(
+        self, *, site_configs: Mapping[SiteId, SiteConfiguration], debug: bool
+    ) -> None:
+        ruleset = SingleRulesetRecursively.load_single_ruleset_recursively(
+            folder_tree(), "logwatch_rules"
+        ).get("logwatch_rules")
+
+        html.h3(_("Log file patterns"))
+        if ruleset.is_empty():
+            html.open_div(class_="info")
+            html.write_text_permissive(
+                "There are no logfile patterns defined. You may create "
+                'logfile patterns using the <a href="%s">Rule Editor</a>.'
+                % folder_preserving_link(
+                    request,
+                    [
+                        ("mode", "edit_ruleset"),
+                        ("varname", "logwatch_rules"),
+                    ],
+                )
+            )
+            html.close_div()
+
+        # Loop all rules for this ruleset
+        already_matched = False
+        abs_rulenr = 0
+        target_folder = folder_from_request(
+            self._tree, request.var("folder"), request.get_ascii_input("host")
+        )
+
+        rules = ruleset.get_rules()
+        rule_match_results = (
+            self._analyze_rule_matches(
+                make_automation_config(site_configs[self._host.site_id()]),
+                self._hostname,
+                self._item,
+                [r[2] for r in rules],
+                debug=debug,
+            )
+            if self._hostname and self._host
+            else {}
+        )
+
+        for folder, folder_rules in rules_grouped_by_folder(rules, target_folder):
+            with table_element(
+                f"logfile_patterns_{folder.ident()}",
+                title="%s %s (%d)"
+                % (
+                    _("Rules in folder"),
+                    folder.alias_path(),
+                    ruleset.num_rules_in_folder(folder),
+                ),
+                css="logwatch",
+                searchable=False,
+                sortable=False,
+                limit=0,
+                foldable=Foldable.FOLDABLE_SAVE_STATE,
+                omit_update_header=True,
+            ) as table:
+                for _folder, rulenr, rule in folder_rules:
+                    # If no host/file given match all rules
+                    rule_matches = rule_match_results[rule.id] if rule_match_results else False
+
+                    abs_rulenr += 1
+
+                    # TODO: What's this?
+                    pattern_list = rule.value
+                    if isinstance(pattern_list, dict):
+                        pattern_list = pattern_list["reclassify_patterns"]
+
+                    # Each rule can hold no, one or several patterns. Loop them all here
+                    for state, pattern, comment in pattern_list:
+                        match_class = ""
+                        disp_match_txt = HTML.empty()
+                        match_img = StaticIcon(IconNames.trans)
+                        if rule_matches:
+                            # Applies to the given host/service
+                            matched = re.search(pattern, self._match_txt)
+                            if matched:
+                                # Prepare highlighted search txt
+                                match_start = matched.start()
+                                match_end = matched.end()
+                                disp_match_txt = (
+                                    HTML.with_escaping(self._match_txt[:match_start])
+                                    + HTMLWriter.render_span(
+                                        self._match_txt[match_start:match_end], class_="match"
+                                    )
+                                    + HTML.with_escaping(self._match_txt[match_end:])
+                                )
+
+                                if not already_matched:
+                                    # First match
+                                    match_class = "match first"
+                                    match_img = StaticIcon(IconNames.checkmark)
+                                    match_title = _(
+                                        "This log file pattern matches first and will be used for "
+                                        "defining the state of the given line."
+                                    )
+                                    already_matched = True
+                                else:
+                                    # subsequent match
+                                    match_class = "match"
+                                    match_img = StaticIcon(IconNames.checkmark_orange)
+                                    match_title = _(
+                                        "This log file pattern matches but another matched first."
+                                    )
+                            else:
+                                match_img = StaticIcon(IconNames.hyphen)
+                                match_title = _(
+                                    "This log file pattern does not match the given string."
+                                )
+                        else:
+                            # rule does not match
+                            match_img = StaticIcon(IconNames.hyphen)
+                            match_title = _("The rule conditions do not match.")
+
+                        table.row()
+                        table.cell("#", css=["narrow nowrap"])
+                        html.write_text_permissive(rulenr)
+                        table.cell(_("Match"))
+                        html.static_icon(match_img, title=match_title)
+
+                        cls = (
+                            ["state%d" % _level_state(state), "fillbackground"]
+                            if match_class == "match first"
+                            else []
+                        )
+
+                        table.cell(
+                            _("Checkmk state"),
+                            HTMLWriter.render_span(_level_name(state)),
+                            css=cls,
+                        )
+                        table.cell(
+                            _("Logwatch state"),
+                            HTMLWriter.render_span(_logwatch_level_name(state)),
+                            css=cls,
+                        )
+                        table.cell(_("Pattern"), HTMLWriter.render_tt(pattern))
+                        table.cell(_("Comment"), comment)
+                        table.cell(_("Matched line"), disp_match_txt)
+
+                    table.row(fixed=True, collect_headers=False)
+                    table.cell(colspan=7)
+                    edit_url = folder_preserving_link(
+                        request,
+                        [
+                            ("mode", "edit_rule"),
+                            ("varname", "logwatch_rules"),
+                            ("rulenr", rulenr),
+                            ("item", mk_repr(self._item).decode()),
+                            ("rule_folder", folder.path()),
+                            ("rule_id", rule.id),
+                        ],
+                    )
+                    html.icon_button(edit_url, _("Edit this rule"), StaticIcon(IconNames.edit))
+
+    def _analyze_rule_matches(
+        self,
+        automation_config: LocalAutomationConfig | RemoteAutomationConfig,
+        host_name: HostName,
+        item: str,
+        rules: Sequence[Rule],
+        *,
+        debug: bool,
+    ) -> dict[str, bool]:
+        service_desc = get_service_name(
+            host_name, CheckPluginName("logwatch"), item, debug=debug
+        ).service_name
+        service_labels = analyse_service(
+            automation_config,
+            host_name,
+            service_desc,
+            debug=debug,
+        ).labels
+
+        return {
+            rule_id: bool(matches)
+            for rule_id, matches in analyze_service_rule_matches(
+                host_name,
+                item,
+                service_labels,
+                [r.to_single_base_ruleset() for r in rules],
+                debug=debug,
+            ).results.items()
+            for rule in rules
+        }
+
+
+class MatchItemGeneratorLogfilePatternAnalyzer(ABCMatchItemGenerator):
+    @override
+    def generate_match_items(self, user_permissions: UserPermissions) -> MatchItems:
+        title = ModePatternEditor.title_pattern_analyzer()
+        yield MatchItem(
+            title=title,
+            topic=_("Miscellaneous"),
+            url=makeuri_contextless(
+                request,
+                [("mode", ModePatternEditor.name())],
+                filename="wato.py",
+            ),
+            match_texts=[title],
+        )
+
+    @staticmethod
+    @override
+    def is_affected_by_change(_change_action_name: str) -> bool:
+        return False
+
+    @property
+    @override
+    def is_localization_dependent(self) -> bool:
+        return True

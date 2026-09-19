@@ -1,0 +1,13 @@
+fastapi
+gunicorn
+h11
+httpx2
+python-dateutil
+python-multipart
+requests
+starlette
+uvicorn
+uvicorn-worker
+pydantic
+pydantic-core
+tenacity

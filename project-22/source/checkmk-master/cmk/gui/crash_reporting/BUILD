@@ -1,0 +1,36 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+
+py_library(
+    name = "crash_reporting",
+    srcs = glob(["**/*.py"]),
+    imports = ["../../.."],
+    visibility = [
+        "//cmk:__subpackages__",
+        "//tests:__subpackages__",
+    ],
+    deps = [
+        "//cmk/gui:auth_core",
+        "//cmk/gui:config",
+        "//cmk/gui:core_toolkit",
+        "//cmk/gui:html_toolkit",
+        "//cmk/gui:page_toolkit",
+        "//cmk/gui:painter_options",
+        "//cmk/gui/data_source",
+        "//cmk/gui/pagetypes",
+        "//cmk/gui/painter:v0_base",
+        "//cmk/gui/userdb",
+        "//cmk/gui/utils:middle",
+        "//cmk/gui/valuespec",
+        "//cmk/gui/views:components",
+        "//cmk/gui/visuals",
+        "//cmk/gui/watolib",
+        "//cmk/gui/watolib:config_infra",
+        "//packages/cmk-ccc:plugin-registry",
+        "//packages/cmk-ccc:site",
+        "//packages/cmk-ccc:version",
+        "//packages/cmk-crash:crash",
+        "//packages/cmk-crash:crash_reporting",
+        "//packages/cmk-livestatus-client",
+        "//packages/cmk-web/cmk/web/utils",
+    ],
+)

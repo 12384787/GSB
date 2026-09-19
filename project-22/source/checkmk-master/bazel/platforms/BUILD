@@ -1,0 +1,106 @@
+load("@bazel_skylib//lib:selects.bzl", "selects")
+
+package(default_visibility = ["//visibility:public"])
+
+selects.config_setting_group(
+    name = "linux_x86_64",
+    match_all = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+platform(
+    name = "x86_64-linux-musl",
+    constraint_values = [
+        ":musl",
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+)
+
+platform(
+    name = "aarch64-linux-musl",
+    constraint_values = [
+        ":musl",
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+    ],
+)
+
+platform(
+    name = "x86_64-windows-msvc",
+    constraint_values = [
+        ":msvc",
+        "@platforms//cpu:x86_64",
+        "@platforms//os:windows",
+    ],
+    # Targeting windows-msvc implies the static CRT: platform flags apply to
+    # every Rust compile in the configuration — dependencies included, like
+    # the [target.'cfg(...)'] rustflags of a plain cargo build — while exec
+    # tools (proc-macros, build scripts) stay unaffected. They take
+    # precedence over the command line, rc files and transitions, so the
+    # invariant cannot be overridden by accident; static_crt_test() asserts
+    # it on the shipped binaries. The matching CRT link libraries and the
+    # /MD -> /MT rewrite for cc-built C sources live in
+    # //bazel/toolchains/cc/clang/xwin/args.
+    flags = [
+        "--@rules_rust//rust/settings:extra_rustc_flags=-Ctarget-feature=+crt-static",
+    ],
+)
+
+constraint_setting(
+    name = "linker",
+    default_constraint_value = ":linker_unknown",
+)
+
+constraint_value(
+    name = "musl",
+    constraint_setting = ":linker",
+)
+
+constraint_value(
+    name = "msvc",
+    constraint_setting = ":linker",
+)
+
+constraint_value(
+    name = "linker_unknown",
+    constraint_setting = ":linker",
+)
+
+platform(
+    name = "x86_64-linux-gcc-hermetic",
+    constraint_values = [
+        ":hermetic",
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+constraint_setting(
+    name = "hermeticity",
+    default_constraint_value = ":hermeticity_unknown",
+    visibility = ["//visibility:public"],
+)
+
+constraint_value(
+    name = "hermetic",
+    constraint_setting = ":hermeticity",
+    visibility = ["//visibility:public"],
+)
+
+constraint_value(
+    name = "hermeticity_unknown",
+    constraint_setting = ":hermeticity",
+    visibility = ["//visibility:public"],
+)
+
+# Config setting using the same constraint_value (hermetic) as //bazel/toolchains/cc/gcc/hermetic
+# This allows select() statements to detect when hermetic platform is active
+config_setting(
+    name = "is_hermetic",
+    constraint_values = [":hermetic"],
+    visibility = ["//visibility:public"],
+)

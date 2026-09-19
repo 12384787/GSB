@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from cmk.gui.i18n import _
+from cmk.gui.plugins.wato.utils import (
+    CheckParameterRulespecWithItem,
+    rulespec_registry,
+    RulespecGroupCheckParametersStorage,
+)
+from cmk.gui.valuespec import Age, Dictionary, DropdownChoice, ListOf, TextInput, Tuple
+
+
+def _item_spec_inotify() -> TextInput:
+    return TextInput(
+        title=_("The file system path, prefixed with <i>File </i> or <i>Folder </i>"),
+    )
+
+
+def _parameter_valuespec_inotify() -> Dictionary:
+    return Dictionary(
+        help=_(
+            "This rule allows you to set levels for specific Inotify changes. "
+            "Keep in mind that you can only monitor operations which are actually "
+            "enabled in the Inotify plug-in. So it might be a good idea to cross check "
+            "these levels here with the configuration rule in the Agent Bakery. "
+        ),
+        elements=[
+            (
+                "age_last_operation",
+                ListOf(
+                    valuespec=Tuple(
+                        elements=[
+                            DropdownChoice(
+                                title=_("Inotify operation"),
+                                choices=[
+                                    ("create", _("Create")),
+                                    ("delete", _("Delete")),
+                                    ("open", _("Open")),
+                                    ("modify", _("Modify")),
+                                    ("access", _("Access")),
+                                    ("movedfrom", _("Moved from")),
+                                    ("movedto", _("Moved to")),
+                                    ("moveself", _("Move self")),
+                                ],
+                            ),
+                            Age(title=_("Warning at")),
+                            Age(title=_("Critical at")),
+                        ],
+                    ),
+                    title=_("Age of last operation"),
+                    movable=False,
+                ),
+            ),
+        ],
+        optional_keys=False,
+    )
+
+
+rulespec_registry.register(
+    CheckParameterRulespecWithItem(
+        check_group_name="inotify",
+        group=RulespecGroupCheckParametersStorage,
+        item_spec=_item_spec_inotify,
+        match_type="dict",
+        parameter_valuespec=_parameter_valuespec_inotify,
+        title=lambda: _("Inotify levels"),
+    )
+)

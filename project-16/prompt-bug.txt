@@ -1,0 +1,5 @@
+任务类型：Bug 修复
+任务难度：困难
+语言/框架：Rust
+
+请在已有的 xberg-io/xberg 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：Polyglot document intelligence with a Rust core: extract text, metadata, images, tables, and structured data from 106 formats across 140 file extensions, plus code intelligence for 371 languages. Fifteen bindings, with CLI, REST API, and MCP server.。围绕真实入口（.agents,.ai-rulez-generated.json .ai-rulez,.alef-generation.toml .alef-ownership.toml,.alef-toml-merge-provenance.toml .cargo,.clang-format .claude-plugin,.dockerignore .editorconfig,.gh-actions-updater.toml .gitattributes,.github .gitignore,.gitmodules .golangci.yml,.hadolint.yaml .lychee.toml,.sdkmanrc .shellcheckrc,.task .textlintignore,.textlintrc.json ATTRIBUTIONS.md,CHANGELOG.md CODE_OF_CONDUCT.md,CONTRIBUTING.md Cargo.lock,Cargo.toml LICENSE,PLATFORM_SUPPORT.md Package.swift,README.md SECURITY.md,THIRD_PARTY_LICENSES.md Taskfile.yml,alef.toml artifacthub-repo.yml,basemind.toml charts,cl）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。

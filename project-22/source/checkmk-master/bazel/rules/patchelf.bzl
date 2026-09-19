@@ -1,0 +1,231 @@
+"""Rules wrapping patchelf."""
+
+def _set_runpath_impl(ctx):
+    """Patches ELF files with the given RUNPATH."""
+    patchelf = ctx.executable._patchelf
+    rpath = ":".join(ctx.attr.rpaths)
+    outputs = []
+    for src in ctx.files.srcs:
+        out = ctx.actions.declare_file(ctx.label.name + "/" + src.basename)
+        arguments = []
+        if ctx.attr.force_rpath:
+            arguments.append("--force-rpath")
+        arguments += ["--set-rpath", rpath, "--output", out.path, src.path]
+        ctx.actions.run(
+            outputs = [out],
+            inputs = [src],
+            executable = patchelf,
+            arguments = arguments,
+            mnemonic = "SetRunpath",
+            progress_message = "Patching %s with RUNPATH %s" % (src.basename, rpath),
+        )
+        outputs.append(out)
+
+    return [DefaultInfo(files = depset(outputs))]
+
+set_runpath = rule(
+    implementation = _set_runpath_impl,
+    attrs = {
+        "force_rpath": attr.bool(
+            default = False,
+            doc = "Pass --force-rpath to patchelf, storing the path in DT_RPATH instead of DT_RUNPATH. Required when the binary uses dlopen() and needs its rpath to be searched for dynamically loaded modules.",
+        ),
+        "rpaths": attr.string_list(
+            default = ["${ORIGIN}"],
+            doc = "RUNPATH entries to set, joined with ':'. Defaults to ['${ORIGIN}'].",
+        ),
+        "srcs": attr.label_list(
+            allow_files = True,
+            doc = "ELF files to patch",
+            mandatory = True,
+        ),
+        "_patchelf": attr.label(
+            cfg = "exec",
+            default = "@patchelf",
+            executable = True,
+        ),
+    },
+    doc = "Sets the RUNPATH of the given ELF files to the given RUNPATH",
+)
+
+def _set_soname_impl(ctx):
+    """Patches ELF files with the given SONAME."""
+    patchelf = ctx.executable._patchelf
+    outputs = []
+    for src in ctx.files.srcs:
+        soname = ctx.attr.soname if ctx.attr.soname else src.basename
+        out = ctx.actions.declare_file(ctx.label.name + "/" + src.basename)
+        ctx.actions.run(
+            outputs = [out],
+            inputs = [src],
+            executable = patchelf,
+            arguments = [
+                "--set-soname",
+                soname,
+                "--output",
+                out.path,
+                src.path,
+            ],
+            mnemonic = "SetSoname",
+            progress_message = "Patching %s with SONAME %s" % (src.basename, soname),
+        )
+        outputs.append(out)
+
+    return [DefaultInfo(files = depset(outputs))]
+
+set_soname = rule(
+    implementation = _set_soname_impl,
+    attrs = {
+        "soname": attr.string(
+            default = "",
+            doc = "SONAME to set. Defaults to the basename of each input file.",
+        ),
+        "srcs": attr.label_list(
+            allow_files = True,
+            doc = "ELF files to patch",
+            mandatory = True,
+        ),
+        "_patchelf": attr.label(
+            cfg = "exec",
+            default = "@patchelf",
+            executable = True,
+        ),
+    },
+    doc = "Sets the SONAME of the given ELF files",
+)
+
+def _set_runpath_tree_impl(ctx):
+    """Patches ELF files within a TreeArtifact with depth-relative RUNPATH."""
+    patchelf = ctx.executable._patchelf
+    tool = ctx.executable._tool
+    src = ctx.file.src
+    out = ctx.actions.declare_directory(ctx.label.name)
+
+    ctx.actions.run(
+        outputs = [out],
+        inputs = [src],
+        tools = [patchelf],
+        executable = tool,
+        arguments = [src.path, out.path, patchelf.path, ctx.attr.rpath],
+        mnemonic = "SetRunpathTree",
+        progress_message = "Patching ELF files in %s with depth-relative RUNPATH" % src.basename,
+    )
+    return [DefaultInfo(files = depset([out]))]
+
+def _set_runpath_whl_impl(ctx):
+    """Patches the ELF files inside a wheel and writes a new wheel."""
+    patchelf = ctx.executable._patchelf
+    tool = ctx.executable._tool
+    src = ctx.file.whl
+    out = ctx.actions.declare_file(ctx.label.name + ".whl")
+
+    ctx.actions.run(
+        outputs = [out],
+        inputs = [src],
+        tools = [patchelf],
+        executable = tool,
+        arguments = [src.path, out.path, patchelf.path, ctx.attr.rpath],
+        mnemonic = "SetRunpathWhl",
+        progress_message = "Patching ELF files in wheel %s with depth-relative RUNPATH" % src.basename,
+    )
+    return [DefaultInfo(files = depset([out]))]
+
+def _add_runpath_impl(ctx):
+    """Appends RUNPATH entries to ELF files, preserving any existing RUNPATH."""
+    patchelf = ctx.executable._patchelf
+    rpath = ":".join(ctx.attr.rpaths)
+    outputs = []
+    for src in ctx.files.srcs:
+        out = ctx.actions.declare_file(ctx.label.name + "/" + src.basename)
+        arguments = []
+        if ctx.attr.force_rpath:
+            arguments.append("--force-rpath")
+        arguments += ["--add-rpath", rpath, "--output", out.path, src.path]
+        ctx.actions.run(
+            outputs = [out],
+            inputs = [src],
+            executable = patchelf,
+            arguments = arguments,
+            mnemonic = "AppendRunpath",
+            progress_message = "Appending RUNPATH %s to %s" % (src.basename, rpath),
+        )
+        outputs.append(out)
+
+    return [DefaultInfo(files = depset(outputs))]
+
+add_runpath = rule(
+    implementation = _add_runpath_impl,
+    attrs = {
+        "force_rpath": attr.bool(
+            default = False,
+            doc = "Pass --force-rpath to patchelf, storing the path in DT_RPATH instead of DT_RUNPATH.",
+        ),
+        "rpaths": attr.string_list(
+            default = ["${ORIGIN}"],
+            doc = "RUNPATH entries to append, joined with ':'. Appended after any existing RUNPATH.",
+        ),
+        "srcs": attr.label_list(
+            allow_files = True,
+            doc = "ELF files to patch",
+            mandatory = True,
+        ),
+        "_patchelf": attr.label(
+            cfg = "exec",
+            default = "@patchelf",
+            executable = True,
+        ),
+    },
+    doc = "Appends entries to the RUNPATH of the given ELF files, preserving any existing RUNPATH",
+)
+
+set_runpath_tree = rule(
+    implementation = _set_runpath_tree_impl,
+    attrs = {
+        "rpath": attr.string(
+            doc = "RUNPATH for files at the top level of the tree. Deeper files get extra '..' segments appended.",
+            mandatory = True,
+        ),
+        "src": attr.label(
+            allow_single_file = True,
+            doc = "TreeArtifact directory whose ELF files will be patched",
+            mandatory = True,
+        ),
+        "_patchelf": attr.label(
+            cfg = "exec",
+            default = "@patchelf",
+            executable = True,
+        ),
+        "_tool": attr.label(
+            cfg = "exec",
+            default = "//bazel/rules:set_runpath_tree",
+            executable = True,
+        ),
+    },
+    doc = "Sets the RUNPATH of all ELF files within a directory TreeArtifact to depth-relative paths",
+)
+
+set_runpath_whl = rule(
+    implementation = _set_runpath_whl_impl,
+    attrs = {
+        "rpath": attr.string(
+            doc = "RUNPATH for ELF files at the top level of the wheel. Deeper files get extra '..' segments appended.",
+            mandatory = True,
+        ),
+        "whl": attr.label(
+            allow_single_file = True,
+            doc = "Wheel whose ELF files will be patched.",
+            mandatory = True,
+        ),
+        "_patchelf": attr.label(
+            cfg = "exec",
+            default = "@patchelf",
+            executable = True,
+        ),
+        "_tool": attr.label(
+            cfg = "exec",
+            default = "//bazel/rules:set_runpath_whl",
+            executable = True,
+        ),
+    },
+    doc = "Sets the RUNPATH of all ELF files within a wheel to depth-relative paths, producing a new wheel",
+)

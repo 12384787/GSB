@@ -1,0 +1,11 @@
+# Default include mappings for Checkmk
+[
+  { ref: asio.imp },
+  { include: ["<bits/stdint-least.h>", private, "<stdint.h>", public ] },
+  { include: ["<linux/if_ether.h>", private, "<netinet/if_ether.h>", public ] },
+  { include: ["<pcap/bpf.h>", private, "<pcap.h>", public ] },
+  { include: ["<pcap/dlt.h>", private, "<pcap.h>", public ] },
+  { include: ["<pcap/pcap.h>", private, "<pcap.h>", public ] },
+  { symbol: ["std::hash", private, "<functional>", public ] },
+  { symbol: ["std::vector", private, "<vector>", public ] },
+]

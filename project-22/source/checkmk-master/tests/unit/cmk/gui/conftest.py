@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# ruff: noqa: ARG001  # Unused fixtures are needed for setup side effects
+
+# mypy: disable-error-code="explicit-any"
+
+
+import typing
+from collections.abc import Iterator
+from unittest.mock import MagicMock, patch
+
+import pytest
+from flask import Flask
+from pytest_mock import MockerFixture
+from werkzeug.test import create_environ
+
+import cmk.gui.watolib.password_store
+import cmk.utils.paths
+from cmk.ccc.hostaddress import HostName
+from cmk.ccc.user import UserId
+from cmk.ccc.version import Edition
+from cmk.gui import http, login
+from cmk.gui.config import Config
+from cmk.gui.permissions import permission_registry
+from cmk.gui.utils.roles import UserPermissions
+from cmk.livestatus_client.testing import mock_livestatus_communication, MockLiveStatusConnection
+from cmk.utils.redis import disable_redis
+from tests.testlib.gui.common_fixtures import (
+    create_aut_user_auth_wsgi_app,
+    create_flask_app,
+    create_test_hosts,
+    create_wsgi_app,
+    inline_background_jobs_patches,
+    patch_theme_context,
+    perform_gui_cleanup_after_test,
+    perform_load_config,
+    perform_load_plugins,
+    RemoteAutomation,
+    set_config_context,
+    suppress_remote_automation_calls_patches,
+    validate_background_job_annotation,
+)
+from tests.testlib.gui.users import create_and_destroy_user
+from tests.testlib.gui.web_test_app import (
+    SetConfig,
+    WebTestAppForCMK,
+    WebTestAppRequestHandler,
+)
+from tests.testlib.rest_api_client import ClientRegistry, get_client_registry
+
+
+@pytest.fixture
+def mock_password_file_regeneration(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cmk.gui.watolib.password_store,
+        cmk.gui.watolib.password_store.update_passwords_merged_file.__name__,
+        lambda: None,
+    )
+
+
+@pytest.fixture(autouse=True)  # ruff: ignore[pytest-fixture-autouse]
+def deactivate_redis(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Disable redis for all GUI unit tests by default
+
+    The flask_app fixture patches the redis client with a reachable fakeredis
+    instance. This makes the FolderTree pick its redis-backed folder cache,
+    which lets e.g. the hosts_and_folders code build its folder caches from disk over and
+    over again in each test, slowing down the tests significantly without any
+    functional benefit.
+
+    Tests that really want to exercise redis code paths (against fakeredis)
+    can request the allow_redis fixture.
+    """
+    if "allow_redis" in request.fixturenames:
+        yield
+        return
+    with disable_redis():
+        yield
+
+
+@pytest.fixture()
+def allow_redis() -> None:
+    """Opt-out of the deactivate_redis fixture (see there)"""
+
+
+@pytest.fixture(autouse=True)  # ruff: ignore[pytest-fixture-autouse]
+def disable_automation_helper(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("_CMK_AUTOMATIONS_FORCE_CLI_INTERFACE", "1")
+
+
+@pytest.fixture(autouse=True)  # ruff: ignore[pytest-fixture-autouse]
+def execute_background_jobs_without_job_scheduler(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("_CMK_BG_JOBS_WITHOUT_JOB_SCHEDULER", "1")
+
+
+@pytest.fixture(autouse=True)  # ruff: ignore[pytest-fixture-autouse]
+def gui_cleanup_after_test(
+    mocker: MockerFixture,
+) -> Iterator[None]:
+    yield from perform_gui_cleanup_after_test(mocker)
+
+
+@pytest.fixture()
+def patch_theme() -> Iterator[None]:
+    yield from patch_theme_context()
+
+
+@pytest.fixture()
+def request_context(flask_app: Flask) -> Iterator[None]:
+    """Empty fixture. Invokes usage of `flask_app` fixture."""
+    yield
+
+
+@pytest.fixture(name="mock_livestatus")
+def fixture_mock_livestatus() -> Iterator[MockLiveStatusConnection]:
+    """UI specific override of the global mock_livestatus fixture"""
+    with (
+        mock_livestatus_communication() as mock_live,
+        patch(
+            "cmk.gui.sites._get_enabled_and_disabled_sites",
+            new=mock_live.enabled_and_disabled_sites,
+        ),
+    ):
+        yield mock_live
+
+
+@pytest.fixture()
+def load_config(request_context: None) -> Iterator[Config]:
+    yield from perform_load_config()
+
+
+@pytest.fixture(name="set_config")
+def set_config_fixture() -> SetConfig:
+    return set_config_context
+
+
+@pytest.fixture(name="remote_site")
+def fixture_remote_site() -> Iterator[None]:
+    """Make the code believe it runs on a distributed-setup remote site."""
+    cmk.utils.paths.check_mk_config_dir.mkdir(parents=True, exist_ok=True)
+    distr_wato_mk = cmk.utils.paths.check_mk_config_dir / "distributed_wato.mk"
+    previous = distr_wato_mk.read_bytes() if distr_wato_mk.exists() else None
+    distr_wato_mk.write_text("is_distributed_setup_remote_site = True\n")
+    try:
+        yield
+    finally:
+        if previous is None:
+            distr_wato_mk.unlink(missing_ok=True)
+        else:
+            distr_wato_mk.write_bytes(previous)
+
+
+@pytest.fixture(scope="session", autouse=True)  # ruff: ignore[pytest-fixture-autouse]
+def load_plugins(test_edition: Edition) -> None:
+    perform_load_plugins(test_edition)
+
+
+@pytest.fixture()
+def ui_context(load_plugins: None, load_config: Config) -> Iterator[None]:
+    """Some helper fixture to provide a initialized UI context to tests outside of tests/unit/cmk/gui"""
+    yield
+
+
+@pytest.fixture()
+def with_user(load_config: Config) -> Iterator[tuple[UserId, str]]:
+    with create_and_destroy_user(automation=False, role="user", config=load_config) as user:
+        yield user
+
+
+@pytest.fixture()
+def with_user_login(load_config: Config, with_user: tuple[UserId, str]) -> Iterator[UserId]:
+    user_id = UserId(with_user[0])
+    with login.TransactionIdContext(
+        user_id, UserPermissions(load_config.roles, permission_registry, {user_id: ["user"]}, [])
+    ):
+        yield user_id
+
+
+@pytest.fixture()
+def with_admin(load_config: Config) -> Iterator[tuple[UserId, str]]:
+    with create_and_destroy_user(automation=False, role="admin", config=load_config) as user:
+        yield user
+
+
+@pytest.fixture()
+def with_admin_login(load_config: Config, with_admin: tuple[UserId, str]) -> Iterator[UserId]:
+    user_id = with_admin[0]
+    with login.TransactionIdContext(
+        user_id, UserPermissions(load_config.roles, permission_registry, {user_id: ["admin"]}, [])
+    ):
+        yield user_id
+
+
+@pytest.fixture()
+def suppress_remote_automation_calls(mocker: MagicMock) -> Iterator[RemoteAutomation]:
+    yield suppress_remote_automation_calls_patches(mocker)
+
+
+@pytest.fixture()
+def inline_background_jobs(mocker: MockerFixture) -> None:
+    inline_background_jobs_patches(mocker)
+
+
+@pytest.fixture()
+def allow_background_jobs() -> None:
+    """Prevents the fail_on_unannotated_background_job_start fixture from raising an error"""
+    return
+
+
+@pytest.fixture(autouse=True)  # ruff: ignore[pytest-fixture-autouse]
+def fail_on_unannotated_background_job_start(
+    request: pytest.FixtureRequest, mocker: MockerFixture
+) -> None:
+    validate_background_job_annotation(request, mocker)
+
+
+@pytest.fixture(name="suppress_bake_agents_in_background")
+def fixture_suppress_bake_agents_in_background(mocker: MockerFixture) -> MagicMock:
+    return mocker.patch(
+        "cmk.gui.watolib.bakery.try_bake_agents_for_hosts",
+        side_effect=lambda *args, **kw: None,  # noqa: ARG005
+    )
+
+
+@pytest.fixture()
+def with_automation_user(load_config: Config) -> Iterator[tuple[UserId, str]]:
+    with create_and_destroy_user(automation=True, role="admin", config=load_config) as user:
+        yield user
+
+
+@pytest.fixture()
+def with_automation_user_not_admin(load_config: Config) -> Iterator[tuple[UserId, str]]:
+    with create_and_destroy_user(automation=True, role="user", config=load_config) as user:
+        yield user
+
+
+@pytest.fixture()
+def with_automation_user_guest(load_config: Config) -> Iterator[tuple[UserId, str]]:
+    with create_and_destroy_user(automation=True, role="guest", config=load_config) as user:
+        yield user
+
+
+@pytest.fixture()
+def auth_request(with_user: tuple[UserId, str]) -> typing.Generator[http.Request]:
+    # NOTE:
+    # REMOTE_USER will be omitted by `flask_app.test_client()` if only passed via an
+    # environment dict. When however a Request is passed in, the environment of the Request will
+    # not be touched.
+    user_id, _ = with_user
+    yield http.Request({**create_environ(path="/NO_SITE/"), "REMOTE_USER": str(user_id)})
+
+
+@pytest.fixture()
+def wsgi_app(flask_app: Flask) -> Iterator[WebTestAppForCMK]:
+    yield from create_wsgi_app(flask_app)
+
+
+@pytest.fixture()
+def logged_in_wsgi_app(
+    wsgi_app: WebTestAppForCMK, with_user: tuple[UserId, str]
+) -> WebTestAppForCMK:
+    _ = wsgi_app.login(with_user[0], with_user[1])
+    return wsgi_app
+
+
+@pytest.fixture()
+def logged_in_admin_wsgi_app(
+    wsgi_app: WebTestAppForCMK, with_admin: tuple[UserId, str]
+) -> WebTestAppForCMK:
+    _ = wsgi_app.login(with_admin[0], with_admin[1])
+    return wsgi_app
+
+
+@pytest.fixture()
+def aut_user_auth_wsgi_app(
+    wsgi_app: WebTestAppForCMK,
+    with_automation_user: tuple[UserId, str],
+) -> WebTestAppForCMK:
+    return create_aut_user_auth_wsgi_app(wsgi_app, with_automation_user)
+
+
+@pytest.fixture()
+def with_host(
+    request_context: None,
+    with_admin_login: UserId,
+) -> Iterator[list[HostName]]:
+    yield from create_test_hosts()
+
+
+@pytest.fixture()
+def flask_app(
+    patch_omd_site: None,
+    use_fakeredis_client: None,
+    load_plugins: None,
+) -> Iterator[Flask]:
+    yield from create_flask_app()
+
+
+@pytest.fixture(name="base_without_version")
+def fixture_base_without_version() -> str:
+    return "/NO_SITE/check_mk/api"
+
+
+@pytest.fixture(name="base")
+def fixture_base(base_without_version: str) -> str:
+    return f"{base_without_version}/1.0"
+
+
+@pytest.fixture()
+def clients(aut_user_auth_wsgi_app: WebTestAppForCMK, base_without_version: str) -> ClientRegistry:
+    return get_client_registry(
+        WebTestAppRequestHandler(aut_user_auth_wsgi_app), base_without_version
+    )

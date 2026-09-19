@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+# Copyright (C) 2021 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import logging
+from collections.abc import Callable, Mapping
+
+import pytest
+
+from cmk.ccc.version import Edition
+from cmk.gui.valuespec import Dictionary, Float, Integer, Tuple
+from cmk.gui.watolib.hosts_and_folders import folder_tree
+from cmk.gui.watolib.rulesets import Rule, Ruleset, RulesetCollection
+from cmk.gui.watolib.rulespec_groups import RulespecGroupMonitoringConfigurationVarious
+from cmk.gui.watolib.rulespecs import HostRulespec, Rulespec
+from cmk.ruleset_matcher.definition import RuleGroup
+from cmk.ruleset_matcher.matcher import RulesetName
+from cmk.update_config.plugins.actions import rulesets as rulesets_updater
+
+_ARTIFICIAL_RULESPECS: Mapping[RulesetName, Rulespec] = {
+    RuleGroup.CheckgroupParameters("ntp_time"): HostRulespec(
+        name=RuleGroup.CheckgroupParameters("ntp_time"),
+        group=RulespecGroupMonitoringConfigurationVarious,
+        valuespec=lambda: Dictionary(
+            elements=[("ntp_levels", Tuple(elements=[Integer(), Float(), Float()]))],
+            optional_keys=True,
+        ),
+    ),
+}
+
+
+def _instantiate_ruleset(
+    ruleset_name: str,
+    param_value: object,
+    rulespec: Rulespec | None = None,
+) -> Ruleset:
+    ruleset = Ruleset(ruleset_name, rulespec=rulespec)
+    folder = folder_tree().root_folder()
+    rule = Rule.from_ruleset(folder, ruleset, ruleset.rulespec.valuespec.default_value())
+    rule.value = param_value
+    ruleset.append_rule(folder, rule)
+    assert ruleset.get_rules()
+    return ruleset
+
+
+@pytest.mark.parametrize(
+    ["rulesets", "n_expected_warnings"],
+    [
+        pytest.param(
+            lambda edition: {  # noqa: ARG005
+                "logwatch_rules": {
+                    "reclassify_patterns": [
+                        ("C", "\\\\x\\\\y\\\\z", "some comment"),
+                        ("W", "\\H", "invalid_regex"),
+                    ]
+                },
+                RuleGroup.CheckgroupParameters("ntp_time"): {
+                    "ntp_levels": (10, 200.0, 500.0),
+                },
+            },
+            2,
+            id="invalid configuration",
+        ),
+        pytest.param(
+            lambda edition: {
+                "logwatch_rules": {
+                    "reclassify_patterns": [
+                        ("C", "\\\\x\\\\y\\\\z", "some comment"),
+                    ]
+                },
+                RuleGroup.CheckgroupParameters("ntp_time"): {
+                    "ntp_levels": (10, 200.0, 500.0),
+                },
+                **(
+                    {}
+                    if edition is Edition.COMMUNITY
+                    else {RuleGroup.ExtraServiceConf("_sla_config"): "i am skipped"}
+                ),
+            },
+            0,
+            id="valid configuration",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("request_context")
+def test_validate_rule_values(
+    caplog: pytest.LogCaptureFixture,
+    test_edition: Edition,
+    rulesets: Callable[[Edition], Mapping[RulesetName, object]],
+    n_expected_warnings: int,
+) -> None:
+    all_rulesets = RulesetCollection(
+        {
+            ruleset_name: _instantiate_ruleset(
+                ruleset_name,
+                rule_value,
+                _ARTIFICIAL_RULESPECS.get(ruleset_name),
+            )
+            for ruleset_name, rule_value in rulesets(test_edition).items()
+        }
+    )
+    caplog.set_level(logging.INFO)
+    rulesets_updater.validate_rule_values(logging.getLogger(), all_rulesets)
+    assert len(caplog.messages) == n_expected_warnings

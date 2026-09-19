@@ -1,0 +1,4 @@
+# Alias: TCP port number for traces
+# Menu: Add-ons
+# Description:
+#  If receiving traces is configured, you can configure the listen port here.

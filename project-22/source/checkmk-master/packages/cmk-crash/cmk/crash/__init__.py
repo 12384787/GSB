@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+"""Minimal crash-reporting library: dataclasses, on-disk store, and fingerprint helpers.
+
+Ported verbatim from ``cmk.ccc.crash_reporting``. Write-time deduplication
+behavior is preserved: the fingerprint helpers and the
+``CrashReportStore.save()`` merge-into-existing logic live in this library
+alongside the store. The public API surface is unchanged from the old module —
+only the import path moves (``cmk.ccc.crash_reporting`` → ``cmk.crash``).
+"""
+
+from cmk.ccc.version_info import VersionInfo
+
+from ._crash import (
+    ABCCrashReport,
+    AggregatedCrashInfo,
+    BaseDetails,
+    ContactDetails,
+    CRASH_INFO_VERSION,
+    CrashInfo,
+    CrashOccurrences,
+    format_var_for_export,
+    make_crash_report_base_path,
+    REDACTED_STRING,
+    RobustJSONEncoder,
+    SENSITIVE_KEYWORDS,
+    SerializedCrashReport,
+)
+from ._fingerprint import (
+    crash_fingerprint,
+    CrashFingerprint,
+    normalize_crash_time,
+    read_occurrences,
+)
+from ._store import (
+    cleanup_crash_reports,
+    CrashReportStore,
+    DEFAULT_MAX_CRASH_AGE,
+    DEFAULT_MAX_CRASHES_TOTAL_SIZE,
+    iter_crash_dirs,
+)
+
+__all__ = [
+    "ABCCrashReport",
+    "AggregatedCrashInfo",
+    "BaseDetails",
+    "cleanup_crash_reports",
+    "ContactDetails",
+    "CRASH_INFO_VERSION",
+    "CrashInfo",
+    "CrashFingerprint",
+    "CrashOccurrences",
+    "CrashReportStore",
+    "DEFAULT_MAX_CRASH_AGE",
+    "DEFAULT_MAX_CRASHES_TOTAL_SIZE",
+    "REDACTED_STRING",
+    "RobustJSONEncoder",
+    "SENSITIVE_KEYWORDS",
+    "SerializedCrashReport",
+    "VersionInfo",
+    "crash_fingerprint",
+    "format_var_for_export",
+    "iter_crash_dirs",
+    "make_crash_report_base_path",
+    "normalize_crash_time",
+    "read_occurrences",
+]

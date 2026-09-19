@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+# Copyright (C) 2023 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from collections.abc import Iterator, Mapping
+from pathlib import Path
+
+from pydantic import BaseModel, model_validator, ValidationInfo
+
+
+class Config(BaseModel):
+    editions: list[tuple[str, str]]
+    components: list[tuple[str, str]]
+    edition_components: dict[str, list[tuple[str, str]]]
+    classes: list[tuple[str, str, str]]
+    levels: list[tuple[str, str]]
+    compatible: list[tuple[str, str]]
+    online_url: str
+    create_commit: bool = True
+    """
+    Should the werk tool automatically create a commit when creating a werk?
+    This option was introduced for cloudmk, they have special requirements for commit messages.
+    """
+    werk_ids_server_url: str = "https://werk-ids.lan.checkmk.net"
+    current_version: str
+
+    def all_components(self) -> list[tuple[str, str]]:
+        return sum(self.edition_components.values(), self.components)
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_current_version_from_context(
+        cls, data: dict[str, object], info: ValidationInfo[Mapping[str, object] | None]
+    ) -> dict[str, object]:
+        """
+        Use the 'current_version' specified via context if it is missing from the model data.
+        """
+        if "current_version" in data:
+            return data
+
+        if (
+            info.context is not None
+            and (context_version := info.context.get("current_version")) is not None
+        ):
+            return data | {"current_version": context_version}
+
+        raise ValueError("current_version must be provided either directly or via context")
+
+
+def try_load_version_from_defines_make_content(
+    defines_make_content: Iterator[bytes],
+) -> str | None:
+    for line in defines_make_content:
+        if line.startswith(b"VERSION"):
+            return line.split(b"=", 1)[1].strip().decode("utf-8")
+    return None
+
+
+def try_load_current_version_from_defines_make(defines_make: Path) -> str | None:
+    try:
+        with defines_make.open("rb") as f:
+            return try_load_version_from_defines_make_content(f)
+    except FileNotFoundError:
+        pass
+
+    return None
+
+
+def load_config(werk_config: Path, *, current_version: str | None = None) -> Config:
+    data: dict[str, object] = {}
+    exec(werk_config.read_text(encoding="utf-8"), data, data)  # nosec B102 # BNS:aee528
+
+    data.pop("__builtins__")
+    return Config.model_validate(
+        data,
+        context={"current_version": current_version},
+    )
+
+
+class RuntimeConfiguration:
+    def __init__(self, repo_root: Path):
+        self._repo_root = repo_root
+        self.__version: str | None = None
+
+    def get_defines_make_version(self) -> str:
+        if self.__version is not None:
+            return self.__version
+
+        defines_make = self._repo_root / "defines.make"
+        version = try_load_current_version_from_defines_make(defines_make)
+        if version is None:
+            raise RuntimeError(f"Could not load version from defines.make ({defines_make})")
+
+        self.__version = version
+
+        return version

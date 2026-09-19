@@ -1,0 +1,133 @@
+// Copyright (C) 2025 Checkmk GmbH
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+pub mod keys {
+    pub const ORACLE: &str = "oracle";
+    pub const MAIN: &str = "main";
+
+    pub const OPTIONS: &str = "options";
+    pub const MAX_CONNECTIONS: &str = "max_connections";
+    pub const USE_HOST_CLIENT: &str = "use_host_client";
+    pub const IGNORE_DB_NAME: &str = "IGNORE_DB_NAME";
+    pub const THREADS: &str = "threads";
+    pub const PERMISSIONS_CHECK: &str = "permissions_check";
+    pub const PERMISSIONS_SAFE_ENTRIES: &str = "permissions_safe_entries";
+
+    pub const AUTHENTICATION: &str = "authentication";
+    pub const USERNAME: &str = "username";
+    pub const PASSWORD: &str = "password";
+    pub const TYPE: &str = "type";
+    pub const ROLE: &str = "role";
+    pub const ACCESS_TOKEN: &str = "access_token";
+    pub const ASM_USERNAME: &str = "asm_username";
+    pub const ASM_PASSWORD: &str = "asm_password";
+    pub const ASM_ROLE: &str = "asm_role";
+    pub const ASM_TYPE: &str = "asm_type";
+
+    pub const CONNECTION: &str = "connection";
+    pub const HOSTNAME: &str = "hostname";
+    pub const TNS_ADMIN: &str = "tns_admin";
+    pub const ORACLE_LOCAL_REGISTRY: &str = "oracle_local_registry";
+    pub const SERVICE_NAME: &str = "service_name";
+    pub const INSTANCE_NAME: &str = "instance_name";
+    pub const SERVICE_TYPE: &str = "service_type";
+    pub const SID: &str = "sid";
+    pub const PORT: &str = "port";
+    pub const SOCKET: &str = "socket";
+    pub const TIMEOUT: &str = "timeout";
+    pub const CA: &str = "ca";
+    pub const CLIENT_CERTIFICATE: &str = "client_certificate";
+    pub const TRUST_SERVER_CERTIFICATE: &str = "trust_server_certificate";
+    pub const ENGINE: &str = "engine";
+
+    pub const SECTIONS: &str = "sections";
+    pub const EXCLUDED_SECTIONS: &str = "excluded_sections";
+    pub const TARGET_ID: &str = "target_id";
+    pub const CUSTOM_METRICS: &str = "custom_metrics";
+    pub const SQL: &str = "sql";
+    pub const SQL_PARAMS: &str = "sql_params";
+    pub const PATH: &str = "path";
+    pub const CACHE_AGE: &str = "cache_age";
+    pub const CUSTOM_METRICS_CACHE_AGE: &str = "custom_metrics_cache_age";
+    pub const IS_ASYNC: &str = "is_async";
+    pub const DISABLED: &str = "disabled";
+    pub const SEP: &str = "sep";
+    pub const HEADER_NAME: &str = "header_name";
+    pub const HEADER_SEP: &str = "header_sep";
+    pub const AFFINITY: &str = "affinity";
+
+    pub const PIGGYBACK_HOST: &str = "piggyback_host";
+    pub const DISCOVERY: &str = "discovery";
+    pub const DETECT: &str = "detect";
+    pub const INCLUDE: &str = "include";
+    pub const EXCLUDE: &str = "exclude";
+
+    pub const MODE: &str = "mode";
+
+    pub const INSTANCES: &str = "instances";
+
+    pub const ORACLE_SID: &str = "sid";
+    pub const ALIAS: &str = "alias";
+    pub const PIGGYBACK: &str = "piggyback";
+
+    pub const CONFIGS: &str = "configs";
+
+    pub const PDBS: &str = "pdbs";
+}
+
+pub mod values {
+    /// AuthType::Standard
+    pub const STANDARD: &str = "standard";
+    /// AuthType::Os
+    pub const OS: &str = "os";
+    /// AuthType::Kerberos
+    pub const WALLET: &str = "wallet";
+
+    /// AuthType::Role
+    pub const SYS_DBA: &str = "sysdba";
+    pub const SYS_OPER: &str = "sysoper";
+    pub const SYS_BACKUP: &str = "sysbackup";
+    pub const SYS_DG: &str = "sysdg";
+    pub const SYS_KM: &str = "syskm";
+    pub const SYS_ASM: &str = "sysasm";
+
+    /// Mode::Port
+    pub const PORT: &str = "port";
+    pub const SPECIAL: &str = "special";
+}
+
+pub mod defaults {
+    use super::values;
+    pub const MAX_CONNECTIONS: u32 = 6;
+    pub const USE_HOST_CLIENT: &str = "auto";
+    pub const MAX_QUERIES: u32 = 16;
+    pub const THREADS: usize = 1;
+
+    pub const AUTH_TYPE: &str = values::STANDARD;
+    pub const MODE: &str = values::PORT;
+    pub const CONNECTION_HOST_NAME: &str = "localhost";
+
+    pub const INSTANCE_NAME: &str = "";
+    pub const CONNECTION_PORT: u16 = 1521;
+    pub const CONNECTION_TIMEOUT: u64 = 5;
+    pub const SECTIONS_CACHE_AGE: u32 = 600;
+    pub const CUSTOM_METRICS_CACHE_AGE: u32 = 600;
+    pub const DISCOVERY_DETECT: bool = true;
+
+    pub const TRUST_SERVER_CERTIFICATE: bool = true;
+    pub const SECTION_SEPARATOR: char = '|';
+    pub const CUSTOM_METRIC_SEPARATOR: char = ':';
+}

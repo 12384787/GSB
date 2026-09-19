@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+# mypy: disable-error-code="no-any-return"
+
+"""Persisted sections type and store.
+
+Cache hierarchy
+
+.. uml::
+
+    abstract FileCache<TRawData> {
+        + read(Mode) : TRawData | None
+        + write(TRawData, Mode) : None
+        - {abstract} _from_cache_file(bytes) : TRawData
+        - {abstract} _to_cache_file(TRawData) : bytes
+    }
+    class AgentFileCache {
+        - _from_cache_file(bytes) : TRawData
+        - _to_cache_file(TRawData) : bytes
+    }
+    class NoCache {
+        - _from_cache_file(bytes) : TRawData
+        - _to_cache_file(TRawData) : bytes
+    }
+    class SNMPFileCache {
+        - _from_cache_file(bytes) : TRawData
+        - _to_cache_file(TRawData) : bytes
+    }
+    class TCPFetcher {}
+    class ProgramFetcher {}
+    class IPMIFetcher {}
+    class SNMPFetcher {}
+    class PiggybackFetcher {}
+
+    FileCache <|.. AgentFileCache : <<bind>>\nTRawData::AgentRawData
+    FileCache <|.. NoCache : <<bind>>\nTRawData::AgentRawData
+    FileCache <|.. SNMPFileCache : <<bind>>\nTRawData::SNMPRawData
+    AgentFileCache *-- TCPFetcher
+    AgentFileCache *-- ProgramFetcher
+    AgentFileCache *-- IPMIFetcher
+    NoCache *-- PiggybackFetcher
+    SNMPFileCache *-- SNMPFetcher
+
+"""
+
+import abc
+import enum
+import logging
+import os
+import time
+from collections.abc import Sequence, Sized
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Final, NamedTuple, NoReturn, override, Self, TypedDict
+
+from cmk.ccc import store
+from cmk.ccc.exceptions import MKGeneralException
+from cmk.checkengine.fetcher_abc import DeserializationContext, FetcherError, Mode
+from cmk.checkengine.helper_interface import JsonSerializable
+
+__all__ = [
+    "FileCache",
+    "FileCacheMode",
+    "FileCacheOptions",
+    "FileCacheParams",
+    "MaxAge",
+    "NoCache",
+]
+logger = logging.getLogger(__name__)
+
+
+class FileCacheParams(TypedDict, total=False):
+    """Serialized parameters of a `FileCache`.
+
+    Describes the on-disk JSON shape: `max_age` is a JSON array (the `MaxAge`
+    named tuple) and `file_cache_mode` is the int value of the `FileCacheMode`
+    flag. `total=False` because `NoCache` serializes to an empty mapping while
+    the other caches populate all keys. `base_path` is deliberately absent --
+    it comes from the `DeserializationContext`, not the payload.
+    """
+
+    relative_path_template: str
+    max_age: Sequence[float]
+    simulation: bool
+    use_only_cache: bool
+    file_cache_mode: int
+
+
+class MaxAge(NamedTuple):
+    """Maximum age allowed for the cached data, in seconds"""
+
+    checking: float
+    discovery: float
+    inventory: float
+
+    @classmethod
+    def zero(cls) -> MaxAge:
+        return cls(0.0, 0.0, 0.0)
+
+    @classmethod
+    def unlimited(cls) -> MaxAge:
+        return cls(float("inf"), float("inf"), float("inf"))
+
+    def get(self, mode: Mode, *, default: float = 0.0) -> float:
+        return self._asdict().get(mode.name.lower(), default)
+
+
+@enum.unique
+class FileCacheMode(enum.IntFlag):
+    DISABLED = enum.auto()
+    READ = enum.auto()
+    WRITE = enum.auto()
+    READ_WRITE = READ | WRITE
+
+
+class FileCache[TRawData: Sized](
+    JsonSerializable[FileCacheParams, DeserializationContext], abc.ABC
+):
+    def __init__(
+        self,
+        *,
+        base_path: Path,
+        relative_path_template: str,
+        max_age: MaxAge,
+        simulation: bool,
+        use_only_cache: bool,
+        file_cache_mode: FileCacheMode | int,
+    ) -> None:
+        super().__init__()
+        self.base_path: Final = base_path
+        self.relative_path_template: Final = relative_path_template
+        self.max_age = max_age
+        # TODO(ml): Make sure simulation and use_only_cache are identical
+        #           and find a better, more generic name such as "force"
+        #           to produce the intended behavior.
+        self.simulation = simulation
+        self.use_only_cache = use_only_cache
+        self.file_cache_mode = FileCacheMode(file_cache_mode)
+
+    @override
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, type(self)):
+            return NotImplemented
+        return all(
+            (
+                self.base_path == other.base_path,
+                self.relative_path_template == other.relative_path_template,
+                self.max_age == other.max_age,
+                self.simulation == other.simulation,
+                self.use_only_cache == other.use_only_cache,
+                self.file_cache_mode == other.file_cache_mode,
+            )
+        )
+
+    @override
+    def serialized_params(self) -> FileCacheParams:
+        # `base_path` is intentionally omitted: it is supplied by the
+        # `DeserializationContext` of the reading process.
+        return {
+            "relative_path_template": self.relative_path_template,
+            "max_age": self.max_age,
+            "simulation": self.simulation,
+            "use_only_cache": self.use_only_cache,
+            "file_cache_mode": self.file_cache_mode,
+        }
+
+    @classmethod
+    @override
+    def from_params(cls, params: FileCacheParams, ctx: DeserializationContext) -> Self:
+        return cls(
+            base_path=ctx.base_path,
+            relative_path_template=params["relative_path_template"],
+            max_age=MaxAge(*params["max_age"]),
+            simulation=params["simulation"],
+            use_only_cache=params["use_only_cache"],
+            file_cache_mode=params["file_cache_mode"],
+        )
+
+    @staticmethod
+    @abc.abstractmethod
+    def _from_cache_file(raw_data: bytes) -> TRawData:
+        raise NotImplementedError
+
+    @staticmethod
+    @abc.abstractmethod
+    def _to_cache_file(raw_data: TRawData) -> bytes:
+        raise NotImplementedError
+
+    def _do_cache(self, mode: Mode) -> bool:
+        if self.simulation:
+            logger.debug("Using cache (Simulation mode)")
+            return True
+
+        if mode in {Mode.FORCE_SECTIONS, Mode.RTC}:
+            logger.debug("Not using cache (Mode %(mode)s)", {"mode": mode})
+            return False
+
+        return True
+
+    def read(self, mode: Mode) -> TRawData | None:
+        logger.debug("Read from cache: %(cls)s", {"cls": self.__class__.__name__})
+        raw_data = self._read(mode)
+        if raw_data is not None:
+            logger.debug("Got %(num_bytes)r bytes data from cache", {"num_bytes": len(raw_data)})
+            return raw_data
+
+        if self.simulation:
+            raise FetcherError("No cached data available (caching enforced via simulation mode)")
+
+        if self.use_only_cache:
+            raise FetcherError("No cached data available")
+
+        return raw_data
+
+    def _make_path(self, mode: Mode) -> Path:
+        # This is a kind of arbitrary mini-language but explicit in the
+        # caller and easy to extend in the future.  If somebody has a
+        # better idea to allow a serializable and parametrizable path
+        # creation, that's fine with me.
+        return self.base_path / self.relative_path_template.format(mode=mode.name.lower())
+
+    def _read(self, mode: Mode) -> TRawData | None:
+        if FileCacheMode.READ not in self.file_cache_mode or not self._do_cache(mode):
+            return None
+
+        path = self._make_path(mode)
+        try:
+            cachefile_age = time.time() - path.stat().st_mtime
+        except FileNotFoundError:
+            logger.debug("Not using cache (does not exist)")
+            return None
+
+        if cachefile_age > self.max_age.get(mode):
+            logger.debug(
+                "Not using cache (Too old. Age is %(age)d sec, allowed is %(max_age)s sec)",
+                {"age": cachefile_age, "max_age": self.max_age.get(mode)},
+            )
+            return None
+
+        # TODO: Use some generic store file read function to generalize error handling,
+        # but there is currently no function that simply reads data from the file
+        try:
+            cache_file = path.read_bytes()
+        except FileNotFoundError:
+            logger.debug("Not using cache (Does not exist)")
+            return None
+
+        if not cache_file:
+            logger.debug("Not using cache (Empty)")
+            return None
+
+        logger.debug("Using data from cache file %(path)s", {"path": path})
+        return self._from_cache_file(cache_file)
+
+    def write(self, raw_data: TRawData, mode: Mode) -> None:
+        if FileCacheMode.WRITE not in self.file_cache_mode or not self._do_cache(mode):
+            return
+        path = self._make_path(mode)
+        logger.debug("Write data to cache file %(path)s", {"path": path})
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            store.RealIo(path).write(self._to_cache_file(raw_data))
+        except Exception as e:
+            raise MKGeneralException(f"Cannot write cache file {path}: {e}")
+
+    def delete(self, mode: Mode) -> None:
+        # Guarded like write() so it is a no-op for disabled caches and non-cacheable modes.
+        if FileCacheMode.WRITE not in self.file_cache_mode or not self._do_cache(mode):
+            return
+        path = self._make_path(mode)
+        logger.debug("Delete cache file %(path)s", {"path": path})
+        path.unlink(missing_ok=True)
+
+
+class NoCache[TRawData: Sized](FileCache[TRawData]):
+    def __init__(self, *_args: object, **_kw: object) -> None:
+        super().__init__(
+            base_path=Path(os.devnull),
+            relative_path_template="",
+            max_age=MaxAge.zero(),
+            simulation=False,
+            use_only_cache=False,
+            file_cache_mode=FileCacheMode.DISABLED,
+        )
+
+    @override
+    def serialized_params(self) -> FileCacheParams:
+        return {}
+
+    @classmethod
+    @override
+    def from_params(cls, _params: FileCacheParams, _ctx: DeserializationContext) -> Self:
+        return cls()
+
+    @staticmethod
+    @override
+    def _from_cache_file(_raw_data: object) -> NoReturn:
+        raise TypeError("NoCache")
+
+    @staticmethod
+    @override
+    def _to_cache_file(_raw_data: TRawData) -> NoReturn:
+        raise TypeError("NoCache")
+
+
+@dataclass(frozen=True, kw_only=True)
+class FileCacheOptions:
+    # TODO(ml): Split between fetcher and checker options; maybe also find
+    # better names.
+
+    # Set by the user via command line to prevent using cached information at all.
+    disabled: bool = False
+    # Is set by the "--cache" command line. This makes the caching logic use
+    # cache files that are even older than the max_cachefile_age of the host/mode.
+    use_outdated: bool = False
+    # Set by the --no-tcp option from discovery, inventory, inventory as check,
+    # and dump agent.
+    tcp_use_only_cache: bool = False
+    # Currently not (yet) used
+    # I think this should be a fetcher option: "allow_live_fetching"
+    use_only_cache: bool = False
+    # Set by the --force option from inventory.
+    keep_outdated: bool = False
+
+    def file_cache_mode(self) -> FileCacheMode:
+        return FileCacheMode.DISABLED if self.disabled else FileCacheMode.READ_WRITE

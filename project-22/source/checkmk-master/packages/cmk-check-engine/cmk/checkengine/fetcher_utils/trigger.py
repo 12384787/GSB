@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+
+import abc
+from collections.abc import Mapping, Sized
+from functools import partial
+from pathlib import Path
+from typing import Final, final, override, Protocol, Self, TypeVar
+
+import cmk.ccc.resulttype as result
+from cmk.ccc import debug
+from cmk.ccc.exceptions import MKTimeout
+from cmk.ccc.version_info import general_version_infos_from_env
+from cmk.checkengine.fetcher_abc import DeserializationContext, Fetcher, FetcherError, Mode
+from cmk.checkengine.filecache import FileCache
+from cmk.checkengine.helper_interface import create_fetcher_crash_dump, JsonSerializable
+from cmk.crash import make_crash_report_base_path
+
+from .secrets import FetcherSecrets
+
+__all__ = [
+    "PlainFetcherTrigger",
+    "FetcherTrigger",
+]
+
+_TRawData = TypeVar("_TRawData", bound=Sized)
+
+
+class FetcherTrigger(JsonSerializable[Mapping[str, str], DeserializationContext]):
+    def __init__(self, omd_root: Path) -> None:
+        self.omd_root: Final = omd_root
+
+    @final
+    def get_raw_data(
+        self,
+        file_cache: FileCache[_TRawData],
+        fetcher: Fetcher[_TRawData],
+        mode: Mode,
+        secrets: FetcherSecrets,
+    ) -> result.Result[_TRawData, Exception]:
+        try:
+            cached = file_cache.read(mode)
+            if cached is not None:
+                return result.OK(cached)
+
+            if file_cache.simulation:
+                raise FetcherError(f"{fetcher}: data unavailable in simulation mode")
+
+            fetched: result.Result[_TRawData, Exception] = result.Error(
+                FetcherError("unknown error")
+            )
+            fetched = self._trigger(fetcher, mode, secrets)
+            fetched.fold(
+                ok=partial(file_cache.write, mode=mode),
+                # Remove a stale cache file so a failed fetch does not leave outdated data
+                # behind for the next (cache-only) read. (See: CMK-31896)
+                error=lambda _exc: file_cache.delete(mode),
+            )
+            return fetched
+
+        except MKTimeout, TimeoutError:
+            raise
+        except FetcherError as exc:
+            # Remove a stale cache file so a failed fetch does not leave outdated data
+            # behind for the next (cache-only) read. (See: CMK-31896)
+            file_cache.delete(mode)
+            # These are intentionally raised exceptions for which we don't need crash reports
+            return result.Error(exc)
+        except Exception as exc:
+            if debug.enabled():
+                raise
+            self._on_error()
+            return result.Error(exc)
+
+    def _on_error(self) -> None:
+        create_fetcher_crash_dump(
+            serial=None,
+            host=None,
+            crash_report_base_path=make_crash_report_base_path(self.omd_root),
+            get_general_version_infos=general_version_infos_from_env,
+            debug=False,
+        )
+
+    @abc.abstractmethod
+    def _trigger(
+        self, fetcher: Fetcher[_TRawData], mode: Mode, secrets: FetcherSecrets
+    ) -> result.Result[_TRawData, Exception]:
+        raise NotImplementedError
+
+
+class FetcherTriggerFactory(Protocol):
+    def __call__(self, relay_id: str | None, trusted_ca_file: Path) -> FetcherTrigger: ...
+
+
+class PlainFetcherTrigger(FetcherTrigger):
+    """A simple trigger that fetches data without any additional logic."""
+
+    @override
+    def _trigger(
+        self, fetcher: Fetcher[_TRawData], mode: Mode, secrets: FetcherSecrets
+    ) -> result.Result[_TRawData, Exception]:
+        with secrets.provide_file(), fetcher:
+            return fetcher.fetch(mode)
+
+    @override
+    def serialized_params(self) -> Mapping[str, str]:
+        return {"omd_root": str(self.omd_root)}
+
+    @classmethod
+    @override
+    def from_params(cls, params: Mapping[str, str], _ctx: DeserializationContext) -> Self:
+        """Create a PlainFetcherTrigger from serialized parameters."""
+        return cls(omd_root=Path(params["omd_root"]))

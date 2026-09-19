@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en" style="background-color: #EAEAEA;">
+    <head>
+        <title>HTML Email template</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="description" content="Checkmk notification email template.">
+        <meta name="keywords" content="Checkmk, monitoring, notification, email">
+        <style>
+            @media (max-width: 460px) {
+                .mobile_padding {
+                    padding: 0 !important;
+                }
+            }
+
+            @media (prefers-color-scheme: dark) {
+                .section-icon {
+                    display: none !important;
+                }
+            }
+        </style>
+    </head>
+    <body style="margin:0; padding:0; background-color:#ffffff;">
+        {% import 'macros.html.jinja' as macros %}
+        {% if not bulk_summary %}
+            {% set service_notification = data.WHAT == 'SERVICE' %}
+            {% if service_notification %}
+                {% set href = data.LINKEDSERVICEDESC.split('"')[1] %}
+            {% else %}
+                {% set href = data.LINKEDHOSTNAME.split('"')[1] %}
+            {% endif %}
+            {% if data.PARAMETER_ELEMENTSS %}
+                {% set elements = data.PARAMETER_ELEMENTSS.split() %}
+            {% else %}
+                {% set elements = ["graph"] %}
+            {% endif %}
+        {% endif %}
+        {% set elements_to_ignore = ["graph", "abstime", "longoutput", "omdsite", "address"] %}
+        {% set elements_without_graph = elements | reject("in", elements_to_ignore) | list %}
+        {% set state_mapping = {
+            "OK": "background-color: #13D389; color: #000000;",
+            "UP": "background-color: #13D389; color: #000000;",
+            "WARNING": "background-color: #FFD703; color: #000000;",
+            "CRITICAL": "background-color: #C83232; color: #ffffff;",
+            "DOWN": "background-color: #C83232; color: #ffffff;",
+            "UNKNOWN": "background-color: #ff8800; color: #ffffff;",
+            "UNREACHABLE": "background-color: #ff8800; color: #ffffff;",
+            "PENDING": "background-color: #888888; color: #ffffff;"
+        } %}
+        <table border="0"
+               cellspacing="0"
+               cellpadding="0"
+               style="border-collapse:collapse;
+                      margin:0 auto;
+                      width:100%;
+                      max-width:600px">
+            <tr>
+                <td style="margin:0 auto; padding: 20px;" class="mobile_padding">
+                    <table border="0"
+                           cellspacing="0"
+                           cellpadding="0"
+                           style="border:1px solid #ccc;
+                                  border-collapse:collapse;
+                                  background-color:#ffffff;
+                                  width:100%;
+                                  max-width:600px">
+                        {{ macros.margin_tr() }}
+                        <tr>
+                            <td style="padding: 8px; margin: 0 auto;">
+                                {% if not is_bulk or bulk_summary %}
+                                    <table width="100%"
+                                           style="border-collapse: collapse;
+                                                  margin: 0 auto;
+                                                  max-width: 600px">
+                                        <tr>
+                                            <td>
+                                                <img src="cid:checkmk_logo.png"
+                                                     alt="Checkmk Logo"
+                                                     width="110"
+                                                     height="30"
+                                                     style="display:block;
+                                                            vertical-align:middle;
+                                                            border:0;
+                                                            background-color:#ffffff" />
+                                            </td>
+                                        </tr>
+                                    </table>
+                                    <table width="100%" style="margin: 0 auto; max-width: 600px;">
+                                        <tr>
+                                            <td style="border-bottom: 1px solid #e5e5e5;
+                                                       height: 1px;
+                                                       line-height: 1px">
+                                                <span style="display:block;
+                                                             width:100%;
+                                                             height:1px;
+                                                             line-height:1px">&nbsp;</span>
+                                            </td>
+                                        </tr>
+                                        {{ macros.margin_tr() }}
+                                    </table>
+                                {% endif %}
+                                {% if bulk_summary %}
+                                    {% include "bulk.html.jinja" %}
+                                {% else %}
+                                    {% if insert %}
+                                        <table width="100%"
+                                               style="margin:0 auto;
+                                                      margin-top:16px;
+                                                      border:1px solid #e5e5e5;
+                                                      max-width:600px;
+                                                      border-radius:4px">
+                                            <tr>
+                                                <td>
+                                                    <div style="padding:20px;">{{ insert | safe }}</div>
+                                                </td>
+                                            </tr>
+                                        </table>
+                                    {% endif %}
+                                    {% if data.NOTIFICATIONTYPE in ["PROBLEM", "RECOVERY"] %}
+                                        {% include "summary.html.jinja" %}
+                                    {% else %}
+                                        {% include "summary_commands.html.jinja" %}
+                                    {% endif %}
+                                    {% include "event_overview.html.jinja" %}
+                                    {% if graphs and "graph" in elements %}
+                                        {% include "graph.html.jinja" %}
+                                    {% endif %}
+                                    {% if elements_without_graph %}
+                                        {% include "additional.html.jinja" %}
+                                    {% endif %}
+                                    {% if data.PARAMETER_CONTACT_GROUPS and data.HOSTCONTACTGROUPNAMES|default(false) %}
+                                        {% include "contact_groups.html.jinja" %}
+                                    {% endif %}
+                                    {% if service_notification and data.PARAMETER_SVC_LABELS %}
+                                        {% include "service_labels.html.jinja" %}
+                                    {% endif %}
+                                    {% if data.PARAMETER_HOST_LABELS %}
+                                        {% include "host_labels.html.jinja" %}
+                                    {% endif %}
+                                    {% if data.PARAMETER_HOST_TAGS %}
+                                        {% include "host_tags.html.jinja" %}
+                                    {% endif %}
+                                    {% if href %}{{ macros.view_issue_button(href) }}{% endif %}
+                                    {% if data.PARAMETER_NOTIFICATION_RULE %}
+                                        {% include "matching_rule.html.jinja" %}
+                                    {% endif %}
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {{ macros.margin_tr() }}
+                    </table>
+                </td>
+            </tr>
+        </table>
+        {% if not is_bulk or last_bulk_entry %}
+            <table style="margin: 0 auto; width:100%; max-width:600px;">
+                <tr>
+                    <td>
+                        <p style="text-align:center;margin:0;color:#23496d;">Sent by Checkmk</p>
+                    </td>
+                </tr>
+            </table>
+        {% endif %}
+    </body>
+</html>

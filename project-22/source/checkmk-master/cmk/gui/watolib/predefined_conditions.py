@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from collections.abc import Sequence
+from typing import override, TypedDict
+
+from cmk.gui import userdb
+from cmk.gui.logged_in import LoggedInUser, user
+from cmk.gui.watolib.simple_config_file import WatoSimpleConfigFile
+from cmk.gui.watolib.utils import wato_root_dir
+from cmk.ruleset_matcher.matcher import RuleConditionsSpec
+
+
+class PredefinedConditionSpec(TypedDict):
+    title: str
+    comment: str
+    docu_url: str
+    conditions: RuleConditionsSpec
+    shared_with: Sequence[str]
+    owned_by: str | None
+
+
+class PredefinedConditionStore(WatoSimpleConfigFile[PredefinedConditionSpec]):
+    def __init__(self) -> None:
+        super().__init__(
+            config_file_path=wato_root_dir() / "predefined_conditions.mk",
+            config_variable="predefined_conditions",
+            spec_class=PredefinedConditionSpec,
+        )
+
+    @override
+    def filter_usable_entries(
+        self, entries: dict[str, PredefinedConditionSpec], acting_user: LoggedInUser
+    ) -> dict[str, PredefinedConditionSpec]:
+        if acting_user.may("wato.edit_all_predefined_conditions"):
+            return entries
+
+        assert acting_user.id is not None
+        user_groups = userdb.contactgroups_of_user(acting_user.id)
+
+        conditions = self.filter_editable_entries(dict(entries), acting_user)
+        conditions.update(
+            {k: v for k, v in entries.items() if set(v["shared_with"]).intersection(user_groups)}
+        )
+        return conditions
+
+    @override
+    def filter_editable_entries(
+        self, entries: dict[str, PredefinedConditionSpec], acting_user: LoggedInUser
+    ) -> dict[str, PredefinedConditionSpec]:
+        if acting_user.may("wato.edit_all_predefined_conditions"):
+            return entries
+
+        assert acting_user.id is not None
+        user_groups = userdb.contactgroups_of_user(acting_user.id)
+        return {k: v for k, v in entries.items() if v["owned_by"] in user_groups}
+
+    def filter_by_path(self, path: str) -> dict[str, PredefinedConditionSpec]:
+        result = {}
+        for ident, condition in self.load_for_reading().items():
+            if condition["conditions"]["host_folder"] == path:
+                result[ident] = condition
+
+        return result
+
+    def choices(self) -> list[tuple[str, str]]:
+        return [
+            (ident, entry["title"])
+            for ident, entry in self.filter_usable_entries(self.load_for_reading(), user).items()
+        ]

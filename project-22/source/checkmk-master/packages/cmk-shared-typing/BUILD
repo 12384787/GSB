@@ -1,0 +1,354 @@
+load("@aspect_rules_js//js:defs.bzl", "js_library")
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+load("@aspect_rules_ts//ts:defs.bzl", "ts_project")
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
+load("@bazel_skylib//rules:run_binary.bzl", "run_binary")
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
+load("@cmk_requirements//:requirements.bzl", "requirement")
+load("@npm//:defs.bzl", "npm_link_all_packages")
+load("@npm//bazel/tools:prettier/package_json.bzl", prettier_bin = "bin")
+load(
+    "@npm//packages/cmk-shared-typing:openapi-typescript/package_json.bzl",
+    openapi_typescript = "bin",
+)
+load("@openapi_spec_editions//:editions.bzl", "OPENAPI_SPEC_EDITION_GENERATORS")
+load("@rules_python//python:packaging.bzl", "py_wheel")
+load("//bazel/rules:package_wheel.bzl", "package_wheel")
+load("//bazel/rules:py_cmk_test.bzl", "py_cmk_test")
+load("//bazel/rules:py_requirements_test.bzl", "py_requirements_test")
+load("//bazel/rules:shared_typing_generators.bzl", "json2python", "json2typescript")
+
+exports_files([
+    "requirements.in",
+    "package.json",
+])
+
+npm_link_all_packages(name = "node_modules")
+
+SOURCES_COMMON = [
+    "ai_button.json",
+    "changes.json",
+    "configuration_entity.json",
+    "create_relay.json",
+    "custom_graph_designer.json",
+    "dialog.json",
+    "global_settings.json",
+    "global_time_picker.json",
+    "loading_transition.json",
+    "main_menu.json",
+    "mode_create_otel_conf.json",
+    "mode_custom_services.json",
+    "mode_host.json",
+    "mode_oauth2_connection.json",
+    "monitoring/all_hosts.json",
+    "monitoring/host_services.json",
+    "monitoring/page_link_button.json",
+    "network_flow/flow_explorer.json",
+    "notifications.json",
+    "setup.json",
+    "icon.json",
+    "sidebar.json",
+    "unified_search.json",
+    "user_frontend_config.json",
+    "vue_formspec_components.json",
+    "welcome.json",
+    "agent_slideout.json",
+    "product_usage_analytics.json",
+    "trial_mode_selection_props.json",
+    "trial_mode_selection_request.json",
+    "two_factor_auth.json",
+]
+
+SOURCES_SPECIAL_DATACLASSES = [
+    "aggregation.json",
+    "attribute_filter.json",
+    "consolidation.json",
+    "cmk_time_series_graph.json",
+    "profiling_flamegraph.json",
+    "service_graphs.json",
+    "unit_format.json",
+]
+
+json2typescript(
+    name = "generated_ts_files",
+    srcs = SOURCES_COMMON + SOURCES_SPECIAL_DATACLASSES,
+    chdir = package_name(),
+    data = glob(["source/**/*.json"]),
+    header_txt = """/**
+ * Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+/* eslint-disable */
+/**
+ * This file is auto-generated via the cmk-shared-typing package.
+ * Do not edit manually.
+ */
+""",
+    source_dir = "source",
+    target_dir = "typescript",
+)
+
+write_file(
+    name = "empty_index_ts",
+    out = "typescript/index.ts",
+)
+
+# Merge the specs of all editions in the checkout (CI strips edition dirs,
+# see versioning.groovy REPO_PATCH_RULES) into the union spec typing the
+# edition-independent frontend bundle. Deliberately not keyed on
+# --cmk_edition: no single edition covers the union, and vue-tsc only runs
+# on full checkouts; distro builds bundle without type checking, so a subset
+# spec cannot fail them. GPL builds merge only community to keep non-free
+# targets out of the gpl dependency graph.
+[
+    run_binary(
+        name = "openapi_spec_internal_" + edition,
+        outs = ["openapi_spec_internal_%s.yaml" % edition],
+        args = [
+            "generate",
+            "--version",
+            "internal",
+            "--edition",
+            edition,
+            "--format",
+            "yaml",
+            "--out",
+            "$(execpath openapi_spec_internal_%s.yaml)" % edition,
+        ],
+        tool = tool,
+    )
+    for edition, tool in OPENAPI_SPEC_EDITION_GENERATORS.items()
+]
+
+run_binary(
+    name = "openapi_spec_internal",
+    srcs = select({
+        "@//:gpl+nonfree_repo": [
+            ":openapi_spec_internal_" + edition
+            for edition in OPENAPI_SPEC_EDITION_GENERATORS
+        ],
+        "@//:gpl_repo": [":openapi_spec_internal_community"],
+    }),
+    outs = ["openapi_spec_internal.yaml"],
+    args = [
+        "--out",
+        "$(execpath openapi_spec_internal.yaml)",
+    ] + select({
+        "@//:gpl+nonfree_repo": [
+            "--input=%s=$(execpath :openapi_spec_internal_%s)" % (edition, edition)
+            for edition in OPENAPI_SPEC_EDITION_GENERATORS
+        ],
+        "@//:gpl_repo": ["--input=community=$(execpath :openapi_spec_internal_community)"],
+    }),
+    tool = "//cmk/gui/openapi/spec/spec_generator:merge_api_specs",
+)
+
+openapi_typescript.openapi_typescript(
+    name = "openapi_internal_ts_file",
+    srcs = [":openapi_spec_internal"],
+    outs = ["typescript/openapi_internal.d.ts"],
+    args = [
+        "$(rootpath :openapi_spec_internal)",
+        "-o",
+        "$(rootpath typescript/openapi_internal.d.ts)",
+    ],
+)
+
+js_library(
+    name = "cmk_shared_typing_ts",
+    srcs = [
+        "package.json",
+        "tsconfig.json",
+        ":cmk_shared_typing_ts_lib",
+        ":empty_index_ts",
+        ":generated_ts_files",
+        ":openapi_internal_ts_file",
+    ],
+    visibility = ["//packages:__subpackages__"],
+)
+
+ts_project(
+    name = "cmk_shared_typing_ts_lib",
+    srcs = [
+        "package.json",
+        "tsconfig.json",
+        ":generated_ts_files",
+    ],
+    declaration = True,
+    declaration_map = True,
+    emit_declaration_only = True,
+    source_map = True,
+    tags = ["manual"],
+    transpiler = "tsc",
+    visibility = ["//packages:__subpackages__"],
+)
+
+py_library(
+    name = "cmk_shared_typing_formatter",
+    srcs = [
+        "utils/__init__.py",
+        "utils/format.py",
+        "utils/postprocess.py",
+    ],
+    imports = ["."],
+    deps = [
+        requirement("black"),
+        requirement("datamodel_code_generator"),
+        requirement("libcst"),
+    ],
+)
+
+py_cmk_test(
+    name = "unit",
+    size = "small",
+    srcs = glob(["tests/**/*.py"]),
+    deps = [":cmk_shared_typing_formatter"],
+)
+
+json2python(
+    name = "generated_py_files_special_dataclasses",
+    srcs = SOURCES_SPECIAL_DATACLASSES,
+    data = glob(["source/**/*.json"]) + ["header_py.txt"],
+    extra_args = [
+        "--use-field-description",
+        "--use-title-as-name",
+        "--use-double-quotes",
+        "--use-default",
+        "--custom-file-header-path=$(location :header_py.txt)",
+        "--custom-formatters=utils.format",
+        "--output-model-type=dataclasses.dataclass",
+        "--enum-field-as-literal=all",
+        "--use-generic-container-types",
+        "--frozen-dataclasses",
+        "--keyword-only",
+        "--use-union-operator",
+    ],
+    formatter = ":cmk_shared_typing_formatter",
+    source_dir = "source",
+    target_dir = "cmk/shared_typing",
+)
+
+json2python(
+    name = "generated_py_files_common",
+    srcs = SOURCES_COMMON,
+    data = glob(["source/**/*.json"]) + ["header_py.txt"],
+    extra_args = [
+        "--use-field-description",
+        "--use-title-as-name",
+        "--use-double-quotes",
+        "--use-default",
+        "--use-one-literal-as-default",
+        "--custom-file-header-path=$(location :header_py.txt)",
+        "--custom-formatters=utils.format",
+        "--output-model-type=dataclasses.dataclass",
+        "--use-generic-container-types",
+        "--frozen-dataclasses",
+        "--keyword-only",
+    ],
+    formatter = ":cmk_shared_typing_formatter",
+    source_dir = "source",
+    target_dir = "cmk/shared_typing",
+)
+
+copy_file(
+    name = "j2py_init",
+    src = "header_py.txt",
+    out = "cmk/shared_typing/__init__.py",
+    allow_symlink = True,
+)
+
+py_library(
+    name = "cmk_shared_typing_py",
+    srcs = [
+        ":cmk/shared_typing/__init__.py",
+        ":generated_py_files_common",
+        ":generated_py_files_special_dataclasses",
+    ],
+    imports = ["."],
+    visibility = [
+        "//cmk:__subpackages__",
+        "//cmk/nonfree:__subpackages__",
+        "//non-free/packages/cmk-data-backend:__pkg__",
+        "//non-free/packages/cmk-network-flow:__pkg__",
+        "//non-free/packages/cmk-robotmk:__pkg__",
+        "//non-free/packages/cmk-telemetry:__pkg__",
+        "//packages/cmk-profiling:__pkg__",
+        "//packages/cmk-web/cmk/web/utils:__pkg__",
+        "//tests:__subpackages__",
+    ],
+)
+
+write_file(
+    name = "py_typed",
+    out = "cmk/shared_typing/py.typed",
+)
+
+filegroup(
+    name = "cmk_shared_typing_extra_files",
+    srcs = [":cmk/shared_typing/py.typed"],
+)
+
+py_wheel(
+    name = "wheel",
+    distribution = "cmk-shared-typing",
+    strip_path_prefixes = ["packages/cmk-shared-typing"],
+    version = "1.0.0",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":cmk_shared_typing_extra_files",
+        ":cmk_shared_typing_py",
+    ],
+)
+
+build_test(
+    name = "build_test",
+    targets = [
+        ":wheel",
+        ":cmk_shared_typing_ts",
+    ],
+)
+
+package_wheel(
+    name = "pkg_tar",
+    visibility = ["//visibility:public"],
+    whl = "wheel",
+)
+
+prettier_bin.prettier_binary(
+    name = "prettier",
+    data = ["//bazel/tools:prettierrc"],
+    env = {"BAZEL_BINDIR": "."},
+    fixed_args = [
+        '--config="$$JS_BINARY__RUNFILES"/$(rlocationpath //bazel/tools:prettierrc)',
+        "--log-level=warn",
+    ],
+)
+
+alias(
+    name = "format",
+    actual = "//bazel/tools/format",
+)
+
+alias(
+    name = "format.check",
+    actual = "//bazel/tools/format:check",
+)
+
+sh_library(
+    name = "helpers",
+    srcs = [
+        ".f12",
+        "run",
+    ],
+)
+
+py_requirements_test(
+    name = "requirements-test",
+    libs = [
+        ":cmk_shared_typing_formatter",
+        ":cmk_shared_typing_py",
+    ],
+    requirements_in = "requirements.in",
+)

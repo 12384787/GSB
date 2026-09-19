@@ -1,0 +1,1 @@
+.gitattributes,.github .gitignore,.gitmodules .tool-versions,CITATION.cff CODE_OF_CONDUCT.md,CONTRIBUTING.md LICENSE.txt,Makefile README.md,SECURITY.md aw-client,aw-core aw-notify,aw-qt aw-server,aw-server-rust aw-tauri,aw-watcher-afk aw-watcher-input,aw-watcher-window aw.spec,awatcher diagram.svg,gptme.toml poetry.lock,pyproject.toml scripts

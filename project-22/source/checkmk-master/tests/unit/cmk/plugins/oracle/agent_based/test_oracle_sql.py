@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+# Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+import datetime
+from collections.abc import Mapping, Sequence
+from zoneinfo import ZoneInfo
+
+import pytest
+import time_machine
+
+from cmk.agent_based.v2 import Metric, Result, Service, State, StringTable
+from cmk.plugins.oracle.agent_based.oracle_sql import (
+    check_oracle_sql,
+    discovery_oracle_sql,
+    Instance,
+    parse_metrics,
+    parse_oracle_sql,
+)
+
+pytestmark = pytest.mark.checks
+check_name = "oracle_sql"
+AGENT_OUTPUT_WITH_FAILURE = [
+    ["[[[foobar1|YOLBE AFS RABAT REPL ERROR STMT]]]"],
+    [
+        "FOOBAR1|FAILURE|ERROR at line 17",
+        " ORA-06550",
+        " line 17, column 5",
+        " PL/SQL",
+        " ORA-00933",
+        " SQL command not properly ended ORA-06550",
+        " line 7, column 5",
+        "",
+    ],
+]
+
+AGENT_OUTPUT_DETAILS_ONLY = [
+    ["[[[foobar1|NBA SESSION LEVEL]]]"],
+    ["details", "Session Level", " 5"],
+    ["exit", "0"],
+    ["elapsed", "0.26815"],
+]
+
+AGENT_OUTPUT_LONG_WITH_INVALID_KEYWORD = [
+    ["[[[bulu|BLABLI NBA SHA FILE]]]"],
+    ["long", "Monitoring SHA/RAB Resultat = 1"],
+    [
+        "detail",
+        "SHA-TT File (sha-ra), welches Sachen macht.",
+    ],
+    ["long", "TODO siehe FOOBAR; Monitoring SHA"],
+    ["exit", "2"],
+    ["elapsed", "0.29285"],
+]
+
+AGENT_OUTPUT_SESSIONS_WITH_PERFDATA = [
+    ["[[[yoble1|NBA SESSIONS]]]"],
+    ["long", "Avara SEP_ID", " 301"],
+    [
+        "details",
+        "Active sessions",
+        " 0 (warn/crit at 10/20) / Inactive sessions",
+        " 0 (warn/crit at 10/40)",
+    ],
+    ["perfdata", "sessions_active=0;10;20"],
+    ["perfdata", "sessions_inactive=0;10;40"],
+    ["perfdata", "sessions_maxage=0"],
+    ["exit", "0"],
+    ["elapsed", "0.29444"],
+]
+
+# In SUP-21227 it was reported that the line 'elapsed:' shows up in the agent output. We did not
+# obtain an agent output, but this could happen if `perl -MTime::HiRes=time -wle 'print time'`
+# fails. This table was copied from AGENT_OUTPUT_SESSIONS_WITH_PERFDATA and modified to match the ticket.
+AGENT_OUTPUT_SESSIONS_EMPTY_ELAPSED = [
+    ["[[[yoble1|NBA SESSIONS]]]"],
+    ["long", "Avara SEP_ID", " 301"],
+    [
+        "details",
+        "Active sessions",
+        " 0 (warn/crit at 10/20) / Inactive sessions",
+        " 0 (warn/crit at 10/40)",
+    ],
+    ["perfdata", "sessions_active=0;10;20"],
+    ["perfdata", "sessions_inactive=0;10;40"],
+    ["perfdata", "sessions_maxage=0"],
+    ["exit", "0"],
+    ["elapsed", ""],
+]
+
+AGENT_OUTPUT_EMPTY_LONG = [
+    ["[[[yoble1|NBA SESSIONS]]]"],
+    ["details", " 0 keine Job sind auf Fehler gelaufen!"],
+    ["exit", " 0"],
+    ["perfdata", " job_count=0"],
+    ["long", ""],
+    ["elapsed", ".31431"],
+]
+
+
+@pytest.mark.parametrize(
+    "info,expected",
+    [
+        (
+            AGENT_OUTPUT_WITH_FAILURE,
+            {
+                "FOOBAR1 SQL YOLBE AFS RABAT REPL ERROR STMT": Instance(
+                    details=[],
+                    elapsed=None,
+                    exit=0,
+                    long=[],
+                    parsing_error={
+                        ("instance", "PL/SQL failure", 2): [
+                            (
+                                "ERROR "
+                                "at "
+                                "line "
+                                "17: "
+                                "ORA-06550: "
+                                "line "
+                                "17, "
+                                "column "
+                                "5: "
+                                "PL/SQL: "
+                                "ORA-00933: "
+                                "SQL "
+                                "command "
+                                "not "
+                                "properly "
+                                "ended "
+                                "ORA-06550: "
+                                "line "
+                                "7, "
+                                "column "
+                                "5:"
+                            )
+                        ]
+                    },
+                    metrics=[],
+                )
+            },
+        ),
+        (
+            AGENT_OUTPUT_DETAILS_ONLY,
+            {
+                "FOOBAR1 SQL NBA SESSION LEVEL": Instance(
+                    details=["Session Level: 5"],
+                    elapsed=0.26815,
+                    exit=0,
+                    long=[],
+                    parsing_error={},
+                    metrics=[],
+                )
+            },
+        ),
+        (
+            AGENT_OUTPUT_LONG_WITH_INVALID_KEYWORD,
+            {
+                "BULU SQL BLABLI NBA SHA FILE": Instance(
+                    details=[],
+                    elapsed=0.29285,
+                    exit=2,
+                    long=[
+                        "Monitoring SHA/RAB Resultat = 1",
+                        "TODO siehe FOOBAR; Monitoring SHA",
+                    ],
+                    parsing_error={
+                        ("unknown", 'Unexpected Keyword: "detail". Line was', 3): [
+                            "detail:SHA-TT File (sha-ra), welches Sachen macht."
+                        ]
+                    },
+                    metrics=[],
+                )
+            },
+        ),
+        (
+            AGENT_OUTPUT_SESSIONS_WITH_PERFDATA,
+            {
+                "YOBLE1 SQL NBA SESSIONS": Instance(
+                    details=[
+                        (
+                            "Active sessions: 0 (warn/crit "
+                            "at 10/20) / Inactive sessions: "
+                            "0 (warn/crit at 10/40)"
+                        )
+                    ],
+                    elapsed=0.29444,
+                    exit=0,
+                    long=["Avara SEP_ID: 301"],
+                    parsing_error={},
+                    metrics=[
+                        Metric(name="sessions_active", value=0, levels=(10, 20), boundaries=None),
+                        Metric(name="sessions_inactive", value=0, levels=(10, 40), boundaries=None),
+                        Metric(name="sessions_maxage", value=0, levels=None, boundaries=None),
+                    ],
+                )
+            },
+        ),
+        (
+            AGENT_OUTPUT_SESSIONS_EMPTY_ELAPSED,
+            {
+                "YOBLE1 SQL NBA SESSIONS": Instance(
+                    details=[
+                        (
+                            "Active sessions: 0 (warn/crit "
+                            "at 10/20) / Inactive sessions: "
+                            "0 (warn/crit at 10/40)"
+                        )
+                    ],
+                    elapsed=None,
+                    exit=0,
+                    long=["Avara SEP_ID: 301"],
+                    parsing_error={},
+                    metrics=[
+                        Metric(name="sessions_active", value=0, levels=(10, 20), boundaries=None),
+                        Metric(name="sessions_inactive", value=0, levels=(10, 40), boundaries=None),
+                        Metric(name="sessions_maxage", value=0, levels=None, boundaries=None),
+                    ],
+                )
+            },
+        ),
+    ],
+)
+def test_oracle_sql_parse(info: StringTable, expected: Mapping[str, Instance]) -> None:
+    assert parse_oracle_sql(info) == expected
+
+
+@pytest.mark.parametrize(
+    "line,expected",
+    [
+        (
+            "sessions_active=0",
+            [Metric(name="sessions_active", value=0, levels=None, boundaries=None)],
+        ),
+        (
+            "sessions_active=0;10;20",
+            [Metric(name="sessions_active", value=0, levels=(10, 20), boundaries=None)],
+        ),
+        (
+            "sessions_active=0;10;20;30;40",
+            [Metric(name="sessions_active", value=0, levels=(10, 20), boundaries=(30, 40))],
+        ),
+        (
+            "one=0;10;20;30;40 two=1;2;3 three=2;3;4;5;6",
+            [
+                Metric(name="one", value=0, levels=(10, 20), boundaries=(30, 40)),
+                Metric(name="two", value=1, levels=(2, 3), boundaries=None),
+                Metric(name="three", value=2, levels=(3, 4), boundaries=(5, 6)),
+            ],
+        ),
+        (
+            "tasks_waiting=2;;100 task_working=7",
+            [
+                Metric(name="tasks_waiting", value=2, levels=(None, 100), boundaries=None),
+                Metric(name="task_working", value=7, levels=None, boundaries=None),
+            ],
+        ),
+    ],
+)
+def test_parse_metrics(line: str, expected: Sequence[Metric]) -> None:
+    assert list(parse_metrics(line)) == expected
+
+
+@pytest.mark.parametrize(
+    "info,expected",
+    [
+        (AGENT_OUTPUT_WITH_FAILURE, [Service(item="FOOBAR1 SQL YOLBE AFS RABAT REPL ERROR STMT")]),
+        (AGENT_OUTPUT_DETAILS_ONLY, [Service(item="FOOBAR1 SQL NBA SESSION LEVEL")]),
+        (AGENT_OUTPUT_LONG_WITH_INVALID_KEYWORD, [Service(item="BULU SQL BLABLI NBA SHA FILE")]),
+        (AGENT_OUTPUT_SESSIONS_WITH_PERFDATA, [Service(item="YOBLE1 SQL NBA SESSIONS")]),
+    ],
+)
+def test_oracle_sql_discovery(info: StringTable, expected: Sequence[Service]) -> None:
+    assert list(discovery_oracle_sql(parse_oracle_sql(info))) == expected
+
+
+@pytest.mark.parametrize(
+    "info, item, expected",
+    [
+        (
+            AGENT_OUTPUT_WITH_FAILURE,
+            "FOOBAR1 SQL YOLBE AFS RABAT REPL ERROR STMT",
+            [
+                Result(
+                    state=State.CRIT,
+                    summary="PL/SQL failure: ERROR at line 17: ORA-06550: line 17, "
+                    "column 5: PL/SQL: ORA-00933: "
+                    "SQL command not properly ended ORA-06550: line 7, column 5:",
+                )
+            ],
+        ),
+        (
+            AGENT_OUTPUT_DETAILS_ONLY,
+            "FOOBAR1 SQL NBA SESSION LEVEL",
+            [
+                Result(state=State.OK, summary="Session Level: 5"),
+                Metric("elapsed_time", 0.26815),
+            ],
+        ),
+        (
+            AGENT_OUTPUT_LONG_WITH_INVALID_KEYWORD,
+            "BULU SQL BLABLI NBA SHA FILE",
+            [
+                Result(
+                    state=State.UNKNOWN,
+                    summary='Unexpected Keyword: "detail". Line was: '
+                    "detail:SHA-TT File (sha-ra), welches Sachen macht.",
+                ),
+                Result(
+                    state=State.OK,
+                    notice="Monitoring SHA/RAB Resultat = 1\nTODO siehe FOOBAR; Monitoring SHA",
+                ),
+            ],
+        ),
+        (
+            AGENT_OUTPUT_SESSIONS_WITH_PERFDATA,
+            "YOBLE1 SQL NBA SESSIONS",
+            [
+                Result(
+                    state=State.OK,
+                    summary="Active sessions: 0 (warn/crit at 10/20) / "
+                    "Inactive sessions: 0 (warn/crit at 10/40)",
+                ),
+                Metric("sessions_active", 0, levels=(10, 20)),
+                Metric("sessions_inactive", 0, levels=(10, 40)),
+                Metric("sessions_maxage", 0),
+                Metric("elapsed_time", 0.29444),
+                Result(state=State.OK, notice="Avara SEP_ID: 301"),
+            ],
+        ),
+    ],
+)
+def test_oracle_sql_check(info: StringTable, item: str, expected: Sequence[Result]) -> None:
+    result = list(check_oracle_sql(item, {}, parse_oracle_sql(info)))
+    assert result == expected
+
+
+def test_oracle_sql_check_empty_long() -> None:
+    result = list(
+        check_oracle_sql("YOBLE1 SQL NBA SESSIONS", {}, parse_oracle_sql(AGENT_OUTPUT_EMPTY_LONG))
+    )
+    assert result == [
+        Result(state=State.OK, summary="0 keine Job sind auf Fehler gelaufen!"),
+        Metric("job_count", 0.0),
+        Metric("elapsed_time", 0.31431),
+    ]
+
+
+def test_check_oracle_sql_cached() -> None:
+    with time_machine.travel(datetime.datetime.fromtimestamp(10, tz=ZoneInfo("UTC"))):
+        assert list(
+            check_oracle_sql(
+                item="SID SQL SQL",
+                params={},
+                section=parse_oracle_sql(
+                    [
+                        ["[[[sid|sql|cached(1,2)]]]"],
+                        ["details", "DETAILS"],
+                        ["perfdata", "metric_name=1;2;3;0;5"],
+                        ["long", "LONG"],
+                        ["exit", "0"],
+                        ["elapsed", "123"],
+                    ]
+                ),
+            )
+        ) == [
+            Result(state=State.OK, summary="DETAILS"),
+            Metric("metric_name", 1.0, levels=(2.0, 3.0), boundaries=(0.0, 5.0)),
+            Metric("elapsed_time", 123.0),
+            Result(state=State.OK, notice="LONG"),
+            Result(
+                state=State.OK,
+                summary="Cache generated 9 seconds ago, cache interval: 2 seconds, elapsed cache lifespan: 450.00%",
+            ),
+        ]

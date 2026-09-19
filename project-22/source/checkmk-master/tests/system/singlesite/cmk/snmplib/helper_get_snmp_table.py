@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import ast
+import logging
+import sys
+from collections.abc import Callable, Mapping
+from pathlib import Path
+
+import cmk.utils.paths
+from cmk.checkengine.snmp_backends.classic import (  # astrein: disable=cmk-module-layer-violation
+    ClassicSNMPBackend,
+)
+from cmk.checkengine.snmp_backends.stored_walk import (  # astrein: disable=cmk-module-layer-violation
+    StoredWalkSNMPBackend,
+)
+from cmk.checkengine.snmplib import (
+    BackendSNMPTree,
+    get_snmp_table,
+    SNMPBackend,
+    SNMPBackendEnum,
+    SNMPHostConfig,
+    SNMPSectionName,
+)
+
+logger = logging.getLogger(__name__)
+
+params: tuple[Mapping[str, object], str, Mapping[str, object], str] = ast.literal_eval(
+    sys.stdin.read()
+)
+tree = BackendSNMPTree.from_json(params[0])
+backend_type = SNMPBackendEnum.deserialize(params[1])
+config = SNMPHostConfig.deserialize(params[2])
+cmk.utils.paths.snmpwalks_dir = Path(params[3])
+
+backend: Callable[[SNMPHostConfig], SNMPBackend]
+match backend_type:
+    case SNMPBackendEnum.INLINE:
+        from cmk.checkengine.snmp_backends.inline import (  # type: ignore[import-not-found,unused-ignore]  # astrein: disable=cmk-module-layer-violation
+            InlineSNMPBackend,
+        )
+
+        backend = InlineSNMPBackend
+    case SNMPBackendEnum.CLASSIC:
+        backend = ClassicSNMPBackend
+    case SNMPBackendEnum.STORED_WALK:
+        backend = StoredWalkSNMPBackend
+    case _:
+        raise ValueError(backend_type)
+
+walk_cache: dict[tuple[str, str, bool], list[tuple[str, bytes]]] = {}
+
+sys.stdout.write(
+    repr(
+        (
+            get_snmp_table(
+                section_name=SNMPSectionName("my_Section"),
+                tree=tree,
+                backend=backend(config),
+                walk_cache=walk_cache,
+            ),
+            walk_cache,
+        )
+    )
+    + "\n"
+)

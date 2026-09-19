@@ -1,0 +1,45 @@
+#!/bin/bash
+
+GIT_ROOT=$(git rev-parse --show-toplevel)
+
+# Walk up the directory tree to find the nearest BUILD / BUILD.bazel file and
+# return the corresponding Bazel package target (e.g. //cmk/foo:all).
+find_bazel_package() {
+    local dir
+    dir=$(dirname "$1")
+    while [[ "$dir" != "." && "$dir" != "/" ]]; do
+        if [[ -f "${GIT_ROOT}/${dir}/BUILD" || -f "${GIT_ROOT}/${dir}/BUILD.bazel" ]]; then
+            echo "//${dir}:all"
+            return
+        fi
+        dir=$(dirname "$dir")
+    done
+    echo "//:all"
+}
+
+python_files() {
+    if [ "${1}" -eq 2 ]; then
+        shebang=python
+        prefix=tests/
+    else
+        shebang=python3
+        prefix=tests/
+    fi
+    for file in ${2}; do
+        if [ "${file#"${GIT_ROOT}/${prefix}"}" != "${file}" ]; then
+            # file is it in GIT_ROOT/prefix
+            echo "${file}"
+            continue
+        fi
+        if head -1 "${file}" | grep -q "^#!.*${shebang}$" >/dev/null; then
+            echo "${file}"
+            continue
+        fi
+        # Assume 3 by default
+        if [ "${1}" -eq 3 ]; then
+            echo "${file}"
+            continue
+        fi
+    done
+    unset shebang prefix
+}

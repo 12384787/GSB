@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+"""agent_innovaphone
+
+Checkmk special agent for monitoring Innovaphone devices.
+"""
+
+import argparse
+import sys
+import urllib.parse
+from collections.abc import Iterable, Sequence
+from xml.etree import ElementTree as etree
+
+import requests
+
+from cmk.password_store.v1_unstable import parser_add_secret_option, resolve_secret_option
+from cmk.server_side_programs.v1_unstable import vcrtrace
+
+PASSWORD_OPTION = "password"
+
+
+class InnovaphoneConnection:
+    def __init__(
+        self, *, host: str, protocol: str, user: str, password: str, verify_ssl: bool
+    ) -> None:
+        self._base_url = f"{protocol}://{host}"
+        self._user = user
+        self._password = password
+        self._session = requests.Session()
+        # we cannot use self._session.verify because it will be overwritten by
+        # the REQUESTS_CA_BUNDLE env variable
+        self._verify_ssl = verify_ssl
+
+    def get(self, endpoint: str) -> str | None:
+        url = urllib.parse.urljoin(self._base_url, endpoint)
+        try:
+            # we must provide the verify keyword to every individual request call!
+            response = self._session.get(
+                url,
+                verify=self._verify_ssl,
+                auth=(self._user, self._password),
+            )
+        except requests.exceptions.RequestException as e:
+            sys.stderr.write(f"ERROR while connecting to {url}: {e}\n")
+            return None
+
+        if response.status_code != 200:
+            sys.stderr.write(
+                f"ERROR while processing request [{response.status_code}]: {response.reason}\n"
+            )
+        return response.text
+
+
+def get_informations(
+    connection: InnovaphoneConnection, name: str, xml_id: str, org_name: str
+) -> None:
+    url = "LOG0/CNT/mod_cmd.xml?cmd=xml-count&x=%s" % (xml_id)
+    response = connection.get(url)
+    if response is None:
+        return
+    data = _get_element(response)
+    if data is None:
+        return
+
+    c = None
+    for line in data:
+        for child in line:
+            if child.get("c"):
+                c = child.get("c")
+    if c:
+        sys.stdout.write("<<<%s>>>\n" % name)
+        sys.stdout.write(org_name + " " + c + "\n")
+
+
+def pri_channels_section(
+    *,
+    connection: InnovaphoneConnection,
+    channels: Sequence[str],
+) -> Iterable[str]:
+    yield "<<<innovaphone_channels>>>"
+    for channel_name, channel_data in _pri_channels_fetch_data(connection, channels):
+        yield _pri_channel_format_line(channel_name, channel_data)
+
+
+def _pri_channels_fetch_data(
+    connection: InnovaphoneConnection,
+    channels: Sequence[str],
+) -> Iterable[tuple[str, etree.Element]]:
+    for channel_name in channels:
+        url = "%s/mod_cmd.xml" % channel_name
+        response = connection.get(url)
+        if response is None:
+            return
+        if response == "?\r\n":
+            # ignore response for invalid module names. For details see
+            # https://wiki.innovaphone.com/index.php?title=Howto:Effect_arbitrary_Configuration_Changes_using_a_HTTP_Command_Line_Client_or_from_an_Update
+            return
+        data = _get_element(response)
+        if data is None:
+            return
+        yield channel_name, data
+
+
+def _pri_channel_format_line(channel_name: str, data: etree.Element) -> str:
+    link = data.get("link")
+    physical = data.get("physical")
+    if link != "Up" or physical != "Up":
+        return f"{channel_name} {link} {physical} 0 0"
+    idle = 0
+    total = 0
+    for channel in data.findall("ch"):
+        if channel.get("state") == "Idle":
+            idle += 1
+        total += 1
+    total -= 1
+    return f"{channel_name} {link} {physical} {idle} {total}"
+
+
+def licenses_section(connection: InnovaphoneConnection) -> Iterable[str]:
+    url = "PBX0/ADMIN/mod_cmd_login.xml"
+    response = connection.get(url)
+    if response is None:
+        return
+    data = _get_element(response)
+
+    if data is None:
+        return
+
+    yield "<<<innovaphone_licenses>>>"
+    for child in data.findall("lic"):
+        if child.get("name") == "Port":
+            count = child.get("count")
+            used = child.get("used")
+            yield f"{count} {used}"
+            return
+
+
+def _get_element(text: str) -> etree.Element | None:
+    try:
+        return etree.fromstring(text)
+    except etree.ParseError as e:
+        # this is a bit broad. But for now it fixes the agent.
+        sys.stderr.write(f"ERROR while parsing: {e}\n")
+    return None
+
+
+def parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
+    prog, description = __doc__.split("\n\n", maxsplit=1)
+    parser = argparse.ArgumentParser(
+        prog=prog, description=description, formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument(
+        "--debug",
+        "-d",
+        action="store_true",
+        help="Enable debug mode (keep some exceptions unhandled)",
+    )
+    parser.add_argument("--verbose", "-v", action="count", default=0)
+    parser.add_argument(
+        "--vcrtrace",
+        "--tracefile",
+        default=False,
+        action=vcrtrace(
+            # This is the result of a refactoring.
+            # I did not check if it makes sense for this special agent.
+            filter_headers=[("authorization", "****")],
+        ),
+    )
+    parser.add_argument("host", metavar="HOST")
+    parser.add_argument("--user", required=True)
+    parser_add_secret_option(
+        parser, long=f"--{PASSWORD_OPTION}", help="Password for the user", required=True
+    )
+    parser.add_argument(
+        "--protocol",
+        choices=[
+            "http",
+            "https",
+        ],
+        default="https",
+        help="specify the connection protocol (default: https)",
+    )
+    parser.add_argument(
+        "--no-cert-check",
+        action="store_true",
+        help="Disable certificate verification",
+    )
+    return parser.parse_args(argv)
+
+
+def main(sys_argv: Sequence[str] | None = None) -> int:
+    if sys_argv is None:
+        sys_argv = sys.argv[1:]
+
+    args = parse_arguments(sys_argv)
+    connection = InnovaphoneConnection(
+        host=args.host,
+        protocol=args.protocol,
+        user=args.user,
+        password=resolve_secret_option(args, PASSWORD_OPTION).reveal(),
+        verify_ssl=not args.no_cert_check,
+    )
+
+    response = connection.get("LOG0/CNT/mod_cmd.xml?cmd=xml-counts")
+    if response is None:
+        return 1
+    root_data = _get_element(response)
+    if root_data is None:
+        return 1
+
+    informations = {}
+    for entry in root_data:
+        n = entry.get("n")
+        x = entry.get("x")
+        informations[n] = x
+
+    for what in ["CPU", "MEM", "TEMP"]:
+        if x := informations.get(what):
+            section_name = "innovaphone_" + what.lower()
+            get_informations(connection, section_name, x, what)
+
+    sys.stdout.writelines(
+        f"{line}\n"
+        for line in pri_channels_section(
+            connection=connection,
+            # TODO: do we really need to guess at the channels?!
+            channels=("PRI1", "PRI2", "PRI3", "PRI4"),
+        )
+    )
+
+    sys.stdout.writelines(f"{line}\n" for line in licenses_section(connection))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

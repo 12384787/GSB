@@ -1,0 +1,64 @@
+<!--
+Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import type { StaticText } from 'cmk-shared-typing/typescript/vue_formspec_components'
+import CmkAlertBox from 'cmk-ui-library/components/CmkAlertBox.vue'
+import { computed } from 'vue'
+
+import FormLabel from '@/form/private/FormLabel.vue'
+
+const props = defineProps<{
+  spec: StaticText
+  // Kept for dispatcher symmetry; StaticText never validates.
+  backendValidation: unknown[]
+}>()
+
+// The displayed text comes from the v-model. The List visitor shares one
+// schema across all entries (built from `DEFAULT_VALUE`), so `spec.value`
+// is always the empty fallback for list rows — only `data` carries the
+// per-instance text. The v-model also round-trips the value back on submit
+// so the parent form preserves it.
+const data = defineModel<unknown>('data', { required: true })
+const display = computed(() => (typeof data.value === 'string' ? data.value : ''))
+
+const ALERT_VARIANTS = {
+  alert_info: 'info',
+  alert_warning: 'warning',
+  alert_error: 'error'
+} as const
+const alertVariant = computed(
+  () => ALERT_VARIANTS[props.spec.style as keyof typeof ALERT_VARIANTS] ?? null
+)
+
+const placeholder = computed(() => (display.value === '' ? (props.spec.placeholder ?? null) : null))
+</script>
+
+<template>
+  <CmkAlertBox
+    v-if="placeholder !== null"
+    size="small"
+    variant="info"
+    class="form-static-text__alert"
+    >{{ placeholder }}</CmkAlertBox
+  >
+  <CmkAlertBox
+    v-else-if="alertVariant"
+    size="small"
+    :variant="alertVariant"
+    class="form-static-text__alert"
+    >{{ display }}</CmkAlertBox
+  >
+  <pre v-else-if="spec.style === 'preformatted'" class="vs_fixed_value">{{ display }}</pre>
+  <FormLabel v-else>{{ display }}</FormLabel>
+</template>
+
+<style scoped>
+.form-static-text__alert.form-static-text__alert {
+  width: fit-content;
+  max-width: 100%;
+  margin: 0;
+}
+</style>

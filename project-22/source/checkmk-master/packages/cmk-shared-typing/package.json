@@ -1,0 +1,10 @@
+{
+  "name": "cmk-shared-typing",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "json-schema-to-typescript": "^15.0.4",
+    "openapi-typescript": "^7.9.1"
+  }
+}

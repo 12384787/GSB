@@ -1,0 +1,394 @@
+#!groovy
+
+/// file: package_helper.groovy
+
+/// distro-package as well as source-package jobs need agent updater binaries
+/// built the same way.
+/// This file gathers the magic to accomplish this, in orde to make it re-usable
+
+import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
+import groovy.transform.Field
+
+/// Build parameters selecting Azure-based signing for the Windows agent/relay jobs.
+@Field
+final Map AZURE_SIGN_METHOD = [SIGN_METHOD: "azure"]
+
+/// Returns the Jenkins 'branch folder' of the currently running job, either with or without
+/// the 'Testing/..' prefix
+/// So "Testing/bla.blubb/checkmk/2.4.0/some_job" will result in
+/// "Testing/bla.blubb/checkmk/2.4.0" or "checkmk/2.4.0"
+String branch_base_folder(with_testing_prefix) {
+    def project_name_components = currentBuild.fullProjectName.split("/").toList();
+    def checkmk_index = project_name_components.indexOf('checkmk');
+    if (with_testing_prefix) {
+        return project_name_components[0..checkmk_index + 1].join('/');
+    }
+    return project_name_components[checkmk_index..checkmk_index + 1].join('/');
+}
+
+LinkedHashMap<String, List> directory_sha256sum(directories) {
+    return directories.collectEntries({ path ->
+        [("${path}".toString()): cmd_output("sha256sum <(find ${path} -type f -exec sha256sum {} \\; | sort) | cut -d' ' -f1")]
+    });
+}
+
+static LinkedHashMap<String, List> dependency_paths_mapping() {
+    return [
+        "build-linux-agent-updater": [
+            "agents",
+            "non-free/packages/cmk-update-agent",
+        ],
+        "build-mk-oracle": [
+            "packages/mk-oracle",
+            "Cargo.toml",
+            "Cargo.lock",
+            ".cargo",
+        ],
+        "winagt-build": [
+            "agents",
+            "packages/cmk-agent-ctl",
+            "packages/mk-sql",
+            "packages/mk-oracle",
+            "Cargo.toml",
+            "Cargo.lock",
+            ".cargo",
+            "third_party/asio",
+            "third_party/fmt",
+            "third_party/googletest",
+            "third_party/openhardwaremonitor",
+            "third_party/simpleini",
+            "third_party/yaml-cpp",
+        ],
+        "relay-msi": [
+            // The MSI is built from the WiX installer sources and bundles
+            // script/install_relay.sh (see RelayProduct.wxs), so a change in either
+            // must rebuild the MSI.
+            "non-free/packages/cmk-relay-engine/windows-installer",
+            "non-free/packages/cmk-relay-engine/script",
+        ],
+        "winagt-build-modules-linux": [
+            "agents/modules/windows",
+        ],
+    ];
+}
+
+LinkedHashMap<String, List> dependency_paths_hashes() {
+    dir("${checkout_dir}") {
+        return dependency_paths_mapping().collectEntries({ job_name, paths ->
+            [("${job_name}".toString()) : {
+                def all_directory_hash_map = directory_sha256sum(paths);
+                def all_directory_hash = all_directory_hash_map.collect { k, v -> "${k}=${v}" }.join('-');
+                return all_directory_hash
+          }()]
+        });
+    }
+}
+
+/* groovylint-disable MethodSize */
+void provide_agent_binaries(Map args) {
+    // always download and move artifacts unless specified differently
+    def move_artifacts = args.move_artifacts == null ? true : args.move_artifacts.asBoolean();
+    def all_dependency_paths_hashes = dependency_paths_hashes();
+    def test_binaries_only = args.test_binaries_only == null ? false : true;
+    def fake_artifacts = args.fake_artifacts == null ? false : args.fake_artifacts.asBoolean();
+    def need_windows_python_cab = args.need_windows_python_cab == null ? false : args.need_windows_python_cab.asBoolean();
+
+    // This _should_ go to an externally maintained file (single point of truth), see
+    // https://jira.lan.tribe29.com/browse/CMK-13857
+    // and https://review.lan.tribe29.com/c/check_mk/+/67387
+    // For now it's nearly JSON like and can be treated as such.
+    def upstream_job_details = [
+        "build-linux-agent-updater": [
+            // NOTE: We're stripping of "Testing/..." if present, because
+            //       Windows can't handle long folder names so we take the absolute
+            //       (production) jobs to build our upstream stuff (both Linux and
+            //       Windows for consistency).
+            //       As 'soon' as this problem does not exist anymore we could run
+            //       relatively from 'builders/..'
+            relative_job_name: "${branch_base_folder(false)}/builders/build-linux-agent-updater",
+            /// no Linux agent updaters for community edition..
+            skip: test_binaries_only || fake_artifacts,
+            retry: 1,
+            dependency_paths_hash: all_dependency_paths_hashes["build-linux-agent-updater"],
+            additional_build_params: [],
+            install_cmd: """\
+                # check-mk-agent-*.{deb,rpm}
+                cp *.deb *.rpm ${checkout_dir}/agents/
+                # artifact file flags are not being kept - building a tar would be better..
+                if [ "${args.edition}" != "community" ]; then
+                    echo "edition is ${args.edition} => copy Linux agent updater binary"
+                    install -m 755 -D cmk-update-agent -t ${checkout_dir}/non-free/packages/cmk-update-agent/
+                fi
+                """.stripIndent(),
+        ],
+        "build-mk-oracle-aix-solaris": [
+            relative_job_name: "${branch_base_folder(false)}/builders/build-mk-oracle-on-aix-and-solaris",
+            dependency_paths_hash: all_dependency_paths_hashes["build-mk-oracle"],
+            additional_build_params: [],
+            skip: test_binaries_only || fake_artifacts,
+            retry: 1,
+            install_cmd: """\
+                cp mk-oracle.{aix,solaris} ${checkout_dir}/omd/packages/mk-oracle/
+                """.stripIndent(),
+        ],
+        "build-mk-oracle-rhel8": [
+            relative_job_name: "${branch_base_folder(false)}/builders/build-cmk-package-mk-oracle-k8s",
+            dependency_paths_hash: all_dependency_paths_hashes["build-mk-oracle"],
+            skip: test_binaries_only || fake_artifacts,
+            retry: 1,
+            additional_build_params: [
+                PACKAGE_PATH: "packages/mk-oracle",
+                DISTRO: "almalinux-8",
+                FILE_ARCHIVING_PATTERN: "mk-oracle*",
+                // do not add line breaks here. ci-artifacts might not find a match
+                // groovylint-disable-next-line LineLength
+                COMMAND_LINE: """bazel build --cmk_version=${args.cmk_version} mk-oracle; cp \$(bazel info workspace)/\$(bazel cquery --output=files mk-oracle) \$(bazel info workspace)""",
+            ],
+            install_cmd: """\
+                cp mk-oracle ${checkout_dir}/omd/packages/mk-oracle/mk-oracle.rhel8
+                """.stripIndent(),
+        ],
+        "build-mk-oracle-rhel8-component-test": [
+            relative_job_name: "${branch_base_folder(false)}/builders/build-cmk-package-mk-oracle-k8s",
+            dependency_paths_hash: all_dependency_paths_hashes["build-mk-oracle"],
+            skip: ! test_binaries_only,
+            retry: 1,
+            additional_build_params: [
+                PACKAGE_PATH: "packages/mk-oracle",
+                DISTRO: "almalinux-8",
+                FILE_ARCHIVING_PATTERN: "test_ora_*_test",
+                // do not add line breaks here. ci-artifacts might not find a match
+                // groovylint-disable-next-line LineLength
+                COMMAND_LINE: """bazel build //packages/mk-oracle:mk-oracle-lib-test-external; for t in test_ora_no_db test_ora_discovery test_ora_with_db; do cp \$(bazel info workspace)/\$(bazel cquery --output=files //packages/mk-oracle:mk-oracle-lib-test-external_tests/\${t}_test) \$(bazel info workspace); done"""
+            ],
+            install_cmd: """\
+                cp test_ora_no_db_test test_ora_discovery_test test_ora_with_db_test ${checkout_dir}/packages/mk-oracle/
+                """.stripIndent(),
+        ],
+        "build-mk-oracle-aix-solaris-component-test": [
+            relative_job_name: "${branch_base_folder(false)}/builders/build-mk-oracle-on-aix-and-solaris",
+            dependency_paths_hash: all_dependency_paths_hashes["build-mk-oracle"],
+            additional_build_params: [],
+            skip: ! test_binaries_only,
+            retry: 1,
+            install_cmd: """\
+                cp test_ora_no_db_test.aix test_ora_no_db_test.solaris ${checkout_dir}/packages/mk-oracle/
+                """.stripIndent(),
+        ],
+        "winagt-build": [
+            // NOTE: We're stripping of "Testing/..." if present, because
+            //       Windows can't handle long folder names so we take the absolute
+            //       (production) jobs to build our upstream stuff (both Linux and
+            //       Windows for consistency).
+            //       As 'soon' as this problem does not exist anymore we could run
+            //       relatively from 'builders/..'
+            relative_job_name: "${branch_base_folder(false)}/winagt-build",
+            dependency_paths_hash: all_dependency_paths_hashes["winagt-build"],
+            skip: test_binaries_only || fake_artifacts,
+            retry: 3,
+            additional_build_params: AZURE_SIGN_METHOD,
+            install_cmd: """\
+                cp \
+                    mk-oracle.exe \
+                    ${checkout_dir}/omd/packages/mk-oracle/
+                cp \
+                    signed_plugins.tar \
+                    ${checkout_dir}/omd/packages/win-signed-plugins/
+                cp \
+                    check_mk_agent.exe \
+                    check_mk_agent.msi \
+                    check_mk_agent_unsigned.msi \
+                    cmk-agent-ctl.exe \
+                    check_mk.yml \
+                    check_mk.user.yml \
+                    mk-sql.exe \
+                    robotmk_ext.exe \
+                    windows_files_hashes.txt \
+                    ${checkout_dir}/agents/windows/
+                (
+                    cd ${checkout_dir}/agents/windows
+                    ${checkout_dir}/buildscripts/scripts/create_unsign_msi_patch.sh \
+                        check_mk_agent.msi \
+                        check_mk_agent_unsigned.msi \
+                        unsign-msi.patch
+                )
+                """.stripIndent(),
+        ],
+        "relay-msi": [
+            // Windows-built relay MSI. Only the cloud/ultimate/ultimatemt editions ship
+            // it (see relay_install_pkg gating in omd/BUILD), so skip the fetch for any
+            // other edition. The MSI binary is identical across editions, so EDITION is
+            // kept out of the cache identity (see additional_build_params_no_check below)
+            // and a single artifact is shared across the gated editions.
+            // The job is registered directly under the branch folder, mirroring
+            // winagt-build (checkmk/<branch>/winagt-build) - NOT under builders/.
+            relative_job_name: "${branch_base_folder(false)}/relay-msi",
+            dependency_paths_hash: all_dependency_paths_hashes["relay-msi"],
+            skip: test_binaries_only || fake_artifacts ||
+                !(args.edition in ["cloud", "ultimate", "ultimatemt"]),
+            retry: 3,
+            additional_build_params: AZURE_SIGN_METHOD,
+            // Forward the edition so the relay-msi job's edition guard can validate
+            // it. Passed via the no-check channel on purpose: the MSI is identical
+            // across editions, so EDITION must NOT enter the cache identity - that
+            // keeps a single artifact shared across the gated editions.
+            additional_build_params_no_check: [EDITION: args.edition],
+            install_cmd: """\
+                cp \
+                    CheckmkRelayInstaller.msi \
+                    ${checkout_dir}/non-free/packages/cmk-relay-engine/
+                """.stripIndent(),
+        ],
+        "winagt-build-modules-linux": [
+            // The deb/rpm/cma package build no longer needs this: it builds
+            // python-3.cab inline via the hermetic Bazel rule (see
+            // agents/windows/BUILD). But `make dist` (source-tgz build) is
+            // driven by artifacts.make, which still expects a real file at
+            // agents/windows/python-3.cab on disk, so that flow alone still
+            // fetches it here. Registered directly under the branch folder
+            // (like winagt-build), not under builders/ - see
+            // winagt-build-modules-linux.groovy.
+            relative_job_name: "${branch_base_folder(false)}/winagt-build-modules-linux",
+            dependency_paths_hash: all_dependency_paths_hashes["winagt-build-modules-linux"],
+            skip: test_binaries_only || fake_artifacts || !need_windows_python_cab,
+            retry: 3,
+            additional_build_params: [],
+            install_cmd: """\
+                cp \
+                    python-3.cab \
+                    ${checkout_dir}/agents/windows/
+                """.stripIndent(),
+        ],
+    ];
+
+    def stages = upstream_job_details.collectEntries { job_name, details ->
+        [("${job_name}".toString()) : {
+            def skip = details["skip"];
+            def build_instance = null;
+
+            if (skip) {
+                Utils.markStageSkippedForConditional("${job_name}");
+            }
+
+            smart_stage(
+                name: job_name,
+                condition: ! skip,
+                raiseOnError: true,
+                retry: details.retry ?: 1,
+            ) {
+                def this_parameters = [
+                    use_upstream_build: true,
+                    force_build: params.DISABLE_JENKINS_CACHE == true,
+                    relative_job_name: details.relative_job_name,
+                    download: false,
+                    // set allow_retry true if retry is desired
+                    // smart_build would swallow the self-raised error and not cause a retry
+                    allow_retry: details.retry ? true : false,
+                ];
+
+                if (details.dependency_paths_hash) {
+                    // if dependency_paths are specified these will be used as unique identifier
+                    // CUSTOM_GIT_REF is handed over as well, but not activly checked by ci-artifacts
+                    this_parameters += [
+                        build_params: [
+                            CIPARAM_PATH_HASH: details.dependency_paths_hash,
+                            VERSION: args.version,
+                            DISABLE_CACHE: args.disable_cache,
+                        ] + details.additional_build_params,
+                        build_params_no_check: [
+                            CUSTOM_GIT_REF: effective_git_ref,
+                            CIPARAM_CLEANUP_WORKSPACE: params.CIPARAM_CLEANUP_WORKSPACE,
+                            CIPARAM_BISECT_COMMENT: args.bisect_comment,
+                        ] + (details.additional_build_params_no_check ?: [:]),
+                    ]
+                } else {
+                    this_parameters += [
+                        build_params: [
+                            CUSTOM_GIT_REF: effective_git_ref,
+                            VERSION: args.version,
+                            DISABLE_CACHE: args.disable_cache,
+                        ] + details.additional_build_params,
+                        build_params_no_check: [
+                            CIPARAM_CLEANUP_WORKSPACE: params.CIPARAM_CLEANUP_WORKSPACE,
+                            CIPARAM_BISECT_COMMENT: args.bisect_comment,
+                        ] + (details.additional_build_params_no_check ?: [:]),
+                    ]
+                }
+
+                if (move_artifacts) {
+                    // specify to download artifacts to desired destination
+                    this_parameters += [
+                        download: true,
+                        dest: "${args.artifacts_base_dir}/${job_name}",
+                        no_remove_others: true, // do not delete other files in the dest dir
+                    ];
+                }
+                build_instance = smart_build(this_parameters);
+            }
+
+            smart_stage(
+                name: "Move artifacts around",
+                condition: ! skip && build_instance && move_artifacts,
+                raiseOnError: true,
+            ) {
+                // prevent "_tmp" directories created by the Jenkins groovy dir() command
+                def install_cmd = "cd ${checkout_dir}/${args.artifacts_base_dir}/${job_name};";
+                install_cmd += details.install_cmd;
+                sh(install_cmd);
+            }
+        }]
+    }
+
+    return stages;
+}
+
+void cleanup_provided_agent_binaries(artifacts_base_dir) {
+    /// Cleanup
+    sh("""
+        # needed only because upstream_build() only downloads relative
+        # to `base-dir` which has to be `checkout_dir`
+        rm -rf ${checkout_dir}/${artifacts_base_dir}
+        rm -rf ${checkout_dir}/agents/windows_tmp ${checkout_dir}/agents_tmp
+    """);
+}
+
+void sign_package(source_dir, package_path) {
+    print("FN sign_package(source_dir=${source_dir}, package_path=${package_path})");
+    withCredentials([file(
+        credentialsId: "Check_MK_Release_Key",
+        variable: "GPG_KEY",)]) {
+        /// --batch is needed to awoid ioctl error
+        sh("gpg --batch --import ${GPG_KEY}");
+        }
+    withCredentials([
+        usernamePassword(
+            credentialsId: "9d7aca31-0043-4cd0-abeb-26a249d68261",
+            passwordVariable: "GPG_PASSPHRASE",
+            usernameVariable: "GPG_USERNAME",)
+    ]) {
+        sh("${source_dir}/buildscripts/scripts/sign-packages.sh ${package_path}");
+    }
+}
+
+void test_package(Map args) {
+    def junit_file = "junit-${args.name}.xml";
+    def pytest_addopts = "--junitxml=${args.workspace}/${junit_file}";
+    if (args.fake_artifacts) {
+        pytest_addopts +=  " --package-contains-faked-artifacts"
+    }
+    try {
+        sh("""
+            cd ${args.source_dir}
+            PACKAGE_PATH=${args.package_path} \
+            PYTEST_ADDOPTS='${pytest_addopts}' \
+            tests/run_tests.sh test-packaging
+        """);
+    } finally {
+        step([
+            $class: "JUnitResultArchiver",
+            testResults: junit_file,
+        ]);
+    }
+}
+
+return this;

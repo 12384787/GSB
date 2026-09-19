@@ -1,0 +1,42 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+load("//bazel/rules:doctest.bzl", "py_doc_test")
+
+py_library(
+    name = "availability",
+    srcs = glob(["**/*.py"]),
+    imports = ["../../.."],
+    visibility = [
+        "//cmk:__subpackages__",
+        "//tests:__subpackages__",
+    ],
+    deps = [
+        "//cmk/bi",
+        "//cmk/gui:auth_core",
+        "//cmk/gui:core_toolkit",
+        "//cmk/gui:main_navigation",
+        "//cmk/gui:page_toolkit",
+        "//cmk/gui/bi:bi_manager",
+        "//cmk/gui/bi:foldable_tree_renderer",
+        "//cmk/gui/data_source",
+        "//cmk/gui/openapi:utils",
+        "//cmk/gui/openapi/framework",
+        "//cmk/gui/openapi/restful_objects",
+        "//cmk/gui/utils:middle",
+        "//cmk/gui/valuespec",
+        "//cmk/gui/watolib:groups_io",
+        "//cmk/utils",
+        "//packages/cmk-ccc:cpu-tracking",
+        "//packages/cmk-ccc:hostaddress",
+        "//packages/cmk-ccc:site",
+        "//packages/cmk-ccc:store",
+        "//packages/cmk-ccc:version",
+        "//packages/cmk-livestatus-client",
+        "//packages/cmk-web/cmk/web/utils",
+    ],
+)
+
+py_doc_test(
+    name = "doctest",
+    size = "small",
+    srcs = [":availability"],
+)

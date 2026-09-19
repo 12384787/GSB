@@ -1,0 +1,144 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@cmk_requirements//:requirements.bzl", "requirement")
+load("@rules_python//python:packaging.bzl", "py_wheel")
+load("//bazel/rules:doctest.bzl", "py_doc_test")
+load("//bazel/rules:package_wheel.bzl", "package_wheel")
+load("//bazel/rules:py_requirements_test.bzl", "py_requirements_test")
+
+exports_files([
+    "dev-requirements.in",
+    "requirements.in",
+])
+
+py_library(
+    name = "crash",
+    srcs = [
+        "cmk/crash/__init__.py",
+        "cmk/crash/_crash.py",
+        "cmk/crash/_fingerprint.py",
+        "cmk/crash/_store.py",
+    ],
+    data = [":crash_py_typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//packages/cmk-ccc:store",
+        "//packages/cmk-ccc:version-info",
+    ],
+)
+
+py_library(
+    name = "crash_reporting",
+    srcs = [
+        "cmk/crash_reporting/__init__.py",
+        "cmk/crash_reporting/_packaging.py",
+        "cmk/crash_reporting/_schedule.py",
+        "cmk/crash_reporting/cli.py",
+        "cmk/crash_reporting/upload.py",
+    ],
+    data = [":crash_reporting_py_typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":crash",
+        "//packages/cmk-ccc:log",
+        "//packages/cmk-ccc:site",
+        "//packages/cmk-ccc:store",
+        "//packages/cmk-ccc:version",
+        requirement("requests"),
+    ],
+)
+
+py_doc_test(
+    name = "doctest",
+    size = "small",
+    srcs = [
+        ":crash",
+        ":crash_reporting",
+    ],
+)
+
+filegroup(
+    name = "crash_py_typed",
+    srcs = ["cmk/crash/py.typed"],
+)
+
+filegroup(
+    name = "crash_reporting_py_typed",
+    srcs = ["cmk/crash_reporting/py.typed"],
+)
+
+py_library(
+    name = "plugins",
+    srcs = glob(["cmk/plugins/**/*.py"]),
+    imports = ["."],
+    visibility = [
+        "//cmk/editions:__subpackages__",
+        "//packages/cmk-crash:__subpackages__",
+        # "//tests:__subpackages__",
+    ],
+    deps = [
+        ":crash",
+        "//packages/cmk-plugin-apis:diagnostics",
+    ],
+)
+
+py_wheel(
+    name = "wheel",
+    distribution = "cmk-crash",
+    entry_points = {"console_scripts": ["cmk-upload-crashes = cmk.crash_reporting.cli:main"]},
+    strip_path_prefixes = ["packages/cmk-crash"],
+    version = "1.0.0",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":crash",
+        ":crash_py_typed",
+        ":crash_reporting",
+        ":crash_reporting_py_typed",
+        ":plugins",
+    ],
+)
+
+# This wheel is only used for providing the entry point "cmk-upload-crashes" from the .venv under
+# .venv/bin. We explicitly need to *not* add dependencies here because venv/IDE would take the
+# static wheels and not the editable sources from the repo which are included via sitecustomize.py.
+py_wheel(
+    name = "wheel_entrypoint_only",
+    distribution = "cmk-crash-entrypoint",
+    entry_points = {"console_scripts": ["cmk-upload-crashes = cmk.crash_reporting.cli:main"]},
+    version = "1.0.0",
+    visibility = ["//visibility:public"],
+    deps = [],
+)
+
+build_test(
+    name = "build_test",
+    targets = [
+        "wheel",
+        "wheel_entrypoint_only",
+    ],
+)
+
+package_wheel(
+    name = "pkg_tar",
+    visibility = ["//visibility:public"],
+    whl = "wheel",
+)
+
+sh_library(
+    name = "helpers",
+    srcs = [
+        ".f12",
+    ],
+)
+
+py_requirements_test(
+    name = "requirements-test",
+    libs = [
+        ":crash",
+        ":crash_reporting",
+        ":plugins",
+    ],
+    requirements_in = "requirements.in",
+)

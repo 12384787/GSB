@@ -1,0 +1,51 @@
+load("@@//bazel/rules:dependency_info.bzl", "dependency_info")
+load("@@//bazel/rules:xcomp/foreign_cc.bzl", "make")
+
+dependency_info(
+    name = "dependency_info",
+    package_name = "heirloom-mailx",
+    cpe_format_str = "cpe:2.3:a:heirloom:mailx:%s:*:*:*:*:*:*:*",
+    license_kind = "@package_metadata//licenses/spdx:BSD-3-Clause",  # todo(wrong) BSD-4-Clause-UC AND MIT AND MPL-1.1
+    purl_namespace = None,
+    purl_type = "generic",
+    version = "12.5",
+)
+
+filegroup(
+    name = "mailxsrc",
+    srcs = glob([
+        "**",
+    ]),
+    package_metadata = [":dependency_info"],
+)
+
+make(
+    name = "heirloom-mailx",
+    args = ["UCBINSTALL=install"],  # We need this in order to override the install command of heirloom's Makefile
+    lib_source = ":mailxsrc",
+    linkopts = ["-Wl,--strip-all"],
+    out_bin_dir = "",
+    out_binaries = [
+        "bin/mailx",
+        "share/man/man1/mailx.1",
+    ],
+    platform = "@@//bazel/platforms:x86_64-linux-gcc-hermetic",
+    targets = [
+        "all",
+        "install",
+    ],
+)
+
+filegroup(
+    name = "mailx",
+    srcs = [":heirloom-mailx"],
+    output_group = "mailx",
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "share",
+    srcs = [":heirloom-mailx"],
+    output_group = "mailx.1",
+    visibility = ["//visibility:public"],
+)

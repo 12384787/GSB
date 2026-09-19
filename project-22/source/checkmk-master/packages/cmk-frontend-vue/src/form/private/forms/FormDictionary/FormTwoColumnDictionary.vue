@@ -1,0 +1,188 @@
+<!--
+Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import { cva } from 'class-variance-authority'
+import type * as FormSpec from 'cmk-shared-typing/typescript/vue_formspec_components'
+import CmkHtml from 'cmk-ui-library/components/CmkHtml.vue'
+import CmkCheckbox from 'cmk-ui-library/components/user-input/CmkCheckbox.vue'
+import CmkInlineValidation from 'cmk-ui-library/components/user-input/CmkInlineValidation.vue'
+import { untranslated } from 'cmk-ui-library/lib/i18n'
+import useId from 'cmk-ui-library/lib/useId'
+import { immediateWatch } from 'cmk-ui-library/lib/watch'
+import { computed, ref } from 'vue'
+
+import FormReadonly from '@/form/FormReadonly.vue'
+import FormEditDispatcher from '@/form/private/FormEditDispatcher/FormEditDispatcher.vue'
+import FormHelp from '@/form/private/FormHelp.vue'
+import FormRequired from '@/form/private/FormRequired.vue'
+import { rendersRequiredLabelItself } from '@/form/private/requiredValidator'
+import { type ValidationMessages, groupNestedValidations } from '@/form/private/validation'
+
+import { getElementsInGroupsFromProps, titleRequired, toggleElement } from './_groups'
+
+const dictionaryVariants = cva('', {
+  variants: {
+    group_layout: {
+      none: '',
+      horizontal: 'horizontal_groups',
+      vertical: 'vertical_groups'
+    }
+  },
+  defaultVariants: {
+    group_layout: 'none'
+  }
+})
+
+const props = defineProps<{
+  spec: FormSpec.Dictionary
+  backendValidation: ValidationMessages
+}>()
+
+const data = defineModel<Record<string, unknown>>('data', { required: true })
+const elementValidation = ref<Record<string, ValidationMessages>>({})
+const validation = ref<ValidationMessages>([])
+
+immediateWatch(
+  () => props.spec.additional_static_elements,
+  (newAdditionalStaticElements: FormSpec.Dictionary['additional_static_elements'] | undefined) => {
+    if (newAdditionalStaticElements) {
+      for (const [key, value] of Object.entries(newAdditionalStaticElements)) {
+        data.value[key] = value
+      }
+    }
+  }
+)
+
+immediateWatch(
+  () => props.backendValidation,
+  (newValidation: ValidationMessages) => {
+    const [dictionaryValidation, dictionaryElementsValidation] = groupNestedValidations(
+      props.spec.elements,
+      newValidation
+    )
+    elementValidation.value = dictionaryElementsValidation
+    validation.value = dictionaryValidation
+  }
+)
+
+const groups = computed(() => getElementsInGroupsFromProps(props.spec.elements, data))
+
+const componentId = useId()
+</script>
+
+<template>
+  <table
+    v-if="props.spec.elements.length > 0"
+    class="form-two-column-dictionary"
+    :aria-label="props.spec.title"
+    role="group"
+  >
+    <tbody>
+      <CmkInlineValidation :validation="validation.map((m) => m.message)"></CmkInlineValidation>
+      <tr v-for="group in groups" :key="`${componentId}.${group.groupKey}`">
+        <td class="form-two-column-dictionary__dictleft">
+          <div v-if="!!group.title" class="form-dictionary__group-title">{{ group?.title }}</div>
+          <FormHelp v-if="group.help" :help="group.help" />
+          <div :class="dictionaryVariants({ group_layout: group.layout })">
+            <div
+              v-for="dict_element in group.elems"
+              :key="`${componentId}.${dict_element.dict_config.name}`"
+              class="form-dictionary__group_elem"
+              role="group"
+              :aria-label="dict_element.dict_config.parameter_form.title"
+            >
+              <span
+                v-if="titleRequired(dict_element.dict_config)"
+                class="form-dictionary__group-elem__title"
+              >
+                <span
+                  v-if="dict_element.dict_config.required"
+                  class="form-dictionary__required-title"
+                >
+                  <CmkHtml :html="dict_element.dict_config.parameter_form.title" /><FormRequired
+                    v-if="!rendersRequiredLabelItself(dict_element.dict_config.parameter_form)"
+                    :spec="dict_element.dict_config.parameter_form"
+                    :space="'before'"
+                  />
+                </span>
+                <CmkCheckbox
+                  v-else
+                  v-model="dict_element.is_active"
+                  :label="untranslated(dict_element.dict_config.parameter_form.title)"
+                  :help="untranslated(dict_element.dict_config.parameter_form.help)"
+                  @update:model-value="
+                    toggleElement(data, spec.elements, dict_element.dict_config.name)
+                  "
+                />
+              </span>
+              <div v-if="dict_element.is_active">
+                <FormEditDispatcher
+                  v-if="!dict_element.dict_config.render_only"
+                  v-model:data="data[dict_element.dict_config.name]"
+                  :spec="dict_element.dict_config.parameter_form as FormSpec.Components"
+                  :backend-validation="elementValidation[dict_element.dict_config.name]!"
+                />
+                <FormReadonly
+                  v-else
+                  :data="data[dict_element.dict_config.name]"
+                  :backend-validation="elementValidation[dict_element.dict_config.name]!"
+                  :spec="dict_element.dict_config.parameter_form"
+                ></FormReadonly>
+              </div>
+            </div>
+          </div>
+        </td>
+      </tr>
+    </tbody>
+  </table>
+  <span v-else>{{ spec.no_elements_text }}</span>
+</template>
+
+<style scoped>
+.form-two-column-dictionary {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+/* stylelint-disable-next-line checkmk/vue-bem-naming-convention */
+.form-dictionary__group-title {
+  font-weight: bold;
+  margin: var(--spacing) 0;
+}
+
+/* stylelint-disable-next-line checkmk/vue-bem-naming-convention */
+tr:first-of-type > td > .form-dictionary__group-title {
+  margin-top: 0;
+}
+
+/* stylelint-disable-next-line checkmk/vue-bem-naming-convention */
+.form-dictionary__group-elem__title {
+  display: inline-block;
+  flex-shrink: 0;
+  width: 180px;
+  margin: 0;
+  padding-top: 0;
+  font-weight: bold;
+  overflow-wrap: break-word;
+  white-space: normal;
+  min-height: 21px;
+
+  /* stylelint-disable-next-line checkmk/vue-bem-naming-convention */
+  & > .form-dictionary__required-title {
+    display: inline-block;
+    margin-bottom: var(--spacing-half);
+  }
+}
+
+/* stylelint-disable-next-line checkmk/vue-bem-naming-convention */
+.form-dictionary__group_elem {
+  padding: 8px 0;
+  display: flex;
+  flex-direction: row;
+  justify-content: flex-start;
+  align-items: start;
+}
+</style>

@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+# <<<jenkins_instance>>>
+# {"quietingDown": false, "nodeDescription": "the master Jenkins node",
+# "numExecutors": 0, "mode": "NORMAL", "_class": "hudson.model.Hudson",
+# "useSecurity": true}
+
+import json
+from typing import TypedDict
+
+from cmk.agent_based.v2 import (
+    AgentSection,
+    CheckPlugin,
+    CheckResult,
+    Result,
+    State,
+    StringTable,
+)
+from cmk.agent_based.v3_unstable import discover_one_service
+
+MAP_INSTANCE_STATE = {
+    True: "yes",
+    False: "no",
+    "NORMAL": "normal",
+    "EXCLUSIVE": "exclusive",
+    None: "N/A",
+}
+
+
+class JenkinsInstance(TypedDict, total=False):
+    nodeDescription: str
+    quietingDown: bool
+    useSecurity: bool
+
+
+def parse_jenkins_instance(string_table: StringTable) -> JenkinsInstance:
+    parsed: JenkinsInstance = {}
+
+    for line in string_table:
+        parsed.update(json.loads(line[0]))
+
+    return parsed
+
+
+agent_section_jenkins_instance = AgentSection(
+    name="jenkins_instance",
+    parse_function=parse_jenkins_instance,
+)
+
+
+def check_jenkins_instance(params: dict, section: JenkinsInstance) -> CheckResult:  # noqa: ARG001
+    if not section:
+        return
+
+    if (instance_description := section.get("nodeDescription")) is not None:
+        if not isinstance(instance_description, str):
+            instance_description = str(instance_description)  # type: ignore[unreachable]
+
+        yield Result(state=State.OK, summary=f"Description: {instance_description.title()}")
+
+    for key, desired_value, infotext in [
+        ("quietingDown", False, "Quieting Down"),
+        ("useSecurity", True, "Security used"),
+    ]:
+        match parsed_data := section.get(key):
+            case None:
+                state = State.UNKNOWN
+            case bool(value) if value == desired_value:
+                state = State.OK
+            case _:
+                state = State.WARN
+
+        yield Result(state=state, summary=f"{infotext}: {MAP_INSTANCE_STATE[parsed_data]}")
+
+
+check_plugin_jenkins_instance = CheckPlugin(
+    name="jenkins_instance",
+    service_name="Jenkins Instance",
+    discovery_function=discover_one_service,
+    check_function=check_jenkins_instance,
+    check_default_parameters={},
+)

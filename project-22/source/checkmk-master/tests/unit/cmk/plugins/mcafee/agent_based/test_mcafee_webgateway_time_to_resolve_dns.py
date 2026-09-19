@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+# Copyright (C) 2023 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+import typing
+
+import pytest
+
+from cmk.agent_based.internal import evaluate_snmp_detection
+from cmk.agent_based.v2 import Metric, Result, Service, SimpleSNMPSection, State, StringTable
+from cmk.plugins.mcafee import libgateway
+from cmk.plugins.mcafee.agent_based import mcafee_webgateway_time_to_resolve_dns
+from cmk.plugins.mcafee.agent_based.mcafee_webgateway_misc_section import (
+    snmp_section_mcafee_webgateway_misc,
+    snmp_section_skyhigh_security_webgateway_misc,
+)
+
+WALK_MCAFEE: dict[str, str] = {
+    ".1.3.6.1.2.1.1.1.0": "McAfee Web Gateway 7",
+    ".1.3.6.1.4.1.1230.2.7.2.5.1.0": "1",
+    ".1.3.6.1.4.1.1230.2.7.2.5.2.0": "16",
+    ".1.3.6.1.4.1.1230.2.7.2.5.3.0": "35",
+    ".1.3.6.1.4.1.1230.2.7.2.5.4.0": "0",
+    ".1.3.6.1.4.1.1230.2.7.2.5.5.0": "0",
+    ".1.3.6.1.4.1.1230.2.7.2.5.6.0": "2000",
+    ".1.3.6.1.4.1.1230.2.7.2.5.7.0": "2",
+    ".1.3.6.1.4.1.1230.2.7.2.5.8.0": "177073",
+    ".1.3.6.1.4.1.1230.2.7.2.5.9.0": "14",
+    ".1.3.6.1.4.1.1230.2.7.2.5.10.0": "177073",
+    ".1.3.6.1.4.1.1230.2.7.2.5.11.0": "177073",
+    ".1.3.6.1.4.1.1230.2.7.2.5.12.0": "23",
+    ".1.3.6.1.4.1.1230.2.7.2.5.13.0": "23",
+    ".1.3.6.1.4.1.1230.2.7.2.5.14.0": "23",
+    ".1.3.6.1.4.1.1230.2.7.2.5.15.0": "32",
+}
+
+WALK_SKYHIGH: dict[str, str] = {
+    ".1.3.6.1.2.1.1.2.0": "1.3.6.1.4.1.59732.2.7.1.1",
+    ".1.3.6.1.4.1.59732.2.7.2.5.1.0": "1",
+    ".1.3.6.1.4.1.59732.2.7.2.5.2.0": "16",
+    ".1.3.6.1.4.1.59732.2.7.2.5.3.0": "35",
+    ".1.3.6.1.4.1.59732.2.7.2.5.4.0": "0",
+    ".1.3.6.1.4.1.59732.2.7.2.5.5.0": "0",
+    ".1.3.6.1.4.1.59732.2.7.2.5.6.0": "2000",
+    ".1.3.6.1.4.1.59732.2.7.2.5.7.0": "2",
+    ".1.3.6.1.4.1.59732.2.7.2.5.8.0": "177073",
+    ".1.3.6.1.4.1.59732.2.7.2.5.9.0": "14",
+    ".1.3.6.1.4.1.59732.2.7.2.5.10.0": "177073",
+    ".1.3.6.1.4.1.59732.2.7.2.5.11.0": "177073",
+    ".1.3.6.1.4.1.59732.2.7.2.5.12.0": "23",
+    ".1.3.6.1.4.1.59732.2.7.2.5.13.0": "23",
+    ".1.3.6.1.4.1.59732.2.7.2.5.14.0": "23",
+    ".1.3.6.1.4.1.59732.2.7.2.5.15.0": "32",
+}
+
+TABLE_TTR_MCAFEE: StringTable = [["16", "35", "2000", "2"]]
+TABLE_TTR_SKYHIGH: StringTable = [["16", "35", "2000", "2"]]
+
+
+@pytest.mark.parametrize(
+    "walk, detected_section",
+    [
+        (WALK_MCAFEE, snmp_section_mcafee_webgateway_misc),
+        (WALK_SKYHIGH, snmp_section_skyhigh_security_webgateway_misc),
+    ],
+)
+def test_detect(walk: dict[str, str], detected_section: SimpleSNMPSection) -> None:  # type: ignore[misc]
+    assert evaluate_snmp_detection(detect_spec=detected_section.detect, oid_value_getter=walk.get)
+
+
+@pytest.mark.parametrize(
+    "table, detected_section",
+    [
+        (TABLE_TTR_MCAFEE, snmp_section_mcafee_webgateway_misc),
+        (TABLE_TTR_SKYHIGH, snmp_section_skyhigh_security_webgateway_misc),
+    ],
+)
+def test_parse(table: StringTable, detected_section: SimpleSNMPSection) -> None:  # type: ignore[misc]
+    # Act
+    section = detected_section.parse_function([table])
+
+    # Assert
+    assert section is not None
+
+
+@pytest.mark.parametrize(
+    "table, detected_section",
+    [
+        (TABLE_TTR_MCAFEE, snmp_section_mcafee_webgateway_misc),
+        (TABLE_TTR_SKYHIGH, snmp_section_skyhigh_security_webgateway_misc),
+    ],
+)
+def test_discovery(table: StringTable, detected_section: SimpleSNMPSection) -> None:  # type: ignore[misc]
+    # Assemble
+    section = detected_section.parse_function([table])
+    assert section is not None
+
+    # Act
+    services = list(mcafee_webgateway_time_to_resolve_dns.discovery(section=section))
+
+    # Assert
+    assert services == [Service()]
+
+
+@pytest.mark.parametrize(
+    "detected_section, params_misc, expected_results",
+    [
+        pytest.param(
+            snmp_section_mcafee_webgateway_misc,
+            {"time_to_resolve_dns": None},
+            [
+                Result(state=State.OK, summary="2 seconds"),
+            ],
+            id="No levels",
+        ),
+        pytest.param(
+            snmp_section_skyhigh_security_webgateway_misc,
+            {"time_to_resolve_dns": None},
+            [
+                Result(state=State.OK, summary="2 seconds"),
+            ],
+            id="No levels",
+        ),
+        pytest.param(
+            snmp_section_mcafee_webgateway_misc,
+            {"time_to_resolve_dns": (3000, 3000)},
+            [
+                Result(state=State.OK, summary="2 seconds"),
+            ],
+            id="Levels, but OK",
+        ),
+        pytest.param(
+            snmp_section_mcafee_webgateway_misc,
+            {"time_to_resolve_dns": (2000, 3000)},
+            [
+                Result(state=State.WARN, summary="2 seconds (warn/crit at 2 seconds/3 seconds)"),
+            ],
+            id="Critical",
+        ),
+        pytest.param(
+            snmp_section_skyhigh_security_webgateway_misc,
+            {"time_to_resolve_dns": (2000, 3000)},
+            [
+                Result(state=State.WARN, summary="2 seconds (warn/crit at 2 seconds/3 seconds)"),
+            ],
+            id="Critical",
+        ),
+        pytest.param(
+            snmp_section_mcafee_webgateway_misc,
+            {"time_to_resolve_dns": (1000, 2000)},
+            [
+                Result(state=State.CRIT, summary="2 seconds (warn/crit at 1 second/2 seconds)"),
+            ],
+            id="Warning",
+        ),
+    ],
+)
+def test_check_results(  # type: ignore[misc]
+    detected_section: SimpleSNMPSection,  # noqa: ARG001
+    params_misc: dict[str, object],
+    expected_results: list[Result],
+) -> None:
+    # Assemble
+    params = typing.cast(libgateway.MiscParams, libgateway.MISC_DEFAULT_PARAMS | params_misc)
+    # Note: original test always used mcafee section here regardless of parametrize
+    section = snmp_section_mcafee_webgateway_misc.parse_function([TABLE_TTR_MCAFEE])
+    assert section is not None
+
+    # Act
+    results = [
+        r
+        for r in mcafee_webgateway_time_to_resolve_dns.check(params=params, section=section)
+        if isinstance(r, Result)
+    ]
+
+    # Assert
+    assert results == expected_results
+
+
+@pytest.mark.parametrize(
+    "table, detected_section",
+    [
+        (TABLE_TTR_MCAFEE, snmp_section_mcafee_webgateway_misc),
+        (TABLE_TTR_SKYHIGH, snmp_section_skyhigh_security_webgateway_misc),
+    ],
+)
+def test_check_metrics(table: StringTable, detected_section: SimpleSNMPSection) -> None:  # type: ignore[misc]
+    # Assemble
+    section = detected_section.parse_function([table])
+    assert section is not None
+
+    # Act
+    metrics = [
+        r
+        for r in mcafee_webgateway_time_to_resolve_dns.check(
+            params=libgateway.MISC_DEFAULT_PARAMS, section=section
+        )
+        if isinstance(r, Metric)
+    ]
+
+    # Assert
+    assert metrics == [Metric("time_to_resolve_dns", 2.0, levels=(1.5, 2.0))]

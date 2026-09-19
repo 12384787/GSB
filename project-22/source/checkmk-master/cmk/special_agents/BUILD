@@ -1,0 +1,27 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+load("@cmk_requirements//:requirements.bzl", "requirement")
+load("//bazel/rules:doctest.bzl", "py_doc_test")
+
+py_library(
+    name = "special_agents",
+    srcs = glob(["**/*.py"]),
+    imports = ["../.."],
+    visibility = [
+        "//cmk:__subpackages__",
+        "//tests:__subpackages__",
+    ],
+    deps = [
+        "//cmk/utils",
+        "//packages/cmk-ccc:log",
+        "//packages/cmk-ccc:version-info",
+        "//packages/cmk-crash:crash",
+        "//packages/cmk-plugin-apis:server_side_programs",
+        requirement("urllib3"),
+    ],
+)
+
+py_doc_test(
+    name = "doctest",
+    size = "small",
+    srcs = [":special_agents"],
+)

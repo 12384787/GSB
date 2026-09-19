@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from typing import Literal, override, TypeGuard
+
+from cmk.ccc.site import omd_site, SiteId
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.logged_in import LoggedInUser
+from cmk.gui.watolib.config_domain_name import CORE
+from cmk.gui.watolib.passwords import load_passwords, load_passwords_to_modify, save_password
+from cmk.gui.watolib.pending_changes import (
+    Change,
+    ChangeScope,
+    PendingChanges,
+)
+from cmk.gui.watolib.simple_config_file import ConfigFileRegistry, WatoSimpleConfigFile
+from cmk.gui.watolib.utils import wato_root_dir
+from cmk.utils.global_ident_type import GlobalIdent, PROGRAM_ID_OAUTH
+from cmk.utils.oauth2_connection import OAuth2Connection, OAuth2ConnectorType, OAuth2Sites
+from cmk.utils.password_store import PasswordConfig
+
+
+def register(config_file_registry: ConfigFileRegistry) -> None:
+    config_file_registry.register(OAuth2ConnectionsConfigFile())
+
+
+class OAuth2ConnectionsConfigFile(WatoSimpleConfigFile[OAuth2Connection]):
+    def __init__(self) -> None:
+        super().__init__(
+            config_file_path=wato_root_dir() / "oauth2_connections.mk",
+            config_variable="oauth2_connections",
+            spec_class=OAuth2Connection,
+        )
+
+    @staticmethod
+    def filter_by_passwords(
+        entries: dict[str, OAuth2Connection], allowed_passwords: dict[str, PasswordConfig]
+    ) -> dict[str, OAuth2Connection]:
+        return {
+            k: v
+            for k, v in entries.items()
+            if all(
+                [
+                    v["client_secret"][2][0] in allowed_passwords,
+                    v["access_token"][2][0] in allowed_passwords,
+                    v["refresh_token"][2][0] in allowed_passwords,
+                ],
+            )
+        }
+
+    @override
+    def filter_usable_entries(
+        self, entries: dict[str, OAuth2Connection], acting_user: LoggedInUser
+    ) -> dict[str, OAuth2Connection]:
+        return self.filter_by_passwords(entries, load_passwords(acting_user))
+
+    @override
+    def filter_editable_entries(
+        self, entries: dict[str, OAuth2Connection], acting_user: LoggedInUser
+    ) -> dict[str, OAuth2Connection]:
+        return self.filter_by_passwords(entries, load_passwords_to_modify(acting_user))
+
+
+def _scope_from_affected_sites(affected_sites: list[SiteId] | None) -> ChangeScope:
+    if affected_sites is None:
+        return ChangeScope.all_activation_sites()
+    return ChangeScope.sites(affected_sites)
+
+
+def save_oauth2_connection(
+    ident: str,
+    details: OAuth2Connection,
+    *,
+    pprint_value: bool,
+    pending_changes: PendingChanges,
+    affected_sites: list[SiteId] | None = None,
+) -> None:
+    oauth2_connections_config_file = OAuth2ConnectionsConfigFile()
+    entries = oauth2_connections_config_file.load_for_modification()
+    entries[ident] = details
+    pending_changes.add(
+        Change(
+            action_name="add-oauth2-connection",
+            text=f"Added the OAuth2 connection '{ident}'",
+            domains=[CORE],
+        ),
+        _scope_from_affected_sites(affected_sites),
+    )
+    oauth2_connections_config_file.save(entries, pprint_value)
+
+
+def load_usable_oauth2_connections(acting_user: LoggedInUser) -> dict[str, OAuth2Connection]:
+    oauth2_connections_config_file = OAuth2ConnectionsConfigFile()
+    entries = oauth2_connections_config_file.load_for_reading()
+    return oauth2_connections_config_file.filter_usable_entries(entries, acting_user)
+
+
+def load_oauth2_connections() -> dict[str, OAuth2Connection]:
+    oauth2_connections_config_file = OAuth2ConnectionsConfigFile()
+    return oauth2_connections_config_file.load_for_reading()
+
+
+def update_oauth2_connection(
+    ident: str,
+    details: OAuth2Connection,
+    *,
+    pprint_value: bool,
+    pending_changes: PendingChanges,
+    affected_sites: list[SiteId] | None = None,
+) -> None:
+    oauth2_connections_config_file = OAuth2ConnectionsConfigFile()
+    entries = oauth2_connections_config_file.load_for_modification()
+    if ident not in entries:
+        raise KeyError(f"OAuth2 connection with ident '{ident}' does not exist")
+    entries[ident] = details
+
+    pending_changes.add(
+        Change(
+            action_name="update-oauth2-connection",
+            text=f"Updated the OAuth2 connection '{ident}'",
+            domains=[CORE],
+        ),
+        _scope_from_affected_sites(affected_sites),
+    )
+    oauth2_connections_config_file.save(entries, pprint_value)
+
+
+def delete_oauth2_connection(
+    ident: str,
+    *,
+    pprint_value: bool,
+    pending_changes: PendingChanges,
+    affected_sites: list[SiteId] | None = None,
+) -> None:
+    oauth2_connections_config_file = OAuth2ConnectionsConfigFile()
+    entries = oauth2_connections_config_file.load_for_modification()
+    if ident not in entries:
+        raise KeyError(f"OAuth2 connection with ident '{ident}' does not exist")
+    del entries[ident]
+    pending_changes.add(
+        Change(
+            action_name="deleted-oauth2-connection",
+            text=f"Deleted the OAuth2 connection '{ident}'",
+            domains=[CORE],
+        ),
+        _scope_from_affected_sites(affected_sites),
+    )
+    oauth2_connections_config_file.save(entries, pprint_value)
+
+
+def is_locked_by_oauth2_connection(
+    ident: GlobalIdent | None, *, check_reference_exists: bool = True
+) -> TypeGuard[GlobalIdent]:
+    return (
+        ident is not None
+        and ident["program_id"] == PROGRAM_ID_OAUTH
+        and (not check_reference_exists or ident["instance_id"] in load_oauth2_connections())
+    )
+
+
+def save_tokens_to_passwordstore(
+    *,
+    ident: str,
+    title: str,
+    client_secret: str,
+    access_token: str,
+    refresh_token: str,
+    owned_by: str | None,
+    shared_with: list[str],
+    acting_user: LoggedInUser,
+    pprint_value: bool,
+    pending_changes: PendingChanges,
+) -> None:
+    # TODO Think site_id should be in data above
+    site_id = omd_site()
+    password_entries = load_passwords(acting_user)
+    for pw_title, entry, password in [
+        ("Client secret", "client_secret", client_secret),
+        ("Access token", "access_token", access_token),
+        ("Refresh token", "refresh_token", refresh_token),
+    ]:
+        password_ident = f"{ident}_{entry}"
+        save_password(
+            ident=password_ident,
+            config=PasswordConfig(
+                title=f"{pw_title} ({title})",
+                comment=f"Created by OAuth2 connection {title}",
+                docu_url="",
+                password=password,
+                owned_by=owned_by,
+                shared_with=shared_with,
+                locked_by=GlobalIdent(
+                    site_id=site_id,
+                    program_id=PROGRAM_ID_OAUTH,
+                    instance_id=ident,
+                ),
+            ),
+            new_password=password_ident not in password_entries,
+            pprint_value=pprint_value,
+            pending_changes=pending_changes,
+        )
+
+
+def update_reference(
+    *,
+    ident: str,
+    title: str,
+    client_id: str,
+    tenant_id: str,
+    authority: str,
+    sites: OAuth2Sites,
+    connector_type: OAuth2ConnectorType,
+    pprint_value: bool,
+    pending_changes: PendingChanges,
+) -> tuple[str, OAuth2Connection]:
+    details = OAuth2Connection(
+        title=title,
+        access_token=("cmk_postprocessed", "stored_password", (f"{ident}_access_token", "")),
+        client_id=client_id,
+        client_secret=("cmk_postprocessed", "stored_password", (f"{ident}_client_secret", "")),
+        refresh_token=("cmk_postprocessed", "stored_password", (f"{ident}_refresh_token", "")),
+        tenant_id=tenant_id,
+        authority=authority,
+        sites=sites,
+        connector_type=connector_type,
+    )
+
+    affected_sites: list[SiteId] | None = None
+    match sites:
+        case ("all", None):  # type: ignore[unreachable] # mypy regression?
+            pass
+        case ("restricted", list() as site_ids):
+            affected_sites = [SiteId(site_id) for site_id in site_ids]
+        case _:
+            raise MKUserError("sites", "Invalid value for sites")
+    update_oauth2_connection(
+        ident=ident,
+        details=details,
+        pprint_value=pprint_value,
+        pending_changes=pending_changes,
+        affected_sites=affected_sites,
+    )
+    return ident, details
+
+
+def save_new_reference_to_config_file(
+    *,
+    ident: str,
+    title: str,
+    client_id: str,
+    tenant_id: str,
+    authority: str,
+    sites: OAuth2Sites,
+    connector_type: OAuth2ConnectorType,
+    pprint_value: bool,
+    pending_changes: PendingChanges,
+) -> tuple[str, OAuth2Connection]:
+    details = OAuth2Connection(
+        title=title,
+        access_token=("cmk_postprocessed", "stored_password", (f"{ident}_access_token", "")),
+        client_id=client_id,
+        client_secret=("cmk_postprocessed", "stored_password", (f"{ident}_client_secret", "")),
+        refresh_token=("cmk_postprocessed", "stored_password", (f"{ident}_refresh_token", "")),
+        tenant_id=tenant_id,
+        authority=authority,
+        sites=sites,
+        connector_type=connector_type,
+    )
+
+    affected_sites: list[SiteId] | None = None
+    match sites:
+        case ("all", None):  # type: ignore[unreachable] # mypy regression?
+            pass
+        case ("restricted", list() as site_ids):
+            affected_sites = [SiteId(site_id) for site_id in site_ids]
+        case _:
+            raise MKUserError("sites", "Invalid value for sites")
+    save_oauth2_connection(
+        ident=ident,
+        details=details,
+        pprint_value=pprint_value,
+        pending_changes=pending_changes,
+        affected_sites=affected_sites,
+    )
+    return ident, details
+
+
+def extract_password_store_entry(
+    acting_user: LoggedInUser,
+    value: tuple[
+        Literal["cmk_postprocessed"],
+        Literal["explicit_password", "stored_password"],
+        tuple[str, str],
+    ],
+) -> str:
+    match value:
+        case ("cmk_postprocessed", "stored_password", (password_id, str())):
+            password_entries = load_passwords(acting_user)
+            password_entry = password_entries[password_id]
+            if not password_entry:
+                raise MKUserError("client_secret", f"Password with ID '{password_id}' not found")
+            return str(password_entry["password"])
+        case ("cmk_postprocessed", "explicit_password", (_password_id, password)):
+            return str(password)
+        case _:
+            raise MKUserError("client_secret", "Incorrect format for secret value")

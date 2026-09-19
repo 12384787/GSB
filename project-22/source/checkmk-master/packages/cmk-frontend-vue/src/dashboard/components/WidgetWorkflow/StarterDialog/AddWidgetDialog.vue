@@ -1,0 +1,76 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import CmkSlideIn from 'cmk-ui-library/components/CmkSlideIn'
+import CmkHeading from 'cmk-ui-library/components/typography/CmkHeading.vue'
+import usei18n from 'cmk-ui-library/lib/i18n'
+
+import ContentSpacer from '@/dashboard/components/ContentSpacer.vue'
+import CloseButton from '@/dashboard/components/Wizard/components/CloseButton.vue'
+import WizardStageContainer from '@/dashboard/components/Wizard/components/WizardStageContainer.vue'
+import { DashboardFeatures } from '@/dashboard/types/dashboard'
+
+import type { WorkflowItem } from '../WidgetWorkflowTypes'
+import WorkflowListItem from './WorkflowListItem.vue'
+
+const { _t } = usei18n()
+
+export interface AddWidgetDialogProperties {
+  workflowItems: Record<string, WorkflowItem>
+  open: boolean
+  dashboardFeatures: DashboardFeatures
+}
+
+const props = defineProps<AddWidgetDialogProperties>()
+
+defineEmits(['close', 'select'])
+
+const isDisabled = (id: string): boolean => {
+  return (
+    props.dashboardFeatures === DashboardFeatures.RESTRICTED &&
+    ['custom_graphs', 'hw_sw_inventory', 'alerts_notifications'].includes(id)
+  )
+}
+</script>
+
+<template>
+  <CmkSlideIn
+    :open="props.open"
+    :size="'small'"
+    :aria-label="_t('Add widget')"
+    @close="$emit('close')"
+  >
+    <WizardStageContainer>
+      <CmkHeading type="h1">
+        {{ _t('Add widget') }}
+      </CmkHeading>
+      <CloseButton @close="() => $emit('close')" />
+
+      <ContentSpacer :dimension="8" />
+
+      <div class="db-add-widget-dialog__container">
+        <WorkflowListItem
+          v-for="(item, id) in props.workflowItems"
+          :key="id"
+          :title="item.title"
+          :icon="item.icon"
+          :subtitle="item.subtitle"
+          :icon_emblem="item.icon_emblem"
+          :disabled="isDisabled(id)"
+          @select="$emit('select', id)"
+        />
+      </div>
+    </WizardStageContainer>
+  </CmkSlideIn>
+</template>
+
+<style scoped>
+.db-add-widget-dialog__container {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing);
+}
+</style>

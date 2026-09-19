@@ -1,0 +1,168 @@
+<!--
+Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import type { FormSpec } from 'cmk-shared-typing/typescript/vue_formspec_components'
+import CmkSlideInDialog from 'cmk-ui-library/components/CmkSlideInDialog.vue'
+import type {
+  SetDataResult,
+  ValidationMessages
+} from 'cmk-ui-library/lib/configuration_entity_types.ts'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import client, { unwrap } from 'cmk-ui-library/lib/rest-api-client/client'
+import { ref } from 'vue'
+
+import { configEntityAPI } from '@/form'
+import type { API, Payload } from '@/form/FormEditAsync.vue'
+import FormEditAsync from '@/form/FormEditAsync.vue'
+
+import type { PasswordConfig } from './password_store_password.types.ts'
+
+function isPasswordConfig(data: unknown): data is PasswordConfig {
+  if (typeof data !== 'object' || data === null) {
+    return false
+  }
+  const d = data as Record<string, unknown>
+  const generalProps = d['general_props']
+  const passwordProps = d['password_props']
+  return (
+    typeof generalProps === 'object' &&
+    generalProps !== null &&
+    typeof (generalProps as Record<string, unknown>)['id'] === 'string' &&
+    typeof (generalProps as Record<string, unknown>)['title'] === 'string' &&
+    typeof passwordProps === 'object' &&
+    passwordProps !== null
+  )
+}
+
+defineProps<{ open: boolean }>()
+
+const emit = defineEmits<{
+  close: []
+  created: [data: PasswordConfig]
+}>()
+
+const { _t } = usei18n()
+
+async function fetchFormSpec(): Promise<{ schema: FormSpec; defaultValues: Payload }> {
+  const data = unwrap(
+    await client.GET('/domain-types/form_spec/collections/{entity_type}', {
+      params: {
+        path: { entity_type: 'passwordstore_password' },
+        query: { entity_type_specifier: 'passwordstore_password' }
+      }
+    })
+  )
+  return {
+    schema: data.extensions!.schema as FormSpec,
+    defaultValues: data.extensions!.default_values as Payload
+  }
+}
+
+const slideInObjectId = ref<string | null>(null)
+
+const api: API<string, PasswordConfig> = {
+  getSchema: async () => {
+    return (await fetchFormSpec()).schema
+  },
+  getData: async (_objectId: string | null) => {
+    return (await fetchFormSpec()).defaultValues
+  },
+  setData: async (
+    _objectId: string | null,
+    data: Record<string, unknown>
+  ): Promise<SetDataResult<PasswordConfig>> => {
+    const gp = data['general_props']
+    if (typeof gp === 'object' && gp !== null) {
+      const gpRecord = gp as Record<string, unknown>
+      if (typeof gpRecord['id'] === 'string') {
+        gpRecord['id'] = gpRecord['id'].trim()
+      }
+    }
+
+    if (!isPasswordConfig(data)) {
+      const validationMessages: ValidationMessages = [
+        { location: [], message: _t('Unexpected form data shape.'), replacement_value: data }
+      ]
+      return { type: 'error', validationMessages }
+    }
+
+    const validationMessages: ValidationMessages = []
+
+    if (!data.general_props.id) {
+      validationMessages.push({
+        location: ['general_props', 'id'],
+        message: _t('An empty value is not allowed here'),
+        replacement_value: ''
+      })
+    }
+    if (!data.general_props.title) {
+      validationMessages.push({
+        location: ['general_props', 'title'],
+        message: _t('An empty value is not allowed here'),
+        replacement_value: ''
+      })
+    }
+    if (!data.password_props.password[0]) {
+      validationMessages.push({
+        location: ['password_props', 'password'],
+        message: _t('An empty value is not allowed here'),
+        replacement_value: data.password_props.password
+      })
+    }
+
+    const ownedBy = data.password_props.owned_by
+    if (Array.isArray(ownedBy) && ownedBy[0] === 'contact_group' && !ownedBy[1]) {
+      validationMessages.push({
+        location: ['password_props', 'owned_by'],
+        message: _t(
+          'You need to be member of at least one contact group to be able to create a password.'
+        ),
+        replacement_value: ownedBy
+      })
+    }
+
+    if (data.general_props.id) {
+      const existing = await configEntityAPI.listEntities(
+        'passwordstore_password',
+        'passwordstore_password'
+      )
+      if (existing.some((e) => e.ident === data.general_props.id)) {
+        validationMessages.push({
+          location: ['general_props', 'id'],
+          message: _t('This ID is already in use. Please choose another one.'),
+          replacement_value: data.general_props.id
+        })
+      }
+    }
+
+    if (validationMessages.length > 0) {
+      return { type: 'error', validationMessages }
+    }
+
+    return { type: 'success', entity: data }
+  }
+}
+</script>
+
+<template>
+  <CmkSlideInDialog
+    :open="open"
+    :header="{ title: _t('New password'), closeButton: true }"
+    @close="emit('close')"
+  >
+    <FormEditAsync
+      :object-id="slideInObjectId"
+      :api="api"
+      :permanent-choice-warning="
+        _t(
+          'Changes submitted through this form will be immediately applied to your configuration when completing the setup. However, you may still need to activate them for them to take effect.'
+        )
+      "
+      @cancel="emit('close')"
+      @submitted="(result) => emit('created', result)"
+    />
+  </CmkSlideInDialog>
+</template>

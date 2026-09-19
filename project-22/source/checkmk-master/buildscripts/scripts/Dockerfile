@@ -1,0 +1,39 @@
+# docker build \
+# --build-arg IMAGE_BASE=$(buildscripts/docker_image_aliases/resolve.py IMAGE_PYTHON_3_14) \
+# --tag minimal-alpine-checkmk-ci-master \
+# -f buildscripts/scripts/Dockerfile .
+#
+# docker run -it --rm \
+# --workdir /checkmk \
+# -v ./:/checkmk \
+# --name alpine321 \
+# minimal-alpine-checkmk-ci-master:latest bash
+#
+
+ARG IMAGE_BASE
+FROM ${IMAGE_BASE}
+# above image is python:3.14-alpine3.23
+# docker inspect -f "{{ .Size }}" minimal-alpine-checkmk-ci-master:latest
+# 136MB (136684737)
+# bash is required to be used in Jenkins with image.inside(), requires +3MB
+# git is required to use checkmk-dev-tools, requires +13MB
+# jq is required to parse JSON data, requires +1MB
+# make is required by scripts/fake-artifacts, see CMK-21338, requires +9MB
+# coreutils, grep is required by validate_changes.py/find-[python,shell]-files
+# to get "sort --zero-terminated" and "grep --binary-files=", requires +2MB
+# rsync is required to upload artifacts to tstbuilds, requires +1MB
+# openssh is required to login with rsync to remote servers, requires +5MB
+# curl is required to upload artifacts to Nexus, requires +1MB
+# cache removal saves 3MB
+RUN apk update && \
+    apk add bash git make coreutils grep rsync openssh jq curl && \
+    rm -rf /var/cache/apk/*
+
+# install checkmk-dev-tools to run ci-artifacts
+# install pyyaml to parse editions.yml and stages.yml
+RUN pip3 install --break-system-packages \
+    "checkmk-dev-tools==2.4.3" \
+    "pyyaml==6.0.2"
+
+# verify installation
+RUN cmk-dev info

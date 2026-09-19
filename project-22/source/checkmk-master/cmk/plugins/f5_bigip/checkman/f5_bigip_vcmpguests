@@ -1,0 +1,12 @@
+title: F5 Big-IP: Show Failover States of all vCMP Guests Running on a vCMP Host
+agents: snmp
+catalog: hw/network/f5
+license: GPLv2
+distribution: check_mk
+description:
+ The check queries the MIB tables of F5 BIG-IP loadbalancers (local traffic managers) to identify
+ the failover status of every vCMP guest running on a vCMP host.
+ The service is informational, no parameters are used or configurable.
+
+discovery:
+ One service is created.

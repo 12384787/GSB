@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="no-any-return"
+# mypy: disable-error-code="type-arg"
+
+import copy
+from collections.abc import Collection, Sequence
+from typing import override
+
+from cmk.ccc.site import SiteId
+from cmk.ccc.version import Edition
+from cmk.gui.config import Config
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.htmllib.html import html
+from cmk.gui.http import request
+from cmk.gui.i18n import _
+from cmk.gui.logged_in import user
+from cmk.gui.oauth2_connections.utils import oauth2_render_link, oauth2_source_cell
+from cmk.gui.oauth2_connections.watolib.store import is_locked_by_oauth2_connection
+from cmk.gui.pages import PageContext
+from cmk.gui.quick_setup.html import (
+    quick_setup_duplication_warning,
+    quick_setup_locked_warning,
+    quick_setup_render_link,
+    quick_setup_source_cell,
+)
+from cmk.gui.table import Table
+from cmk.gui.valuespec import (
+    Alternative,
+    DictionaryEntry,
+    DropdownChoice,
+    DualListChoice,
+    FixedValue,
+    ValueSpec,
+)
+from cmk.gui.valuespec import Password as PasswordValuespec
+from cmk.gui.wato.pages._simple_modes import (
+    convert_dict_elements_vs2fs,
+    SimpleEditMode,
+    SimpleListMode,
+    SimpleModeType,
+)
+from cmk.gui.watolib.config_domain_name import (
+    ABCConfigDomain,
+    ConfigDomainName,
+    PasswordChange,
+    SerializedSettings,
+)
+from cmk.gui.watolib.configuration_bundle_store import is_locked_by_config_bundle
+from cmk.gui.watolib.groups_io import load_contact_group_information
+from cmk.gui.watolib.mode import ModeRegistry, WatoMode
+from cmk.gui.watolib.password_store import PasswordStore
+from cmk.gui.watolib.passwords import password_change_effect_registry, sorted_contact_group_choices
+from cmk.gui.watolib.pending_changes import Change, ChangeScope, PendingChanges
+from cmk.rulesets.v1.form_specs import DictElement
+from cmk.utils.password_store import PasswordConfig
+from cmk.web.utils.icons import IconNames, StaticIcon
+from cmk.web.utils.permission_verification import PermissionName
+
+
+def register(mode_registry: ModeRegistry) -> None:
+    mode_registry.register(ModePasswords)
+    mode_registry.register(ModeEditPassword)
+
+
+class PasswordStoreModeType(SimpleModeType[PasswordConfig]):
+    @override
+    def type_name(self) -> str:
+        return "password"
+
+    @override
+    def name_singular(self) -> str:
+        return _("password")
+
+    @override
+    def is_site_specific(self) -> bool:
+        return False
+
+    @override
+    def can_be_disabled(self) -> bool:
+        return False
+
+    @override
+    def affected_config_domains(self) -> list[ABCConfigDomain]:
+        # handled in _add_change
+        raise NotImplementedError
+
+
+class ModePasswords(SimpleListMode[PasswordConfig]):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "passwords"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["passwords"]
+
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(
+            edition,
+            ctx,
+            mode_type=PasswordStoreModeType(),
+            store=PasswordStore(),
+        )
+        self._contact_groups = load_contact_group_information()
+
+    @override
+    def title(self) -> str:
+        return _("Passwords")
+
+    @override
+    def _table_title(self) -> str:
+        return _("Passwords")
+
+    @override
+    def _validate_deletion(self, ident: str, entry: PasswordConfig, *, debug: bool) -> None:
+        if is_locked_by_config_bundle(entry.get("locked_by")):
+            raise MKUserError(
+                "_delete",
+                _("Cannot delete %(name_singular)s because it is managed by Quick Setup.")
+                % {"name_singular": self._mode_type.name_singular()},
+            )
+        if is_locked_by_oauth2_connection(entry.get("locked_by")):
+            raise MKUserError(
+                "_delete",
+                _(
+                    "Cannot delete %(name_singular)s because it is managed by an existing OAuth2 connection."
+                )
+                % {"name_singular": self._mode_type.name_singular()},
+            )
+
+    @override
+    def _delete_confirm_message(self) -> str:
+        return " ".join(
+            [
+                _(
+                    "<b>Beware:</b> The password may be used in checks. If you "
+                    "delete the password, the checks won't be able to "
+                    "authenticate with this password anymore."
+                ),
+                super()._delete_confirm_message(),
+            ]
+        )
+
+    @override
+    def _show_delete_action(self, nr: int, ident: str, entry: PasswordConfig) -> None:
+        if is_locked_by_config_bundle(entry.get("locked_by")):
+            html.icon_button(
+                url="",
+                title=_("%(name_singular)s can only be deleted via Quick Setup")
+                % {"name_singular": self._mode_type.name_singular().title()},
+                icon=StaticIcon(IconNames.delete),
+                class_=["disabled"],
+            )
+        elif is_locked_by_oauth2_connection(entry.get("locked_by")):
+            html.icon_button(
+                url="",
+                title=_("%(name_singular)s can only be deleted via OAuth2 connection")
+                % {"name_singular": self._mode_type.name_singular().title()},
+                icon=StaticIcon(IconNames.delete),
+                class_=["disabled"],
+            )
+        else:
+            super()._show_delete_action(nr, ident, entry)
+
+    @override
+    def page(self, config: Config) -> None:
+        html.p(
+            _(
+                "This password management module stores the passwords you use in your checks and "
+                "special agents in a central place. Please note that this password store is no "
+                "kind of password safe. Your passwords will not be encrypted."
+            )
+        )
+        html.p(
+            _(
+                "All the passwords you store in your monitoring configuration, "
+                "including this password store, are needed in plain text to contact remote systems "
+                "for monitoring. So all those passwords have to be stored readable by the monitoring."
+            )
+        )
+        super().page(config)
+
+    @override
+    def _show_entry_cells(self, table: Table, ident: str, entry: PasswordConfig) -> None:
+        table.cell(_("ID"), ident)
+        table.cell(_("Title"), entry["title"])
+        table.cell(_("Editable by"))
+        if entry["owned_by"] is None:
+            html.write_text_permissive(
+                _('Administrators (having the permission "Write access to all passwords")')
+            )
+        else:
+            html.write_text_permissive(self._contact_group_alias(entry["owned_by"]))
+        table.cell(_("Shared with"))
+        if not entry["shared_with"]:
+            html.write_text_permissive(_("Not shared"))
+        else:
+            html.write_text_permissive(
+                ", ".join([self._contact_group_alias(g) for g in entry["shared_with"]])
+            )
+
+        quick_setup_source_cell(table, entry.get("locked_by"))
+        oauth2_source_cell(entry.get("locked_by"))
+
+    def _contact_group_alias(self, name: str) -> str:
+        return self._contact_groups.get(name, {"alias": name})["alias"]
+
+    @override
+    def _add_change(
+        self,
+        *,
+        action: str,
+        text: str,
+        affected_sites: list[SiteId] | None,
+        pending_changes: PendingChanges,
+    ) -> None:
+        """Add a Setup change entry for this object type modifications"""
+
+        affected_domains: Sequence[ConfigDomainName] = []
+        domain_settings: dict[ConfigDomainName, SerializedSettings] = {}
+        match action:
+            case "delete":
+                if (ident := request.get_ascii_input("_delete")) is None:
+                    return
+                affected_domains = password_change_effect_registry.affected_domains_delete
+                domain_settings = {
+                    domain: SerializedSettings(
+                        changed_passwords=[PasswordChange(change_type="DELETE", password_id=ident)]
+                    )
+                    for domain in password_change_effect_registry.affected_domains_delete
+                }
+            case _:
+                raise NotImplementedError(f"Unknown action {action} for mode {self.name()}")
+
+        pending_changes.add(
+            Change(
+                action_name=f"{action}-{self._mode_type.type_name()}",
+                text=text,
+                domains=affected_domains,
+                domain_settings=domain_settings,
+            ),
+            (
+                ChangeScope.all_activation_sites()
+                if affected_sites is None
+                else ChangeScope.sites(affected_sites)
+            ),
+        )
+
+
+class ModeEditPassword(SimpleEditMode[PasswordConfig]):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "edit_password"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["passwords"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModePasswords
+
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        self._clone_source: PasswordConfig | None = None
+        super().__init__(
+            edition,
+            ctx,
+            mode_type=PasswordStoreModeType(),
+            store=PasswordStore(),
+        )
+
+    @override
+    def _clone_entry(self, entry: PasswordConfig) -> PasswordConfig:
+        self._clone_source = entry
+        clone = copy.deepcopy(entry)
+        # remove the lock when cloning
+        clone.pop("locked_by", None)
+        return clone
+
+    @override
+    def _vs_mandatory_elements(self) -> list[DictionaryEntry]:
+        elements = super()._vs_mandatory_elements()
+        locked_by = None if self._new else self._entry.get("locked_by")
+        if is_locked_by_config_bundle(locked_by, check_reference_exists=False):
+            elements.append(
+                (
+                    "source",
+                    FixedValue(
+                        value=locked_by["instance_id"],
+                        title=_("Source"),
+                        totext=quick_setup_render_link(locked_by),
+                    ),
+                )
+            )
+        if is_locked_by_oauth2_connection(locked_by, check_reference_exists=False):
+            elements.append(
+                (
+                    "source",
+                    FixedValue(
+                        value=locked_by["instance_id"],
+                        title=_("Source"),
+                        totext=oauth2_render_link(locked_by),
+                    ),
+                )
+            )
+
+        return elements
+
+    def _mandatory_elements(self) -> dict[str, DictElement]:
+        return convert_dict_elements_vs2fs(self._vs_mandatory_elements())
+
+    @override
+    def _vs_individual_elements(self) -> list[DictionaryEntry]:
+        if user.may("wato.edit_all_passwords"):
+            admin_element: list[ValueSpec] = [
+                FixedValue(
+                    value=None,
+                    title=_("Administrators"),
+                    totext=_(
+                        'Administrators (having the permission "Write access to all passwords")'
+                    ),
+                )
+            ]
+        else:
+            admin_element = []
+
+        elements: list[DictionaryEntry] = [
+            (
+                "password",
+                PasswordValuespec(
+                    title=_("Password"),
+                    allow_empty=False,
+                    size=32,
+                ),
+            ),
+            (
+                "owned_by",
+                Alternative(
+                    title=_("Editable by"),
+                    help=_(
+                        "Each password is owned by a group of users which are able to edit, "
+                        "delete and use existing passwords."
+                    ),
+                    elements=admin_element
+                    + [
+                        DropdownChoice(
+                            title=_("Members of the contact group:"),
+                            choices=lambda: sorted_contact_group_choices(only_own=True),
+                            invalid_choice="complain",
+                            empty_text=_(
+                                "You need to be member of at least one contact group to be able to "
+                                "create a password."
+                            ),
+                            invalid_choice_title=_("Group not existant or not member"),
+                            invalid_choice_error=_(
+                                "The choosen group is either not existant "
+                                "anymore or you are not a member of this "
+                                "group. Please choose another one."
+                            ),
+                        ),
+                    ],
+                ),
+            ),
+            (
+                "shared_with",
+                DualListChoice(
+                    title=_("Share with"),
+                    help=_(
+                        "By default, only the members of the owner contact group are permitted "
+                        "to use a a configured password. It is possible to share a password with "
+                        "other groups of users to make them able to use a password in checks."
+                    ),
+                    choices=sorted_contact_group_choices,
+                    autoheight=False,
+                    size=43,
+                ),
+            ),
+        ]
+
+        return elements
+
+    @override
+    def _page_form_quick_setup_warning(self) -> None:
+        locked_by = None if self._new else self._entry.get("locked_by")
+        if (
+            is_locked_by_config_bundle(locked_by)
+            and request.get_ascii_input("mode") != "edit_configuration_bundle"
+        ):
+            quick_setup_locked_warning(locked_by, self._mode_type.name_singular())
+
+        elif self._clone_source and (locked_by := self._clone_source.get("locked_by")):
+            quick_setup_duplication_warning(locked_by, self._mode_type.name_singular())
+
+    @override
+    def _add_change(
+        self,
+        *,
+        action: str,
+        text: str,
+        affected_sites: list[SiteId] | None,
+        pending_changes: PendingChanges,
+    ) -> None:
+        """Add a Setup change entry for this object type modifications"""
+
+        if self._ident is None:
+            return
+
+        affected_domains: Sequence[ConfigDomainName] = []
+        domain_settings: dict[ConfigDomainName, SerializedSettings] = {}
+        match action:
+            case "add":
+                affected_domains = password_change_effect_registry.affected_domains_add
+                domain_settings = {
+                    domain: SerializedSettings(
+                        changed_passwords=[
+                            PasswordChange(change_type="ADD", password_id=self._ident)
+                        ]
+                    )
+                    for domain in password_change_effect_registry.affected_domains_add
+                }
+            case "edit":
+                affected_domains = password_change_effect_registry.affected_domains_edit
+                domain_settings = {
+                    domain: SerializedSettings(
+                        changed_passwords=[
+                            PasswordChange(change_type="EDIT", password_id=self._ident)
+                        ]
+                    )
+                    for domain in password_change_effect_registry.affected_domains_edit
+                }
+            case _:
+                raise NotImplementedError(f"Unknown action {action} for mode {self.name()}")
+
+        pending_changes.add(
+            Change(
+                action_name=f"{action}-{self._mode_type.type_name()}",
+                text=text,
+                domains=affected_domains,
+                domain_settings=domain_settings,
+            ),
+            (
+                ChangeScope.all_activation_sites()
+                if affected_sites is None
+                else ChangeScope.sites(affected_sites)
+            ),
+        )

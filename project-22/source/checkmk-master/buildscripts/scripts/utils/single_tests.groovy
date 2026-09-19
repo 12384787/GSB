@@ -1,0 +1,250 @@
+#!groovy
+
+/// file: single_tests.groovy
+
+Map common_prepare(Map args) {
+    def versioning = load("${checkout_dir}/buildscripts/scripts/utils/versioning.groovy");
+
+    def safe_branch_name = versioning.safe_branch_name();
+    def branch_version = versioning.get_branch_version(checkout_dir);
+    def cmk_version_rc_aware = versioning.get_cmk_version(safe_branch_name, branch_version, args.version);
+    def cmk_version = versioning.strip_rc_number_from_version(cmk_version_rc_aware);
+    def docker_tag = versioning.select_docker_tag(
+        args.docker_tag,  // 'build tag'
+        safe_branch_name,  // 'branch', returns '<BRANCH>-latest'
+    );
+
+    currentBuild.description += (
+        """
+        |Run *-single-f12less test<br>
+        |safe_branch_name: ${safe_branch_name}<br>
+        |branch_version: ${branch_version}<br>
+        |cmk_version: ${cmk_version}<br>
+        |cmk_version_rc_aware: ${cmk_version_rc_aware}<br>
+        |docker_tag: ${docker_tag}<br>
+        |edition: ${params.EDITION}<br>
+        |distro: ${params.DISTRO}<br>
+        |make_target: ${args.make_target}<br>
+        """.stripMargin());
+
+    print(
+        """
+        |===== CONFIGURATION ===============================
+        |safe_branch_name:...... │${safe_branch_name}│
+        |branch_version:........ │${branch_version}│
+        |cmk_version:........... │${cmk_version}
+        |cmk_version_rc_aware:.. │${cmk_version_rc_aware}
+        |docker_tag:............ │${docker_tag}│
+        |edition:............... │${params.EDITION}│
+        |distro:................ │${params.DISTRO}│
+        |checkout_dir:.......... │${checkout_dir}│
+        |make_target:........... │${args.make_target}│
+        |fake_artifacts:........ │${params.FAKE_ARTIFACTS}│
+        |force_build:........... │${params.DISABLE_JENKINS_CACHE == true}│
+        |disable_cache:......... │${params.DISABLE_CACHE}│
+        |disable_signing:....... │${params.DISABLE_CMK_DISTRO_PACKAGE_SIGNING}│
+        |===================================================
+        """.stripMargin());
+
+    // use a map as return value to easily extend it later
+    return [safe_branch_name: safe_branch_name, docker_tag: docker_tag, cmk_version: cmk_version];
+}
+
+void fetch_package(Map args) {
+    // this is a quick fix for FIPS based tests, see CMK-20851
+    def build_node = params.CIPARAM_OVERRIDE_BUILD_NODE;
+    def relative_job_name = args.relative_job_name == null ? "builders/trigger-cmk-distro-package" : args.relative_job_name;
+
+    if (build_node == "fips") {
+        // Do not start builds on FIPS node
+        println("Detected build node 'fips', switching this to 'fra'.");
+        build_node = "fra";
+    }
+
+    inside_container_minimal(safe_branch_name: args.safe_branch_name) {
+        def this_parameters = [
+            build_params: [
+                DISABLE_CACHE: args.disable_cache ?: false,
+                DISABLE_CMK_DISTRO_PACKAGE_SIGNING: args.disable_signing ?: false,
+                DISTRO: args.distro,
+                EDITION: args.edition,
+                FAKE_ARTIFACTS: args.fake_artifacts,
+            ],
+            build_params_no_check: [
+                CIPARAM_BISECT_COMMENT: args.bisect_comment,
+                CIPARAM_OVERRIDE_BUILD_NODE: build_node,
+                CIPARAM_OVERRIDE_DOCKER_TAG_BUILD: args.docker_tag,
+            ],
+            dest: args.download_dir,
+            force_build: args.force_build ?: false,
+            no_raise: false,        // abort on problems of upstream build
+            no_remove_others: args.no_remove_others,    // do not delete other files in the dest dir
+            no_venv: true,          // run ci-artifacts call without venv
+            omit_build_venv: true,  // do not check or build a venv first
+            relative_job_name: relative_job_name,
+        ];
+        this_parameters.build_params += [
+            CUSTOM_GIT_REF: cmd_output("git rev-parse HEAD"),
+        ];
+        if (args.version) {
+            // Pin the match to the exact upstream VERSION (e.g. an RC like "2.5.0p9-rc2").
+            // Without this, ci-artifacts may match a different same-commit build (e.g. a
+            // "daily" build) and download a package with an unexpected version in its name.
+            this_parameters.build_params += [VERSION: args.version];
+        }
+        if (args.dependency_paths) {
+            this_parameters["build_params"].remove("CUSTOM_GIT_REF");
+
+            // do not use map[keyX] += [key: value] as this would overwrite all existing values of keyX with [key: value]
+            // using the dot operator does not do this
+            this_parameters.build_params += [CIPARAM_PATH_HASH: args.dependency_paths];
+            this_parameters.build_params_no_check += [
+                CUSTOM_GIT_REF: cmd_output("git rev-parse HEAD")
+            ];
+        }
+        if (args.klaus_spezial) {
+            this_parameters["build_params"].remove("DISABLE_CMK_DISTRO_PACKAGE_SIGNING");
+        }
+        upstream_build(this_parameters);
+    }
+}
+
+void withAugmentedTimeout(Map args = [:], Closure body) {
+    // update the default map content with the user provided config content
+    // new key/value of provided map is automatically added to the defaultDict
+    def defaultDict = [
+        timeout: 0,
+        message: "Warning - ran into a timeout while executing tests",
+    ] << args;
+
+    if (!defaultDict.timeout || defaultDict.timeout <= 0) {
+        body();
+        return;
+    }
+
+    try {
+        timeout(time: defaultDict.timeout, unit: "MINUTES") {
+            println("Starting with ${defaultDict.timeout}min timeout");
+            body();
+            return;
+        }
+    } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException exc) {
+        def isTimeout = exc.causes.any { it.toString().contains("Timeout") }
+        if (isTimeout) {
+            println("Timeout detected");
+            raise("${defaultDict.message}. Timeout is ${defaultDict.timeout}min");
+        }
+        throw exc;
+    }
+}
+
+void run_make_target(Map args) {
+    withAugmentedTimeout([
+        timeout: args.timeout,
+        message: args.message,
+    ]) {
+        docker.withRegistry(DOCKER_REGISTRY, "nexus") {
+            def faked_artifacts = args.faked_artifacts ? "--package-contains-faked-artifacts" : "";
+            def mk_oracle_binary_path_arg = args.mk_oracle_binary_path ? "MK_ORACLE_BINARY_PATH='${args.mk_oracle_binary_path}'" : "";
+
+            // no inline bash comments are allowed in this sh call
+            sh("""
+                RESULT_PATH='${args.result_path}' \
+                EDITION='${args.edition}' \
+                DOCKER_TAG='${args.docker_tag}' \
+                VERSION='${args.version}' \
+                DISTRO='${args.distro}' \
+                BRANCH='${args.branch_name}' \
+                TEST_FILTER='${args.test_filter}' \
+                FAKED_ARTIFACTS='${faked_artifacts}' \
+                CI_NODE_NAME='${env.NODE_NAME}' \
+                CI_WORKSPACE='${env.WORKSPACE}' \
+                CI_JOB_NAME='${env.JOB_NAME}' \
+                CI_BUILD_NUMBER='${env.BUILD_NUMBER}' \
+                CI_BUILD_URL='${env.BUILD_URL}' \
+                OTEL_SDK_DISABLED='${env.OTEL_SDK_DISABLED}' \
+                OTEL_EXPORTER_OTLP_ENDPOINT='${env.OTEL_EXPORTER_OTLP_ENDPOINT}' \
+                ${mk_oracle_binary_path_arg} \
+                tests/run_tests.sh ${args.make_target}
+            """);
+        }
+    }
+}
+
+void run_make_target_k8s(Map args) {
+    withAugmentedTimeout([
+        timeout: args.timeout,
+        message: args.message,
+    ]) {
+        def faked_artifacts = args.faked_artifacts ? "--package-contains-faked-artifacts" : "";
+        def mk_oracle_binary_path_arg = args.mk_oracle_binary_path ? "MK_ORACLE_BINARY_PATH='${args.mk_oracle_binary_path}'" : "";
+        def working_dir = "${checkout_dir}";
+
+        if (args.prepare_fake_git_overlay) {
+            sh("""
+                # prepare a fake git "overlay"
+                time cp -r . /git
+
+                # prevent unsafe directory warnings
+                git config --global --add safe.directory /git
+            """);
+            working_dir = "/git";
+        }
+
+        // use try-finally to always perform required chmod command
+        try {
+            // no inline bash comments are allowed in this sh call
+            sh("""
+                mkdir -p ${args.result_path}
+                cd ${working_dir} || exit 1
+
+                # PTYTEST_ADDOPTS have been added by _container_env in dockerized_execution.py
+                PYTEST_ADDOPTS="--junitxml=${args.result_path}/junit.xml" \
+                RESULT_PATH='${args.result_path}' \
+                EDITION='${args.edition}' \
+                DOCKER_TAG='${args.docker_tag}' \
+                VERSION='${args.version}' \
+                DISTRO='${args.distro}' \
+                BRANCH='${args.branch_name}' \
+                TEST_FILTER='${args.test_filter}' \
+                FAKED_ARTIFACTS='${faked_artifacts}' \
+                CI_NODE_NAME='${env.NODE_NAME}' \
+                CI_WORKSPACE='${env.WORKSPACE}' \
+                CI_JOB_NAME='${env.JOB_NAME}' \
+                CI_BUILD_NUMBER='${env.BUILD_NUMBER}' \
+                CI_BUILD_URL='${env.BUILD_URL}' \
+                OTEL_SDK_DISABLED='${env.OTEL_SDK_DISABLED}' \
+                OTEL_EXPORTER_OTLP_ENDPOINT='${env.OTEL_EXPORTER_OTLP_ENDPOINT}' \
+                ${mk_oracle_binary_path_arg} \
+                tests/run_tests.sh ${args.make_target}
+            """);
+        } finally {
+            // these lines are mandatory to prevent a broken archiveArtifacts step
+            if (args.prepare_fake_git_overlay) {
+                sh("""
+                    cd ${checkout_dir}
+                    chmod -R 555 ${args.result_path}
+                """);
+            }
+        }
+    }
+}
+
+void archive_and_process_reports(Map args) {
+    show_duration("archiveArtifacts") {
+        archiveArtifacts(
+            artifacts: args.test_results,
+            fingerprint: true,  // this is mandatory to work with ci-artifacts
+        );
+    }
+    xunit([Custom(
+        customXSL: "$JENKINS_HOME/userContent/xunit/JUnit/0.1/pytest-xunit.xsl",
+        deleteOutputFiles: true,
+        failIfNotNew: true,
+        pattern: "**/junit.xml",
+        skipNoTestFiles: false,
+        stopProcessingIfError: true
+    )]);
+}
+
+return this;

@@ -1,0 +1,38 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+load("@cmk_requirements//:requirements.bzl", "requirement")
+
+py_library(
+    name = "valuespec",
+    srcs = glob(["**/*.py"]),
+    imports = ["../../.."],
+    visibility = [
+        "//cmk:__subpackages__",
+        "//non-free/packages:__subpackages__",
+        "//non-free/packages/cmk-dcd:__pkg__",
+        "//non-free/packages/cmk-liveproxyd:__pkg__",
+        "//packages/cmk-backup:__pkg__",
+        "//tests:__subpackages__",
+    ],
+    deps = [
+        "//cmk/gui:auth_core",
+        "//cmk/gui:config",
+        "//cmk/gui:core_toolkit",
+        "//cmk/gui:html_toolkit",
+        "//cmk/gui:page_toolkit",
+        "//cmk/gui/utils",
+        "//cmk/gui/utils:base",
+        "//cmk/gui/utils:middle",
+        "//cmk/utils",
+        "//cmk/utils:encryption",
+        "//packages/cmk-ccc:exceptions",
+        "//packages/cmk-ccc:hostaddress",
+        "//packages/cmk-ccc:regex",
+        "//packages/cmk-ccc:site",
+        "//packages/cmk-ccc:user",
+        "//packages/cmk-ccc:version",
+        "//packages/cmk-crypto",
+        "//packages/cmk-livestatus-client",
+        "//packages/cmk-web/cmk/web/utils",
+        requirement("python-dateutil"),
+    ],
+)

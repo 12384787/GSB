@@ -1,0 +1,22 @@
+{
+  "extends": "@tsconfig/node22/tsconfig.json",
+  "include": [
+    "vite.config.*",
+    "vitest.config.*",
+    "cypress.config.*",
+    "nightwatch.conf.*",
+    "playwright.config.*",
+    "ui-component-library/_ucl/vite-plugin-ucl-mcp.ts",
+    "ui-component-library/_ucl/types/prop-def.ts"
+  ],
+  "compilerOptions": {
+    "composite": true,
+    "strict": true,
+    "noEmit": true,
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
+
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "types": ["node"]
+  }
+}

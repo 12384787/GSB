@@ -1,0 +1,59 @@
+# host_crates and site_crates share the same Cargo workspace (//:Cargo.toml)
+# and therefore the same cargo_lockfile. Each keeps its own Bazel lockfile because
+# they target different platform triples and use different OpenSSL providers
+# (shared @openssl for site, static @openssl_static for host).
+host_crates = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+host_crates.from_cargo(
+    name = "host_crates",
+    cargo_config = "//:.cargo/config.toml",
+    cargo_lockfile = "//:Cargo.lock",
+    lockfile = "//:host.Cargo.lock.bazel",
+    manifests = [
+        "//:Cargo.toml",
+        "//agents/wnx/extensions/robotmk_ext:Cargo.toml",
+        "//packages/cmk-agent-ctl:Cargo.toml",
+        "//packages/mk-sql:Cargo.toml",
+        "//packages/mk-oracle:Cargo.toml",
+    ],
+    supported_platform_triples = [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+    ],
+)
+use_repo(host_crates, "host_crates")
+host_crates.annotation(
+    build_script_data = [
+        "@openssl//:gen_static_dir",
+    ],
+    build_script_env = {
+        "OPENSSL_DIR": "$(execpath @openssl//:gen_static_dir)",
+        "OPENSSL_NO_VENDOR": "1",
+        "OPENSSL_STATIC": "1",
+    },
+    crate = "openssl-sys",
+    repositories = ["host_crates"],
+)
+host_crates.annotation(
+    crate = "mk-oracle",
+    gen_build_script = "off",
+    repositories = ["host_crates"],
+)
+
+# Pure-Rust RSA key generation is unusably slow without optimization; keep
+# these optimized even in fastbuild (mirrors the cargo profile override in
+# //:Cargo.toml).
+host_crates.annotation(
+    crate = "rsa",
+    repositories = ["host_crates"],
+    rustc_flags = ["-Copt-level=3"],
+)
+host_crates.annotation(
+    crate = "num-bigint-dig",
+    repositories = ["host_crates"],
+    rustc_flags = ["-Copt-level=3"],
+)
+host_crates.splicing_config(
+    repositories = ["host_crates"],
+    resolver_version = "2",
+)

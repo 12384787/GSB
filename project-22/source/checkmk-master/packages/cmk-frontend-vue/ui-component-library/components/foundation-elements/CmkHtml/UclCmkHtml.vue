@@ -1,0 +1,62 @@
+<!--
+Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script lang="ts">
+import { type PanelConfigFor } from '@ucl/_ucl/components/detail-page'
+
+import codeExample from './UclCmkHtmlCodeExample.vue?raw'
+
+export const a11yData: never[] = []
+
+export const panelConfig = {
+  html: {
+    type: 'multiline-string' as const,
+    title: 'html',
+    initialState: "<h1>Heading</h1> <b>bold</b> and <a href='https://checkmk.com'>link</a>"
+  }
+} satisfies PanelConfigFor<typeof CmkHtml, 'allowedClasses'>
+</script>
+
+<script setup lang="ts">
+import {
+  PanelStateCreator,
+  UclDetailPageAccessibility,
+  UclDetailPageCodeExample,
+  UclDetailPageComponent,
+  UclDetailPageDeveloperPlayground,
+  UclDetailPageHeader,
+  UclDetailPageLayout,
+  UclPropertiesPanel
+} from '@ucl/_ucl/components/detail-page'
+import CmkHtml from 'cmk-ui-library/components/CmkHtml.vue'
+
+import UclCmkHtmlDev from './UclCmkHtmlDev.vue'
+
+defineProps<{ screenshotMode: boolean }>()
+
+const propState = new PanelStateCreator<typeof CmkHtml, 'allowedClasses'>().createRef(panelConfig)
+</script>
+
+<template>
+  <UclDetailPageLayout>
+    <UclDetailPageHeader>CmkHtml</UclDetailPageHeader>
+
+    <UclDetailPageComponent>
+      <CmkHtml :html="propState.html" />
+
+      <template #properties>
+        <UclPropertiesPanel v-model="propState" :config="panelConfig" />
+      </template>
+    </UclDetailPageComponent>
+
+    <UclDetailPageCodeExample :code="codeExample" />
+
+    <UclDetailPageAccessibility :data="a11yData" />
+
+    <UclDetailPageDeveloperPlayground>
+      <UclCmkHtmlDev :screenshot-mode="screenshotMode" />
+    </UclDetailPageDeveloperPlayground>
+  </UclDetailPageLayout>
+</template>

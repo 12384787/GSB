@@ -1,0 +1,124 @@
+# Git it is mounted if necessary but not included in images
+.git
+
+# copy of repo root .gitignore
+.*.swo
+.*.swp
+.aspect
+.bugs/.last
+.bugs/.my_ids
+.cache
+.cargo
+.coverage
+.coverage.*
+.directory
+.DS_Store
+.idea/
+.metadata
+.mypy_cache
+.mypy_cache/
+.python-*-stamp
+.pytest_cache
+.cargo
+.ropeproject
+.hypothesis
+.ruff_cache
+.syntastic
+.testmondata
+.venv.lock
+.venv*
+*.cookie
+*.gcno
+*.gcov
+*.iml
+*.py.*.py
+*.pyc
+*_pb2.py
+*_pb2.pyi
+*.pb.cc
+*.pb.h
+*.timer
+**/launch.json
+*~
+*kate-swp
+/.tmp*
+/*.wpr
+/*.wpu
+/announce*
+artefacts/
+agents/linux/*
+agents/windows/*
+agents/.buildroot*
+agents/.rpm*
+bazel_execution_log*.json
+/bazel-*
+/bazel_log*
+bazel-memory.profile
+build/
+/buildscripts/docker_image_aliases/docker-image-alias-resolve-error.txt
+ChangeLog
+check_mk-*.tar.gz
+check-mk-*.build
+check-mk-*.dsc
+check-mk-*.tar.gz
+check-mk-*_amd64.deb
+clang-analyzer/
+cmc-*.tar.gz
+/container_shadow_workspace*/
+download/
+packages/cmk-plugin-apis/doc/build/
+packages/cmk-plugin-apis/doc/apidoc/
+doc/documentation/*.png
+doc/documentation/*.cmapx
+docker-build.log
+GPATH
+GRTAGS
+GTAGS
+htmlcov/
+logback.log
+mk-livestatus-*.tar.gz
+node_modules/
+omd/bazel-*
+omd/build/
+omd/debian/check-mk-*
+omd/pkgs_by_bzl/
+pip-mirror-tmp
+packages/**/node_modules
+packages/**/dist
+RemoteSystemsTempFiles
+remote.bazelrc
+requirements-no-dev.txt
+/shared_cargo_folder/
+tags
+tests/web/data/*
+tests/var/*
+tests/results/*
+tests/.hypothesis/
+tests/qa-test-data
+/results
+user.bazelrc
+version_txt_from_previous_run
+
+# Created by https://www.toptal.com/developers/gitignore/api/visualstudiocode
+# Edit at https://www.toptal.com/developers/gitignore?templates=visualstudiocode
+
+# Used by pyenv
+.python-version
+
+### VisualStudioCode ###
+.vscode/*
+*.code-workspace
+
+# Local History for Visual Studio Code
+.history/
+
+### VisualStudioCode Patch ###
+# Ignore all local history of files
+.history
+.ionide
+
+# End of https://www.toptal.com/developers/gitignore/api/visualstudiocode
+
+# gui-e2e tests: playwright specific ignores
+test-results/
+/*.png

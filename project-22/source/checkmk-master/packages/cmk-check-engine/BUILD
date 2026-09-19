@@ -1,0 +1,561 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+load("@bazel_skylib//rules:build_test.bzl", "build_test")
+load("@cmk_requirements//:requirements.bzl", "requirement")
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+load("@rules_python//python:packaging.bzl", "py_wheel")
+load("//bazel/rules:doctest.bzl", "py_doc_test")
+load("//bazel/rules:package_wheel.bzl", "package_wheel")
+load("//bazel/rules:py_cmk_test.bzl", "py_cmk_test")
+load("//bazel/rules:py_requirements_test.bzl", "py_requirements_test")
+
+exports_files(
+    [
+        "dev-requirements.in",
+        "requirements.in",
+    ],
+)
+
+py_library(
+    name = "snmplib",
+    srcs = [
+        "cmk/checkengine/snmplib/__init__.py",
+        "cmk/checkengine/snmplib/_detect.py",
+        "cmk/checkengine/snmplib/_getoid.py",
+        "cmk/checkengine/snmplib/_parse.py",
+        "cmk/checkengine/snmplib/_table.py",
+        "cmk/checkengine/snmplib/_typedefs.py",
+        "cmk/checkengine/snmplib/_walk.py",
+    ],
+    data = ["cmk/checkengine/snmplib/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//packages/cmk-ccc:debug",
+        "//packages/cmk-ccc:exceptions",
+        "//packages/cmk-ccc:hostaddress",
+    ],
+)
+
+py_library(
+    name = "subclass-discovery",
+    srcs = ["cmk/checkengine/subclass_discovery.py"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "snmp-backends",
+    srcs = [
+        "cmk/checkengine/snmp_backend_builder.py",
+        "cmk/checkengine/snmp_backends/_utils.py",
+        "cmk/checkengine/snmp_backends/classic.py",
+        "cmk/checkengine/snmp_backends/stored_walk.py",
+    ],
+    data = ["cmk/checkengine/snmp_backends/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":snmplib",
+        ":subclass-discovery",
+        "//packages/cmk-ccc:exceptions",
+        "//packages/cmk-ccc:tty",
+    ],
+)
+
+py_library(
+    name = "helper-interface",
+    srcs = [
+        "cmk/checkengine/helper_interface/__init__.py",
+        "cmk/checkengine/helper_interface/_agentdatatype.py",
+        "cmk/checkengine/helper_interface/_crashreporting.py",
+        "cmk/checkengine/helper_interface/_json_serialization.py",
+        "cmk/checkengine/helper_interface/_serialization.py",
+        "cmk/checkengine/helper_interface/_source_info.py",
+    ],
+    data = ["cmk/checkengine/helper_interface/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//packages/cmk-ccc:hostaddress",
+        "//packages/cmk-crash:crash",
+    ],
+)
+
+py_library(
+    name = "fetchers",
+    srcs = [
+        "cmk/checkengine/fetchers/ipmi.py",
+        "cmk/checkengine/fetchers/nofetcher.py",
+        "cmk/checkengine/fetchers/piggyback.py",
+        "cmk/checkengine/fetchers/program.py",
+        "cmk/checkengine/fetchers/snmp/__init__.py",
+        "cmk/checkengine/fetchers/snmp/_cache.py",
+        "cmk/checkengine/fetchers/snmp/_fetcher.py",
+        "cmk/checkengine/fetchers/snmp/_scan.py",
+        "cmk/checkengine/fetchers/tcp.py",
+        "cmk/checkengine/filecache/__init__.py",
+        "cmk/checkengine/filecache/_agent.py",
+        "cmk/checkengine/filecache/_cache.py",
+        "cmk/checkengine/filecache/_snmp.py",
+    ] + glob(
+        [
+            "cmk/checkengine/fetcher_utils/*.py",
+        ],
+    ),
+    data = ["cmk/checkengine/fetchers/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":fetcher-protocol",
+        ":helper-interface",
+        ":snmp-backends",
+        ":snmplib",
+        requirement("pyghmi"),
+        "//packages/cmk-ccc:hostaddress",
+        "//packages/cmk-ccc:resulttype",
+        "//packages/cmk-ccc:store",
+        "//packages/cmk-ccc:version-info",
+        "//packages/cmk-plugin-apis:agent_based",
+        "//packages/cmk-plugin-apis:password_store",
+    ],
+)
+
+py_library(
+    name = "fetcher-protocol",
+    srcs = [
+        "cmk/checkengine/agent_protocol.py",
+        "cmk/checkengine/fetcher_abc.py",
+    ],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":helper-interface",
+        ":snmplib",
+        "//packages/cmk-ccc:cpu-tracking",
+        "//packages/cmk-ccc:hostaddress",
+        "//packages/cmk-ccc:resulttype",
+        "//packages/cmk-crypto",
+    ],
+)
+
+py_library(
+    name = "sources",
+    srcs = [
+        "cmk/checkengine/source_builder.py",
+    ] + glob([
+        "cmk/checkengine/source_abc/*.py",
+        "cmk/checkengine/sources/*.py",
+    ]),
+    imports = ["."],
+    visibility = [
+        "//cmk:__pkg__",
+        "//cmk/base:__subpackages__",
+        "//non-free/packages/cmk-telemetry:__pkg__",
+        "//packages/cmk-check-engine:__pkg__",
+    ],
+    deps = [
+        "//cmk/server_side_calls_backend",
+        "//cmk/utils",
+        "//packages/cmk-ccc:hostaddress",
+        "//packages/cmk-check-engine:fetchers",
+        "//packages/cmk-check-engine:helper-interface",
+        "//packages/cmk-check-engine:snmplib",
+        "//packages/cmk-check-engine:subclass-discovery",
+        "//packages/cmk-check-engine/cmk/checkengine/plugin_backend",
+        "//packages/cmk-check-engine/cmk/checkengine/plugins",
+    ],
+)
+
+py_library(
+    name = "checker-plugin",
+    srcs = [
+        "cmk/checkengine/checkerplugin.py",
+    ],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":helper-interface",
+        ":section-parser",
+        ":specs",
+        "//cmk/utils",
+        "//packages/cmk-ccc:hostaddress",
+        "//packages/cmk-check-engine/cmk/checkengine/plugins",
+    ],
+)
+
+py_library(
+    name = "checker-helper-config",
+    srcs = [
+        "cmk/checkengine/checker_helper_config.py",
+    ],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//packages/cmk-ccc:hostaddress",
+    ],
+)
+
+py_library(
+    name = "specs",
+    srcs = glob([
+        "cmk/checkengine/specs/*.py",
+    ]),
+    data = ["cmk/checkengine/specs/py.typed"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cmk/utils",
+        "//packages/cmk-ccc:debug",
+    ],
+)
+
+py_library(
+    name = "section-parser",
+    srcs = [
+        "cmk/checkengine/sectionparser.py",
+        "cmk/checkengine/sectionparserutils.py",
+    ],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":helper-interface",
+        ":specs",
+        "//cmk/piggyback:backend",
+        "//packages/cmk-ccc:debug",
+        "//packages/cmk-ccc:hostaddress",
+        "//packages/cmk-check-engine/cmk/checkengine/parser",
+        "//packages/cmk-check-engine/cmk/checkengine/plugins",
+    ],
+)
+
+py_library(
+    name = "lib",
+    srcs = [
+        "cmk/checkengine/auto_queue.py",
+        "cmk/checkengine/submitters.py",
+        "cmk/checkengine/summarize.py",
+        "cmk/checkengine/value_store.py",
+    ],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":fetcher-protocol",
+        ":helper-interface",
+        ":specs",
+        "//cmk/piggyback:backend",
+        "//cmk/utils",
+        "//packages/cmk-ccc:exceptions",
+        "//packages/cmk-ccc:hostaddress",
+        "//packages/cmk-ccc:store",
+        "//packages/cmk-ccc:timeout",
+        "//packages/cmk-check-engine/cmk/checkengine/parser",
+        "//packages/cmk-check-engine/cmk/checkengine/plugins",
+    ],
+)
+
+py_library(
+    name = "inventory",
+    srcs = [
+        "cmk/checkengine/inventory.py",
+    ],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":fetcher-protocol",
+        ":helper-interface",
+        ":lib",
+        ":section-parser",
+        ":specs",
+        "//packages/cmk-ccc:debug",
+        "//packages/cmk-ccc:hostaddress",
+        "//packages/cmk-check-engine/cmk/checkengine/parser",
+        "//packages/cmk-check-engine/cmk/checkengine/plugins",
+        "//packages/cmk-inventory:inventory",
+        "//packages/cmk-plugin-apis:agent_based",
+    ],
+)
+
+py_doc_test(
+    name = "doctest",
+    size = "small",
+    srcs = [
+        ":checker-plugin",
+        ":fetcher-protocol",
+        ":fetchers",
+        ":helper-interface",
+        ":inventory",
+        ":lib",
+        ":section-parser",
+        ":snmp-backends",
+        ":snmplib",
+        ":sources",
+        ":specs",
+        ":subclass-discovery",
+        "//packages/cmk-check-engine/cmk/checkengine/checking",
+        "//packages/cmk-check-engine/cmk/checkengine/discovery",
+        "//packages/cmk-check-engine/cmk/checkengine/parser",
+        "//packages/cmk-check-engine/cmk/checkengine/plugin_backend",
+        "//packages/cmk-check-engine/cmk/checkengine/plugins",
+    ],
+)
+
+py_cmk_test(
+    name = "fetchers-tests",
+    size = "small",
+    srcs = glob([
+        "tests/cmk/checkengine/fetchers/**/*.py",
+        "tests/cmk/checkengine/fetcher_utils/**/*.py",
+        "tests/cmk/checkengine/filecache/**/*.py",
+    ]) + [
+        "tests/cmk/checkengine/test_agent_protocol.py",
+    ],
+    deps = [
+        requirement("pyghmi"),
+        ":fetchers",
+    ],
+)
+
+py_cmk_test(
+    name = "snmplib-tests",
+    size = "small",
+    srcs = glob(["tests/cmk/checkengine/snmplib/**/*.py"]),
+    deps = [
+        "snmplib",
+        "//packages/cmk-plugin-apis:agent_based",
+    ],
+)
+
+py_cmk_test(
+    name = "snmp-backends-tests",
+    size = "small",
+    srcs = glob(["tests/cmk/checkengine/snmp_backends/**/*.py"]) + [
+        "tests/cmk/checkengine/test_snmp_backend.py",
+    ],
+    deps = [
+        "snmp-backends",
+        "snmplib",
+    ],
+)
+
+py_cmk_test(
+    name = "specs-tests",
+    size = "small",
+    srcs = glob(["tests/cmk/checkengine/specs/*.py"]),
+    deps = [
+        "specs",
+    ],
+)
+
+py_cmk_test(
+    name = "parser-tests",
+    size = "small",
+    srcs = glob([
+        "tests/cmk/checkengine/parser/*.py",
+    ]),
+    deps = [
+        "//packages/cmk-check-engine/cmk/checkengine/parser",
+    ],
+)
+
+py_cmk_test(
+    name = "section-parser-tests",
+    size = "small",
+    srcs = glob([
+        "tests/cmk/checkengine/sectionparser/*.py",
+    ]),
+    deps = [
+        ":section-parser",
+    ],
+)
+
+py_cmk_test(
+    name = "lib-tests",
+    size = "small",
+    srcs = [
+        "tests/cmk/checkengine/test_auto_queue.py",
+        "tests/cmk/checkengine/test_submitters.py",
+        "tests/cmk/checkengine/test_summarizers.py",
+        "tests/cmk/checkengine/test_value_store.py",
+    ],
+    deps = [
+        ":lib",
+        "//packages/cmk-check-engine/cmk/checkengine/plugins",
+        "//packages/cmk-plugin-apis:agent_based",
+    ],
+)
+
+py_cmk_test(
+    name = "subclass-discovery-tests",
+    size = "small",
+    srcs = ["tests/cmk/checkengine/test_subclass_discovery.py"],
+    deps = [
+        ":subclass-discovery",
+    ],
+)
+
+py_cmk_test(
+    name = "plugin-backend-tests",
+    size = "small",
+    srcs = glob([
+        "tests/cmk/checkengine/plugin_backend/*.py",
+    ]),
+    deps = [
+        "//packages/cmk-check-engine/cmk/checkengine/plugin_backend",
+    ],
+)
+
+py_cmk_test(
+    name = "discovery-tests",
+    size = "small",
+    srcs = glob([
+        "tests/cmk/checkengine/discovery/**/*.py",
+    ]),
+    deps = [
+        "//packages/cmk-check-engine/cmk/checkengine/discovery",
+        requirement("time_machine"),
+    ],
+)
+
+py_cmk_test(
+    name = "inventory-tests",
+    size = "small",
+    srcs = [
+        "tests/cmk/checkengine/test_inventory.py",
+    ],
+    deps = [
+        ":inventory",
+    ],
+)
+
+py_cmk_test(
+    name = "checking-tests",
+    size = "small",
+    srcs = glob([
+        "tests/cmk/checkengine/checking/*.py",
+    ]),
+    deps = [
+        "//packages/cmk-check-engine/cmk/checkengine/checking",
+    ],
+)
+
+py_cmk_test(
+    name = "checker-helper-config-tests",
+    size = "small",
+    srcs = ["tests/cmk/checkengine/test_checker_helper_config.py"],
+    deps = [
+        ":checker-helper-config",
+    ],
+)
+
+py_wheel(
+    name = "wheel_fetchers",
+    distribution = "cmk-check-engine-fetchers",
+    strip_path_prefixes = ["packages/cmk-check-engine"],
+    version = "1.0.0",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":fetcher-protocol",
+        ":fetchers",
+        ":helper-interface",
+        ":snmp-backends",
+        ":snmplib",
+        ":subclass-discovery",
+    ],
+)
+
+py_wheel(
+    name = "wheel_plugins",
+    distribution = "cmk-check-engine-plugins",
+    strip_path_prefixes = ["packages/cmk-check-engine"],
+    version = "1.0.0",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":specs",
+        "//packages/cmk-check-engine/cmk/checkengine/plugin_backend",
+        "//packages/cmk-check-engine/cmk/checkengine/plugins",
+    ],
+)
+
+py_wheel(
+    name = "wheel_checkers",
+    distribution = "cmk-check-engine-checkers",
+    strip_path_prefixes = ["packages/cmk-check-engine"],
+    version = "1.0.0",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":checker-helper-config",
+        ":checker-plugin",
+        ":inventory",
+        ":lib",
+        ":section-parser",
+        ":sources",
+        "//packages/cmk-check-engine/cmk/checkengine/checking",
+        "//packages/cmk-check-engine/cmk/checkengine/discovery",
+        "//packages/cmk-check-engine/cmk/checkengine/parser",
+    ],
+)
+
+build_test(
+    name = "build_test",
+    targets = [
+        "wheel_checkers",
+        "wheel_fetchers",
+        "wheel_plugins",
+    ],
+)
+
+package_wheel(
+    name = "wheel_fetchers_pkg",
+    visibility = ["//omd:__subpackages__"],
+    whl = "wheel_fetchers",
+)
+
+package_wheel(
+    name = "wheel_plugins_pkg",
+    visibility = ["//omd:__subpackages__"],
+    whl = "wheel_plugins",
+)
+
+package_wheel(
+    name = "wheel_checkers_pkg",
+    visibility = ["//omd:__subpackages__"],
+    whl = "wheel_checkers",
+)
+
+pkg_tar(
+    name = "pkg_tar",
+    stamp = 1,
+    visibility = ["//omd:__subpackages__"],
+    deps = [
+        ":wheel_checkers_pkg",
+        ":wheel_fetchers_pkg",
+        ":wheel_plugins_pkg",
+    ],
+)
+
+sh_library(
+    name = "helpers",
+    srcs = [
+        ".f12",
+    ],
+)
+
+py_requirements_test(
+    name = "requirements-test",
+    libs = [
+        ":checker-helper-config",
+        ":fetchers",
+        ":fetcher-protocol",
+        ":helper-interface",
+        ":inventory",
+        ":snmplib",
+        ":specs",
+        ":sources",
+        "//packages/cmk-check-engine/cmk/checkengine/plugins",
+        "//packages/cmk-check-engine/cmk/checkengine/plugin_backend",
+        "//packages/cmk-check-engine/cmk/checkengine/parser",
+        "//packages/cmk-check-engine/cmk/checkengine/discovery",
+        "//packages/cmk-check-engine/cmk/checkengine/checking",
+    ],
+    requirements_in = "requirements.in",
+)

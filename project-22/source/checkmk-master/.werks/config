@@ -1,0 +1,70 @@
+editions = [
+    ( "community",    "Checkmk Community (formerly Raw)" ),
+    ( "pro",          "Checkmk Pro (formerly Enterprise)" ),
+    ( "ultimate",     "Checkmk Ultimate (formerly Cloud)" ),
+    ( "ultimatemt",   "Checkmk Ultimate with multi-tenancy (formerly MSP)" ),
+    ( "cloud",        "Checkmk Cloud (formerly SaaS)" ),
+]
+
+components = [
+   ( "core",          "Core & setup" ),
+   ( "checks",        "Checks & agents" ),
+   ( "multisite",     "Multisite" ),
+   ( "wato",          "Setup" ),
+   ( "notifications", "Notifications" ),
+   ( "bi",            "BI" ),
+   ( "reporting",     "Reporting & Availability" ),
+   ( "ec",            "Event Console" ),
+   ( "livestatus",    "Livestatus" ),
+   ( "liveproxy",     "Livestatus Proxy" ),
+   ( "inv",           "HW/SW Inventory" ),
+   ( "dcd",           "Dynamic host configuration" ),
+
+   ( "omd",           "Site Management" ),
+   ( "rpm",           "RPM Packaging" ),
+   ( "deb",           "DEB Packaging" ),
+   ( "nagvis",        "NagVis" ),
+   ( "packages",      "Other Components" ),
+   ( "distros",       "Linux Distributions" ),
+   ( "rest-api",      "REST API"),
+]
+
+edition_components = {
+    "pro": [
+        ( "cmc",           "The Check_MK Micro Core" ),
+        ( "setup",         "Setup, site management" ),
+        ( "config",        "Configuration generation" ),
+        ( "inline-snmp",   "Inline SNMP" ),
+        ( "agents",        "Agent bakery" ),
+        ( "metrics",       "Metrics system" ),
+        ( "alerts",        "Alert handlers" ),
+        ( "ntopng_integration", "Ntopng integration" ),
+    ],
+    "ultimate":
+    [
+        ( "relay",         "Relay"),
+        ( "telemetry",     "Telemetry"),
+    ]
+}
+
+classes = [
+  ( "feature",      "New feature",          "" ),
+  ( "fix",          "Bug fix",              "FIX" ),
+  ( "security",     "Security fix",         "SEC" ),
+]
+
+levels = [
+  ( '1',              "Trivial change" ),
+  ( '2',              "Prominent change" ),
+  ( '3',              "Major change" ),
+]
+
+# Note: Ordering matters here: The 'werk new' command still displays 'compat' and 'incompat'
+# as choices to the user, but acts on the real config. To be agnostic of the config and 'yes' and
+# 'no' as strings, the first element always maps to 'compat' and the second to 'incompat'.
+compatible = [
+    ("yes", "Compatible"),
+    ("no", "Incompatible"),
+]
+
+online_url = "https://checkmk.com/werk/%d"

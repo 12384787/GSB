@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+# Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import sys
+
+from cmk.base import config
+from cmk.ccc.version import edition as get_edition
+from cmk.gui import main_modules
+from cmk.gui.wsgi.app import gui_context
+from cmk.utils import paths
+from cmk.utils.redis import disable_redis
+from cmk.validate_config import validate_mk_files
+
+
+def main() -> int:
+    try:
+        edition = get_edition(paths.omd_root)
+        main_modules.register(edition)
+
+        if errors := main_modules.get_failed_plugins():
+            sys.stderr.write(f"The following errors occurred during plug-in loading: {errors!r}\n")
+            return 1
+
+        with disable_redis(), gui_context():
+            config.load_all_plugins()
+            # Watch out: always load the plugins before loading the config.
+            # The validation step will not be executed otherwise.
+            config.load()
+
+            result = validate_mk_files()
+
+    except Exception as e:
+        sys.stderr.write("ERROR: Failed to validate configuration\n")
+        sys.stderr.write(str(e) + "\n")
+        return 1
+
+    if result.logs_invalid:
+        sys.stderr.write("The following mk files had issues during the validation:\n")
+        for message in result.logs_invalid:
+            sys.stderr.write(f"  {message}\n")
+        return 1
+
+    if result.logs_valid:
+        sys.stdout.write("The following mk files have passed the validation:\n")
+        for message in result.logs_valid:
+            sys.stdout.write(f"  {message}\n")
+    else:
+        sys.stdout.write("No mk files have been found to validate.\n")
+        return 1
+
+    return 0

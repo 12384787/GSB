@@ -1,0 +1,8 @@
+#!/bin/sh
+
+# In case of changed installation directories, cleaning up here is not effective,
+# but must happen on preremove instead.
+# We still have to keep it here because the old package may be missing the preremove script.
+if [ -r /var/lib/cmk-agent/scripts/super-server/setup ]; then
+    /bin/sh /var/lib/cmk-agent/scripts/super-server/setup cleanup
+fi

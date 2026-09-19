@@ -1,0 +1,128 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import CmkCatalogPanel from 'cmk-ui-library/components/CmkCatalogPanel.vue'
+import type { ConfiguredFilters } from 'cmk-ui-library/components/filter'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import { useDebounceRef } from 'cmk-ui-library/lib/useDebounce'
+import { computed, toValue } from 'vue'
+
+import ContentSpacer from '@/dashboard/components/ContentSpacer.vue'
+import DashboardPreviewContent from '@/dashboard/components/DashboardPreviewContent.vue'
+import WidgetVisualization from '@/dashboard/components/Wizard/components/WidgetVisualization/WidgetVisualization.vue'
+import { useWidgetVisualizationProps } from '@/dashboard/components/Wizard/components/WidgetVisualization/useWidgetVisualization.ts'
+import type { EventStatsContent } from '@/dashboard/components/Wizard/types'
+import { useInjectDashboardConstants } from '@/dashboard/composables/useProvideDashboardConstants'
+import { usePreviewWidgetTitle } from '@/dashboard/composables/useWidgetTitles'
+import type { DashboardKey } from '@/dashboard/types/dashboard'
+import type { WidgetContent, WidgetGeneralSettings, WidgetSpec } from '@/dashboard/types/widget'
+import { buildWidgetEffectiveFilterContext } from '@/dashboard/utils.ts'
+
+import Stage2Header from '../../../components/Stage2Header.vue'
+
+const { _t } = usei18n()
+
+interface Stage2Props {
+  dashboardKey: DashboardKey
+  filters: ConfiguredFilters
+  editWidgetSpec?: WidgetSpec | null
+}
+
+const props = defineProps<Stage2Props>()
+const emit = defineEmits<{
+  goPrev: []
+  addWidget: [
+    content: WidgetContent,
+    generalSettings: WidgetGeneralSettings,
+    filterUsesInfos: string[]
+  ]
+}>()
+
+const filterUsesInfos = ['host', 'event']
+
+const {
+  title,
+  showTitle,
+  showTitleBackground,
+  showWidgetBackground,
+  titleUrlEnabled,
+  titleUrl,
+  titleUrlValidationErrors,
+  validate: validateTitle,
+  widgetGeneralSettings,
+  titleMacros
+} = useWidgetVisualizationProps(
+  '$DEFAULT_TITLE$',
+  props.editWidgetSpec?.general_settings,
+  'event_stats'
+)
+
+const content: EventStatsContent = { type: 'event_stats' }
+const debouncedGeneralSettings = useDebounceRef(widgetGeneralSettings, 300)
+const dashboardConstants = useInjectDashboardConstants()
+const effectiveTitle = usePreviewWidgetTitle(
+  computed(() => {
+    return {
+      generalSettings: widgetGeneralSettings.value,
+      content,
+      effectiveFilters: props.filters
+    }
+  })
+)
+
+const widgetProps = computed(() => {
+  return {
+    general_settings: debouncedGeneralSettings.value,
+    content,
+    effectiveTitle: effectiveTitle.value,
+    effective_filter_context: buildWidgetEffectiveFilterContext(
+      content,
+      props.filters,
+      filterUsesInfos,
+      dashboardConstants
+    )
+  }
+})
+
+const gotoNextStage = () => {
+  const isValid = validateTitle()
+  if (!isValid) {
+    return
+  }
+
+  emit('addWidget', toValue(content), toValue(widgetGeneralSettings), filterUsesInfos)
+}
+</script>
+
+<template>
+  <Stage2Header :edit="!!editWidgetSpec" @back="emit('goPrev')" @save="gotoNextStage" />
+
+  <DashboardPreviewContent
+    widget_id="event-stats-preview"
+    :dashboard-key="dashboardKey"
+    :general_settings="widgetProps.general_settings"
+    :content="widgetProps.content"
+    :effective-title="widgetProps.effectiveTitle"
+    :effective_filter_context="widgetProps.effective_filter_context"
+  />
+
+  <ContentSpacer />
+
+  <CmkCatalogPanel :title="_t('Widget settings')" variant="padded">
+    <WidgetVisualization
+      v-model:show-title="showTitle"
+      v-model:show-title-background="showTitleBackground"
+      v-model:show-widget-background="showWidgetBackground"
+      v-model:title="title"
+      v-model:title-url="titleUrl"
+      v-model:title-url-enabled="titleUrlEnabled"
+      v-model:title-url-validation-errors="titleUrlValidationErrors"
+      :title-macros="titleMacros"
+    />
+  </CmkCatalogPanel>
+
+  <ContentSpacer />
+</template>

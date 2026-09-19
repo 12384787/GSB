@@ -1,0 +1,7 @@
+# Alias: Start Daemon for Checkmk Event Console
+# Menu: Add-ons
+# Description:
+#  This option enables mkeventd - the event correlation and
+#  classification daemon of Checkmk. This daemon will receive
+#  events via a pipe or socket and applies it so a set of
+#  rules.

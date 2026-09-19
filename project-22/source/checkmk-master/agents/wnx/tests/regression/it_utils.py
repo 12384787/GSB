@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+import os
+import platform
+import subprocess
+from collections.abc import Sequence
+
+import pytest
+
+
+def check_actual_input(name: str, lines: int, alone: bool, data: Sequence[str] | None) -> bool:
+    if data is None:
+        pytest.skip(f"Section '{name}': Data is absent")
+        return False  # type: ignore[unreachable]
+
+    if not alone:
+        lines += 2
+
+    if len(data) < lines:
+        all_data = "\n".join(data)
+        pytest.skip(f"Section '{name}': Data is TOO short:\n{all_data}\n")
+        return False  # type: ignore[unreachable]
+
+    return True
+
+
+def safe_binary_remove(binary_path: str) -> None:
+    try:
+        os.unlink(binary_path)
+    except OSError as os_error:
+        print("Error %s during file delete" % os_error.errno)  # noqa: T201  # It's OK for test/script helpers to print()
+
+
+def stop_ohm() -> None:
+    # stopping all
+    subprocess.call("taskkill /F /IM OpenhardwareMonitorCLI.exe")
+    subprocess.call("net stop winring0_1_2_0")
+
+
+def remove_files(target_dir: str, binaries: Sequence[str]) -> None:
+    # removing all
+    for f in binaries:
+        safe_binary_remove(os.path.join(target_dir, f))
+
+
+def make_dir(directory: str) -> None:
+    if not os.path.exists(directory):
+        os.mkdir(directory)
+
+
+def check_os() -> bool:
+    return platform.system() == "Windows"

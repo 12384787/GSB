@@ -1,0 +1,79 @@
+<!--
+Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import CmkIcon from 'cmk-ui-library/components/CmkIcon'
+import CmkKeyboardKey from 'cmk-ui-library/components/CmkKeyboardKey.vue'
+import CmkHeading from 'cmk-ui-library/components/typography/CmkHeading.vue'
+import CmkParagraph from 'cmk-ui-library/components/typography/CmkParagraph.vue'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import { computed } from 'vue'
+
+import { getSearchUtils } from '@/unified-search/providers/search-utils'
+
+const { _t } = usei18n()
+const searchUtils = getSearchUtils()
+
+function isMonitoringSearch(): boolean {
+  return ['all', 'monitoring'].indexOf(searchUtils.query.provider.value) >= 0
+}
+
+const findText = computed(() => {
+  switch (searchUtils.query.provider.value) {
+    case 'monitoring':
+      return _t('Find services, hosts, dashboards, ...')
+    case 'customize':
+      return _t('Find customization options')
+    case 'setup':
+      return _t('Find rules, hosts, settings ...')
+    default:
+      return _t('Find rules, hosts, dashboards, settings ...')
+  }
+})
+</script>
+
+<template>
+  <div class="unified-search-empty-start">
+    <CmkIcon class="unified-search-empty-start__icon" name="search" size="xxxlarge"></CmkIcon>
+    <CmkHeading class="unified-search-empty-start__heading" type="h2">{{ findText }}</CmkHeading>
+    <CmkParagraph v-if="isMonitoringSearch()" class="unified-search-empty-start__text">
+      {{ _t('Tip: Press') }}
+      <CmkKeyboardKey keyboard-key="/" size="small"></CmkKeyboardKey>
+      {{
+        _t('to view all search operator and, e.g., find all hosts with the same host label (hl:)')
+      }}
+    </CmkParagraph>
+  </div>
+</template>
+
+<style scoped>
+.unified-search-empty-start {
+  opacity: 0.8;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 0 var(--spacing-double);
+
+  .unified-search-empty-start__icon {
+    margin-top: calc(-2 * var(--dimension-10));
+    margin-bottom: var(--dimension-10);
+    opacity: 0.1;
+
+    &:hover {
+      opacity: 0.1 !important;
+    }
+  }
+
+  .unified-search-empty-start__heading {
+    margin-bottom: var(--dimension-5);
+  }
+
+  .unified-search-empty-start__text {
+    text-align: center;
+  }
+}
+</style>

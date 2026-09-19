@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<table width="100%"
+       style="margin: 0 auto;
+              max-width: 600px;
+              border-spacing: 0">
+    <tr>
+        <td style="height: 20px;
+                   line-height: 20px;
+                   font-size: 0;
+                   mso-line-height-rule: exactly">&nbsp;</td>
+    </tr>
+    <tr>
+        <th style="font-size: 18px;
+                   font-weight: 600;
+                   text-align: left"
+            colspan="2">
+            <img class="section-icon"
+                 src="cid:contact_groups.png"
+                 alt="Contact group icon"
+                 width="18"
+                 height="19"
+                 style="display:inline-block;
+                        vertical-align:middle;
+                        width:18px;
+                        height:19px;
+                        border:0;
+                        background-color:#ffffff;
+                        color-scheme:light dark;
+                        supported-color-schemes:light dark;
+                        mso-line-height-rule:exactly" />
+            Contact groups
+        </th>
+    </tr>
+    <tr>
+        <td>
+            {% for item in data.HOSTCONTACTGROUPNAMES.split(',') %}
+                <span style=" padding-right: 8px; font-size: 14px; ">• {{ item }}</span>
+            {% endfor %}
+        </td>
+    </tr>
+</table>

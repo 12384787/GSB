@@ -1,0 +1,194 @@
+/**
+ * Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+import type { ConfiguredFilters } from 'cmk-ui-library/components/filter'
+import { useDebounceFn } from 'cmk-ui-library/lib/useDebounce'
+import { type Ref, ref, watch } from 'vue'
+
+import type { GraphTimerange } from '@/dashboard/components/TimeRange/GraphTimeRange.vue'
+import type { TimerangeModel } from '@/dashboard/components/TimeRange/types'
+import { useTimeRange } from '@/dashboard/components/TimeRange/useTimeRange'
+import { useFixedDataRange } from '@/dashboard/components/Wizard/components/FixedDataRangeInput/useFixedDataRange'
+import {
+  type UseWidgetVisualizationOptions,
+  useWidgetVisualizationProps
+} from '@/dashboard/components/Wizard/components/WidgetVisualization/useWidgetVisualization'
+import type {
+  ForStates,
+  GaugeContent,
+  ShowServiceStatusType,
+  UseWidgetHandler,
+  WidgetProps
+} from '@/dashboard/components/Wizard/types'
+import { useInjectDashboardConstants } from '@/dashboard/composables/useProvideDashboardConstants'
+import { computePreviewWidgetTitle } from '@/dashboard/composables/useWidgetTitles'
+import type { WidgetSpec } from '@/dashboard/types/widget'
+import { determineWidgetEffectiveFilterContext } from '@/dashboard/utils'
+
+type TimeRangeType = 'current' | 'window'
+
+const CONTENT_TYPE = 'gauge'
+
+export interface UseGauge extends UseWidgetHandler, UseWidgetVisualizationOptions {
+  //Time range
+  timeRangeType: Ref<TimeRangeType>
+  timeRange: Ref<GraphTimerange>
+
+  //Data settings
+  dataRangeSymbol: Ref<string>
+  dataRangeMax: Ref<number>
+  dataRangeMin: Ref<number>
+  showServiceStatusEnabled: Ref<boolean>
+  showServiceStatus: Ref<ShowServiceStatusType>
+  showServiceStatusSelection: Ref<ForStates>
+}
+
+export const useGauge = async (
+  metric: string,
+  filters: ConfiguredFilters,
+  currentSpec?: WidgetSpec | null
+): Promise<UseGauge> => {
+  const constants = useInjectDashboardConstants()
+  const currentContent =
+    currentSpec?.content?.type === CONTENT_TYPE ? (currentSpec?.content as GaugeContent) : null
+
+  const timeRangeType = ref<TimeRangeType>(
+    !currentContent || currentContent.time_range === 'current' ? 'current' : 'window'
+  )
+  const currentTimerange: TimerangeModel | null =
+    currentContent?.time_range === 'current' ? null : currentContent?.time_range?.window || null
+  const { timeRange, widgetProps: generateTimeRangeSpec } = useTimeRange(currentTimerange)
+
+  const {
+    symbol: dataRangeSymbol,
+    maximum: dataRangeMax,
+    minimum: dataRangeMin,
+    fixedDataRangeProps
+  } = useFixedDataRange(
+    currentContent?.display_range?.unit,
+    currentContent?.display_range?.minimum,
+    currentContent?.display_range?.maximum
+  )
+
+  const showServiceStatusEnabled = ref<boolean>(!!currentContent?.status_display)
+  const showServiceStatus = ref<ShowServiceStatusType>(
+    currentContent?.status_display?.type ?? 'text'
+  )
+  const showServiceStatusSelection = ref<ForStates>(
+    currentContent?.status_display?.for_states ?? 'all'
+  )
+
+  const {
+    title,
+    showTitle,
+    showTitleBackground,
+    titleUrlEnabled,
+    titleUrl,
+    titleUrlValidationErrors,
+    titleMacros,
+    validate: validateTitle,
+    widgetGeneralSettings,
+    showWidgetBackground
+  } = useWidgetVisualizationProps('$DEFAULT_TITLE$', currentSpec?.general_settings, CONTENT_TYPE)
+
+  const widgetProps = ref<WidgetProps>()
+
+  const validate = (): boolean => {
+    return validateTitle()
+  }
+
+  const _generateContent = (): GaugeContent => {
+    const content: GaugeContent = {
+      type: CONTENT_TYPE,
+      metric: metric,
+      display_range: fixedDataRangeProps.value,
+      time_range:
+        timeRangeType.value === 'current'
+          ? 'current'
+          : {
+              type: 'window',
+              window: generateTimeRangeSpec(),
+              consolidation: 'average'
+            }
+    }
+
+    if (showServiceStatusEnabled.value) {
+      content.status_display = {
+        type: showServiceStatus.value,
+        for_states: showServiceStatusSelection.value
+      }
+    }
+
+    return content
+  }
+
+  const _computeWidgetProps = async (): Promise<WidgetProps> => {
+    const content = _generateContent()
+    const [effectiveTitle, effectiveFilterContext] = await Promise.all([
+      computePreviewWidgetTitle({
+        generalSettings: widgetGeneralSettings.value,
+        content,
+        effectiveFilters: filters
+      }),
+      determineWidgetEffectiveFilterContext(content, filters, constants)
+    ])
+
+    return {
+      general_settings: widgetGeneralSettings.value,
+      content,
+      effectiveTitle,
+      effective_filter_context: effectiveFilterContext
+    }
+  }
+
+  const _updateWidgetProps = async () => {
+    widgetProps.value = await _computeWidgetProps()
+  }
+
+  watch(
+    [
+      timeRangeType,
+      timeRange,
+      fixedDataRangeProps,
+      showServiceStatusEnabled,
+      showServiceStatus,
+      showServiceStatusSelection,
+      showWidgetBackground,
+      widgetGeneralSettings
+    ],
+    useDebounceFn(() => {
+      void _updateWidgetProps()
+    }, 300),
+    { deep: true }
+  )
+
+  await _updateWidgetProps()
+
+  return {
+    timeRangeType,
+    timeRange,
+
+    dataRangeSymbol,
+    dataRangeMax,
+    dataRangeMin,
+    showServiceStatusEnabled,
+    showServiceStatus,
+    showServiceStatusSelection,
+
+    title,
+    showTitle,
+    showTitleBackground,
+    titleUrlEnabled,
+    titleUrl,
+    showWidgetBackground,
+
+    titleUrlValidationErrors,
+    titleMacros,
+    validate,
+
+    widgetProps: widgetProps as Ref<WidgetProps>,
+    getSubmitProps: _computeWidgetProps
+  }
+}

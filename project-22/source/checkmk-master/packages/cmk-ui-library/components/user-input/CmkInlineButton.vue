@@ -1,0 +1,82 @@
+<!--
+Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import type { SimpleIcons } from 'cmk-ui-library/components/CmkIcon'
+import CmkIcon from 'cmk-ui-library/components/CmkIcon'
+import { computed, ref } from 'vue'
+
+export interface CmkInlineButtonProps {
+  icon?: SimpleIcons | null
+  disabled?: boolean | string | undefined
+}
+const buttonRef = ref<HTMLButtonElement | null>(null)
+
+// Expose the focus method
+defineExpose({
+  focus: () => {
+    buttonRef.value?.focus()
+  }
+})
+
+const props = defineProps<CmkInlineButtonProps>()
+const iconName = computed(() => props.icon || 'plus')
+const isDisabled = computed(() => props.disabled === true || props.disabled === 'true')
+
+defineEmits(['click'])
+</script>
+
+<template>
+  <button
+    ref="buttonRef"
+    class="cmk-inline-button"
+    :class="{ 'cmk-inline-button--disabled': isDisabled }"
+    :disabled="isDisabled"
+    @click.prevent="
+      (e) => {
+        if (!isDisabled) $emit('click', e)
+      }
+    "
+  >
+    <CmkIcon :name="iconName" variant="inline" size="small" />
+    <slot />
+  </button>
+</template>
+
+<style scoped>
+.cmk-inline-button {
+  display: inline-flex;
+  height: var(--form-field-height);
+  padding: 0 8px;
+  margin: 0;
+  align-items: center;
+  font-weight: var(--font-weight-normal);
+  letter-spacing: unset;
+  background-color: var(--default-button-form-color);
+  border: 1px solid var(--button-form-border-color);
+  color: var(--button-form-text-color);
+
+  &:focus-visible {
+    outline: revert;
+  }
+
+  &:hover:not(.cmk-inline-button--disabled) {
+    background-color: color-mix(in srgb, var(--default-button-form-color) 90%, var(--white) 10%);
+  }
+
+  &:active:not(.cmk-inline-button--disabled) {
+    background-color: color-mix(
+      in srgb,
+      var(--default-button-form-color) 90%,
+      var(--color-conference-grey-10) 10%
+    );
+  }
+}
+
+button.cmk-inline-button--disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+</style>

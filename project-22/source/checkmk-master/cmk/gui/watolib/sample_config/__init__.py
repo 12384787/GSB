@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+# Copyright (C) 2021 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+"""Create an initial Checkmk configuration for new sites"""
+
+from ._abc import SampleConfigGeneratorABCGroups
+from ._constants import (
+    CMK_INV_RULES,
+    INVENTORY_PROCESS_DISCOVERY_RULES,
+    USE_NEW_DESCRIPTIONS_FOR_SETTING,
+)
+from ._impl import (
+    get_default_notification_rule,
+    init_wato_datastructures,
+    new_notification_parameter_id,
+    new_notification_rule_id,
+    register,
+    SampleConfigGeneratorGroups,
+    SampleConfigGeneratorInlineSNMPBackend,
+)
+from ._registry import (
+    sample_config_generator_registry,
+    SampleConfigGenerator,
+    SampleConfigGeneratorRegistry,
+)
+
+__all__ = [
+    "SampleConfigGenerator",
+    "SampleConfigGeneratorABCGroups",
+    "SampleConfigGeneratorGroups",
+    "SampleConfigGeneratorInlineSNMPBackend",
+    "SampleConfigGeneratorRegistry",
+    "sample_config_generator_registry",
+    "CMK_INV_RULES",
+    "new_notification_parameter_id",
+    "new_notification_rule_id",
+    "get_default_notification_rule",
+    "init_wato_datastructures",
+    "register",
+    "INVENTORY_PROCESS_DISCOVERY_RULES",
+    "USE_NEW_DESCRIPTIONS_FOR_SETTING",
+]

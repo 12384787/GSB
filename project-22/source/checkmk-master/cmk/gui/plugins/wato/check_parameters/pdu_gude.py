@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from cmk.gui.i18n import _
+from cmk.gui.plugins.wato.utils import (
+    CheckParameterRulespecWithItem,
+    rulespec_registry,
+    RulespecGroupCheckParametersEnvironment,
+)
+from cmk.gui.valuespec import Dictionary, Integer, TextInput, Tuple
+
+
+def _parameter_valuespec_pdu_gude() -> Dictionary:
+    return Dictionary(
+        elements=[
+            (
+                "kWh",
+                Tuple(
+                    title=_("Total accumulated Active Energy of Power Channel"),
+                    elements=[
+                        Integer(title=_("warning at"), unit=_("kW")),
+                        Integer(title=_("critical at"), unit=_("kW")),
+                    ],
+                ),
+            ),
+            (
+                "W",
+                Tuple(
+                    title=_("Active power"),
+                    elements=[
+                        Integer(title=_("warning at"), unit=_("W")),
+                        Integer(title=_("critical at"), unit=_("W")),
+                    ],
+                ),
+            ),
+            (
+                "A",
+                Tuple(
+                    title=_("Current on power channel"),
+                    elements=[
+                        Integer(title=_("warning at"), unit=_("A")),
+                        Integer(title=_("critical at"), unit=_("A")),
+                    ],
+                ),
+            ),
+            (
+                "V",
+                Tuple(
+                    title=_("Voltage on power channel"),
+                    elements=[
+                        Integer(title=_("warning if below"), unit=_("V")),
+                        Integer(title=_("critical if below"), unit=_("V")),
+                    ],
+                ),
+            ),
+            (
+                "VA",
+                Tuple(
+                    title=_("Line Mean Apparent Power"),
+                    elements=[
+                        Integer(title=_("warning at"), unit=_("VA")),
+                        Integer(title=_("critical at"), unit=_("VA")),
+                    ],
+                ),
+            ),
+        ],
+    )
+
+
+rulespec_registry.register(
+    CheckParameterRulespecWithItem(
+        check_group_name="pdu_gude",
+        group=RulespecGroupCheckParametersEnvironment,
+        item_spec=lambda: TextInput(
+            title=_("Phase Number"), help=_("The number of the power phase.")
+        ),
+        match_type="dict",
+        parameter_valuespec=_parameter_valuespec_pdu_gude,
+        title=lambda: _("Levels for Gude PDU Devices"),
+    )
+)

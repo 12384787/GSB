@@ -1,0 +1,8 @@
+# Alias: TCP port number for Apache
+# Menu: Web GUI
+# Description:
+#  Configure the TCP port used for the Apache webserver
+#  process of this site.
+#
+#  After changing this variable, the man Apache webserver
+#  must be restarted.

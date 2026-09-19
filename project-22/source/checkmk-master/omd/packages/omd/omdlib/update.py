@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+# Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+import contextlib
+import enum
+import os
+import shutil
+import sys
+from collections.abc import Callable, Iterator
+from pathlib import Path
+from types import TracebackType
+from typing import assert_never, Literal, Self
+
+from omdlib.config_api import Config
+from omdlib.crash_reporting import report_crash
+from omdlib.options import CommandOptions
+from omdlib.skel_permissions import Permissions
+from omdlib.tmpfs import prepare_and_populate_tmpfs, unmount_tmpfs_without_save
+from omdlib.type_defs import Replacements, Skeleton
+
+from cmk.crash import make_crash_report_base_path
+
+
+def get_edition(
+    omd_version: str,
+) -> tuple[
+    Literal[
+        "raw",
+        "enterprise",
+        "managed",
+        "cloud",
+        "saas",
+        "unknown",
+        "community",
+        "pro",
+        "ultimate",
+        "ultimatemt",
+    ],
+    Literal[
+        "cloud",
+        "community",
+        "pro",
+        "ultimate",
+        "ultimatemt",
+        "unknown",
+    ],
+]:
+    """Returns the long Checkmk Edition name or "unknown" of the given OMD version"""
+    # TODO: Needs to be able to deal with 2.4 edition names in 2.5. Can be removed with 2.6
+    match omd_version.rsplit(".", maxsplit=1)[-1]:
+        case "community" | "pro" | "ultimate" | "ultimatemt" | "cloud" as new_edition:
+            return new_edition, new_edition
+        case "cre":
+            return "raw", "community"
+        case "cee":
+            return "enterprise", "pro"
+        case "cce":
+            return "cloud", "ultimate"
+        case "cme":
+            return "managed", "ultimatemt"
+        case "cse":
+            return "saas", "cloud"
+        case _:
+            return "unknown", "unknown"
+
+
+def store(site_home: Path, relpath: Path | str, backup_dir: Path) -> None:
+    # `store` is only valid on files, symlinks and empty dirs.
+    source = site_home / relpath
+    destination = backup_dir / relpath
+    match file_type(source):
+        case ManagedTypes.file:
+            shutil.copy2(source, destination)
+        case ManagedTypes.symlink:
+            destination.symlink_to(source.readlink())
+        case ManagedTypes.directory:
+            destination.mkdir()
+            shutil.copystat(source, destination)
+        case ManagedTypes.missing:
+            pass
+        case ManagedTypes.unknown:
+            raise NotImplementedError
+
+
+def restore(site_home: Path, relpath: Path | str, backup_dir: Path) -> None:
+    source = backup_dir / relpath
+    destination = site_home / relpath
+    match file_type(source):
+        case ManagedTypes.file:
+            shutil.copy2(source, destination)
+        case ManagedTypes.symlink:
+            destination.unlink(missing_ok=True)
+            destination.symlink_to(source.readlink())
+        case ManagedTypes.directory:
+            destination.mkdir(exist_ok=True)
+            shutil.copystat(source, destination)
+        case ManagedTypes.missing:
+            if destination.is_dir():
+                destination.rmdir()
+            elif destination.is_file() or destination.is_symlink():
+                destination.unlink(missing_ok=True)
+        case ManagedTypes.unknown:
+            raise Exception
+
+
+class ManagedTypes(enum.Enum):
+    missing = "missing"
+    file = "file"
+    symlink = "symlink"
+    directory = "directory"
+    unknown = "unknown"
+
+
+def file_type(path: Path) -> ManagedTypes:
+    if not path.exists(follow_symlinks=False):
+        return ManagedTypes.missing
+    if path.is_symlink():
+        return ManagedTypes.symlink
+    if path.is_file():
+        return ManagedTypes.file
+    if path.is_dir():
+        return ManagedTypes.directory
+    return ManagedTypes.unknown
+
+
+####
+
+
+def walk_in_DFS_order(
+    path: Path, onerror: Callable[[OSError], None] | None = None
+) -> Iterator[Path]:
+    for root, _directories, files in os.walk(path, onerror=onerror):
+        yield Path(root)
+        for file in files:
+            yield Path(root).joinpath(file)
+
+
+def ensure_skel_is_intact(skel: Path) -> None:
+    # Basic sanity check, because running the update with an empty skel directory is very
+    # destructive.
+    if missing := [d for d in ("etc", "var") if not os.path.isdir(skel / d)]:
+        sys.exit(
+            f"ERROR: The skeleton hierarchy '{skel}' is incomplete (missing: {', '.join(missing)})."
+            "It looks damaged, updating with it could corrupt the site. The update was aborted.\n"
+        )
+
+    def _exit(error: OSError) -> None:
+        sys.exit(
+            f"ERROR: Cannot read the skeleton hierarchy '{skel}': {error}\n"
+            "Updating with it could corrupt the site. The update was aborted.\n"
+        )
+
+    for _path in walk_in_DFS_order(skel, onerror=_exit):
+        pass
+
+
+def walk_managed(skel: Path) -> Iterator[str]:
+    for path in walk_in_DFS_order(skel):
+        relpath = os.path.relpath(path, start=skel)
+        yield relpath
+
+
+def backup_managed(site_home: Path, old_skel: Path, new_skel: Path, backup_dir: Path) -> None:
+    for relpath in walk_managed(new_skel):
+        store(site_home, Path(relpath), backup_dir)
+    for relpath in walk_managed(old_skel):
+        if not os.path.lexists(new_skel / relpath):  # Already backed-up
+            store(site_home, Path(relpath), backup_dir)
+
+
+def restore_managed(site_home: Path, old_skel: Path, new_skel: Path, backup_dir: Path) -> None:
+    for relpath in walk_managed(old_skel):
+        if not (new_skel / relpath).exists():
+            restore(site_home, Path(relpath), backup_dir)
+    for relpath in reversed(list(walk_managed(new_skel))):
+        restore(site_home, Path(relpath), backup_dir)
+
+
+def _store_version_meta_dir(site_home: Path, backup_dir: Path) -> None:
+    version_meta_dir = site_home / ".version_meta"
+    if version_meta_dir.exists():
+        shutil.copytree(version_meta_dir, backup_dir / ".version_meta", symlinks=True)
+
+
+def _restore_version_meta_dir(site_home: Path, backup_dir: Path) -> None:
+    version_meta_dir = site_home / ".version_meta"
+    backup_version_meta_dir = backup_dir / ".version_meta"
+    with contextlib.suppress(FileNotFoundError):
+        shutil.rmtree(version_meta_dir)
+    if backup_version_meta_dir.exists():
+        shutil.copytree(backup_version_meta_dir, version_meta_dir, symlinks=True)
+
+
+HOOK_RELPATHS = [
+    ".forward",
+    "etc/apache/apache/listen-port.conf",
+    "etc/apache/conf.d/ai-control-plane.conf",
+    "etc/apache/conf.d/cookie_auth.conf",
+    "etc/apache/conf.d/mcp.conf",
+    "etc/apache/conf.d/nagios.conf",
+    "etc/apache/conf.d/pnp4nagios.conf",
+    "etc/check_mk/conf.d/microcore.mk",
+    "etc/check_mk/conf.d/mkeventd.mk",
+    "etc/check_mk/conf.d/pnp4nagios.mk",
+    "etc/check_mk/multisite.d/liveproxyd.mk",
+    "etc/check_mk/multisite.d/mkeventd.mk",
+    "etc/init.d/core",
+    "etc/jaeger/apache.conf",
+    "etc/jaeger/omd-admin-port.yaml",
+    "etc/jaeger/omd-grpc.yaml",
+    "etc/jaeger/omd-query-port.yaml",
+    "etc/mk-livestatus/xinetd.conf",
+    "etc/mod-gearman/perfdata.conf",
+    "etc/nagios/nagios.d/pnp4nagios.cfg",
+    "etc/nagvis/conf.d/cookie_auth.ini.php",
+    "etc/omd/site.conf",
+    "etc/pnp4nagios/config.d/cookie_auth.php",
+    "etc/rabbitmq/conf.d/01-default.conf",
+    "etc/rabbitmq/conf.d/02-management-port.conf",
+    "etc/xinetd.d/livestatusv1",
+    "var/check_mk/core/config",
+    "var/log/livestatus.log",
+    "var/log/nagios.log",
+]
+
+
+class ManageUpdate:
+    def __init__(
+        self, site_name: str, tmp_dir: str, site_home: Path, old_skel: Path, new_skel: Path
+    ) -> None:
+        self.backup_dir = site_home / ".update_backup"
+        self.old_skel = old_skel
+        self.new_skel = new_skel
+        self.site_home = site_home
+        self.site_name = site_name
+        self.tmp_dir = tmp_dir
+        self.populated_tmpfs = False
+
+    def __enter__(self) -> Self:
+        if self.backup_dir.exists():
+            sys.exit(
+                f"The folder {self.backup_dir} contains data from a failed update attempt. This "
+                "only happens, if a serious error occurred during a previous update attempt. "
+                f"Please contact support. A crash report may be available in {make_crash_report_base_path(self.site_home)}. "
+                "Since the root cause of this error is not known to OMD, the site is an "
+                "unknown state and both, restarting or updating the site, can have unknown effects.\n"
+            )
+        backup_managed(self.site_home, self.old_skel, self.new_skel, self.backup_dir)
+        store(self.site_home, "version", self.backup_dir)
+        _store_version_meta_dir(self.site_home, self.backup_dir)
+        for relpath in HOOK_RELPATHS:
+            store(self.site_home, relpath, self.backup_dir)
+        return self
+
+    def prepare_and_populate_tmpfs(
+        self,
+        config: Config,
+        replacements: Replacements,
+        skel_permissions: Permissions,
+    ) -> None:
+        prepare_and_populate_tmpfs(
+            config,
+            self.site_name,
+            str(self.site_home),
+            str(self.tmp_dir),
+            replacements,
+            skel_permissions,
+            str(self.new_skel),
+        )
+        self.populated_tmpfs = True
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> Literal[False]:
+        if exc_type is not None:
+            try:
+                if self.populated_tmpfs:
+                    # Always leave the tmpfs unmounted. We currently are in the context of the new
+                    # version (symlink has been restored, but python3 interpreter and dynamic libraries
+                    # are pointing to the new context. Thus, we only umount here.
+                    unmount_tmpfs_without_save(self.site_name, self.tmp_dir, False, False)
+                for relpath in HOOK_RELPATHS:
+                    restore(self.site_home, relpath, self.backup_dir)
+                _restore_version_meta_dir(self.site_home, self.backup_dir)
+                restore(self.site_home, "version", self.backup_dir)
+                restore_managed(self.site_home, self.old_skel, self.new_skel, self.backup_dir)
+            except Exception:
+                identity = report_crash(self.site_home)
+                sys.stderr.write(
+                    f"A serious error occurred, which resulted in a crash with id: {identity}\n"
+                    "Please contact support with this crash id.\n"
+                    "Since the root cause of this error is not known to OMD, the site is an "
+                    "unknown state and both, restarting or updating the site, can have unknown effects.\n"
+                )
+            sys.stdout.write("\nThe update was rolled back successfully.\n")
+        shutil.rmtree(self.backup_dir)
+        return False  # Don't suppress the exception
+
+
+class PreFlight(enum.Enum):
+    ASK = "ask"
+    ABORT = "abort"
+    IGNORE = "ignore"
+
+
+def get_conflict_mode_update(options: CommandOptions) -> tuple[Skeleton, PreFlight]:
+    if "conflict" in options:
+        if "pre-flight" in options or "skeleton" in options:
+            sys.exit("argument --conflict cannot be combined with --pre-flight or --skeleton")
+        match options["conflict"]:
+            case "ask":
+                return Skeleton.ASK, PreFlight.ASK
+            case "install":
+                return Skeleton.INSTALL, PreFlight.IGNORE
+            case "keepold":
+                return Skeleton.KEEPOLD, PreFlight.IGNORE
+            case "abort":
+                return Skeleton.ABORT, PreFlight.ABORT
+            case "ignore":
+                return Skeleton.INSTALL, PreFlight.IGNORE
+            case None:  # mismatch between our yanky argument parsing and reading the result.
+                raise NotImplementedError
+            case _:
+                sys.exit(
+                    "Argument to --conflict must be one of ask, install, keepold, ignore and abort."
+                )
+
+    match options.get("skeleton", "ask"):
+        case "ask":
+            skel = Skeleton.ASK
+        case "abort":
+            skel = Skeleton.ABORT
+        case "install":
+            skel = Skeleton.INSTALL
+        case "keepold":
+            skel = Skeleton.KEEPOLD
+        case str(_):
+            sys.exit("Argument to --skeleton must be one of ask, install, keepold and abort.")
+        case None:  # mismatch between our yanky argument parsing and reading the result.
+            raise NotImplementedError
+        case never:
+            assert_never(never)
+
+    match options.get("pre-flight", "ask"):
+        case "ask":
+            pre = PreFlight.ASK
+        case "abort":
+            pre = PreFlight.ABORT
+        case "ignore":
+            pre = PreFlight.IGNORE
+        case str(_):
+            sys.exit("Argument to --pre-flight must be one of ask, ignore and abort.")
+        case None:  # mismatch between our yanky argument parsing and reading the result.
+            raise NotImplementedError
+        case never:
+            assert_never(never)
+
+    return skel, pre

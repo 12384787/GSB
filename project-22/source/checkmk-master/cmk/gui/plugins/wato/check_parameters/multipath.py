@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+from cmk.gui.i18n import _
+from cmk.gui.plugins.wato.utils import (
+    CheckParameterRulespecWithItem,
+    HostRulespec,
+    rulespec_registry,
+    RulespecGroupCheckParametersDiscovery,
+    RulespecGroupCheckParametersStorage,
+)
+from cmk.gui.valuespec import (
+    Alternative,
+    Checkbox,
+    Dictionary,
+    Integer,
+    Migrate,
+    Percentage,
+    TextInput,
+    Tuple,
+)
+from cmk.ruleset_matcher.definition import RuleGroup
+
+
+def _valuespec_inventory_multipath_rules() -> Dictionary:
+    return Dictionary(
+        title=_("Linux Multipath Inventory"),
+        elements=[
+            (
+                "use_alias",
+                Checkbox(
+                    title=_("Use the multipath alias as service name, if one is set"),
+                    label=_("use alias"),
+                    help=_(
+                        "If a multipath device has an alias, then you can use it for specifying "
+                        "the device instead of the UUID. The alias will then be part of the service "
+                        "name. The UUID will be displayed in the plug-in output."
+                    ),
+                ),
+            ),
+        ],
+        help=_(
+            "This rule controls whether the UUID or the alias is used in the service name during "
+            "discovery of Multipath devices on Linux."
+        ),
+    )
+
+
+rulespec_registry.register(
+    HostRulespec(
+        group=RulespecGroupCheckParametersDiscovery,
+        match_type="dict",
+        name=RuleGroup.DiscoveryParameters("inventory_multipath_rules"),
+        valuespec=_valuespec_inventory_multipath_rules,
+    )
+)
+
+
+def _item_spec_multipath() -> TextInput:
+    return TextInput(
+        title=_("Name of the MP LUN"),
+        help=_(
+            "For Linux multipathing this is either the UUID (e.g. "
+            "60a9800043346937686f456f59386741), or the configured "
+            "alias."
+        ),
+    )
+
+
+def _multipath_lower_levels() -> Alternative:
+    return Alternative(
+        title=_("Expected number of active paths"),
+        elements=[
+            Integer(title=_("Expected number of active paths")),
+            Tuple(
+                title=_("Expected percentage of active paths"),
+                elements=[
+                    Percentage(title=_("Warning if less then")),
+                    Percentage(title=_("Critical if less then")),
+                ],
+            ),
+        ],
+    )
+
+
+def _parameter_valuespec_multipath() -> Migrate:
+    return Migrate(
+        valuespec=Dictionary(
+            help=_(
+                "This rules sets the expected number of active paths for a multipath LUN "
+                "on Linux and Solaris hosts"
+            ),
+            elements=[
+                ("levels", _multipath_lower_levels()),
+            ],
+        ),
+        migrate=lambda p: p if isinstance(p, dict) else {"levels": p},
+    )
+
+
+rulespec_registry.register(
+    CheckParameterRulespecWithItem(
+        check_group_name="multipath",
+        group=RulespecGroupCheckParametersStorage,
+        item_spec=_item_spec_multipath,
+        parameter_valuespec=_parameter_valuespec_multipath,
+        title=lambda: _("Linux and Solaris Multipath Count"),
+    )
+)

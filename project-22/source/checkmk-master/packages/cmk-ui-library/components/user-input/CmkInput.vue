@@ -1,0 +1,162 @@
+<!--
+Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script
+  setup
+  lang="ts"
+  generic="T extends 'text' | 'number' | 'date' | 'time' | 'password' = 'text'"
+>
+import { type VariantProps, cva } from 'class-variance-authority'
+import CmkSpace from 'cmk-ui-library/components/CmkSpace.vue'
+import CmkInlineValidation from 'cmk-ui-library/components/user-input/CmkInlineValidation.vue'
+import useId from 'cmk-ui-library/lib/useId'
+import { immediateWatch } from 'cmk-ui-library/lib/watch'
+import { computed, ref, watch } from 'vue'
+
+import { inputSizes } from './sizes'
+
+defineOptions({ inheritAttrs: false })
+
+const propsCva = cva('cmk-input', {
+  variants: {
+    type: {
+      text: 'cmk-input--text',
+      number: 'cmk-input--number',
+      date: 'cmk-input--date',
+      time: 'cmk-input--time',
+      password: 'cmk-input--password'
+    }
+  }
+})
+
+type InputType = NonNullable<VariantProps<typeof propsCva>['type']>
+type InputDataType<TType extends InputType> = TType extends 'number' ? number | undefined : string
+
+const {
+  type = 'text',
+  fieldSize = 'small',
+  unit,
+  externalErrors,
+  validators,
+  inline = false,
+  hideValidationMessage = false,
+  describedBy
+} = defineProps<{
+  type?: T
+  fieldSize?: keyof typeof inputSizes
+  unit?: string
+  externalErrors?: string[]
+  validators?: ((value: InputDataType<T>) => string[])[]
+  inline?: boolean
+  hideValidationMessage?: boolean
+  describedBy?: string | undefined
+}>()
+
+const wrapperStyle = computed(() => (inline ? { display: 'inline-block' } : undefined))
+
+const data = defineModel<InputDataType<T>>()
+const validation = ref<string[]>([])
+const width = computed(() => inputSizes[fieldSize].width)
+
+const validationId = useId()
+const showsValidation = computed(() => !hideValidationMessage && validation.value.length > 0)
+
+const describedByIds = computed(() => {
+  const ids = [describedBy, showsValidation.value ? validationId : undefined].filter(
+    (id) => id !== undefined
+  )
+  return ids.length > 0 ? ids.join(' ') : undefined
+})
+
+const inputRef = ref<HTMLInputElement | null>(null)
+
+defineExpose({
+  focus: () => {
+    inputRef.value?.focus()
+  }
+})
+
+watch(data, (newData) => {
+  if (newData !== undefined && validators && validators.length > 0) {
+    validation.value =
+      validators.reduce((acc, validator) => {
+        return [...acc, ...validator(newData)]
+      }, [] as string[]) || []
+  }
+})
+
+immediateWatch(
+  () => externalErrors,
+  (newErrors) => {
+    if (newErrors === undefined) {
+      validation.value = []
+      return
+    }
+    validation.value = newErrors
+  }
+)
+</script>
+
+<template>
+  <div class="cmk-input__wrapper" :style="wrapperStyle">
+    <CmkInlineValidation v-if="showsValidation" :id="validationId" :validation="validation" />
+    <div class="cmk-input__input-unit-container">
+      <input
+        ref="inputRef"
+        v-model="data"
+        v-bind="$attrs"
+        :class="[
+          propsCva({ type }),
+          { 'cmk-input': true, 'cmk-input--error': validation.length > 0 }
+        ]"
+        :type="type"
+        step="any"
+        :aria-invalid="validation.length > 0 || undefined"
+        :aria-describedby="describedByIds"
+      />
+      <div v-if="unit" class="cmk-input__unit"><CmkSpace size="small" />{{ unit }}</div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.cmk-input__wrapper {
+  display: flex;
+  flex-direction: column;
+}
+
+.cmk-input:focus-visible {
+  outline: revert;
+}
+
+.cmk-input__input-unit-container {
+  display: flex;
+  align-items: flex-end;
+}
+
+.cmk-input__unit {
+  padding-bottom: 3px;
+}
+
+.cmk-input--error {
+  border: 1px solid var(--inline-error-border-color);
+}
+
+input.cmk-input--number::-webkit-outer-spin-button,
+input.cmk-input--number::-webkit-inner-spin-button {
+  appearance: none;
+  margin: 0;
+}
+
+input.cmk-input--number {
+  width: 5.8ex;
+  appearance: textfield;
+  text-align: right;
+}
+
+input.cmk-input--text {
+  width: v-bind('width');
+}
+</style>

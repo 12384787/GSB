@@ -1,0 +1,240 @@
+# Deploy specifications for cmk-dev-deploy.
+#
+# Wheel and config specs are auto-discovered from Bazel (py_wheel targets and
+# deps_packages packaging targets).  Only package (compiled artifact) and
+# service specs remain here as they have no Bazel representation.
+#
+# Fields not specified use defaults:
+#   package: needs_version_flag=false, needs_faked_artifacts=false, output_basename="", post_install=[], use_copytree=false, frontend_supervised=false
+#
+# The package_target labels are used during manifest enrichment (bazel cquery)
+# to derive source_prefix, site_dest, mode, file lists, and deploy dependencies.
+#
+# Service restart convention:
+#   Python-wheel deploys trigger apache:reload + automation-helper:restart +
+#   cmc:restart (cmc is edition-gated and drops on CRE).  Explicit [[service]]
+#   entries below *replace* that default — use them to opt out of cmc restarts
+#   or to add service-specific restarts.
+
+# =============================================================================
+# Supplementary categorization rules
+# =============================================================================
+# Packages and directories that need categorization rules but have no
+# install/wheel/config spec in the manifest.  Install, wheel, and config
+# specs derive categorization automatically; only entries here are needed
+# for directories outside of that coverage.
+#
+# Fields:
+#   prefix:     path prefix for first-match-wins matching (include trailing /)
+#   category:   one of: python, cpp, rust, vue, frontend, config, data
+#   extensions:  list of file extensions to match (omit for "all files")
+
+# Agent-side Rust binaries (rust_binary, no install spec)
+[[categorization]]
+prefix = "packages/cmk-agent-ctl/"
+category = "rust"
+extensions = [".rs"]
+
+[[categorization]]
+prefix = "packages/mk-sql/"
+category = "rust"
+extensions = [".rs"]
+
+# cmk-shared-typing .ts files are consumed by cmk-frontend-vue
+[[categorization]]
+prefix = "packages/cmk-shared-typing/"
+category = "vue"
+extensions = [".ts"]
+
+# Catch-all: notification scripts (no per-file spec)
+[[categorization]]
+prefix = "notifications/"
+category = "config"
+
+# Catch-all: doc directory
+[[categorization]]
+prefix = "doc/"
+category = "data"
+
+# Catch-all: .py files in packages without their own wheel spec
+[[categorization]]
+prefix = "packages/"
+category = "python"
+extensions = [".py"]
+
+[[categorization]]
+prefix = "non-free/packages/"
+category = "python"
+extensions = [".py"]
+
+# =============================================================================
+# Config deploy overrides (for specs that need extra metadata not in Bazel)
+# =============================================================================
+# Auto-discovered config specs may need overrides for includes, delete_extra,
+# file_chmod, or services.  These are keyed by package_target and merged during
+# discovery.
+
+[config_overrides]
+# agents: include dev-convenience patterns, delete extra files, and reload apache
+"//omd:agents" = { includes = [
+  "cee/robotmk/*",
+], delete_extra = true, services = [
+  "apache:reload",
+] }
+# agents/windows/plugins: set executable permissions, delete extra files, and reload apache
+"//omd:agents_windows" = { file_chmod = "755", delete_extra = true, services = [
+  "apache:reload",
+] }
+# locale: reload apache to pick up updated translations
+"//omd:locale" = { services = ["apache:reload"] }
+
+# =============================================================================
+# Package (compiled artifact) deploys
+# =============================================================================
+
+[[package]]
+name = "deploy_check_cert"
+package_target = "//omd/packages/check-cert:check-cert_pkg"
+
+[[package]]
+name = "deploy_check_http"
+package_target = "//packages/check-http:check_http_pkg"
+
+[[package]]
+name = "deploy_cmk_frontend"
+package_target = "//packages/cmk-frontend:frontend_dist_pkg"
+use_copytree = true
+
+[[package]]
+name = "deploy_cmk_frontend_vue"
+package_target = "//packages/cmk-frontend-vue:frontend_vue_dist_pkg"
+use_copytree = true
+frontend_supervised = true
+
+[[package]]
+name = "deploy_livestatus"
+package_target = "//packages/livestatus:livestatus_shared_files"
+
+[[package]]
+name = "deploy_mk_oracle"
+package_target = "//omd/packages/mk-oracle:mk-oracle_pkg"
+needs_faked_artifacts = true
+
+[[package]]
+name = "deploy_neb"
+package_target = "//packages/neb:neb_shared_files"
+needs_version_flag = true
+
+[[package]]
+name = "deploy_unixcat"
+package_target = "//packages/unixcat:unixcat_pkg"
+
+# Non-free package deploys
+
+[[package]]
+name = "deploy_cmc"
+package_target = "//omd/non-free/packages/cmc:executables"
+needs_version_flag = true
+output_basename = "cmc"
+
+[[package]]
+name = "deploy_checkhelper"
+package_target = "//omd/non-free/packages/cmc:helpers"
+needs_version_flag = true
+output_basename = "checkhelper"
+
+[[package]]
+name = "deploy_icmpreceiver"
+package_target = "//omd/non-free/packages/cmc:helpers"
+needs_version_flag = true
+output_basename = "icmpreceiver"
+post_install = ["setcap_net_raw"]
+
+[[package]]
+name = "deploy_icmpsender"
+package_target = "//omd/non-free/packages/cmc:helpers"
+needs_version_flag = true
+output_basename = "icmpsender"
+post_install = ["setcap_net_raw"]
+
+# =============================================================================
+# Service restart overrides
+# =============================================================================
+# Entries here *replace* the wheel-convention default (see the file header).
+# source_prefix is auto-derived from package_target unless explicitly set.
+
+# Sub-path overrides within the cmk wheel (//cmk:cmk_cmk)
+
+[[service]]
+name = "deploy_svc_base"
+package_target = "//cmk:cmk_cmk"
+source_prefix = "cmk/base/"
+services = ["automation-helper:restart", "cmc:restart"]
+
+[[service]]
+name = "deploy_svc_gui"
+package_target = "//cmk:cmk_cmk"
+source_prefix = "cmk/gui/"
+services = ["apache:reload", "ui-job-scheduler:restart"]
+
+[[service]]
+name = "deploy_svc_dcd_core"
+package_target = "//non-free/packages/cmk-dcd:wheel"
+services = ["dcd:restart", "apache:reload"]
+
+# Whole-target overrides (source_prefix derived from package_target)
+
+[[service]]
+name = "deploy_svc_cmk_agent_receiver"
+package_target = "//packages/cmk-agent-receiver:wheel"
+services = ["agent-receiver:restart"]
+
+[[service]]
+name = "deploy_svc_cmk_ec"
+package_target = "//packages/cmk-ec:wheel"
+services = ["mkeventd:restart"]
+
+# The GUI resolves the hashed bundle filenames from the dist's .manifest.json
+# once per apache process (lru_cache in cmk.gui.htmllib.html); without a
+# reload pages keep referencing the replaced bundles.
+[[service]]
+name = "deploy_svc_cmk_frontend_vue"
+package_target = "//packages/cmk-frontend-vue:frontend_vue_dist_pkg"
+services = ["apache:reload"]
+
+[[service]]
+name = "deploy_svc_livestatus"
+package_target = "//packages/livestatus:all"
+services = ["nagios:restart", "cmc:restart"]
+
+[[service]]
+name = "deploy_svc_neb"
+package_target = "//packages/neb:all"
+services = ["nagios:restart"]
+
+# Non-free service overrides
+
+[[service]]
+name = "deploy_svc_cmc"
+package_target = "//non-free/packages/cmc:all"
+services = ["cmc:restart"]
+
+[[service]]
+name = "deploy_svc_cmk_ai_control_plane"
+package_target = "//non-free/packages/cmk-ai-control-plane:wheel"
+services = ["ai-control-plane:restart"]
+
+[[service]]
+name = "deploy_svc_cmk_core_helpers"
+package_target = "//non-free/packages/cmk-core-helpers:wheel"
+services = ["apache:reload", "cmc:restart"]
+
+# The MCP server is a standalone uvicorn daemon (etc/init.d/mcp-server) that
+# imports cmk.mcp once at startup; nothing else on the site imports it and no
+# apache proxy fronts it.  Restart only that daemon so a reinstalled wheel's
+# new tools become visible -- the wheel-convention default (apache/
+# automation-helper/cmc) would never restart it, leaving the daemon stale.
+[[service]]
+name = "deploy_svc_cmk_mcp"
+package_target = "//non-free/packages/cmk-mcp:wheel"
+services = ["mcp-server:restart"]

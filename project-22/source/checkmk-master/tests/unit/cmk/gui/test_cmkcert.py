@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from datetime import date
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+from pytest_mock import MockerFixture
+
+from livestatus import SiteConfigurations
+
+from cmk.ccc.site import SiteId
+from cmk.gui.cmkcert.main import (
+    _certificate_path,
+    _run_init,
+    _run_rotate,
+    CertificateType,
+)
+from cmk.gui.config import Config
+from cmk.utils.certs import cert_dir, RootCA, SiteCA
+
+
+@pytest.fixture(name="omd_root")
+def fixture_omd_root(tmp_path: Path) -> Path:
+    return tmp_path / "test_root"
+
+
+def _site_id() -> SiteId:
+    return SiteId("test_site")
+
+
+def _dummy_certificate() -> str:
+    return """-----BEGIN CERTIFICATE-----
+MIICRjCCAa+gAwIBAgIUIzp8u+4nxaYgZwyOUGJS8j/4yUAwDQYJKoZIhvcNAQEN
+BQAwOzEdMBsGA1UEAwwUU2l0ZSAndjI1MCcgbG9jYWwgQ0ExGjAYBgNVBAoMEUNo
+ZWNrbWsgU2l0ZSB2MjUwMCAXDTI1MDgwODA3MjExN1oYDzIwNTIxMjIzMDcyMTE3
+WjA7MR0wGwYDVQQDDBRTaXRlICd2MjUwJyBsb2NhbCBDQTEaMBgGA1UECgwRQ2hl
+Y2ttayBTaXRlIHYyNTAwgZ8wDQYJKoZIhvcNAQEBBQADgY0AMIGJAoGBAMn1UiDK
+NT3B/woiOEqV0nDpoZf6RND98UsFVf7QmzYnsRoSCKulFpJOmLLJqcZWnNhPPR+s
+AuFrOMC9BXdOQFCRG48XzHN8tP3tbNHFt4F6hGLJMZCXmeAolxeGBxcY1eYLxuw0
+CD61mjy043ft/C+Qxg6paxdi2eaBeveyFySxAgMBAAGjRTBDMBIGA1UdEwEB/wQI
+MAYBAf8CAQAwHQYDVR0OBBYEFIQRSx/cHJE904wSPdCC4QwVqyREMA4GA1UdDwEB
+/wQEAwIBBjANBgkqhkiG9w0BAQ0FAAOBgQBc3tkQmugWuO7Xyj5EQ9Je3SxUYKR6
+qU5sQQ76fOT9hRcQvhszZKqRFj2flvNs/lCf1JMrOGbBgAWceGmrlubaJgK/MGbf
+eGAPlxJ2poGukdPO/ae6pEDcwK7zz6nA2PxmvcAZmm5/BAlxA7NYjJaXG/TPcOBh
+51Q0/VZEBkeOUw==
+-----END CERTIFICATE-----"""
+
+
+def _dummy_key() -> str:
+    return """-----BEGIN PRIVATE KEY-----
+MIICeAIBADANBgkqhkiG9w0BAQEFAASCAmIwggJeAgEAAoGBAMn1UiDKNT3B/woi
+OEqV0nDpoZf6RND98UsFVf7QmzYnsRoSCKulFpJOmLLJqcZWnNhPPR+sAuFrOMC9
+BXdOQFCRG48XzHN8tP3tbNHFt4F6hGLJMZCXmeAolxeGBxcY1eYLxuw0CD61mjy0
+43ft/C+Qxg6paxdi2eaBeveyFySxAgMBAAECgYAGDWAEs4qc6y9lclkVgx/nWlkJ
+YOqnCLUudl55YG8GVHIuQdQYsL3YbJqO4RRBaV8R7G38gP8lGj19KSz8wk+TDN8c
+4J0Rg0C4RqjEyzH0ePA7Z/sUqOWUZVLZevNBxSvOTnTLe22Gz2X1eyITxh83QpLm
+hXVhZc5L+KGW9+gdQQJBAPFihTqnOyJxKCLAdCL3Ai6sAmwFBcEtfxpLJI3o5ctX
+hNpYk/wtvUwmcboHZPOdwlXZENqZvYSnw8cZpNf2dR0CQQDWL6+zLlPxsm4d9W5T
+JKWAacxDTU5cIJwdg+SoP/0bwbTXWTyORZ59Kim6yXJdkEyryN+FULfSw+RNNQ7g
+gP2lAkEAjyWe3r6nqfAzHhDFjqqvR6BIO2jrFbl2Y9BmGCYiiGkZZycac3Voig1O
+akTSUEqhIan9fbWol0+qIZuKj2wf3QJBAKz5f/zF+lckkZeyQTH2U458YtErmo/+
+afXQMZbLbp6+9kxALg58HP3aUi8eRzVWtwS4ygNBZ+NX/oV3xxb6NV0CQQDlv4oH
+G0tQIZb1B4/CrCbBnh69L0RGt3h7y906lRuVV0Ng/Mj5Sj8R+R/wVqEcNylRXhSE
+VXzJSdPU5tH3gi42
+-----END PRIVATE KEY-----"""
+
+
+def _dummy_cert_with_key() -> str:
+    return f"{_dummy_key()}\n{_dummy_certificate()}"
+
+
+def _create_dummy(omd_root: Path, target_certificate: CertificateType) -> Path:
+    cert_path = _certificate_path(
+        omd_root=omd_root,
+        site_id=_site_id(),
+        target_certificate=target_certificate,
+    )
+    cert_path.parent.mkdir(parents=True, exist_ok=True)
+    cert_path.write_text(_dummy_cert_with_key())
+    return cert_path
+
+
+@pytest.fixture(name="site_ca")
+def fixture_site_ca(omd_root: Path) -> Path:
+    site_ca_path = SiteCA.root_ca_path(cert_dir(omd_root))
+    site_ca_path.parent.mkdir(parents=True, exist_ok=True)
+    site_ca_path.write_text(_dummy_cert_with_key())
+    return site_ca_path
+
+
+@pytest.fixture(name="agent_ca")
+def fixture_agent_ca(omd_root: Path) -> Path:
+    agent_ca_path = _certificate_path(
+        omd_root=omd_root,
+        site_id=_site_id(),
+        target_certificate="agent-ca",
+    )
+    agent_ca_path.parent.mkdir(parents=True, exist_ok=True)
+    agent_ca_path.write_text(_dummy_cert_with_key())
+    return agent_ca_path
+
+
+def _test_init(omd_root: Path, target_cert: CertificateType) -> None:
+    site_id = _site_id()
+    cert_path = _certificate_path(
+        omd_root=omd_root,
+        site_id=site_id,
+        target_certificate=target_cert,
+    )
+
+    assert not cert_path.exists()
+
+    _run_init(
+        omd_root=omd_root,
+        site_id=site_id,
+        target_certificate=target_cert,
+        key_size=1024,
+    )
+
+    assert cert_path.exists()
+
+
+@pytest.mark.parametrize(
+    "target_cert",
+    [
+        "site-ca",
+        "agent-ca",
+    ],
+)
+def test_init_cas(omd_root: Path, target_cert: CertificateType) -> None:
+    _test_init(omd_root, target_cert)
+
+
+@pytest.mark.usefixtures("site_ca")
+def test_init_site(omd_root: Path) -> None:
+    _create_dummy(omd_root, "site-ca")
+    _test_init(omd_root, "site")
+
+
+@pytest.mark.parametrize(
+    "target_certificate",
+    [
+        "site-ca",
+        "agent-ca",
+        "site",
+    ],
+)
+def test_init_cert_does_not_replace_existing(
+    omd_root: Path, target_certificate: CertificateType
+) -> None:
+    _create_dummy(omd_root, target_certificate)
+
+    with pytest.raises(ValueError):
+        _run_init(
+            omd_root=omd_root,
+            site_id=_site_id(),
+            target_certificate=target_certificate,
+            key_size=1024,
+        )
+
+
+@pytest.mark.usefixtures("site_ca")
+def test_rotate_site(mocker: MockerFixture, omd_root: Path) -> None:
+    _mock_site_and_config(mocker)
+    _create_dummy(omd_root, "site-ca")
+    _create_dummy(omd_root, "site")
+
+    _run_rotate(
+        omd_root=omd_root,
+        site_id=_site_id(),
+        target_certificate="site",
+        expiry=90,
+        finalize=False,
+    )
+
+    assert (
+        "BEGIN CERTIFICATE"
+        in _certificate_path(
+            omd_root=omd_root,
+            site_id=_site_id(),
+            target_certificate="site",
+        ).read_text()
+    )
+
+
+def test_rotate_site_wo_site_ca(mocker: MockerFixture, omd_root: Path) -> None:
+    _mock_site_and_config(mocker)
+
+    _create_dummy(omd_root, "site")
+
+    with pytest.raises(FileNotFoundError):
+        _run_rotate(
+            omd_root=omd_root,
+            site_id=_site_id(),
+            target_certificate="site",
+            expiry=90,
+            finalize=True,
+        )
+
+
+def _mock_site_and_config(mocker: MockerFixture) -> None:
+    mocker.patch("cmk.gui.site_config.site_is_local").return_value = True
+    mocker.patch(
+        "cmk.gui.watolib.config_domains.ConfigDomainCACertificates.load_full_config"
+    ).return_value = {
+        "trusted_certificate_authorities": {"trusted_cas": [], "use_system_wide_cas": False}
+    }
+
+    mock_sites = SiteConfigurations(
+        {
+            SiteId("test_site"): {
+                "alias": "Local site test_site",
+                "disable_wato": True,
+                "disabled": False,
+                "id": SiteId("test_site"),
+                "insecure": False,
+                "message_broker_port": 5672,
+                "multisiteurl": "",
+                "persist": False,
+                "proxy": None,
+                "replicate_ec": False,
+                "replicate_mkps": False,
+                "replication": None,
+                "socket": ("local", None),
+                "status_host": None,
+                "timeout": 5,
+                "url_prefix": "/test_site/",
+                "user_login": True,
+                "user_attribute_sync_connections": "all",
+                "is_trusted": True,
+            }
+        }
+    )
+
+    mocker.patch("cmk.gui.cmkcert.cmkcert_rotate.load_config").return_value = Config(
+        sites=mock_sites
+    )
+    mocker.patch("cmk.gui.cmkcert.cmkcert_rotate._verify_site").return_value = mock_sites[
+        SiteId("test_site")
+    ]
+
+
+@pytest.mark.usefixtures("site_ca")
+def test_rotate_site_ca(mocker: MockerFixture, omd_root: Path) -> None:
+    _mock_site_and_config(mocker)
+
+    with (
+        patch(
+            "cmk.gui.cmkcert.cmkcert_rotate.all_activation_sites",
+            return_value=SiteConfigurations({}),
+        ),
+        patch("cmk.gui.cmkcert.cmkcert_rotate.PendingChanges") as mock_pending_changes,
+        patch("cmk.gui.watolib.config_domains.ConfigDomainCACertificates.save") as mock_save,
+    ):
+        _run_rotate(
+            omd_root=omd_root,
+            site_id=_site_id(),
+            target_certificate="site-ca",
+            expiry=90,
+            finalize=False,
+        )
+        mock_pending_changes.return_value.add.assert_called_once()
+        mock_save.assert_called_once()
+
+    # site-ca rotation requires a second call with finalize=True to complete the rotation
+    _run_rotate(
+        omd_root=omd_root,
+        site_id=_site_id(),
+        target_certificate="site-ca",
+        expiry=90,
+        finalize=True,
+    )
+
+    assert "BEGIN CERTIFICATE" in SiteCA.root_ca_path(cert_dir(omd_root)).read_text()
+
+
+def test_rotate_agent_ca(omd_root: Path, agent_ca: Path) -> None:
+    with patch("cmk.gui.cmkcert.cmkcert_rotate._reload_agent_receiver") as mock_reload:
+        _run_rotate(
+            omd_root=omd_root,
+            site_id=_site_id(),
+            target_certificate="agent-ca",
+            expiry=90,
+            finalize=False,
+        )
+        mock_reload.assert_called_once()
+
+    retired_ca = agent_ca.with_name(f"{date.today().isoformat()}_ca_old.pem")
+    assert retired_ca.read_text() == _dummy_cert_with_key()
+    assert "BEGIN CERTIFICATE" in agent_ca.read_text()
+    assert agent_ca.read_text() != _dummy_cert_with_key()
+
+    with pytest.raises(ValueError):
+        _run_rotate(
+            omd_root=omd_root,
+            site_id=_site_id(),
+            target_certificate="agent-ca",
+            expiry=90,
+            finalize=False,
+        )
+
+
+def _dummy_common_name() -> str:
+    return "Site 'v250' local CA"
+
+
+def _provided_ca_file(
+    tmp_path: Path, common_name: str, key_size: int = 2048
+) -> tuple[RootCA, Path]:
+    """Create a CA in a single PEM file, as a user would provide it."""
+    ca_pem = tmp_path / "provided_ca.pem"
+    return RootCA.create(path=ca_pem, name=common_name, key_size=key_size), ca_pem
+
+
+def test_rotate_agent_ca_with_provided_ca(omd_root: Path, agent_ca: Path, tmp_path: Path) -> None:
+    provided_ca, ca_pem = _provided_ca_file(tmp_path, _dummy_common_name())
+
+    with patch("cmk.gui.cmkcert.cmkcert_rotate._reload_agent_receiver"):
+        _run_rotate(
+            omd_root=omd_root,
+            site_id=_site_id(),
+            target_certificate="agent-ca",
+            expiry=90,
+            finalize=False,
+            ca_pem=ca_pem,
+        )
+
+    assert agent_ca.read_text() == (
+        provided_ca.private_key.dump_pem(password=None).str + provided_ca.certificate.dump_pem().str
+    )
+
+
+def test_rotate_agent_ca_rejects_provided_ca_with_another_common_name(
+    omd_root: Path, agent_ca: Path, tmp_path: Path
+) -> None:
+    _, ca_pem = _provided_ca_file(tmp_path, "DummyCA")
+
+    with pytest.raises(ValueError, match=_dummy_common_name()):
+        _run_rotate(
+            omd_root=omd_root,
+            site_id=_site_id(),
+            target_certificate="agent-ca",
+            expiry=90,
+            finalize=False,
+            ca_pem=ca_pem,
+        )
+
+    assert agent_ca.read_text() == _dummy_cert_with_key()
+
+
+@pytest.mark.parametrize(
+    "ca_pem_content, expected_error",
+    [
+        pytest.param(_dummy_certificate(), "Could not find private key", id="key missing"),
+        pytest.param(_dummy_key(), "Could not find certificate", id="certificate missing"),
+        pytest.param(
+            f"{_dummy_certificate()}\nnot a private key",
+            "Could not find private key",
+            id="invalid key",
+        ),
+    ],
+)
+def test_rotate_agent_ca_keeps_current_ca_if_provided_ca_is_incomplete(
+    omd_root: Path,
+    agent_ca: Path,
+    tmp_path: Path,
+    ca_pem_content: str,
+    expected_error: str,
+) -> None:
+    (ca_pem := tmp_path / "custom_ca.pem").write_text(ca_pem_content)
+
+    with pytest.raises(ValueError, match=expected_error):
+        _run_rotate(
+            omd_root=omd_root,
+            site_id=_site_id(),
+            target_certificate="agent-ca",
+            expiry=90,
+            finalize=False,
+            ca_pem=ca_pem,
+        )
+
+    assert agent_ca.read_text() == _dummy_cert_with_key()
+
+
+def test_rotate_agent_ca_rejects_provided_ca_with_a_weak_key(
+    omd_root: Path, agent_ca: Path, tmp_path: Path
+) -> None:
+    _, ca_pem = _provided_ca_file(tmp_path, _dummy_common_name(), key_size=1024)
+
+    with pytest.raises(ValueError, match="too weak"):
+        _run_rotate(
+            omd_root=omd_root,
+            site_id=_site_id(),
+            target_certificate="agent-ca",
+            expiry=90,
+            finalize=False,
+            ca_pem=ca_pem,
+        )
+
+    assert agent_ca.read_text() == _dummy_cert_with_key()

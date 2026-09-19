@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+"""Performing the actual checks."""
+
+import itertools
+import logging
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Container, Iterable, Mapping, Sequence
+from pathlib import Path
+from typing import NamedTuple
+
+from cmk.ccc.hostaddress import HostName
+from cmk.ccc.regex import regex
+from cmk.ccc.resulttype import Result
+from cmk.checkengine.checkerplugin import AggregatedResult, CheckerPlugin, ConfiguredService
+from cmk.checkengine.helper_interface import AgentRawData, HostKey, SourceInfo
+from cmk.checkengine.inventory import (
+    HWSWInventoryParameters,
+    inventorize_status_data_of_real_host,
+)
+from cmk.checkengine.parser import group_by_host, ParserFunction
+from cmk.checkengine.plugins import (
+    CheckPluginName,
+    InventoryPlugin,
+    InventoryPluginName,
+    SectionName,
+)
+from cmk.checkengine.sectionparser import (
+    make_providers,
+    Provider,
+    SectionPlugin,
+    store_piggybacked_sections,
+)
+from cmk.checkengine.snmplib import SNMPRawData
+from cmk.checkengine.specs.checkresults import ActiveCheckResult, SubmittableServiceCheckResult
+from cmk.checkengine.specs.exitspec import ExitSpec
+from cmk.checkengine.submitters import Submittee, Submitter
+from cmk.checkengine.summarize import SummarizerFunction
+from cmk.inventory.structured_data import (
+    InventoryStore,
+)
+from cmk.utils.everythingtype import EVERYTHING
+from cmk.utils.servicename import ServiceName
+from cmk.utils.timeperiod import TimeperiodName
+
+__all__ = [
+    "execute_checkmk_checks",
+    "check_host_services",
+    "check_plugins_missing_data",
+    "ABCCheckingConfig",
+]
+logger = logging.getLogger(__name__)
+
+type _Labels = Mapping[str, str]
+
+
+class ABCCheckingConfig(ABC):
+    @abstractmethod
+    def __call__(
+        self,
+        host_name: HostName,
+        item: str | None,
+        service_labels: Mapping[str, str],
+        ruleset_name: str,
+    ) -> Sequence[Mapping[str, object]]: ...
+
+
+def execute_checkmk_checks(
+    *,
+    hostname: HostName,
+    omd_root: Path,
+    fetched: Iterable[
+        tuple[
+            SourceInfo,
+            Result[AgentRawData | SNMPRawData, Exception],
+        ]
+    ],
+    parser: ParserFunction,
+    summarizer: SummarizerFunction,
+    section_plugins: Mapping[SectionName, SectionPlugin],
+    check_plugins: Mapping[CheckPluginName, CheckerPlugin],
+    inventory_plugins: Mapping[InventoryPluginName, InventoryPlugin],
+    inventory_parameters: Callable[[HostName, InventoryPlugin], Mapping[str, object]],
+    params: HWSWInventoryParameters,
+    services: Sequence[ConfiguredService],
+    get_check_period: Callable[[ServiceName, _Labels], TimeperiodName],
+    run_plugin_names: Container[CheckPluginName],
+    submitter: Submitter,
+    exit_spec: ExitSpec,
+    section_error_handling: Callable[[SectionName, Sequence[object]], str],
+    timeperiods_active: Mapping[str, bool],
+) -> Sequence[ActiveCheckResult]:
+    host_sections = parser(fetched)
+    host_sections_by_host = group_by_host(
+        ((HostKey(s.hostname, s.source_type), r.ok) for s, r in host_sections if r.is_ok())
+    )
+    store_piggybacked_sections(host_sections_by_host, omd_root)
+    providers = make_providers(
+        host_sections_by_host,
+        section_plugins,
+        error_handling=section_error_handling,
+    )
+    service_results = list(
+        check_host_services(
+            hostname,
+            providers=providers,
+            services=services,
+            check_plugins=check_plugins,
+            run_plugin_names=run_plugin_names,
+            get_check_period=get_check_period,
+            timeperiods_active=timeperiods_active,
+        )
+    )
+    submitter.submit(
+        Submittee(s.service.description, s.result, s.cache_info) for s in service_results
+    )
+
+    if run_plugin_names is EVERYTHING:
+        _do_inventory_actions_during_checking_for(
+            hostname,
+            omd_root=omd_root,
+            inventory_parameters=inventory_parameters,
+            inventory_plugins=inventory_plugins,
+            params=params,
+            providers=providers,
+        )
+    return [
+        *summarizer(host_sections),
+        *itertools.chain.from_iterable(
+            resolver.parsing_errors() for resolver in providers.values()
+        ),
+        *check_plugins_missing_data(service_results, exit_spec),
+    ]
+
+
+def _do_inventory_actions_during_checking_for(
+    host_name: HostName,
+    *,
+    omd_root: Path,
+    inventory_parameters: Callable[[HostName, InventoryPlugin], Mapping[str, object]],
+    inventory_plugins: Mapping[InventoryPluginName, InventoryPlugin],
+    params: HWSWInventoryParameters,
+    providers: Mapping[HostKey, Provider],
+) -> None:
+    inv_store = InventoryStore(omd_root)
+
+    if not params.status_data_inventory:
+        # includes cluster case
+        inv_store.remove_status_data_tree(host_name=host_name)
+        return  # nothing to do here
+
+    status_data_tree = inventorize_status_data_of_real_host(
+        host_name,
+        inventory_parameters=inventory_parameters,
+        providers=providers,
+        inventory_plugins=inventory_plugins,
+        run_plugin_names=EVERYTHING,
+    )
+
+    if status_data_tree:
+        inv_store.save_status_data_tree(host_name=host_name, tree=status_data_tree)
+
+
+class PluginState(NamedTuple):
+    state: int
+    name: CheckPluginName
+
+
+def check_plugins_missing_data(
+    service_results: Sequence[AggregatedResult],
+    exit_spec: ExitSpec,
+) -> Iterable[ActiveCheckResult]:
+    """Compute a state for the fact that plugins did not get any data"""
+
+    # NOTE:
+    # The keys used here are 'missing_sections' and 'specific_missing_sections'.
+    # They are from a time where the distinction between section and plug-in was unclear.
+    # They are kept for compatibility.
+    missing_status = exit_spec.get("missing_sections", 1)
+    specific_plugins_missing_data_spec = exit_spec.get("specific_missing_sections", [])
+
+    if all(r.data_received for r in service_results):
+        return
+
+    if not any(r.data_received for r in service_results):
+        yield ActiveCheckResult(
+            state=missing_status,
+            summary="Missing monitoring data for all plugins",
+        )
+        return
+
+    plugins_missing_data = {
+        r.service.check_plugin_name for r in service_results if not r.data_received
+    }
+
+    yield ActiveCheckResult(state=0, summary="Missing monitoring data for plugins")
+
+    for check_plugin_name in sorted(plugins_missing_data):
+        for pattern, status in specific_plugins_missing_data_spec:
+            reg = regex(pattern)
+            if reg.match(str(check_plugin_name)):
+                yield ActiveCheckResult(state=status, summary=str(check_plugin_name))
+                break
+        else:  # no break
+            yield ActiveCheckResult(state=missing_status, summary=str(check_plugin_name))
+
+
+def check_host_services(
+    host_name: HostName,
+    *,
+    providers: Mapping[HostKey, Provider],
+    services: Sequence[ConfiguredService],
+    check_plugins: Mapping[CheckPluginName, CheckerPlugin],
+    run_plugin_names: Container[CheckPluginName],
+    get_check_period: Callable[[ServiceName, _Labels], TimeperiodName],
+    timeperiods_active: Mapping[str, bool],
+) -> Iterable[AggregatedResult]:
+    """Compute service state results for all given services on node or cluster"""
+    for service in (
+        s
+        for s in services
+        if s.check_plugin_name in run_plugin_names
+        and _service_inside_check_period(
+            s.description, get_check_period(s.description, s.labels), timeperiods_active
+        )
+    ):
+        if service.check_plugin_name not in check_plugins:
+            yield AggregatedResult(
+                service=service,
+                data_received=True,
+                result=SubmittableServiceCheckResult.check_not_implemented(),
+                cache_info=None,
+            )
+        else:
+            plugin = check_plugins[service.check_plugin_name]
+            yield plugin.function(host_name, service, providers=providers, is_preview=False)
+
+
+def _service_inside_check_period(
+    description: ServiceName, period: TimeperiodName, timeperiods_active: Mapping[str, bool]
+) -> bool:
+    if period == TimeperiodName("24X7"):
+        # No need to look this one up. Might save us a livestatus query.
+        return True
+    if timeperiods_active.get(period, True):
+        logger.debug(
+            "Service %(description)s: time period %(period)s is currently active.",
+            {"description": description, "period": period},
+        )
+        return True
+    logger.debug(
+        "Skipping service %(description)s: currently not in time period %(period)s.",
+        {"description": description, "period": period},
+    )
+    return False

@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+# Copyright (C) 2023 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+from typing import override
+
+from cmk.gui.breadcrumb import make_simple_page_breadcrumb
+from cmk.gui.header import make_header
+from cmk.gui.htmllib.html import html
+from cmk.gui.i18n import _
+from cmk.gui.logged_in import user
+from cmk.gui.main_menu import main_menu_registry
+from cmk.gui.pages import Page, PageContext, PageEndpoint, PageRegistry, PageResult
+
+
+class GuiTimingsPage(Page):
+    @override
+    def page(self, ctx: PageContext) -> PageResult:
+        breadcrumb = make_simple_page_breadcrumb(main_menu_registry.menu_help(), _("Info"))
+        make_header(
+            html,
+            title="GUI timings",
+            breadcrumb=breadcrumb,
+            debug=ctx.config.debug,
+            lang=user.language,
+            inject_js_profiling_code=ctx.config.inject_js_profiling_code,
+            load_frontend_vue=ctx.config.load_frontend_vue,
+            custom_style_sheet=ctx.config.custom_style_sheet,
+            screenshotmode=ctx.config.screenshotmode,
+            inline_help_as_text=user.inline_help_as_text,
+            hide_suggestions=not user.get_tree_state("suggestions", "all", True),
+            user_role_ids=user.role_ids,
+        )
+
+        html.open_div(id_="info_title")
+        html.h1("Client side GUI timings")
+        html.close_div()
+
+        html.div(None, id_="info_underline")
+
+        html.call_ts_function(
+            container="div",
+            function_name="render_stats_table",
+            arguments=None,
+        )
+
+        html.final_javascript_code()
+        html.close_body()
+        return None
+
+
+def register(page_registry: PageRegistry) -> None:
+    page_registry.register(PageEndpoint("gui_timings", GuiTimingsPage()))

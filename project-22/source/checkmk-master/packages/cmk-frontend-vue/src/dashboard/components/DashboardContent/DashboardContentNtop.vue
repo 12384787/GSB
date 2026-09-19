@@ -1,0 +1,106 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import usei18n from 'cmk-ui-library/lib/i18n'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
+
+import { useInjectIsPublicDashboard } from '@/dashboard/composables/useIsPublicDashboard'
+
+import DashboardContentContainer from './DashboardContentContainer.vue'
+import { NtopBase, getIfid } from './ntop.ts'
+import type { ContentProps, NtopType } from './types.ts'
+
+const { _t } = usei18n()
+
+const props = defineProps<ContentProps>()
+const isPublicDashboard = useInjectIsPublicDashboard()
+
+let ntop: NtopBase | undefined = undefined
+const interfaceDivId: string = 'ntop_interface_quickstats'
+const contentDivId: string = `db-content-ntop-${props.widget_id}`
+let ifid: string
+const exception = ref<{ class: 'warning' | 'error'; msg: string } | null>(null)
+
+onMounted(async () => {
+  if (isPublicDashboard) {
+    return
+  }
+  try {
+    ifid = await getIfid()
+    // Persist the resolved ifid to the URL so page reloads always use the same interface
+    const url = new URL(window.location.href)
+    url.searchParams.set('ifid', ifid)
+    window.history.replaceState({}, '', url.toString())
+    ntop = new NtopBase(props.content.type as NtopType, interfaceDivId, contentDivId, ifid)
+  } catch (exc) {
+    // Can't let the site crash because of ntop warnings, they are for the user
+    // e.g. ntopng integration is not activated under global settings.
+    if (exc instanceof Error) {
+      exception.value = {
+        class: 'error',
+        msg: exc.message
+      }
+    } else {
+      exception.value = {
+        class: 'warning',
+        msg: exc as string
+      }
+    }
+  }
+})
+
+onBeforeUnmount(() => {
+  if (ntop) {
+    ntop.disable()
+  }
+})
+</script>
+
+<template>
+  <DashboardContentContainer
+    v-if="isPublicDashboard"
+    :effective-title="effectiveTitle"
+    :general_settings="general_settings"
+  >
+    <div class="db-content-ntop__not-available">
+      {{ _t('Not available on shared dashboards') }}
+    </div>
+  </DashboardContentContainer>
+  <template v-else>
+    <div v-if="exception" :class="['db-content-ntop__warning', exception.class]">
+      {{ exception.msg }}
+    </div>
+    <div
+      v-else
+      class="db-content-ntop__wrapper ntop"
+      :class="{ 'db-content-ntop__background': !!general_settings.render_background }"
+    >
+      <div :id="interfaceDivId" class="ntop_interface_quickstats" />
+      <div :id="contentDivId" class="db-content-ntop" />
+    </div>
+  </template>
+</template>
+
+<style scoped>
+.db-content-ntop__wrapper {
+  width: 100%;
+  height: 100%;
+  padding-top: var(--dimension-2);
+}
+
+.db-content-ntop__background {
+  background-color: var(--db-content-bg-color);
+}
+
+.db-content-ntop__warning {
+  max-width: 95%;
+}
+
+.db-content-ntop__not-available {
+  padding: var(--spacing);
+  color: var(--font-color);
+}
+</style>

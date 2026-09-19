@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import json
+
+from cmk.gui.http import response
+from cmk.gui.logged_in import user
+from cmk.gui.pages import PageContext, PageEndpoint, PageRegistry
+
+
+def register(page_registry: PageRegistry) -> None:
+    page_registry.register(PageEndpoint("ajax_switch_help", ajax_switch_help))
+
+
+def ajax_switch_help(ctx: PageContext) -> None:
+    state = ctx.request.var("enabled", "") != ""
+    user.inline_help_as_text = state
+    response.set_data(json.dumps(state))

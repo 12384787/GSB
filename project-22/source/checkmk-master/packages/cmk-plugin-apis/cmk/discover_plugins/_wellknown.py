@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+"""This bundles the paths or names that are of special significance for plug-in loading"""
+
+import enum
+
+CMK_PLUGINS = "cmk.plugins"
+CMK_ADDONS_PLUGINS = "cmk_addons.plugins"
+
+LIBEXEC_FOLDER = "libexec"
+AGENT_PLUGINS_FOLDER = "agents"
+
+
+class PluginGroup(enum.Enum):
+    """Definitive list of discoverable plug-in groups"""
+
+    AGENT_BASED = "agent_based"
+    BAKERY = "bakery"
+    CHECKMAN = "checkman"
+    DCD_CONNECTORS = "dcd_connectors"
+    DCD_CONNECTOR_PARAMETERS = "dcd_connector_parameters"
+    GRAPHING = "graphing"
+    POST_RENAME_SITE = "post_rename_site"
+    RULESETS = "rulesets"
+    SERVER_SIDE_CALLS = "server_side_calls"
+    INVENTORY_UI = "inventory_ui"
+    DIAGNOSTICS = "diagnostics"
+    LICENSING = "licensing"
+    CLI = "cli"

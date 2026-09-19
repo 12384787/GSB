@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+
+import time
+from collections import Counter
+from collections.abc import Generator, Sequence
+from typing import Any, NamedTuple
+
+from cmk.bi.lib import (
+    BIHostSpec,
+    BIHostStatusInfoRow,
+    BIServiceWithFullState,
+    BIState,
+    BIStatusInfo,
+    NodeComputeResult,
+    NodeResultBundle,
+)
+from cmk.bi.trees import BICompiledAggregation, BICompiledRule, CompiledAggrTree
+from cmk.ccc.hostaddress import HostName
+from cmk.ccc.site import omd_site, SiteId
+from cmk.gui.bi.bi_manager import BIManager
+from cmk.gui.data_source import query_livestatus
+from cmk.gui.i18n import _
+from cmk.gui.log import logger
+from cmk.gui.type_defs import (
+    Row,
+    Rows,
+)
+from cmk.livestatus_client import (
+    LivestatusRow,
+    lq_logic,
+    MKLivestatusPayloadTooLargeError,
+    Query,
+    QuerySpecification,
+)
+from cmk.utils.servicename import ServiceName
+
+from .annotations import reclassify_history_by_annotations
+from .computation import spans_by_object
+from .type_defs import (
+    AVAnnotations,
+    AVBIPhaseData,
+    AVBIPhases,
+    AVBITimelineState,
+    AVBITimelineStates,
+    AVOptions,
+    AVRawData,
+    AVSpan,
+    AVTimeRange,
+    AVTimeStamp,
+)
+
+BIAggregationGroupTitle = str
+BIAggregationTitle = str
+BITreeState = Any
+
+
+DEFAULT_MAX_TIME_RANGE = 31 * 24 * 60 * 60  # One month
+
+
+# Not a real class, more a struct
+class TimelineContainer:
+    def __init__(self, aggr_row: Row) -> None:
+        self._aggr_row = aggr_row
+
+        # PUBLIC accessible data
+        self.aggr_compiled_aggregation: BICompiledAggregation = self._aggr_row[
+            "aggr_compiled_aggregation"
+        ]
+        self.aggr_compiled_branch: BICompiledRule = self._aggr_row["aggr_compiled_branch"]
+        self.aggr_tree: CompiledAggrTree = self._aggr_row["aggr_tree"]
+        self.aggr_group: BIAggregationGroupTitle = self._aggr_row["aggr_group"]
+
+        # Data fetched from livestatus query
+        self.host_service_info: set[tuple[HostName, ServiceName]] = set()
+
+        # Computed data
+        self.timeline: list[AVSpan] = []
+        self.states: AVBITimelineStates = {}
+
+        # Can be optional after computation
+        self.node_compute_result: NodeComputeResult | None = None
+        self.timewarp_state: BITreeState | None = None
+        # Can not be optional after computation
+        self.tree_time: AVTimeStamp | None = None
+
+
+class BIAvailability(NamedTuple):
+    timeline_containers: list[TimelineContainer]
+    av_rawdata: AVRawData
+    has_reached_logrow_limit: bool
+
+
+def get_bi_availability(
+    avoptions: AVOptions,
+    aggr_rows: Rows,
+    timewarp: AVTimeStamp | None,
+    annotations: AVAnnotations,
+) -> BIAvailability:
+    logrow_limit = avoptions["logrow_limit"]
+    livestatus_limit = None if logrow_limit == 0 else len(aggr_rows) * logrow_limit + 1
+
+    timeline_containers, has_reached_logrow_limit = get_timeline_containers(
+        aggr_rows, avoptions, timewarp, livestatus_limit, annotations
+    )
+
+    spans: list[AVSpan] = []
+    for timeline_container in timeline_containers:
+        spans.extend(timeline_container.timeline)
+
+    av_rawdata = spans_by_object(spans)
+
+    return BIAvailability(timeline_containers, av_rawdata, has_reached_logrow_limit)
+
+
+def get_timeline_containers(
+    aggr_rows: Rows,
+    avoptions: AVOptions,
+    timewarp: AVTimeStamp | None,
+    livestatus_limit: int | None,
+    annotations: AVAnnotations,
+) -> tuple[list[TimelineContainer], bool]:
+    time_range: AVTimeRange = avoptions["range"][0]
+    phases_list, timeline_containers, has_reached_logrow_limit = get_bi_leaf_history(
+        aggr_rows, time_range, livestatus_limit, annotations
+    )
+    return (
+        compute_bi_timelines(timeline_containers, time_range, timewarp, phases_list),
+        has_reached_logrow_limit,
+    )
+
+
+def split_time_range(
+    start: AVTimeStamp, end: AVTimeStamp, interval: AVTimeStamp
+) -> Generator[AVTimeRange]:
+    """
+    Split a time range into smaller ranges of a given interval.
+
+    Examples:
+    >>> _start, _end = 42, 1337
+    >>> list(split_time_range(_start, _end, -((_end - _start) // -2)))
+    [(42, 690), (690, 1337)]
+    >>> list(split_time_range(_start, _end, (_end - _start) // 2))
+    [(42, 689), (689, 1336), (1336, 1337)]
+    >>> list(split_time_range(_start, _end, 250))
+    [(42, 292), (292, 542), (542, 792), (792, 1042), (1042, 1292), (1292, 1337)]
+    """
+    if interval <= 0:
+        raise ValueError("Interval must be positive")
+    while start < end:
+        yield start, min(start + interval, end)
+        start += interval
+
+
+def _bi_span_from_statehist_row(row: LivestatusRow) -> AVSpan:
+    """Turn one raw statehist row into an AVSpan.
+
+    The columns are the ones queried in get_bi_leaf_history(), prepended by the site.
+    The statehist table does not provide the remaining AVSpan fields, so they are set
+    explicitly here: they are not consumed anywhere on these rows (the BI aggregate
+    recomputation only looks at state, log_output, in_downtime and in_service_period)
+    and the timeline entries built later in create_bi_timeline_entry() compute them
+    from scratch with exactly these values.
+    """
+    site, host_name, service_description, from_time, until_time = row[:5]
+    log_output, state, in_downtime, in_service_period = row[5:]
+    return {
+        "site": SiteId(site),
+        "host_name": HostName(host_name),
+        "service_description": service_description,
+        "from": from_time,
+        "until": until_time,
+        "log_output": log_output,
+        "state": state,
+        "in_downtime": in_downtime,
+        "in_service_period": in_service_period,
+        "duration": until_time - from_time,
+        "host_down": 0,
+        "in_host_downtime": 0,
+        "in_notification_period": 1,
+        "is_flapping": 0,
+    }
+
+
+def get_bi_leaf_history(
+    aggr_rows: Rows,
+    time_range: AVTimeRange,
+    livestatus_limit: int | None,
+    annotations: AVAnnotations,
+    max_time_range: int = DEFAULT_MAX_TIME_RANGE,
+) -> tuple[AVBIPhases, list[TimelineContainer], bool]:
+    """Get state history of all hosts and services contained in the tree.
+    In order to simplify the query, we always fetch the information for all hosts of the aggregates.
+    """
+    only_sites = set()
+    hosts = set()
+    for row in aggr_rows:
+        for site, host in row["aggr_compiled_branch"].get_required_hosts():
+            only_sites.add(site)
+            hosts.add(host)
+
+    columns = [
+        "host_name",
+        "service_description",
+        "from",
+        "until",
+        "log_output",
+        "state",
+        "in_downtime",
+        "in_service_period",
+    ]
+
+    # Create a specific filter. We really only want the services and hosts
+    # of the aggregation in question. That prevents status changes
+    # irrelevant services from introducing new phases.
+    by_host: dict[HostName, set[ServiceName]] = {}
+    timeline_containers: list[TimelineContainer] = []
+    for row in aggr_rows:
+        timeline_container = TimelineContainer(row)
+
+        for _site, host, service in timeline_container.aggr_compiled_branch.required_elements:
+            this_service = service or ""
+            by_host.setdefault(host, {""}).add(this_service)
+            timeline_container.host_service_info.add((host, this_service))
+            timeline_container.host_service_info.add((host, ""))
+
+        timeline_containers.append(timeline_container)
+
+    headers = ""
+    for host, services in by_host.items():
+        headers += "Filter: host_name = %s\n" % host
+        headers += lq_logic("Filter: service_description = ", list(services), "Or")
+        headers += "And: 2\n"
+    if len(hosts) != 1:
+        headers += "Or: %d\n" % len(hosts)
+
+    data: list[LivestatusRow] = []
+    has_reached_logrow_limit = False
+
+    split_time_ranges = split_time_range(time_range[0], time_range[1], max_time_range)
+    for current_time_range in split_time_ranges:
+        fetched_rows, limit_reached = get_bi_split_history_data(
+            current_time_range, columns, only_sites, headers, livestatus_limit
+        )
+        data.extend(fetched_rows)
+        has_reached_logrow_limit = has_reached_logrow_limit or limit_reached
+
+    if not data:
+        return [], [], has_reached_logrow_limit
+
+    spans = [_bi_span_from_statehist_row(row) for row in data]
+
+    # Reclassify base data due to annotations
+    spans = reclassify_bi_rows(spans, annotations)
+    merged_rows_by_id = get_bi_merged_rows_by_id(spans)
+
+    # Now comes the tricky part: recompute the state of the aggregate
+    # for each step in the state history and construct a timeline from
+    # it. As a first step we need the start state for each of the
+    # hosts/services. They will always be the first consecute rows
+    # in the statehist table
+
+    # First partition the rows into sequences with equal start time
+    phases: dict[int, AVBIPhaseData] = {}
+    for id_, merged_rows in merged_rows_by_id.items():
+        for span in merged_rows:
+            phases.setdefault(span["from"], {})[id_] = span
+
+    # Convert phases to sorted list
+    sorted_times = sorted(phases.keys())
+    phases_list: AVBIPhases = []
+
+    for from_time in sorted_times:
+        phases_list.append((from_time, phases[from_time]))
+    return phases_list, timeline_containers, has_reached_logrow_limit
+
+
+def get_bi_merged_rows_by_id(
+    rows: list[AVSpan],
+) -> dict[tuple[HostName, ServiceName], list[AVSpan]]:
+    by_id: dict[tuple[HostName, ServiceName], list[AVSpan]] = {}
+    for row in rows:
+        id_ = (row["host_name"], row["service_description"])
+        by_id.setdefault(id_, [])
+        by_id[id_].append(row)
+
+    for id_, service_rows in by_id.items():
+        by_id[id_] = sorted(service_rows, key=lambda x: x["from"])
+
+    merged_rows_by_id: dict[tuple[HostName, ServiceName], list[AVSpan]] = {id_: [] for id_ in by_id}
+    for id_, service_rows in by_id.items():
+        for service_row in service_rows:
+            if not merged_rows_by_id[id_] or (
+                merged_rows_by_id[id_][-1]["state"] != service_row["state"]
+                or merged_rows_by_id[id_][-1]["in_downtime"] != service_row["in_downtime"]
+                or merged_rows_by_id[id_][-1]["in_service_period"]
+                != service_row["in_service_period"]
+                or merged_rows_by_id[id_][-1]["log_output"] != service_row["log_output"]
+            ):
+                merged_rows_by_id[id_].append(service_row)
+            else:
+                # "duration" is deliberately left alone: it is not consumed on these
+                # rows, see _bi_span_from_statehist_row().
+                merged_rows_by_id[id_][-1]["until"] = service_row["until"]
+    return merged_rows_by_id
+
+
+def get_bi_split_history_data(
+    time_range: AVTimeRange,
+    columns: Sequence[str],
+    only_sites: set[Any],
+    headers: str,
+    livestatus_limit: int | None,
+) -> tuple[list[LivestatusRow], bool]:
+    """Fetch statehist rows for the given time range.
+
+    Returns the fetched rows together with ``True`` if any single site reached
+    ``livestatus_limit`` for this query.
+    """
+    try:
+        # Try to fetch complete data
+        fetched_rows = query_livestatus(
+            Query(
+                QuerySpecification(
+                    table="statehist",
+                    columns=columns,
+                    headers="Filter: time >= %d\nFilter: time < %d\n" % time_range + headers,
+                )
+            ),
+            only_sites=list(only_sites),
+            limit=livestatus_limit,
+            auth_domain="read",
+        )
+    except MKLivestatusPayloadTooLargeError:
+        # If the query fails, split the time range into two and try again
+        split_time_ranges = split_time_range(
+            time_range[0],
+            time_range[1],
+            # Ceiling division in order not to split into three parts (see docstring example)
+            -((time_range[1] - time_range[0]) // -2),
+        )
+        data: list[LivestatusRow] = []
+        has_reached_logrow_limit = False
+        for current_time_range in split_time_ranges:
+            rows, limit_reached = get_bi_split_history_data(
+                current_time_range, columns, only_sites, headers, livestatus_limit
+            )
+            data.extend(rows)
+            has_reached_logrow_limit = has_reached_logrow_limit or limit_reached
+        return data, has_reached_logrow_limit
+
+    return fetched_rows, _limit_reached_for_any_site(fetched_rows, livestatus_limit)
+
+
+def _limit_reached_for_any_site(
+    rows: Sequence[LivestatusRow], livestatus_limit: int | None
+) -> bool:
+    """Return whether any single site reached the livestatus row limit.
+
+    The livestatus ``Limit:`` header is applied to each site individually (see
+    ``MultiSiteConnection``), so a site truncated its data iff its own row count
+    reaches ``livestatus_limit`` (which carries a +1 overflow margin). Comparing
+    the summed row count of all sites against the per-site limit would yield false
+    positives in multisite setups. ``query_livestatus`` prepends the site id as the
+    first column of each row.
+    """
+    if livestatus_limit is None:
+        return False
+    rows_per_site = Counter(row[0] for row in rows)
+    return any(count >= livestatus_limit for count in rows_per_site.values())
+
+
+def compute_bi_timelines(
+    timeline_containers: list[TimelineContainer],
+    time_range: AVTimeRange,
+    timewarp: AVTimeStamp | None,
+    phases_list: AVBIPhases,
+) -> list[TimelineContainer]:
+    if not timeline_containers:
+        return timeline_containers
+
+    def update_states(
+        states: AVBITimelineStates,
+        use_entries: set[tuple[HostName, ServiceName]],
+        phase_entries: AVBIPhaseData,
+    ) -> None:
+        for element in use_entries:
+            hostname, svc_desc = element
+            values = phase_entries[element]
+            key = values["site"], hostname, svc_desc
+            states[key] = (
+                values["state"],
+                values["log_output"],
+                values["in_downtime"],
+                (values["in_service_period"] != 0),
+            )
+
+    bi_manager = BIManager()
+
+    logger.debug(
+        "Computing timelines for range %(time_range)r. %(phase_count)d phases and %(timeline_container_count)d timeline containers",
+        {
+            "time_range": tuple(
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(x)) for x in time_range
+            ),
+            "phase_count": len(phases_list),
+            "timeline_container_count": len(timeline_containers),
+        },
+    )
+    computed_aggregations = 0
+    for from_time, phase_hst_svc in phases_list:
+        phase_keys = set(phase_hst_svc.keys())
+
+        for timeline_container in timeline_containers:
+            changed_elements = timeline_container.host_service_info.intersection(phase_keys)
+            if not changed_elements:
+                continue
+
+            update_states(timeline_container.states, changed_elements, phase_hst_svc)
+            result_bundle = _compute_node_result_bundle(timeline_container, bi_manager)
+            computed_aggregations += 1
+            next_node_compute_result = result_bundle.actual_result
+
+            if timeline_container.node_compute_result is not None:
+                assert timeline_container.tree_time is not None
+                timeline_container.timeline.append(
+                    create_bi_timeline_entry(
+                        timeline_container.aggr_tree,
+                        timeline_container.aggr_group,
+                        timeline_container.tree_time,
+                        from_time,
+                        timeline_container.node_compute_result,
+                    )
+                )
+
+            timeline_container.node_compute_result = next_node_compute_result
+            timeline_container.tree_time = from_time
+            if timewarp == timeline_container.tree_time:
+                timeline_container.timewarp_state = _get_timewarp_state(
+                    result_bundle, timeline_container
+                )
+
+    # Create a final timeline entry to the end of the query interval
+    for timeline_container in list(timeline_containers):
+        if timeline_container.node_compute_result is None:
+            # This can only happen if the livestatus row limit was reached
+            # The data is incomplete or entirely missing
+            timeline_containers.remove(timeline_container)
+            continue
+
+        assert timeline_container.tree_time is not None
+        timeline_container.timeline.append(
+            create_bi_timeline_entry(
+                timeline_container.aggr_tree,
+                timeline_container.aggr_group,
+                timeline_container.tree_time,
+                time_range[1],
+                timeline_container.node_compute_result,
+            )
+        )
+
+    logger.debug(
+        "Timeline generation finished. Computed %(computed_aggregations)d aggregations",
+        {"computed_aggregations": computed_aggregations},
+    )
+    return timeline_containers
+
+
+def _get_timewarp_state(
+    node_compute_result_bundle: NodeResultBundle, timeline_container: TimelineContainer
+) -> BITreeState:
+    if node_compute_result_bundle.instance is None:
+        # This timeline container was unable to find any host/services for the aggregation
+        # Since this timewarp info is rendered through the legacy bi tree renderer,
+        # which requires the legacy data format, we need to fake legacy data
+        # state, assumed_state, node, _subtrees = aggr_treestate
+        return (
+            {
+                "state": -1,
+                "in_downtime": False,
+                "in_service_period": True,
+                "output": _("Not yet monitored"),
+                "acknowledged": False,
+            },
+            None,
+            {
+                "title": _("Unknown aggregation"),
+                "reqhosts": [],
+            },
+            [],  # no subtrees available
+        )
+    return timeline_container.aggr_compiled_aggregation.convert_result_to_legacy_format(
+        node_compute_result_bundle
+    )["aggr_treestate"]
+
+
+def create_bi_timeline_entry(
+    tree: CompiledAggrTree,
+    aggr_group: BIAggregationGroupTitle,
+    from_time: AVTimeStamp,
+    until_time: AVTimeStamp,
+    node_compute_result: NodeComputeResult,
+) -> AVSpan:
+    return {
+        "state": node_compute_result.state,
+        "log_output": node_compute_result.output,
+        "from": int(from_time),
+        "until": int(until_time),
+        "site": omd_site(),
+        "host_name": HostName(aggr_group),
+        "service_description": tree["title"],
+        "in_notification_period": 1,
+        "in_service_period": int(node_compute_result.in_service_period),
+        "in_downtime": int(node_compute_result.in_downtime),
+        "in_host_downtime": 0,
+        "host_down": 0,
+        "is_flapping": 0,
+        "duration": int(until_time - from_time),
+    }
+
+
+def _compute_node_result_bundle(
+    timeline_container: TimelineContainer, bi_manager: BIManager
+) -> NodeResultBundle:
+    # Convert our status format into that needed by BI
+    status = timeline_container.states
+    services_by_host: dict[BIHostSpec, dict[str, BIServiceWithFullState]] = {}
+    hosts: dict[BIHostSpec, AVBITimelineState] = {}
+    for site_host_service, state_output in status.items():
+        site_host = BIHostSpec(site_id=site_host_service[0], host_name=site_host_service[1])
+        service = site_host_service[2]
+        state: int | None = state_output[0]
+
+        # Create an entry for hosts that are not explicitly referenced in the timeline container.
+        hosts.setdefault(site_host, (0, "", 0, False))
+        if service:
+            if state == -1:
+                # Ignore pending services
+                continue
+            services_by_host.setdefault(site_host, {})
+            services_by_host[site_host][service] = BIServiceWithFullState(
+                state=state,
+                has_been_checked=True,
+                plugin_output=state_output[1],
+                hard_state=state,
+                current_attempt=1,
+                max_check_attempts=1,
+                scheduled_downtime_depth=state_output[2],
+                acknowledged=False,
+                in_service_period=state_output[3],
+            )
+        else:
+            hosts[site_host] = state_output
+
+    bi_manager.status_fetcher.states = _compute_status_info(hosts, services_by_host)
+    compiled_aggregation = timeline_container.aggr_compiled_aggregation
+    branch = timeline_container.aggr_compiled_branch
+    results = compiled_aggregation.compute_branches([branch], bi_manager.status_fetcher)
+
+    if not results:
+        # The aggregation did not find any hosts or services. Return "Not yet monitored"
+        return NodeResultBundle(
+            NodeComputeResult(
+                state=BIState.PENDING,
+                in_downtime=False,
+                acknowledged=False,
+                output=_("Not yet monitored"),
+                in_service_period=True,
+                state_messages={},
+                custom_infos={},
+            ),
+            None,
+            [],
+            None,
+        )
+
+    return results[0]
+
+
+def _compute_status_info(
+    hosts: dict[BIHostSpec, AVBITimelineState],
+    services_by_host: dict[BIHostSpec, dict[str, BIServiceWithFullState]],
+) -> BIStatusInfo:
+    status_info: BIStatusInfo = {}
+
+    for site_host, state_output in hosts.items():
+        state: int | None = state_output[0]
+
+        if state == -1:
+            state = None  # Means: consider this object as missing
+
+        status_info[site_host] = BIHostStatusInfoRow(
+            state=state,
+            has_been_checked=True,
+            hard_state=state,
+            plugin_output=state_output[1],
+            scheduled_downtime_depth=state_output[2],
+            in_service_period=state_output[3],
+            acknowledged=False,
+            services_with_fullstate=services_by_host.get(site_host, {}),
+            remaining_row_keys={},
+        )
+    return status_info
+
+
+def reclassify_bi_rows(rows: list[AVSpan], annotations: AVAnnotations) -> list[AVSpan]:
+    if not annotations:
+        return rows
+
+    new_rows: list[AVSpan] = []
+    for row in rows:
+        site = row["site"]
+        host_name = row["host_name"]
+        service_description = row["service_description"]
+        anno_key = (site, host_name, service_description or None)
+        if anno_key in annotations:
+            new_rows += reclassify_history_by_annotations([row], annotations[anno_key])
+        else:
+            new_rows.append(row)
+    return new_rows

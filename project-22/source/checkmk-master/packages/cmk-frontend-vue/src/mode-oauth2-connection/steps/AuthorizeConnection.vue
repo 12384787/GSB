@@ -1,0 +1,146 @@
+<!--
+Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+
+<script setup lang="ts">
+import type { Oauth2Urls } from 'cmk-shared-typing/typescript/mode_oauth2_connection'
+import CmkButton from 'cmk-ui-library/components/CmkButton'
+import CmkCopy from 'cmk-ui-library/components/CmkCopy.vue'
+import CmkIcon from 'cmk-ui-library/components/CmkIcon'
+import CmkPaste from 'cmk-ui-library/components/CmkPaste.vue'
+import type { CmkWizardStepProps } from 'cmk-ui-library/components/CmkWizard'
+import { CmkWizardButton, CmkWizardStep } from 'cmk-ui-library/components/CmkWizard'
+import CmkHeading from 'cmk-ui-library/components/typography/CmkHeading.vue'
+import CmkInput from 'cmk-ui-library/components/user-input/CmkInput.vue'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import { randomId } from 'cmk-ui-library/lib/randomId.ts'
+import { computed } from 'vue'
+
+import type { ValidationMessages } from '@/form'
+
+import type {
+  OAuth2FormData,
+  Oauth2ConnectionApi
+} from '@/mode-oauth2-connection/lib/service/oauth2-connection-api.ts'
+import { buildAuthorizationUrl } from '@/mode-oauth2-connection/steps/utils.ts'
+
+const { _t } = usei18n()
+
+const props = defineProps<
+  CmkWizardStepProps & {
+    urls: Oauth2Urls
+    authorityMapping: Record<string, string>
+    connectorType: 'microsoft_entra_id'
+    ident: string
+    api: Oauth2ConnectionApi
+  }
+>()
+
+const canProceed = computed(() => {
+  if (!model.value.data.override_site) {
+    return true
+  }
+  return model.value.overrideCode.trim().length > 0
+})
+
+async function validateCanProceed(): Promise<boolean> {
+  return canProceed.value
+}
+const refId = randomId()
+
+const model = defineModel<{
+  data: OAuth2FormData
+  validation: ValidationMessages
+  overrideCode: string
+}>({
+  required: true
+})
+
+const authorizationUrl = computed(() =>
+  buildAuthorizationUrl(
+    props.urls,
+    props.connectorType,
+    props.authorityMapping,
+    model.value.data,
+    refId
+  )
+)
+</script>
+
+<template>
+  <CmkWizardStep :index="index" :is-completed="isCompleted">
+    <template #header>
+      <CmkHeading type="h2"> {{ _t('Authorize the connection') }}</CmkHeading>
+    </template>
+
+    <template #content>
+      <template v-if="!model.data.override_site">
+        {{
+          _t(
+            'A new tab will be opened and you will need to log in to Microsoft Azure to authorize the application. The process has to be completed within 5 minutes.'
+          )
+        }}
+      </template>
+      <template v-else>
+        <p>
+          {{
+            _t(
+              `Since you have configured a distributed site for the redirect, the authorization process cannot be started automatically.
+              Click "Copy authorization URL to clipboard" and open the copied URL into a browser on the remote site to start the authorization`
+            )
+          }}
+        </p>
+        <CmkCopy :text="authorizationUrl">
+          <CmkButton>
+            <CmkIcon name="copied" variant="inline" size="medium" />
+            {{ _t('Copy authorization URL to clipboard') }}
+          </CmkButton>
+        </CmkCopy>
+        <div class="mode-oauth2-connection-authorize-connection">
+          <p>
+            {{
+              _t(
+                'Authorization code: To be copied from the redirect authorization URL page by clicking "Copy code to clipboard" button'
+              )
+            }}
+          </p>
+          <CmkPaste input-first>
+            <template #input>
+              <CmkInput
+                v-model="model.overrideCode"
+                field-size="fill"
+                :placeholder="_t('Paste the code from the redirect page here')"
+              />
+            </template>
+            <template #trigger>
+              <CmkButton>
+                <CmkIcon name="clipboard" variant="inline" size="medium" />
+                {{ _t('Paste') }}
+              </CmkButton>
+            </template>
+          </CmkPaste>
+        </div>
+      </template>
+    </template>
+
+    <template #actions>
+      <CmkWizardButton
+        type="next"
+        :override-label="_t('Start authorization')"
+        :validation-cb="validateCanProceed"
+      />
+      <CmkWizardButton type="previous" />
+    </template>
+  </CmkWizardStep>
+</template>
+
+<style scoped>
+.mode-oauth2-connection-authorize-connection {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dimension-3);
+  margin-top: var(--spacing);
+}
+</style>

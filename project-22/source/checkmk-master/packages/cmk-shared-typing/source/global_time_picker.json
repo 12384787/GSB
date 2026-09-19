@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GlobalTimePickerProps",
+  "type": "object",
+  "properties": {
+    "custom_time_ranges": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/custom_graph_time_range" }
+    },
+    "default_time_range": { "type": "number" },
+    "server_time_zone": { "type": "string" },
+    "first_day_of_week": {
+      "anyOf": [{ "$ref": "#/$defs/first_day_of_week" }, { "type": "null" }]
+    },
+    "refresh": { "$ref": "#/$defs/global_time_picker_refresh" }
+  },
+  "required": [
+    "custom_time_ranges",
+    "default_time_range",
+    "server_time_zone",
+    "first_day_of_week",
+    "refresh"
+  ],
+  "$defs": {
+    "global_time_picker_refresh": {
+      "title": "GlobalTimePickerRefresh",
+      "type": "object",
+      "properties": {
+        "interval_seconds": { "type": ["number", "null"] },
+        "starts_live": { "type": "boolean" },
+        "reloads_page_content": { "type": "boolean" }
+      },
+      "required": ["interval_seconds", "starts_live", "reloads_page_content"]
+    },
+    "first_day_of_week": {
+      "title": "FirstDayOfWeek",
+      "type": "string",
+      "enum": ["saturday", "sunday", "monday"]
+    },
+    "custom_graph_time_range": {
+      "title": "CustomGraphTimeRange",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "total_seconds": { "type": "number" }
+      },
+      "required": ["title", "total_seconds"]
+    }
+  }
+}

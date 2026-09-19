@@ -1,0 +1,12 @@
+diff --git a/uv/private/create_venv.sh b/uv/private/create_venv.sh
+index 9d2990b..3fcf296 100644
+--- a/uv/private/create_venv.sh
++++ b/uv/private/create_venv.sh
+@@ -34,6 +34,7 @@ if [[ "$target" != /* ]]; then
+   target="$BUILD_WORKSPACE_DIRECTORY/$target"
+ fi
+ 
++rm -rf "$target"
+ "$UV" venv "$target" --python "$PYTHON"
+ source "$target/bin/activate"
+ "$UV" pip install -r "$REQUIREMENTS_TXT" {{args}}

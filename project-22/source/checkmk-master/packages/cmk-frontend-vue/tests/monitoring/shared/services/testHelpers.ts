@@ -1,0 +1,25 @@
+/**
+ * Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+import type { KeyShortcutService } from 'cmk-ui-library/lib/keyShortcuts'
+import { vi } from 'vitest'
+
+import type { PagedResponse } from '@/monitoring/shared/services/MonitoringService'
+
+export function makeResponse<T>(
+  items: T[],
+  matched: number,
+  total: number,
+  limit = 1000
+): PagedResponse<T> {
+  return { items, meta: { limit, matched, total } }
+}
+
+export function makeKeyShortcutService(): KeyShortcutService {
+  return {
+    on: vi.fn(() => 'shortcut-id'),
+    remove: vi.fn()
+  } as unknown as KeyShortcutService
+}

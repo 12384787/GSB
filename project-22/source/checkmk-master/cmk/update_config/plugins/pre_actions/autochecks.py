@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+# Copyright (C) 2023 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+import itertools
+from logging import Logger
+from typing import override
+
+from cmk.ccc.hostaddress import HostName
+from cmk.checkengine.plugins import CheckPluginName
+from cmk.gui.config import active_config
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.watolib.hosts_and_folders import make_folder_tree
+from cmk.update_config.plugins.pre_actions.utils import (
+    AUTOCHECK_REWRITE_PREACTION_SORT_INDEX,
+    ConflictMode,
+    continue_per_users_choice,
+)
+from cmk.update_config.registry import pre_update_action_registry, PreUpdateAction
+from cmk.utils.log import VERBOSE
+
+from ...lib import ExpiryVersion
+from ..lib.autochecks import rewrite_yielding_errors
+
+
+def _continue_per_users_choice(conflict_mode: ConflictMode, msg: str) -> bool:
+    match conflict_mode:
+        case ConflictMode.FORCE:
+            return True
+        case ConflictMode.ABORT:
+            return False
+        case ConflictMode.ASK:
+            return continue_per_users_choice(msg).is_not_abort()
+
+
+class PreUpdateAgentBasedPlugins(PreUpdateAction):
+    """Load all agent based plugins before the real update happens"""
+
+    @override
+    def __call__(self, logger: Logger, conflict_mode: ConflictMode) -> None:
+        plugin_errors: dict[CheckPluginName, dict[HostName, list[str]]] = {}
+
+        for error in rewrite_yielding_errors(make_folder_tree(active_config), write=False):
+            if error.plugin is None:
+                logger.error(
+                    "%(host_name)s: %(message)s.",
+                    {"host_name": error.host_name, "message": error.message},
+                )
+                if _continue_per_users_choice(
+                    conflict_mode,
+                    " You can abort and fix this manually."
+                    " If you continue, the affected service(s) will be lost, but can be rediscovered."
+                    " Abort the update process? [A/c] \n",
+                ):
+                    continue
+                raise MKUserError(None, "Failed to migrate autochecks")
+
+            plugin_errors.setdefault(error.plugin, {}).setdefault(error.host_name, []).append(
+                error.message
+            )
+
+        # show one error per plugin to decrease the number of errors user has to handle
+        for plugin, hosts in plugin_errors.items():
+            logger.log(VERBOSE, "%(plugin)s: Failed to migrate autochecks", {"plugin": plugin})
+            for host, messages in hosts.items():
+                logger.log(
+                    VERBOSE,
+                    "  %(service_count)s service(s) on %(host)s affected",
+                    {"service_count": len(messages), "host": host},
+                )
+
+            all_messages = list(itertools.chain(*hosts.values()))
+
+            logger.error(
+                "%(plugin)s: %(message)s. ", {"plugin": plugin, "message": all_messages[0]}
+            )
+            if _continue_per_users_choice(
+                conflict_mode,
+                "You can abort and fix this manually. "
+                f"If you continue, {len(all_messages)} service(s) on {len(hosts)} host(s) will be lost, but can be rediscovered."
+                " Abort the update process? [A/c] \n",
+            ):
+                continue
+            raise MKUserError(None, "Failed to migrate autochecks")
+
+
+pre_update_action_registry.register(
+    PreUpdateAgentBasedPlugins(
+        name="autochecks",
+        title="Autochecks",
+        sort_index=AUTOCHECK_REWRITE_PREACTION_SORT_INDEX,
+        expiry_version=ExpiryVersion.NEVER,
+    )
+)

@@ -1,0 +1,30 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+
+py_library(
+    name = "discovery",
+    srcs = glob(["**/*.py"]),
+    imports = ["../../.."],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cmk/utils",
+        "//packages/cmk-ccc:cleanup",
+        "//packages/cmk-ccc:debug",
+        "//packages/cmk-ccc:exceptions",
+        "//packages/cmk-ccc:hostaddress",
+        "//packages/cmk-ccc:regex",
+        "//packages/cmk-ccc:resulttype",
+        "//packages/cmk-ccc:store",
+        "//packages/cmk-ccc:tty",
+        "//packages/cmk-check-engine:checker-plugin",
+        "//packages/cmk-check-engine:fetcher-protocol",
+        "//packages/cmk-check-engine:helper-interface",
+        "//packages/cmk-check-engine:lib",
+        "//packages/cmk-check-engine:section-parser",
+        "//packages/cmk-check-engine:snmplib",
+        "//packages/cmk-check-engine:specs",
+        "//packages/cmk-check-engine/cmk/checkengine/parser",
+        "//packages/cmk-check-engine/cmk/checkengine/plugins",
+        "//packages/cmk-plugin-apis:agent_based",
+        "//packages/cmk-trace",
+    ],
+)

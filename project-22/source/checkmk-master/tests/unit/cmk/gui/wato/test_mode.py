@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+from collections.abc import Collection, Iterable
+from typing import override
+
+import pytest
+
+from cmk.ccc.version import Edition
+from cmk.gui.breadcrumb import BreadcrumbItem
+from cmk.gui.config import Config
+from cmk.gui.http import request
+from cmk.gui.pages import PageContext
+from cmk.gui.wato import MainModuleTopicHosts
+from cmk.gui.watolib.main_menu import ABCMainModule, MainModuleRegistry, MainModuleTopic
+from cmk.gui.watolib.mode import _base, WatoMode
+from cmk.web.utils.icons import DynamicIcon, DynamicIconName
+from cmk.web.utils.permission_verification import PermissionName
+
+module_registry = MainModuleRegistry()
+
+
+class SomeWatoMode(WatoMode):
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return []
+
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "some_wato_mode"
+
+    @override
+    def page(self, config: Config) -> None:
+        pass
+
+
+@module_registry.register
+class SomeMainModule(ABCMainModule):
+    @property
+    @override
+    def mode_or_url(self) -> str:
+        return "some_wato_mode"
+
+    @property
+    @override
+    def topic(self) -> MainModuleTopic:
+        return MainModuleTopicHosts
+
+    @property
+    @override
+    def title(self) -> str:
+        return "Main Module"
+
+    @property
+    @override
+    def icon(self) -> DynamicIcon:
+        return DynamicIconName("icon")
+
+    @property
+    @override
+    def permission(self) -> None | str:
+        return "some_permission"
+
+    @property
+    @override
+    def description(self) -> str:
+        return "Description"
+
+    @property
+    @override
+    def sort_index(self) -> int:
+        return 30
+
+    @property
+    @override
+    def is_show_more(self) -> bool:
+        return False
+
+
+@pytest.fixture(name="main_module_registry", scope="function", autouse=True)  # ruff: ignore[pytest-fixture-autouse]
+def fixture_main_module_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_base, "main_module_registry", module_registry)
+
+
+class TestWatoMode:
+    @pytest.mark.usefixtures("request_context", "main_module_registry")
+    def test_breadcrumb_without_additions(self, test_edition: Edition) -> None:
+        assert list(
+            SomeWatoMode(test_edition, PageContext(config=Config(), request=request)).breadcrumb()
+        ) == [
+            BreadcrumbItem(title="Hosts", url=None, id="hosts"),
+            BreadcrumbItem(
+                title="(Untitled module)",
+                url="wato.py?mode=some_wato_mode",
+                id="some_wato_mode",
+            ),
+        ]
+
+    @pytest.mark.usefixtures("request_context", "main_module_registry")
+    def test_breadcrumb_with_additions(
+        self, monkeypatch: pytest.MonkeyPatch, test_edition: Edition
+    ) -> None:
+        def additional_breadcrumb_items() -> Iterable[BreadcrumbItem]:
+            yield BreadcrumbItem(
+                title="In between 1",
+                url=None,
+                id=None,
+            )
+            yield BreadcrumbItem(
+                title="In between 2",
+                url="123",
+                id=None,
+            )
+
+        monkeypatch.setattr(
+            SomeMainModule,
+            "additional_breadcrumb_items",
+            additional_breadcrumb_items,
+        )
+        assert list(
+            SomeWatoMode(test_edition, PageContext(config=Config(), request=request)).breadcrumb()
+        ) == [
+            BreadcrumbItem(title="Hosts", url=None, id="hosts"),
+            BreadcrumbItem(title="In between 1", url=None, id=None),
+            BreadcrumbItem(title="In between 2", url="123", id=None),
+            BreadcrumbItem(
+                title="(Untitled module)",
+                url="wato.py?mode=some_wato_mode",
+                id="some_wato_mode",
+            ),
+        ]

@@ -1,0 +1,154 @@
+#!/bin/bash
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+PIDFILE="$OMD_ROOT/tmp/run/agent-receiver.pid"
+PID=$(cat "$PIDFILE" 2>/dev/null)
+KEY_AND_CERT_FILE="${OMD_ROOT}/etc/ssl/sites/${OMD_SITE}.pem"
+CERT_STORE="${OMD_ROOT}/etc/ssl/agent_cert_store.pem"
+
+# shellcheck disable=SC1090,SC1091
+. "$OMD_ROOT/etc/omd/site.conf"
+if [ "$CONFIG_AGENT_RECEIVER" != on ]; then
+    exit 5
+fi
+
+process_is_running() {
+    [ -e "$PIDFILE" ] && kill -0 "$PID" 2>/dev/null
+}
+
+await_process_stop() {
+    max=$(("${1}" * 10)) # tenths of a second
+    for N in $(seq "${max}"); do
+        process_is_running || return 0
+        [ $((N % 10)) -eq 0 ] && printf "."
+        sleep 0.1
+    done
+    return 1
+}
+
+force_kill() {
+    printf 'sending SIGKILL.'
+    kill -9 "${PID}"
+}
+
+exit_successfully() {
+    printf "%s\n" "${1}"
+    exit 0
+}
+
+exit_failure() {
+    printf "%s\n" "${1}"
+    exit 1
+}
+
+if ping -c1 ::1 &>/dev/null; then
+    ANY_ADDRESS="[::]"
+else
+    ANY_ADDRESS="0.0.0.0"
+fi
+
+case "$1" in
+
+    start)
+        echo -en "Starting agent-receiver..."
+        if process_is_running; then
+            exit_successfully 'already running.'
+        fi
+
+        rm -f "${CERT_STORE}"
+        touch "${CERT_STORE}"
+        chmod 660 "${CERT_STORE}"
+        for pemfile in "${OMD_ROOT}"/etc/ssl/agents/*.pem; do
+            openssl x509 -in "${pemfile}" >>"${CERT_STORE}"
+        done
+        for pemfile in "${OMD_ROOT}"/etc/ssl/relays/*.pem; do
+            openssl x509 -in "${pemfile}" >>"${CERT_STORE}"
+        done
+        # Add site CA to allow internal site mTLS authentication (e.g., for activate-config endpoint)
+        # The site certificate is signed by this CA, so we need to trust it
+        if [ -f "${OMD_ROOT}/etc/ssl/ca.pem" ]; then
+            openssl x509 -in "${OMD_ROOT}/etc/ssl/ca.pem" >>"${CERT_STORE}"
+        else
+            exit_failure "CA file ${OMD_ROOT}/etc/ssl/ca.pem not found, cannot start agent-receiver"
+        fi
+
+        # If you change this please also evaluate to update the receiver runner components
+        if gunicorn -D -p "$PIDFILE" \
+            -c "$OMD_ROOT/etc/agent-receiver/gunicorn.conf.py" \
+            --ciphers "ECDHE+AESGCM:CHACHA20:ECDHE+AES256:!aNULL:!eNULL:!MD5:!RC4:!3DES:!SHA1:!CBC" \
+            --keyfile "$KEY_AND_CERT_FILE" \
+            --certfile "$KEY_AND_CERT_FILE" \
+            --ca-certs "${CERT_STORE}" \
+            --cert-reqs 1 \
+            -b "${ANY_ADDRESS}:${CONFIG_AGENT_RECEIVER_PORT}" \
+            -k cmk.agent_receiver.worker.ClientCertWorker 'cmk.agent_receiver.main:main_app()'; then
+            exit_successfully 'OK'
+        fi
+        exit_failure 'failed'
+        ;;
+
+    stop)
+        echo -n "Stopping agent-receiver..."
+
+        if [ -z "$PID" ]; then
+            exit_successfully 'not running.'
+        fi
+
+        if ! kill -0 "$PID" >/dev/null 2>&1; then
+            rm "$PIDFILE"
+            exit_successfully 'not running (PID file orphaned)'
+        fi
+
+        echo -n "killing $PID..."
+        if ! kill "$PID" 2>/dev/null; then
+            rm "$PIDFILE"
+            exit_successfully 'OK'
+        fi
+
+        # Signal could be sent
+
+        # Patiently wait for the process to stop
+        if await_process_stop 60; then
+            exit_successfully 'OK'
+        fi
+
+        # Insist on killing the process
+        force_kill
+        if await_process_stop 10; then
+            exit_successfully 'OK'
+        fi
+        exit_failure 'failed'
+        ;;
+
+    restart | reload)
+        $0 stop
+        $0 start
+        ;;
+
+    logrotate)
+        echo -n 'Rotating logs of agent-receiver...'
+        if [ -z "$PID" ]; then
+            exit_failure 'not running.'
+        else
+            echo "killing $PID with SIGUSR1..."
+            kill -USR1 "$PID"
+        fi
+        ;;
+
+    status)
+        echo -n 'Checking status of agent-receiver...'
+        if [ -z "$PID" ]; then
+            exit_failure 'not running (PID file missing)'
+        fi
+        if ! kill -0 "$PID"; then
+            exit_failure 'not running (PID file orphaned)'
+        fi
+        exit_successfully 'running'
+        ;;
+    *)
+        exit_failure "Usage: ${0} {start|stop|restart|reload|status}"
+        ;;
+
+esac

@@ -1,0 +1,33 @@
+Title: Add all custom variables of host, service and contact to notification
+Level: 2
+Edition: cee
+Component: cmc
+Version: 1.2.5i1
+Date: 1391091862
+Class: feature
+
+The CMC now automatically adds all custom variables of hosts, service and
+contacts to the notification context. The variable name is prefixed with
+the word <tt>HOST</tt>, <tt>SERVICE</tt> or `CUSTOM` and - as its
+variable name custom - converted to upper case. So a host variable with
+the name `_foobar` will be available as `HOST_FOOBAR` in the
+notification context. The names will be prefixed with `NOTIFY_` and put
+into the environment of the notification plugin. So at the end the variable
+will be available as `NOTIFY_HOST_FOOBAR`, e.g. in a shell script:
+
+`mynotify.sh`
+```
+echo "Foobar: $NOTIFY_HOST_FOOBAR"
+```
+
+H2:Notes
+
+
+* In the configuration files in <tt>main.mk</tt> or below <tt>conf.d</tt>
+  the variables can be set via `extra_host_conf` or `extra_service_conf`.
+  You need to have the variable names begin with an underscore. So a variable name of <tt>foobar</tt>
+  is not allowed. You have to write either `_foobar` or `_FOOBAR`.
+* When you add contact custom variables via WATO (button <i>Custom Attributes</i>
+  in the users management) the underscore will <i>automatically</i> be added.
+* when using Nagios as monitoring core you have to adapt `check_mk_templates.cfg`
+  whenever you add a new custom variable.

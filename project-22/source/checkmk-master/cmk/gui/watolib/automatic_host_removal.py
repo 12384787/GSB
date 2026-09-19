@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+# Copyright (C) 2022 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+import itertools
+import json
+import time
+from collections.abc import Collection, Iterator, Mapping, Sequence
+from logging import FileHandler
+from typing import Literal, NamedTuple, override, TypedDict
+
+from redis import ConnectionError as RedisConnectionError
+
+import cmk.gui.log
+from cmk.ccc.hostaddress import HostName
+from cmk.ccc.log import CMKFormatter
+from cmk.ccc.site import omd_site, SiteId
+from cmk.gui.config import Config
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.http import Request
+from cmk.gui.i18n import _
+from cmk.gui.logged_in import LoggedInSuperUser
+from cmk.gui.session_context import SuperUserContext
+from cmk.gui.site_config import (
+    all_activation_sites,
+    is_distributed_setup_remote_site,
+    sites_ready_for_remote_automation,
+)
+from cmk.gui.utils.roles import UserPermissionSerializableConfig
+from cmk.gui.watolib.activate_changes import ActivateChangesManager, STATE_SUCCESS
+from cmk.gui.watolib.audit_log import make_audit_log_change_hook
+from cmk.gui.watolib.automation_commands import AutomationCommand
+from cmk.gui.watolib.automations import (
+    do_remote_automation,
+    make_automation_config,
+    MKAutomationException,
+)
+from cmk.gui.watolib.check_mk_automations import analyze_host_rule_matches, delete_hosts
+from cmk.gui.watolib.hosts_and_folders import (
+    Folder,
+    FolderTree,
+    Host,
+    make_folder_tree,
+)
+from cmk.gui.watolib.pending_changes import (
+    index_update_change_hook,
+    PendingChanges,
+    PendingChangesStore,
+)
+from cmk.gui.watolib.rulesets import SingleRulesetRecursively, UseHostFolder
+from cmk.livestatus_client import LocalConnection, MKLivestatusSocketError, SiteConfigurations
+from cmk.ruleset_matcher.matcher import RuleSpec
+from cmk.utils.automation_config import LocalAutomationConfig, RemoteAutomationConfig
+from cmk.utils.paths import log_dir
+
+_LOGGER = cmk.gui.log.logger.getChild("automatic_host_removal")
+_LOGGER_BACKGROUND_JOB = _LOGGER.getChild("background_job")
+
+
+def execute_host_removal_job(config: Config) -> None:
+    if is_distributed_setup_remote_site(config.sites):
+        return
+
+    tree = make_folder_tree(config)
+    if not _load_automatic_host_removal_ruleset(tree):
+        _LOGGER.debug("Automatic host removal not configured")
+        return
+
+    _init_logging()
+
+    _LOGGER_BACKGROUND_JOB.debug("Starting host removal background job")
+
+    def _folder_of_host(h: Host) -> Folder:
+        return h.folder()
+
+    try:
+        _LOGGER.info("Starting host removal background job")
+
+        if not (
+            hosts_to_be_removed := {
+                site_id: hosts
+                for site_id, hosts in _hosts_to_be_removed(
+                    tree=tree,
+                    automation_configs={
+                        site_id: make_automation_config(
+                            config.sites[site_id],
+                        )
+                        for site_id in [
+                            omd_site(),
+                            *sites_ready_for_remote_automation(config.sites),
+                        ]
+                    },
+                    debug=config.debug,
+                )
+                if hosts
+            }
+        ):
+            _LOGGER_BACKGROUND_JOB.debug("Found no hosts to be removed, exiting")
+            _LOGGER.info("Found no hosts to be removed, exiting")
+            return
+
+        # Host removal runs unattended as a background job; act as the superuser explicitly
+        # instead of swapping the request-global session user via SuperUserContext.
+        acting_user = LoggedInSuperUser()
+        activation_site_configs = all_activation_sites(config.sites)
+        for folder, hosts_in_folder in itertools.groupby(
+            itertools.chain.from_iterable(hosts_to_be_removed.values()), _folder_of_host
+        ):
+            hostnames = [host.name() for host in hosts_in_folder]
+            _LOGGER_BACKGROUND_JOB.debug(
+                "Removing %(host_count)d host(s) from folder %(folder)s",
+                {"host_count": len(hostnames), "folder": folder.title()},
+            )
+            _LOGGER.info(
+                "Removing %(host_count)s hosts from folder %(folder)s",
+                {"host_count": len(hostnames), "folder": folder.title()},
+            )
+            folder.delete_hosts(
+                hostnames,
+                automation=delete_hosts,
+                pprint_value=config.wato_pprint_config,
+                debug=config.debug,
+                pending_changes=PendingChanges(
+                    activation_sites=activation_site_configs,
+                    local_site=omd_site(),
+                    acting_user=acting_user.id,
+                    store=PendingChangesStore(),
+                    hooks=(
+                        make_audit_log_change_hook(use_git=config.wato_use_git),
+                        index_update_change_hook,
+                    ),
+                ),
+                acting_user=acting_user,
+            )
+
+        _LOGGER.info("Hosts removed, starting activation of changes")
+        _activate_changes(
+            tree,
+            config.sites,
+            UserPermissionSerializableConfig.from_global_config(config),
+            hosts_to_be_removed,
+            max_snapshots=config.wato_max_snapshots,
+            use_git=config.wato_use_git,
+            debug=config.debug,
+        )
+
+        _LOGGER.info("Host removal background job finished")
+    except RedisConnectionError as e:
+        # This can happen when Redis or the whole site is stopped while the background job is
+        # running. Report an error in the background job result but don't create a crash report.
+        _LOGGER.warning(_("A connection error occurred: %(error)s"), {"error": e})
+
+
+def _init_logging() -> None:
+    handler = FileHandler(log_file := log_dir / "automatic-host-removal.log", encoding="utf-8")
+    _LOGGER.info("Logging host removal to %(log_file)s", {"log_file": log_file})
+    handler.setFormatter(CMKFormatter(with_process=True))
+    del _LOGGER.handlers[:]  # Remove all previously existing handlers
+    _LOGGER.addHandler(handler)
+    _LOGGER.propagate = False
+
+
+def _hosts_to_be_removed(
+    *,
+    tree: FolderTree,
+    automation_configs: Mapping[SiteId, LocalAutomationConfig | RemoteAutomationConfig],
+    debug: bool,
+) -> list[tuple[SiteId, list[Host]]]:
+    _LOGGER_BACKGROUND_JOB.info("Gathering hosts to be removed")
+    return [
+        (site_id, _hosts_to_be_removed_for_site(tree, site_id, automation_config, debug=debug))
+        for site_id, automation_config in automation_configs.items()
+    ]
+
+
+def _hosts_to_be_removed_for_site(
+    tree: FolderTree,
+    site_id: SiteId,
+    automation_config: LocalAutomationConfig | RemoteAutomationConfig,
+    *,
+    debug: bool,
+) -> list[Host]:
+    if isinstance(automation_config, LocalAutomationConfig):
+        try:
+            # evaluate the generator here to potentially catch the exception below
+            hostnames = list(_hosts_to_be_removed_local(tree, debug=debug))
+        # can happen if the Nagios core is currently restarting during the activation of changes
+        except MKLivestatusSocketError:
+            _LOGGER.info(
+                "Skipping local site %(site_id)s, since livestatus is not available",
+                {"site_id": site_id},
+                exc_info=True,
+            )
+            return []
+    else:
+        try:
+            hostnames_serialized = str(
+                do_remote_automation(
+                    automation_config,
+                    "hosts-for-auto-removal",
+                    [],
+                    debug=debug,
+                )
+            )
+        except (MKUserError, MKAutomationException) as e:
+            _LOGGER.info(
+                "Skipping remote site %(site_id)s, might be down or not logged in (%(error)s)",
+                {"site_id": site_id, "error": e},
+            )
+            return []
+        hostnames = json.loads(hostnames_serialized)
+
+    return [tree.load_host(hostname) for hostname in hostnames]
+
+
+def _hosts_to_be_removed_local(tree: FolderTree, *, debug: bool) -> Iterator[HostName]:
+    if not (automatic_host_removal_ruleset := _load_automatic_host_removal_ruleset(tree)):
+        _LOGGER.debug("No cleanup rule configured: Terminating.")
+        return  # small 'optimization'
+    now = time.time()
+
+    for hostname, check_mk_service_crit_since in _livestatus_query_local_candidates():
+        _LOGGER.debug(
+            "Found '%(hostname)s' to be CRIT since %(crit_since)0.2fs",
+            {"hostname": hostname, "crit_since": check_mk_service_crit_since},
+        )
+        if not (
+            matches := list(
+                analyze_host_rule_matches(
+                    hostname, [automatic_host_removal_ruleset], debug=debug
+                ).results.values()
+            )[0]
+        ):
+            _LOGGER.debug("No matched rule: Skipping")
+            continue
+
+        # Unfortunately we don't get specific typing of the value out of analyze_host_rule_matches.
+        # So reconstruct the original value to help mypy with typing.
+        first_match = matches[0]
+        _LOGGER.debug("Matching rule: %(rule)r", {"rule": first_match})
+        matched_value: (
+            tuple[Literal["enabled"], _RemovalConditions] | tuple[Literal["disabled"], None]
+        )
+        match first_match:
+            case ("enabled", {"checkmk_service_crit": int(crit)}):
+                matched_value = ("enabled", _RemovalConditions({"checkmk_service_crit": crit}))
+            case ("disabled", _):
+                matched_value = ("disabled", None)
+            case _:
+                raise ValueError("Unexpected match")
+
+        if _should_delete_host(
+            rule_value=matched_value,
+            check_mk_service_crit_for=now - check_mk_service_crit_since,
+        ):
+            _LOGGER.debug("Shall be removed")
+            yield hostname
+        else:
+            _LOGGER.debug("Shall not be removed")
+
+
+def _load_automatic_host_removal_ruleset(tree: FolderTree) -> Sequence[RuleSpec]:
+    return [
+        rule.to_config(use_host_folder=UseHostFolder.HOST_FOLDER_FOR_BASE)
+        for _folder, _idx, rule in SingleRulesetRecursively.load_single_ruleset_recursively(
+            tree, "automatic_host_removal"
+        )
+        .get("automatic_host_removal")
+        .get_rules()
+    ]
+
+
+def _livestatus_query_local_candidates() -> Iterator[tuple[HostName, int]]:
+    yield from (
+        (HostName(hostname), int(crit_since))
+        for hostname, crit_since in LocalConnection().query_table(
+            """GET services
+Columns: host_name last_state_change
+Filter: description = Check_MK
+Filter: state = 2"""
+        )
+    )
+
+
+class _RemovalConditions(TypedDict):
+    checkmk_service_crit: int  # seconds
+
+
+def _should_delete_host(
+    *,
+    rule_value: tuple[Literal["enabled"], _RemovalConditions] | tuple[Literal["disabled"], None],
+    check_mk_service_crit_for: float,
+) -> bool:
+    # TODO: use a match statement once mypy can handle this
+    if rule_value[0] == "enabled":
+        return check_mk_service_crit_for >= rule_value[1]["checkmk_service_crit"]
+    return False
+
+
+def _activate_changes(
+    tree: FolderTree,
+    all_site_configs: SiteConfigurations,
+    user_permission_config: UserPermissionSerializableConfig,
+    sites: Collection[SiteId],
+    *,
+    max_snapshots: int,
+    use_git: bool,
+    debug: bool,
+) -> None:
+    _LOGGER_BACKGROUND_JOB.debug(
+        "Activating changes for %(site_count)d site(s)", {"site_count": len(sites)}
+    )
+
+    # workaround until CMK-13093 is fixed
+    tree.invalidate_caches()
+    manager = ActivateChangesManager()
+    manager.changes.load(list(all_site_configs))
+    with SuperUserContext():
+        activation_id = manager.start(
+            sites=list(sites),
+            source="INTERNAL",
+            all_site_configs=all_site_configs,
+            user_permission_config=user_permission_config,
+            max_snapshots=max_snapshots,
+            activate_foreign=True,
+            use_git=use_git,
+            debug=debug,
+        )
+        _LOGGER_BACKGROUND_JOB.info(
+            "Activation %(activation_id)s started", {"activation_id": activation_id}
+        )
+
+        timeout = 60
+        while manager.is_running() and timeout > 0:
+            _LOGGER_BACKGROUND_JOB.info("Waiting for activation to finish...")
+            time.sleep(1)
+            timeout -= 1
+
+        for site_id in sites:
+            state = manager.get_site_state(site_id)
+            if state["_state"] != STATE_SUCCESS:
+                _LOGGER_BACKGROUND_JOB.error(
+                    "Activation of site %(site_id)s failed: %(status_details)s",
+                    {"site_id": site_id, "status_details": state["_status_details"]},
+                )
+
+        _LOGGER_BACKGROUND_JOB.info("Activation finished")
+
+
+class HostsForAutoRemovalRequest(NamedTuple):
+    tree: FolderTree
+    debug: bool
+
+
+class AutomationHostsForAutoRemoval(AutomationCommand[HostsForAutoRemovalRequest]):
+    @override
+    def command_name(self) -> str:
+        return "hosts-for-auto-removal"
+
+    @override
+    def get_request(self, config: Config, request: Request) -> HostsForAutoRemovalRequest:
+        return HostsForAutoRemovalRequest(
+            tree=make_folder_tree(config),
+            #  default is needed for 2.4 central site compability in 2.5
+            debug=request.get_str_input_mandatory("debug", deflt="") == "1",
+        )
+
+    @override
+    def execute(self, api_request: HostsForAutoRemovalRequest) -> str:
+        return json.dumps(
+            list(_hosts_to_be_removed_local(api_request.tree, debug=api_request.debug))
+        )

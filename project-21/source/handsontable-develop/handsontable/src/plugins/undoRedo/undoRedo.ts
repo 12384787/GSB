@@ -1,0 +1,448 @@
+import type { HotInstance } from '../../core/types';
+import { BasePlugin } from '../base';
+import { Hooks } from '../../core/hooks';
+import { deepClone } from '../../helpers/object';
+import { registerActions } from './actions';
+
+const SHORTCUTS_GROUP = 'undoRedo';
+
+export interface UndoRedoAction {
+  actionType: string;
+  [key: string]: unknown;
+}
+
+export interface UndoRedoActionResult {
+  wasUndone?: boolean;
+}
+
+export const PLUGIN_KEY = 'undoRedo';
+export const PLUGIN_PRIORITY = 1000;
+
+Hooks.getSingleton().register('beforeUndo');
+Hooks.getSingleton().register('afterUndo');
+Hooks.getSingleton().register('beforeRedo');
+Hooks.getSingleton().register('afterRedo');
+
+/**
+ * @description
+ * Handsontable UndoRedo plugin allows to undo and redo certain actions done in the table.
+ *
+ * The plugin is enabled by default. It doesn't track every grid operation. For the list of tracked
+ * actions and the known limitations, see
+ * [Undo and redo](@/guides/accessories-and-menus/undo-redo/undo-redo.md).
+ * @example
+ * ```js
+ * undo: true
+ * ```
+ * @class UndoRedo
+ * @plugin UndoRedo
+ */
+export class UndoRedo extends BasePlugin {
+  /**
+   * Returns the plugin key used to identify this plugin in Handsontable settings.
+   */
+  static get PLUGIN_KEY() {
+    return PLUGIN_KEY;
+  }
+
+  /**
+   * Returns the priority order used to determine the order in which plugins are initialized.
+   */
+  static get PLUGIN_PRIORITY() {
+    return PLUGIN_PRIORITY;
+  }
+
+  /**
+   * Returns whether the plugin handles its own settings keys without a dedicated key list.
+   */
+  static get SETTING_KEYS(): true {
+    return true;
+  }
+
+  /**
+   * The list of registered action do undo.
+   *
+   * @private
+   * @type {Array}
+   */
+  doneActions: unknown[] = [];
+
+  /**
+   * The list of registered action do redo.
+   *
+   * @private
+   * @type {Array}
+   */
+  undoneActions: unknown[] = [];
+
+  /**
+   * The flag that determines if new actions should be ignored.
+   *
+   * @private
+   * @type {boolean}
+   */
+  ignoreNewActions = false;
+
+  /**
+   * Initializes the plugin and registers all built-in undo/redo action handlers for the given Handsontable instance.
+   */
+  constructor(hotInstance: HotInstance) {
+    super(hotInstance);
+    registerActions(hotInstance, this);
+  }
+
+  /**
+   * Checks if the plugin is enabled in the handsontable settings. This method is executed in {@link Hooks#beforeInit}
+   * hook and if it returns `true` then the {@link UndoRedo#enablePlugin} method is called.
+   *
+   * @returns {boolean}
+   */
+  isEnabled(): boolean {
+    return !!this.hot.getSettings().undo;
+  }
+
+  /**
+   * Enables the plugin functionality for this Handsontable instance.
+   */
+  enablePlugin() {
+    if (this.enabled) {
+      return;
+    }
+
+    this.addHook('afterChange', this.#onAfterChange);
+    this.registerShortcuts();
+
+    super.enablePlugin();
+  }
+
+  /**
+   * Disables the plugin functionality for this Handsontable instance.
+   */
+  disablePlugin() {
+    super.disablePlugin();
+    this.clear();
+    this.unregisterShortcuts();
+  }
+
+  /**
+   * Registers shortcuts responsible for performing undo/redo.
+   *
+   * @private
+   */
+  registerShortcuts() {
+    const shortcutManager = this.hot.getShortcutManager();
+    const gridContext = shortcutManager.getContext('grid');
+    const runOnlyIf = (event?: KeyboardEvent): boolean => {
+      return !(event?.altKey); // right ALT in some systems triggers ALT+CTR
+    };
+    const config = {
+      runOnlyIf,
+      group: SHORTCUTS_GROUP,
+    };
+
+    gridContext?.addShortcuts([{
+      keys: [['Control/Meta', 'z']],
+      callback: () => {
+        this.undo();
+      },
+    }, {
+      keys: [['Control/Meta', 'y'], ['Control/Meta', 'Shift', 'z']],
+      callback: () => {
+        this.redo();
+      },
+    }], { ...config });
+  }
+
+  /**
+   * Unregister shortcuts responsible for performing undo/redo.
+   *
+   * @private
+   */
+  unregisterShortcuts() {
+    const shortcutManager = this.hot.getShortcutManager();
+    const gridContext = shortcutManager.getContext('grid');
+
+    gridContext?.removeShortcutsByGroup(SHORTCUTS_GROUP);
+  }
+
+  /**
+   * Stash information about performed actions.
+   *
+   * @example
+   * ```js
+   * // Register a custom action, for example when setting cell metadata directly
+   * // (a change that UndoRedo doesn't track by default).
+   * function setCellBackgroundColor(row, col, className) {
+   *   const undoRedo = hot.getPlugin('undoRedo');
+   *   const previousClassName = hot.getCellMeta(row, col).className;
+   *
+   *   undoRedo.done(() => ({
+   *     actionType: 'cellBackgroundColor',
+   *     undo(instance, callback) {
+   *       instance.setCellMeta(row, col, 'className', previousClassName);
+   *       instance.render();
+   *       callback();
+   *     },
+   *     redo(instance, callback) {
+   *       instance.setCellMeta(row, col, 'className', className);
+   *       instance.render();
+   *       callback();
+   *     },
+   *   }), 'cellBackgroundColor');
+   *
+   *   hot.setCellMeta(row, col, 'className', className);
+   *   hot.render();
+   * }
+   * ```
+   * @fires Hooks#beforeUndoStackChange
+   * @fires Hooks#afterUndoStackChange
+   * @fires Hooks#beforeRedoStackChange
+   * @fires Hooks#afterRedoStackChange
+   * @param {Function} wrappedAction The action descriptor wrapped in a closure.
+   * @param {string} [source] Source of the action. It is defined just for more general actions (not related to plugins).
+   */
+  done(wrappedAction: Function, source?: string) {
+    if (this.ignoreNewActions) {
+      return;
+    }
+
+    const isBlockedByDefault = source === 'UndoRedo.undo' || source === 'UndoRedo.redo' || source === 'auto';
+
+    if (isBlockedByDefault) {
+      return;
+    }
+
+    // A wrappedAction returns `null` when the operation changed nothing (e.g. an `alter` that
+    // removed no rows or columns). A no-op must not stack an action, clear the redo stack, or fire
+    // any stack-change hook, so resolve it before announcing anything. wrappedAction only snapshots
+    // grid state (every registered one is a pure capture), and `done()` runs inside the
+    // `beforeRemove*`/`beforeCreate*` hook before the operation applies, so capturing it here rather
+    // than after `beforeUndoStackChange` reads the same state.
+    const newAction: unknown = wrappedAction();
+
+    if (newAction === null) {
+      return;
+    }
+
+    const doneActionsCopy = this.doneActions.slice();
+    const continueAction = this.hot.runHooks('beforeUndoStackChange', doneActionsCopy, source);
+
+    if (continueAction === false) {
+      return;
+    }
+
+    const undoneActionsCopy = this.undoneActions.slice();
+
+    this.doneActions.push(newAction);
+
+    this.hot.runHooks('afterUndoStackChange', doneActionsCopy, this.doneActions.slice());
+    this.hot.runHooks('beforeRedoStackChange', undoneActionsCopy);
+
+    this.undoneActions.length = 0;
+
+    this.hot.runHooks('afterRedoStackChange', undoneActionsCopy, this.undoneActions.slice());
+  }
+
+  /**
+   * Undo the last action performed to the table.
+   *
+   * @fires Hooks#beforeUndoStackChange
+   * @fires Hooks#afterUndoStackChange
+   * @fires Hooks#beforeRedoStackChange
+   * @fires Hooks#afterRedoStackChange
+   * @fires Hooks#beforeUndo
+   * @fires Hooks#afterUndo
+   */
+  undo(): void {
+    if (!this.isUndoAvailable()) {
+      return;
+    }
+
+    type UndoableAction = {
+      canUndo?: (hot: HotInstance) => boolean
+      undo: (hot: HotInstance, callback: (result?: UndoRedoActionResult) => void) => void
+    };
+    const pendingAction = this.doneActions[this.doneActions.length - 1] as UndoableAction;
+
+    // A nested remove-row undo can still fail (plugin disabled, create-row veto). Formulas
+    // always calls `engine.undo()` in `beforeUndo`, so that check has to win first.
+    if (pendingAction.canUndo?.(this.hot) === false) {
+      return;
+    }
+
+    const doneActionsCopy = this.doneActions.slice();
+
+    this.hot.runHooks('beforeUndoStackChange', doneActionsCopy);
+
+    const action = this.doneActions.pop();
+
+    this.hot.runHooks('afterUndoStackChange', doneActionsCopy, this.doneActions.slice());
+
+    const actionClone = deepClone(action);
+    const continueAction = this.hot.runHooks('beforeUndo', actionClone);
+
+    if (continueAction === false) {
+      return;
+    }
+
+    this.ignoreNewActions = true;
+
+    const undoneActionsCopy = this.undoneActions.slice();
+
+    this.hot.runHooks('beforeRedoStackChange', undoneActionsCopy);
+
+    let wasUndone = true;
+
+    try {
+      (action as UndoableAction).undo(this.hot, (result) => {
+        this.ignoreNewActions = false;
+        wasUndone = result?.wasUndone !== false;
+
+        if (wasUndone) {
+          this.undoneActions.push(action);
+        } else {
+          this.doneActions.push(action);
+        }
+      });
+
+    } catch (error) {
+      // An action that throws never reaches its settle callback. Without this reset every later
+      // user action would be silently dropped from the stack for the rest of the session. The
+      // popped action itself is deliberately discarded: it applied only partially, so neither
+      // replaying its undo nor redoing it can be trusted to land on a consistent grid.
+      this.ignoreNewActions = false;
+      throw error;
+    }
+
+    this.hot.runHooks('afterRedoStackChange', undoneActionsCopy, this.undoneActions.slice());
+
+    if (wasUndone) {
+      this.hot.runHooks('afterUndo', actionClone);
+    }
+  }
+
+  /**
+   * Redo the previous action performed to the table (used to reverse an undo).
+   *
+   * @fires Hooks#beforeUndoStackChange
+   * @fires Hooks#afterUndoStackChange
+   * @fires Hooks#beforeRedoStackChange
+   * @fires Hooks#afterRedoStackChange
+   * @fires Hooks#beforeRedo
+   * @fires Hooks#afterRedo
+   */
+  redo(): void {
+    if (!this.isRedoAvailable()) {
+      return;
+    }
+
+    type RedoableAction = {
+      canRedo?: (hot: HotInstance) => boolean
+    };
+    const pendingAction = this.undoneActions[this.undoneActions.length - 1] as RedoableAction;
+
+    // A redo whose removal would name no row or column changes nothing. Formulas always calls
+    // `engine.redo()` in `beforeRedo`, so that check has to win first - same as `canUndo()` in `undo()`.
+    if (pendingAction.canRedo?.(this.hot) === false) {
+      return;
+    }
+
+    const undoneActionsCopy = this.undoneActions.slice();
+
+    this.hot.runHooks('beforeRedoStackChange', undoneActionsCopy);
+
+    const action = this.undoneActions.pop();
+
+    this.hot.runHooks('afterRedoStackChange', undoneActionsCopy, this.undoneActions.slice());
+
+    const actionClone = deepClone(action);
+
+    const continueAction = this.hot.runHooks('beforeRedo', actionClone);
+
+    if (continueAction === false) {
+      return;
+    }
+
+    this.ignoreNewActions = true;
+
+    const doneActionsCopy = this.doneActions.slice();
+
+    this.hot.runHooks('beforeUndoStackChange', doneActionsCopy);
+
+    // Most actions settle the redo by calling back with no argument. An action that can legitimately
+    // fail to redo (currently only MoveCellsAction) reports it with `{ wasRedone: false }`, which
+    // pushes the action back onto the undone stack instead of the done stack.
+    const redo = action as {
+      redo: (hot: HotInstance, callback: (result?: { wasRedone?: boolean }) => void) => void
+    };
+
+    try {
+      redo.redo(this.hot, (result) => {
+        this.ignoreNewActions = false;
+
+        if (result?.wasRedone === false) {
+          this.undoneActions.push(action);
+        } else {
+          this.doneActions.push(action);
+        }
+      });
+
+    } catch (error) {
+      // Same contract as `undo()`: reset the flag and deliberately discard the partially applied
+      // action rather than pushing it back onto either stack.
+      this.ignoreNewActions = false;
+      throw error;
+    }
+
+    this.hot.runHooks('afterUndoStackChange', doneActionsCopy, this.doneActions.slice());
+    this.hot.runHooks('afterRedo', actionClone);
+  }
+
+  /**
+   * Checks if undo action is available.
+   *
+   * @returns {boolean} Return `true` if undo can be performed, `false` otherwise.
+   */
+  isUndoAvailable(): boolean {
+    return this.doneActions.length > 0;
+  }
+
+  /**
+   * Checks if redo action is available.
+   *
+   * @returns {boolean} Return `true` if redo can be performed, `false` otherwise.
+   */
+  isRedoAvailable(): boolean {
+    return this.undoneActions.length > 0;
+  }
+
+  /**
+   * Clears undo and redo history.
+   */
+  clear(): void {
+    this.doneActions.length = 0;
+    this.undoneActions.length = 0;
+  }
+
+  /**
+   * Listens to the data change and if the source is `loadData` then clears the undo and redo history.
+   *
+   * @param {Array} changes The data changes.
+   * @param {string} source The source of the change.
+   */
+  #onAfterChange = (changes: unknown[][], source: string) => {
+    if (source === 'loadData') {
+      this.clear();
+    }
+  };
+
+  /**
+   * Destroys the plugin instance.
+   */
+  destroy() {
+    this.clear();
+    this.doneActions = [];
+    this.undoneActions = [];
+    super.destroy();
+  }
+}

@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+# Copyright (C) 2023 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# Configuration file for the Sphinx documentation builder.
+#
+# This file only contains a selection of the most common options. For a full
+# list see the documentation:
+# https://www.sphinx-doc.org/en/master/usage/configuration.html
+
+# -- Path setup --------------------------------------------------------------
+
+# If extensions (or modules to document with autodoc) are in another directory,
+# add these directories to sys.path here. If the directory is relative to the
+# documentation root, use os.path.abspath to make it absolute, like shown here.
+#
+import glob
+import os
+import sys
+from datetime import datetime
+
+DOC_ROOT = os.path.dirname(__file__)
+
+sys.path.insert(0, os.path.join(DOC_ROOT, "..", ".."))
+
+
+# -- Project information -----------------------------------------------------
+
+year = datetime.now().year
+project = "CheckMK"
+author = "Checkmk GmbH"
+copyright = f"{year}, {author}"  # noqa: A001
+
+
+# -- General configuration ---------------------------------------------------
+
+# Add any Sphinx extension module names here, as strings. They can be
+# extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
+# ones.
+extensions = [
+    "sphinx.ext.autodoc",
+    "sphinxcontrib.spelling",
+    "sphinxcontrib.plantuml",
+]
+
+_runfiles = os.path.dirname(sys.prefix)
+_matches = glob.glob(os.path.join(_runfiles, "plantuml+/plantuml"))
+if not _matches:
+    raise Exception("@plantuml//:plantuml must be in sphinx_build data")
+
+plantuml = _matches[0]
+
+plantuml_output_format = "svg"
+
+spelling_show_suggestions = True
+spelling_warning = True
+
+# Add any paths that contain templates here, relative to this directory.
+templates_path = ["_templates"]
+
+# List of patterns, relative to source directory, that match files and
+# directories to ignore when looking for source files.
+# This pattern also affects html_static_path and html_extra_path.
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+
+
+# -- Options for HTML output -------------------------------------------------
+
+# The theme to use for HTML and HTML Help pages.  See the documentation for
+# a list of builtin themes.
+#
+html_theme = "alabaster"
+
+language = "en"
+
+# Replaces e.g. "Checkmk's" with characters that can not correctly be rendered
+# in htmlhelp in all cases
+smartquotes = False

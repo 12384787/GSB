@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import argparse
+from collections.abc import Mapping
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import assert_never, Literal
+
+from cmk.password_store.v1_unstable import dereference_secret
+
+
+@dataclass(kw_only=True)
+class BasicAuth:
+    username: str
+    password: str
+
+
+@dataclass(kw_only=True)
+class OAuth2:
+    client_id: str
+    client_secret: str
+    tenant_id: str
+
+
+@dataclass(kw_only=True)
+class OAuth2WithTokens(OAuth2):
+    storage_id: str
+    initial_access_token: str
+    initial_refresh_token: str
+
+
+MailboxAuth = BasicAuth | OAuth2 | OAuth2WithTokens | None
+
+
+class Scope(StrEnum):
+    FETCH = "fetch"
+    SEND = "send"
+
+
+FETCH_PROTOCOLS = {"IMAP", "POP3", "EWS", "GRAPHAPI"}
+SEND_PROTOCOLS = {"SMTP", "EWS", "GRAPHAPI"}
+
+
+@dataclass(frozen=True)
+class TRXConfig:
+    server: str
+    address: str
+    auth: MailboxAuth
+    authority: Literal["global", "china"]
+    protocol: Literal["IMAP", "POP3", "EWS", "SMTP", "GRAPHAPI"]
+    port: int
+    tls: bool
+    disable_cert_validation: bool
+
+
+def add_trx_arguments(parser: argparse.ArgumentParser, scope: Scope) -> None:
+    match scope:
+        case Scope.FETCH:
+            protocols = FETCH_PROTOCOLS
+        case Scope.SEND:
+            protocols = SEND_PROTOCOLS
+        case other:
+            assert_never(other)
+
+    parser.add_argument(
+        f"--{scope}-server",
+        required=True,
+        metavar="ADDRESS",
+        help=f"Host address of the {'/'.join(protocols)} server hosting your mailbox. Can be any dummy IP for GRAPHAPI.",
+    )
+    parser.add_argument(
+        f"--{scope}-email-address",
+        required=False,
+        metavar="EMAIL-ADDRESS",
+        help="Email address (default: same as username, only affects EWS protocol)",
+    )
+    parser.add_argument(
+        f"--{scope}-username",
+        required=False,
+        metavar="USER",
+        help=f"Username to use for {'/'.join(protocols - {'GRAPHAPI'})}",
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        f"--{scope}-password",
+        required=False,
+        metavar="PASSWORD",
+        help=f"Password to use for {'/'.join(protocols - {'GRAPHAPI'})}",
+    )
+    group.add_argument(
+        f"--{scope}-password-reference",
+        required=False,
+        metavar="PASSWORD-ID",
+        help=f"Password store reference of password to use for {'/'.join(protocols - {'GRAPHAPI'})}",
+    )
+    parser.add_argument(
+        f"--{scope}-client-id",
+        required=False,
+        metavar="CLIENT_ID",
+        help="OAuth2 ClientID for EWS",
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        f"--{scope}-client-secret",
+        required=False,
+        metavar="CLIENT_SECRET",
+        help="OAuth2 client secret for EWS",
+    )
+    group.add_argument(
+        f"--{scope}-client-secret-reference",
+        required=False,
+        metavar="CLIENT_SECRET_ID",
+        help="Password store reference for OAuth2 client secret for EWS",
+    )
+    parser.add_argument(
+        f"--{scope}-tenant-id",
+        required=False,
+        metavar="TENANT_ID",
+        help="OAuth2 TenantID for EWS",
+    )
+    parser.add_argument(
+        f"--{scope}-protocol",
+        type=str.upper,
+        choices=protocols,
+        required=True,
+        help="Protocol used for mail transfer",
+    )
+    parser.add_argument(
+        f"--{scope}-port",
+        type=int,
+        metavar="PORT",
+        help=f"{'/'.join(protocols - {'GRAPHAPI'})} port (defaults to 110/995 (TLS) for POP3, to 143/993 (TLS) for "
+        "IMAP and to 80/443 (TLS) for EWS)",
+    )
+    parser.add_argument(
+        f"--{scope}-tls",
+        action="store_true",
+        help="Use TLS/SSL for fetching the mailbox (disabled by default)",
+    )
+    parser.add_argument(
+        f"--{scope}-disable-cert-validation",
+        action="store_true",
+        help="Don't enforce SSL/TLS certificate validation",
+    )
+    parser.add_argument(
+        f"--{scope}-authority",
+        type=str.lower,
+        choices=["global", "china"],
+        default="global",
+        help="Authority to use for OAuth2 authentication (default: global)",
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        f"--{scope}-initial-access-token",
+        required=False,
+        metavar="INITIAL_ACCESS_TOKEN",
+        help="Initial access token for GraphApi authentication",
+    )
+    group.add_argument(
+        f"--{scope}-initial-access-token-reference",
+        required=False,
+        metavar="INITIAL_ACCESS_TOKEN_ID",
+        help="Password store reference for initial access token for GraphApi authentication",
+    )
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        f"--{scope}-initial-refresh-token",
+        required=False,
+        metavar="INITIAL_REFRESH_TOKEN",
+        help="Initial refresh token for GraphApi authentication",
+    )
+    group.add_argument(
+        f"--{scope}-initial-refresh-token-reference",
+        required=False,
+        metavar="INITIAL_REFRESH_TOKEN_ID",
+        help="Password store reference for initial refresh token for GraphApi authentication",
+    )
+    parser.add_argument(
+        f"--{scope}-storage-id",
+        required=False,
+        help="Storage ID used for storing access to the GraphAPI. Only required of not using referenced tokens.",
+    )
+
+
+def _parse_auth(raw: Mapping[str, object]) -> MailboxAuth:
+    args_related_to_auth = {
+        "client_id": raw.get("client_id"),
+        "client_secret": _parse_secret(raw, "client_secret"),
+        "initial_access_token": _parse_secret(raw, "initial_access_token"),
+        "initial_refresh_token": _parse_secret(raw, "initial_refresh_token"),
+        "password": _parse_secret(raw, "password"),
+        "protocol": raw.get("protocol"),
+        "storage_id": _parse_storage_id(raw),
+        "tenant_id": raw.get("tenant_id"),
+        "username": raw.get("username"),
+    }
+
+    match args_related_to_auth:
+        case {
+            "client_id": str(client_id),
+            "client_secret": str(client_secret),
+            "tenant_id": str(tenant_id),
+            "initial_access_token": str(initial_access_token),
+            "initial_refresh_token": str(initial_refresh_token),
+            "storage_id": str(storage_id),
+        }:
+            return OAuth2WithTokens(
+                client_id=client_id,
+                client_secret=client_secret,
+                tenant_id=tenant_id,
+                initial_access_token=initial_access_token,
+                initial_refresh_token=initial_refresh_token,
+                storage_id=storage_id,
+            )
+        case {
+            "client_id": str(client_id),
+            "client_secret": str(client_secret),
+            "tenant_id": str(tenant_id),
+        }:
+            return OAuth2(
+                client_id=client_id,
+                client_secret=client_secret,
+                tenant_id=tenant_id,
+            )
+        case {"username": str(username), "password": str(password)}:
+            return BasicAuth(username=username, password=password)
+        case {"protocol": "SMTP"}:
+            return None
+        case _:
+            raise RuntimeError(f"Incomplete auth credentials for {raw['protocol']} protocol.")
+
+
+def _parse_secret(raw: Mapping[str, object], ident: str) -> str | None:
+    match raw.get(ident), raw.get(f"{ident}_reference"):
+        case str(secret), None:
+            return secret
+        case None, str(reference):
+            return dereference_secret(reference).reveal()
+        case _:
+            return None
+
+
+def _parse_storage_id(raw: Mapping[str, object]) -> str | None:
+    match raw.get("storage_id"), raw.get("initial_access_token_reference"):
+        case str(storage_id), None:
+            return f"emailchecks-{storage_id}"
+        case None, str(reference):
+            return f"emailchecks-{reference.split(':')[0].split('_')[0]}"
+        case _:
+            return None
+
+
+def _parse_port(raw: Mapping[str, object]) -> int:
+    match raw:
+        case {"port": int(port)}:
+            return port
+        case {"protocol": "POP3", "tls": True}:
+            return 995
+        case {"protocol": "POP3", "tls": False}:
+            return 110
+        case {"protocol": "IMAP", "tls": True}:
+            return 993
+        case {"protocol": "IMAP", "tls": False}:
+            return 143
+        case {"protocol": "SMTP"}:
+            return 25
+        case {"tls": True}:
+            return 443
+        case _:
+            return 80
+
+
+def parse_trx_arguments(args: argparse.Namespace, scope: Scope) -> TRXConfig:
+    prefix = f"{scope}_"
+    raw = {k.removeprefix(prefix): v for k, v in vars(args).items() if k.startswith(prefix)}
+    return TRXConfig(
+        server=raw["server"],
+        # not sure how clever this is, what if we have neither?
+        address=str(raw.get("email_address") or raw.get("username")),
+        auth=_parse_auth(raw),
+        authority=raw["authority"],
+        protocol=raw["protocol"],
+        port=_parse_port(raw),
+        tls=raw["tls"],
+        disable_cert_validation=raw["disable_cert_validation"],
+    )

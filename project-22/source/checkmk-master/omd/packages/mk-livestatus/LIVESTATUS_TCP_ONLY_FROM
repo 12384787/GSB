@@ -1,0 +1,7 @@
+# Alias: Restrict livestatus port to IP addresses
+# Menu: Distributed Monitoring
+# Description:
+#  If Livestatus is configured to listen on a TCP port, you
+#  can configure the IP addresses that are allowed to
+#  connect to livestatus here. The setting "0.0.0.0 ::/0" makes the
+#  port available to all IPv4 and IPv6 clients,

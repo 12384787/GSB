@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+"""Verify or find out a hosts agent related configuration"""
+
+import json
+from collections.abc import Collection
+from typing import NotRequired, override, TypedDict
+
+from cmk.ccc.exceptions import MKGeneralException
+from cmk.ccc.hostaddress import HostAddress, HostName
+from cmk.ccc.site import omd_site
+from cmk.checkengine.snmplib import SNMPCredentials  # astrein: disable=cmk-module-layer-violation
+from cmk.gui import forms
+from cmk.gui.breadcrumb import Breadcrumb
+from cmk.gui.config import Config
+from cmk.gui.exceptions import MKAuthException, MKUserError
+from cmk.gui.htmllib.html import html
+from cmk.gui.http import request
+from cmk.gui.i18n import _
+from cmk.gui.logged_in import user
+from cmk.gui.page_menu import (
+    make_form_submit_link,
+    PageMenu,
+    PageMenuDropdown,
+    PageMenuEntry,
+    PageMenuTopic,
+)
+from cmk.gui.pages import AjaxPage, PageContext, PageEndpoint, PageRegistry, PageResult
+from cmk.gui.type_defs import ActionResult
+from cmk.gui.user_sites import activation_sites
+from cmk.gui.utils.csrf_token import check_csrf_token
+from cmk.gui.utils.transaction_manager import transactions
+from cmk.gui.utils.user_errors import user_errors
+from cmk.gui.valuespec import Dictionary, FixedValue, Float, Integer, Password
+from cmk.gui.valuespec import HostAddress as VSHostAddress
+from cmk.gui.wato.pages.hosts import ModeEditHost, page_menu_host_entries
+from cmk.gui.watolib.attributes import SNMPCredentials as VSSNMPCredentials
+from cmk.gui.watolib.audit_log import make_audit_log_change_hook
+from cmk.gui.watolib.automations import make_automation_config
+from cmk.gui.watolib.check_mk_automations import diag_host
+from cmk.gui.watolib.host_attributes import HostAttributes
+from cmk.gui.watolib.hosts_and_folders import (
+    folder_from_request,
+    folder_preserving_link,
+    folder_tree,
+)
+from cmk.gui.watolib.mode import mode_url, ModeRegistry, redirect, WatoMode
+from cmk.gui.watolib.pending_changes import (
+    index_update_change_hook,
+    PendingChanges,
+    PendingChangesStore,
+)
+from cmk.gui.watolib.rulesets import AllRulesets
+from cmk.gui.watolib.sidebar_reload import sidebar_reload_change_hook
+from cmk.web.utils.flashed_messages import flash
+from cmk.web.utils.icons import IconNames, StaticIcon
+from cmk.web.utils.permission_verification import PermissionName
+
+SNMPv3NoAuthNoPriv = tuple[str, str]
+SNMPv3AuthNoPriv = tuple[str, str, str, str]
+SNMPv3AuthPriv = tuple[str, str, str, str, str, str]
+
+
+class HostSpec(TypedDict):
+    hostname: HostName
+    ipaddress: NotRequired[HostAddress]
+    snmp_community: NotRequired[SNMPCredentials]
+    snmp_v3_credentials: NotRequired[SNMPv3NoAuthNoPriv | SNMPv3AuthNoPriv | SNMPv3AuthPriv]
+
+
+def register(page_registry: PageRegistry, mode_registry: ModeRegistry) -> None:
+    page_registry.register(PageEndpoint("wato_ajax_diag_host", PageAjaxDiagHost()))
+    mode_registry.register(ModeDiagHost)
+
+
+class ModeDiagHost(WatoMode):
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "diag_host"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["hosts", "diag_host"]
+
+    @classmethod
+    @override
+    def parent_mode(cls) -> type[WatoMode] | None:
+        return ModeEditHost
+
+    @classmethod
+    def diag_host_tests(cls) -> list[tuple[str, str]]:
+        return [
+            ("ping", _("Ping")),
+            ("agent", _("Agent")),
+            ("snmpv1", _("SNMPv1")),
+            ("snmpv2", _("SNMPv2c")),
+            ("snmpv2_nobulk", _("SNMPv2c (without bulk walk)")),
+            ("snmpv3", _("SNMPv3")),
+            ("traceroute", _("Traceroute")),
+        ]
+
+    @override
+    def _from_vars(self) -> None:
+        self._hostname = request.get_validated_type_input_mandatory(HostName, "host")
+        self._tree = folder_tree()
+        self._host = folder_from_request(
+            self._tree, request.var("folder"), self._hostname
+        ).load_host(self._hostname)
+        self._host.permissions.need_permission("read", user)
+
+        if self._host.is_cluster():
+            raise MKGeneralException(_("This page does not support cluster hosts."))
+
+        if "cmk/relay_monitored" in self._host.labels():
+            raise MKGeneralException(_("This page is not available for hosts monitored via Relay."))
+
+    @override
+    def title(self) -> str:
+        return _("Test connection to host") + " " + self._hostname
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        return PageMenu(
+            dropdowns=[
+                PageMenuDropdown(
+                    name="actions",
+                    title=_("Test"),
+                    topics=[
+                        PageMenuTopic(
+                            title=_("Options"),
+                            entries=[
+                                PageMenuEntry(
+                                    title=_("Run tests"),
+                                    icon_name=StaticIcon(IconNames.connection_tests),
+                                    item=make_form_submit_link("diag_host", "_save"),
+                                    is_shortcut=True,
+                                    is_suggested=True,
+                                ),
+                            ],
+                        ),
+                        PageMenuTopic(
+                            title=_("Host properties"),
+                            entries=[
+                                PageMenuEntry(
+                                    title=_("Save & go to host properties"),
+                                    icon_name=StaticIcon(IconNames.save),
+                                    item=make_form_submit_link("diag_host", "go_to_properties"),
+                                    is_shortcut=True,
+                                    is_suggested=True,
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+                PageMenuDropdown(
+                    name="host",
+                    title=_("Host"),
+                    topics=[
+                        PageMenuTopic(
+                            title=_("For this host"),
+                            entries=list(page_menu_host_entries(self.name(), self._host)),
+                        ),
+                    ],
+                ),
+            ],
+            breadcrumb=breadcrumb,
+        )
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        check_csrf_token()
+
+        if not transactions.check_transaction(request):
+            return None
+
+        if request.var("_save"):
+            try:
+                self._validate_diag_html_vars()
+            except MKUserError as e:
+                user_errors.add(e)
+            return None
+
+        if request.var("go_to_properties"):
+            # Save the ipaddress and/or community
+            vs_host = _vs_host(self._hostname)
+            new = vs_host.from_html_vars("vs_host")
+            vs_host.validate_value(new, "vs_host")
+
+            return_message = []
+            attributes = HostAttributes()
+
+            if "ipaddress" in new:
+                return_message.append(_("IP address"))
+                attributes["ipaddress"] = new["ipaddress"]
+
+            # If both SNMP types have credentials set - SNMPv3 takes precedence
+            if "snmp_v3_credentials" in new:
+                if "snmp_community" in new:
+                    return_message.append(_("SNMPv3 credentials (SNMPv2 community was discarded)"))
+                else:
+                    return_message.append(_("SNMPv3 credentials"))
+                attributes["snmp_community"] = new["snmp_v3_credentials"]
+            elif "snmp_community" in new:
+                return_message.append(_("SNMP credentials"))
+                attributes["snmp_community"] = new["snmp_community"]
+
+            self._host.update_attributes(
+                attributes,
+                pprint_value=config.wato_pprint_config,
+                pending_changes=PendingChanges(
+                    activation_sites=activation_sites(config.sites),
+                    local_site=omd_site(),
+                    acting_user=user.id,
+                    store=PendingChangesStore(),
+                    hooks=(
+                        make_audit_log_change_hook(use_git=config.wato_use_git),
+                        sidebar_reload_change_hook,
+                        index_update_change_hook,
+                    ),
+                ),
+                acting_user=user,
+            )
+
+            flash(_("Updated attributes: ") + ", ".join(return_message))
+            return redirect(
+                mode_url(
+                    "edit_host",
+                    host=self._hostname,
+                    folder=folder_from_request(
+                        self._tree, request.var("folder"), request.get_ascii_input("host")
+                    ).path(),
+                )
+            )
+        return None
+
+    def _validate_diag_html_vars(self) -> None:
+        vs_host = _vs_host(self._hostname)
+        host_vars = vs_host.from_html_vars("vs_host")
+        vs_host.validate_value(host_vars, "vs_host")
+
+        vs_rules = _vs_rules()
+        rule_vars = vs_rules.from_html_vars("vs_rules")
+        vs_rules.validate_value(rule_vars, "vs_rules")
+
+    @override
+    def page(self, config: Config) -> None:
+        html.open_div(class_="diag_host")
+        html.open_table()
+        html.open_tr()
+        html.open_td()
+        all_rulesets = AllRulesets.load_all_rulesets(folder_tree())
+        agent_ports_ruleset = all_rulesets.get("agent_ports")
+        tcp_connect_timeouts_ruleset = all_rulesets.get("tcp_connect_timeouts")
+        snmp_timing_ruleset = all_rulesets.get("snmp_timing")
+        agent_port: int | None = None
+        match agent_ports_ruleset.analyse_ruleset(  # type: ignore[exhaustive-match]
+            hostname=self._hostname,
+            svc_desc_or_item=None,
+            svc_desc=None,
+            service_labels={},
+            debug=config.debug,
+        ):
+            case int() as agent_port, _:
+                pass
+
+        tcp_connect_timeout: float | None = None
+        match tcp_connect_timeouts_ruleset.analyse_ruleset(  # type: ignore[exhaustive-match]
+            hostname=self._hostname,
+            svc_desc_or_item=None,
+            svc_desc=None,
+            service_labels={},
+            debug=config.debug,
+        ):
+            case float() as tcp_connect_timeout, _:
+                pass
+
+        snmp_timing: dict[str, int] = {}
+        match snmp_timing_ruleset.analyse_ruleset(  # type: ignore[exhaustive-match]
+            hostname=self._hostname,
+            svc_desc_or_item=None,
+            svc_desc=None,
+            service_labels={},
+            debug=config.debug,
+        ):
+            case dict() as snmp_timing, _:
+                pass
+
+        with html.form_context("diag_host", method="POST"):
+            html.prevent_password_auto_completion()
+
+            forms.header(_("Host properties"))
+
+            forms.section(legend=False)
+
+            # The diagnose page shows both SNMP variants at the same time
+            # We need to analyse the preconfigured community and set either the
+            # snmp_community or the snmp_v3_credentials
+            vs_dict: dict[str, object] = {}
+            for key, value in self._host.attributes.items():
+                if key == "snmp_community" and isinstance(value, tuple):
+                    vs_dict["snmp_v3_credentials"] = value
+                    continue
+                vs_dict[key] = value
+
+            vs_host = _vs_host(self._hostname)
+            vs_host.render_input("vs_host", vs_dict)
+            html.help(vs_host.help())
+
+            forms.end()
+
+            html.open_div(style="margin-bottom:10px")
+            html.close_div()
+
+            forms.header(_("Options"))
+
+            value = {}
+            forms.section(legend=False)
+            vs_rules = _vs_rules(
+                agent_port=agent_port,
+                tcp_connect_timeout=tcp_connect_timeout,
+                snmp_timeout=snmp_timing.get("timeout"),
+                snmp_retries=snmp_timing.get("retries"),
+            )
+            vs_rules.render_input("vs_rules", value)
+            html.help(vs_rules.help())
+            forms.end()
+
+            # When clicking "Save & Test" on the "Edit host" page, this will be set
+            # to immediately execute the tests using the just saved settings
+            if request.has_var("_start_on_load"):
+                html.final_javascript("cmk.page_menu.form_submit('diag_host', '_save');")
+
+            html.hidden_fields()
+
+        html.close_td()
+        html.open_td(style="padding-left:10px;")
+
+        self._show_diagnose_output()
+
+    def _show_diagnose_output(self) -> None:
+        if not request.var("_save"):
+            html.show_message(
+                _(
+                    "You can diagnose the connection to a specific host using this dialog. "
+                    "You can either test whether your current configuration is still working "
+                    "or investigate in which ways a host can be reached. Simply configure the "
+                    "connection options you want to try on the right side of the screen and "
+                    'press the "Test" button. The results will be displayed here.'
+                )
+            )
+            return
+
+        if user_errors:
+            html.show_user_errors()
+            return
+
+        # TODO: Insert any vs_host valuespec validation
+        #       These tests can be called with invalid valuespec settings...
+        # TODO: Replace hard coded icon paths with dynamic ones to old or new theme
+        for ident, title in ModeDiagHost.diag_host_tests():
+            html.h3(title)
+            html.open_table(class_=["data", "test"])
+            html.open_tr(class_=["data", "odd0"])
+
+            html.open_td(class_="icons")
+            html.open_div()
+            html.static_icon(StaticIcon(IconNames.reload), id_="%s_img" % ident)
+            html.open_a(href="")
+            html.static_icon(
+                StaticIcon(IconNames.reload),
+                title=_("Retry this test"),
+                css_classes=["retry"],
+                id_="%s_retry" % ident,
+            )
+            html.close_a()
+            html.close_div()
+            html.close_td()
+
+            html.open_td()
+            html.div("", class_="log", id="%s_log" % ident)
+            html.close_td()
+
+            html.close_tr()
+            html.close_table()
+            html.javascript(
+                "cmk.host_diagnose.start_test(%s, %s, %s)"
+                % (
+                    json.dumps(ident),
+                    json.dumps(self._hostname),
+                    json.dumps(transactions.fresh_transid()),
+                )
+            )
+
+
+def _vs_host(hostname: HostName) -> Dictionary:
+    return Dictionary(
+        required_keys=["hostname"],
+        elements=[
+            (
+                "hostname",
+                FixedValue(
+                    value=hostname,
+                    title=_("Host name"),
+                ),
+            ),
+            (
+                "ipaddress",
+                VSHostAddress(
+                    title=_("IPv4 address"),
+                    allow_empty=False,
+                    allow_ipv6_address=False,
+                ),
+            ),
+            (
+                "snmp_community",
+                Password(
+                    title=_("SNMPv1/2 community"),
+                    allow_empty=False,
+                ),
+            ),
+            (
+                "snmp_v3_credentials",
+                VSSNMPCredentials(
+                    default_value=None,
+                    only_v3=True,
+                ),
+            ),
+        ],
+    )
+
+
+def _vs_rules(
+    agent_port: int | None = None,
+    tcp_connect_timeout: float | None = None,
+    snmp_timeout: int | None = None,
+    snmp_retries: int | None = None,
+) -> Dictionary:
+    return Dictionary(
+        optional_keys=False,
+        elements=[
+            (
+                "agent_port",
+                Integer(
+                    minvalue=1,
+                    maxvalue=65535,
+                    default_value=agent_port if agent_port is not None else 6556,
+                    title=_('Checkmk agent port (<a href="%(url)s">rules</a>)')
+                    % {
+                        "url": folder_preserving_link(
+                            request,
+                            [
+                                ("mode", "edit_ruleset"),
+                                ("varname", "agent_ports"),
+                            ],
+                        )
+                    },
+                    help=_(
+                        "This variable allows to specify the TCP port to "
+                        "be used to connect to the agent on a per-host-basis."
+                    ),
+                ),
+            ),
+            (
+                "tcp_connect_timeout",
+                Float(
+                    minvalue=1.0,
+                    default_value=tcp_connect_timeout if tcp_connect_timeout is not None else 5.0,
+                    unit=_("sec"),
+                    display_format="%.0f",  # show values consistent to
+                    size=2,  # SNMP-Timeout
+                    title=_('TCP connection timeout (<a href="%(url)s">Rules</a>)')
+                    % {
+                        "url": folder_preserving_link(
+                            request,
+                            [
+                                ("mode", "edit_ruleset"),
+                                ("varname", "tcp_connect_timeouts"),
+                            ],
+                        )
+                    },
+                    help=_(
+                        "This variable allows to specify a timeout for the "
+                        "TCP connection to the Checkmk agent on a per-host-basis. "
+                        "If the agent does not respond within this time, it is considered to be unreachable."
+                    ),
+                ),
+            ),
+            (
+                "snmp_timeout",
+                Integer(
+                    title=_('SNMP-timeout (<a href="%(url)s">Rules</a>)')
+                    % {
+                        "url": folder_preserving_link(
+                            request,
+                            [
+                                ("mode", "edit_ruleset"),
+                                ("varname", "snmp_timing"),
+                            ],
+                        )
+                    },
+                    help=_(
+                        "After a request is sent to the remote SNMP agent, the service will wait up to "
+                        "the provided timeout limit before assuming that the answer got lost and retrying."
+                    ),
+                    default_value=snmp_timeout if snmp_timeout is not None else 1,
+                    minvalue=1,
+                    maxvalue=60,
+                    unit=_("sec"),
+                ),
+            ),
+            (
+                "snmp_retries",
+                Integer(
+                    title=_('SNMP-retries (<a href="%(url)s">Rules</a>)')
+                    % {
+                        "url": folder_preserving_link(
+                            request,
+                            [
+                                ("mode", "edit_ruleset"),
+                                ("varname", "snmp_timing"),
+                            ],
+                        )
+                    },
+                    default_value=snmp_retries if snmp_retries is not None else 5,
+                    minvalue=0,
+                    maxvalue=50,
+                ),
+            ),
+        ],
+    )
+
+
+class PageAjaxDiagHost(AjaxPage):
+    @override
+    def page(self, ctx: PageContext) -> PageResult:
+        check_csrf_token()
+        if not user.may("wato.diag_host"):
+            raise MKAuthException(_("You are not permitted to perform this action."))
+
+        if not transactions.check_transaction(request):
+            raise MKAuthException(_("Invalid transaction"))
+
+        api_request = ctx.request.get_request()
+
+        hostname = api_request.get("host")
+        if not hostname:
+            raise MKGeneralException(_("The host name is missing."))
+
+        host = folder_tree().host(hostname)
+
+        if not host:
+            raise MKGeneralException(_("The given host does not exist."))
+        if host.is_cluster():
+            raise MKGeneralException(_("This view does not support cluster hosts."))
+
+        host.permissions.need_permission("read", user)
+
+        _test = api_request.get("_test")
+        if not _test:
+            raise MKGeneralException(_("The test is missing."))
+
+        # Execute a specific test
+        if _test not in dict(ModeDiagHost.diag_host_tests()):
+            raise MKGeneralException(_("Invalid test."))
+
+        # Parse the submitted form fields via the valuespecs. This lets the
+        # Password valuespec handle the typed-or-decrypt-_orig logic correctly,
+        # so SNMPv3 credentials entered by the user are honored. We also
+        # validate here -- per-test retries bypass the action path's
+        # _validate_diag_html_vars(), so this is the only safety net for
+        # those requests.
+        vs_host = _vs_host(hostname)
+        host_vars = vs_host.from_html_vars("vs_host")
+        vs_host.validate_value(host_vars, "vs_host")
+        vs_rules = _vs_rules()
+        rule_vars = vs_rules.from_html_vars("vs_rules")
+        vs_rules.validate_value(rule_vars, "vs_rules")
+
+        args: list[str] = [""] * 13
+        ipaddress = host_vars.get("ipaddress", "")
+        args[0] = ipaddress if isinstance(ipaddress, str) else ""
+        snmp_community = host_vars.get("snmp_community", "")
+        args[1] = snmp_community if isinstance(snmp_community, str) else ""
+        args[2] = str(rule_vars["agent_port"])
+        args[3] = str(rule_vars["snmp_timeout"])
+        args[4] = str(rule_vars["snmp_retries"])
+        args[5] = str(rule_vars["tcp_connect_timeout"])
+        # args[6] is intentionally empty (legacy "cmd" slot in the automation).
+
+        match host_vars.get("snmp_v3_credentials"):
+            case None:
+                pass  # SNMPv3 credentials section not enabled in the form.
+            case (use, name):  # noAuthNoPriv
+                args[7] = use
+                args[9] = name
+            case (use, auth_proto, name, auth_pw):  # authNoPriv
+                args[7], args[8], args[9], args[10] = use, auth_proto, name, auth_pw
+            case (use, auth_proto, name, auth_pw, priv_proto, priv_pw):  # authPriv
+                args[7], args[8], args[9], args[10] = use, auth_proto, name, auth_pw
+                args[11], args[12] = priv_proto, priv_pw
+            # Do not interpolate the credential value itself into error
+            # messages: the tuple carries the SNMPv3 password in plaintext.
+            case tuple() as unexpected:
+                raise MKGeneralException(
+                    _("Unexpected SNMPv3 credentials shape: tuple of length %(length)d")
+                    % {"length": len(unexpected)}
+                )
+            case unexpected:
+                raise MKGeneralException(
+                    _("Unexpected SNMPv3 credentials type: %(type_name)s")
+                    % {"type_name": type(unexpected).__name__}
+                )
+
+        result = diag_host(
+            make_automation_config(ctx.config.sites[host.site_id()]),
+            hostname,
+            _test,
+            ctx.config.debug,
+            *args,
+        )
+        return {
+            "next_transid": transactions.fresh_transid(),
+            "status_code": result.return_code,
+            "output": result.response,
+        }

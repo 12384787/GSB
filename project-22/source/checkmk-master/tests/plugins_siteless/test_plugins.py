@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import os
+import shutil
+from collections.abc import Iterator, Mapping, Sequence
+from pathlib import Path
+from typing import override
+
+import pytest
+
+from cmk.agent_based.v1.value_store import set_value_store_manager
+from cmk.agent_based.v2 import CheckPlugin
+from cmk.base import config
+from cmk.base.checkers import (
+    CheckerConfig,
+    CheckerPluginMapper,
+    SectionPluginMapper,
+)
+from cmk.ccc.hostaddress import HostName, Hosts
+from cmk.checkengine import value_store
+from cmk.checkengine.checking import execute_checkmk_checks
+from cmk.checkengine.helper_interface import FetcherType, SourceInfo, SourceType
+from cmk.checkengine.inventory import HWSWInventoryParameters
+from cmk.checkengine.specs.exitspec import ExitSpec
+from cmk.logwatch.config import ParameterLogwatchEc, ParameterLogwatchRules, set_global_state
+from cmk.utils import paths
+from cmk.utils.everythingtype import EVERYTHING
+from cmk.utils.timeperiod import TimeperiodName
+from tests.plugins_siteless.helpers import (
+    BasicSubmitter,
+    compare_services_states,
+    discover_services,
+    DUMPS_DIR,
+    get_agent_data_filenames,
+    get_raw_data,
+    LOGGER,
+    parser,
+    store_services_states,
+    summarizer,
+)
+from tests.testlib.common.empty_config import EMPTY_CONFIG
+
+os.environ["OMD_SITE"] = ""
+HOSTNAME = HostName("test_host")
+
+
+@pytest.fixture(name="setup_dirs", scope="function")
+def _setup_dirs() -> Iterator[None]:
+    var_dir = Path(os.getcwd()) / "var"
+    if var_dir.exists():
+        shutil.rmtree(var_dir)
+    autochecks_dir = var_dir / "check_mk/autochecks/"
+    os.makedirs(autochecks_dir)
+    yield
+    shutil.rmtree(var_dir)
+
+
+class _AllValueStoresStoreMocker(value_store.AllValueStoresStore):
+    """Mock the AllValueStoresStore class to avoid writing to disk"""
+
+    def __init__(self) -> None:
+        super().__init__(Path(), log_debug=lambda x: None)  # noqa: ARG005
+        self.update_count = 0
+
+    @override
+    def load(self) -> Mapping[value_store.ValueStoreKey, Mapping[str, str]]:
+        return {}
+
+    @override
+    def update(self, update: object) -> None:
+        pass
+
+
+class _LogwatchConfigMocker:
+    def __init__(self) -> None:
+        self.base_spool_path = paths.var_dir / "logwatch_spool"
+        self.msg_dir = paths.var_dir / "logwatch"
+        self.omd_root = paths.omd_root
+        self.debug = False
+
+    def logwatch_rules_all(
+        self,
+        *,
+        host_name: str,  # noqa: ARG002
+        plugin: CheckPlugin,  # noqa: ARG002
+        logfile: str,  # noqa: ARG002
+    ) -> Sequence[ParameterLogwatchRules]:
+        return ()
+
+    def logwatch_ec_all(self, host_name: str) -> Sequence[ParameterLogwatchEc]:  # noqa: ARG002
+        return ()
+
+
+@pytest.mark.parametrize("agent_data_filename", get_agent_data_filenames())
+@pytest.mark.usefixtures("setup_dirs")
+def test_checks_executor(agent_data_filename: str, request: pytest.FixtureRequest) -> None:
+    _SKIP_LIST = [
+        "agent-2.2.0p14-proxmox",
+        "agent-2.4.0-proxmox",
+    ]
+    if any(dump in request.node.name for dump in _SKIP_LIST):
+        pytest.skip(
+            reason="CMK-36484; This is an expected issue with Proxmox for 3.0. Right now, "
+            "we are doing an agent rework which is affecting this."
+        )
+
+    agent_based_plugins = config.load_all_plugins()
+    assert not agent_based_plugins.errors
+    assert agent_based_plugins.agent_sections
+
+    hosts_config = Hosts(
+        # weird to leave hosts empty, but at the time of writing this works
+        hosts=(),
+        clusters={},
+        shadow_hosts=(),
+        host_paths={},
+    )
+    source_info = SourceInfo(HOSTNAME, None, "test_dump", FetcherType.PUSH_AGENT, SourceType.HOST)
+    submitter = BasicSubmitter(HOSTNAME)
+    config_cache = config.ConfigCache(
+        EMPTY_CONFIG,
+        hosts_config,
+        config.make_host_tags(EMPTY_CONFIG, hosts_config),
+        autochecks_dir=paths.autochecks_dir,
+        discovered_host_labels_dir=paths.discovered_host_labels_dir,
+        builtin_host_labels_file=Path("/dev/null"),
+    )
+    parser_config = config.make_parser_config(
+        EMPTY_CONFIG,
+        config_cache.ruleset_matcher,
+        config_cache.label_manager,
+        ip_address_of=config_cache.primary_ip_address_of,
+    )
+
+    # make sure logwatch doesn't crash
+    set_global_state(_LogwatchConfigMocker())
+
+    discovered_services = discover_services(
+        HOSTNAME,
+        agent_data_filename,
+        parser_config,
+        config_cache.ruleset_matcher,
+        config_cache.check_plugin_ignored,
+        agent_based_plugins,
+        source_info,
+    )
+
+    with (
+        set_value_store_manager(
+            value_store.ValueStoreManager(HOSTNAME, _AllValueStoresStoreMocker()),
+            store_changes=False,
+        ) as value_store_manager,
+    ):
+        check_plugins = CheckerPluginMapper(
+            CheckerConfig(
+                only_from=config_cache.only_from,
+                effective_service_level=config_cache.service_level_config.effective,
+                get_clustered_service_configuration=config_cache.clustering.get_clustered_service_configuration,
+                nodes=lambda hn: hosts_config.clusters.get(hn, ()),
+                effective_host=config_cache.clustering.effective_host,
+                get_snmp_backend=config_cache.get_snmp_backend,
+                timeperiods_active={},
+            ),
+            agent_based_plugins.check_plugins,
+            value_store_manager,
+            clusters=(),
+            rtc_package=None,
+            omd_root=Path(""),
+        )
+        assert check_plugins
+
+        LOGGER.debug("check_plugins found: %s\n\n", list(check_plugins))
+        _ = execute_checkmk_checks(
+            hostname=HOSTNAME,
+            omd_root=Path(""),
+            fetched=[(source_info, get_raw_data(DUMPS_DIR / agent_data_filename))],
+            parser=parser(parser_config),
+            summarizer=summarizer(HOSTNAME),
+            section_plugins=SectionPluginMapper(
+                {**agent_based_plugins.agent_sections, **agent_based_plugins.snmp_sections}
+            ),
+            section_error_handling=lambda *a: "",  # noqa: ARG005
+            check_plugins=check_plugins,
+            inventory_plugins={},
+            inventory_parameters=lambda host, plugin: plugin.defaults,  # noqa: ARG005
+            params=HWSWInventoryParameters.from_raw({}),
+            services=discovered_services,
+            run_plugin_names=EVERYTHING,
+            get_check_period=lambda *_a, **_kw: TimeperiodName("24X7"),
+            submitter=submitter,
+            exit_spec=ExitSpec(),
+            timeperiods_active={},
+        )
+        checks_result = submitter.results
+        assert checks_result
+
+        if request.config.getoption("--store"):
+            store_services_states(checks_result, agent_data_filename)
+            return
+
+        compare_services_states(checks_result, agent_data_filename)

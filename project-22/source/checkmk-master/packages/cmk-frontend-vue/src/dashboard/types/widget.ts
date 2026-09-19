@@ -1,0 +1,123 @@
+/**
+ * Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+import type { components } from 'cmk-shared-typing/typescript/openapi_internal'
+import type { DateTimeRange } from 'cmk-ui-library/components/date-time'
+
+export type ComputedWidgetSpecResponse =
+  components['schemas']['ComputedWidgetResponse_ComputedWidgetSpec_']
+export type ComputedTopListResponse = components['schemas']['ComputedWidgetResponse_TopList_']
+export type ComputedTopList = components['schemas']['TopList']
+export type TopListEntry = components['schemas']['TopListEntry']
+export type TopListError = components['schemas']['TopListError']
+export type ComputedSingleMetricResponse =
+  components['schemas']['ComputedWidgetResponse_SingleMetric_']
+export type ComputedSingleMetric = components['schemas']['SingleMetric']
+export type ComputedTimelineCountResponse =
+  components['schemas']['ComputedWidgetResponse_TimelineCount_']
+export type ComputedTimelineCount = components['schemas']['TimelineCount']
+
+export type WidgetContent = components['schemas']['WidgetContent']
+export type WidgetSizeValue = components['schemas']['WidgetSizeValue']
+export type WidgetGeneralSettings = components['schemas']['WidgetGeneralSettings']
+export type WidgetFilterContext = components['schemas']['WidgetFilterContext']
+
+export type RelativeGridWidget = components['schemas']['RelativeGridWidgetResponse']
+export type ResponsiveGridWidget = components['schemas']['ResponsiveGridWidgetResponse']
+
+export type AnyWidget = RelativeGridWidget | ResponsiveGridWidget
+
+export type RelativeGridWidgets = components['schemas']['RelativeGridDashboardResponse']['widgets']
+export type ResponsiveGridWidgets =
+  components['schemas']['ResponsiveGridDashboardResponse']['widgets']
+
+export type RelativeGridWidgetLayout = components['schemas']['WidgetRelativeGridLayout']
+export type ResponsiveGridWidgetLayouts = components['schemas']['WidgetResponsiveGridLayouts']
+
+export type WidgetLayout = RelativeGridWidgetLayout | ResponsiveGridWidgetLayouts
+export interface WidgetSpec {
+  content: WidgetContent
+  filter_context: WidgetFilterContext
+  general_settings: WidgetGeneralSettings
+}
+export type WidgetContentType = components['schemas']['WidgetContent']['type']
+
+export type ResponsiveGridWidgetLayout = components['schemas']['WidgetResponsiveGridLayout']
+
+export type AnnotatedInfoName = components['schemas']['AnnotatedInfoName']
+
+export interface EffectiveWidgetFilterContext extends WidgetFilterContext {
+  restricted_to_single: AnnotatedInfoName[]
+}
+
+export type FilterHTTPVars = Record<string, string>
+export type VisualContext = Record<string, FilterHTTPVars>
+
+// Specific widget types
+export type EmbeddedViewContent = components['schemas']['EmbeddedViewContent']
+export type IFrameContent = components['schemas']['URLContent']
+export type LinkedViewContent = components['schemas']['LinkedViewContent']
+export type StaticTextContent = components['schemas']['StaticTextContent']
+export type TopListContent = components['schemas']['TopListContent']
+export type NetworkFlowTopTableContent = components['schemas']['NetworkFlowTopTableContent']
+export type ComputedNetworkFlowTopTableResponse =
+  components['schemas']['ComputedNetworkFlowTopTableResponse']
+export type NetworkFlowDonutContent = components['schemas']['NetworkFlowDonutContent']
+export type ComputedNetworkFlowDonutSlice = components['schemas']['ComputedNetworkFlowDonutSlice']
+export type ComputedNetworkFlowDonutResponse =
+  components['schemas']['ComputedNetworkFlowDonutResponse']
+export type NetworkFlowKpiStatCardContent = components['schemas']['NetworkFlowKpiStatCardContent']
+export type ComputedNetworkFlowKpiStatCardResponse =
+  components['schemas']['ComputedNetworkFlowKpiStatCardResponse']
+export type NetworkFlowTrendChartContent = components['schemas']['NetworkFlowTrendChartContent']
+export type ComputedNetworkFlowTrendChartResponse =
+  components['schemas']['ComputedNetworkFlowTrendChartResponse']
+export type ComputedNetworkFlowHostResponse =
+  components['schemas']['ComputedNetworkFlowHostResponse']
+export type ComputedNetworkFlowHost = components['schemas']['ComputedNetworkFlowHost']
+export type ComputedNetworkFlowAutonomousSystemResponse =
+  components['schemas']['ComputedNetworkFlowAutonomousSystemResponse']
+export type ComputedNetworkFlowAutonomousSystem =
+  components['schemas']['ComputedNetworkFlowAutonomousSystem']
+export type ComputedNetworkFlowHostApplication =
+  components['schemas']['ComputedNetworkFlowHostApplication']
+export type ComputedNetworkFlowHostPeer = components['schemas']['ComputedNetworkFlowHostPeer']
+export type SidebarElementContent = components['schemas']['SidebarElementContent']
+export type PerformanceGraphContent = components['schemas']['PerformanceGraphContent']
+export type SingleTimeseriesContent = components['schemas']['SingleTimeseriesContent']
+export type SingleMetricContent = components['schemas']['SingleMetricContent']
+export type AlertTimelineContent = components['schemas']['AlertTimelineContent']
+export type NotificationTimelineContent = components['schemas']['NotificationTimelineContent']
+/** Either timeline widget; they share their render modes and their computed count. */
+export type TimelineContent = AlertTimelineContent | NotificationTimelineContent
+export type CombinedGraphContent = components['schemas']['CombinedGraphContent']
+export type AverageScatterplotContent = components['schemas']['AverageScatterplotContent']
+export type ProblemGraphContent = components['schemas']['ProblemGraphContent']
+export type CustomGraphContent = components['schemas']['CustomGraphContent']
+// Only picks graph_render_options, used to check legend visibility in the scrollable preview
+// as this is used by multiple widget types we extract it only once here
+export type GraphWidgetContent = Pick<
+  components['schemas']['PerformanceGraphContent'],
+  'graph_render_options'
+>
+export type WidgetAvailableInventory =
+  components['schemas']['WidgetAvailableInventoryCollectionModel']
+
+export interface WidgetRefreshSignal {
+  tick: number
+}
+
+export interface WidgetInteractionState {
+  editMode: boolean
+  isPreview: boolean
+}
+
+export interface WidgetTimeRange {
+  range: DateTimeRange
+}
+
+export interface WidgetEmitTimeRange {
+  updateTimeRange: [range: DateTimeRange]
+}

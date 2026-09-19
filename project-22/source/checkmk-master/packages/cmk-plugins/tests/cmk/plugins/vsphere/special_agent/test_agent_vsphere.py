@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import argparse
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import override
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from cmk.plugins.vsphere.special_agent.agent_vsphere import (
+    ESXConnection,
+    ESXSession,
+    eval_multipath_info,
+    fetch_virtual_machines,
+    get_section_snapshot_summary,
+)
+from cmk.server_side_programs.v1_unstable import Storage
+
+
+def _build_id(lun_id: str) -> str:
+    # Taken from https://kb.vmware.com/s/article/2078730
+    assert len(lun_id) == 32 or len(lun_id) == 0
+    uuid_type = "02"
+    device_type = "00"
+    lun_number = "00"
+    reserved = "0000"
+    unique_hash = "695343534944"
+
+    return f"{uuid_type}{device_type}{lun_number}{reserved}{lun_id}{unique_hash}"
+
+
+VALID_LUN_ID = "12344a12345b4b0000333a4b00000320"
+VALID_PATH = "aaaaa1:AA:AA:AA"
+MULTIPATH_PROPSET = (
+    "<id>%s</id>"
+    "<path>"
+    f"<key>key-vim.host.MultipathInfo.Path-{VALID_PATH}</key>"
+    f"<name>{VALID_PATH}</name>"
+    "<pathState>active</pathState>"
+    "<state>active</state>"
+    "<isWorkingPath>true</isWorkingPath>"
+    "<adapter>key-vim.host.BlockHba-vmhba2</adapter>"
+    "<lun>key-vim.host.MultipathInfo.LogicalUnit-123456789</lun>"
+    '<transport xsi:type="HostBlockAdapterTargetTransport"></transport>'
+    "</path>"
+)
+PROP_NAME = "foo"
+
+
+@pytest.mark.parametrize(
+    "propset, expected",
+    [
+        (
+            MULTIPATH_PROPSET % _build_id(VALID_LUN_ID),
+            ({PROP_NAME: [f"{VALID_LUN_ID} {VALID_PATH} active"]}, {}),
+        ),
+        (
+            MULTIPATH_PROPSET % _build_id(""),
+            ({}, {}),
+        ),
+    ],
+)
+def test_eval_multipath_info(
+    propset: str, expected: tuple[Mapping[str, Sequence[str]], Mapping[object, object]]
+) -> None:
+    assert eval_multipath_info("", PROP_NAME, propset) == expected
+
+
+def test_postsoap_encodes_body_as_utf8() -> None:
+    session = ESXSession("vcenter.example.com", 443, cert_check=False)
+
+    payload = (
+        '<ns1:Login xsi:type="ns1:LoginRequestType">'
+        "  <ns1:userName>user</ns1:userName>"
+        "  <ns1:password>pa§§word</ns1:password>"
+        "</ns1:Login>"
+    )
+
+    with patch("requests.Session.post", return_value=MagicMock()) as mock_post:
+        session.postsoap(payload)
+
+    sent_data = mock_post.call_args.kwargs["data"]
+    assert isinstance(sent_data, bytes)
+    assert sent_data.decode("utf-8")
+    assert "pa§§word".encode() in sent_data
+
+
+class FakeConnection(ESXConnection):
+    """Encapsulates the API calls to the ESX system"""
+
+    def __init__(self) -> None:
+        pass
+
+    @override
+    def query_server(self, method: str, **kwargs: str) -> str:
+        return (
+            # this is thinned out data
+            '<?xml version="1.0" encoding="UTF-8"?><soapenv:Envelope xmlns:soapenc="http://schemas.xmlsoa'
+            'p.org/soap/encoding/" xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsd="h'
+            'ttp://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><soap'
+            'env:Body><RetrievePropertiesExResponse xmlns="urn:vim25"><returnval><token>0</token><objects'
+            '><obj type="VirtualMachine">vm-111</obj><propSet><name>config.datastoreUrl</name><val xsi:ty'
+            'pe="ArrayOfVirtualMachineConfigInfoDatastoreUrlPair"><VirtualMachineConfigInfoDatastoreUrlPa'
+            'ir xsi:type="VirtualMachineConfigInfoDatastoreUrlPair"><name>Storage</name><url>/vmfs/volume'
+            "s/11111111-22222222-0000-000000000000</url></VirtualMachineConfigInfoDatastoreUrlPair></val>"
+            '</propSet><propSet><name>config.guestFullName</name><val xsi:type="xsd:string">Red Hat Enter'
+            "prise Linux 7 (64 Bit)</val></propSet><propSet><name>config.hardware.device</name><val xsi:t"
+            'ype="ArrayOfVirtualDevice"><VirtualDevice xsi:type="VirtualIDEController"><key>200</key><dev'
+            "iceInfo><label>IDE 0</label><summary>IDE 0</summary></deviceInfo><busNumber>0</busNumber></V"
+            'irtualDevice></val></propSet><propSet><name>config.hardware.memoryMB</name><val xsi:type="xs'
+            'd:int">33333</val></propSet><propSet><name>config.uuid</name><val xsi:type="xsd:string">1111'
+            "1111-2222-3333-4444-555555555555</val></propSet><propSet><name>guestHeartbeatStatus</name><v"
+            'al xsi:type="ManagedEntityStatus">green</val></propSet><propSet><name>name</name><val xsi:ty'
+            'pe="xsd:string">AAA-BBBBBBB</val></propSet><propSet><name>runtime.host</name><val type="Host'
+            'System" xsi:type="ManagedObjectReference">host-222</val></propSet></objects><objects><obj ty'
+            'pe="VirtualMachine">vm-888</obj><propSet><name>guestHeartbeatStatus</name><val xsi:type="Man'
+            'agedEntityStatus">gray</val></propSet><propSet><name>name</name><val xsi:type="xsd:string">A'
+            'AA-BBBB-CCCCC</val></propSet><propSet><name>runtime.powerState</name><val xsi:type="VirtualM'
+            'achinePowerState">poweredOff</val></propSet></objects></returnval></RetrievePropertiesExResp'
+            "onse></soapenv:Body></soapenv:Envelope>"
+        )
+
+
+_STORE_AGENT = "agent_vsphere"
+_STORE_HOST = "vcenter.example.com"
+
+
+class StoreBackedConnection(ESXConnection):
+    """Connection wired to a real Storage, without performing any vCenter I/O."""
+
+    def __init__(self) -> None:
+        self._store = Storage(_STORE_AGENT, _STORE_HOST)
+        self._perf_samples = None
+
+    def read_stored_float(self, key: str, default: float) -> float:
+        return self._read_stored_float(key, default)
+
+
+class TestStoreBackedReads:
+    @pytest.fixture(autouse=True)  # ruff: ignore[pytest-fixture-autouse]
+    def patch_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setenv("SERVER_SIDE_PROGRAM_STORAGE_PATH", str(tmp_path))
+
+    def test_read_stored_float_falls_back_on_empty_content(self) -> None:
+        Storage(_STORE_AGENT, _STORE_HOST).write("timer", "")
+        connection = StoreBackedConnection()
+
+        result = connection.read_stored_float("timer", 12.5)
+
+        assert result == 12.5
+
+    def test_read_stored_float_falls_back_on_unparsable_content(self) -> None:
+        Storage(_STORE_AGENT, _STORE_HOST).write("timer", "not-a-float")
+        connection = StoreBackedConnection()
+
+        result = connection.read_stored_float("timer", 12.5)
+
+        assert result == 12.5
+
+    def test_read_stored_float_parses_valid_content(self) -> None:
+        Storage(_STORE_AGENT, _STORE_HOST).write("timer", "123.0")
+        connection = StoreBackedConnection()
+
+        result = connection.read_stored_float("timer", 12.5)
+
+        assert result == 123.0
+
+    def test_perf_samples_does_not_crash_on_empty_timer_store(self) -> None:
+        store = Storage(_STORE_AGENT, _STORE_HOST)
+        store.write("timer", "")
+
+        perf_samples = StoreBackedConnection().perf_samples
+
+        assert perf_samples >= 1
+        assert float(store.read("timer", ""))
+
+
+def test_cloning_vm_is_processed() -> None:
+    """
+    VMs that are in the process of being cloned do not define runtime.host.
+    Make sure that this does not lead to a KeyError.
+    """
+
+    opt = argparse.Namespace(skip_placeholder_vm=False, vm_piggyname=None, spaces="underscore")
+
+    result = fetch_virtual_machines(FakeConnection(), hostsystems={}, datastores={}, opt=opt)
+
+    assert result == (
+        {
+            "AAA-BBBB-CCCCC": {
+                "guestHeartbeatStatus": "gray",
+                "name": "AAA-BBBB-CCCCC",
+                "runtime.powerState": "poweredOff",
+            },
+            "AAA-BBBBBBB": {
+                "config.datastoreUrl": "name Storage",
+                "config.guestFullName": "Red Hat Enterprise Linux 7 (64 Bit)",
+                "config.hardware.device": "",
+                "config.hardware.memoryMB": "33333",
+                "config.uuid": "11111111-2222-3333-4444-555555555555",
+                "guestHeartbeatStatus": "green",
+                "name": "AAA-BBBBBBB",
+                "runtime.host": "host-222",
+            },
+        },
+        {"host-222": ["AAA-BBBBBBB"]},
+    )
+
+
+@pytest.mark.parametrize(
+    "virtual_machines, systime, expected_output",
+    [
+        pytest.param(
+            {
+                "vm_name": {
+                    "name": "vm_name",
+                    "snapshot.rootSnapshotList": "871 1605626114 poweredOn SnapshotName|834 1605632160 poweredOff Snapshotname2",
+                }
+            },
+            1605636114,
+            [
+                "<<<esx_vsphere_snapshots_summary:sep(0)>>>",
+                '{"time": 1605626114, "systime": 1605636114, "state": "poweredOn", "name": "SnapshotName", "vm": "vm_name"}',
+                '{"time": 1605632160, "systime": 1605636114, "state": "poweredOff", "name": "Snapshotname2", "vm": "vm_name"}',
+            ],
+            id="There are two snapshots available. For every available snapshot, information about the creation time, state, name and vm_name is provided.",
+        ),
+        pytest.param(
+            {"vm_name": {"name": "vm_name"}},
+            1605636114,
+            ["<<<esx_vsphere_snapshots_summary:sep(0)>>>"],
+            id="There are no snapshots available and because of that an empty section is created.",
+        ),
+        pytest.param(
+            {
+                "vm_name": {
+                    "name": "vm_name",
+                    "snapshot.rootSnapshotList": "871 1605626114 poweredOn SnapshotName",
+                }
+            },
+            1605636114,
+            [
+                "<<<esx_vsphere_snapshots_summary:sep(0)>>>",
+                '{"time": 1605626114, "systime": 1605636114, "state": "poweredOn", "name": "SnapshotName", "vm": "vm_name"}',
+            ],
+            id="There is only one snapshot available. Same behaviour as when there are multiple snapshots available.",
+        ),
+        pytest.param(
+            {
+                "vm_name": {
+                    "name": "vm_name",
+                    "snapshot.rootSnapshotList": "871 1605626114 poweredOn SnapshotName",
+                }
+            },
+            None,
+            [
+                "<<<esx_vsphere_snapshots_summary:sep(0)>>>",
+                '{"time": 1605626114, "systime": null, "state": "poweredOn", "name": "SnapshotName", "vm": "vm_name"}',
+            ],
+            id="Systime not available",
+        ),
+    ],
+)
+def test_get_section_snapshot_summary(
+    virtual_machines: Mapping[str, Mapping[str, str]],
+    systime: int | None,
+    expected_output: Sequence[str],
+) -> None:
+    assert get_section_snapshot_summary(virtual_machines, systime) == expected_output

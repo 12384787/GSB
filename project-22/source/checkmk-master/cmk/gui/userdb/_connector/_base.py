@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import abc
+from collections.abc import Sequence
+from datetime import datetime
+from typing import Literal, Protocol
+
+from cmk.ccc.user import UserId
+from cmk.crypto.password import Password
+from cmk.gui.type_defs import Users, UserSpec
+from cmk.gui.user_connection_config_types import UserConnectionConfig
+
+from .._user_attribute import UserAttribute
+
+CheckCredentialsResult = UserId | None | Literal[False]
+
+
+class LoadUsersFunction(Protocol):
+    def __call__(self, lock: bool = False) -> Users: ...
+
+
+class SaveUsersFunction(Protocol):
+    def __call__(
+        self,
+        profiles: Users,
+        user_attributes: Sequence[tuple[str, UserAttribute]],
+        user_connections: Sequence[UserConnectionConfig],
+        now: datetime,
+        pprint_value: bool,
+        call_users_saved_hook: bool,
+        /,
+        changed_users: list[UserId] | Literal["all"] = "all",
+    ) -> None: ...
+
+
+class UserConnector[T_Config: UserConnectionConfig](abc.ABC):
+    def __init__(self, cfg: T_Config) -> None:
+        self._config = cfg
+
+    @classmethod
+    @abc.abstractmethod
+    def type(cls) -> str:
+        raise NotImplementedError
+
+    @classmethod
+    @abc.abstractmethod
+    def title(cls) -> str:
+        """The string representing this connector to humans"""
+        raise NotImplementedError
+
+    @property
+    @abc.abstractmethod
+    def id(self) -> str:
+        """The unique identifier of the connection"""
+        raise NotImplementedError
+
+    @classmethod
+    @abc.abstractmethod
+    def short_title(cls) -> str:
+        raise NotImplementedError
+
+    @classmethod
+    def config_changed(cls) -> None:
+        return
+
+    #
+    # USERDB API METHODS
+    #
+
+    @abc.abstractmethod
+    def is_enabled(self) -> bool:
+        raise NotImplementedError
+
+    # Optional: Hook function can be registered here to be executed
+    # to validate a login issued by a user.
+    # Gets parameters: username, password
+    # Has to return either:
+    #     '<user_id>' -> Login succeeded
+    #     False       -> Login failed
+    #     None        -> Unknown user
+    def check_credentials(
+        self,
+        user_id: UserId,  # noqa: ARG002
+        password: Password,  # noqa: ARG002
+        user_attributes: Sequence[tuple[str, UserAttribute]],  # noqa: ARG002
+        user_connections: Sequence[UserConnectionConfig],  # noqa: ARG002
+        default_user_profile: UserSpec,  # noqa: ARG002
+    ) -> CheckCredentialsResult:
+        return None
+
+    # Optional: Hook function can be registered here to be executed
+    # to synchronize all users.
+    def do_sync(
+        self,
+        *,
+        add_to_changelog: bool,  # noqa: ARG002
+        only_username: UserId | None,  # noqa: ARG002
+        user_attributes: Sequence[tuple[str, UserAttribute]],  # noqa: ARG002
+        load_users_func: LoadUsersFunction,  # noqa: ARG002
+        save_users_func: SaveUsersFunction,  # noqa: ARG002
+        default_user_profile: UserSpec,  # noqa: ARG002
+    ) -> None:
+        return
+
+    # Optional: Tells whether or not the synchronization (using do_sync()
+    # method) is needed.
+    def sync_is_needed(self) -> bool:
+        return False
+
+    # Optional: Hook function can be registered here to be xecuted
+    # to save all users.
+    def save_users(self, users: dict[UserId, UserSpec]) -> None:  # noqa: ARG002
+        return
+
+    # List of user attributes locked for all users attached to this
+    # connection. Those locked attributes are read-only in Setup.
+    def locked_attributes(
+        self,
+        user_attributes: Sequence[tuple[str, UserAttribute]],  # noqa: ARG002
+    ) -> Sequence[str]:
+        return []
+
+    def multisite_attributes(
+        self,
+        user_attributes: Sequence[tuple[str, UserAttribute]],  # noqa: ARG002
+    ) -> Sequence[str]:
+        return []
+
+    def non_contact_attributes(
+        self,
+        user_attributes: Sequence[tuple[str, UserAttribute]],  # noqa: ARG002
+    ) -> Sequence[str]:
+        return []
+
+
+class ConnectorType:
+    # TODO: should be improved to be an enum
+    SAML2 = "saml2"
+    LDAP = "ldap"
+    HTPASSWD = "htpasswd"
+    OAUTH2 = "oauth2"

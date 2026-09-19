@@ -1,0 +1,39 @@
+{
+  "cmk.buildVenv": {
+    "name": "Build venv",
+    "command": "bazel run //:create_venv",
+    "postAction": "cmk.resolveInterpreter"
+  },
+  "cmk.buildSharedTyping": {
+    "name": "Build shared-typing",
+    "command": "bazel build //packages/cmk-shared-typing:cmk_shared_typing_ts //packages/cmk-shared-typing:cmk_shared_typing_py && for pkg in cmk-frontend-vue cmk-ui-library; do mkdir -p packages/$pkg/node_modules/ && ln -sfn $(bazel info bazel-bin)/packages/cmk-shared-typing packages/$pkg/node_modules/cmk-shared-typing; done",
+    "requires": "frontend"
+  },
+  "cmk.buildCmkFrontend": {
+    "name": "Build cmk-frontend",
+    "command": "bazel build //packages/cmk-frontend:dist && rm -rf packages/cmk-frontend/dist && ln -sfn $(bazel info bazel-bin)/packages/cmk-frontend/dist packages/cmk-frontend/dist",
+    "requires": "frontend"
+  },
+  "cmk.buildCmkFrontendVue": {
+    "name": "Build cmk-frontend-vue",
+    "command": "bazel build //packages/cmk-frontend-vue:dist",
+    "requires": "frontend"
+  },
+  "cmk.runUcl": {
+    "name": "Run UI Component Library",
+    "command": "cd packages/cmk-frontend-vue && { ibazel build //packages/cmk-frontend:dist //packages/cmk-frontend-vue:compile_i18n //packages/cmk-shared-typing:cmk_shared_typing_ts & deps=$!; trap 'kill $deps 2>/dev/null' EXIT; ./node_modules/.bin/vite --config vite.config.ucl.ts; }",
+    "requires": "frontend",
+    "force": true,
+    "openBrowser": "http://localhost:5174/"
+  },
+  "cmk.installNodeModules": {
+    "name": "Install node_modules",
+    "command": "bazel build @pnpm//:pnpm && BAZEL_BINDIR=. \"$(bazel info bazel-bin)/external/aspect_rules_js++pnpm+pnpm/pnpm_/pnpm\" install",
+    "requires": "frontend"
+  },
+  "cmk.refreshCompileCommands": {
+    "name": "Refresh C++ compile_commands.json",
+    "command": "bazel build //bazel/tools:bazel_env && bazel run //:refresh_compile_commands",
+    "requires": "cpp"
+  }
+}

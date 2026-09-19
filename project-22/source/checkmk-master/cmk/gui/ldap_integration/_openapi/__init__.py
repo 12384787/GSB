@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+# Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+# mypy: disable-error-code="comparison-overlap"
+# mypy: disable-error-code="explicit-any"
+
+from collections.abc import Mapping
+from typing import Any
+
+import cmk.utils.paths
+from cmk.ccc.site import omd_site, SiteId
+from cmk.ccc.user import UserId
+from cmk.ccc.version import edition
+from cmk.gui.config import active_config, Config
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.http import Response
+from cmk.gui.i18n import _
+from cmk.gui.ldap_integration._openapi._fields import LDAPConnectionID
+from cmk.gui.ldap_integration._openapi.error_schemas import GETLdapConnection404
+from cmk.gui.ldap_integration._openapi.internal_to_restapi_interface import (
+    LDAPConnectionInterface,
+    request_ldap_connection,
+    request_ldap_connections,
+    update_suffixes,
+)
+from cmk.gui.ldap_integration._openapi.request_schemas import (
+    LDAPConnectionConfigCreateRequest,
+    LDAPConnectionConfigUpdateRequest,
+)
+from cmk.gui.ldap_integration._openapi.response_schemas import (
+    LDAPConnectionResponse,
+    LDAPConnectionResponseCollection,
+)
+from cmk.gui.logged_in import user
+from cmk.gui.openapi.restful_objects import Endpoint
+from cmk.gui.openapi.restful_objects.constructors import (
+    collection_href,
+    collection_object,
+    domain_object,
+    hash_of_dict,
+    object_href,
+    require_etag,
+    response_with_etag_created_from_dict,
+)
+from cmk.gui.openapi.restful_objects.registry import EndpointRegistry
+from cmk.gui.openapi.restful_objects.type_defs import DomainObject
+from cmk.gui.openapi.shared_endpoint_families.ldap_connection import LDAP_CONNECTION_FAMILY
+from cmk.gui.openapi.utils import ProblemException, serve_json
+from cmk.gui.user_connection_config_types import (
+    ConfigurableUserConnectionSpec,
+    LDAPUserConnectionConfig,
+    SAMLUserConnectionConfig,
+)
+from cmk.gui.user_sites import activation_sites
+from cmk.gui.userdb import get_ldap_connections, UserConnectionConfigFile
+from cmk.gui.wato.pages.userdb_common import get_affected_sites
+from cmk.gui.watolib.audit_log import make_audit_log_change_hook
+from cmk.gui.watolib.config_domains import ConfigDomainGUI
+from cmk.gui.watolib.pending_changes import (
+    index_update_change_hook,
+    PendingChanges,
+    PendingChangesStore,
+)
+from cmk.web.utils import permission_verification as permissions
+
+RO_PERMISSIONS = permissions.AllPerm(
+    [
+        permissions.Perm("wato.seeall"),
+        permissions.Perm("wato.users"),
+    ]
+)
+RW_PERMISSIONS = permissions.AllPerm(
+    [
+        permissions.Perm("wato.edit"),
+        RO_PERMISSIONS,
+    ]
+)
+
+
+LDAP_CONNECTION_ID_EXISTS = {
+    "ldap_connection_id": LDAPConnectionID(
+        presence="should_exist",
+        example="LDAP_1",
+    ),
+}
+
+
+@Endpoint(
+    object_href("ldap_connection", "{ldap_connection_id}"),
+    "cmk/show",
+    method="get",
+    etag="output",
+    tag_group="Setup",
+    path_params=[LDAP_CONNECTION_ID_EXISTS],
+    response_schema=LDAPConnectionResponse,
+    error_schemas={404: GETLdapConnection404},
+    permissions_required=RO_PERMISSIONS,
+    family_name=LDAP_CONNECTION_FAMILY.name,
+)
+def show_ldap_connection(params: Mapping[str, Any]) -> Response:
+    """Show an LDAP connection"""
+    user.need_permission("wato.seeall")
+    user.need_permission("wato.users")
+    ldap_id = params["ldap_connection_id"]
+    connection = request_ldap_connection(ldap_id=ldap_id)
+    return response_with_etag_created_from_dict(
+        serve_json(
+            _serialize_ldap_connection(
+                request_ldap_connection(ldap_id=params["ldap_connection_id"])
+            )
+        ),
+        connection.api_response(),
+    )
+
+
+@Endpoint(
+    collection_href("ldap_connection"),
+    ".../collection",
+    method="get",
+    tag_group="Setup",
+    response_schema=LDAPConnectionResponseCollection,
+    permissions_required=RO_PERMISSIONS,
+    family_name=LDAP_CONNECTION_FAMILY.name,
+)
+def show_ldap_connections(params: Mapping[str, Any]) -> Response:  # noqa: ARG001
+    """Show all LDAP connections"""
+    user.need_permission("wato.seeall")
+    user.need_permission("wato.users")
+    return serve_json(
+        collection_object(
+            domain_type="ldap_connection",
+            value=[_serialize_ldap_connection(cnx) for cnx in request_ldap_connections().values()],
+        )
+    )
+
+
+@Endpoint(
+    object_href("ldap_connection", "{ldap_connection_id}"),
+    ".../delete",
+    method="delete",
+    etag="input",
+    path_params=[LDAP_CONNECTION_ID_EXISTS],
+    output_empty=True,
+    permissions_required=RW_PERMISSIONS,
+    family_name=LDAP_CONNECTION_FAMILY.name,
+)
+def delete_ldap_connection(params: Mapping[str, Any]) -> Response:
+    """Delete an LDAP connection"""
+    user.need_permission("wato.edit")
+    user.need_permission("wato.seeall")
+    user.need_permission("wato.users")
+    ldap_id = params["ldap_connection_id"]
+    if (connection := request_ldap_connection(ldap_id=ldap_id)) is not None:
+        require_etag(hash_of_dict(connection.api_response()))
+
+        config_file = UserConnectionConfigFile()
+        all_connections = config_file.load_for_modification()
+        updated_connections = [c for c in all_connections if c["id"] != ldap_id]
+        deleted_connection = [c for c in all_connections if c["id"] == ldap_id][0]
+        update_suffixes(updated_connections)
+        config_file.delete(
+            cfg=updated_connections,
+            connection_id=ldap_id,
+            connection_type="ldap",
+            sites=_get_affected_sites(deleted_connection),
+            domains=[ConfigDomainGUI()],
+            pprint_value=active_config.wato_pprint_config,
+            pending_changes=_pending_changes(active_config, omd_site(), user.id),
+        )
+
+    return Response(status=204)
+
+
+def _get_affected_sites(connection: ConfigurableUserConnectionSpec) -> list[SiteId]:
+    return get_affected_sites(edition(cmk.utils.paths.omd_root), active_config.sites, connection)
+
+
+@Endpoint(
+    collection_href("ldap_connection"),
+    "cmk/create",
+    method="post",
+    etag="output",
+    tag_group="Setup",
+    request_schema=LDAPConnectionConfigCreateRequest,
+    response_schema=LDAPConnectionResponse,
+    permissions_required=RW_PERMISSIONS,
+    family_name=LDAP_CONNECTION_FAMILY.name,
+)
+def create_ldap_connection(params: Mapping[str, Any]) -> Response:
+    """Create an LDAP connection"""
+    user.need_permission("wato.edit")
+    user.need_permission("wato.seeall")
+    user.need_permission("wato.users")
+
+    connection = LDAPConnectionInterface.from_api_request(params["body"])
+    config_file = UserConnectionConfigFile()
+    all_connections = config_file.load_for_modification()
+    all_connections.append(connection.to_mk_format())
+    update_suffixes(all_connections)
+
+    config_file.create(
+        cfg=all_connections,
+        connection_type="ldap",
+        sites=_get_affected_sites(connection.to_mk_format()),
+        domains=[ConfigDomainGUI()],
+        pprint_value=active_config.wato_pprint_config,
+        pending_changes=_pending_changes(active_config, omd_site(), user.id),
+    )
+
+    return response_with_etag_created_from_dict(
+        serve_json(_serialize_ldap_connection(connection)),
+        connection.api_response(),
+    )
+
+
+@Endpoint(
+    object_href("ldap_connection", "{ldap_connection_id}"),
+    "cmk/update",
+    method="put",
+    etag="both",
+    tag_group="Setup",
+    path_params=[LDAP_CONNECTION_ID_EXISTS],
+    request_schema=LDAPConnectionConfigUpdateRequest,
+    response_schema=LDAPConnectionResponse,
+    error_schemas={404: GETLdapConnection404},
+    permissions_required=RW_PERMISSIONS,
+    family_name=LDAP_CONNECTION_FAMILY.name,
+)
+def edit_ldap_connection(params: Mapping[str, Any]) -> Response:
+    """Update an ldap connection"""
+    user.need_permission("wato.edit")
+    user.need_permission("wato.seeall")
+    user.need_permission("wato.users")
+    ldap_id = params["ldap_connection_id"]
+    current_connection = request_ldap_connection(ldap_id=ldap_id)
+    require_etag(hash_of_dict(current_connection.api_response()))
+
+    ldap_data = params["body"]
+    ldap_data["general_properties"]["id"] = ldap_id
+    try:
+        if ldap_data["ldap_connection"]["connection_suffix"]["state"] == "enabled":
+            for ldap_connection in [
+                cnx for ldapid, cnx in get_ldap_connections().items() if ldapid != ldap_id
+            ]:
+                if (suffix := ldap_connection.get("suffix")) is not None and suffix == ldap_data[
+                    "ldap_connection"
+                ]["connection_suffix"]["suffix"]:
+                    raise MKUserError(
+                        None,
+                        _("The suffix '%(suffix)s' is already in use by another LDAP connection.")
+                        % {"suffix": ldap_connection["suffix"]},
+                    )
+
+        config_file = UserConnectionConfigFile()
+        ldap_connection_from_request = LDAPConnectionInterface.from_api_request(ldap_data)
+        updated_connection = ldap_connection_from_request.to_mk_format()
+
+        modified_connections: list[LDAPUserConnectionConfig | SAMLUserConnectionConfig] = [
+            updated_connection if connection["id"] == ldap_id else connection
+            for connection in config_file.load_for_modification()
+        ]
+
+        update_suffixes(modified_connections)
+
+        config_file.update(
+            cfg=modified_connections,
+            connection_id=ldap_id,
+            connection_type="ldap",
+            sites=_get_affected_sites(updated_connection),
+            domains=[ConfigDomainGUI()],
+            pprint_value=active_config.wato_pprint_config,
+            pending_changes=_pending_changes(active_config, omd_site(), user.id),
+        )
+
+    except MKUserError as exc:
+        raise ProblemException(
+            title=f"There was problem when trying to update the LDAP connection with ldap_id {ldap_id}",
+            detail=str(exc),
+        )
+
+    return response_with_etag_created_from_dict(
+        serve_json(_serialize_ldap_connection(ldap_connection_from_request)),
+        ldap_connection_from_request.api_response(),
+    )
+
+
+def _serialize_ldap_connection(connection: LDAPConnectionInterface) -> DomainObject:
+    return domain_object(
+        domain_type="ldap_connection",
+        identifier=connection.general_properties.id,
+        title=connection.general_properties.description,
+        extensions=connection.api_response(),
+        editable=True,
+        deletable=True,
+    )
+
+
+def register(endpoint_registry: EndpointRegistry) -> None:
+    endpoint_registry.register(show_ldap_connection)
+    endpoint_registry.register(show_ldap_connections)
+    endpoint_registry.register(delete_ldap_connection)
+    endpoint_registry.register(create_ldap_connection)
+    endpoint_registry.register(edit_ldap_connection)
+
+
+def _pending_changes(config: Config, local_site: SiteId, user_id: UserId | None) -> PendingChanges:
+    return PendingChanges(
+        activation_sites=activation_sites(config.sites),
+        local_site=local_site,
+        acting_user=user_id,
+        store=PendingChangesStore(),
+        hooks=(make_audit_log_change_hook(use_git=config.wato_use_git), index_update_change_hook),
+    )

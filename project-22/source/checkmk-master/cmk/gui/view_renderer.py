@@ -1,0 +1,869 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import abc
+import collections
+import contextlib
+import json
+import re
+from collections.abc import Callable, Iterator, Sequence
+from typing import Final, override
+
+import cmk.ccc.version as cmk_version
+import cmk.gui.view_utils
+import cmk.utils.paths
+from cmk.gui import sites, visuals, weblib
+from cmk.gui.alarm import play_alarm_sounds
+from cmk.gui.breadcrumb import Breadcrumb
+from cmk.gui.config import active_config
+from cmk.gui.data_source import row_id
+from cmk.gui.display_options import display_options
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.graphing import global_time_picker_refresh, render_global_time_picker
+from cmk.gui.hooks import call as call_hooks
+from cmk.gui.htmllib.html import html
+from cmk.gui.http import request
+from cmk.gui.i18n import _
+from cmk.gui.logged_in import LoggedInUser, user
+from cmk.gui.main_navigation import MainNavigation
+from cmk.gui.page_menu import (
+    make_checkbox_selection_topic,
+    make_display_options_dropdown,
+    make_external_link,
+    make_simple_link,
+    PageMenu,
+    PageMenuDropdown,
+    PageMenuEntry,
+    PageMenuLink,
+    PageMenuPopup,
+    PageMenuSidePopup,
+    PageMenuTopic,
+    PageMenuVue,
+)
+from cmk.gui.page_menu_entry import toggle_page_menu_entries
+from cmk.gui.page_menu_utils import collect_context_links, get_context_page_menu_dropdowns
+from cmk.gui.painter_options import PainterOptions
+from cmk.gui.top_heading import top_heading
+from cmk.gui.type_defs import InfoName, Rows, ViewSpec, VisualContext
+from cmk.gui.utils.output_funnel import output_funnel
+from cmk.gui.utils.roles import UserPermissions
+from cmk.gui.utils.selection_id import SelectionId
+from cmk.gui.utils.transaction_manager import transactions
+from cmk.gui.view import View
+from cmk.gui.view_breadcrumbs import view_breadcrumb
+from cmk.gui.views.command import Command, do_actions, get_command_groups, should_show_command_form
+from cmk.gui.views.page_ajax_filters import AjaxInitialViewFilters
+from cmk.gui.visuals import view_title
+from cmk.gui.visuals.filter import Filter
+from cmk.web.utils.doc_references import DocReference
+from cmk.web.utils.html import HTML
+from cmk.web.utils.icons import IconNames, StaticIcon
+from cmk.web.utils.urls import HTTPVariable, makeuri, makeuri_contextless
+
+_NON_DEFAULT_KEYS_TO_IGNORE: Final = frozenset(
+    {"_csrf_token", "_active", "_apply", "selection", "filled_in", "view_name", "name"}
+)
+_NON_DEFAULT_KEY_REGEX: Final = re.compile(r".*(_op|_bool|_count|_indexof_\d+)$")
+_COUNT_KEY_REGEX: Final = re.compile(r".*_count$")
+_OP_KEY_REGEX: Final = re.compile(r".*_op$")
+
+
+def check_if_non_default_filter_in_request(ctx: VisualContext) -> bool:
+    if request.var("filled_in") != "filter" or request.var("_active") == "":
+        return False
+
+    ctx_keys = set(ctx.keys())
+    request_arg_keys = request.args.keys() - _NON_DEFAULT_KEYS_TO_IGNORE
+
+    for active_key in (request.var("_active") or "").split(";"):
+        if active_key in ctx:
+            ctx_keys.discard(active_key)
+            request_arg_keys.discard(active_key)
+
+            if ctx_sub_keys := ctx[active_key].keys():
+                request_arg_keys -= ctx_sub_keys
+                for sub_key in ctx_sub_keys:
+                    given = request.var(sub_key) or ""
+                    default = ctx[active_key][sub_key] or ""
+                    default = "is" if _OP_KEY_REGEX.match(sub_key) and default == "" else default
+
+                    # Variables with the `_count` suffix and a value of "" are valid as they
+                    # can also increase the count.
+                    if given != default and not _COUNT_KEY_REGEX.match(sub_key):
+                        return True
+
+            # First request check: only hit if key in _active and ctx without sub keys.
+            elif request.var(active_key):
+                return True
+
+        # Second request check: hit if key found in _active but not in context.
+        elif request.var(active_key):
+            return True
+
+    # If any request args remain and are not default keys, a filter must exist.
+    if any(key for key in request_arg_keys if not _NON_DEFAULT_KEY_REGEX.match(key)):
+        return True
+
+    # If any context keys remain post-processing, a filter must exist.
+    return bool(ctx_keys)
+
+
+def _filter_selected_rows(view_spec: ViewSpec, rows: Rows, selected_ids: list[str]) -> Rows:
+    action_rows: Rows = []
+    for row in rows:
+        if row_id(view_spec["datasource"], row) in selected_ids:
+            action_rows.append(row)
+    return action_rows
+
+
+def show_filter_form(view: View, show_filters: list[Filter]) -> None:
+    context = dict(view.context)
+    if "siteopt" in context and (site_id := request.var("site")):
+        context["siteopt"] = {"site": site_id}
+    visuals.show_filter_form(
+        info_list=view.datasource.infos,
+        context={f.ident: context.get(f.ident, {}) for f in show_filters if f.available()},
+        page_name=view.name,
+        reset_ajax_page="ajax_initial_view_filters",
+    )
+
+
+class ABCViewRenderer(abc.ABC):
+    def __init__(self, view: View) -> None:
+        super().__init__()
+        self.view = view
+        self._menu_topics: dict[str, list[PageMenuTopic]] = collections.defaultdict(list)
+
+    def append_menu_topic(self, dropdown: str, topic: PageMenuTopic) -> None:
+        self._menu_topics[dropdown].append(topic)
+
+    @abc.abstractmethod
+    def render(
+        self,
+        rows: Rows,
+        show_checkboxes: bool,
+        num_columns: int,
+        show_filters: list[Filter],
+        unfiltered_amount_of_rows: int,
+        user_permissions: UserPermissions,
+        *,
+        debug: bool,
+        inject_js_profiling_code: bool,
+        load_frontend_vue: str,
+        custom_style_sheet: str | None,
+        screenshotmode: bool,
+        selection_livetime: int,
+        show_livestatus_errors: bool,
+        enable_sounds: bool,
+        sounds: Sequence[tuple[str, str]],
+        sound_url: str,
+    ) -> None:
+        raise NotImplementedError
+
+
+class GUIViewRenderer(ABCViewRenderer):
+    def __init__(
+        self,
+        view: View,
+        show_buttons: bool,
+        page_menu_dropdowns_callback: Callable[[View, Rows, list[PageMenuDropdown]], None],
+        render_row_limit_warning: Callable[[int, LoggedInUser], None] | None = None,
+    ) -> None:
+        super().__init__(view)
+        self._show_buttons = show_buttons
+        self._page_menu_dropdowns_callback = page_menu_dropdowns_callback
+        self._render_row_limit_warning = (
+            cmk.gui.view_utils.query_limit_exceeded_warn
+            if render_row_limit_warning is None
+            else render_row_limit_warning
+        )
+
+    @override
+    def render(
+        self,
+        rows: Rows,
+        show_checkboxes: bool,
+        num_columns: int,
+        show_filters: list[Filter],
+        unfiltered_amount_of_rows: int,
+        user_permissions: UserPermissions,
+        *,
+        debug: bool,
+        inject_js_profiling_code: bool,
+        load_frontend_vue: str,
+        custom_style_sheet: str | None,
+        screenshotmode: bool,
+        selection_livetime: int,
+        show_livestatus_errors: bool,
+        enable_sounds: bool,
+        sounds: Sequence[tuple[str, str]],
+        sound_url: str,
+    ) -> None:
+        view_spec = self.view.spec
+
+        if transactions.transaction_valid(request) and html.do_actions():
+            html.browser_reload = 0.0
+
+        command_form = should_show_command_form(self.view.datasource)
+        if command_form:
+            weblib.init_selection(selection_livetime)
+            if self.view.checkboxes_displayed:
+                SelectionId.from_request(request)
+
+        # Show/hide the header with page title, MK logo, etc. — replaces the
+        # bare ``html.body_start`` so views render the main navigation +
+        # sidebar like every other page. ``main_navigation.render`` emits
+        # html_head, opens <body>, the nav + sidebar, and the #content_area
+        # wrapper that ``html.footer`` later closes via ``body_end``.
+        if display_options.enabled(display_options.H):
+            MainNavigation.render(active_config, view_title(view_spec, self.view.context))
+
+        if display_options.enabled(display_options.T):
+            breadcrumb = view_breadcrumb(self.view)
+            top_heading(
+                html,
+                request,
+                view_title(view_spec, self.view.context),
+                breadcrumb,
+                page_menu=self._page_menu(rows, show_filters, user_permissions),
+                browser_reload=html.browser_reload,
+                debug=debug,
+                hide_suggestions=not user.get_tree_state("suggestions", "all", True),
+                user_role_ids=user.role_ids,
+            )
+            if self.view.renders_engine_graphs:
+                self._render_time_picker()
+            html.begin_page_content()
+
+        has_done_actions = False
+        row_count = len(rows)
+
+        # Used this before. This does not looked like it's correct, replaced the logic
+        # enable_commands = painter_options.painter_option_form_enabled()
+        # enable_checkboxes = view.layout.can_display_checkboxes and not checkboxes_enforced
+        # selection_enabled = enable_checkboxes if enable_commands else checkboxes_enforced
+        html.javascript(
+            "cmk.selection.set_selection_enabled(%s);" % json.dumps(self.view.checkboxes_displayed)
+        )
+
+        layout = self.view.layout
+
+        # Display the filter form on page rendering in some cases
+        if self._should_show_filter_form():
+            html.final_javascript("cmk.page_menu.open_popup('popup_filters');")
+
+        # Actions
+        if command_form:
+            # There are one shot actions which only want to affect one row, filter the rows
+            # by this id during actions
+            if request.has_var("_row_id") and html.do_actions():
+                rows = _filter_selected_rows(
+                    view_spec, rows, [request.get_str_input_mandatory("_row_id")]
+                )
+
+            # If we are currently within an action (confirming or executing), then
+            # we display only the selected rows (if checkbox mode is active)
+            elif show_checkboxes and html.do_actions():
+                rows = _filter_selected_rows(
+                    view_spec,
+                    rows,
+                    user.get_rowselection(
+                        SelectionId.from_request(request), "view-" + view_spec["name"]
+                    ),
+                )
+
+            if html.do_actions() and transactions.transaction_valid(
+                request
+            ):  # submit button pressed, no reload
+                try:
+                    # Create URI with all actions variables removed
+                    backurl = makeuri(request, [], delvars=["filled_in", "actions"])
+                    has_done_actions = do_actions(
+                        view_spec,
+                        self.view.datasource.infos[0],
+                        rows,
+                        backurl,
+                        debug=debug,
+                    )
+                except MKUserError as e:
+                    html.user_error(e)
+
+        # Also execute commands in cases without command form (needed for Python-
+        # web service e.g. for NagStaMon)
+        elif (
+            row_count > 0
+            and user.may("general.act")
+            and html.do_actions()
+            and transactions.transaction_valid(request)
+        ):
+            # There are one shot actions which only want to affect one row, filter the rows
+            # by this id during actions
+            if request.has_var("_row_id") and html.do_actions():
+                rows = _filter_selected_rows(
+                    view_spec, rows, [request.get_str_input_mandatory("_row_id")]
+                )
+
+            with contextlib.suppress(Exception):  # currently no feed back on webservice
+                do_actions(view_spec, self.view.datasource.infos[0], rows, "", debug=debug)
+
+        # The refreshing content container
+        if display_options.enabled(display_options.R):
+            html.open_div(id_="data_container")
+
+        # In multi site setups error messages of single sites do not block the
+        # output and raise now exception. We simply print error messages here.
+        # In case of the web service we show errors only on single site installations.
+        if show_livestatus_errors and display_options.enabled(display_options.W):
+            for info in sites.live().dead_sites().values():
+                if isinstance(info["site"], dict):
+                    html.show_error(
+                        "<b>{} - {}</b><br>{}".format(
+                            info["site"]["alias"], _("Livestatus error"), info["exception"]
+                        )
+                    )
+
+        missing_single_infos = self.view.missing_single_infos
+        if missing_single_infos:
+            html.show_warning(
+                _(
+                    "Unable to render this view, "
+                    "because we miss some required context information (%(single_infos)s). Please update the "
+                    "form on the right to make this view render."
+                )
+                % {"single_infos": ", ".join(sorted(missing_single_infos))}
+            )
+
+        for message in self.view.warning_messages:
+            html.show_warning(message)
+
+        call_hooks("view_banner", self.view.name)
+        call_hooks("rmk_view_banner", self.view.name)
+        call_hooks("experimental_view_button", self.view.name)
+
+        if not has_done_actions and not missing_single_infos:
+            if self.view.spec.get("mustsearch") and len(rows) == 0:
+                html.open_div(class_="info")
+                html.static_icon(StaticIcon(IconNames.toggle_details))
+                html.span(
+                    _(' To view content, click on "<b>Apply filters</b>" in the "Filters" panel.')
+                )
+                html.close_div()
+
+            html.div("", id_="row_info")
+            if display_options.enabled(display_options.W):
+                row_limit = None if self.view.datasource.ignore_limit else self.view.row_limit
+                if row_limit and (
+                    cmk.gui.view_utils.row_limit_exceeded(unfiltered_amount_of_rows, row_limit)
+                    or cmk.gui.view_utils.row_limit_exceeded(len(rows), row_limit)
+                ):
+                    self._render_row_limit_warning(row_limit, user)
+                    del rows[row_limit:]
+                    self.view.process_tracking.amount_rows_after_limit = len(rows)
+
+            layout.render(
+                rows,
+                view_spec,
+                self.view.group_cells,
+                self.view.row_cells,
+                num_columns,
+                show_checkboxes and not html.do_actions(),
+                user_permissions,
+            )
+            row_info = "%d %s" % (row_count, _("row") if row_count == 1 else _("rows"))
+            if show_checkboxes:
+                selected = _filter_selected_rows(
+                    view_spec,
+                    rows,
+                    user.get_rowselection(
+                        SelectionId.from_request(request), "view-" + view_spec["name"]
+                    ),
+                )
+                row_info = "%d/%s" % (len(selected), row_info)
+            html.javascript("cmk.utils.update_row_info(%s);" % json.dumps(row_info))
+
+            # The number of rows might have changed to enable/disable actions and checkboxes
+            if self._show_buttons:
+                # don't take display_options into account here ('c' is set during reload)
+                toggle_page_menu_entries(
+                    html,
+                    css_class="command",
+                    state=row_count > 0
+                    and should_show_command_form(self.view.datasource, ignore_display_option=True),
+                )
+
+            # Play alarm sounds, if critical events have been displayed
+            if display_options.enabled(display_options.S) and view_spec.get("play_sounds"):
+                play_alarm_sounds(
+                    enable_sounds=enable_sounds,
+                    sounds=sounds,
+                    sound_url=sound_url,
+                )
+        else:
+            # Always hide action related context links in this situation
+            toggle_page_menu_entries(html, css_class="command", state=False)
+
+        if display_options.enabled(display_options.R):
+            html.close_div()
+
+        if display_options.enabled(display_options.T):
+            html.end_page_content()
+
+        if display_options.enabled(display_options.H):
+            html.body_end()
+
+    def _should_show_filter_form(self) -> bool:
+        """Whether or not the filter form should be displayed on page load
+
+        a) In case the user toggled the popup in the frontend, always enforce that property
+
+        b) Show in case the view is a "mustsearch" view (User needs to submit the filter form before
+        data is shown).
+
+        c) Show after submitting the filter form. The user probably wants to update the filters
+        after first filtering.
+
+        d) In case there are single info filters missing
+        """
+
+        show_form = request.get_integer_input("_show_filter_form")
+        if show_form is not None:
+            return show_form == 1
+
+        return (
+            bool(self.view.spec.get("mustsearch"))
+            or request.get_ascii_input("filled_in") == "filter"
+            or bool(self.view.missing_single_infos)
+        )
+
+    def _page_menu(
+        self, rows: Rows, show_filters: list[Filter], user_permissions: UserPermissions
+    ) -> PageMenu:
+        breadcrumb: Breadcrumb = view_breadcrumb(self.view)
+        if not display_options.enabled(display_options.B):
+            return PageMenu()  # No buttons -> no menu
+
+        export_dropdown = [
+            PageMenuDropdown(
+                name="export",
+                title=_("Export"),
+                topics=self._page_menu_topic_add_to()
+                + [
+                    PageMenuTopic(
+                        title=_("Data"),
+                        entries=list(self._page_menu_entries_export_data()),
+                    ),
+                    PageMenuTopic(
+                        title=_("Reports"),
+                        entries=list(
+                            self._page_menu_entries_export_reporting(rows, user_permissions)
+                        ),
+                    ),
+                ],
+            ),
+        ]
+
+        page_menu_dropdowns = (
+            self._page_menu_dropdown_commands(rows=rows)
+            + self._page_menu_dropdowns_context(rows, user_permissions)
+            + export_dropdown
+        )
+
+        self._page_menu_dropdowns_callback(self.view, rows, page_menu_dropdowns)
+
+        menu = PageMenu(
+            dropdowns=page_menu_dropdowns,
+            breadcrumb=breadcrumb,
+        )
+
+        self._extend_display_dropdown(menu, show_filters)
+        self._extend_help_dropdown(menu)
+
+        for dropdown_name, topics in self._menu_topics.items():
+            menu[dropdown_name].topics.extend(topics)
+
+        if should_show_command_form(self.view.datasource):
+            _add_command_doc_references(menu)
+
+        return self._extend_dropdown_with_teleported_commands(menu, rows)
+
+    def _page_menu_dropdown_commands(self, rows: Rows) -> list[PageMenuDropdown]:
+        if not display_options.enabled(display_options.C):
+            return []
+
+        return [
+            PageMenuDropdown(
+                name="commands",
+                title=_("Commands"),
+                topics=[
+                    PageMenuTopic(
+                        title=_("On selected objects"),
+                        entries=list(self._page_menu_entries_selected_objects(rows=rows)),
+                    ),
+                    make_checkbox_selection_topic(
+                        "view-%s" % self.view.spec["name"],
+                        is_enabled=self.view.checkboxes_displayed,
+                    ),
+                ],
+            )
+        ]
+
+    def _get_page_menu_entry_by_command(
+        self, info_name: InfoName, command: Command, rows: Rows
+    ) -> PageMenuEntry:
+        item: PageMenuPopup | PageMenuVue | PageMenuLink
+        if vue_item := command.get_vue_page_menu(user=user, rows=rows):
+            item = vue_item
+        else:
+            item = (
+                PageMenuPopup(self._render_command_form(info_name, command))
+                if command.show_command_form
+                else make_simple_link(
+                    makeuri(
+                        request,
+                        [
+                            ("_transid", str(transactions.get())),
+                            ("_do_actions", "yes"),
+                            (f"_{command.ident}", True),
+                        ],
+                    )
+                )
+            )
+
+        return PageMenuEntry(
+            title=str(command.title),
+            icon_name=command.icon_name,
+            item=item,
+            name="command_%s" % command.ident,
+            is_enabled=should_show_command_form(self.view.datasource),
+            is_show_more=command.is_show_more,
+            is_shortcut=command.is_shortcut,
+            is_suggested=command.is_suggested,
+            css_classes=["command"],
+        )
+
+    def _page_menu_entries_selected_objects(self, rows: Rows) -> Iterator[PageMenuEntry]:
+        info_name: InfoName = self.view.datasource.infos[0]
+        by_group = get_command_groups(info_name)
+
+        for _group_class, commands in sorted(by_group.items(), key=lambda x: x[0]().sort_index):
+            if _group_class().teleport_to_menu:
+                continue
+
+            for command in commands:
+                yield self._get_page_menu_entry_by_command(info_name, command, rows)
+
+    def _page_menu_dropdowns_context(
+        self, rows: Rows, user_permissions: UserPermissions
+    ) -> list[PageMenuDropdown]:
+        return get_context_page_menu_dropdowns(self.view, rows, user_permissions)
+
+    def _page_menu_entries_export_data(self) -> Iterator[PageMenuEntry]:
+        if not user.may("general.csv_export"):
+            return
+
+        yield PageMenuEntry(
+            title=_("Export CSV"),
+            icon_name=StaticIcon(IconNames.download_csv),
+            item=make_simple_link(
+                makeuri(
+                    request,
+                    [("output_format", "csv_export")],
+                    delvars=["show_checkboxes", "selection"],
+                )
+            ),
+        )
+
+        yield PageMenuEntry(
+            title=_("Export JSON"),
+            icon_name=StaticIcon(IconNames.download_json),
+            item=make_simple_link(
+                makeuri(
+                    request,
+                    [("output_format", "json_export")],
+                    delvars=["show_checkboxes", "selection"],
+                )
+            ),
+        )
+
+    def _page_menu_entries_export_reporting(
+        self, rows: Rows, user_permissions: UserPermissions
+    ) -> Iterator[PageMenuEntry]:
+        if cmk_version.edition(cmk.utils.paths.omd_root) is cmk_version.Edition.COMMUNITY:
+            return
+
+        if not user.may("general.instant_reports"):
+            return
+
+        yield PageMenuEntry(
+            title=_("This view as PDF"),
+            icon_name=StaticIcon(IconNames.report),
+            item=make_external_link(
+                makeuri(
+                    request,
+                    [],
+                    filename="report_instant.py",
+                    delvars=["show_checkboxes", "selection"],
+                )
+            ),
+            css_classes=["context_pdf_export"],
+        )
+
+        # Link related reports
+        yield from collect_context_links(
+            self.view,
+            rows,
+            mobile=False,
+            visual_types=["reports"],
+            user_permissions=user_permissions,
+        )
+
+    def _extend_display_dropdown(self, menu: PageMenu, show_filters: list[Filter]) -> None:
+        painter_options = PainterOptions.get_instance()
+        painter_options.set_used_option_names(self.view.painter_options)
+
+        display_dropdown = menu.get_dropdown_by_name("display", make_display_options_dropdown())
+
+        display_dropdown.topics.insert(
+            0,
+            PageMenuTopic(
+                title=_("View layout"),
+                entries=list(self._page_menu_entries_view_layout(painter_options)),
+            ),
+        )
+
+        # Only render the filter page menu popup if there are filters available for the given infos
+        if display_options.enabled(display_options.F) and visuals.filters_exist_for_infos(
+            self.view.datasource.infos
+        ):
+            display_dropdown.topics.insert(
+                0,
+                PageMenuTopic(
+                    title=_("Filter"),
+                    entries=list(self._page_menu_entries_filter(show_filters)),
+                ),
+            )
+
+        if (
+            display_options.enabled(display_options.D)
+            and painter_options.painter_option_graph_time_form_enabled()
+        ) and not self.view.renders_engine_graphs:
+            display_dropdown.topics.insert(
+                0,
+                PageMenuTopic(
+                    title=_("Set graph time"),
+                    entries=[
+                        PageMenuEntry(
+                            title=_("Set graph time"),
+                            icon_name=StaticIcon(IconNames.graph_time),
+                            item=PageMenuPopup(
+                                self._render_painter_options_timerange_form(painter_options)
+                            ),
+                            name="display_painter_options_timerange",
+                            is_shortcut=True,
+                            is_suggested=True,
+                            is_list_entry=False,
+                        )
+                    ],
+                ),
+            )
+
+    def _page_menu_entries_filter(self, show_filters: list[Filter]) -> Iterator[PageMenuEntry]:
+        is_filter_set = check_if_non_default_filter_in_request(
+            AjaxInitialViewFilters().get_context(page_name=self.view.name)
+        )
+        yield PageMenuEntry(
+            title=_("Filter"),
+            icon_name=StaticIcon(
+                IconNames.filter,
+                emblem="warning",
+            )
+            if is_filter_set
+            else StaticIcon(IconNames.filter),
+            item=PageMenuSidePopup(self._render_filter_form(show_filters)),
+            name="filters",
+            is_shortcut=True,
+        )
+
+    def _page_menu_entries_view_layout(
+        self, painter_options: PainterOptions
+    ) -> Iterator[PageMenuEntry]:
+        if display_options.enabled(display_options.D):
+            yield PageMenuEntry(
+                title=_("Modify display options"),
+                icon_name=StaticIcon(IconNames.painteroptions),
+                item=PageMenuPopup(self._render_painter_options_form(painter_options)),
+                name="display_painter_options",
+                is_enabled=painter_options.painter_option_form_enabled(),
+            )
+
+        checkboxes_toggleable = (
+            self.view.layout.can_display_checkboxes and not self.view.checkboxes_enforced
+        )
+        yield PageMenuEntry(
+            title=_("Show checkboxes"),
+            icon_name=StaticIcon(IconNames.toggle_on)
+            if self.view.checkboxes_displayed
+            else StaticIcon(IconNames.toggle_off),
+            item=make_simple_link(
+                makeuri(
+                    request,
+                    [
+                        ("show_checkboxes", "0" if self.view.checkboxes_displayed else "1"),
+                    ],
+                )
+            ),
+            is_shortcut=True,
+            is_suggested=True,
+            is_enabled=checkboxes_toggleable,
+        )
+
+        if display_options.enabled(display_options.E) and user.may("general.edit_views"):
+            url_vars: list[HTTPVariable] = [
+                ("back", request.requested_url),
+                ("load_name", self.view.name),
+            ]
+
+            is_builtin_view: bool = not (view_owner := self.view.spec["owner"])
+            is_foreign_view: bool = view_owner != user.id
+            is_own_view: bool = not is_builtin_view and not is_foreign_view
+
+            if not is_builtin_view and (
+                is_own_view or (is_foreign_view and user.may("general.edit_foreign_views"))
+            ):
+                if is_own_view:
+                    title = _("Edit my view")
+                else:
+                    title = _("Edit view of user %(view_owner)s") % {"view_owner": view_owner}
+                    url_vars += [("owner", view_owner)]
+
+                yield PageMenuEntry(
+                    title=title,
+                    icon_name=StaticIcon(IconNames.edit),
+                    item=make_simple_link(
+                        makeuri_contextless(
+                            request,
+                            url_vars + [("mode", "edit")],
+                            filename="edit_view.py",
+                        )
+                    ),
+                )
+
+            if is_builtin_view or not is_own_view:
+                yield PageMenuEntry(
+                    title=_("Clone built-in view") if is_builtin_view else _("Clone view"),
+                    icon_name=StaticIcon(IconNames.clone),
+                    item=make_simple_link(
+                        makeuri_contextless(
+                            request,
+                            url_vars + [("owner", view_owner), ("mode", "clone")],
+                            filename="edit_view.py",
+                        )
+                    ),
+                )
+
+    def _page_menu_topic_add_to(self) -> list[PageMenuTopic]:
+        return visuals.page_menu_topic_add_to(
+            visual_type="view", name=self.view.name, source_type="view"
+        )
+
+    def _render_filter_form(self, show_filters: list[Filter]) -> HTML:
+        if not display_options.enabled(display_options.F):
+            return HTML.empty()
+
+        with output_funnel.plugged():
+            show_filter_form(self.view, show_filters)
+            return HTML.without_escaping(output_funnel.drain())
+
+    def _render_painter_options_form(self, painter_options: PainterOptions) -> HTML:
+        with output_funnel.plugged():
+            painter_options.show_form(self.view.spec)
+            return HTML.without_escaping(output_funnel.drain())
+
+    def _render_painter_options_timerange_form(self, painter_options: PainterOptions) -> HTML:
+        with output_funnel.plugged():
+            painter_options.show_graph_time_form(self.view.spec)
+            return HTML.without_escaping(output_funnel.drain())
+
+    def _render_command_form(self, info_name: InfoName, command: Command) -> HTML:
+        with output_funnel.plugged():
+            if not should_show_command_form(self.view.datasource):
+                return HTML.empty()
+
+            # TODO: Make unique form names (object IDs), investigate whether or not something
+            # depends on the form name "actions"
+            with html.form_context("actions"):
+                # TODO: Are these variables still needed
+                html.hidden_field("_do_actions", "yes")
+                html.hidden_field("actions", "yes")
+
+                command.render(info_name)
+
+                html.hidden_fields()
+
+            return HTML.without_escaping(output_funnel.drain())
+
+    def _render_time_picker(self) -> None:
+        if not PainterOptions.get_instance().painter_options_permitted():
+            return
+        # The view's own setting, not the `refresh` painter option: that control is not offered
+        # on such a view (see View.painter_options), so a value saved under it is unreachable.
+        # Missing, or 0 for the setting's "off": either way no interval of its own.
+        browser_reload = self.view.spec.get("browser_reload") or None
+        render_global_time_picker(
+            active_config.graph_timeranges,
+            default_time_range_seconds=self.view.engine_graph_time_range_seconds,
+            refresh=global_time_picker_refresh(
+                interval_seconds=browser_reload,
+                starts_live=browser_reload is not None,
+                reloads_page_content=True,
+            ),
+        )
+
+    def _extend_help_dropdown(self, menu: PageMenu) -> None:
+        # TODO
+        # menu.add_doc_reference(title=_("Host administration"), doc_ref=DocReference.WATO_HOSTS)
+        # menu.add_youtube_reference(title=_("Episode 4: Monitoring Windows in Checkmk"),
+        #                           youtube_ref=YouTubeReference.MONITORING_WINDOWS)
+        pass
+
+    def _extend_dropdown_with_teleported_commands(self, menu: PageMenu, rows: Rows) -> PageMenu:
+        info_name: InfoName = self.view.datasource.infos[0]
+        by_group = get_command_groups(info_name)
+
+        for _group_class, commands in sorted(by_group.items(), key=lambda x: x[0]().sort_index):
+            group = _group_class()
+
+            if not group.teleport_to_menu:
+                continue
+
+            visible_entries = []
+            for command in commands:
+                entry = self._get_page_menu_entry_by_command(info_name, command, rows)
+                if str(command.title).strip():
+                    visible_entries.append(entry)
+                elif isinstance(entry.item, PageMenuVue):
+                    menu.hidden_vue_items.append(entry.item)
+
+            if not visible_entries:
+                continue
+
+            dropdown = menu[group.teleport_to_menu]
+            dropdown.topics.insert(
+                group.teleport_menu_index,
+                PageMenuTopic(
+                    title=group.title,
+                    entries=visible_entries,
+                ),
+            )
+
+        return menu
+
+
+def _add_command_doc_references(menu: PageMenu) -> None:
+    menu.add_doc_reference(_("Commands"), DocReference.COMMANDS)
+    if user.may("action.acknowledge"):
+        menu.add_doc_reference(_("Acknowledging problems"), DocReference.COMMANDS_ACK)
+    if user.may("action.downtimes") or user.may("action.remove_all_downtimes"):
+        menu.add_doc_reference(_("Scheduled downtimes"), DocReference.COMMANDS_DOWNTIME)

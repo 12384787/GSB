@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+# Copyright (C) 2022 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# ruff: noqa: ARG001  # Unused fixtures are needed for setup side effects
+
+# mypy: disable-error-code="type-arg"
+
+import datetime
+from collections.abc import Sequence
+from io import StringIO
+from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
+
+import pytest
+import time_machine
+from pytest_mock import MockerFixture
+
+from cmk.automations.results import ABCAutomationResult
+from cmk.base.automations.check_mk import automation_analyze_host_rule_matches
+from cmk.base.community_app import make_app
+from cmk.ccc.hostaddress import HostName
+from cmk.ccc.site import SiteId
+from cmk.gui.config import Config, get_default_config, make_config_object
+from cmk.gui.logged_in import LoggedInSuperUser
+from cmk.gui.watolib import automatic_host_removal
+from cmk.gui.watolib.hosts_and_folders import FolderTree, make_folder_tree
+from cmk.gui.watolib.pending_changes import NoopPendingChangesStore, PendingChanges
+from cmk.gui.watolib.rulesets import FolderRulesets, Rule, RuleConditions, RuleOptions, Ruleset
+from cmk.livestatus_client import SiteConfiguration, SiteConfigurations
+from cmk.livestatus_client.testing import MockLiveStatusConnection
+from cmk.ruleset_matcher.matcher import RuleSpec
+from cmk.ruleset_matcher.tags import get_effective_tag_config
+from cmk.utils.paths import default_config_dir
+from tests.testlib.unit.base_configuration_scenario import Scenario
+
+
+def _noop_pending_changes() -> PendingChanges:
+    return PendingChanges(
+        activation_sites=SiteConfigurations({}),
+        local_site=SiteId("NO_SITE"),
+        acting_user=None,
+        store=NoopPendingChangesStore(),
+        hooks=(),
+    )
+
+
+def default_site_config() -> SiteConfiguration:
+    return SiteConfiguration(
+        id=SiteId("mysite"),
+        alias="Local site mysite",
+        socket=("local", None),
+        disable_wato=True,
+        disabled=False,
+        insecure=False,
+        url_prefix="/mysite/",
+        multisiteurl="",
+        persist=False,
+        replicate_ec=False,
+        replicate_mkps=False,
+        replication=None,
+        timeout=5,
+        user_login=True,
+        proxy=None,
+        user_attribute_sync_connections="all",
+        status_host=None,
+        message_broker_port=5672,
+        is_trusted=False,
+    )
+
+
+@pytest.fixture(name="activate_changes_mock")
+def fixture_activate_changes(mocker: MockerFixture) -> MagicMock:
+    return mocker.patch.object(
+        automatic_host_removal,
+        "_activate_changes",
+        mocker.MagicMock(),
+    )
+
+
+@pytest.mark.usefixtures("patch_omd_site")
+def test_remove_hosts_no_rules_early_return(activate_changes_mock: MagicMock) -> None:
+    automatic_host_removal.execute_host_removal_job(Config())
+    activate_changes_mock.assert_not_called()
+
+
+TEST_HOSTS = [
+    HostName("host_crit_remove"),
+    HostName("host_crit_keep"),
+    HostName("host_ok"),
+    HostName("host_removal_disabled"),
+    HostName("host_no_rule_match"),
+]
+
+
+@pytest.fixture(name="config")
+def fixture_config() -> Config:
+    raw_config = get_default_config()
+    raw_config["tags"] = get_effective_tag_config(raw_config["wato_tags"])
+    config = make_config_object(raw_config)
+    config.sites = SiteConfigurations({SiteId("NO_SITE"): default_site_config()})
+    return config
+
+
+@pytest.fixture(name="tree")
+def fixture_tree(patch_omd_site: None, config: Config) -> FolderTree:
+    return make_folder_tree(config)
+
+
+@pytest.fixture(name="setup_hosts")
+def fixture_setup_hosts(tree: FolderTree) -> None:
+    tree.root_folder().create_hosts(
+        [(hostname, {}, None) for hostname in TEST_HOSTS],
+        pprint_value=False,
+        pending_changes=_noop_pending_changes(),
+        acting_user=LoggedInSuperUser(),
+    )
+
+
+@pytest.fixture(name="setup_rules")
+def fixture_setup_rules(tree: FolderTree) -> None:
+    root_folder = tree.root_folder()
+    ruleset = Ruleset("automatic_host_removal")
+    ruleset.append_rule(
+        root_folder,
+        Rule(
+            id_="1",
+            folder=root_folder,
+            ruleset=ruleset,
+            conditions=RuleConditions(
+                host_folder=root_folder.path(),
+                host_tags=None,
+                host_label_groups=None,
+                host_name=["host_crit_remove", "host_crit_keep", "host_ok"],
+                service_description=None,
+                service_label_groups=None,
+            ),
+            options=RuleOptions(
+                disabled=None,
+                description="",
+                comment="",
+                docu_url="",
+            ),
+            value=(
+                "enabled",
+                {"checkmk_service_crit": 300},
+            ),
+        ),
+    )
+    ruleset.append_rule(
+        root_folder,
+        Rule(
+            id_="2",
+            folder=root_folder,
+            ruleset=ruleset,
+            conditions=RuleConditions(
+                host_folder=root_folder.path(),
+                host_tags=None,
+                host_label_groups=None,
+                host_name=["host_removal_disabled"],
+                service_description=None,
+                service_label_groups=None,
+            ),
+            options=RuleOptions(
+                disabled=None,
+                description="",
+                comment="",
+                docu_url="",
+            ),
+            value=(
+                "disabled",
+                None,
+            ),
+        ),
+    )
+    (default_config_dir / "main.mk").touch()
+    FolderRulesets({"automatic_host_removal": ruleset}, folder=root_folder).save_folder(
+        pprint_value=False,
+        debug=False,
+    )
+
+
+@pytest.fixture(name="setup_livestatus_mock")
+def fixture_setup_livestatus_mock(mock_livestatus: MockLiveStatusConnection) -> None:
+    mock_livestatus.set_sites(["NO_SITE"])
+    mock_livestatus.add_table(
+        "services",
+        [
+            {
+                "host_name": "host_crit_remove",
+                "description": "Check_MK",
+                "last_state_change": 100,
+                "state": 2,
+            },
+            {
+                "host_name": "host_crit_keep",
+                "description": "Check_MK",
+                "last_state_change": 900,
+                "state": 2,
+            },
+            {
+                "host_name": "host_ok",
+                "description": "Check_MK",
+                "last_state_change": 456,
+                "state": 0,
+            },
+            {
+                "host_name": "host_removal_disabled",
+                "description": "Check_MK",
+                "last_state_change": 100,
+                "state": 2,
+            },
+            {
+                "host_name": "host_no_rule_match",
+                "description": "Check_MK",
+                "last_state_change": 100,
+                "state": 2,
+            },
+        ],
+    )
+
+
+@pytest.fixture(name="mock_delete_hosts_automation")
+def fixture_mock_delete_hosts_automation(mocker: MockerFixture) -> MagicMock:
+    return mocker.patch.object(
+        automatic_host_removal,
+        "delete_hosts",
+        mocker.MagicMock(),
+    )
+
+
+@pytest.fixture(name="mock_analyze_host_rule_matches_automation")
+def fixture_mock_analyze_host_rule_matches_automation(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
+) -> MagicMock:
+    """Replace rule matching via automation call, which does not work in unit test context,
+    with a direct call to the automation"""
+    ts = Scenario()
+    for host_name in TEST_HOSTS:
+        ts.add_host(host_name)
+    ts.apply(monkeypatch)
+
+    def analyze_with_matcher(
+        h: HostName,
+        r: Sequence[Sequence[RuleSpec]],
+        *,
+        debug: bool,
+    ) -> ABCAutomationResult:
+        with mocker.patch("sys.stdin", StringIO(repr(r))):
+            return automation_analyze_host_rule_matches.handler(make_app(), [h], None, None)
+
+    return mocker.patch.object(
+        automatic_host_removal, "analyze_host_rule_matches", analyze_with_matcher
+    )
+
+
+@pytest.mark.usefixtures("setup_hosts")
+@pytest.mark.usefixtures("setup_rules")
+@pytest.mark.usefixtures("setup_livestatus_mock")
+@pytest.mark.usefixtures("mock_analyze_host_rule_matches_automation")
+def test_execute_host_removal_job(
+    config: Config,
+    tree: FolderTree,
+    mock_livestatus: MockLiveStatusConnection,
+    activate_changes_mock: MagicMock,
+    mock_delete_hosts_automation: MagicMock,
+) -> None:
+    with (
+        time_machine.travel(datetime.datetime.fromtimestamp(1000, tz=ZoneInfo("UTC"))),
+        mock_livestatus(expect_status_query=False),
+    ):
+        mock_livestatus.expect_query(
+            [
+                "GET services",
+                "Columns: host_name last_state_change",
+                "Filter: description = Check_MK",
+                "Filter: state = 2",
+                "ColumnHeaders: off",
+            ]
+        )
+        automatic_host_removal.execute_host_removal_job(config)
+
+    # The job mutated its own tree instance; re-read this one from disk.
+    tree.invalidate_caches()
+    assert sorted(tree.root_folder().all_hosts_recursively()) == [
+        "host_crit_keep",
+        "host_no_rule_match",
+        "host_ok",
+        "host_removal_disabled",
+    ]
+    mock_delete_hosts_automation.assert_called_once()
+    activate_changes_mock.assert_called_once()
+
+
+@pytest.mark.usefixtures(
+    "setup_rules"
+)  # needed to pass the early-exit guard in execute_host_removal_job
+def test_execute_host_removal_job_skips_remote_site_without_secret(
+    mocker: MockerFixture,
+) -> None:
+    """A remote site with replication enabled but no login secret must not appear in
+    automation_configs. Covers the race window between sites.create() (no secret yet)
+    and sites.login() (secret added).
+    """
+    mock_hosts_to_be_removed = mocker.patch.object(
+        automatic_host_removal,
+        "_hosts_to_be_removed",
+        return_value=[],  # I don't care about actually removing hosts in this test
+    )
+
+    config = Config()
+    config.sites[SiteId("NO_SITE")] = default_site_config()
+    remote_without_secret = default_site_config()
+    remote_without_secret["id"] = SiteId("remote_no_secret")
+    remote_without_secret["replication"] = "slave"  # replication enabled — but no "secret"
+    config.sites[SiteId("remote_no_secret")] = remote_without_secret
+
+    automatic_host_removal.execute_host_removal_job(config)
+
+    mock_hosts_to_be_removed.assert_called_once()
+    automation_configs = mock_hosts_to_be_removed.call_args.kwargs["automation_configs"]
+    assert SiteId("remote_no_secret") not in automation_configs
+    assert SiteId("NO_SITE") in automation_configs

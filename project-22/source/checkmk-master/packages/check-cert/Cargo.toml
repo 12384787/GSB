@@ -1,0 +1,27 @@
+[package]
+name = "check-cert"
+version = "0.1.0"
+workspace = "../.."
+edition.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+vendored = ["openssl/vendored"]
+
+[dependencies]
+anyhow = { workspace = true, features = ["backtrace"] }
+clap = { workspace = true, features = ["derive"] }
+log = { workspace = true, features = ["std"] }
+openssl.workspace = true
+openssl-probe.workspace = true
+time.workspace = true
+typed-builder.workspace = true
+x509-parser.workspace = true
+der-parser.workspace = true
+aes-gcm = { workspace = true, features = ["aes", "std"] }
+scrypt = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+assertor.workspace = true
+tempfile.workspace = true

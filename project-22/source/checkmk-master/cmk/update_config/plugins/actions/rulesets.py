@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from logging import Logger
+from typing import override
+
+from cmk.base import config as base_config
+from cmk.ccc.site import omd_site
+from cmk.gui.config import active_config
+from cmk.gui.crash_handler import create_gui_crash_report
+from cmk.gui.exceptions import MKUserError
+from cmk.gui.form_specs import get_visitor, RawDiskData, VisitorOptions
+from cmk.gui.site_config import all_activation_sites
+from cmk.gui.watolib.hosts_and_folders import Folder, make_folder_tree
+from cmk.gui.watolib.pending_changes import (
+    NoopPendingChangesStore,
+    PendingChanges,
+)
+from cmk.gui.watolib.rulesets import Ruleset, RulesetCollection
+from cmk.gui.watolib.rulespecs import FormSpecNotImplementedError
+from cmk.update_config.lib import ExpiryVersion, format_warning
+from cmk.update_config.plugins.lib.rulesets import load_and_transform, SKIP_ACTION
+from cmk.update_config.registry import update_action_registry, UpdateAction
+
+
+class UpdateRulesets(UpdateAction):
+    @override
+    def __call__(self, logger: Logger) -> None:
+        loading_result = base_config.load()
+        pending_changes = PendingChanges(
+            activation_sites=all_activation_sites(active_config.sites),
+            local_site=omd_site(),
+            acting_user=None,
+            store=NoopPendingChangesStore(),
+            hooks=(),
+        )
+        all_rulesets = load_and_transform(
+            make_folder_tree(active_config),
+            logger,
+            pending_changes=pending_changes,
+            use_new_descriptions_for=loading_result.loaded_config.use_new_descriptions_for,
+        )
+        validate_rule_values(logger, all_rulesets)
+        all_rulesets.save(pprint_value=active_config.wato_pprint_config, debug=active_config.debug)
+
+
+def validate_rule_values(
+    logger: Logger,
+    all_rulesets: RulesetCollection,
+) -> None:
+    n_invalid, n_broken = 0, 0
+    for ruleset in all_rulesets.get_rulesets().values():
+        if ruleset.name in SKIP_ACTION:
+            continue
+
+        # Note: the rule values in these rulesets are already transformed
+        # "thanks" to the load_and_transform call from above..
+        for folder, index, rule in ruleset.get_rules():
+            try:
+                try:
+                    visitor = get_visitor(
+                        ruleset.rulespec.form_spec,
+                        VisitorOptions(migrate_values=False, mask_values=True),
+                    )
+                    validation_errors = visitor.validate(RawDiskData(rule.value))
+                    if validation_errors:
+                        raise ValueError(f"Validation errors: {validation_errors}")
+                except FormSpecNotImplementedError:
+                    ruleset.rulespec.valuespec.validate_datatype(
+                        rule.value,
+                        "",
+                    )
+                    ruleset.rulespec.valuespec.validate_value(
+                        rule.value,
+                        "",
+                    )
+            except MKUserError as excpt:
+                n_invalid += 1
+                logger.warning(
+                    format_warning(
+                        f"WARNING: Invalid rule configuration detected ({_make_rule_reference(ruleset, folder, index, excpt)})"
+                    ),
+                )
+
+            except Exception as excpt:
+                n_broken += 1
+                logger.warning(
+                    format_warning(
+                        f"WARNING: Exception in ruleset implementation detected ({_make_rule_reference(ruleset, folder, index, excpt)})"
+                    ),
+                    exc_info=True,
+                )
+                identity = create_gui_crash_report().ident_to_text()
+                logger.warning(
+                    "A crash report was generated with ID: %(crash_report_id)s",
+                    {"crash_report_id": identity},
+                )
+
+    if n_invalid:
+        logger.warning(
+            format_warning(
+                "Detected %(n_invalid)s issue(s) in configured rules.\n"
+                "To correct these issues, we recommend to open the affected rules in the GUI.\n"
+                "Upon attempting to save them, any problematic fields will be highlighted."
+            ),
+            {"n_invalid": n_invalid},
+        )
+    if n_broken:
+        logger.warning(
+            format_warning(
+                "Detected %(n_broken)s issue(s) in loaded rulesets. This is a problem with the "
+                "plug-in implementation. It needs to be addressed by the maintainers. Please "
+                "review the crashes in the crash reports page to help fix the issues. "
+                "Until all issues are resolved, we recommend disabling the affected rules."
+            ),
+            {"n_broken": n_broken},
+        )
+
+
+def _make_rule_reference(ruleset: Ruleset, folder: Folder, index: int, excpt: Exception) -> str:
+    return (
+        f"Ruleset: {ruleset.name}, Title: {ruleset.title()}, Folder: {folder.path()},\n"
+        f"Rule nr: {index}, Exception: {excpt}"
+    )
+
+
+update_action_registry.register(
+    UpdateRulesets(
+        name="rulesets",
+        title="Rulesets",
+        sort_index=30,
+        expiry_version=ExpiryVersion.NEVER,
+    )
+)

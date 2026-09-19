@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+import contextlib
+import http.client
+import json
+import types
+from collections.abc import Callable
+from inspect import BoundArguments
+from typing import get_origin, TypeAliasType
+
+from werkzeug.datastructures import MIMEAccept
+from werkzeug.http import parse_accept_header
+
+from cmk import trace
+from cmk.ccc import store
+from cmk.gui.exceptions import MKAuthException, MKUnauthenticatedException
+from cmk.gui.fields.fields_filter import FieldsFilter
+from cmk.gui.http import FILE_EXTENSIONS as CONTENT_TYPE_FILE_EXTENSIONS
+from cmk.gui.http import HTTPMethod, Response
+from cmk.gui.openapi.restful_objects.utils import identify_expected_status_codes
+from cmk.gui.openapi.restful_objects.validators import (
+    ContentTypeValidator,
+    HeaderValidator,
+    PermissionValidator,
+    ResponseValidator,
+)
+from cmk.gui.openapi.utils import (
+    EXT,
+    RestAPIForbiddenException,
+    RestAPIResponseException,
+    RestAPIWatoDisabledException,
+)
+from cmk.utils.paths import configuration_lockfile
+
+from ._context import ApiContext
+from ._types import RawRequestData
+from ._utils import iter_dataclass_fields, resolve_type
+from .endpoint_model import EndpointModel
+from .exceptions import RedirectException
+from .model import json_dump_without_omitted
+from .model.response import ApiResponse, TypedResponse
+from .registry import RequestEndpoint
+
+tracer = trace.get_tracer()
+
+
+def dump_body(
+    body: object | None,
+    # TODO(PEP-747): replace with TypeForm | None once available
+    body_type: type | TypeAliasType | types.UnionType | None,
+    *,
+    is_testing: bool,
+    body_kind: str = "Response body",
+) -> bytes | None:
+    if body is None and body_type is None:
+        return None
+
+    if body is None:
+        raise ValueError(f"{body_kind} is None, but should be of type: {body_type}")
+
+    if body_type is None:
+        raise ValueError(f"{body_kind} is of type: {type(body)}, but should be None")
+
+    resolved = resolve_type(body_type)
+    check_type = (
+        resolved if isinstance(resolved, types.UnionType) else (get_origin(resolved) or resolved)
+    )
+    if not isinstance(body, check_type):
+        raise ValueError(f"{body_kind} is of type: {type(body)}, but should be {body_type}")
+
+    return json_dump_without_omitted(body_type, body, is_testing=is_testing)
+
+
+def _create_response(
+    endpoint_response: TypedResponse[object | None],
+    response_body_type: type[object] | None,
+    content_type: str | None,
+    *,
+    fields_filter: FieldsFilter | None,
+    is_testing: bool,
+) -> Response:
+    """Create a Flask response from the endpoint response."""
+    if isinstance(endpoint_response, ApiResponse):
+        json_text: str | bytes | None = dump_body(
+            endpoint_response.body, response_body_type, is_testing=is_testing
+        )
+        status_code = endpoint_response.status_code
+        headers = endpoint_response.headers
+    else:
+        json_text = dump_body(endpoint_response, response_body_type, is_testing=is_testing)
+        status_code = 204 if json_text is None else 200
+        headers = {}
+
+    if json_text is not None and fields_filter is not None:
+        json_object = json.loads(json_text)
+        json_object = fields_filter.apply(json_object)
+        json_text = json.dumps(json_object)
+
+    return Response(
+        response=json_text,
+        status=status_code,
+        headers=headers,
+        content_type=content_type,
+    )
+
+
+def _validate_direct_response(response: Response) -> None:
+    if not response.data:
+        return
+
+    content_type = response.headers.get("Content-Type")
+    if content_type == "application/problem+json":
+        ResponseValidator.validate_problem_json(response)
+        return
+
+    # TODO: maybe use special response classes that handle serialization?
+
+    # Allow raw responses for non-JSON content types (e.g. file downloads)
+    if content_type in CONTENT_TYPE_FILE_EXTENSIONS:
+        return
+
+    if response.status_code < 300:
+        raise RestAPIResponseException(
+            title="Server was about to send an invalid response.",
+            detail="This is an error of the implementation.",
+            ext=EXT(
+                {
+                    "error": "OK response data should be returned directly, not as a Response object",
+                    "orig": response.get_data(as_text=True),
+                },
+            ),
+        )
+
+
+def _optional_config_lock(
+    skip_locking: bool, method: HTTPMethod
+) -> contextlib.AbstractContextManager[None]:
+    """Return a context manager which may lock the configuration."""
+    if skip_locking or method == "get":
+        return contextlib.nullcontext()
+
+    return store.lock_checkmk_configuration(configuration_lockfile)
+
+
+def _identify_fields_filter(
+    bound_arguments: BoundArguments, has_request_schema: bool
+) -> FieldsFilter | None:
+    for name, value in bound_arguments.arguments.items():
+        if name == "body":
+            continue
+        if isinstance(value, FieldsFilter):
+            return value
+
+    if has_request_schema:
+        # for request body we only check on the first level
+        for _, value in iter_dataclass_fields(bound_arguments.arguments["body"]):
+            if isinstance(value, FieldsFilter):
+                return value
+    return None
+
+
+@tracer.instrument("handle_endpoint_request")
+def handle_endpoint_request(
+    endpoint: RequestEndpoint,
+    request_data: RawRequestData,
+    api_context: ApiContext,
+    permission_validator: PermissionValidator,
+    *,
+    update_config_generation: Callable[[], None],
+    do_git_commit: Callable[[], None],
+    wato_enabled: bool = True,
+    wato_use_git: bool = False,
+    is_testing: bool = False,
+) -> Response:
+    # Step 1: Check WATO enabled for relevant endpoints
+    if endpoint.doc_group == "Setup" and not wato_enabled:
+        raise RestAPIWatoDisabledException(
+            title="Forbidden: Setup is disabled",
+            detail="This endpoint is currently disabled via the "
+            "'Disable remote configuration' option in 'Distributed Monitoring'. "
+            "You may be able to query the central site.",
+        )
+
+    # Step 2: Build the endpoint model
+    model = EndpointModel.build(endpoint.handler)
+
+    # Step 3: Validate content type
+    content_type = request_data["headers"].get("Content-Type")
+    ContentTypeValidator.validate(
+        has_schema=model.has_request_schema,
+        content_type=content_type,
+        accepted_types=endpoint.accept if isinstance(endpoint.accept, list) else [endpoint.accept],
+        method=endpoint.method,
+    )
+
+    accept_mimetypes = parse_accept_header(request_data["headers"].get("Accept"), MIMEAccept)
+    HeaderValidator.validate_accept_header(endpoint.content_type, accept_mimetypes)
+
+    # Step 4: Validate the request parameters and call the handler function
+    # NOTE: exceptions will be caught in the WSGI app (including the other validation exceptions)
+    # We probably don't want permission tracking for tokens, do we?
+    try:
+        with (
+            permission_validator.track_permissions(),
+            _optional_config_lock(endpoint.skip_locking, endpoint.method),
+        ):
+            bound_arguments = model.validate_request_and_identify_args(
+                request_data, content_type, api_context
+            )
+            with tracer.span("endpoint-body-call"):
+                try:
+                    raw_response = endpoint.handler(*bound_arguments.args, **bound_arguments.kwargs)
+                except RedirectException as exc:
+                    raw_response = Response(status=exc.status_code)
+                    raw_response.location = exc.location
+    except MKUnauthenticatedException:
+        raise
+    except MKAuthException as exc:
+        # At this point the request is already authenticated, so a failed permission check means
+        # the user lacks a permission -> forbidden (403), not unauthorized (401). Without this
+        # remap, `MKAuthException.status` (401) would end up in the response.
+        raise RestAPIForbiddenException(
+            title=http.client.responses[403],
+            detail=str(exc),
+        ) from exc
+
+    # Step 5: Create the response object
+    with tracer.span("create-response"):
+        if isinstance(raw_response, Response):
+            _validate_direct_response(raw_response)
+            response = raw_response
+        else:
+            response = _create_response(
+                raw_response,
+                model.response_body_type,
+                endpoint.content_type,
+                fields_filter=_identify_fields_filter(bound_arguments, model.has_request_schema),
+                is_testing=is_testing,
+            )
+
+    # Step 6: Validate ETag
+    ResponseValidator.validate_etag_response(response.headers.get("ETag"), endpoint.etag)
+
+    # Step 7: Check permissions
+    if response.status_code < 400:
+        ResponseValidator.validate_permissions(
+            endpoint=endpoint.operation_id,
+            params=request_data,
+            permissions_required=endpoint.permissions_required,
+            used_permissions=permission_validator.used_permissions,
+            is_testing=is_testing,
+        )
+
+    # Step 8: Validate response status code
+    allowed_status_codes = identify_expected_status_codes(
+        endpoint.method,
+        endpoint.doc_group,
+        endpoint.content_type,
+        endpoint.etag,
+        has_response=model.has_response_schema,
+        has_path_params=model.has_path_parameters,
+        has_query_params=model.has_query_parameters,
+        has_request_schema=model.has_request_schema,
+        additional_status_codes=endpoint.additional_status_codes,
+    )
+    ResponseValidator.validate_response_constraints(
+        response=response,
+        output_empty=not model.has_response_schema,
+        operation_id=endpoint.operation_id,
+        expected_status_codes=list(allowed_status_codes),
+    )
+
+    # Step 9: Update config generation if needed
+    if (
+        endpoint.method != "get"
+        and response.status_code < 300
+        and endpoint.update_config_generation
+    ):
+        update_config_generation()
+        if wato_use_git:
+            do_git_commit()
+
+    return response

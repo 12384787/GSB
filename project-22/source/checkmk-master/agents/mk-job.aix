@@ -1,0 +1,104 @@
+#!/usr/bin/ksh93
+# Copyright (C) 2020 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+MK_VARDIR="${MK_VARDIR:-/var/lib/check_mk_agent}"
+export MK_VARDIR
+TMPDIR=${TMPDIR:-/tmp}
+
+help() {
+    echo "Usage: mk-job JOB_NAME PROGRAM [ARGS...]"
+    echo ""
+    echo "Execute PROGRAM as subprocess while measuring performance information"
+    echo "about the running process and writing it to an output file. This file"
+    echo "can be monitored using Check_MK. The Check_MK Agent will forward the"
+    echo "information of all job files to the monitoring server."
+    echo ""
+    echo "This file is being distributed with the Check_MK Agent."
+}
+
+CURRENT_USER=$(whoami)
+JOB_DIR="${MK_VARDIR}/job/${CURRENT_USER}"
+JOB_NAME="${1}"
+TMP_FILE="${TMPDIR}/${JOB_NAME}.$$"
+RUNNING_FILE="${JOB_DIR}/${JOB_NAME}.$$running"
+COMPLETED_FILE="${JOB_DIR}/${JOB_NAME}"
+
+cleanup_running_files() {
+    jobdir="$1"
+    jobname="$2"
+    # in some situations the trap is not executed and old running files pile up.
+    # here we check if the PID is actually still running and if the process
+    # name includes mk-job (another process might have the same PID by now)
+    for file in "${jobdir}/${jobname}."*running; do
+        [ -f "$file" ] || continue # skip if file does not exist (this might be the case if the folder is empty)
+        # shellcheck disable=SC2001 # can not replace subgroup with shell
+        suffix=${file##*.}    # remove largest matchin prefix
+        pid=${suffix%running} # remove smallest matching suffix
+        # keep the file if the process is running and mk-job is in the command, otherwise: remove
+        ps -p "$pid" -o command | grep "mk-job" >/dev/null || rm "$file"
+    done
+}
+
+main() {
+
+    if [ $# -lt 2 ]; then
+        help >&2
+        exit 1
+    fi
+
+    shift
+
+    cleanup_running_files "$JOB_DIR" "$JOB_NAME"
+
+    if [ ! -d "${JOB_DIR}" ]; then
+        if ! mkdir -p "${JOB_DIR}" 2>/dev/null; then
+            echo "ERROR: Unable to create output directory ${JOB_DIR} for user '${CURRENT_USER}'." >&2
+            exit 1
+        fi
+    fi
+
+    if ! type "${1}" >/dev/null 2>&1; then
+        echo -e "ERROR: Cannot run ${1}. Command not found.\n" >&2
+        help >&2
+        exit 1
+    fi
+
+    cleanup() {
+        # shellcheck disable=SC2317 # shellcheck doesn't understand trap
+        rm "${RUNNING_FILE}" 2>/dev/null
+    }
+
+    try_perl() {
+        perl -e 'print "start_time " . time . "\n"' >"${TMP_FILE}" 2>/dev/null
+    }
+
+    fallback_date() {
+        date +"start_time %s" >"${TMP_FILE}" 2>/dev/null
+    }
+    try_perl || fallback_date
+
+    cp "${TMP_FILE}" "${RUNNING_FILE}" 2>/dev/null
+
+    if [ ! -w "${RUNNING_FILE}" ]; then
+        # Looks like we are lacking the permissions to create this file..
+        # In this scenario no mk-job status file is created. We simply execute the command
+        rm "${TMP_FILE}" 2>/dev/null
+        exec "$@"
+        exit $?
+    fi
+
+    trap "cleanup" 0
+
+    # BEGIN PLATFORM SPECIFIC CODE
+    /usr/bin/time -p "$@" 2>>"${TMP_FILE}" # the -p option writes to stderr, strangely...
+    # END PLATFORM SPECIFIC CODE
+    RC=$?
+    echo "exit_code ${RC}" >>"${TMP_FILE}"
+
+    mv "${TMP_FILE}" "${COMPLETED_FILE}"
+    exit $RC
+}
+
+[ -z "${MK_SOURCE_ONLY}" ] && main "$@"

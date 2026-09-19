@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import pytest
+
+from cmk.ccc.version import Edition
+from cmk.gui.config import Config
+from cmk.gui.http import request
+from cmk.gui.pages import PageContext
+from cmk.gui.quick_setup._modes import ModeConfigurationBundle
+from cmk.gui.watolib.configuration_bundle_store import ConfigBundleStore
+
+
+@pytest.mark.usefixtures("request_context")
+def test_mode_configuration_bundle_action_crashes_when_bundle_missing(
+    monkeypatch: pytest.MonkeyPatch, test_edition: Edition
+) -> None:
+    # Reproduces the crash: if the bundle disappears between GET (form render) and
+    # POST (save), _from_vars() sets self._existing_bundle=False and returns early
+    # without setting self._bundle. action() then crashes accessing self._bundle.
+    request.set_var("bundle_id", "azure_config_2")
+    monkeypatch.setattr(ConfigBundleStore, "load_for_reading", lambda self: {})  # noqa: ARG005
+
+    # __init__ calls _from_vars(), which finds the bundle missing and returns early
+    # without setting self._bundle — exactly mirroring the crash scenario.
+    mode = ModeConfigurationBundle(test_edition, PageContext(config=Config(), request=request))
+
+    # The fix ensures self._bundle is never accessed when self._existing_bundle is False.
+    assert not hasattr(mode, "_bundle")

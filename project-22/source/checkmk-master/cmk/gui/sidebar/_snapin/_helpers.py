@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+"""Module to hold shared code for module internals and the plugins"""
+
+import json
+import traceback
+from collections.abc import Sequence
+from typing import assert_never, get_args, Literal, NamedTuple, TypeGuard
+
+from cmk.ccc.site import SiteId, url_prefix
+from cmk.gui import pagetypes
+from cmk.gui.htmllib.foldable_container import foldable_container
+from cmk.gui.htmllib.generator import ClickAction, HTMLWriter
+from cmk.gui.htmllib.html import html
+from cmk.gui.i18n import _
+from cmk.gui.icon_helpers import migrate_to_dynamic_icon, migrate_to_static_icon
+from cmk.gui.logged_in import user
+from cmk.gui.main_menu import get_main_menu_items_prefixed_by_segment
+from cmk.gui.sites import SiteStatus, states
+from cmk.gui.type_defs import Visual
+from cmk.gui.utils.loading_transition import LoadingTransition
+from cmk.gui.utils.roles import UserPermissions
+from cmk.gui.visuals import visual_title
+from cmk.shared_typing.main_menu import LoadingTransition as SharedLoadingTransition
+from cmk.shared_typing.main_menu import NavItemTopic, NavItemTopicEntry
+from cmk.web.utils.choices import Choices
+from cmk.web.utils.html import HTML
+from cmk.web.utils.icons import DynamicIcon, IconNames, StaticIcon
+
+# Constants to be used in snap-ins
+snapin_width = 240
+
+VisualMenuItemType = Literal[
+    "views",
+    "dashboards",
+    "reports",
+    "pages",
+    "custom_graph",
+    "graph_collection",
+    "forecast_graph",
+]
+
+
+def is_menu_item_supported_visual(type_name: str) -> TypeGuard[VisualMenuItemType]:
+    return type_name in get_args(VisualMenuItemType)
+
+
+class VisualItem(NamedTuple):
+    name: str
+    visual: Visual
+
+
+class VisualMenuItem(NamedTuple):
+    type: VisualMenuItemType
+    item: VisualItem
+
+
+def render_link(
+    text: str | HTML,
+    url: str,
+    target: str | None = None,
+    onclick: str | None = None,
+    title: str | None = None,
+    click_action: ClickAction | None = None,
+) -> HTML:
+    # Convert relative links into absolute links. We have three kinds
+    # of possible links and we change only [3]
+    # [1] protocol://hostname/url/link.py
+    # [2] /absolute/link.py
+    # [3] relative.py
+    if ":" not in url[:10] and not url.startswith("javascript") and url[0] != "/":
+        url = url_prefix() + "check_mk/" + url
+    return HTMLWriter.render_a(
+        text,
+        href=url,
+        class_="link",
+        target=target or "",
+        onclick=onclick or None,
+        title=title,
+        **(click_action.data_attributes() if click_action else {}),
+    )
+
+
+def link(
+    text: str | HTML,
+    url: str,
+    target: str | None = None,
+    onclick: str | None = None,
+    title: str | None = None,
+    click_action: ClickAction | None = None,
+) -> None:
+    html.write_html(
+        render_link(
+            text, url, target=target, onclick=onclick, title=title, click_action=click_action
+        )
+    )
+
+
+def bulletlink(
+    text: str, url: str | None, target: str | None = None, onclick: str | None = None
+) -> None:
+    if url:
+        html.open_li(class_="sidebar")
+        link(text, url, target, onclick)
+        html.close_li()
+
+
+def iconlink(text: str, url: str | None, icon: StaticIcon | DynamicIcon) -> None:
+    if url:
+        html.open_a(class_=["iconlink", "link"], href=url)
+        if isinstance(icon, StaticIcon):
+            html.static_icon(icon, css_classes=["inline"])
+        else:
+            html.dynamic_icon(icon, css_classes=["inline"])
+        html.write_text_permissive(text)
+        html.close_a()
+        html.br()
+
+
+def write_snapin_exception(e: Exception) -> None:
+    html.open_div(class_=["snapinexception"])
+    html.h2(_("Error"))
+    html.p(str(e))
+    html.div(traceback.format_exc().replace("\n", "<br>"), style="display:none;")
+    html.close_div()
+
+
+def heading(text: str) -> None:
+    html.h3(text)
+
+
+# TODO: Better change to context manager?
+def begin_footnote_links() -> None:
+    html.open_div(class_="footnotelink")
+
+
+def end_footnote_links() -> None:
+    html.close_div()
+
+
+def footnotelinks(links: list[tuple[str, str]]) -> None:
+    begin_footnote_links()
+    for text, target in links:
+        link(text, target)
+    end_footnote_links()
+
+
+def snapin_site_choice(ident: str, choices: list[tuple[SiteId, str]]) -> list[SiteId] | None:
+    sites = user.load_file("sidebar_sites", {})
+    available_site_choices = _filter_available_site_choices(choices)
+    site = sites.get(ident, "")
+    only_sites = None if site == "" else [site]
+
+    if len(available_site_choices) <= 1:
+        return None
+
+    dropdown_choices: Choices = [
+        ("", _("All sites")),
+    ]
+    dropdown_choices += available_site_choices
+
+    onchange = "cmk.sidebar.set_snapin_site(event, %s, this)" % json.dumps(ident)
+    html.dropdown("site", dropdown_choices, deflt=site, onchange=onchange)
+
+    return only_sites
+
+
+def _filter_available_site_choices(choices: list[tuple[SiteId, str]]) -> list[tuple[SiteId, str]]:
+    """Filter sites by site status"""
+    all_site_states = states()
+    sites_enabled = []
+    for entry in choices:
+        site_id, _desc = entry
+        site_state = all_site_states.get(site_id, SiteStatus({})).get("state")
+        if site_state is None:
+            continue
+        sites_enabled.append(entry)
+    return sites_enabled
+
+
+def make_main_menu(
+    visuals: Sequence[VisualMenuItem], user_permissions: UserPermissions
+) -> list[NavItemTopic]:
+    topics = {
+        p.name(): p
+        for p in pagetypes.PagetypeTopics.load(user_permissions).permitted_instances_sorted(
+            user_permissions
+        )
+    }
+
+    by_topic: dict[pagetypes.PagetypeTopics, list[NavItemTopicEntry]] = {}
+
+    for visual_type_name, (name, visual) in visuals:
+        if visual["hidden"] or visual.get("mobile"):
+            continue  # Skip views not inteded to be shown in the menus
+
+        topic_id = visual["topic"]
+        try:
+            topic = topics[topic_id]
+        except KeyError:
+            topic = topics["other"]
+
+        url = _visual_url(visual_type_name, name, visual)
+        match visual_type_name:
+            case "dashboards" | "custom_graph":
+                loading_transition: LoadingTransition | None = LoadingTransition.dashboard
+            case "reports" | "views":
+                loading_transition = LoadingTransition.table
+            case _:
+                loading_transition = None
+
+        entries = by_topic.setdefault(topic, [])
+        entries.append(
+            NavItemTopicEntry(
+                id=name,
+                title=visual_title(
+                    visual_type_name, visual, visual["context"], skip_title_context=True
+                ),
+                url=url,
+                sort_index=visual["sort_index"],
+                is_show_more=visual["is_show_more"],
+                icon=migrate_to_dynamic_icon(visual["icon"]),
+                main_menu_search_terms=list(visual.get("main_menu_search_terms") or []),
+                loading_transition=SharedLoadingTransition(loading_transition)
+                if loading_transition
+                else None,
+            )
+        )
+
+    # Sort the entries and create NavItemTopic objects
+    nav_topics: list[NavItemTopic] = []
+    for topic, entries in by_topic.items():
+        entries.sort(key=lambda i: (i.sort_index, i.title))
+        nav_item = NavItemTopic(
+            id=topic.name(),
+            title=topic.title(),
+            entries=entries,
+            icon=migrate_to_dynamic_icon(topic.icon_name()),
+            is_show_more=topic.hide(),
+            sort_index=topic.sort_index(),
+        )
+        if not nav_item.is_show_more:
+            nav_topics.append(nav_item)
+
+    # Return the sorted topics
+    return sorted(nav_topics, key=lambda t: (t.sort_index, t.title))
+
+
+def _visual_url(visual_type_name: VisualMenuItemType, name: str, visual: Visual) -> str:
+    match visual_type_name:
+        case "views":
+            return f"view.py?view_name={name}"
+        case "dashboards":
+            return f"dashboard.py?name={name}&owner={visual['owner']}"
+        case "pages":
+            # Note: This is no real visual type like the others here. This is just a hack to make top level
+            # pages work with this function.
+            return name if name.endswith(".py") else f"{name}.py"
+        case "reports":
+            return f"report.py?name={name}"
+        case "custom_graph":
+            return f"custom_graph.py?name={name}&owner={visual['owner']}"
+        case "graph_collection" | "forecast_graph":
+            # Handle page types
+            return f"{visual_type_name}.py?name={name}"
+        case other:
+            assert_never(other)
+
+
+def show_main_menu(treename: str, menu: list[NavItemTopic], show_item_icons: bool = False) -> None:
+    for topic in menu:
+        _show_topic(treename, topic, show_item_icons)
+
+
+def _show_topic(treename: str, topic: NavItemTopic, show_item_icons: bool) -> None:
+    if not topic.entries:
+        return
+
+    with foldable_container(
+        treename=treename,
+        id_=topic.id,
+        isopen=user.get_tree_state(treename, topic.id, False),
+        title=topic.title,
+        indent=True,
+    ):
+        for item in get_main_menu_items_prefixed_by_segment(topic):
+            if show_item_icons:
+                html.open_li(class_=["sidebar"] + (["show_more_mode"] if item.is_show_more else []))
+                iconlink(
+                    item.title,
+                    item.url,
+                    migrate_to_static_icon(item.icon) or StaticIcon(IconNames.missing),
+                )
+                html.close_li()
+            else:
+                bulletlink(
+                    item.title,
+                    item.url,
+                    onclick="return cmk.sidebar.wato_views_clicked(this)",
+                )

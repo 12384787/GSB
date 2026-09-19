@@ -1,0 +1,433 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>15.0</VCProjectVersion>
+    <ProjectGuid>{343045B4-F20A-4E48-AB2F-83E1C22C9710}</ProjectGuid>
+    <RootNamespace>engine</RootNamespace>
+    <AsioVersion>asio-1.34.2-patched</AsioVersion>
+    <FmtVersion>fmt-11.1.4</FmtVersion>
+    <SimpleIniVersion>simpleini-2af65fc</SimpleIniVersion>
+    <YamlCpp>yaml-cpp-0.8.0</YamlCpp>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <SpectreMitigation>false</SpectreMitigation>
+    <EnableASAN>false</EnableASAN>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+    <SpectreMitigation>false</SpectreMitigation>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <LinkIncremental>true</LinkIncremental>
+    <OutDir>../../build/engine\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>../../build/engine\$(Platform)\$(Configuration)\obj\</IntDir>
+    <TargetName>engine</TargetName>
+    <CustomBuildBeforeTargets>Run</CustomBuildBeforeTargets>
+    <CodeAnalysisRuleSet>all.ruleset</CodeAnalysisRuleSet>
+    <RunCodeAnalysis>false</RunCodeAnalysis>
+    <EnableMicrosoftCodeAnalysis>false</EnableMicrosoftCodeAnalysis>
+    <EnableClangTidyCodeAnalysis>false</EnableClangTidyCodeAnalysis>
+    <ClangTidyChecks>-altera-unroll-loops;-hicpp-signed-bitwise;-google-readability-braces-around-statements,-readability-braces-around-statements,-hicpp-braces-around-statements,-cppcoreguidelines-pro-bounds-array-to-pointer-decay,-hicpp-no-array-decay,-cppcoreguidelines-pro-bounds-pointer-arithmetic</ClangTidyChecks>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <LinkIncremental>false</LinkIncremental>
+    <OutDir>../../build/engine\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>../../build/engine\$(Platform)\$(Configuration)\obj\</IntDir>
+    <TargetName>engine</TargetName>
+    <CustomBuildBeforeTargets>Run</CustomBuildBeforeTargets>
+    <CodeAnalysisRuleSet>all.ruleset</CodeAnalysisRuleSet>
+    <RunCodeAnalysis>false</RunCodeAnalysis>
+    <EnableMicrosoftCodeAnalysis>false</EnableMicrosoftCodeAnalysis>
+    <EnableClangTidyCodeAnalysis>false</EnableClangTidyCodeAnalysis>
+    <ClangTidyChecks>-altera-unroll-loops;-hicpp-signed-bitwise;-google-readability-braces-around-statements,-readability-braces-around-statements,-hicpp-braces-around-statements,-cppcoreguidelines-pro-bounds-array-to-pointer-decay,-hicpp-no-array-decay,-cppcoreguidelines-pro-bounds-pointer-arithmetic</ClangTidyChecks>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>Disabled</Optimization>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>SOLUTION_DIR=uR"($(SolutionDir))";PROJECT_DIR_CMK_ENGINE=uR"($(ProjectDir))";_SILENCE_CXX17_ITERATOR_BASE_CLASS_DEPRECATION_WARNING;_DEBUG;_LIB;YAML_CPP_STATIC_DEFINE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <AdditionalIncludeDirectories>$(ProjectDir);../../include;..;.;../../extlibs/$(AsioVersion)/include;../../extlibs/$(YamlCpp)/include;../../extlibs/$(FmtVersion)/include;../../extlibs/$(SimpleIniVersion)</AdditionalIncludeDirectories>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
+      <ShowIncludes>
+      </ShowIncludes>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <DisableSpecificWarnings>26444</DisableSpecificWarnings>
+      <AdditionalOptions>/utf-8 /Zc:char8_t- $(ExternalCompilerOptions) %(AdditionalOptions)</AdditionalOptions>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <EnablePREfast>false</EnablePREfast>
+      <BuildStlModules>false</BuildStlModules>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+    <PreBuildEvent>
+      <Command>
+      </Command>
+    </PreBuildEvent>
+    <CustomBuildStep>
+      <Command>
+      </Command>
+    </CustomBuildStep>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>SOLUTION_DIR=uR"($(SolutionDir))";PROJECT_DIR_CMK_ENGINE=uR"($(ProjectDir))";_SILENCE_CXX17_ITERATOR_BASE_CLASS_DEPRECATION_WARNING;NDEBUG;_LIB;YAML_CPP_STATIC_DEFINE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <AdditionalIncludeDirectories>$(ProjectDir);../../include;..;.;../../extlibs/$(AsioVersion)/include;../../extlibs/$(YamlCpp)/include;../../extlibs/$(FmtVersion)/include;../../extlibs/$(SimpleIniVersion)</AdditionalIncludeDirectories>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
+      <ShowIncludes>
+      </ShowIncludes>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <DisableSpecificWarnings>26444</DisableSpecificWarnings>
+      <AdditionalOptions>/utf-8 /Zc:char8_t- $(ExternalCompilerOptions) %(AdditionalOptions)</AdditionalOptions>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <BuildStlModules>false</BuildStlModules>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+    <PreBuildEvent>
+      <Command>
+      </Command>
+    </PreBuildEvent>
+    <CustomBuildStep>
+      <Command>
+      </Command>
+    </CustomBuildStep>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\include\common\cfg_info.h" />
+    <ClInclude Include="..\..\include\common\cfg_yaml.h" />
+    <ClInclude Include="..\..\include\common\cma_yml.h" />
+    <ClInclude Include="..\..\include\common\cmdline_info.h" />
+    <ClInclude Include="..\..\include\common\datablock.h" />
+    <ClInclude Include="..\..\include\common\fmt_ext.h" />
+    <ClInclude Include="..\..\include\common\mailslot_transport.h" />
+    <ClInclude Include="..\..\include\common\object_repo.h" />
+    <ClInclude Include="..\..\include\common\stop_watch.h" />
+    <ClInclude Include="..\..\include\common\version.h" />
+    <ClInclude Include="..\..\include\common\wnx_version.h" />
+    <ClInclude Include="..\..\include\common\wtools.h" />
+    <ClInclude Include="..\..\include\common\wtools_runas.h" />
+    <ClInclude Include="..\..\include\common\wtools_service.h" />
+    <ClInclude Include="..\..\include\common\wtools_user_control.h" />
+    <ClInclude Include="..\..\include\common\yaml.h" />
+    <ClInclude Include="..\..\include\eventlog\eventlogbase.h" />
+    <ClInclude Include="..\..\include\eventlog\eventlogstd.h" />
+    <ClInclude Include="..\..\include\eventlog\eventlogvista.h" />
+    <ClInclude Include="..\..\include\providers\agent_plugins.h" />
+    <ClInclude Include="..\..\include\providers\check_mk.h" />
+    <ClInclude Include="..\..\include\providers\df.h" />
+    <ClInclude Include="..\..\include\providers\fileinfo.h" />
+    <ClInclude Include="..\..\include\providers\fileinfo_details.h" />
+    <ClInclude Include="..\..\include\providers\internal.h" />
+    <ClInclude Include="..\..\include\providers\logwatch_event.h" />
+    <ClInclude Include="..\..\include\providers\logwatch_event_details.h" />
+    <ClInclude Include="..\..\include\providers\mem.h" />
+    <ClInclude Include="..\..\include\providers\mrpe.h" />
+    <ClInclude Include="..\..\include\providers\ohm.h" />
+    <ClInclude Include="..\..\include\providers\perf_counters_cl.h" />
+    <ClInclude Include="..\..\include\providers\perf_cpuload.h" />
+    <ClInclude Include="..\..\include\providers\plugins.h" />
+    <ClInclude Include="..\..\include\providers\ps.h" />
+    <ClInclude Include="..\..\include\providers\p_perf_counters.h" />
+    <ClInclude Include="..\..\include\providers\services.h" />
+    <ClInclude Include="..\..\include\providers\skype.h" />
+    <ClInclude Include="..\..\include\providers\spool.h" />
+    <ClInclude Include="..\..\include\providers\system_time.h" />
+    <ClInclude Include="..\..\include\providers\w32time_peers.h" />
+    <ClInclude Include="..\..\include\providers\w32time_status.h" />
+    <ClInclude Include="..\..\include\providers\wmi.h" />
+    <ClInclude Include="..\..\include\tools\_kbd.h" />
+    <ClInclude Include="..\..\include\tools\_misc.h" />
+    <ClInclude Include="..\..\include\tools\_process.h" />
+    <ClInclude Include="..\..\include\tools\_raii.h" />
+    <ClInclude Include="..\..\include\tools\_tgt.h" />
+    <ClInclude Include="..\..\include\tools\_win.h" />
+    <ClInclude Include="..\..\include\tools\_xdbg.h" />
+    <ClInclude Include="..\..\include\tools\_xlog.h" />
+    <ClInclude Include="..\..\include\wnx\agent_controller.h" />
+    <ClInclude Include="..\..\include\wnx\asio.h" />
+    <ClInclude Include="..\..\include\wnx\async_answer.h" />
+    <ClInclude Include="..\..\include\wnx\cap.h" />
+    <ClInclude Include="..\..\include\wnx\carrier.h" />
+    <ClInclude Include="..\..\include\wnx\cfg.h" />
+    <ClInclude Include="..\..\include\wnx\cfg_details.h" />
+    <ClInclude Include="..\..\include\wnx\cfg_engine.h" />
+    <ClInclude Include="..\..\include\wnx\cma_core.h" />
+    <ClInclude Include="..\..\include\wnx\commander.h" />
+    <ClInclude Include="..\..\include\wnx\cvt.h" />
+    <ClInclude Include="..\..\include\wnx\encryption.h" />
+    <ClInclude Include="..\..\include\wnx\extensions.h" />
+    <ClInclude Include="..\..\include\wnx\external_port.h" />
+    <ClInclude Include="..\..\include\wnx\firewall.h" />
+    <ClInclude Include="..\..\include\wnx\glob_match.h" />
+    <ClInclude Include="..\..\include\wnx\install_api.h" />
+    <ClInclude Include="..\..\include\wnx\logger.h" />
+    <ClInclude Include="..\..\include\wnx\modules.h" />
+    <ClInclude Include="..\..\include\wnx\onlyfrom.h" />
+    <ClInclude Include="..\..\include\wnx\on_start.h" />
+    <ClInclude Include="..\..\include\wnx\read_file.h" />
+    <ClInclude Include="..\..\include\wnx\realtime.h" />
+    <ClInclude Include="..\..\include\wnx\section_header.h" />
+    <ClInclude Include="..\..\include\wnx\service_processor.h" />
+    <ClInclude Include="..\..\include\wnx\stdafx_defines.h" />
+    <ClInclude Include="..\..\include\wnx\upgrade.h" />
+    <ClInclude Include="..\..\include\wnx\windows_service_api.h" />
+    <ClInclude Include="..\..\include\wnx\zip.h" />
+    <ClInclude Include="..\lwa\Configurable.h" />
+    <ClInclude Include="..\lwa\Configuration.h" />
+    <ClInclude Include="..\lwa\SettingsCollector.h" />
+    <ClInclude Include="..\lwa\stringutil.h" />
+    <ClInclude Include="..\lwa\types.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\binary.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\convert.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\directives.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\emit.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\emitfromevents.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\emitter.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\emitterstate.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\emitterutils.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\exceptions.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\exp.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\memory.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\node.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\nodebuilder.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\nodeevents.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\node_data.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\null.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\ostream_wrapper.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\parse.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\parser.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\regex_yaml.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\scanner.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\scanscalar.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\scantag.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\scantoken.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\simplekey.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\singledocparser.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\stream.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\tag.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\extlibs\$(YamlCpp)\src\depthguard.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\common\cma_yml.cpp" />
+    <ClCompile Include="..\common\mailslot_transport.cpp" />
+    <ClCompile Include="..\common\object_repo.cpp" />
+    <ClCompile Include="..\common\wtools.cpp" />
+    <ClCompile Include="..\common\wtools_service.cpp" />
+    <ClCompile Include="..\common\wtools_user_control.cpp" />
+    <ClCompile Include="..\common\wtools_runas.cpp" />
+    <ClCompile Include="..\lwa\Configuration.cpp" />
+    <ClCompile Include="..\lwa\stringutil.cpp" />
+    <ClCompile Include="..\lwa\types.cc" />
+    <ClCompile Include="..\lwa\win_error.cc" />
+    <ClCompile Include="agent_controller.cpp" />
+    <ClCompile Include="async_answer.cpp" />
+    <ClCompile Include="cap.cpp" />
+    <ClCompile Include="carrier.cpp" />
+    <ClCompile Include="cfg.cpp" />
+    <ClCompile Include="cma_core.cpp" />
+    <ClCompile Include="commander.cpp" />
+    <ClCompile Include="cvt.cpp" />
+    <ClCompile Include="encryption.cpp" />
+    <ClCompile Include="eventlog\eventlogbase.cpp" />
+    <ClCompile Include="eventlog\eventlogstd.cpp" />
+    <ClCompile Include="eventlog\eventlogvista.cpp" />
+    <ClCompile Include="extensions.cpp" />
+    <ClCompile Include="external_port.cpp" />
+    <ClCompile Include="firewall.cpp" />
+    <ClCompile Include="groups.cpp" />
+    <ClCompile Include="install_api.cpp" />
+    <ClCompile Include="logger.cpp" />
+    <ClCompile Include="modules.cpp" />
+    <ClCompile Include="onlyfrom.cpp" />
+    <ClCompile Include="on_start.cpp" />
+    <ClCompile Include="providers\agent_plugins.cpp" />
+    <ClCompile Include="providers\check_mk.cpp" />
+    <ClCompile Include="providers\df.cpp" />
+    <ClCompile Include="providers\fileinfo.cpp" />
+    <ClCompile Include="providers\internal.cpp" />
+    <ClCompile Include="providers\logwatch_event.cpp" />
+    <ClCompile Include="providers\mem.cpp" />
+    <ClCompile Include="providers\mrpe.cpp" />
+    <ClCompile Include="providers\ohm.cpp" />
+    <ClCompile Include="providers\perf_counters_cl.cpp" />
+    <ClCompile Include="providers\perf_cpuload.cpp" />
+    <ClCompile Include="providers\plugins.cpp" />
+    <ClCompile Include="providers\ps.cpp" />
+    <ClCompile Include="providers\p_perf_counters.cpp" />
+    <ClCompile Include="providers\services.cpp" />
+    <ClCompile Include="providers\skype.cpp" />
+    <ClCompile Include="providers\spool.cpp" />
+    <ClCompile Include="providers\system_time.cpp" />
+    <ClCompile Include="providers\wmi.cpp" />
+    <ClCompile Include="realtime.cpp" />
+    <ClCompile Include="section_header.cpp" />
+    <ClCompile Include="service_processor.cpp" />
+    <ClCompile Include="stdafx.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
+      <MultiProcessorCompilation Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+      </MultiProcessorCompilation>
+      <MultiProcessorCompilation Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+      </MultiProcessorCompilation>
+    </ClCompile>
+    <ClCompile Include="upgrade.cpp" />
+    <ClCompile Include="w32time_peers.cpp" />
+    <ClCompile Include="w32time_status.cpp" />
+    <ClCompile Include="windows_service_api.cpp" />
+    <ClCompile Include="zip.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\..\test_files\config\check_mk.example.ini" />
+    <None Include="..\..\test_files\config\check_mk_dev.yml" />
+    <None Include="..\..\test_files\config\check_mk_dev_default.yml" />
+    <None Include="..\..\test_files\config\check_mk_dev_minimum.yml" />
+    <None Include="..\..\test_files\config\check_mk_dev_unit_testing.yml" />
+    <None Include=".clang-tidy" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+  <PropertyGroup Condition="'$(Language)'=='C++'">
+    <CAExcludePath>..\..\extlibs;$(CAExcludePath)</CAExcludePath>
+  </PropertyGroup>
+</Project>

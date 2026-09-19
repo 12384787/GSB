@@ -1,0 +1,21 @@
+title: Check Point Firewalls: Power Supply
+agents: snmp
+catalog: hw/network/checkpoint
+license: GPLv2
+distribution: check_mk
+
+item:
+ Index of the power supply
+
+description:
+ This check monitors the health of the power supplies in checkpoint firewalls.
+ The resulting state is determined by mapping the reported device status to a
+ monitoring state via the rule "Check Point powersupply".
+
+ By default, the statuses "Up" and "OK" result in {OK} and "No Redundancy"
+ results in {WARN}. Any other status, including "Present", results in {CRIT}
+ unless explicitly configured otherwise, to be backward compatible.
+
+
+discovery:
+ One service is created for each power supply.

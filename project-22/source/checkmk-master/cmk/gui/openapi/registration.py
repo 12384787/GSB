@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+# Copyright (C) 2020 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from cmk.gui.openapi.endpoints import (
+    acknowledgement,
+    activate_changes,
+    aux_tags,
+    broker_connection,
+    cert,
+    configuration_entity,
+    contact_group_config,
+    host_internal,
+    host_tag_group,
+    notification_rules,
+    ruleset,
+    service,
+    service_group_config,
+    time_periods,
+    version,
+)
+from cmk.gui.openapi.restful_objects.registry import EndpointRegistry
+
+from .api_endpoints import (
+    agent_download,
+    custom_host_attributes,
+    host,
+    icon,
+    rule,
+    site_management,
+)
+from .api_endpoints import (
+    audit_log as api_audit_log,
+)
+from .api_endpoints import (
+    autocomplete as api_autocomplete,
+)
+from .api_endpoints import background_job as api_background_job
+from .api_endpoints import (
+    comment as api_comment,
+)
+from .api_endpoints import (
+    crash_report as api_crash_report,
+)
+from .api_endpoints import downtime as api_downtime
+from .api_endpoints import folder_config as api_folder_config
+from .api_endpoints import global_settings as api_global_settings
+from .api_endpoints import host_config as api_host_config
+from .api_endpoints import host_config_internal as api_host_config_internal
+from .api_endpoints import host_group_config as api_host_group_config
+from .api_endpoints import master_control as api_master_control
+from .api_endpoints import notification_rule as api_notification_rule
+from .api_endpoints import quick_setup as api_quick_setup
+from .api_endpoints import service_discovery as api_service_discovery
+from .api_endpoints import user_config as api_user_config
+from .api_endpoints.graph_timerange import registration as api_graph_timerange
+from .api_endpoints.password import registration as api_password
+from .api_endpoints.user_role import registration as api_user_role
+from .framework.registry import VersionedEndpointRegistry
+from .restful_objects.endpoint_family import EndpointFamilyRegistry
+from .shared_endpoint_families.agent import AGENTS_FAMILY
+from .shared_endpoint_families.notification_rules import NOTIFICATION_RULES_FAMILY
+
+
+def register(
+    endpoint_registry: EndpointRegistry,
+    versioned_endpoint_registry: VersionedEndpointRegistry,
+    endpoint_family_registry: EndpointFamilyRegistry,
+) -> None:
+    # TODO: once all legacy endpoints have been migrated the family registry should happen inside
+    #  respective endpoint module
+    endpoint_family_registry.register(AGENTS_FAMILY)
+    endpoint_family_registry.register(NOTIFICATION_RULES_FAMILY)
+
+    acknowledgement.register(endpoint_registry)
+    activate_changes.register(endpoint_registry)
+    aux_tags.register(endpoint_registry)
+    cert.register(endpoint_registry)
+    contact_group_config.register(endpoint_registry)
+    configuration_entity.register(endpoint_registry)
+    host_internal.register(endpoint_registry)
+    host_tag_group.register(endpoint_registry)
+    notification_rules.register(endpoint_registry)
+    ruleset.register(endpoint_registry)
+    service.register(endpoint_registry)
+    service_group_config.register(endpoint_registry)
+    time_periods.register(endpoint_registry)
+    version.register(endpoint_registry)
+    broker_connection.register(endpoint_registry)
+
+    agent_download.register(versioned_endpoint_registry)
+    api_comment.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    api_background_job.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    host.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    api_host_config.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    api_folder_config.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    api_host_config_internal.register(versioned_endpoint_registry)
+    api_notification_rule.register(versioned_endpoint_registry)
+    api_host_group_config.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    api_master_control.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    api_service_discovery.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    rule.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    api_user_role.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    api_password.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    api_global_settings.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    api_graph_timerange.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    site_management.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    icon.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    api_downtime.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    custom_host_attributes.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    api_quick_setup.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    api_user_config.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    api_autocomplete.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    api_audit_log.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )
+    api_crash_report.register(
+        versioned_endpoint_registry=versioned_endpoint_registry,
+        endpoint_family_registry=endpoint_family_registry,
+    )

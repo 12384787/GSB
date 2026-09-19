@@ -1,0 +1,836 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="comparison-overlap"
+
+import shutil
+import tempfile
+from collections.abc import Iterator
+from functools import partial
+from pathlib import Path
+
+import pytest
+
+from tests.testlib.common.utils import wait_until
+from tests.testlib.common.utils2 import run
+from tests.testlib.site import Site, SiteFactory
+from tests.testlib.version import CMKPackageInfo, edition_from_env, version_from_env
+
+
+def _ensure_cloud_initial_config() -> None:
+    """Create Checkmk Cloud config files needed for cloud-edition sites to start."""
+    if not edition_from_env().is_cloud_edition():
+        return
+    from tests.testlib.system.cloud.utils import (  # type: ignore[import-untyped, unused-ignore, import-not-found]
+        create_cloud_initial_config,
+    )
+
+    create_cloud_initial_config()
+
+
+def _get_orphaned_versions() -> list[str]:
+    """Return installed OMD versions that are not used by any site."""
+    versions_path = Path("/omd/versions")
+    sites_path = Path("/omd/sites")
+    try:
+        candidates = list(versions_path.iterdir())
+    except OSError:
+        return []
+    in_use: set[str] = set()
+    if sites_path.exists():
+        for site_dir in sites_path.iterdir():
+            link = site_dir / "version"
+            if link.is_symlink():
+                in_use.add(link.readlink().name)
+    return [v.name for v in candidates if v.name not in in_use]
+
+
+@pytest.fixture(scope="function")
+def _orphan_version_guard() -> Iterator[None]:
+    """Shield pre-existing orphaned OMD versions from being removed during the cleanup test.
+
+    For each orphaned version a minimal fake site directory is created under /omd/sites/ with
+    only a 'version' symlink.  omd cleanup resolves in-use versions solely through that symlink,
+    so the version is kept without any real site being present.  The fake directories are removed
+    unconditionally when the module finishes.
+    """
+    fake_site_dirs: list[Path] = []
+    for i, version in enumerate(_get_orphaned_versions()):
+        fake_site = Path("/omd/sites") / f"_cleanup_guard_{i}"
+        run(["mkdir", "-p", str(fake_site)], sudo=True, check=True)
+        run(
+            ["ln", "-s", f"/omd/versions/{version}", str(fake_site / "version")],
+            sudo=True,
+            check=True,
+        )
+        fake_site_dirs.append(fake_site)
+    yield
+    for fake_site in fake_site_dirs:
+        run(["rm", "-rf", str(fake_site)], sudo=True, check=False)
+
+
+def test_run_omd(site: Site) -> None:
+    p = site.run(["omd"], check=False)
+    assert p.returncode == 1
+    assert p.stderr == ""
+    assert (
+        "Manage multiple monitoring sites comfortably with OMD. The Open Monitoring Distribution.\nUsage (called as site user):"
+        in p.stdout
+    )
+    assert "omd COMMAND -h" in p.stdout
+
+
+def test_run_omd_help(site: Site) -> None:
+    p = site.omd("help", check=True)
+    assert p.stderr == ""
+    assert "Usage" in p.stdout
+    assert "omd COMMAND -h" in p.stdout
+
+
+def test_run_omd_version(site: Site) -> None:
+    p = site.omd("version", check=True)
+    assert p.stderr == ""
+    assert p.stdout.endswith("%s\n" % site.package.omd_version())
+
+
+def test_run_omd_version_bare(site: Site) -> None:
+    p = site.omd("version", "-b", check=True)
+    assert p.stderr == ""
+    assert p.stdout.rstrip("\n") == site.package.omd_version()
+
+
+def test_run_omd_versions(site: Site) -> None:
+    p = site.omd("versions", check=True)
+    assert p.stderr == ""
+    versions = [v.split(" ", 1)[0] for v in p.stdout.split("\n")]
+    assert len(versions) >= 1
+    assert site.package.omd_version() in versions
+
+
+def test_run_omd_versions_bare(site: Site) -> None:
+    p = site.omd("versions", "-b", check=True)
+    assert p.stderr == ""
+    versions = p.stdout.split("\n")
+    assert len(versions) >= 1
+    assert site.package.omd_version() in versions
+
+
+def test_run_omd_sites(site: Site) -> None:
+    p = site.omd("sites", check=True)
+    assert p.stderr == ""
+    assert site.id in p.stdout
+
+
+def test_run_omd_sites_bare(site: Site) -> None:
+    p = site.omd("sites", "-b", check=True)
+    assert p.stderr == ""
+    sites = p.stdout.split("\n")
+    assert len(sites) >= 1
+    assert site.id in sites
+
+
+def test_run_omd_status_bare(site: Site) -> None:
+    """
+    Test the 'omd status --bare' command for the current site.
+
+    Verifies that each line in the output follows the expected format,
+    which is a service name followed by a number representing its status.
+    """
+
+    p = site.omd("-v", "status", "--bare", check=False)
+    assert p.returncode == 0, "The command should return status 0, 'running'"
+    assert p.stderr == "", "No error output expected"
+    services = p.stdout.splitlines()
+    assert len(services) > 1, "Expected at least one line of service status"
+    # check format of single line (e.g. "jaeger 5")
+    # (used in AutomationGetRemoteOMDStatus()._parse_omd_status)
+    service_state = services[-1].split(" ")
+    assert len(service_state) == 2, (
+        "The line is expected to have two parts in following format:"
+        "\n<servicename> <status-integer-code>"
+    )
+
+    assert service_state[0] == "OVERALL", "The last line should be the overall status"
+    try:
+        assert int(service_state[1]) in (0, 1, 2), "The status should be one of 0, 1, 2"
+    except ValueError as excp:
+        # ValueError will be raised if service_state[1] can not
+        # be parsed as an integer.
+        excp.add_note("Expected status of service to be an integer!")
+        raise excp
+
+
+def test_run_omd_reload(site: Site) -> None:
+    """
+    Test the 'omd reload' command for the current site.
+    Verifies that the 'omd reload' command reloads all services of the current site.
+    """
+
+    expected: list[str] = list(set(site.get_omd_service_names_and_statuses().keys()))
+
+    p = site.omd("reload", check=False)
+    assert p.returncode == 0, "The 'omd reload' should return status 0"
+    assert p.stderr == "", "No error output expected from 'omd reload'"
+    assert site.is_running(), "Site should be running after 'omd reload'"
+
+    # Get list of service names which were stopped or reloaded during the 'omd reload' command.
+    reloaded = [l for l in p.stdout.splitlines() if l.startswith(("Stopping", "Reloading"))]
+    assert len(reloaded) > 0, "Expected at least one service reload or stop during reload"
+
+    # Check that all expected services are mentioned in the output of 'omd reload'
+    for service in reloaded:
+        expected = [s for s in expected if s not in service]
+    assert len(expected) == 0, (
+        "All services should be mentioned in the output of 'omd reload', "
+        "but the following service(s) were not found: %s" % ", ".join(expected)
+    )
+
+
+def test_run_omd_reload_service(site: Site) -> None:
+    """
+    Test the 'omd reload <service>' command for the current site.
+    Verifies that each service can be reloaded successfully.
+    """
+
+    def _service_status_is_ok(service: str) -> bool:
+        return site.get_omd_service_names_and_statuses(service)[service] == 0
+
+    expected: dict[str, int] = site.get_omd_service_names_and_statuses()
+    for service in expected:
+        _ = site.omd("reload", service)
+        wait_until(
+            partial(_service_status_is_ok, service),
+            timeout=10,
+            interval=1,
+            condition_name=f"Validate '{service}' state is OK",
+        )
+
+
+def test_run_omd_backup_and_omd_restore(site: Site) -> None:
+    """
+    Test the 'omd backup' and 'omd restore' commands.
+    This test creates a backup of the current site and then restores it with a new name.
+
+    """
+    package = CMKPackageInfo(version_from_env(), edition_from_env())
+    site_factory = SiteFactory(package=package, prefix="")
+    restored_site_name = "restored_site"
+    restored_site = None
+    backup_path = Path(tempfile.gettempdir()) / "backup.tar.gz"
+    try:
+        site_factory.backup_site(site.id, backup_path, no_past=True)
+        assert backup_path.stat().st_size > 0, "Backup file was not created."
+
+        # run restore as root to use a different site name
+        run(["omd", "restore", restored_site_name, str(backup_path)], sudo=True, check=True)
+        restored_site = site_factory.get_existing_site(restored_site_name, start=True)
+        assert restored_site.exists(), "Restored site does not exist."
+        assert restored_site.is_running(), "Restored site is not running."
+
+    finally:
+        if backup_path.exists():
+            run(["rm", "-rf", str(backup_path)], sudo=True)
+        if restored_site is not None and restored_site.exists():
+            restored_site.rm()
+
+
+@pytest.mark.skipif(
+    edition_from_env().is_cloud_edition(),
+    reason="The Event Console is disabled in the cloud edition (MKEVENTD defaults to off)",
+)
+def test_omd_backup_excludes_ec_history_sidecars(site: Site) -> None:
+    """Test that 'omd backup' does not archive the Event Console history sidecars."""
+    history_dir = "var/mkeventd/history"
+
+    def _wal_on_disk() -> bool:
+        site.live.query("GET eventconsolehistory\nLimit: 1\n")
+        return site.file_exists(f"{history_dir}/history.sqlite-wal")
+
+    # The Event Console opens its history before daemonizing, so the sidecars of that
+    # first connection are unlinked when the pre-fork process exits. Only a reload
+    # reopens the database from the daemon itself, and sqlite needs an access to
+    # materialize the files. Without a sidecar the assertions below prove nothing.
+    site.omd("reload", "mkeventd", check=True)
+    wait_until(_wal_on_disk, timeout=30, interval=1, condition_name="EC history WAL exists")
+
+    # Inside the site, because the site user writes the archive. 'tmp/*' is excluded
+    # from the backup, so the archive cannot end up inside itself.
+    backup_path = "tmp/backup_ec_history.tar.gz"
+    archive = site.path(backup_path).as_posix()
+    try:
+        site.omd("backup", archive, check=True)
+        members = site.run(["tar", "-tf", archive]).stdout.splitlines()
+    finally:
+        site.delete_file(backup_path)
+
+    assert f"{site.id}/{history_dir}/history.sqlite" in members
+    assert f"{site.id}/{history_dir}/history.sqlite-wal" not in members
+    assert f"{site.id}/{history_dir}/history.sqlite-shm" not in members
+
+
+def test_run_omd_backup_and_omd_restore_empty() -> None:
+    """Test that restore works on empty site directory."""
+    package = CMKPackageInfo(version_from_env(), edition_from_env())
+    site_factory = SiteFactory(package=package, prefix="")
+    restored_site_name = "restored_site"
+    backup_path = Path(tempfile.gettempdir()) / "backup.tar.gz"
+    try:
+        # run the backup
+        _ensure_cloud_initial_config()
+        restored_site = site_factory.get_site(restored_site_name, create=True)
+        site_factory.backup_site(restored_site_name, backup_path, no_past=True)
+        assert backup_path.stat().st_size > 0, "Backup file was not created."
+
+        restored_site.omd("stop")
+        restored_site.omd("umount", check=True)
+        run(["rm", "-rf", str(restored_site.root)], sudo=True, check=True)
+        # create_site_home
+        run(["mkdir", str(restored_site.root)], sudo=True, check=True)
+        owner_group = f"{restored_site_name}:{restored_site_name}"
+        run(["chown", owner_group, str(restored_site.root)], sudo=True, check=True)
+        run(["chmod", "0751", str(restored_site.root)], sudo=True, check=True)
+
+        restored_site.omd("restore", str(backup_path), check=True)
+        restored_site = site_factory.get_existing_site(restored_site_name, start=True)
+        assert restored_site.exists(), "Restored site does not exist."
+        assert restored_site.is_running(), "Restored site is not running."
+
+    finally:
+        if backup_path.exists():
+            run(["rm", str(backup_path)], sudo=True)
+        if restored_site is not None and restored_site.exists():  # type: ignore[redundant-expr]
+            restored_site.rm()
+
+
+def test_run_omd_create_welcome_message() -> None:
+    """
+    Test the 'omd create' command.
+    This test creates a new site and verifies that the welcome message is displayed.
+
+    """
+    package = CMKPackageInfo(version_from_env(), edition_from_env())
+    site_factory = SiteFactory(package=package, prefix="")
+    try:
+        _ensure_cloud_initial_config()
+        site = site_factory.get_site("test_create_site", create=False)
+        assert not site.exists()
+        site.create()
+    finally:
+        if site is not None and site.exists():  # type: ignore[redundant-expr]
+            if site.is_running():
+                site.stop()
+            site.rm()
+
+
+def test_run_omd_init() -> None:
+    """
+    Test the 'omd init' command.
+    """
+    package = CMKPackageInfo(version_from_env(), edition_from_env())
+    site_factory = SiteFactory(package=package, prefix="")
+    site = None
+    try:
+        _ensure_cloud_initial_config()
+        site = site_factory.get_site("test_init_site")
+        run(["omd", "-V", package.version_directory(), "disable", site.id], sudo=True)
+        run(["omd", "-V", package.version_directory(), "--force", "init", site.id], sudo=True)
+        site.start()
+    finally:
+        if site is not None and site.exists():
+            site.rm()
+
+
+def test_run_omd_status_as_site_user(site: Site) -> None:
+    """Test the 'omd status' command as the site user.
+
+    Verifies that the command succeeds and produces output containing the site's services.
+    """
+    p = site.omd("status", check=False)
+    assert p.returncode == 0, "The command should return status 0, 'running'"
+    assert p.stderr == "", "No error output expected"
+    assert len(p.stdout.splitlines()) > 0, "Expected at least one line of output"
+
+
+def test_run_omd_status_as_root(site: Site) -> None:
+    """Test the 'sudo omd status <site>' command as root.
+
+    Verifies that root can query the status of a specific site by name.
+    """
+    p = run(["omd", "status", site.id], sudo=True, check=False)
+    assert p.returncode == 0, "The command should return status 0, 'running'"
+    assert p.stderr == "", "No error output expected"
+
+
+def test_run_omd_status_service_as_site_user(site: Site) -> None:
+    """Test the 'omd status <service>' command as the site user.
+
+    Verifies that a single service status can be queried by name.
+    """
+    service = "crontab"
+    p = site.omd("status", service, check=False)
+    assert p.returncode == 0, f"Service '{service}' should be running"
+    assert p.stderr == "", "No error output expected"
+    assert service in p.stdout, f"Expected service '{service}' in output"
+
+
+def test_run_omd_status_service_as_root(site: Site) -> None:
+    """Test the 'sudo omd status <site> <service>' command as root.
+
+    Verifies that root can query a specific service's status for a named site.
+    """
+    service = "crontab"
+    p = run(["omd", "status", site.id, service], sudo=True, check=False)
+    assert p.returncode == 0, f"Service '{service}' should be running"
+    assert p.stderr == "", "No error output expected"
+    assert service in p.stdout, f"Expected service '{service}' in output"
+
+
+def test_run_omd_start_as_site_user(site: Site) -> None:
+    """Test the 'omd start' command as the site user.
+
+    Stops the site first, then verifies that 'omd start' brings it back up.
+    """
+    assert site.omd("stop", check=False).returncode == 0, "Pre-condition: site should stop cleanly"
+    try:
+        p = site.omd("start", check=False)
+        assert p.returncode == 0, "The 'omd start' command should succeed"
+        assert p.stderr == "", "No error output expected from 'omd start'"
+        assert site.is_running(), "Site should be running after 'omd start'"
+    finally:
+        if not site.is_running():
+            site.omd("start")
+
+
+def test_run_omd_start_as_root(site: Site) -> None:
+    """Test the 'sudo omd start <site>' command as root.
+
+    Stops the site first, then verifies that root can start it by site name.
+    """
+    assert site.omd("stop", check=False).returncode == 0, "Pre-condition: site should stop cleanly"
+    try:
+        p = run(["omd", "start", site.id], sudo=True, check=False)
+        assert p.returncode == 0, "The 'sudo omd start <site>' command should succeed"
+        assert p.stderr == "", "No error output expected"
+        assert site.is_running(), "Site should be running after 'sudo omd start <site>'"
+    finally:
+        if not site.is_running():
+            site.omd("start")
+
+
+def test_run_omd_start_service_as_site_user(site: Site) -> None:
+    """Test the 'omd start <service>' command as the site user.
+
+    Stops a single service and verifies it can be restarted by name.
+    """
+    service = "crontab"
+    site.omd("stop", service, check=False)
+    p = site.omd("start", service, check=False)
+    assert p.returncode == 0, f"The 'omd start {service}' command should succeed"
+    assert p.stderr == "", "No error output expected"
+    wait_until(
+        lambda: site.get_omd_service_names_and_statuses(service)[service] == 0,
+        timeout=10,
+        interval=1,
+        condition_name=f"Validate '{service}' state is OK after start",
+    )
+
+
+def test_run_omd_start_service_as_root(site: Site) -> None:
+    """Test the 'sudo omd start <site> <service>' command as root.
+
+    Stops a single service and verifies root can start it by site and service name.
+    """
+    service = "crontab"
+    site.omd("stop", service, check=False)
+    p = run(["omd", "start", site.id, service], sudo=True, check=False)
+    assert p.returncode == 0, f"The 'sudo omd start {site.id} {service}' command should succeed"
+    assert p.stderr == "", "No error output expected"
+    wait_until(
+        lambda: site.get_omd_service_names_and_statuses(service)[service] == 0,
+        timeout=10,
+        interval=1,
+        condition_name=f"Validate '{service}' state is OK after root start",
+    )
+
+
+def test_run_omd_stop_as_site_user(site: Site) -> None:
+    """Test the 'omd stop' command as the site user.
+
+    Verifies that the site can be stopped and then restores it.
+    """
+    p = site.omd("stop", check=False)
+    try:
+        assert p.returncode == 0, "The 'omd stop' command should succeed"
+        assert p.stderr == "", "No error output expected from 'omd stop'"
+        assert site.is_stopped(), "Site should be stopped after 'omd stop'"
+    finally:
+        site.omd("start")
+
+
+def test_run_omd_stop_as_root(site: Site) -> None:
+    """Test the 'sudo omd stop <site>' command as root.
+
+    Verifies that root can stop a site by name, then restores it.
+    """
+    p = run(["omd", "stop", site.id], sudo=True, check=False)
+    try:
+        assert p.returncode == 0, "The 'sudo omd stop <site>' command should succeed"
+        assert p.stderr == "", "No error output expected"
+        assert site.is_stopped(), "Site should be stopped after 'sudo omd stop <site>'"
+    finally:
+        site.omd("start")
+
+
+def test_run_omd_stop_service_as_site_user(site: Site) -> None:
+    """Test the 'omd stop <service>' command as the site user.
+
+    Verifies that a single service can be stopped and then restores it.
+    """
+    service = "crontab"
+    p = site.omd("stop", service, check=False)
+    try:
+        assert p.returncode == 0, f"The 'omd stop {service}' command should succeed"
+        assert p.stderr == "", "No error output expected"
+        wait_until(
+            lambda: site.get_omd_service_names_and_statuses(service)[service] != 0,
+            timeout=10,
+            interval=1,
+            condition_name=f"Validate '{service}' is stopped",
+        )
+    finally:
+        site.omd("start", service)
+
+
+def test_run_omd_stop_service_as_root(site: Site) -> None:
+    """Test the 'sudo omd stop <site> <service>' command as root.
+
+    Verifies that root can stop a single service by site and service name.
+    """
+    service = "crontab"
+    p = run(["omd", "stop", site.id, service], sudo=True, check=False)
+    try:
+        assert p.returncode == 0, f"The 'sudo omd stop {site.id} {service}' command should succeed"
+        assert p.stderr == "", "No error output expected"
+        wait_until(
+            lambda: site.get_omd_service_names_and_statuses(service)[service] != 0,
+            timeout=10,
+            interval=1,
+            condition_name=f"Validate '{service}' is stopped after root stop",
+        )
+    finally:
+        site.omd("start", service)
+
+
+def test_run_omd_restart_as_site_user(site: Site) -> None:
+    """Test the 'omd restart' command as the site user.
+
+    Verifies that all site services are restarted and the site is running afterward.
+    """
+    p = site.omd("restart", check=False)
+    assert p.returncode == 0, "The 'omd restart' command should succeed"
+    assert p.stderr == "", "No error output expected from 'omd restart'"
+    assert site.is_running(), "Site should be running after 'omd restart'"
+
+
+def test_run_omd_restart_as_root(site: Site) -> None:
+    """Test the 'sudo omd restart <site>' command as root.
+
+    Verifies that root can restart all services for a site by name.
+    """
+    p = run(["omd", "restart", site.id], sudo=True, check=False)
+    assert p.returncode == 0, "The 'sudo omd restart <site>' command should succeed"
+    assert p.stderr == "", "No error output expected"
+    assert site.is_running(), "Site should be running after 'sudo omd restart <site>'"
+
+
+def test_run_omd_restart_service_as_site_user(site: Site) -> None:
+    """Test the 'omd restart <service>' command as the site user.
+
+    Verifies that a single service can be restarted and is running afterward.
+    """
+    service = "crontab"
+    p = site.omd("restart", service, check=False)
+    assert p.returncode == 0, f"The 'omd restart {service}' command should succeed"
+    assert p.stderr == "", "No error output expected"
+    wait_until(
+        lambda: site.get_omd_service_names_and_statuses(service)[service] == 0,
+        timeout=10,
+        interval=1,
+        condition_name=f"Validate '{service}' state is OK after restart",
+    )
+
+
+def test_run_omd_restart_service_as_root(site: Site) -> None:
+    """Test the 'sudo omd restart <site> <service>' command as root.
+
+    Verifies that root can restart a single service by site and service name.
+    """
+    service = "crontab"
+    p = run(["omd", "restart", site.id, service], sudo=True, check=False)
+    assert p.returncode == 0, f"The 'sudo omd restart {site.id} {service}' command should succeed"
+    assert p.stderr == "", "No error output expected"
+    wait_until(
+        lambda: site.get_omd_service_names_and_statuses(service)[service] == 0,
+        timeout=10,
+        interval=1,
+        condition_name=f"Validate '{service}' state is OK after root restart",
+    )
+
+
+def test_run_omd_reload_as_root(site: Site) -> None:
+    """Test the 'sudo omd reload <site>' command as root.
+
+    Verifies that root can reload all services for a named site.
+    """
+    p = run(["omd", "reload", site.id], sudo=True, check=False)
+    assert p.returncode == 0, "The 'sudo omd reload <site>' command should succeed"
+    assert p.stderr == "", "No error output expected"
+    assert site.is_running(), "Site should be running after 'sudo omd reload <site>'"
+
+
+def test_run_omd_reload_service_as_root(site: Site) -> None:
+    """Test the 'sudo omd reload <site> <service>' command as root.
+
+    Verifies that root can reload a single service by site and service name.
+    """
+    service = "crontab"
+    p = run(["omd", "reload", site.id, service], sudo=True, check=False)
+    assert p.returncode == 0, f"The 'sudo omd reload {site.id} {service}' command should succeed"
+    assert p.stderr == "", "No error output expected"
+    wait_until(
+        lambda: site.get_omd_service_names_and_statuses(service)[service] == 0,
+        timeout=10,
+        interval=1,
+        condition_name=f"Validate '{service}' state is OK after root reload",
+    )
+
+
+def test_run_omd_umount_as_site_user(site: Site) -> None:
+    """Test the 'omd umount' command as the site user.
+
+    Stops the site first (umount requires a stopped site), runs umount,
+    then starts the site again (which remounts the tmpfs).
+    """
+    assert site.omd("stop", check=False).returncode == 0, "Pre-condition: site should stop cleanly"
+    try:
+        p = site.omd("umount", check=False)
+        assert p.returncode == 0, "The 'omd umount' command should succeed"
+        assert p.stderr == "", "No error output expected from 'omd umount'"
+    finally:
+        site.omd("start")
+
+
+def test_run_omd_umount_as_root(site: Site) -> None:
+    """Test the 'sudo omd umount <site>' command as root.
+
+    Stops the site first (umount requires a stopped site), runs umount as root,
+    then starts the site again (which remounts the tmpfs).
+    """
+    assert site.omd("stop", check=False).returncode == 0, "Pre-condition: site should stop cleanly"
+    try:
+        p = run(["omd", "umount", site.id], sudo=True, check=False)
+        assert p.returncode == 0, "The 'sudo omd umount <site>' command should succeed"
+        assert p.stderr == "", "No error output expected"
+    finally:
+        site.omd("start")
+
+
+def test_run_omd_status_auto_with_autostart_enabled(site: Site) -> None:
+    """Test 'omd status --auto' when the site has AUTOSTART enabled.
+
+    Verifies that the site is included in the output when AUTOSTART is on.
+    """
+    autostart_orig = site.get_config("AUTOSTART")  # cache original autostart value to restore later
+    site.stop()
+    site.set_config("AUTOSTART", "on", with_restart=False)
+    site.start()
+    try:
+        site.set_config("AUTOSTART", "on", with_restart=False)
+        p = run(["omd", "status", "--auto"], sudo=True, check=False)
+        assert site.id in p.stdout, f"Expected site '{site.id}' to appear in output"
+        assert f"Ignoring site '{site.id}'" not in p.stdout, (
+            f"Site '{site.id}' should not be ignored when AUTOSTART=on"
+        )
+    finally:
+        site.stop()
+        site.set_config("AUTOSTART", autostart_orig, with_restart=False)
+        site.omd("start")
+
+
+def test_run_omd_status_auto_with_autostart_disabled(site: Site) -> None:
+    """Test 'omd status --auto' when the site has AUTOSTART disabled.
+
+    Verifies that the site is skipped (with an appropriate message) when AUTOSTART is off.
+    """
+    autostart_orig = site.get_config("AUTOSTART")  # cache original autostart value to restore later
+    site.stop()
+    site.set_config("AUTOSTART", "off", with_restart=False)
+    site.start()
+    try:
+        p = run(["omd", "status", "--auto"], sudo=True, check=False)
+        assert f"Ignoring site '{site.id}': AUTOSTART != on" in p.stdout, (
+            f"Expected site '{site.id}' to be ignored when AUTOSTART=off"
+        )
+    finally:
+        site.stop()
+        site.set_config("AUTOSTART", autostart_orig, with_restart=False)
+        site.omd("start")
+
+
+def test_run_omd_diff_empty_on_fresh_site() -> None:
+    """Test 'omd diff' shows no entries on a fresh site."""
+    package = CMKPackageInfo(version_from_env(), edition_from_env())
+    site_factory = SiteFactory(package=package, prefix="")
+    site = None
+    try:
+        site = site_factory.get_site("test_omd_diff", create=False)
+        run(["omd", "create", str(site.id)], sudo=True)
+        p = site.omd("diff", check=False)
+        assert not p.stderr
+        assert not p.stdout, "Expected no differences on a fresh site"
+    finally:
+        if site is not None and site.exists():
+            site.rm()
+
+
+@pytest.mark.skip_if_not_containerized  # "Test might affect installed Checkmk packages"
+@pytest.mark.usefixtures("_orphan_version_guard")
+def test_run_omd_cleanup_no_orphaned_versions(site: Site) -> None:
+    """Test 'omd cleanup' when all installed versions are in use.
+
+    Verifies that cleanup completes successfully and does not remove the active version.
+    """
+    p = run(["omd", "cleanup"], sudo=True, check=False)
+    assert p.returncode == 0, "omd cleanup should succeed"
+    assert p.stderr == "", "No error output expected"
+    assert Path(site.package.version_path()).exists(), (
+        "Active version must not be removed by cleanup"
+    )
+    active_version = site.package.omd_version()
+    assert active_version in p.stdout, (
+        f"Expected active version {active_version!r} to be kept by cleanup"
+    )
+
+
+@pytest.mark.skip_if_not_containerized  # "Test might affect installed Checkmk packages"
+@pytest.mark.skipif(shutil.which("dpkg") is None, reason="DEB-only: requires dpkg and dpkg-deb")
+@pytest.mark.usefixtures("_orphan_version_guard")
+def test_run_omd_cleanup_removes_orphaned_version(site: Site, tmp_path: Path) -> None:
+    """Test 'omd cleanup' removes a version that is installed but not used by any site.
+
+    A minimal fake .deb package is built at test-time and installed so that the
+    package manager recognizes it. 'omd cleanup' then treats it as an orphaned
+    version and must uninstall and remove it.
+    """
+    fake_version = "0.0.0.fake"
+    # Resolve symlinks so dpkg -S matches the physical path queried by omd cleanup
+    physical_versions = Path("/omd/versions").resolve()
+    fake_version_dir = physical_versions / fake_version
+
+    pkg_root = Path(tmp_path) / "pkg"
+    debian = pkg_root / "DEBIAN"
+    debian.mkdir(parents=True)
+    (debian / "control").write_text(
+        "Package: check-mk-fake\n"
+        "Version: 0.0.0\n"
+        "Architecture: all\n"
+        "Maintainer: Test Suite <test@example.com>\n"
+        "Description: Fake OMD version for testing omd cleanup\n"
+    )
+    # Mirror the physical path inside the package root so dpkg registers it
+    fake_in_pkg = pkg_root / str(fake_version_dir).lstrip("/")
+    fake_in_pkg.mkdir(parents=True)
+    (fake_in_pkg / "placeholder").write_text("fake")
+
+    deb_path = Path(tmp_path) / "fake.deb"
+    run(["dpkg-deb", "--build", str(pkg_root), str(deb_path)], sudo=False, check=True)
+    run(["dpkg", "-i", str(deb_path)], sudo=True, check=True)
+
+    try:
+        assert fake_version_dir.exists(), "Pre-condition: fake version directory must exist"
+
+        p = run(["omd", "cleanup"], sudo=True, check=False)
+        assert p.returncode == 0, "omd cleanup should succeed"
+        assert p.stderr == "", "No error output expected"
+        assert fake_version in p.stdout, (
+            f"Expected fake version '{fake_version}' to appear in output"
+        )
+        assert "Uninstalling" in p.stdout, "Expected cleanup to uninstall the orphaned version"
+        assert not fake_version_dir.exists(), "Fake version directory must be removed by cleanup"
+        assert Path(site.package.version_path()).exists(), "Real version must be preserved"
+    finally:
+        run(["apt-get", "-y", "purge", "check-mk-fake"], sudo=True, check=False)
+        if fake_version_dir.exists():
+            run(["rm", "-rf", str(fake_version_dir)], sudo=True, check=False)
+
+
+# TODO: Add tests for these modes (also check -h of each mode)
+# omd update                      Update site to other version of OMD
+# omd config     ...              Show and set site configuration parameters
+# omd diff       ([RELBASE])      Shows differences compared to the original version files
+#
+# General Options:
+# -V <version>                    set specific version, useful in combination with update/create
+# omd COMMAND -h, --help          show available options of COMMAND
+
+
+def test_run_omd_config_show_all(site: Site) -> None:
+    p = site.omd("config", "show", check=False)
+    assert p.returncode == 0
+    assert p.stderr == ""
+    assert f"CORE: {site.core_name()}\n" in p.stdout
+
+
+def test_run_omd_config_show_variable(site: Site) -> None:
+    p = site.omd("config", "show", "CORE", check=False)
+    assert p.returncode == 0
+    assert p.stderr == ""
+    assert p.stdout == f"{site.core_name()}\n"
+
+
+def test_run_omd_config_show_unknown_variable(site: Site) -> None:
+    p = site.omd("config", "show", "NO_SUCH_VARIABLE", check=False)
+    assert p.returncode == 1
+    assert "No such variable NO_SUCH_VARIABLE" in p.stderr
+
+
+def test_run_omd_config_show_reports_every_unknown_variable(site: Site) -> None:
+    p = site.omd("config", "show", "NO_SUCH_VARIABLE", "ME_NEITHER", check=False)
+    assert p.returncode == 1
+    assert "No such variable NO_SUCH_VARIABLE" in p.stderr
+    assert "No such variable ME_NEITHER" in p.stderr
+
+
+def test_run_omd_config_show_keeps_printing_the_known_variables(site: Site) -> None:
+    p = site.omd("config", "show", "CORE", "NO_SUCH_VARIABLE", check=False)
+    assert p.returncode == 1
+    assert p.stdout == f"{site.core_name()}\n"
+
+
+def test_run_omd_config_unknown_command(site: Site) -> None:
+    p = site.omd("config", "no-such-command", check=False)
+    assert p.returncode == 1
+    assert "No such command 'no-such-command'" in p.stderr
+    assert "Usage of config command:" in p.stdout
+
+
+def test_run_omd_config_set_without_arguments(site: Site) -> None:
+    p = site.omd("config", "set", check=False)
+    assert p.returncode == 1
+    assert "Please specify variable name and value" in p.stderr
+    assert "Usage of config command:" in p.stdout
+
+
+def test_run_omd_config_set_on_running_site(site: Site) -> None:
+    p = site.omd("config", "set", "CORE", site.core_name(), check=False)
+    assert p.returncode == 1
+    assert "Cannot change config variables while site is running." in p.stderr
+
+
+def test_run_omd_config_set_unknown_variable(site: Site) -> None:
+    with site.omd_stopped():
+        p = site.omd("config", "set", "NO_SUCH_VARIABLE", "on", check=False)
+    assert p.returncode == 1
+    assert "No such variable 'NO_SUCH_VARIABLE'" in p.stderr

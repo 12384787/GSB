@@ -1,0 +1,82 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import {
+  CmkFilterSelection,
+  type Filters,
+  getCategoryDefinition,
+  parseFilterTypes,
+  useFilterDefinitions
+} from 'cmk-ui-library/components/filter'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import { computed } from 'vue'
+
+import ContentSpacer from '@/dashboard/components/ContentSpacer.vue'
+import type { ObjectType } from '@/dashboard/types/shared.ts'
+
+import StepsHeader from '../StepsHeader.vue'
+
+const { _t } = usei18n()
+
+interface AddFiltersProps {
+  filterSelectionTarget: ObjectType
+  close: () => void
+}
+const props = defineProps<AddFiltersProps>()
+
+const filters = defineModel<Filters>('filters', { required: true })
+
+const filterDefinitions = useFilterDefinitions()
+
+const filterCategory = computed(() => {
+  const categories = parseFilterTypes(
+    filterDefinitions,
+    new Set([props.filterSelectionTarget as unknown as string])
+  )
+  return categories.get(props.filterSelectionTarget)
+})
+</script>
+
+<template>
+  <div role="region" :aria-label="_t('Add filter')" class="db-add-filters__container">
+    <StepsHeader :title="_t('Add filter')" @back="props.close" />
+    <ContentSpacer :height="40" class="db-add-filters__spacer" />
+
+    <CmkFilterSelection
+      :key="`${filterSelectionTarget}`"
+      :category-filter="filterCategory || []"
+      :category-definition="getCategoryDefinition(filterSelectionTarget)"
+      :filters="filters"
+      class="db-add-filters__selection"
+    />
+  </div>
+</template>
+
+<style scoped>
+.db-add-filters__container {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.db-add-filters__spacer {
+  flex: 0;
+}
+
+.db-add-filters__selection {
+  min-height: 0;
+  flex-grow: 1;
+
+  /* We want the same padding on both sides and the bottom, however the parent already sets some. */
+  padding: 0 var(--dimension-7) calc(var(--dimension-7) - var(--spacing))
+    calc(var(--dimension-7) - var(--spacing));
+}
+
+/* stylelint-disable-next-line selector-pseudo-class-no-unknown,checkmk/vue-bem-naming-convention */
+.db-add-filters__selection :deep(.cmk-filter-selection__scroll-container) {
+  border-bottom: none;
+}
+</style>

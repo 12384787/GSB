@@ -1,0 +1,72 @@
+<!--
+Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import CmkWizard from 'cmk-ui-library/components/CmkWizard/CmkWizard.vue'
+import { computed, onMounted, provide } from 'vue'
+
+import QuickSetupSaveStage from './QuickSetupSaveStage.vue'
+import QuickSetupStage from './QuickSetupStage.vue'
+import type { QuickSetupProps } from './quick_setup_types'
+import { quickSetupGetWidgetKey } from './utils'
+import { getWidget } from './widgets/utils'
+
+provide(quickSetupGetWidgetKey, getWidget)
+
+const props = defineProps<QuickSetupProps>()
+
+const numberOfStages = computed(() => props.regularStages.length)
+const showSaveStage = computed(
+  () => props.currentStage === numberOfStages.value || props.mode.value === 'overview'
+)
+
+onMounted(() => {
+  // The "old" world sets the title to "Reloading..." if a reload is
+  // triggered. This would lead to a wrong title in case the user clicks
+  // "Cancel" in the browser dialog
+  document.querySelectorAll('a.title').forEach((link) => {
+    link.setAttribute('onclick', 'document.location.reload();')
+  })
+})
+
+const stageModel = computed({
+  get: () => props.currentStage,
+  set: (value) => props.goToStage && props.goToStage(value)
+})
+</script>
+
+<template>
+  <CmkWizard v-model="stageModel" :mode="mode.value">
+    <QuickSetupStage
+      v-for="(stg, index) in regularStages"
+      :key="index"
+      :index="index"
+      :current-stage="currentStage"
+      :number-of-stages="numberOfStages"
+      :mode="props.mode.value"
+      :loading="loading"
+      :title="stg.title"
+      :sub_title="stg.sub_title || null"
+      :actions="stg.actions || []"
+      :content="stg.content || null"
+      :recap-content="stg.recapContent || null"
+      :errors="stg.errors"
+      :go-to-this-stage="stg.goToThisStage || null"
+      :hide-wait-icon="!!props.hideWaitIcon"
+    />
+  </CmkWizard>
+  <QuickSetupSaveStage
+    v-if="saveStage && showSaveStage"
+    :index="numberOfStages"
+    :current-stage="currentStage"
+    :number-of-stages="numberOfStages"
+    :mode="props.mode.value"
+    :loading="loading"
+    :content="saveStage.content || null"
+    :errors="saveStage.errors || []"
+    :actions="saveStage.actions || []"
+    :hide-wait-icon="!!props.hideWaitIcon"
+  />
+</template>

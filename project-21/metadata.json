@@ -1,0 +1,10 @@
+{
+  "number": 21,
+  "repository": "handsontable/handsontable",
+  "url": "https://github.com/handsontable/handsontable",
+  "description": "JavaScript Data Grid / Data Table with a Spreadsheet Look & Feel. Works with React, Angular, and Vue. Supported by the Handsontable team ⚡",
+  "language": "JavaScript",
+  "stars": 22044,
+  "default_branch": "main",
+  "source_zip_url": "https://github.com/handsontable/handsontable/archive/refs/heads/main.zip"
+}

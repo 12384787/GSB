@@ -1,0 +1,109 @@
+<!--
+Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script lang="ts">
+import { type PanelConfigFor, listOptions } from '@ucl/_ucl/components/detail-page'
+import {
+  type Colors,
+  type Shapes,
+  type Sizes,
+  type Types
+} from 'cmk-ui-library/components/CmkBadge.vue'
+
+import codeExample from './UclCmkBadgeCodeExample.vue?raw'
+
+export const panelConfig = {
+  size: {
+    type: 'list' as const,
+    title: 'Size',
+    options: listOptions<Sizes>({
+      small: 'Small',
+      medium: 'Medium',
+      large: 'Large'
+    }),
+    initialState: 'medium' as const
+  },
+  color: {
+    type: 'list' as const,
+    title: 'Color',
+    options: listOptions<Colors>({
+      default: 'Default',
+      success: 'Success',
+      warning: 'Warning',
+      unknown: 'Unknown',
+      danger: 'Danger'
+    }),
+    initialState: 'default' as const
+  },
+  type: {
+    type: 'list' as const,
+    title: 'Type',
+    options: listOptions<Types>({
+      fill: 'Fill',
+      outline: 'Outline'
+    }),
+    initialState: 'fill' as const
+  },
+  shape: {
+    type: 'list' as const,
+    title: 'Shape',
+    help: '"Default" stretches to contain its content (pill/elongated). "Circle" clips overflow to maintain a fixed circular shape — max-width equals height.',
+    options: listOptions<Shapes>({
+      default: 'Default',
+      circle: 'Circle'
+    }),
+    initialState: 'default' as const
+  }
+} satisfies PanelConfigFor<typeof CmkBadge>
+</script>
+
+<script setup lang="ts">
+import {
+  PanelStateCreator,
+  UclDetailPageAccessibility,
+  UclDetailPageCodeExample,
+  UclDetailPageComponent,
+  UclDetailPageDeveloperPlayground,
+  UclDetailPageHeader,
+  UclDetailPageLayout,
+  UclPropertiesPanel
+} from '@ucl/_ucl/components/detail-page'
+import CmkBadge from 'cmk-ui-library/components/CmkBadge.vue'
+
+import UclCmkBadgeDev from './UclCmkBadgeDev.vue'
+
+defineProps<{ screenshotMode: boolean }>()
+
+const propState = new PanelStateCreator<typeof CmkBadge>().createRef(panelConfig)
+</script>
+
+<template>
+  <UclDetailPageLayout>
+    <UclDetailPageHeader>CmkBadge</UclDetailPageHeader>
+
+    <UclDetailPageComponent>
+      <CmkBadge
+        :size="propState.size"
+        :color="propState.color"
+        :type="propState.type"
+        :shape="propState.shape"
+      >
+        99999
+      </CmkBadge>
+
+      <template #properties>
+        <UclPropertiesPanel v-model="propState" :config="panelConfig" />
+      </template>
+    </UclDetailPageComponent>
+
+    <UclDetailPageCodeExample :code="codeExample" />
+
+    <UclDetailPageAccessibility :data="[]" />
+
+    <UclDetailPageDeveloperPlayground>
+      <UclCmkBadgeDev :screenshot-mode="screenshotMode" />
+    </UclDetailPageDeveloperPlayground>
+  </UclDetailPageLayout>
+</template>

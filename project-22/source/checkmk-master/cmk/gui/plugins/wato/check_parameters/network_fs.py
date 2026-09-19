@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from cmk.gui.i18n import _
+from cmk.gui.plugins.wato.check_parameters.filesystem_utils import FilesystemElements, vs_filesystem
+from cmk.gui.plugins.wato.utils import (
+    CheckParameterRulespecWithItem,
+    rulespec_registry,
+    RulespecGroupCheckParametersStorage,
+)
+from cmk.gui.valuespec import Dictionary, DropdownChoice, TextInput
+
+
+def _item_spec_network_fs() -> TextInput:
+    return TextInput(
+        title=_("Name of the mount point"), help=_("For NFS enter the name of the mount point.")
+    )
+
+
+def _parameter_valuespec_network_fs() -> Dictionary:
+    return vs_filesystem(
+        elements=[
+            FilesystemElements.levels,
+            FilesystemElements.show_levels,
+            FilesystemElements.magic_factor,
+            FilesystemElements.size_trend,
+        ],
+        extra_elements=[
+            (
+                "has_perfdata",
+                DropdownChoice(
+                    title=_("Metrics settings"),
+                    choices=[
+                        (True, _("Enable metrics")),
+                        (False, _("Disable metrics")),
+                    ],
+                    default_value=False,
+                ),
+            ),
+        ],
+    )
+
+
+rulespec_registry.register(
+    CheckParameterRulespecWithItem(
+        check_group_name="network_fs",
+        group=RulespecGroupCheckParametersStorage,
+        item_spec=_item_spec_network_fs,
+        match_type="dict",
+        parameter_valuespec=_parameter_valuespec_network_fs,
+        title=lambda: _("Network file system - overall status and usage (e.g. NFS)"),
+    )
+)

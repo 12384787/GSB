@@ -1,0 +1,90 @@
+<!--
+Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script lang="ts">
+import { type PanelConfigFor } from '@ucl/_ucl/components/detail-page'
+import { allIconOptions } from '@ucl/_ucl/lib/icon'
+import { type SimpleIcons } from 'cmk-ui-library/components/CmkIcon'
+
+import codeExample from './UclCmkInlineButtonCodeExample.vue?raw'
+
+export const a11yData = [
+  {
+    keys: ['Tab'],
+    description:
+      'Moves keyboard focus to the button (if not disabled). While the focus outline is hidden from view, its underlying functionality remains intact.'
+  },
+  {
+    keys: [['Shift', 'Tab']],
+    description: 'Moves focus to the button from the next focusable element in reverse order.'
+  },
+  {
+    keys: ['Enter', 'Space'],
+    description: 'Activates the button and emits the click event.'
+  }
+]
+
+export const panelConfig = {
+  icon: {
+    type: 'list' as const,
+    title: 'Icon',
+    initialState: 'plus',
+    help: 'Name of the icon to display. Defaults to "plus" if not set.',
+    options: allIconOptions
+  },
+  disabled: {
+    type: 'boolean' as const,
+    title: 'Disabled',
+    initialState: false
+  }
+} satisfies PanelConfigFor<typeof CmkInlineButton>
+</script>
+
+<script setup lang="ts">
+import {
+  PanelStateCreator,
+  UclDetailPageAccessibility,
+  UclDetailPageCodeExample,
+  UclDetailPageComponent,
+  UclDetailPageDeveloperPlayground,
+  UclDetailPageHeader,
+  UclDetailPageLayout,
+  UclPropertiesPanel
+} from '@ucl/_ucl/components/detail-page'
+import CmkInlineButton from 'cmk-ui-library/components/user-input/CmkInlineButton.vue'
+
+import UclCmkInlineButtonDev from './UclCmkInlineButtonDev.vue'
+
+defineProps<{ screenshotMode: boolean }>()
+
+const propState = new PanelStateCreator<typeof CmkInlineButton>().createRef(panelConfig)
+</script>
+
+<template>
+  <UclDetailPageLayout>
+    <UclDetailPageHeader>CmkInlineButton</UclDetailPageHeader>
+
+    <UclDetailPageComponent>
+      <CmkInlineButton
+        :icon="(propState.icon as SimpleIcons) || undefined"
+        :disabled="propState.disabled"
+      >
+        Add item
+      </CmkInlineButton>
+
+      <template #properties>
+        <UclPropertiesPanel v-model="propState" :config="panelConfig" />
+      </template>
+    </UclDetailPageComponent>
+
+    <UclDetailPageCodeExample :code="codeExample" />
+
+    <UclDetailPageAccessibility :data="a11yData" />
+
+    <UclDetailPageDeveloperPlayground>
+      <UclCmkInlineButtonDev :screenshot-mode="screenshotMode" />
+    </UclDetailPageDeveloperPlayground>
+  </UclDetailPageLayout>
+</template>

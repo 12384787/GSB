@@ -1,0 +1,93 @@
+diff -Nur googletest.orig/googletest/include/gtest/internal/gtest-death-test-internal.h googletest/googletest/include/gtest/internal/gtest-death-test-internal.h
+--- googletest.orig/googletest/include/gtest/internal/gtest-death-test-internal.h	2025-04-16 13:36:56.329232128 +0200
++++ googletest/googletest/include/gtest/internal/gtest-death-test-internal.h	2025-04-16 13:37:17.880266584 +0200
+@@ -226,14 +226,14 @@
+             #statement,                                                        \
+             ::testing::internal::MakeDeathTestMatcher(regex_or_matcher),       \
+             __FILE__, __LINE__, &gtest_dt)) {                                  \
+-      goto GTEST_CONCAT_TOKEN_(gtest_label_, __LINE__);                        \
++      goto GTEST_CONCAT_TOKEN_(gtest_label_, __LINE__); /*NOLINT*/             \
+     }                                                                          \
+     if (gtest_dt != nullptr) {                                                 \
+       std::unique_ptr< ::testing::internal::DeathTest> gtest_dt_ptr(gtest_dt); \
+       switch (gtest_dt->AssumeRole()) {                                        \
+         case ::testing::internal::DeathTest::OVERSEE_TEST:                     \
+           if (!gtest_dt->Passed(predicate(gtest_dt->Wait()))) {                \
+-            goto GTEST_CONCAT_TOKEN_(gtest_label_, __LINE__);                  \
++            goto GTEST_CONCAT_TOKEN_(gtest_label_, __LINE__); /*NOLINT*/       \
+           }                                                                    \
+           break;                                                               \
+         case ::testing::internal::DeathTest::EXECUTE_TEST: {                   \
+diff -Nur googletest.orig/googletest/include/gtest/internal/gtest-internal.h googletest/googletest/include/gtest/internal/gtest-internal.h
+--- googletest.orig/googletest/include/gtest/internal/gtest-internal.h	2025-04-16 13:36:56.329232128 +0200
++++ googletest/googletest/include/gtest/internal/gtest-internal.h	2025-04-16 13:37:17.880266584 +0200
+@@ -1360,7 +1360,7 @@
+     gtest_msg.value += " with description \"";                                 \
+     gtest_msg.value += e.what();                                               \
+     gtest_msg.value += "\".";                                                  \
+-    goto GTEST_CONCAT_TOKEN_(gtest_label_testthrow_, __LINE__);                \
++    goto GTEST_CONCAT_TOKEN_(gtest_label_testthrow_, __LINE__); /*NOLINT*/     \
+   }
+ 
+ #else  // GTEST_HAS_EXCEPTIONS
+@@ -1383,13 +1383,13 @@
+       gtest_msg.value = "Expected: " #statement                             \
+                         " throws an exception of type " #expected_exception \
+                         ".\n  Actual: it throws a different type.";         \
+-      goto GTEST_CONCAT_TOKEN_(gtest_label_testthrow_, __LINE__);           \
++      goto GTEST_CONCAT_TOKEN_(gtest_label_testthrow_, __LINE__); /*NOLINT*/ \
+     }                                                                       \
+     if (!gtest_caught_expected) {                                           \
+       gtest_msg.value = "Expected: " #statement                             \
+                         " throws an exception of type " #expected_exception \
+                         ".\n  Actual: it throws nothing.";                  \
+-      goto GTEST_CONCAT_TOKEN_(gtest_label_testthrow_, __LINE__);           \
++      goto GTEST_CONCAT_TOKEN_(gtest_label_testthrow_, __LINE__); /*NOLINT*/ \
+     }                                                                       \
+   } else /*NOLINT*/                                                         \
+     GTEST_CONCAT_TOKEN_(gtest_label_testthrow_, __LINE__)                   \
+@@ -1404,7 +1404,7 @@
+     gtest_msg.value += " with description \"";                    \
+     gtest_msg.value += e.what();                                  \
+     gtest_msg.value += "\".";                                     \
+-    goto GTEST_CONCAT_TOKEN_(gtest_label_testnothrow_, __LINE__); \
++    goto GTEST_CONCAT_TOKEN_(gtest_label_testnothrow_, __LINE__); /*NOLINT*/ \
+   }
+ 
+ #else  // GTEST_HAS_EXCEPTIONS
+@@ -1422,7 +1422,7 @@
+     GTEST_TEST_NO_THROW_CATCH_STD_EXCEPTION_()                           \
+     catch (...) {                                                        \
+       gtest_msg.value = "it throws.";                                    \
+-      goto GTEST_CONCAT_TOKEN_(gtest_label_testnothrow_, __LINE__);      \
++      goto GTEST_CONCAT_TOKEN_(gtest_label_testnothrow_, __LINE__); /*NOLINT*/ \
+     }                                                                    \
+   } else                                                                 \
+     GTEST_CONCAT_TOKEN_(gtest_label_testnothrow_, __LINE__)              \
+@@ -1441,7 +1441,7 @@
+       gtest_caught_any = true;                                       \
+     }                                                                \
+     if (!gtest_caught_any) {                                         \
+-      goto GTEST_CONCAT_TOKEN_(gtest_label_testanythrow_, __LINE__); \
++      goto GTEST_CONCAT_TOKEN_(gtest_label_testanythrow_, __LINE__); /*NOLINT*/ \
+     }                                                                \
+   } else                                                             \
+     GTEST_CONCAT_TOKEN_(gtest_label_testanythrow_, __LINE__)         \
+@@ -1469,7 +1469,7 @@
+         gtest_fatal_failure_checker;                                \
+     GTEST_SUPPRESS_UNREACHABLE_CODE_WARNING_BELOW_(statement);      \
+     if (gtest_fatal_failure_checker.has_new_fatal_failure()) {      \
+-      goto GTEST_CONCAT_TOKEN_(gtest_label_testnofatal_, __LINE__); \
++      goto GTEST_CONCAT_TOKEN_(gtest_label_testnofatal_, __LINE__); /*NOLINT*/ \
+     }                                                               \
+   } else /* NOLINT */                                               \
+     GTEST_CONCAT_TOKEN_(gtest_label_testnofatal_, __LINE__)         \
+@@ -1510,7 +1510,7 @@
+   };                                                                           \
+                                                                                \
+   ::testing::TestInfo* const GTEST_TEST_CLASS_NAME_(test_suite_name,           \
+-                                                    test_name)::test_info_ =   \
++                                                    test_name)::test_info_ = /*NOLINT*/ \
+       ::testing::internal::MakeAndRegisterTestInfo(                            \
+           #test_suite_name, #test_name, nullptr, nullptr,                      \
+           ::testing::internal::CodeLocation(__FILE__, __LINE__), (parent_id),  \

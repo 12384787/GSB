@@ -1,0 +1,795 @@
+// Copyright (C) 2025 Checkmk GmbH
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::config::defines::defaults::SECTION_SEPARATOR;
+use crate::config::ora_sql::{CustomInstance, Piggyback};
+use crate::config::{
+    authentication::{AuthType, Authentication, Role},
+    connection::EngineTag,
+    ora_sql::Endpoint,
+};
+use crate::ora_sql::perf::{Label, PerfTimer};
+use crate::ora_sql::types::Target;
+use crate::types::{ConnectionStringType, Credentials, InstanceName, PdbName, SqlQuery};
+use anyhow::{Context, Result};
+use oracle::sql_type::{FromSql, ToSql};
+use oracle::{Connection, Connector, Privilege};
+use std::marker::PhantomData;
+
+#[derive(Debug)]
+pub struct StdEngine {
+    connection: Option<Connection>,
+}
+
+impl Clone for StdEngine {
+    fn clone(&self) -> Self {
+        StdEngine { connection: None }
+    }
+}
+
+pub trait OraDbEngine: Send {
+    fn connect(&mut self, target: &Target, instance: Option<&InstanceName>) -> Result<()>;
+
+    fn close(&mut self) -> Result<()>;
+
+    fn query_table(&self, query: &SqlQuery) -> QueryResult;
+
+    fn switch_container(&self, _container: &PdbName) -> Result<()> {
+        anyhow::bail!("container switching not supported by this engine")
+    }
+
+    fn clone_box(&self) -> Box<dyn OraDbEngine + Send + Sync>;
+}
+
+impl OraDbEngine for StdEngine {
+    fn connect(&mut self, target: &Target, instance_name: Option<&InstanceName>) -> Result<()> {
+        if self.connection.is_some() {
+            log::warn!("Connection already established, closing the previous connection.");
+            return Ok(());
+        }
+
+        let connection_string = target
+            .make_connection_string(instance_name, ConnectionStringType::Tns)
+            .context("Target is not defined")?;
+        // An ASM instance is reached with the `asm_*` credentials from the config.
+        let auth = target.connection_auth();
+        log::debug!(
+            "Connection string: {}, asm {}, auth type {:?}",
+            connection_string,
+            target.is_asm(),
+            auth.auth_type
+        );
+
+        let mut connector = match &auth.auth_type {
+            AuthType::Standard => {
+                // Standard authentication with username and password
+                log::info!("Using standard authentication with user: {}", auth.username);
+                Connector::new(
+                    &auth.username,
+                    auth.password.as_deref().unwrap_or(""),
+                    &connection_string,
+                )
+            }
+            AuthType::Os | AuthType::Wallet => {
+                // OS/Wallet authentication - use external auth with empty credentials
+                log::info!("Using Wallet/OS authentication (external auth)");
+                let mut conn = Connector::new("", "", &connection_string);
+                conn.external_auth(true);
+                conn
+            }
+        };
+
+        if let Some(role) = &auth.role {
+            log::info!("Using role: {}", role);
+            connector.privilege(_to_privilege(role));
+        }
+
+        self.connection = Some(connector.connect()?);
+
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        if let Some(conn) = self.connection.take() {
+            conn.close()?;
+        }
+        Ok(())
+    }
+
+    fn query_table(&self, query: &SqlQuery) -> QueryResult {
+        fn _query_table(
+            connection: Option<&Connection>,
+            query: &SqlQuery,
+        ) -> Result<Vec<Vec<String>>> {
+            let conn = connection.ok_or_else(|| anyhow::anyhow!("No connection established"))?;
+            let x = query
+                .params()
+                .iter()
+                .map(|(k, v)| {
+                    let z: &dyn ToSql = v;
+                    (k.as_str(), z)
+                })
+                .collect::<Vec<(&str, &dyn ToSql)>>();
+
+            collect_rows(
+                conn.query_named(query.as_str(), x.as_slice())?
+                    .map(row_to_vector),
+            )
+        }
+
+        let result = _query_table(self.connection.as_ref(), query);
+
+        QueryResult(result)
+    }
+
+    fn switch_container(&self, container: &PdbName) -> Result<()> {
+        let conn = self
+            .connection
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No connection established"))?;
+        conn.execute(
+            &format!("ALTER SESSION SET CONTAINER = {}", container.as_ref()),
+            &[] as &[&dyn ToSql],
+        )?;
+        Ok(())
+    }
+
+    fn clone_box(&self) -> Box<dyn OraDbEngine + Send + Sync> {
+        Box::new(self.clone())
+    }
+}
+
+impl Clone for Box<dyn OraDbEngine + Send + Sync> {
+    fn clone(&self) -> Box<dyn OraDbEngine + Send + Sync> {
+        self.clone_box()
+    }
+}
+
+/// Collects mapped rows, aborting on the first row error.
+///
+/// `collect` into a `Result` short-circuits: it stops pulling the iterator at the
+/// first `Err`, so a driver that re-yields a mid-fetch error (e.g. ORA-01476 after
+/// N rows) cannot spin CPU or grow memory without bound. The error is logged and
+/// returned, surfacing as a FAILURE row.
+fn collect_rows(rows: impl Iterator<Item = Result<Vec<String>>>) -> Result<Vec<Vec<String>>> {
+    rows.collect::<Result<Vec<Vec<String>>>>()
+        .inspect_err(|e| log::error!("Stopping section query after a row fetch error: {e:#}"))
+}
+
+/// Converts one fetched row to its string cells.
+///
+/// A row-level fetch error and a cell the driver cannot render as a string
+/// (a REF CURSOR, for example) both fail the whole query. The caller stops
+/// and the section carries one FAILURE row instead of data rows with an
+/// `Error: ...` cell. Stopping also matters for fetch errors, which the
+/// driver can re-yield indefinitely.
+fn row_to_vector(row: oracle::Result<oracle::Row>) -> Result<Vec<String>> {
+    // Propagate the raw driver error (no `.context`): its Display carries the
+    // ORA-xxxxx text, which the section surfaces as the FAILURE reason.
+    let row = row?;
+    row.sql_values()
+        .iter()
+        .zip(row.column_info())
+        .map(|(value, column)| cell_to_string(value, column.name()))
+        .collect()
+}
+
+/// NULL becomes the empty string. The column name goes into the error so
+/// the FAILURE row names the offending column of a user-supplied query.
+fn cell_to_string(value: &oracle::SqlValue, column_name: &str) -> Result<String> {
+    if value.is_null()? {
+        return Ok(String::new());
+    }
+    String::from_sql(value).map_err(|e| anyhow::anyhow!("{e} in column {column_name}"))
+}
+
+fn _to_privilege(role: &Role) -> Privilege {
+    match role {
+        Role::SysDba => Privilege::Sysdba,
+        Role::SysOper => Privilege::Sysoper,
+        Role::SysASM => Privilege::Sysasm,
+        Role::SysBackup => Privilege::Sysbackup,
+        Role::SysKM => Privilege::Syskm,
+        Role::SysDG => Privilege::Sysdg,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SqlPlusEngine {}
+
+impl OraDbEngine for SqlPlusEngine {
+    fn connect(&mut self, _target: &Target, _service_name: Option<&InstanceName>) -> Result<()> {
+        anyhow::bail!("Sql*Plus engine is not implemented yet")
+    }
+
+    fn close(&mut self) -> Result<()> {
+        Ok(()) // No operation needed for Sql*Plus
+    }
+
+    fn query_table(&self, _query: &SqlQuery) -> QueryResult {
+        let result = Err(anyhow::anyhow!("Sql*Plus engine is not implemented yet"));
+        QueryResult(result)
+    }
+
+    fn clone_box(&self) -> Box<dyn OraDbEngine + Send + Sync> {
+        Box::new(self.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct JdbcEngine {}
+impl OraDbEngine for JdbcEngine {
+    fn connect(&mut self, _target: &Target, _service_name: Option<&InstanceName>) -> Result<()> {
+        anyhow::bail!("Jdbc engine is not implemented yet")
+    }
+    fn close(&mut self) -> Result<()> {
+        Ok(()) // No operation needed for Sql*Plus
+    }
+
+    fn query_table(&self, _query: &SqlQuery) -> QueryResult {
+        let result = Err(anyhow::anyhow!("Sql*Plus engine is not implemented yet"));
+        QueryResult(result)
+    }
+
+    fn clone_box(&self) -> Box<dyn OraDbEngine + Send + Sync> {
+        Box::new(self.clone())
+    }
+}
+
+#[derive(Debug)]
+enum EngineType {
+    Std,
+    SqlPlus,
+    Jdbc,
+}
+
+impl EngineType {
+    fn create_engine(&self) -> Box<dyn OraDbEngine + Send + Sync> {
+        match self {
+            EngineType::Std => Box::new(StdEngine { connection: None }),
+            EngineType::SqlPlus => Box::new(SqlPlusEngine {}),
+            EngineType::Jdbc => Box::new(JdbcEngine {}),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct SpotBuilder {
+    target: Option<Target>,
+    engine_type: Option<EngineType>,
+    custom_engine: Option<Box<dyn OraDbEngine>>,
+    database: Option<String>,
+    piggyback: Option<Piggyback>,
+}
+
+pub struct Closed;
+pub struct Opened;
+
+pub type OpenedSpot = Spot<Opened>;
+pub type ClosedSpot = Spot<Closed>;
+
+pub struct Spot<State: Send> {
+    pub target: Target,
+    engine: Box<dyn OraDbEngine + Send + Sync>,
+    _database: Option<String>,
+    piggyback: Option<Piggyback>,
+    _state: PhantomData<State>,
+}
+
+impl Clone for Spot<Closed> {
+    fn clone(&self) -> Self {
+        Spot {
+            target: self.target.clone(),
+            engine: self.engine.clone(),
+            _database: self._database.clone(),
+            piggyback: self.piggyback.clone(),
+            _state: PhantomData::<Closed>,
+        }
+    }
+}
+
+impl Spot<Closed> {
+    pub fn connect(mut self, use_instance: Option<&InstanceName>) -> Result<Spot<Opened>> {
+        log::info!(
+            "Connecting to {} at {}:{}",
+            self.target.display_name(),
+            self.target.host,
+            self.target.port.0
+        );
+        let connect_timer = PerfTimer::start("connection", Label::Inline);
+        self.engine.connect(&self.target, use_instance)?;
+
+        connect_timer.stop();
+
+        Ok(Spot {
+            target: self.target,
+            engine: self.engine,
+            _database: self._database,
+            piggyback: self.piggyback,
+            _state: PhantomData::<Opened>,
+        })
+    }
+    pub fn target(&self) -> &Target {
+        &self.target
+    }
+
+    pub fn database(&self) -> Option<&String> {
+        self._database.as_ref()
+    }
+
+    pub fn piggyback(&self) -> Option<&Piggyback> {
+        self.piggyback.as_ref()
+    }
+}
+
+pub struct QueryResult(pub Result<Vec<Vec<String>>>);
+
+impl QueryResult {
+    pub fn format(self, sep: &str) -> Result<Vec<String>> {
+        let result: Vec<String> = self
+            .0?
+            .into_iter()
+            .map(|row| row.join(sep))
+            .collect::<Vec<String>>();
+
+        Ok(result)
+    }
+
+    /// Pass-through formatter for custom-metric output: each SELECT-ed row is
+    /// emitted as-is, one column value per output line. Used for the
+    /// custom_metrics sections.
+    pub fn into_rows_passthrough(self) -> Result<Vec<String>> {
+        let result: Vec<String> = self.0?.into_iter().flatten().collect();
+        Ok(result)
+    }
+}
+
+/// Collapse `|` (`SECTION_SEPARATOR`) and line breaks to spaces and drop the
+/// driver's "OCI Error: " marker, so the message survives transport as one
+/// `<sid>|FAILURE|<message>` row.
+pub(crate) fn sanitize_failure_message(message: &str) -> String {
+    message
+        .replace("OCI Error: ", "")
+        .replace(['\r', '\n', SECTION_SEPARATOR], " ")
+        .trim()
+        .to_string()
+}
+
+impl Spot<Opened> {
+    pub fn close(mut self) -> Spot<Closed> {
+        if let Err(e) = self.engine.close() {
+            log::error!("Failed to close the engine: {}", e);
+        };
+
+        Spot {
+            target: self.target,
+            engine: self.engine,
+            _database: self._database,
+            piggyback: self.piggyback,
+            _state: PhantomData::<Closed>,
+        }
+    }
+
+    pub fn query_table(&self, query: &SqlQuery) -> QueryResult {
+        self.engine.query_table(query)
+    }
+
+    pub fn switch_container(&self, container: &PdbName) -> Result<()> {
+        self.engine.switch_container(container)
+    }
+
+    pub fn target(&self) -> &Target {
+        &self.target
+    }
+
+    pub fn database(&self) -> Option<&String> {
+        self._database.as_ref()
+    }
+
+    pub fn piggyback(&self) -> Option<&Piggyback> {
+        self.piggyback.as_ref()
+    }
+}
+
+/// Switch to `container`, run `f`, then reset to `CDB$ROOT`.
+pub fn with_container<T>(
+    spot: &Spot<Opened>,
+    container: Option<&PdbName>,
+    f: impl FnOnce() -> T,
+) -> Result<T> {
+    if let Some(pdb) = container {
+        spot.switch_container(pdb)?;
+    }
+    let result = f();
+    if container.is_some() {
+        spot.switch_container(&PdbName::from("CDB$ROOT"))?;
+    }
+    Ok(result)
+}
+
+impl SpotBuilder {
+    pub fn new() -> SpotBuilder {
+        SpotBuilder::default()
+    }
+
+    pub fn database<S: Into<String>>(mut self, database: Option<S>) -> Self {
+        self.database = database.map(|d| d.into());
+        self
+    }
+
+    pub fn endpoint_target(mut self, endpoint: &Endpoint) -> Self {
+        self.target = Some(Target::new(
+            endpoint.conn().hostname().clone(),
+            endpoint.conn().port().clone(),
+            endpoint.auth().clone(),
+            endpoint.target_id().cloned(),
+            endpoint.conn().timeout(),
+        ));
+        self
+    }
+
+    pub fn custom_instance_target(mut self, custom_instance: &CustomInstance) -> Self {
+        self.target = Some(Target::new(
+            custom_instance.conn().hostname().clone(),
+            custom_instance.conn().port().clone(),
+            custom_instance.auth().clone(),
+            custom_instance.target_id().cloned(),
+            custom_instance.conn().timeout(),
+        ));
+        self
+    }
+
+    pub fn engine_type(mut self, engine_tag: &EngineTag) -> Self {
+        self.engine_type = Some(match engine_tag {
+            EngineTag::Std | EngineTag::Auto => EngineType::Std,
+            EngineTag::SqlPlus => EngineType::SqlPlus,
+            EngineTag::Jdbc => EngineType::Jdbc,
+        });
+        self
+    }
+
+    pub fn custom_engine(mut self, engine: Box<dyn OraDbEngine>) -> Self {
+        self.custom_engine = Some(engine);
+        self
+    }
+
+    pub fn piggyback(mut self, piggyback: Option<Piggyback>) -> Self {
+        self.piggyback = piggyback;
+        self
+    }
+
+    pub fn build(self) -> Result<ClosedSpot> {
+        Ok(Spot {
+            engine: self
+                .engine_type
+                .map(|e| e.create_engine())
+                .or(self.custom_engine.map(|v| v.clone_box()))
+                .context("Engine is not defined")?,
+            target: self
+                .target
+                .ok_or_else(|| anyhow::anyhow!("Target is absent"))?,
+            _database: self.database,
+            piggyback: self.piggyback,
+            _state: PhantomData::<Closed>,
+        })
+    }
+}
+
+pub fn make_spot(endpoint: &Endpoint) -> Result<ClosedSpot> {
+    SpotBuilder::new()
+        .endpoint_target(endpoint)
+        .engine_type(endpoint.conn().engine_tag())
+        .build()
+}
+
+pub fn make_custom_spot(instance: &CustomInstance) -> Result<ClosedSpot> {
+    SpotBuilder::new()
+        .custom_instance_target(instance)
+        .engine_type(instance.endpoint().conn().engine_tag())
+        .piggyback(instance.piggyback().cloned())
+        .build()
+}
+
+pub fn obtain_config_credentials(auth: &Authentication) -> Option<Credentials> {
+    match auth.auth_type() {
+        AuthType::Standard | AuthType::Wallet => Some(Credentials {
+            user: auth.username().to_string(),
+            password: auth.password().unwrap_or("").to_string(),
+        }),
+        AuthType::Os => None,
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! Fake [`OraDbEngine`] and helpers for tests.
+    use super::*;
+    use crate::ora_sql::sqls::query::internal::{
+        INSTANCE_INFO_SQL_TEXT_NEW, INSTANCE_INFO_SQL_TEXT_OLD, INSTANCE_VERSION,
+        INSTANCE_VERSION_FULL, PDB_DISCOVERY_SQL,
+    };
+    use std::sync::{Arc, Mutex};
+
+    /// A `v$instance` row; parsing reads only columns 0 (name), 2 (version), 4 (cdb).
+    pub fn instance_row(name: &str, version: &str, cdb: &str) -> Vec<String> {
+        vec![
+            name.to_string(),
+            "0".to_string(),
+            version.to_string(),
+            format!("{name}DB"),
+            cdb.to_string(),
+        ]
+    }
+
+    /// Fake engine; answers from the field matching the query (see `query_table`).
+    #[derive(Default)]
+    pub struct MiniOra {
+        pub instance_rows: Vec<Vec<String>>,
+        pub pdb_rows: Vec<Vec<String>>,
+        pub default_rows: Vec<Vec<String>>,
+        /// A query naming any of these is answered with ORA-00904.
+        pub absent_columns: Vec<String>,
+        /// Shared with every clone from `clone_box`, so one run collects here.
+        pub asked: Arc<Mutex<Vec<String>>>,
+        pub version_rows: Vec<Vec<String>>,
+    }
+
+    impl MiniOra {
+        fn missing_column_in(&self, query: &str) -> Option<&str> {
+            let upper = query.to_uppercase();
+            self.absent_columns
+                .iter()
+                .find(|c| upper.contains(&c.to_uppercase()))
+                .map(String::as_str)
+        }
+    }
+
+    impl OraDbEngine for MiniOra {
+        fn connect(&mut self, _target: &Target, _instance: Option<&InstanceName>) -> Result<()> {
+            Ok(())
+        }
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn switch_container(&self, _container: &PdbName) -> Result<()> {
+            Ok(())
+        }
+        fn query_table(&self, query: &SqlQuery) -> QueryResult {
+            self.asked.lock().unwrap().push(query.as_str().to_owned());
+            if let Some(column) = self.missing_column_in(query.as_str()) {
+                return QueryResult(Err(anyhow::anyhow!(
+                    "ORA-00904: \"{column}\": invalid identifier"
+                )));
+            }
+            let rows = match query.as_str() {
+                INSTANCE_INFO_SQL_TEXT_NEW | INSTANCE_INFO_SQL_TEXT_OLD => &self.instance_rows,
+                INSTANCE_VERSION_FULL | INSTANCE_VERSION => &self.version_rows,
+                PDB_DISCOVERY_SQL => &self.pdb_rows,
+                _ => &self.default_rows,
+            };
+            QueryResult(Ok(rows.clone()))
+        }
+        fn clone_box(&self) -> Box<dyn OraDbEngine + Send + Sync> {
+            Box::new(MiniOra {
+                instance_rows: self.instance_rows.clone(),
+                pdb_rows: self.pdb_rows.clone(),
+                default_rows: self.default_rows.clone(),
+                absent_columns: self.absent_columns.clone(),
+                asked: Arc::clone(&self.asked),
+                version_rows: self.version_rows.clone(),
+            })
+        }
+    }
+
+    impl MiniOra {
+        /// One non-CDB instance `name`; custom queries return `details:ok`.
+        pub fn single(name: &str) -> Self {
+            Self::at_version(name, "19.1.0.0", "NO")
+        }
+
+        /// Derives `absent_columns` from `version`.
+        pub fn at_version(name: &str, version: &str, cdb: &str) -> Self {
+            let numeric: Vec<u32> = version
+                .split('.')
+                .filter_map(|p| p.parse::<u32>().ok())
+                .collect();
+            let major = numeric.first().copied().unwrap_or(0);
+            let minor = numeric.get(1).copied().unwrap_or(0);
+            let mut absent_columns = Vec::new();
+            if major < 18 {
+                absent_columns.push("VERSION_FULL".to_string());
+            }
+            if major < 12 || (major == 12 && minor < 1) {
+                absent_columns.push("CON_ID".to_string());
+                absent_columns.push("d.cdb".to_string());
+            }
+            Self {
+                instance_rows: vec![instance_row(name, version, cdb)],
+                default_rows: vec![vec!["details:ok".to_string()]],
+                version_rows: vec![vec![version.to_string()]],
+                absent_columns,
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Open a spot on `db`. `target` sets `target_id` to match that instance
+    /// (per-instance `custom_metrics` key on it); `None` uses a default endpoint.
+    pub fn open_spot(db: MiniOra, target: Option<&CustomInstance>) -> OpenedSpot {
+        let builder = SpotBuilder::new().custom_engine(Box::new(db));
+        let builder = match target {
+            Some(ci) => builder.custom_instance_target(ci),
+            None => builder.endpoint_target(&Endpoint::default()),
+        };
+        builder
+            .build()
+            .expect("fake spot builds")
+            .connect(None)
+            .expect("fake spot connects")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ora_sql::Config;
+
+    fn make_config_with_auth_type(auth_type: &str) -> Result<Config> {
+        const BASE: &str = r#"
+---
+oracle:
+  main:
+    authentication:
+       username: "bad_user"
+       password: "bad_password"
+       type: type_tag
+    connection:
+       hostname: "localhost" # we use real host to avoid long timeout
+       port: 65345 # we use weird port to avoid connection
+       service_name: XE
+       timeout: 1
+"#;
+        let s = Config::from_string(BASE.replace("type_tag", auth_type))?.unwrap();
+        Ok(s)
+    }
+
+    #[test]
+    fn test_create_client_from_config_for_error() {
+        let c = make_config_with_auth_type("bad");
+        assert!(c.is_err());
+    }
+
+    #[test]
+    fn test_create_client_from_config_correct() {
+        let config = make_config_with_auth_type("standard").unwrap();
+        assert!(make_spot(&config.endpoint()).is_ok());
+    }
+
+    #[test]
+    fn test_make_custom_spot_with_piggyback_config() {
+        use crate::config::section::Sections;
+        use crate::config::target::TargetIdBuilder;
+        use crate::config::yaml::test_tools::create_yaml;
+        use crate::types::ServiceName;
+
+        let piggyback = Piggyback::from_yaml(
+            &create_yaml("piggyback:\n  hostname: oracle-prod-db01\n"),
+            &Sections::default(),
+        )
+        .unwrap();
+        assert!(piggyback.is_some());
+
+        let instance = CustomInstance::new(
+            Authentication::default(),
+            crate::config::connection::Connection::default(),
+            TargetIdBuilder::new()
+                .service_name(Some(&ServiceName::from("ORCLPDB1")))
+                .build(),
+            None,
+            piggyback.clone(),
+        );
+
+        let spot = make_custom_spot(&instance).unwrap();
+        assert_eq!(spot.piggyback(), piggyback.as_ref());
+    }
+
+    #[test]
+    fn test_make_custom_spot_without_piggyback_config() {
+        use crate::config::target::TargetIdBuilder;
+        use crate::types::ServiceName;
+
+        let instance = CustomInstance::new(
+            Authentication::default(),
+            crate::config::connection::Connection::default(),
+            TargetIdBuilder::new()
+                .service_name(Some(&ServiceName::from("ORCLPDB1")))
+                .build(),
+            None,
+            None,
+        );
+
+        let spot = make_custom_spot(&instance).unwrap();
+        assert!(spot.piggyback().is_none());
+    }
+
+    #[test]
+    fn test_obtain_credentials_from_config() {
+        assert!(
+            obtain_config_credentials(make_config_with_auth_type("os").unwrap().auth()).is_none()
+        );
+        assert!(make_config_with_auth_type("kerberos").is_err());
+        assert!(
+            obtain_config_credentials(make_config_with_auth_type("standard").unwrap().auth())
+                .is_some()
+        );
+    }
+
+    // TC-ORA-101 (Param: details/perfdata/long/exit prefixes pass through verbatim)
+    #[test]
+    fn test_query_result_passthrough_emits_each_cell_as_is() {
+        let rows = vec![
+            vec!["details:All OK".to_string()],
+            vec!["perfdata:cache_hit_ratio=98;90;80;100".to_string()],
+            vec!["long:extended detail line".to_string()],
+            vec!["exit:0".to_string()],
+        ];
+        let lines = QueryResult(Ok(rows)).into_rows_passthrough().unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "details:All OK".to_string(),
+                "perfdata:cache_hit_ratio=98;90;80;100".to_string(),
+                "long:extended detail line".to_string(),
+                "exit:0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_query_result_format_joins_columns() {
+        let rows = vec![vec!["a".to_string(), "b".to_string(), "c".to_string()]];
+        let lines = QueryResult(Ok(rows)).format("|").unwrap();
+        assert_eq!(lines, vec!["a|b|c".to_string()]);
+    }
+
+    #[test]
+    fn test_collect_rows_stops_at_first_error_without_draining() {
+        use std::cell::Cell;
+        // Ok, Ok, then Err on every further pull - mimics a driver that re-yields a
+        // mid-fetch error instead of ending. If collect_rows drained instead of
+        // short-circuiting, this iterator never returns None and the test hangs.
+        let pulls = Cell::new(0usize);
+        let rows = std::iter::from_fn(|| {
+            let n = pulls.get();
+            pulls.set(n + 1);
+            Some(if n < 2 {
+                Ok(vec![format!("row{n}")])
+            } else {
+                Err(anyhow::anyhow!("ORA-01476: divisor is equal to zero"))
+            })
+        });
+
+        let result = collect_rows(rows);
+
+        assert!(result.is_err());
+        assert_eq!(
+            pulls.get(),
+            3,
+            "must stop right after the first error, not drain"
+        );
+        assert!(result.unwrap_err().to_string().contains("ORA-01476"));
+    }
+}

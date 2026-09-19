@@ -1,0 +1,60 @@
+<!--
+Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import CmkHelpText from 'cmk-ui-library/components/CmkHelpText.vue'
+import { untranslated } from 'cmk-ui-library/lib/i18n'
+import { computed, ref, watch } from 'vue'
+
+import type { ValidationMessages } from '@/form'
+import FormEdit from '@/form/FormEdit.vue'
+
+import { type FormSpecWidgetProps } from './widget_types'
+
+const props = defineProps<FormSpecWidgetProps>()
+const emit = defineEmits(['update'])
+
+const formSpecId = props.form_spec.id as string
+const internal = ref(props?.data![formSpecId] || props.form_spec.data || {})
+
+const validationErrors = computed((): ValidationMessages => {
+  const errors = props?.errors![formSpecId] || []
+  return errors
+})
+
+//This will set a starting value on the quick setup component for this form spec
+emit('update', formSpecId, internal.value)
+
+watch(
+  internal,
+  (newValue) => {
+    emit('update', formSpecId, newValue)
+  },
+  { deep: true }
+)
+</script>
+
+<template>
+  <table class="qs-form-spec-widget">
+    <tbody>
+      <tr>
+        <td>
+          <CmkHelpText :help="untranslated(form_spec.spec.help)" />
+          <FormEdit
+            v-model:data="internal"
+            :spec="form_spec.spec"
+            :backend-validation="validationErrors"
+          />
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</template>
+
+<style scoped>
+table.qs-form-spec-widget {
+  border-spacing: 0;
+}
+</style>

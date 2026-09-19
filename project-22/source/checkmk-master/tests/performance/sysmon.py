@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+"""Helpers for retrieving system performance metrics."""
+
+import datetime
+import json
+import os
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
+from pathlib import Path
+from sys import argv
+from typing import IO
+
+import psutil
+
+from tests.testlib.version import CMKPackageInfo, edition_from_env, version_from_env
+
+perf_dict = dict[str, int | float | str | None]
+nested_perf_dict = dict[str, perf_dict]
+
+
+def _named_section(name: str, data: perf_dict) -> perf_dict:
+    for key in list(data.keys()):
+        data[f"{name}.{key}"] = data.pop(key)
+    return data
+
+
+def get_cpu_info(count_cores: bool = False) -> perf_dict:
+    """Get CPU metrics."""
+    data: perf_dict = {
+        "cpu_freq": psutil.cpu_freq().current,
+        "cpu_percent": psutil.cpu_percent(interval=0.1),
+    }
+    if count_cores:
+        data |= {
+            "cpu_count_physical": psutil.cpu_count(logical=False),
+            "cpu_count_logical": psutil.cpu_count(logical=True),
+        }
+    core_data: perf_dict = {
+        f"cpu_percent_{core}": usage
+        for core, usage in enumerate(psutil.cpu_percent(percpu=True, interval=0.1))
+    }  # "percpu" -> "per core"
+    data.update(core_data)
+    return _named_section("cpu_info", data)
+
+
+def get_disk_info() -> perf_dict:
+    """Get disk metrics."""
+    partitions = psutil.disk_partitions()
+    data: perf_dict = {}
+    for partition in partitions:
+        partition_usage = psutil.disk_usage(partition.mountpoint)
+        partition_info = {
+            "total_space": partition_usage.total / (1024.0**3),
+            "used_space": partition_usage.used / (1024.0**3),
+            "free_space": partition_usage.free / (1024.0**3),
+            "usage_percentage": partition_usage.percent,
+        }
+        for key, value in partition_info.items():
+            data[f"{partition.mountpoint}.{key}"] = value
+    return _named_section("disk_info", data)
+
+
+def get_disk_io_counters() -> perf_dict:
+    """Get disk IO metrics."""
+    io_counters = psutil.disk_io_counters()
+    data: perf_dict = {
+        "read_count": io_counters.read_count if io_counters else 0,
+        "write_count": io_counters.write_count if io_counters else 0,
+        "read_bytes": io_counters.read_bytes if io_counters else 0,
+        "write_bytes": io_counters.write_bytes if io_counters else 0,
+        "read_time": io_counters.read_time if io_counters else 0,
+        "write_time": io_counters.write_time if io_counters else 0,
+    }
+    return _named_section("disk_io_counters", data)
+
+
+def get_kernel_info() -> perf_dict:
+    """Get kernel metrics."""
+    data: perf_dict = {
+        "kernel_version": os.uname().release,
+        "system_name": os.uname().sysname,
+        "node_name": os.uname().nodename,
+        "machine": os.uname().machine,
+    }
+    return _named_section("kernel_info", data)
+
+
+def get_load_average() -> perf_dict:
+    """Get average load metrics."""
+    load_avg_1, load_avg_5, load_avg_15 = psutil.getloadavg()
+    data: perf_dict = {
+        "load_average_1": load_avg_1,
+        "load_average_5": load_avg_5,
+        "load_average_15": load_avg_15,
+    }
+    return _named_section("load_average", data)
+
+
+def get_memory_info() -> perf_dict:
+    """Get memory metrics."""
+    conversion_factor = 1024.0**3  # GiB
+    data: perf_dict = {
+        "virtual_memory_total": psutil.virtual_memory().total / conversion_factor,
+        "virtual_memory_available": psutil.virtual_memory().available / conversion_factor,
+        "virtual_memory_percent": psutil.virtual_memory().percent,
+        "virtual_memory_used": psutil.virtual_memory().used / conversion_factor,
+    }
+    return _named_section("memory_info", data)
+
+
+def get_net_io_counters() -> perf_dict:
+    net_io_counters = psutil.net_io_counters()
+    data: perf_dict = {
+        "bytes_sent": net_io_counters.bytes_sent,
+        "bytes_recv": net_io_counters.bytes_recv,
+        "packets_sent": net_io_counters.packets_sent,
+        "packets_recv": net_io_counters.packets_recv,
+        "errin": net_io_counters.errin,
+        "errout": net_io_counters.errout,
+        "dropin": net_io_counters.dropin,
+        "dropout": net_io_counters.dropout,
+    }
+    return _named_section("net_io_counters", data)
+
+
+def get_process_info() -> perf_dict:
+    processes: nested_perf_dict = {}
+    for process in psutil.process_iter(["pid", "name", "memory_percent", "cpu_percent"]):
+        with suppress(psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            processes[process.info["pid"]] = {
+                "name": process.info["name"],
+                "cpu_percent": process.info["cpu_percent"],
+                "memory_percent": process.info["memory_percent"],
+            }
+    data = {}
+    for pid, proc in processes.items():
+        if type(proc) is perf_dict:
+            data[f"{pid}.name_{proc['name']}.cpu_percent"] = proc["cpu_percent"]
+            data[f"{pid}.name_{proc['name']}.memory_percent"] = proc["memory_percent"]
+    return _named_section("process_info", data)
+
+
+@dataclass(frozen=True, kw_only=True)
+class ProcessGroupUsage:
+    """What one user's processes have consumed.
+
+    An OMD site runs everything as its own user, so asking for that user's processes is asking
+    for that site and nothing else. That is what makes this different from the machine-wide
+    figures above: on a box that is also running the test - and, when remote sites are faked,
+    running them inside the test - a machine-wide number cannot say what the site itself cost.
+    """
+
+    #: CPU seconds these processes have used since they started. A difference between two
+    #: samples is what a piece of work cost.
+    cpu_seconds: float
+    #: Resident memory held right now, summed. A level rather than a total, so two samples are
+    #: compared rather than subtracted.
+    rss_mib: float
+
+
+def get_process_group_usage(username: str) -> ProcessGroupUsage:
+    """CPU and resident memory of every process running as ``username``."""
+    cpu_seconds = 0.0
+    rss_bytes = 0
+    for process in psutil.process_iter(["pid", "username"]):
+        with suppress(psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            if process.info["username"] != username:
+                continue
+            times = process.cpu_times()
+            cpu_seconds += times.user + times.system
+            rss_bytes += process.memory_info().rss
+    return ProcessGroupUsage(cpu_seconds=cpu_seconds, rss_mib=rss_bytes / (1024.0**2))
+
+
+def get_system_uptime() -> str:
+    boot_time_timestamp = psutil.boot_time()
+    current_time_timestamp = time.time()
+    uptime_seconds = current_time_timestamp - boot_time_timestamp
+    uptime_minutes = uptime_seconds // 60
+    uptime_hours = uptime_minutes // 60
+    uptime_days = uptime_hours // 24
+    return f"{int(uptime_days)}d {int(uptime_hours % 24)}h {int(uptime_minutes % 60)}m {int(uptime_seconds % 60)}s"
+
+
+def get_statistics(timestamp: str, all_stats: bool = False) -> perf_dict:
+    statistics = (
+        perf_dict({"time": timestamp}) | get_cpu_info() | get_memory_info() | get_disk_io_counters()
+    )
+    if not all_stats:
+        return statistics
+
+    return (
+        statistics
+        | get_kernel_info()
+        | get_disk_info()
+        | get_process_info()
+        | get_load_average()
+        | get_net_io_counters()
+    )
+
+
+def write_statistics(file: IO, all_stats: bool = False, close: bool = False) -> None:
+    if close:
+        file.write("[]" if file.tell() == 0 else "\n]")
+        return
+
+    timestamp = datetime.datetime.now().astimezone().isoformat()
+    statistics = get_statistics(timestamp, all_stats=all_stats)
+    separator = "[\n" if file.tell() == 0 else ",\n"
+    file.write(separator)
+    json.dump(statistics, file, separators=(",", ":"))
+
+
+def _init_resources_file(task_name: str) -> Path:
+    if bazel_outputs_dir := os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR"):
+        resource_statistics_json = Path(bazel_outputs_dir) / f"{task_name}.resources.json"
+        resource_statistics_json.unlink(missing_ok=True)
+        return resource_statistics_json
+
+    version_directory = CMKPackageInfo(version_from_env(), edition_from_env()).version_directory()
+    result_dir = Path(os.getenv("RESULT_PATH", Path(__file__).parent.parent.parent / "results"))
+    report_dir = result_dir / "performance" / version_directory
+    report_dir.mkdir(parents=True, exist_ok=True)
+    benchmark_json_name = next(
+        (_.split("=", 1)[-1] for _ in argv if _.startswith("--benchmark-json=")),
+        "cmk.benchmark.json",
+    )
+    benchmark_json_path = report_dir / benchmark_json_name
+    resource_statistics_json = benchmark_json_path.parent / f"{task_name}.resources.json"
+    resource_statistics_json.unlink(missing_ok=True)
+
+    return resource_statistics_json
+
+
+def _log_resources(
+    file_path: Path,
+    start_event: threading.Event,
+    stop_event: threading.Event,
+    sampling_interval: float,
+) -> None:
+    max_duration = 0.0
+    with open(file_path, "w") as stats_file:
+        while not stop_event.is_set():
+            start_time = time.time()
+            if start_event.is_set():
+                write_statistics(stats_file)
+            end_time = time.time()
+            duration = end_time - start_time
+            max_duration = duration if duration > max_duration else max_duration
+            # wait until next sampling interval
+            if duration < sampling_interval:
+                time.sleep(sampling_interval - duration)
+        write_statistics(stats_file, close=True)
+
+
+@contextmanager
+def track_resources(
+    task_name: str,
+    start_event: threading.Event | None = None,
+    stop_event: threading.Event | None = None,
+    sampling_interval: float = 1.0,
+) -> Iterator[None]:
+    """Monitor and track the resource usage of the host while executing a task context.
+
+    By default, the resource tracking is started when the context manager is entered
+    and stopped when the context manager is exited. More fine-grained, event-based control
+    is possible by passing a start_event and a stop_event.
+
+    Args:
+        task_name: The name of the task (used for naming the resources file).
+        start_event: Controls the actual start of the resource tracking (optional).
+        stop_event: Controls the actual end of the resource tracking (optional).
+        sampling_interval: The measurement sampling interval in seconds (default: 1.0).
+    """
+    file_path = _init_resources_file(task_name)
+    if start_event is None:
+        start_event = threading.Event()
+        start_event.set()
+    stop_event = stop_event or threading.Event()
+    thread = threading.Thread(
+        target=_log_resources, args=(file_path, start_event, stop_event, sampling_interval)
+    )
+    thread.start()
+
+    yield
+
+    start_event.clear()
+    stop_event.set()

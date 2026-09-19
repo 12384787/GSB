@@ -1,0 +1,124 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import { useCmkErrorBoundary } from 'cmk-ui-library/components/CmkErrorBoundary'
+import type { DateTimeRange } from 'cmk-ui-library/components/date-time'
+import { computed, ref } from 'vue'
+
+import type {
+  ContentProps,
+  ContentPropsRecord
+} from '@/dashboard/components/DashboardContent/types'
+import RelativeGrid from '@/dashboard/components/RelativeGrid/RelativeGrid.vue'
+import ResponsiveGrid from '@/dashboard/components/ResponsiveGrid/ResponsiveGrid.vue'
+import { squashFilters } from '@/dashboard/components/Wizard/components/FiltersRecap/utils'
+import type { DashboardFilters } from '@/dashboard/composables/useDashboardFilters'
+import type { DashboardWidgets } from '@/dashboard/composables/useDashboardWidgets.ts'
+import { useInjectDashboardConstants } from '@/dashboard/composables/useProvideDashboardConstants'
+import type { WidgetTitles } from '@/dashboard/composables/useWidgetTitles'
+import type {
+  ContentRelativeGrid,
+  ContentResponsiveGrid,
+  DashboardKey,
+  DashboardModel
+} from '@/dashboard/types/dashboard'
+import type { WidgetLayout } from '@/dashboard/types/widget'
+
+interface DashboardProps {
+  dashboardKey: DashboardKey
+  baseFilters: DashboardFilters['baseFilters']
+  widgetCores: DashboardWidgets['widgetCores']
+  updatedWidgetRenderKeys: DashboardWidgets['updatedWidgetRenderKeys']
+  widgetTitles: WidgetTitles
+  isEditing: boolean
+}
+
+const props = defineProps<DashboardProps>()
+const constants = useInjectDashboardConstants()
+
+const dashboard = defineModel<DashboardModel>('dashboard', { required: true })
+
+defineEmits<{
+  'widget:edit': [widgetId: string]
+  'widget:delete': [widgetId: string]
+  'widget:clone': [oldWidgetId: string, newLayout: WidgetLayout]
+  'widget:updateTimeRange': [widgetId: string, range: DateTimeRange]
+}>()
+
+const widgetContentProps = computed<ContentPropsRecord>(() => {
+  const record: Record<string, ContentProps> = {}
+  for (const [widgetId, widget] of Object.entries(props.widgetCores.value)) {
+    const widgetConstants = constants.widgets[widget.content.type]!
+    if (!widgetConstants) {
+      // TODO: until we have not migrated to the new format for dashboards
+      // the old view widget will throw an error
+      console.error(`Widget type ${widget.content.type} not found in constants`)
+      continue
+    }
+
+    record[widgetId] = {
+      widget_id: widgetId,
+      general_settings: widget.general_settings,
+      content: widget.content,
+      effectiveTitle: props.widgetTitles[widgetId],
+      effective_filter_context: {
+        uses_infos: widget.filter_context.uses_infos,
+        restricted_to_single: widgetConstants.filter_context.restricted_to_single,
+        filters: squashFilters(props.baseFilters.value, widget.filter_context.filters)
+      },
+      dashboardKey: props.dashboardKey
+    }
+  }
+  return record
+})
+
+const relativeGrid = ref<InstanceType<typeof RelativeGrid> | null>(null)
+
+defineExpose({
+  /**
+   * The relative grid's widget IDs in reading order, or null when the active dashboard does not
+   * use the relative grid layout or its grid has not been measured yet.
+   */
+  getRelativeGridWidgetOrder: (): string[] | null =>
+    relativeGrid.value?.getWidgetReadingOrder() ?? null
+})
+
+// eslint-disable-next-line @typescript-eslint/naming-convention
+const { CmkErrorBoundary } = useCmkErrorBoundary()
+</script>
+
+<template>
+  <CmkErrorBoundary>
+    <ResponsiveGrid
+      v-if="dashboard.content.layout.type === 'responsive_grid'"
+      v-model:content="dashboard.content as ContentResponsiveGrid"
+      :dashboard-key="dashboardKey"
+      :content-props="widgetContentProps"
+      :updated-widget-render-keys="updatedWidgetRenderKeys.value"
+      :is-editing="isEditing"
+      @widget:edit="$emit('widget:edit', $event)"
+      @widget:delete="$emit('widget:delete', $event)"
+      @widget:clone="(oldWidgetId, newLayout) => $emit('widget:clone', oldWidgetId, newLayout)"
+      @widget:update-time-range="
+        (widgetId, range) => $emit('widget:updateTimeRange', widgetId, range)
+      "
+    />
+    <RelativeGrid
+      v-else-if="dashboard.content.layout.type === 'relative_grid'"
+      ref="relativeGrid"
+      v-model:content="dashboard.content as ContentRelativeGrid"
+      :content-props="widgetContentProps"
+      :updated-widget-render-keys="updatedWidgetRenderKeys.value"
+      :is-editing="isEditing"
+      @widget:edit="$emit('widget:edit', $event)"
+      @widget:delete="$emit('widget:delete', $event)"
+      @widget:clone="(oldWidgetId, newLayout) => $emit('widget:clone', oldWidgetId, newLayout)"
+      @widget:update-time-range="
+        (widgetId, range) => $emit('widget:updateTimeRange', widgetId, range)
+      "
+    />
+  </CmkErrorBoundary>
+</template>

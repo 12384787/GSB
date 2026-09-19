@@ -1,0 +1,20 @@
+title: Dell iDRAC: Disks
+agents: snmp
+catalog: hw/server/dell
+license: GPLv2
+distribution: check_mk
+description:
+ This checks connects to a Dell iDRAC and monitors the health and current
+ Status of Hardisks attached to server. Currently tested with iDRAC V7.
+ The check returns a {CRIT} in case of an error state reported
+ by the device. The check also reports Size, SMART Errors and Spare state for each disk.
+ Moreover the disk power status is monitored. The check goes WARN if this status
+ is REBUILDING, data-erased or COPY-BACK, it's OK in case of no-operation, otherwise
+ UNKNOWN.
+
+item:
+ The combination of EnclosureID, Channel and TargetID seperated by colons
+
+discovery:
+ One service is created for each Disk.
+ If the configured disk name is an empty string, the disk will be discovered with a generic name {noname-<idx>} (see werk 20028).

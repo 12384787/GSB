@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from typing import override
+
+from cmk.gui.config import Config
+from cmk.gui.dashboard import get_permitted_dashboards
+from cmk.gui.i18n import _
+from cmk.gui.logged_in import user
+from cmk.gui.permissions import permission_registry
+from cmk.gui.utils.roles import UserPermissions
+from cmk.shared_typing.main_menu import NavItemTopic
+
+from ._base import SidebarSnapin
+from ._helpers import footnotelinks, make_main_menu, show_main_menu, VisualItem, VisualMenuItem
+
+
+class Dashboards(SidebarSnapin):
+    @staticmethod
+    @override
+    def type_name() -> str:
+        return "dashboards"
+
+    @classmethod
+    @override
+    def title(cls) -> str:
+        return _("Dashboards")
+
+    @classmethod
+    @override
+    def description(cls) -> str:
+        return _("Links to all dashboards")
+
+    @override
+    def show(self, config: Config) -> None:
+        show_main_menu(
+            treename="dashboards",
+            menu=self._get_dashboard_menu_items(
+                UserPermissions.from_config(config, permission_registry)
+            ),
+        )
+
+        links = []
+        if user.may("general.edit_dashboards"):
+            if config.debug:
+                links.append((_("Export"), "export_dashboards.py"))
+            links.append((_("Edit"), "edit_dashboards.py"))
+            footnotelinks(links)
+
+    def _get_dashboard_menu_items(self, user_permissions: UserPermissions) -> list[NavItemTopic]:
+        return make_main_menu(
+            [
+                VisualMenuItem("dashboards", VisualItem(k, v))
+                for k, v in get_permitted_dashboards().items()
+            ],
+            user_permissions,
+        )

@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+# mypy: disable-error-code="no-untyped-call"
+
+"""agent_storeonce4x
+
+Checkmk special agent for HP StoreOnce REST API Version 4.2.3"""
+
+# TODO: once this agent can be used on a 2.x live system, it should be checked for functionality
+#       and against known exceptions
+
+import argparse
+import datetime as dt
+import json
+import logging
+import sys
+from collections.abc import Callable, Generator, Sequence
+from types import GeneratorType
+from typing import Any, TypedDict
+
+import urllib3
+from oauthlib.oauth2 import LegacyApplicationClient
+from requests_oauthlib import OAuth2Session  # type: ignore[attr-defined]
+
+from cmk.password_store.v1_unstable import parser_add_secret_option, resolve_secret_option, Secret
+from cmk.server_side_programs.v1_unstable import report_agent_crashes, vcrtrace
+
+AnyGenerator = Generator[Any]
+ResultFn = Callable[..., AnyGenerator]
+
+__version__ = "3.0.0b1"
+
+AGENT = "storeonce4x"
+
+LOGGER = logging.getLogger(f"agent_{AGENT}")
+
+PASSWORD_OPTION = "password"
+
+StringMap = dict[str, str]  # should be Mapping[] but we're not ready yet..
+
+
+class TokenDict(TypedDict):
+    access_token: str
+    refresh_token: str
+    expires_in: float
+    expires_in_abs: str | None
+
+
+def to_token_dict(data: Any) -> TokenDict:
+    return {
+        "access_token": str(data["access_token"]),
+        "refresh_token": str(data["refresh_token"]),
+        "expires_in": float(data["expires_in"]),
+        "expires_in_abs": str(data["expires_in_abs"]) if "expires_in_abs" in data else None,
+    }
+
+
+class StoreOnceOauth2Session:
+    _refresh_endpoint = "/pml/login/refresh"
+    _token_endpoint = "/pml/login/authenticate"
+    _dt_fmt = "%Y-%m-%d %H:%M:%S.%f"
+
+    def __init__(
+        self, host: str, port: str, user: str, secret: Secret[str], verify_ssl: bool
+    ) -> None:
+        self._host = host
+        self._port = port
+        self._user = user
+        self._secret = secret
+        self._verify_ssl = verify_ssl
+        if not verify_ssl:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        # We need to use LegacyClient due to grant_type==password
+        self._client = LegacyApplicationClient("")
+        self._client.prepare_request_body(username=self._user, password=self._secret.reveal())
+        self._oauth_session = OAuth2Session(
+            self._user,
+            client=self._client,
+            auto_refresh_url=f"https://{self._host}:{self._port}{self._refresh_endpoint}",
+            token_updater=lambda x: self.update_expires_in_abs(to_token_dict(x)),
+        )
+        # Fetch token
+        token_dict = to_token_dict(
+            self._oauth_session.fetch_token(
+                token_url=f"https://{self._host}:{self._port}{self._token_endpoint}",
+                username=self._user,
+                password=self._secret.reveal(),
+                verify=self._verify_ssl,
+            )
+        )
+        # Initially create the token file
+        self.update_expires_in_abs(token_dict)
+        self._json_token = token_dict
+
+    def update_expires_in_abs(self, token_dict: TokenDict) -> None:
+        # Update expires_in_abs:
+        # we need this to calculate a current "expires_in" (in seconds)
+        token_dict["expires_in_abs"] = self.get_absolute_expire_time(token_dict["expires_in"])
+
+    def get_absolute_expire_time(self, expires_in: float, expires_in_earlier: int = 20) -> str:
+        """
+        :param: expires_in_earlier: Will calculate an earlier absolute expire time about its
+        value in [s].
+        """
+        # all expires_in are in seconds according to oAuth2 spec
+        now = dt.datetime.now()
+        dt_expires_in = dt.timedelta(0, expires_in)
+        dt_expires_in_earlier = dt.timedelta(0, expires_in_earlier)
+        return dt.datetime.strftime(now + dt_expires_in - dt_expires_in_earlier, self._dt_fmt)
+
+    def get(self, path: str, parameters: StringMap | None = None) -> Any:  # noqa: ARG002
+        url = f"https://{self._host}:{self._port}{path}"
+        resp = self._oauth_session.request(
+            method="GET",
+            headers={"Accept": "application/json"},
+            url=url,
+            verify=self._verify_ssl,
+        )
+        if resp.status_code != 200:
+            LOGGER.warning(
+                "Call to %(url)s returned HTTP %(status_code)s.",
+                {"url": url, "status_code": resp.status_code},
+            )
+        return resp.json()
+
+
+def handler_simple(requester: StoreOnceOauth2Session, uris: Sequence[str]) -> AnyGenerator:
+    yield from (requester.get(uri) for uri in uris)
+
+
+def handler_nested(
+    requester: StoreOnceOauth2Session, uris: Sequence[str], identifier: str
+) -> AnyGenerator:
+    # Get all appliance UUIDs
+    members = requester.get(uris[0])
+    yield members
+
+    # Get appliance's dashboard per UUID
+    for member in members["members"]:
+        yield requester.get(f"{uris[1]}/{member[identifier]}")
+
+
+# REST API 4.2.3 endpoint definitions
+# https://hewlettpackard.github.io/storeonce-rest/cindex.html
+BASE = "/api/v1"
+SECTIONS: Sequence[tuple[str, ResultFn]] = (
+    (
+        "d2d_services",
+        lambda conn: handler_simple(
+            conn,
+            (BASE + "/data-services/d2d-service/status",),
+        ),
+    ),
+    (
+        "rep_services",
+        lambda conn: handler_simple(
+            conn,
+            (BASE + "/data-services/rep/services",),
+        ),
+    ),
+    (
+        "vtl_services",
+        lambda conn: handler_simple(
+            conn,
+            (BASE + "/data-services/vtl/services",),
+        ),
+    ),
+    (
+        "alerts",
+        lambda conn: handler_simple(
+            conn,
+            ("/rest/alerts",),
+        ),
+    ),
+    (
+        "system_information",
+        lambda conn: handler_simple(
+            conn,
+            (BASE + "/management-services/system/information",),
+        ),
+    ),
+    (
+        "storage",
+        lambda conn: handler_simple(
+            conn,
+            (BASE + "/management-services/local-storage/overview",),
+        ),
+    ),
+    (
+        "appliances",
+        lambda conn: handler_nested(
+            conn,
+            (
+                BASE + "/management-services/federation/members",
+                BASE + "/data-services/dashboard/appliance",
+            ),
+            "uuid",
+        ),
+    ),
+    (
+        "licensing",
+        lambda conn: handler_simple(
+            conn,
+            (
+                BASE + "/management-services/licensing",
+                BASE + "/management-services/licensing/licenses",
+            ),
+        ),
+    ),
+    (
+        "cat_stores",
+        lambda conn: handler_nested(
+            conn,
+            (
+                BASE + "/data-services/cat/stores",
+                BASE + "/data-services/cat/stores/store",
+            ),
+            "id",
+        ),
+    ),
+)
+
+
+def parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
+    prog, description = __doc__.split("\n", maxsplit=1)
+    parser = argparse.ArgumentParser(
+        prog=prog, description=description, formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument(
+        "--debug",
+        "-d",
+        action="store_true",
+        help="Enable debug mode (keep some exceptions unhandled)",
+    )
+    parser.add_argument("--verbose", "-v", action="count", default=0)
+    parser.add_argument(
+        "--vcrtrace",
+        "--tracefile",
+        default=False,
+        action=vcrtrace(
+            # This is the result of a refactoring.
+            # I did not check if it makes sense for this special agent.
+            filter_headers=[("authorization", "****")],
+        ),
+    )
+    parser.add_argument(
+        "--user", metavar="USER", required=True, help="""Username for Observer Role"""
+    )
+    parser_add_secret_option(
+        parser, long=f"--{PASSWORD_OPTION}", required=True, help="Password for Observer Role"
+    )
+    parser.add_argument(
+        "-p", "--port", default=443, type=int, help="Use alternative port (default: 443)"
+    )
+
+    parser.add_argument("--verify_ssl", action="store_true", default=False)
+    parser.add_argument("host", metavar="HOST", help="""APPLIANCE-ADDRESS of HP StoreOnce""")
+    return parser.parse_args(argv)
+
+
+def agent_storeonce4x_main(args: argparse.Namespace) -> int:
+    if not args.verify_ssl:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    oauth_session = StoreOnceOauth2Session(
+        args.host,
+        args.port,
+        args.user,
+        resolve_secret_option(args, PASSWORD_OPTION),
+        args.verify_ssl,
+    )
+
+    for section_basename, function in SECTIONS:
+        sys.stdout.write(f"<<<storeonce4x_{section_basename}:sep(0)>>>\n")
+        try:
+            data = function(oauth_session)
+            if isinstance(data, GeneratorType):
+                for entry in data:
+                    sys.stdout.write(f"{json.dumps(entry, sort_keys=True)}\n")
+            else:
+                sys.stdout.write(f"{json.dumps(data, sort_keys=True)}\n")
+        except Exception:
+            if args.debug:
+                raise
+            LOGGER.exception("Caught exception")
+            return 1
+
+    return 0
+
+
+@report_agent_crashes(AGENT, __version__)
+def main() -> int:
+    """Main entry point to be used"""
+    return agent_storeonce4x_main(parse_arguments(sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

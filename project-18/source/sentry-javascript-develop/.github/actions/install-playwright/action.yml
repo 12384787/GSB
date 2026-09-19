@@ -1,0 +1,60 @@
+name: 'Install Playwright dependencies'
+description: 'Installs Playwright dependencies and caches them.'
+inputs:
+  browsers:
+    description: 'What browsers to install.'
+    default: 'chromium webkit firefox'
+  cwd:
+    description: 'The working directory to run Playwright in.'
+    default: '.'
+
+runs:
+  using: 'composite'
+  steps:
+    # Resolve the app's @playwright/test version. Some apps (e.g. the node bundler apps) assert via a
+    # plain node script and don't depend on Playwright — emit an empty version instead of failing, so
+    # the steps below skip the (wasted) browser install rather than erroring on the missing package.
+    - name: Get Playwright version
+      id: playwright-version
+      run: |
+        version=$(node -e "let v = ''; try { v = require('@playwright/test/package.json').version; } catch {} process.stdout.write(String(v));")
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+      shell: bash
+      working-directory: ${{ inputs.cwd }}
+
+    - name: Restore cached playwright binaries
+      uses: actions/cache/restore@v6.1.0
+      id: playwright-cache
+      if: steps.playwright-version.outputs.version != ''
+      with:
+        path: |
+          ~/.cache/ms-playwright
+        # Bump the iteration when bumping runner images to use a new cache
+        key: playwright-${{ runner.os }}-iteration-1-${{ steps.playwright-version.outputs.version }}
+
+    # We always install all browsers, if uncached
+    - name: Install Playwright dependencies (uncached)
+      run: npx playwright install chromium webkit firefox --with-deps
+      if: steps.playwright-version.outputs.version != '' && steps.playwright-cache.outputs.cache-hit != 'true'
+      shell: bash
+      working-directory: ${{ inputs.cwd }}
+
+    - name: Install Playwright system dependencies only (cached)
+      env:
+        PLAYWRIGHT_BROWSERS: ${{ inputs.browsers || 'chromium webkit firefox' }}
+      run: npx playwright install-deps "$PLAYWRIGHT_BROWSERS"
+      if: steps.playwright-version.outputs.version != '' && steps.playwright-cache.outputs.cache-hit == 'true'
+      shell: bash
+      working-directory: ${{ inputs.cwd }}
+
+    # Only store cache on develop branch
+    - name: Store cached playwright binaries
+      uses: actions/cache/save@v6.1.0
+      if:
+        steps.playwright-version.outputs.version != '' && github.event_name == 'push' && github.ref ==
+        'refs/heads/develop'
+      with:
+        path: |
+          ~/.cache/ms-playwright
+        # Bump the iteration when bumping runner images to use a new cache
+        key: playwright-${{ runner.os }}-iteration-1-${{ steps.playwright-version.outputs.version }}

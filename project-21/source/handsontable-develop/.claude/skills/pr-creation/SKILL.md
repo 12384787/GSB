@@ -1,0 +1,209 @@
+---
+name: pr-creation
+description: Use whenever you are about to create, push, open, update, or edit a pull request in the Handsontable monorepo — load this BEFORE running `gh pr create` or pushing a feature/docs/fix branch, not only when the user says "PR". Triggers: create/open/submit a PR, push the branch, commit and push, ship it, ready to review, update or fix a PR description, any PR URL, finishing work on a `feature/*`/`docs/*`/`fix/*` branch, or a completed ClickUp/DEV task ready to submit. Covers branch naming, pre-flight lint/tests, the PR-first then changelog flow, `gh auth` fallback, and filling the GitHub PR template.
+---
+
+## 1. Branch Naming
+
+Choose the prefix that matches your work:
+
+| Type | Pattern | Example |
+|------|---------|---------|
+| Feature (ClickUp, default) | `feature/<TASK-ID>_Short-Description` | `feature/DEV-627_Forum-Update` |
+| Docs (ClickUp) | `docs/<TASK-ID>_Short-Description` | `docs/DEV-458_Clarify-undo-redo-docs` |
+| Feature (public GitHub issue) | `feature/issue-xxxx` | `feature/issue-11832` |
+| Docs (public GitHub issue) | `docs/issue-xxxx` | `docs/issue-9500` |
+| Release | `release/x.y.z` | `release/16.1.0` |
+
+`<TASK-ID>` is the ClickUp custom ID. Its prefix follows the space the task lives in, so it is not always `DEV`: `docs/SU-833_BeforeKeyDown-Return-False-Note` and `feature/PRO-858_Theme-API-e2e-test-data-driven-for-each-theme` are both valid. Copy the prefix from the task, never assume one.
+
+When working from a ClickUp task, the **human-readable custom ID** (e.g. `DEV-627`, `IT-42`) **must** appear in the branch name so ClickUp links automatically. Never use the internal ClickUp hash ID (e.g. `86c9j4fxj`) — it is not a valid task identifier for branch linking.
+
+**Important:** `clickup_create_task` returns `custom_id: null` in its response. Always call `clickup_get_task` immediately after creating a task to retrieve the real custom ID before naming the branch:
+
+```
+1. clickup_create_task → returns task_id (hash, e.g. "86c9j4fxj")
+2. clickup_get_task(task_id) → returns custom_id (e.g. "DEV-1532")
+3. Use custom_id in the branch name: feature/DEV-1532_Short-Description
+```
+
+## 2. Pre-flight Checks
+
+Run these **before** opening the PR. Fix any failures first.
+
+```bash
+# Lint
+npm run eslint --prefix handsontable
+npm run stylelint --prefix handsontable
+
+# Build (wrappers depend on this output)
+npm run build --prefix handsontable
+
+# Unit tests for the area you changed
+npm run test:unit --prefix handsontable --testPathPattern=<regex>
+
+# E2E tests for the area you changed
+npm run test:e2e --prefix handsontable --testPathPattern=<regex>
+
+# If you touched a wrapper, test it too
+npm run test --prefix wrappers/react-wrapper
+npm run test --prefix wrappers/vue3
+npm run test --prefix wrappers/angular-wrapper
+```
+
+## 3. Fill the PR Template
+
+The repository has a PR template at `.github/PULL_REQUEST_TEMPLATE.md`. Fill in each section:
+
+- **Context** -- Explain *why* the change is needed, not just what changed. Link the ClickUp task or GitHub issue.
+- **How has this been tested?** -- List the specific tests you added or ran (unit, E2E, manual). Include commands someone can copy-paste to reproduce.
+- **Types of changes** -- Check the box that applies: bug fix, new feature, breaking change, or translation.
+- **Related issue(s)** -- Link GitHub issues with `#xxx`. Include ClickUp task IDs (e.g. `DEV-627`) so they auto-link.
+- **Affected project(s)** -- Check every package your change touches: `handsontable`, `@handsontable/react-wrapper`, `@handsontable/angular-wrapper`, `@handsontable/vue3`.
+- **Checklist** -- Confirm code style, CLA signature, and whether documentation needs updating. The CLA is checked automatically by the required `cla/signed` status check; one signature covers Handsontable and HyperFormula. See [`CONTRIBUTING.md`](../../../CONTRIBUTING.md#contributor-license-agreement).
+
+## 4. Target Branch
+
+All PRs target the **develop** branch. Cherry-picks to `release/*` or `lts/*` branches are handled separately by maintainers.
+
+## 5. Create the PR First (before the changelog)
+
+The PR is created **before** the changelog entry. The changelog file is named after the PR number, so you need the number the GitHub API returns from `gh pr create` before you can write the file correctly. Creating the changelog first and guessing the next PR number is unreliable — other PRs can be opened between your check and your push.
+
+Workflow:
+
+1. Commit the code change on the feature branch.
+2. Push the branch (use `gh auth setup-git` once if git is configured for SSH and the SSH key is unavailable in the session; then push over HTTPS).
+3. Run `gh pr create` and capture the returned PR URL / number.
+4. Use that PR number when creating the changelog entry (next step).
+
+Use the GitHub CLI to create the PR. **Always create PRs as drafts** -- the author marks it ready for review when appropriate.
+
+**Authentication fallback:** If `git push` fails with `Permission denied (publickey)` because the session has no SSH key, switch the remote to HTTPS and let `gh` provide credentials, then push:
+
+```bash
+git remote set-url origin https://github.com/handsontable/handsontable.git
+gh auth setup-git
+git push -u origin <branch-name>
+```
+
+**Always write the PR body to a temp file and use `--body-file`.** Never use `--body "$(cat <<'EOF'...EOF)"` — backticks inside a heredoc passed through shell command substitution are stored as literal `\`` characters in GitHub, breaking all inline code formatting in the PR description.
+
+**Use a unique, task-scoped temp filename — not a fixed `/tmp/pr-body.md`.** The Write tool refuses to overwrite a file it has not read in the current session, so a stale `/tmp/pr-body.md` left over from an earlier session makes the write fail with "Error writing file." Name the file after the branch's task/issue ID so it is both unique per PR and easy to trace: `/tmp/pr-body-DEV-1860.md`, `/tmp/pr-body-issue-11832.md`. If that path somehow already exists, append a short unique suffix (e.g. `/tmp/pr-body-DEV-1860-2.md`).
+
+The correct workflow:
+
+1. Write the body to `/tmp/pr-body-<task-id>.md` using the Write tool (no shell escaping needed).
+2. Pass it with `--body-file /tmp/pr-body-<task-id>.md`.
+
+```bash
+# Step 1: write body to file first (use the Write tool, not shell echo/cat)
+#         e.g. /tmp/pr-body-DEV-1860.md
+# Step 2: create the PR
+gh pr create --draft --base develop \
+  --title "DEV-xxx: Short description" \
+  --body-file /tmp/pr-body-DEV-xxx.md
+```
+
+**Start from the live template, every time.** Run `cat .github/PULL_REQUEST_TEMPLATE.md` and mirror every `###` heading and every checklist line it carries — including `MANUAL QA NEEDED`, left unticked when no manual QA is needed. That line is machine-read by the Checks scope router (`checks.yml`), so keep its wording, and its absence means the gate can never be armed on that PR without editing the description. The copy below is a convenience: `.github/scripts/__tests__/pr-template-skill-sync.test.mjs` pins its headings and checklist lines to the template, and when the two disagree the template wins.
+
+The body file template (write this with the Write tool, backticks and all, no escaping):
+
+````markdown
+### Context
+
+The PR fixes/adds/changes <what>. <Why the change is needed; link the task and explain the problem.>
+
+### Test evidence (required for source changes)
+
+- Unit tests added/modified (`*.unit.js`): <paths, or "none — covered by <path>">
+- E2E tests added/modified (Playwright `tests/e2e/*.spec.ts`): <paths>
+- Type tests (`*.types.ts`) updated if public API changed: <paths, or "none">
+- For a bug fix — the spec that fails without this fix: <name>
+- Demo page / recorded trace (for UI changes): <link, or "none">
+
+### Commands run
+
+```bash
+<the test commands you ran, one per block>
+```
+<their final output lines>
+
+### Types of changes
+
+- [x] Bug fix (non-breaking change which fixes an issue)
+- [ ] New feature or improvement (non-breaking change which adds functionality)
+- [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
+- [ ] Additional language file or change to the existing one (translations)
+
+### Related issue(s):
+
+1. DEV-xxx
+
+### Affected project(s):
+
+- [x] `handsontable`
+- [ ] `@handsontable/angular-wrapper`
+- [ ] `@handsontable/react-wrapper`
+- [ ] `@handsontable/vue3`
+
+### Checklist:
+
+- [x] I have reviewed the guidelines about [Contributing to Handsontable](https://github.com/handsontable/handsontable/blob/master/CONTRIBUTING.md) and I confirm that my code follows the code style of this project.
+- [x] I have signed the [Contributor License Agreement](https://cla.handsontable.com/sign) — one signature covers both Handsontable and HyperFormula; the `cla/signed` check on this PR confirms it.
+- [ ] My change requires a change to the documentation.
+- [ ] MANUAL QA NEEDED — <!-- one line: WHAT to check and why automation can't judge it. Also add the red `Requires Manual QA` label (that exact name — it already exists; `QA needed` and `Verified by QA` are different labels). Ticking holds the Tests run for a manual-qa environment approval by a designated reviewer (never whoever triggered the run). The box is read once per run, so if you change it after the pipeline ran, press "Re-run all jobs". This line is machine-read — keep its wording. -->
+
+ClickUp task: https://app.clickup.com/t/9015210959/DEV-xxx
+````
+
+- **Commit messages:** Descriptive, max 80 characters. Include task ID (e.g. `DEV-627: Fix filter column index`).
+- Include the ClickUp task ID in the PR title when applicable.
+- Start the **Context** section with "The PR fixes/adds/changes/..." -- be direct, no filler.
+- If the PR introduces a breaking change, require the `Breaking change` label and include a migration section with before/after examples. Update migration guides in `docs/content/guides/upgrade-and-migration/`.
+- **If you tick "MANUAL QA NEEDED" in the checklist, also apply the red `Requires Manual QA` label** so the request is visible in the PR list. Nothing applies it automatically — labels in this repo are applied by hand:
+
+  ```bash
+  gh pr edit <number> --add-label "Requires Manual QA"
+  ```
+
+  The label already exists in this repository — **do not create it.** `gh label list --search "Manual QA"` also returns `QA needed` and `Verified by QA`, which are different labels with their own meanings, so match the name exactly rather than the closest hit. Creating a near-miss name (`Manual QA required`) silently makes a second red label that nobody filters on.
+
+  The label is a **marker only**. The gate is the ticked box, which the Checks scope router reads when the pipeline starts: it holds `Manual QA / sign-off` until a designated reviewer approves the run. Because the box is read once per run, ticking it *after* a pipeline has already gone green does not arm anything — press **"Re-run all jobs"** on the Tests run (and the same applies in reverse after unticking).
+
+## 5a. Updating an Existing PR's Body
+
+When asked to update, fix, or re-fill a PR description, use the same temp-file approach with a unique, task-scoped filename: write the body to `/tmp/pr-body-<task-id>.md` (e.g. `/tmp/pr-body-DEV-1860.md`) with the Write tool, then `gh pr edit <number> --body-file /tmp/pr-body-<task-id>.md`. A fixed `/tmp/pr-body.md` fails when a stale copy from an earlier session exists, because the Write tool will not overwrite a file it has not read this session. Keep the full template structure — do not replace it with a shorter summary. Never use `--body "$(cat <<'EOF'...EOF)"` — backticks are not shell-escaped in the Write tool output and will be stored as literal `\`` on GitHub.
+
+## 6. Changelog Entry (after PR is created)
+
+Every PR that changes source code needs a changelog entry in `.changelogs/`. `bin/changelog` names the file after the entry's `issueOrPR` field, so the filename is the **PR number** only for a `private` entry — the default, and what the rest of this section assumes. A `public` entry is named after its GitHub issue number instead, and because that number is known before the PR exists, it can be committed together with the code rather than in the round-trip below.
+
+**Which `issuesOrigin` to use is decided by [`.changelogs/README.md`](../../../.changelogs/README.md), not here** — read it before writing the entry.
+
+Two blocking checks constrain the entry, so get both right the first time. The filename must be `<issueOrPR>.json`, a plain number with no suffix, and it must match the entry's `issueOrPR` field — `bin/changelog` fails the `changelog` job over a mismatch, and the pre-push hook fails locally. And the PR may add at most **two** entry files, the second only for a separate GitHub issue it closes; a maintenance PR back-filling entries for other PRs writes `[multiple changelogs]` in the description to lift that. Running `npm run changelog entry` satisfies the filename rule by construction; writing the JSON by hand is what breaks it.
+
+**In a non-interactive session, pass the fields `--help` does not list.** `bin/changelog entry` only prompts when stdin is a TTY, which an agent's shell is not, so every field must arrive as a flag — and the two that matter are missing from `--help`. `--issuesOrigin` is not declared at all, and the declared `--issue` is dead: the builder reads `issueOrPR`, so `--issue` is silently dropped and the command dies in `assertChangelogEntryFormat` with a stack trace rather than a usage message. The working invocation:
+
+```bash
+bin/changelog entry "Fixed …, ending with a period." \
+  --type fixed --issuesOrigin private --issueOrPR <PR-number> \
+  --breaking false --framework none
+```
+
+Confirm it landed where you expect — the command prints the destination path and the compiled markdown line before writing.
+
+For a `private` entry, after writing the file:
+
+1. Commit it on the same branch (`DEV-xxx: Add changelog entry for PR #<number>`).
+2. Push so the PR picks up the new commit.
+
+Use `[skip changelog]` in the PR body only for test-only, docs-only, or CI/tooling changes. When skipping, you do **not** create a PR-first round-trip — just open the PR and be done.
+
+## 7. After PR Creation
+
+When working from a ClickUp task, use the ClickUp MCP tools to update the task status to **"code review"**.
+
+## 8. Merge Strategy
+
+All PRs are merged using **"Squash and merge"**. The squashed commit message becomes the permanent history, so make sure the PR title is clear and descriptive.

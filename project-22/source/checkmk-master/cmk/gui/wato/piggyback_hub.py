@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from cmk.gui.watolib.config_domain_name import (
+    ConfigVariable,
+    ConfigVariableRegistry,
+)
+from cmk.gui.watolib.config_domains import ConfigDomainOMD
+from cmk.gui.watolib.config_variable_groups import ConfigVariableGroupSiteManagement
+from cmk.gui.watolib.piggyback_hub import CONFIG_VARIABLE_PIGGYBACK_HUB_IDENT
+from cmk.rulesets.v1 import Help, Title
+from cmk.rulesets.v1.form_specs import BooleanChoice, DefaultValue
+
+
+def register(config_variable_registry: ConfigVariableRegistry) -> None:
+    config_variable_registry.register(ConfigVariableSitePiggybackHub)
+
+
+def piggyback_hub_config_form_spec() -> BooleanChoice:
+    return BooleanChoice(
+        title=Title("Enable piggyback-hub"),
+        help_text=Help(
+            "Enable the piggyback-hub to send/receive piggyback data to/from other sites."
+        ),
+        prefill=DefaultValue(False),
+    )
+
+
+ConfigVariableSitePiggybackHub = ConfigVariable(
+    group=ConfigVariableGroupSiteManagement,
+    primary_domain=ConfigDomainOMD,
+    ident=CONFIG_VARIABLE_PIGGYBACK_HUB_IDENT,
+    form_spec=lambda context: piggyback_hub_config_form_spec(),  # noqa: ARG005
+)

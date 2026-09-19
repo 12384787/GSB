@@ -1,0 +1,5 @@
+任务类型：Bug 修复
+任务难度：困难
+语言/框架：Python
+
+请在已有的 ActivityWatch/activitywatch 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：The best free and open-source automated time tracker. Cross-platform, extensible, privacy-focused.。围绕真实入口（.gitattributes,.github .gitignore,.gitmodules .tool-versions,CITATION.cff CODE_OF_CONDUCT.md,CONTRIBUTING.md LICENSE.txt,Makefile README.md,SECURITY.md aw-client,aw-core aw-notify,aw-qt aw-server,aw-server-rust aw-tauri,aw-watcher-afk aw-watcher-input,aw-watcher-window aw.spec,awatcher diagram.svg,gptme.toml poetry.lock,pyproject.toml scripts）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。

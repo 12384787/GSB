@@ -1,0 +1,111 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
+load("@cmk_requirements//:requirements.bzl", "requirement")
+load("//bazel/rules:py_cmk_test.bzl", "py_cmk_test")
+
+package(default_visibility = [":__subpackages__"])
+
+py_library(
+    name = "conftest",
+    testonly = True,
+    srcs = [
+        "conftest.py",
+        "mocks_and_helpers.py",
+    ],
+    visibility = [
+        ":__subpackages__",
+        "//non-free/packages/cmk-bakery:__pkg__",
+        "//non-free/packages/cmk-robotmk:__pkg__",
+    ],
+    deps = [
+        "//cmk/base",
+        "//packages/cmk-check-engine/cmk/checkengine/plugins",
+        "//packages/cmk-licensing",
+        "//packages/cmk-livestatus-client:py_livestatus",
+        "//tests/testlib:fake_site",
+        requirement("pytest_metadata"),
+    ],
+)
+
+write_file(
+    name = "cannot_fail",
+    out = "test_cannot_fail.py",
+    content = [
+        "def test_cannot_fail() -> None:",
+        "    assert True",
+    ],
+)
+
+py_cmk_test(
+    # Start the collection and load the conftests.  The complexity
+    # of those warrants this target.
+    name = "smoke",
+    size = "small",
+    srcs = [
+        "test_cannot_fail.py",
+    ],
+    env = {"EDITION": "community"},
+    use_project_pytest_config = True,
+    deps = [
+        ":conftest",
+        "//tests/testlib",
+    ],
+)
+
+py_cmk_test(
+    name = "repo_community",
+    size = "small",
+    timeout = "moderate",
+    # This is the "catch all" target. Don't add new stuff here.
+    srcs = [
+        "__init__.py",
+    ] + glob(
+        include = [
+            "cmk/*.py",
+            "cmk/automations/**/*.py",
+            "cmk/bi/**/*.py",
+            "cmk/diskspace/**/*.py",
+            "cmk/fields/**/*.py",
+            "cmk/notifications/**/*.py",
+            "cmk/piggyback_hub/**/*.py",
+            "cmk/piggyback/**/*.py",
+            "cmk/product_usage/**/*.py",
+            "cmk/server_side_calls_backend/**/*.py",
+            "cmk/special_agents/**/*.py",
+            "livestatus/**/*.py",
+        ],
+        exclude = ["**/nonfree/**"],
+    ),
+    args = [
+        "--random-order-bucket=global",
+    ],
+    use_project_pytest_config = True,
+    visibility = ["//tests:__subpackages__"],
+    deps = [
+        ":conftest",
+        "//cmk:cmkpasswd",
+        "//cmk/bi",
+        "//cmk/diskspace",
+        "//cmk/fields",
+        "//cmk/piggyback:hub",
+        "//cmk/product_usage:product_usage_cli",
+        "//cmk/special_agents",
+        "//packages/cmk-messaging",
+        requirement("exchangelib"),
+        requirement("fakeredis"),
+        requirement("feedparser"),
+        requirement("google-cloud-monitoring"),
+        requirement("marshmallow"),
+        requirement("polyfactory"),
+        requirement("pysmb"),
+        requirement("pytest-asyncio"),
+        requirement("pytest-mock"),
+        requirement("pytest-random-order"),
+        requirement("python-snap7"),
+        requirement("requests"),
+        requirement("responses"),
+        requirement("time-machine"),
+        requirement("vcrpy"),
+        requirement("werkzeug"),
+    ],
+)

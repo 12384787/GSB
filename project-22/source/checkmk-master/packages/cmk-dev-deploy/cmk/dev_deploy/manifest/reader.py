@@ -1,0 +1,209 @@
+# Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+
+"""Manifest reader: loads JSON manifest and constructs typed dataclass instances.
+
+Does NOT import ``cmk.dev_deploy.output`` to avoid circular dependencies.
+"""
+
+import functools
+import json
+import logging
+from pathlib import Path
+from typing import Any
+
+from cmk.dev_deploy.types import (
+    CategorizationRule,
+    ChangeCategory,
+    ConfigDeploySpec,
+    ConfigFileEntry,
+    DeployMethod,
+    InstallSpec,
+    PostInstallAction,
+    Service,
+    ServiceAction,
+    ServiceSpec,
+)
+
+logger = logging.getLogger(__name__)
+
+MANIFEST_VERSION = "4"
+"""Manifest format version; a mismatch triggers regeneration."""
+
+
+def _manifest_dir() -> Path:
+    """Return the manifest directory inside the checkout's source tree."""
+    return Path(__file__).parent
+
+
+def manifest_path() -> Path:
+    """Return the path to the deploy manifest JSON file."""
+    return _manifest_dir() / "deploy_manifest.json"
+
+
+def hash_path() -> Path:
+    """Return the path to the manifest hash file."""
+    return _manifest_dir() / ".manifest_hash"
+
+
+@functools.lru_cache(maxsize=1)
+def _load_raw() -> dict[str, Any]:  # type: ignore[misc]
+    """Load and cache the raw manifest dict."""
+    with open(manifest_path()) as f:
+        result: dict[str, Any] = json.load(f)
+        return result
+
+
+def clear_cache() -> None:
+    """Clear the cached manifest (used after rebuild)."""
+    _load_raw.cache_clear()
+
+
+# --- Field mapping functions ---
+
+
+def _parse_install_spec(raw: dict[str, Any]) -> InstallSpec:
+    """Convert a manifest install_spec dict to an InstallSpec dataclass."""
+    return InstallSpec(
+        package=raw["source_prefix"].rstrip("/"),
+        package_target=raw["package_target"],
+        output_basename=raw["output_basename"],
+        install_dest=raw["site_dest"],
+        mode=raw["mode"],
+        post_install=tuple(PostInstallAction(a) for a in raw["post_install"]),
+        edition_constraint=frozenset(raw["editions"]) if raw["editions"] else None,
+        needs_version_flag=raw["needs_version_flag"],
+        needs_faked_artifacts=raw.get("needs_faked_artifacts", False),
+        use_copytree=raw["use_copytree"],
+        frontend_supervised=raw.get("frontend_supervised", False),
+        input_prefixes=tuple(raw.get("input_prefixes", ())),
+    )
+
+
+def _parse_config_spec(raw: dict[str, Any]) -> ConfigDeploySpec:
+    """Convert a manifest config_spec dict to a ConfigDeploySpec dataclass."""
+    mode_raw = raw["mode"]
+    files = tuple(
+        ConfigFileEntry(
+            src=f["src"], dest=f["dest"], mode=f["mode"], generated=f.get("generated", False)
+        )
+        for f in raw.get("files", [])
+    )
+    services = tuple(_parse_service_pair(s) for s in raw.get("services", []))
+    return ConfigDeploySpec(
+        source_prefix=raw["source_prefix"],
+        site_dest=raw["site_dest"],
+        method=DeployMethod(raw["method"]),
+        mode=mode_raw if mode_raw != -1 else None,
+        includes=tuple(raw["includes"]),
+        files=files,
+        delete_extra=raw["delete_extra"],
+        file_chmod=raw["file_chmod"] or None,
+        services=services,
+    )
+
+
+def _parse_service_pair(s: str) -> tuple[Service, ServiceAction]:
+    """Parse a "name:action" string into a (Service, ServiceAction) tuple."""
+    name, action = s.split(":")
+    return (Service(name), ServiceAction(action))
+
+
+def _parse_service_spec(raw: dict[str, Any]) -> ServiceSpec:
+    """Convert a manifest service_spec dict to a ServiceSpec dataclass."""
+    return ServiceSpec(
+        source_prefix=raw["source_prefix"],
+        services=tuple(_parse_service_pair(s) for s in raw["services"]),
+        edition_constraint=frozenset(raw["editions"]) if raw["editions"] else None,
+    )
+
+
+def _parse_categorization_rule(raw: dict[str, Any]) -> CategorizationRule | None:
+    """Convert a manifest categorization rule dict to a CategorizationRule.
+
+    Returns None if the category string is not a valid ChangeCategory member
+    (forward compatibility: new categories added later are silently skipped).
+    """
+    try:
+        category = ChangeCategory(raw["category"])
+    except ValueError:
+        logger.warning(
+            "Skipping categorization rule with unknown category %(category)r (prefix: %(prefix)s)",
+            {"category": raw["category"], "prefix": raw.get("prefix", "?")},
+        )
+        return None
+
+    extensions_raw = raw["extensions"]
+    extensions = frozenset(extensions_raw) if extensions_raw is not None else None
+
+    return CategorizationRule(
+        prefix=raw["prefix"],
+        extensions=extensions,
+        category=category,
+    )
+
+
+# --- Public getters ---
+
+
+def get_install_specs() -> tuple[InstallSpec, ...]:
+    """Return all install specs from the manifest as typed dataclasses."""
+    data = _load_raw()
+    return tuple(_parse_install_spec(s) for s in data["install_specs"])
+
+
+def get_config_specs() -> tuple[ConfigDeploySpec, ...]:
+    """Return all config deploy specs from the manifest as typed dataclasses."""
+    data = _load_raw()
+    return tuple(_parse_config_spec(s) for s in data["config_specs"])
+
+
+def get_wheel_prefixes() -> tuple[str, ...]:
+    """Return the source-tree prefixes of deployed wheels (with trailing slash)."""
+    data = _load_raw()
+    return tuple(data["wheel_prefixes"])
+
+
+def get_service_specs() -> tuple[ServiceSpec, ...]:
+    """Return all service specs from the manifest as typed dataclasses."""
+    data = _load_raw()
+    return tuple(_parse_service_spec(s) for s in data["service_specs"])
+
+
+def get_frontend_supervised_prefixes() -> frozenset[str]:
+    """Return the path prefixes Vite HMR takes over under ``--frontend``.
+
+    Covers the frontend-supervised install specs and their input packages:
+    iBazel watches the vite target's transitive sources, so those get
+    hot-reloaded too.
+    """
+    return frozenset(
+        prefix
+        for spec in get_install_specs()
+        if spec.frontend_supervised
+        for prefix in (spec.package + "/", *spec.input_prefixes)
+    )
+
+
+def get_deploy_deps() -> dict[str, tuple[str, ...]]:
+    """Return deploy dependency mapping from the manifest."""
+    data = _load_raw()
+    return {k: tuple(v) for k, v in data.get("deploy_deps", {}).items()}
+
+
+def get_categorization_rules() -> tuple[CategorizationRule, ...]:
+    """Return categorization rules from the manifest, ordered longest-prefix-first.
+
+    Follows the same pattern as get_install_specs() etc.: calls _load_raw()
+    (which is LRU-cached) and parses the result on each call.
+
+    Raises FileNotFoundError if manifest doesn't exist.
+    Raises KeyError if 'categorization_rules' key is missing (old manifest).
+    Invalid category strings in individual rules are logged and skipped.
+    """
+    data = _load_raw()
+    parsed = [_parse_categorization_rule(r) for r in data["categorization_rules"]]
+    return tuple(r for r in parsed if r is not None)

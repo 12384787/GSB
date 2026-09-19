@@ -1,0 +1,306 @@
+# Describes stages for test-gerrit Job
+
+# some thoughts about this file:
+# - stages should abort early if semantical condition is not met
+# - stages should be sorted by probability to fail * duration
+# - `make` is not needed at this level (but make-target could still call validate_changes.py)
+# - running inside docker should be optional
+# - some variables are not needed
+#
+# WARNING
+#
+# ENV_VAR_LIST and SEC_VAR_LIST shall not contain elements with "#", see test-gerrit.groovy
+#
+
+# yamllint disable rule:line-length
+
+VARIABLES:
+    - NAME: PATCHSET_REVISION
+      # Will be used if not provided by Jenkins
+      SH: "git rev-parse HEAD"
+
+    - NAME: BASE_COMMIT_ID
+      # Can be provided directly instead of PATCHSET_REVISION in order to compare HEAD against
+      # arbitrary refs like `origin/master`
+      SH: "git rev-parse ${PATCHSET_REVISION}^"
+
+    - NAME: CHANGED_FILES_REL
+      SH: "git diff-tree --no-commit-id --name-only -r ${BASE_COMMIT_ID}..HEAD | sort"
+
+    - NAME: CHANGED_FILES_REL_WITHOUT_DELETED_FILES
+      SH: "git --no-pager diff --name-only --diff-filter=d ${BASE_COMMIT_ID}..HEAD | sort"
+
+    - NAME: CHANGED_FILES_WITH_MODE
+      SH: "git diff-tree --no-commit-id --name-status -r ${BASE_COMMIT_ID}..HEAD | sort"
+
+    - NAME: CHANGED_MAKEFILE
+      SH: "echo '${CHANGED_FILES_REL}' | grep '^Makefile' || true"
+
+    - NAME: CHANGED_REFERENCE_IMAGE
+      SH: "echo '${CHANGED_FILES_REL}' | grep '^defines/dev-images/reference/Dockerfile' || true"
+
+    - NAME: CHANGED_TESTS_MAKEFILE
+      SH: "echo '${CHANGED_FILES_REL}' | grep '^tests/Makefile' || true"
+
+    - NAME: CHANGED_PYTHON_REQUIREMENTS
+      SH: "echo '${CHANGED_FILES_REL}' | grep 'requirements.txt\\|requirements.in\\|constraints.txt' || true"
+
+    - NAME: CHANGED_BAZEL_MODULES
+      SH: "echo '${CHANGED_FILES_REL}' | grep '^MODULE.bazel' || true"
+
+    - NAME: CHANGED_RUN_UVENV_SCRIPT
+      SH: "echo '${CHANGED_FILES_REL}' | grep '^scripts/run-uvenv' || true"
+
+    - NAME: CHANGED_BAZEL_FILES
+      SH: "echo '${CHANGED_FILES_REL}' | grep '\\.bzl$\\|BUILD\\|WORKSPACE' || true"
+
+    - NAME: CHANGED_AGENT_PLUGINS_SRCS
+      SH: "echo '${CHANGED_FILES_REL}' | grep 'tests/agent-plugin-unit/sources-list.txt' || true"
+      REPLACE_NEWLINES: true
+
+    - NAME: CHANGED_AGENT_PLUGINS_SRC_FILES
+      # intersect CHANGED_FILES_REL with tests/agent-plugin-unit/sources-list.txt
+      SH: "echo '${CHANGED_FILES_REL}' | awk 'NR==FNR { if (!/^#/ && NF) src[$0]=1; next } $0 in src' tests/agent-plugin-unit/sources-list.txt - || true"
+      REPLACE_NEWLINES: true
+
+    - NAME: CHANGED_WERK_FILES
+      SH: "echo '${CHANGED_FILES_REL}' | grep '^\\.werks/' || true"
+      REPLACE_NEWLINES: true
+
+    - NAME: CHANGED_WERK_CODE_FILES
+      SH: "echo '${CHANGED_FILES_REL}' | grep '^packages/cmk-werks\\|^cmk/utils/werks' || true"
+      REPLACE_NEWLINES: true
+
+    - NAME: CHANGED_JS_DEPENDENCIES
+      SH: "echo '${CHANGED_FILES_REL}' | grep '^package.json\\|^pnpm-' || true"
+
+    ########## packages ########################################################
+
+    - NAME: CHANGED_CC_FILES
+      SH: "echo '${CHANGED_FILES_REL}' | grep -e '^packages/livestatus/' -e '^packages/neb/' -e '^packages/unixcat/' -e '^non-free/packages/cmc/' || true"
+
+    - NAME: CHANGED_RUST_WORKSPACE_FILES
+      SH: "echo '${CHANGED_FILES_REL}' | grep -E '^(Cargo\\..*|\\.cargo/config\\.toml|packages/[^/]+/BUILD)$' || true"
+
+    - NAME: CHANGED_MK_ORACLE_FILES
+      SH: "echo '${CHANGED_FILES_REL}' | grep '^packages/mk-oracle/\\|^packages/[^/]*$' || true"
+
+    - NAME: CHANGED_FRONTEND_VUE_FILES
+      SH: "echo '${CHANGED_FILES_REL}' | grep '^packages/cmk-frontend-vue/' || true"
+
+    - NAME: CHANGED_SHARED_TYPING_FILES
+      SH: "echo '${CHANGED_FILES_REL}' | grep '^packages/cmk-shared-typing/' || true"
+
+STAGES:
+    - NAME: "Bazel sanity check (guarded)"
+      ONLY_WHEN_NOT_EMPTY: CHANGED_BAZEL_FILES
+      COMMAND: |
+          for edition in community pro ultimate ultimatemt cloud; do \
+              bazel aquery --cmk_edition=$edition ... &> ${RESULTS}/results.txt && rm ${RESULTS}/results.txt || exit 1
+              bazel cquery --cmk_edition=$edition ... &> ${RESULTS}/results.txt && rm ${RESULTS}/results.txt || exit 1
+          done
+          bazel mod graph --output=json | jq -e ".. | select(.name? == \"boringssl\")" >"${RESULTS}/results.txt" && exit 1 || true
+      RESULT_CHECK_FILE_PATTERN: "results/results.txt"
+
+    - NAME: "Bazel sanity check"
+      # omdlib/__init__.py is checked in in the repo but then overwritten by bazel. No way to lint the checked in file.
+      #
+      # WARNING: COMMAND is flattened to a single semicolon-joined shell line before
+      # execution (see CIPARAM_COMMAND in the Jenkins job), not run as a real multi-line
+      # script. A `#` comment inside this block therefore does NOT end at the next `;` —
+      # it swallows everything after it on the flattened line, silently disabling every
+      # later command (this previously ate the .ps1 check, the bootstrap.sh check, and
+      # the final `exit $make_rc`). Put explanatory comments here, above COMMAND, never
+      # inside the block.
+      #
+      # Every .ps1 file must be declared in a filegroup. The existing strays are
+      # accepted as --known-offender exceptions and should be drained into proper
+      # filegroups incrementally. Being in a filegroup is necessary but not sufficient
+      # for the PSScriptAnalyzer aspect to discover the script — the filegroup must
+      # also carry the lint-with-psscriptanalyzer tag (separate follow-up).
+      #
+      # The py-extension check scans all git-tracked files (the aspect only sees
+      # declared srcs) and is unguarded on purpose: adding a plain file matches
+      # no CHANGED_* guard. Its summary is appended to results.txt; a missing
+      # summary means the bazel invocation itself broke.
+      COMMAND: |
+          make_rc=0
+          ./scripts/in_bazel.sh ".py" "py_binary|py_library|py_test" \
+              --known-offender omd/packages/omd/omdlib/__init__.py \
+              > ${RESULTS}/results.txt || make_rc=$?
+          ./buildscripts/scripts/check_community_edition_all_free.sh >> ${RESULTS}/results.txt || make_rc=$?
+          ./scripts/in_bazel.sh "requirements.in" "filegroup" \
+              --path "packages" \
+              --path "non-free/packages" \
+              >> ${RESULTS}/results.txt || make_rc=$?
+          ./scripts/check_requirements_test_coverage.sh >> ${RESULTS}/results.txt || make_rc=$?
+          ./scripts/in_bazel.sh ".ps1" "filegroup" \
+              >> ${RESULTS}/results.txt || make_rc=$?
+          ./tests/agent-plugin-unit/bootstrap.sh --check-sources >> ${RESULTS}/results.txt || make_rc=$?
+          ./scripts/check_no_py_test.sh \
+              `# permanent exceptions by design, deliberately kept on plain py_test` \
+              --known-offender bazel/rules/BUILD \
+              --known-offender non-free/packages/cmk-network-flow/BUILD \
+              --known-offender packages/cmk-frontend/BUILD \
+              --known-offender tests/unit/qa_metrics/test_coverage/BUILD \
+              >> ${RESULTS}/results.txt || make_rc=$?
+          PYEXT_RESULTS=$(mktemp)
+          bazel test //tests/code_quality:python_extensions \
+              --test_env=RESULTS_FILE=$PYEXT_RESULTS || make_rc=$?
+          cat $PYEXT_RESULTS >> ${RESULTS}/results.txt || make_rc=$?
+          rm -f $PYEXT_RESULTS
+          exit $make_rc
+      RESULT_CHECK_FILE_PATTERN: "results/results.txt"
+
+    - NAME: "All unit tests"
+      SEC_VAR_LIST:
+        - "CI_TEST_SQL_DB_ENDPOINT"
+      ENV_VARS:
+        BAZEL_TEST_LOGS_DEST: "../results/unit"
+        BAZEL_EXTRA_TAG_FILTERS: "-cpp,-requires-git"
+      DIR: "tests"
+      COMMAND: |
+          make_rc=0
+          VITEST_MAX_WORKERS=$(../buildscripts/scripts/vitest_max_workers.sh)
+          echo "VITEST_MAX_WORKERS=$VITEST_MAX_WORKERS"
+          ../buildscripts/scripts/bazel_test_ci.sh \
+              --test_verbose_timeout_warnings \
+              --test_env=TZ='America/Chicago' \
+              --test_env=VITEST_MAX_WORKERS="$VITEST_MAX_WORKERS" \
+              --cmk_edition=ultimate \
+              -- \
+              //... || make_rc=$?
+          ../buildscripts/scripts/bazel_test_post_archive_xunit.sh || :
+          bazel --run_under="cd $PWD &&" run //buildscripts/scripts:collect_rust_tests -- "../results" "../results" || :
+          exit $make_rc
+      RESULT_CHECK_TYPE: "JUNIT"
+      RESULT_CHECK_FILE_PATTERN: "results/unit/**/test.xml"
+      JENKINS_TEST_RESULT_PATH: "testReport/"
+
+    - NAME: "C++ unit tests"
+      ONLY_WHEN_NOT_EMPTY: CHANGED_REFERENCE_IMAGE,CHANGED_CC_FILES
+      DIR: "tests"
+      TEXT_ON_SKIP: "No C++ files changed"
+      ENV_VARS:
+        BAZEL_TEST_LOGS_DEST: "../results/cpp"
+        BAZEL_EXTRA_TAG_FILTERS: "cpp"
+      COMMAND: |
+        make_rc=0
+        ../buildscripts/scripts/bazel_test_ci.sh \
+              --test_verbose_timeout_warnings \
+              --test_env=TZ='America/Chicago' \
+              --cmk_edition=ultimate \
+              -- \
+              //... || make_rc=$?
+        ../buildscripts/scripts/bazel_test_post_archive_xunit.sh || :
+        exit $make_rc
+      RESULT_CHECK_TYPE: "GoogleTest"
+      RESULT_CHECK_FILE_PATTERN: "results/cpp/**/test.xml"
+      JENKINS_TEST_RESULT_PATH: "testReport/(root)/"
+
+    - NAME: "Python Werks Test"
+      ONLY_WHEN_NOT_EMPTY: CHANGED_REFERENCE_IMAGE,CHANGED_WERK_FILES,CHANGED_WERK_CODE_FILES,CHANGED_RUN_UVENV_SCRIPT
+      DIR: "tests"
+      GIT_FETCH_TAGS: true  # expensive
+      GIT_FETCH_NOTES: true
+      ENV_VARS:
+          BAZEL_TEST_LOGS_DEST: "../results/werks"
+      COMMAND: |
+          make_rc=0
+            ../buildscripts/scripts/bazel_test_ci.sh \
+            --test_verbose_timeout_warnings \
+            --cmk_edition=ultimate \
+            -- \
+            //tests/code_quality/werks:werks || make_rc=$?
+          ../buildscripts/scripts/bazel_test_post_archive_xunit.sh || :
+          exit $make_rc
+      TEXT_ON_SKIP: "No Werk files changed"
+      RESULT_CHECK_TYPE: "JUNIT"
+      RESULT_CHECK_FILE_PATTERN: "results/werks/tests/**/test.xml"
+      JENKINS_TEST_RESULT_PATH: "testReport/"
+
+    - NAME: "Bazel Lint"
+      ONLY_WHEN_NOT_EMPTY: CHANGED_REFERENCE_IMAGE,CHANGED_BAZEL_FILES
+      COMMAND: "bazel run //:buildifier.check 2>${RESULTS}/bazel-lint.txt"
+      TEXT_ON_SKIP: "No Bazel files changed"
+      RESULT_CHECK_TYPE: "BAZELLINT"
+      RESULT_CHECK_FILE_PATTERN: "results/bazel-lint.txt"
+
+    - NAME: "Agent Plugin Unit Tests"
+      ONLY_WHEN_NOT_EMPTY: CHANGED_REFERENCE_IMAGE,CHANGED_AGENT_PLUGINS_SRCS,CHANGED_AGENT_PLUGINS_SRC_FILES,CHANGED_TESTS_MAKEFILE
+      COMMAND: echo "Just have this line here, task is handled in test-gerrit.groovy"
+      TEXT_ON_SKIP: "No agent files changed"
+
+    - NAME: "GitHub actions"
+      ONLY_WHEN_NOT_EMPTY: CHANGED_BAZEL_FILES
+      COMMAND: echo "Just have this line here, task is handled in test-gerrit.groovy"
+      TEXT_ON_SKIP: "No Bazel files changed"
+
+    ########## packages ########################################################
+
+    - NAME: "Package cmk-frontend-vue"
+      ONLY_WHEN_NOT_EMPTY: CHANGED_REFERENCE_IMAGE,CHANGED_FRONTEND_VUE_FILES,CHANGED_SHARED_TYPING_FILES,CHANGED_JS_DEPENDENCIES
+      DIR: "packages/cmk-frontend-vue"
+      COMMAND: "./run -B --build-dev --lint &> ${RESULTS}/cmk-frontend-vue.txt"
+      TEXT_ON_SKIP: "No cmk-frontend-vue files changed"
+      RESULT_CHECK_FILE_PATTERN: "results/cmk-frontend-vue.txt"
+
+    - NAME: "Package mk-oracle"
+      ONLY_WHEN_NOT_EMPTY: CHANGED_REFERENCE_IMAGE,CHANGED_MK_ORACLE_FILES,CHANGED_RUST_WORKSPACE_FILES
+      SEC_VAR_LIST:
+          - "CI_TEST_SQL_DB_ENDPOINT"
+          - "CI_ORA_TEST_PASSWORD"
+      DIR: "packages/mk-oracle"
+      COMMAND: echo "Just have this line here, task is handled in test-gerrit.groovy"
+      TEXT_ON_SKIP: "No mk-oracle files changed"
+      RESULT_CHECK_FILE_PATTERN: "mk-oracle.txt"
+
+    - NAME: "Build mk-oracle on AIX and Solaris"
+      ONLY_WHEN_NOT_EMPTY: CHANGED_MK_ORACLE_FILES
+      COMMAND: echo "Just have this line here, task is handled in test-gerrit.groovy"
+      TEXT_ON_SKIP: "No mk-oracle files changed"
+
+    - NAME: "Format repository"
+      COMMAND: "bazel run //:format.check &> ${RESULTS}/format.txt"
+      TEXT_ON_SKIP: "unconditional"
+      RESULT_CHECK_FILE_PATTERN: "results/format.txt"
+
+    - NAME: "Lint repository"
+      COMMAND: |
+          set +e
+          bazel lint --quiet --machine --fixes=false ... &> ${RESULTS}/lint.txt
+          exit_code=$?
+          set -e
+          bazel run //scripts:sarif_preparse -- --root_dir=$PWD/bazel-bin --output ${RESULTS}/results.sarif || true
+          exit $exit_code
+      TEXT_ON_SKIP: "unconditional"
+      RESULT_CHECK_TYPE: "SARIF"
+      RESULT_CHECK_FILE_PATTERN: "results/results.sarif"
+
+    - NAME: "Type repository with mypy"
+      COMMAND: |
+          set +e
+          ./buildscripts/scripts/bazel_mypy.sh
+          exit_code=$?
+          set -e
+          bazel \
+             --run_under="cd $PWD &&" \
+             run \
+             //buildscripts/scripts:collect_mypy \
+             -- \
+             bazel-out/k8-fastbuild/bin \
+             > results/mypy-results.xml
+          exit $exit_code
+      TEXT_ON_SKIP: "unconditional"
+      RESULT_CHECK_TYPE: "JUNIT"
+      RESULT_CHECK_FILE_PATTERN: "results/mypy-results.xml"
+
+    - NAME: "Enforced relay build"
+      ONLY_WHEN_NOT_EMPTY: CHANGED_PYTHON_REQUIREMENTS,CHANGED_BAZEL_MODULES,CHANGED_BAZEL_FILES,CHANGED_MAKEFILE
+      COMMAND: |
+          make_rc=0
+          bazel build --cmk_edition=ultimate --cmk_version=$(make print-VERSION) //omd/non-free/relay:image_tar //omd/non-free/relay:sbom &> ${RESULTS}/cmk-relay-build.txt || make_rc=$?
+          cp $(bazel cquery --cmk_edition=ultimate //omd/non-free/relay:bill_of_materials --output=files) ${RESULTS}/relay-bill-of-materials.json || true
+          exit $make_rc
+      TEXT_ON_SKIP: "No package dependencies changed"
+      RESULT_CHECK_FILE_PATTERN: "results/relay-bill-of-materials.json"

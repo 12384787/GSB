@@ -1,0 +1,110 @@
+load("@rules_pkg//pkg:mappings.bzl", "pkg_attributes", "pkg_files", "pkg_mkdirs", "pkg_mklink", "strip_prefix")
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+load("//bazel/rules:patchelf.bzl", "set_runpath")
+
+exports_files(["skel.permissions"])
+
+set_runpath(
+    name = "bin_runpath",
+    srcs = [
+        "@redis//:redis-benchmark",
+        "@redis//:redis-cli",
+        "@redis//:redis-server",
+    ],
+    rpaths = ["$ORIGIN/../lib"],
+    tags = ["manual"],
+)
+
+pkg_files(
+    name = "bin_pkg",
+    srcs = [
+        ":bin_runpath",
+    ],
+    attributes = pkg_attributes(
+        mode = "0755",
+    ),
+    prefix = "bin",
+    tags = ["manual"],
+)
+
+pkg_mklink(
+    name = "redis-check-aof",
+    link_name = "bin/redis-check-aof",
+    tags = ["manual"],
+    target = "redis-server",
+)
+
+pkg_mklink(
+    name = "redis-check-rdb",
+    link_name = "bin/redis-check-rdb",
+    tags = ["manual"],
+    target = "redis-server",
+)
+
+pkg_mklink(
+    name = "redis-sentinel",
+    link_name = "bin/redis-sentinel",
+    tags = ["manual"],
+    target = "redis-server",
+)
+
+pkg_files(
+    name = "skel",
+    srcs = [
+        "skel/etc/logrotate.d/redis",
+        "skel/etc/redis/redis.conf",
+    ],
+    strip_prefix = strip_prefix.from_pkg(""),
+    tags = ["manual"],
+)
+
+pkg_files(
+    name = "skel_755",
+    srcs = [
+        "skel/etc/init.d/redis",
+    ],
+    attributes = pkg_attributes(
+        mode = "0755",
+    ),
+    strip_prefix = strip_prefix.from_pkg(""),
+    tags = ["manual"],
+)
+
+pkg_mklink(
+    name = "40-redis",
+    link_name = "skel/etc/rc.d/40-redis",
+    tags = ["manual"],
+    target = "../init.d/redis",
+)
+
+pkg_mkdirs(
+    name = "skel_var",
+    dirs = [
+        "skel/var/redis",
+    ],
+    tags = ["manual"],
+)
+
+pkg_tar(
+    name = "redis",
+    srcs = [
+        "redis-check-rdb",
+        "redis-sentinel",
+        ":40-redis",
+        ":bin_pkg",
+        ":redis-check-aof",
+        ":skel",
+        ":skel_755",
+        ":skel_var",
+    ],
+    stamp = 1,
+    tags = ["manual"],
+    visibility = ["//omd:__pkg__"],
+)
+
+sh_library(
+    name = "omd_packages_redis_sh",
+    srcs = [
+        "skel/etc/init.d/redis",
+    ],
+)

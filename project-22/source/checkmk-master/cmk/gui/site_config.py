@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+from collections.abc import Mapping
+
+import cmk.utils.paths
+from cmk.ccc.site import omd_site, SiteId
+from cmk.livestatus_client import SiteConfiguration, SiteConfigurations
+
+
+# TODO: Cleanup: Make clear that this function is used by the status GUI (and not WATO)
+# and only returns the currently enabled sites. Or should we redeclare the "disabled" state
+# to disable the sites at all?
+def enabled_sites(site_configs: SiteConfigurations) -> SiteConfigurations:
+    return SiteConfigurations(
+        {
+            site_id: site_config
+            for site_id, site_config in site_configs.items()
+            if not site_config["disabled"]
+        }
+    )
+
+
+def has_distributed_setup_remote_sites(site_configs: SiteConfigurations) -> bool:
+    return bool(distributed_setup_remote_sites(site_configs))
+
+
+def is_distributed_setup_remote_site(site_configs: SiteConfigurations) -> bool:
+    return _has_distributed_wato_file() and not has_distributed_setup_remote_sites(site_configs)
+
+
+def _has_distributed_wato_file() -> bool:
+    path = cmk.utils.paths.check_mk_config_dir / "distributed_wato.mk"
+    return path.exists() and path.stat().st_size != 0
+
+
+def central_site_config(site_configs: SiteConfigurations) -> SiteConfiguration | None:
+    """The central site's own ``SiteConfiguration``, if it can be known here."""
+    if is_distributed_setup_remote_site(site_configs):
+        return None
+    return site_configs.get(omd_site())
+
+
+def get_login_sites(site_configs: SiteConfigurations) -> list[SiteId]:
+    """Returns the distributed setup remote sites a user may login and the local site"""
+    return login_enabled_distributed_remote_sites(site_configs) + [omd_site()]
+
+
+# TODO: All site listing functions should return the same data structure, e.g. a list of
+#       pairs (site_id, site)
+def login_enabled_distributed_remote_sites(site_configs: SiteConfigurations) -> list[SiteId]:
+    """Returns a list of site ids which are distributed setup remote sites and users can login"""
+    login_sites = []
+    for site_id, site_spec in distributed_setup_remote_sites(site_configs).items():
+        if site_spec.get("user_login", True) and not site_is_local(site_spec):
+            login_sites.append(site_id)
+    return login_sites
+
+
+def is_replication_enabled(site_config: SiteConfiguration) -> bool:
+    return bool(site_config.get("replication"))
+
+
+def all_activation_sites(site_configs: SiteConfigurations) -> SiteConfigurations:
+    """All sites that are affected by Setup changes, regardless of user authorization
+
+    Use this in unattended contexts (CLI commands, background jobs) which act without a
+    GUI user. User facing code paths use `cmk.gui.user_sites.activation_sites` instead,
+    which additionally applies the user's site authorization."""
+    return SiteConfigurations(
+        {
+            site_id: site
+            for site_id, site in site_configs.items()
+            if site_is_local(site) or is_replication_enabled(site)
+        }
+    )
+
+
+def distributed_setup_remote_sites(site_configs: SiteConfigurations) -> SiteConfigurations:
+    return SiteConfigurations(
+        {site_id: s for site_id, s in site_configs.items() if is_replication_enabled(s)}
+    )
+
+
+def sites_ready_for_remote_automation(site_configs: SiteConfigurations) -> SiteConfigurations:
+    """Remote sites that have replication enabled and a login secret configured."""
+    return SiteConfigurations(
+        {
+            site_id: s
+            for site_id, s in distributed_setup_remote_sites(site_configs).items()
+            if "secret" in s
+        }
+    )
+
+
+def site_is_local(site_config: SiteConfiguration) -> bool:
+    socket_info = site_config["socket"]
+    if isinstance(socket_info, str):
+        # Should be unreachable
+        return False
+
+    if socket_info[0] == "local":
+        return True
+
+    if socket_info[0] == "unix":
+        return socket_info[1]["path"] == str(cmk.utils.paths.livestatus_unix_socket)
+
+    return False
+
+
+def is_single_local_site(sites: Mapping[SiteId, SiteConfiguration]) -> bool:
+    if len(sites) > 1:
+        return False
+    if not sites:
+        return True
+
+    return site_is_local(list(sites.values())[0])
+
+
+def wato_site_ids(site_configs: SiteConfigurations) -> list[SiteId]:
+    return [omd_site(), *distributed_setup_remote_sites(site_configs)]

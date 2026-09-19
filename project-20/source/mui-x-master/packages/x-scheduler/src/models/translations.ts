@@ -1,0 +1,154 @@
+import type { CalendarView } from '@mui/x-scheduler-internals/models';
+
+export type SchedulerWeekday =
+  'monday' | 'tuesday' | 'wednesday' | 'thursday' | 'friday' | 'saturday' | 'sunday';
+
+// Strings shared by every event-editing surface: the dialog, the drawer, and the armed-event toolbar.
+export interface EventEditingLocaleText {
+  // EventDialog
+  colorPickerLabel: string;
+  colorSectionLabel: string;
+  dateTimeSectionLabel: string;
+  resourceColorSectionLabel: string;
+  allDayLabel: string;
+  closeButtonAriaLabel: string;
+  closeButtonLabel: string;
+  // EventToolbar (armed-event actions), not the dialog.
+  editEventButtonAriaLabel: string;
+  // Duplicates `deleteEvent` today but stays separate so the toolbar's aria-label can diverge from the
+  // dialog's button text without a translation regression.
+  deleteEventButtonAriaLabel: string;
+  eventActionsToolbarAriaLabel: string;
+  deleteEvent: string;
+  // EventContextMenu (shown on right-click of an event, or on Space while it is focused)
+  editEvent: string;
+  // Replaces `editEvent` on a read-only event: opens the same non-editable view, so the label
+  // says so instead of promising an edit that can't happen.
+  showEventDetails: string;
+  eventContextMenuAriaLabel: string;
+  descriptionLabel: string;
+  endDateLabel: string;
+  endTimeLabel: string;
+  eventTitleAriaLabel: string;
+  generalTabLabel: string;
+  labelNoResource: string;
+  labelInvalidResource: string;
+  recurrenceLabel: string;
+  recurrenceNoRepeat: string;
+  recurrenceCustomRepeat: string;
+  recurrenceDailyPresetLabel: string;
+  recurrenceDailyFrequencyLabel: string;
+  recurrenceEndsLabel: string;
+  recurrenceEndsAfterLabel: string;
+  recurrenceEndsNeverLabel: string;
+  recurrenceEndsUntilLabel: string;
+  recurrenceEndsTimesLabel: string;
+  recurrenceEveryLabel: string;
+  recurrenceRepeatLabel: string;
+  recurrenceTabLabel: string;
+  recurrenceMainSelectCustomLabel: string;
+  recurrenceWeeklyFrequencyLabel: string;
+  recurrenceWeeklyPresetLabel: (params: {
+    weekday: SchedulerWeekday;
+    weekdayName: string;
+  }) => string;
+  recurrenceMonthlyDayOfMonthLabel: (dayNumber: number) => string;
+  recurrenceMonthlyFrequencyLabel: string;
+  recurrenceMonthlyLastWeekAriaLabel: (weekDay: string) => string;
+  recurrenceMonthlyLastWeekLabel: (weekDay: string) => string;
+  recurrenceMonthlyPresetLabel: (dayNumber: number) => string;
+  recurrenceMonthlyWeekNumberAriaLabel: (ord: number, weekDay: string) => string;
+  recurrenceMonthlyWeekNumberLabel: (ord: number, weekDay: string) => string;
+  recurrenceWeeklyMonthlySpecificInputsLabel: string;
+  recurrenceYearlyFrequencyLabel: string;
+  recurrenceYearlyPresetLabel: (date: string) => string;
+  noResourceAriaLabel: string;
+  selectColorAriaLabel: (color: string) => string;
+  resourceLabel: string;
+  invalidDateError: string;
+  invalidTimeError: string;
+  requiredResourceError: string;
+  saveChanges: string;
+  startDateAfterEndDateError: string;
+  startDateLabel: string;
+  startTimeAfterEndTimeError: string;
+  startTimeLabel: string;
+
+  // RecurringScopeDialog
+  all: string;
+  cancel: string;
+  confirm: string;
+  onlyThis: string;
+  radioGroupAriaLabel: string;
+  thisAndFollowing: string;
+  title: string;
+}
+
+export interface EventCalendarLocaleText extends EventEditingLocaleText {
+  // ResourcesTree
+  resourcesLabel: string;
+
+  // ViewSwitcher
+  agenda: string;
+  day: string;
+  month: string;
+  other: string;
+  today: string;
+  week: string;
+  time: string;
+  days: string;
+  months: string;
+  weeks: string;
+  years: string;
+
+  // DateNavigator
+  closeSidePanel: string;
+  openSidePanel: string;
+
+  // SidePanelDrawer (small screens)
+  openMenu: string;
+
+  // PreferencesMenu
+  amPm12h: string;
+  hour24h: string;
+  preferencesMenu: string;
+  showEmptyDaysInAgenda: string;
+  showWeekends: string;
+  showWeekNumber: string;
+  timeFormat: string;
+  viewSpecificOptions: (view: CalendarView) => string;
+  startWeekOn: string;
+  weekdaySunday: string;
+  weekdayMonday: string;
+  weekdaySaturday: string;
+
+  // WeekView
+  allDay: string;
+
+  // MonthView
+  hiddenEvents: (hiddenEventsCount: number) => string;
+  nextTimeSpan: (view: CalendarView) => string;
+  previousTimeSpan: (view: CalendarView) => string;
+  resourceAriaLabel: (resourceName: string) => string;
+  weekAbbreviation: string;
+  weekNumberAriaLabel: (weekNumber: number) => string;
+
+  // EventItem
+  eventItemMultiDayLabel: (endDate: string) => string;
+
+  // MiniCalendar
+  miniCalendarLabel: string;
+  miniCalendarGoToPreviousMonth: string;
+  miniCalendarGoToNextMonth: string;
+
+  // Main calendar region
+  calendarContentAriaLabel: string;
+
+  // Timeline title sub grid
+  timelineResourceTitleHeader: string;
+}
+
+export interface EventTimelineLocaleText extends EventEditingLocaleText {
+  // Timeline title sub grid
+  timelineResourceTitleHeader: string;
+}

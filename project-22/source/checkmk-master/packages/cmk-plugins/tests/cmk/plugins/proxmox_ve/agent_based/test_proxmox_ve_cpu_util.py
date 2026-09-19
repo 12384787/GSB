@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import json
+from collections.abc import Mapping
+
+import pytest
+
+import cmk.plugins.proxmox_ve.agent_based.proxmox_ve_cpu_util as pvcu
+from cmk.agent_based.v2 import CheckResult, Metric, Result, State
+
+
+@pytest.fixture
+def empty_value_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = dict[str, object]()
+    monkeypatch.setattr(pvcu, "get_value_store", lambda: store)
+
+
+VM_DATA = pvcu.parse_proxmox_ve_cpu_util(
+    [
+        [
+            json.dumps(
+                {
+                    "cpu": "0.75",
+                    "max_cpu": "6",
+                    "uptime": "0",
+                }
+            )
+        ]
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "params,section,expected_results",
+    [
+        (
+            {"util": ("no_levels", None), "average": 1},
+            VM_DATA,
+            (
+                Metric("util", 75.0, boundaries=(0.0, 100.0)),
+                Result(state=State.OK, summary="Total CPU (1 min average): 75.00%"),
+                Metric("util_average", 75.0, boundaries=(0.0, None)),
+                Result(state=State.OK, summary="CPU cores assigned: 6"),
+                Result(state=State.OK, summary="Total CPU Core usage (1 min average): 4.50"),
+                Metric("cpu_core_usage", 4.5, boundaries=(0.0, 6.0)),
+            ),
+        ),
+        (
+            {"util": ("fixed", (90.0, 95.0)), "average": 1},
+            VM_DATA,
+            (
+                Metric("util", 75.0, levels=(90.0, 95.0), boundaries=(0.0, 100.0)),
+                Result(state=State.OK, summary="Total CPU (1 min average): 75.00%"),
+                Metric("util_average", 75.0, levels=(90.0, 95.0), boundaries=(0.0, None)),
+                Result(state=State.OK, summary="CPU cores assigned: 6"),
+                Result(state=State.OK, summary="Total CPU Core usage (1 min average): 4.50"),
+                Metric("cpu_core_usage", 4.5, levels=(5.4, 5.7), boundaries=(0.0, 6.0)),
+            ),
+        ),
+        (
+            {"util": ("fixed", (90.0, 95.0)), "average": 30},
+            VM_DATA,
+            (
+                Metric("util", 75.0, levels=(90.0, 95.0), boundaries=(0.0, 100.0)),
+                Result(state=State.OK, summary="Total CPU (30 min average): 75.00%"),
+                Metric("util_average", 75.0, levels=(90.0, 95.0), boundaries=(0.0, None)),
+                Result(state=State.OK, summary="CPU cores assigned: 6"),
+                Result(state=State.OK, summary="Total CPU Core usage (30 min average): 4.50"),
+                Metric("cpu_core_usage", 4.5, levels=(5.4, 5.7), boundaries=(0.0, 6.0)),
+            ),
+        ),
+        (
+            {"util": ("no_levels", None), "average": 30},
+            VM_DATA,
+            (
+                Metric("util", 75.0, boundaries=(0.0, 100.0)),
+                Result(state=State.OK, summary="Total CPU (30 min average): 75.00%"),
+                Metric("util_average", 75.0, boundaries=(0.0, None)),
+                Result(state=State.OK, summary="CPU cores assigned: 6"),
+                Result(state=State.OK, summary="Total CPU Core usage (30 min average): 4.50"),
+                Metric("cpu_core_usage", 4.5, boundaries=(0.0, 6.0)),
+            ),
+        ),
+    ],
+)
+@pytest.mark.usefixtures("empty_value_store")
+def test_check_proxmox_ve_vm_info(
+    params: Mapping[str, object], section: pvcu.Section, expected_results: CheckResult
+) -> None:
+    results = tuple(pvcu.check_proxmox_ve_cpu_util(params, section))
+    assert results == expected_results
+
+
+def test_core_usage_follows_average_not_instantaneous_spike(
+    empty_value_store: None,  # noqa: ARG001
+) -> None:
+    """A short CPU spike must not trip CRIT on "Total CPU Core usage" while the averaged
+    percentage is still well below its levels: both lines are levelled on the same average."""
+    params = {"util": ("fixed", (90.0, 95.0)), "average": 30}
+    low_load = pvcu.parse_proxmox_ve_cpu_util(
+        [[json.dumps({"cpu": "0.10", "max_cpu": "6", "uptime": "0"})]]
+    )
+    spike = pvcu.parse_proxmox_ve_cpu_util(
+        [[json.dumps({"cpu": "1.0", "max_cpu": "6", "uptime": "60"})]]
+    )
+
+    # Establish a low-usage baseline.
+    tuple(pvcu.check_proxmox_ve_cpu_util(params, low_load))
+
+    # One minute of full load barely moves a 30 minute average.
+    results = tuple(pvcu.check_proxmox_ve_cpu_util(params, spike))
+
+    core_usage_result = next(
+        r for r in results if isinstance(r, Result) and "Core usage" in r.summary
+    )
+    assert core_usage_result.state == State.OK
+
+
+if __name__ == "__main__":
+    # Please keep these lines - they make TDD easy and have no effect on normal test runs.
+    # Just run this file from your IDE and dive into the code.
+    assert not pytest.main(["--doctest-modules", pvcu.__file__])
+    pytest.main(["-T=unit", "-vvsx", __file__])

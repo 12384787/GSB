@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+import functools
+from collections.abc import Callable
+
+from cmk.ccc.version import Edition
+from cmk.gui.background_job.job import BackgroundJobRegistry
+from cmk.gui.main_menu import MainMenuRegistry
+from cmk.gui.pages import PageEndpoint, PageRegistry
+from cmk.gui.painter.v0 import PainterRegistry
+from cmk.gui.permissions import PermissionRegistry, PermissionSectionRegistry
+from cmk.gui.quick_setup.v0_unstable._registry import QuickSetupRegistry
+from cmk.gui.search.matchers import MatchItemGeneratorRegistry
+from cmk.gui.search.permissions import (
+    search_permissions_handler_registry,
+    SearchPermissionsHandlerFactory,
+)
+from cmk.gui.sidebar import SnapinRegistry
+from cmk.gui.utils.roles import UserPermissions
+from cmk.gui.views.icon import IconRegistry
+from cmk.gui.views.sorter import SorterRegistry
+from cmk.gui.visuals.filter import FilterRegistry
+from cmk.gui.wato.page_handler import page_handler
+from cmk.gui.watolib.analyze_configuration import ACTestRegistry
+from cmk.gui.watolib.automation_commands import AutomationCommandRegistry
+from cmk.gui.watolib.config_domain_name import (
+    ConfigDomainRegistry,
+    ConfigVariableGroupRegistry,
+    ConfigVariableRegistry,
+)
+from cmk.gui.watolib.config_sync import ReplicationPathRegistry
+from cmk.gui.watolib.groups_io import ContactGroupUsageFinderRegistry
+from cmk.gui.watolib.host_rename import rename_host_in_rule_value_registry
+from cmk.gui.watolib.hosts_and_folders import ajax_popup_host_action_menu
+from cmk.gui.watolib.main_menu import MainModuleTopicRegistry
+from cmk.gui.watolib.mode import ModeRegistry
+from cmk.gui.watolib.notification_parameter import NotificationParameterRegistry
+from cmk.gui.watolib.rulespecs import RulespecGroupRegistry
+from cmk.shared_typing.main_menu import NavItemTopic
+from cmk.shared_typing.unified_search import ProviderName
+
+from . import (
+    _ac_tests,
+    _check_mk_configuration,
+    _main_module_topics,
+    _notification_settings,
+    _omd_configuration,
+    _permissions,
+    _snapins,
+    _tracing,
+    filters,
+    piggyback_hub,
+)
+from . import pages as wato_pages
+from ._main_modules import register as register_main_modules
+from ._main_modules import register_agent_download_pages, register_multisite_modules
+from ._notification_parameter import registration as _notification_parameter_registration
+from ._search_permissions import SetupPermissionsHandler
+from ._virtual_host_tree import VirtualHostTree
+from .icons import DownloadAgentOutputIcon, DownloadSnmpWalkIcon, WatoIcon
+from .pages._rule_conditions import PageAjaxDictHostTagConditionGetChoice
+from .views import (
+    PainterHostFilename,
+    PainterWatoFolderAbs,
+    PainterWatoFolderPlain,
+    PainterWatoFolderRel,
+    SorterWatoFolderAbs,
+    SorterWatoFolderPlain,
+    SorterWatoFolderRel,
+)
+
+
+def register(
+    *,
+    edition: Edition,
+    page_registry: PageRegistry,
+    painter_registry: PainterRegistry,
+    sorter_registry: SorterRegistry,
+    icon_registry: IconRegistry,
+    automation_command_registry: AutomationCommandRegistry,
+    job_registry: BackgroundJobRegistry,
+    filter_registry: FilterRegistry,
+    mode_registry: ModeRegistry,
+    quick_setup_registry: QuickSetupRegistry,
+    permission_section_registry: PermissionSectionRegistry,
+    permission_registry: PermissionRegistry,
+    main_module_topic_registry: MainModuleTopicRegistry,
+    rulespec_group_registry: RulespecGroupRegistry,  # noqa: ARG001
+    config_domain_registry: ConfigDomainRegistry,
+    config_variable_registry: ConfigVariableRegistry,
+    config_variable_group_registry: ConfigVariableGroupRegistry,
+    snapin_registry: SnapinRegistry,
+    match_item_generator_registry: MatchItemGeneratorRegistry,
+    main_menu_registry: MainMenuRegistry,
+    ac_test_registry: ACTestRegistry,
+    contact_group_usage_finder_registry: ContactGroupUsageFinderRegistry,
+    notification_parameter_registry: NotificationParameterRegistry,
+    replication_path_registry: ReplicationPathRegistry,
+    user_menu_topics: Callable[[UserPermissions], list[NavItemTopic]],
+) -> None:
+    painter_registry.register(PainterHostFilename)
+    painter_registry.register(PainterWatoFolderAbs)
+    painter_registry.register(PainterWatoFolderRel)
+    painter_registry.register(PainterWatoFolderPlain)
+    sorter_registry.register(SorterWatoFolderAbs)
+    sorter_registry.register(SorterWatoFolderRel)
+    sorter_registry.register(SorterWatoFolderPlain)
+
+    icon_registry.register(DownloadAgentOutputIcon)
+    icon_registry.register(DownloadSnmpWalkIcon)
+    icon_registry.register(WatoIcon)
+
+    page_registry.register(PageEndpoint("wato", lambda ctx: page_handler(edition, ctx)))
+    page_registry.register(PageEndpoint("ajax_popup_host_action_menu", ajax_popup_host_action_menu))
+    page_registry.register(
+        PageEndpoint(
+            "ajax_dict_host_tag_condition_get_choice", PageAjaxDictHostTagConditionGetChoice()
+        )
+    )
+
+    filters.register(filter_registry)
+    wato_pages.register(
+        edition,
+        page_registry,
+        mode_registry,
+        quick_setup_registry,
+        automation_command_registry,
+        job_registry,
+        match_item_generator_registry,
+        main_menu_registry,
+        user_menu_topics,
+    )
+    _permissions.register(permission_section_registry, permission_registry)
+    _main_module_topics.register(main_module_topic_registry)
+    _check_mk_configuration.register(
+        edition,
+        config_variable_registry,
+        config_variable_group_registry,
+        contact_group_usage_finder_registry,
+        rename_host_in_rule_value_registry,
+    )
+    _ac_tests.register(ac_test_registry)
+    _omd_configuration.register(
+        config_domain_registry,
+        config_variable_registry,
+        replication_path_registry,
+    )
+    _tracing.register(config_variable_registry)
+    _snapins.register(snapin_registry, match_item_generator_registry, main_menu_registry)
+    _notification_settings.register(config_variable_registry)
+    _notification_parameter_registration.register(edition, notification_parameter_registry)
+    snapin_registry.register(VirtualHostTree)
+    piggyback_hub.register(config_variable_registry)
+    search_permissions_handler_registry.register(
+        SearchPermissionsHandlerFactory(
+            provider=ProviderName.setup,
+            build=functools.partial(SetupPermissionsHandler, edition),
+        )
+    )
+
+
+__all__ = [
+    "register",
+    "register_agent_download_pages",
+    "register_main_modules",
+    "register_multisite_modules",
+]

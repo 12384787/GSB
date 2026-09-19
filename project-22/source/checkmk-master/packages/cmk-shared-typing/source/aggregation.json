@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "aggregator",
+  "type": "object",
+  "properties": {
+    "stages": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/aggregation_stage"
+      }
+    }
+  },
+  "required": ["stages"],
+  "$defs": {
+    "attribute_kind": {
+      "type": "string",
+      "enum": ["scope", "resource", "data_point"]
+    },
+    "attribute_key": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/attribute_kind"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": ["kind", "name"]
+    },
+    "scalar_aggregation": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["scalar"]
+        },
+        "name": {
+          "type": "string",
+          "enum": ["avg", "count", "max", "min", "sum"]
+        }
+      },
+      "required": ["type", "name"]
+    },
+    "aggregation_fn": {
+      "$ref": "#/$defs/scalar_aggregation"
+    },
+    "aggregation_stage": {
+      "type": "object",
+      "properties": {
+        "aggregate_by": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/attribute_key"
+          }
+        },
+        "aggregation_fn": {
+          "$ref": "#/$defs/aggregation_fn"
+        }
+      },
+      "required": ["aggregate_by", "aggregation_fn"]
+    }
+  }
+}

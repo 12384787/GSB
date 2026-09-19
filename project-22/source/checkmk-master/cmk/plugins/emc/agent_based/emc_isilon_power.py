@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+
+from collections.abc import Mapping
+from typing import Any
+
+from cmk.agent_based.v2 import (
+    CheckPlugin,
+    CheckResult,
+    DiscoveryResult,
+    Result,
+    Service,
+    SimpleSNMPSection,
+    SNMPTree,
+    State,
+    StringTable,
+)
+from cmk.plugins.emc.lib import DETECT_ISILON
+
+
+# Power Supply 1 Input Voltage --> Power Supply 1 Input
+# Battery 1 Voltage (now) --> Battery 1 (now)
+# Voltage 1.5v --> 1.5v
+def _isilon_power_item_name(sensor_name: str) -> str:
+    return sensor_name.replace("Voltage", "").replace("  ", " ").strip()
+
+
+def parse_emc_isilon_power(string_table: StringTable) -> StringTable:
+    return string_table
+
+
+def discover_emc_isilon_power(section: StringTable) -> DiscoveryResult:
+    for line in section:
+        # only monitor power supply currently
+        if "Power Supply" in line[0] or "PS" in line[0]:
+            yield Service(item=_isilon_power_item_name(line[0]))
+
+
+def check_emc_isilon_power(
+    item: str, params: Mapping[str, Any], section: StringTable
+) -> CheckResult:
+    for line in section:
+        if item == _isilon_power_item_name(line[0]):
+            volt = float(line[1])
+
+            infotext = f"{volt:.1f} V"
+            warn_lower, crit_lower = params["levels_lower"]
+            warn_upper, crit_upper = params.get("levels_upper", (None, None))
+            lower_text = f" (warn/crit below {warn_lower:.1f}/{crit_lower:.1f} V)"
+            upper_text = (
+                f" (warn/crit at or above {warn_upper:.1f}/{crit_upper:.1f} V)"
+                if warn_upper is not None
+                else ""
+            )
+
+            if volt < crit_lower:
+                state = State.CRIT
+                infotext += lower_text
+            elif crit_upper is not None and volt >= crit_upper:
+                state = State.CRIT
+                infotext += upper_text
+            elif volt < warn_lower:
+                state = State.WARN
+                infotext += lower_text
+            elif warn_upper is not None and volt >= warn_upper:
+                state = State.WARN
+                infotext += upper_text
+            else:
+                state = State.OK
+
+            yield Result(state=state, summary=infotext)
+            return
+
+
+snmp_section_emc_isilon_power = SimpleSNMPSection(
+    name="emc_isilon_power",
+    parse_function=parse_emc_isilon_power,
+    detect=DETECT_ISILON,
+    fetch=SNMPTree(
+        base=".1.3.6.1.4.1.12124.2.55.1",
+        oids=["3", "4"],
+    ),
+)
+
+
+check_plugin_emc_isilon_power = CheckPlugin(
+    name="emc_isilon_power",
+    service_name="Voltage %s",
+    discovery_function=discover_emc_isilon_power,
+    check_function=check_emc_isilon_power,
+    check_ruleset_name="evolt",
+    check_default_parameters={
+        # the check handles only power supply input voltage currently, but there
+        # are sensors for 1.0V, 1.5V, 3.3V, 12V, ... outputs.
+        "levels_lower": (0.5, 0.0),
+    },
+)

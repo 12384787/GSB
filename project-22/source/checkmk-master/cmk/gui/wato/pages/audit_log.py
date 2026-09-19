@@ -1,0 +1,896 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="type-arg"
+
+"""Handling of the audit logfiles"""
+
+import copy
+import dataclasses
+import time
+from collections.abc import Collection, Iterator
+from dataclasses import dataclass
+from typing import Any, override
+
+from cmk.ccc.resulttype import Error, OK, Result
+from cmk.ccc.version import Edition
+from cmk.gui.breadcrumb import Breadcrumb
+from cmk.gui.config import Config
+from cmk.gui.display_options import display_options
+from cmk.gui.exceptions import FinalizeRequest, MKUserError
+from cmk.gui.form_specs import (
+    DEFAULT_VALUE,
+    get_visitor,
+    IncomingData,
+    parse_data_from_field_id,
+    RawDiskData,
+    render_form_spec,
+    VisitorOptions,
+)
+from cmk.gui.form_specs.generators.cascading_choice_utils import (
+    CascadingDataConversion,
+    enable_deprecated_cascading_elements,
+)
+from cmk.gui.form_specs.generators.regex_utils import create_regex
+from cmk.gui.form_specs.unstable import (
+    CascadingSingleChoiceExtended,
+    LegacyValueSpec,
+)
+from cmk.gui.form_specs.unstable.cascading_single_choice_extended import (
+    CascadingSingleChoiceElementExtended,
+)
+from cmk.gui.htmllib.generator import HTMLWriter
+from cmk.gui.htmllib.html import html
+from cmk.gui.http import ContentDispositionType, Request, request, response
+from cmk.gui.i18n import _
+from cmk.gui.logged_in import user
+from cmk.gui.page_menu import (
+    make_display_options_dropdown,
+    make_simple_link,
+    PageMenu,
+    PageMenuDropdown,
+    PageMenuEntry,
+    PageMenuSidePopup,
+    PageMenuTopic,
+)
+from cmk.gui.pages import PageContext
+from cmk.gui.table import table_element
+from cmk.gui.type_defs import ActionResult
+from cmk.gui.userdb.store import load_users
+from cmk.gui.utils.csrf_token import check_csrf_token
+from cmk.gui.utils.output_funnel import output_funnel
+from cmk.gui.utils.transaction_manager import transactions
+from cmk.gui.valuespec import AbsoluteDate
+from cmk.gui.valuespec import Integer as IntegerVS
+from cmk.gui.wato.pages.activate_changes import render_object_ref
+from cmk.gui.watolib.audit_log import AuditLogFilterRaw, AuditLogStore, build_audit_log_filter
+from cmk.gui.watolib.hosts_and_folders import folder_preserving_link
+from cmk.gui.watolib.mode import ModeRegistry, redirect, WatoMode
+from cmk.gui.watolib.objref import ObjectRefType
+from cmk.gui.watolib.paths import wato_var_dir
+from cmk.rulesets.internal.form_specs import (
+    SingleChoiceElementExtended,
+    SingleChoiceExtended,
+)
+from cmk.rulesets.v1 import Label, Message, Title
+from cmk.rulesets.v1.form_specs import (
+    CascadingSingleChoiceElement,
+    DefaultValue,
+    DictElement,
+    Dictionary,
+    FixedValue,
+    MatchingScope,
+    String,
+)
+from cmk.utils import render
+from cmk.web.utils import escaping
+from cmk.web.utils.confirm_links import make_confirm_delete_link
+from cmk.web.utils.flashed_messages import flash
+from cmk.web.utils.html import HTML
+from cmk.web.utils.icons import IconNames, StaticIcon
+from cmk.web.utils.permission_verification import PermissionName
+from cmk.web.utils.urls import makeactionuri, makeuri
+
+
+def register(mode_registry: ModeRegistry) -> None:
+    mode_registry.register(ModeAuditLog)
+
+
+@dataclass(frozen=True, kw_only=True)
+class AuditLogRequestData:
+    selected_filename: str | None = None
+    audit_log_options: dict[str, object] = dataclasses.field(default_factory=dict)
+
+
+class ModeAuditLog(WatoMode[AuditLogRequestData]):
+    def _audit_options_id(self) -> str:
+        return "audit_options"
+
+    def _filename_selection_id(self) -> str:
+        return "selected_filename"
+
+    @override
+    def _parse_data_from_request(self, req: Request) -> Result[AuditLogRequestData, None]:
+        if not req.has_var(self._filename_selection_id()):
+            return Error(None)
+
+        try:
+            parsed_filename = parse_data_from_field_id(
+                self._fs_file_selection(), self._filename_selection_id()
+            )
+            audit_log_options = {}
+            if req.has_var(self._audit_options_id()):
+                options = parse_data_from_field_id(
+                    self._audit_log_options_fs(), self._audit_options_id()
+                )
+                audit_log_options = options if isinstance(options, dict) else {}
+
+            # Add special vars from table pagination
+            # This modifies the data from the AbsoluteDate ValueSpec...
+            if (
+                req.has_var("audit_options_start_1_day")
+                and req.var("audit_options_start_sel", "0") == "1"
+            ):
+                audit_log_options["start"] = (
+                    "time",
+                    AbsoluteDate().from_html_vars("audit_options_start_1"),
+                )
+
+            if req.has_var("audit_options_start_sel"):
+                audit_log_options["sel"] = int(
+                    req.get_str_input_mandatory("audit_options_start_sel")
+                )
+
+            assert isinstance(parsed_filename, str)
+            return OK(
+                AuditLogRequestData(
+                    selected_filename=parsed_filename,
+                    audit_log_options=audit_log_options,
+                )
+            )
+        except MKUserError:
+            return Error(None)
+
+    @classmethod
+    @override
+    def name(cls) -> str:
+        return "auditlog"
+
+    @staticmethod
+    @override
+    def static_permissions() -> Collection[PermissionName]:
+        return ["auditlog"]
+
+    def __init__(self, edition: Edition, ctx: PageContext) -> None:
+        super().__init__(edition, ctx)
+        options = get_visitor(
+            self._audit_log_options_fs(), VisitorOptions(migrate_values=False, mask_values=False)
+        ).to_disk(DEFAULT_VALUE)
+        if not isinstance(options, dict):
+            raise TypeError("Audit log options are not a dictionary")
+        self._options = options
+        if self._request_data.is_ok():
+            self._options.update(self._request_data.ok.audit_log_options)
+        self._current_audit_log = wato_var_dir() / "log" / "wato_audit.log"
+        self._show_details = request.get_integer_input_mandatory("show_details", 1) == 1
+        self._show_object_type = request.get_integer_input_mandatory("show_object_type", 1) == 1
+        self._show_object = request.get_integer_input_mandatory("show_object", 1) == 1
+
+    @override
+    def title(self) -> str:
+        return _("Audit log")
+
+    @override
+    def page_menu(self, config: Config, breadcrumb: Breadcrumb) -> PageMenu:
+        menu = PageMenu(
+            dropdowns=[
+                PageMenuDropdown(
+                    name="log",
+                    title=_("Audit log"),
+                    topics=[
+                        PageMenuTopic(
+                            title=_("Actions"),
+                            entries=list(self._page_menu_entries_actions()),
+                        ),
+                    ],
+                ),
+                PageMenuDropdown(
+                    name="related",
+                    title=_("Related"),
+                    topics=[
+                        PageMenuTopic(
+                            title=_("Setup"),
+                            entries=list(self._page_menu_entries_setup()),
+                        ),
+                    ],
+                ),
+                PageMenuDropdown(
+                    name="export",
+                    title=_("Export"),
+                    topics=[
+                        PageMenuTopic(
+                            title=_("Export"),
+                            entries=list(self._page_menu_entries_export()),
+                        ),
+                    ],
+                ),
+            ],
+            breadcrumb=breadcrumb,
+        )
+
+        if self._request_data.is_ok():
+            self._extend_display_dropdown(menu)
+        return menu
+
+    def _page_menu_entries_setup(self) -> Iterator[PageMenuEntry]:
+        if user.may("wato.sites"):
+            yield PageMenuEntry(
+                title=_("Activate pending changes"),
+                icon_name=StaticIcon(IconNames.activate),
+                item=make_simple_link(folder_preserving_link(request, [("mode", "changelog")])),
+            )
+
+    def _page_menu_entries_actions(self) -> Iterator[PageMenuEntry]:
+        if not user.may("wato.auditlog"):
+            return
+
+        if not user.may("wato.edit"):
+            return
+
+        if (
+            user.may("wato.clear_auditlog")
+            and self._request_data.is_ok()
+            and self._request_data.ok.selected_filename
+        ):
+            yield PageMenuEntry(
+                title=_("Archive log"),
+                icon_name=StaticIcon(IconNames.delete),
+                item=make_simple_link(
+                    make_confirm_delete_link(
+                        i18n=_,
+                        url=makeactionuri(
+                            request,
+                            transactions.get(),
+                            [
+                                ("_action", "clear"),
+                            ],
+                        ),
+                        title=_("Archive current audit log"),
+                        confirm_button=_("Archive"),
+                    )
+                ),
+                is_enabled=wato_var_dir() / "log" / self._request_data.ok.selected_filename
+                == self._current_audit_log,
+                disabled_tooltip=_("You can only archive the current audit log"),
+            )
+
+    def _page_menu_entries_export(self) -> Iterator[PageMenuEntry]:
+        if not user.may("wato.auditlog"):
+            return
+
+        if not user.may("wato.edit"):
+            return
+
+        if not user.may("general.csv_export"):
+            return
+
+        if self._request_data.is_ok() and self._request_data.ok.selected_filename:
+            yield PageMenuEntry(
+                title=_("Export CSV"),
+                icon_name=StaticIcon(IconNames.download_csv),
+                item=make_simple_link(
+                    makeactionuri(
+                        request,
+                        transactions.get(),
+                        [
+                            ("_action", "csv"),
+                            ("file_selection", self._request_data.ok.selected_filename),
+                        ],
+                    )
+                ),
+            )
+
+    def _extend_display_dropdown(self, menu: PageMenu) -> None:
+        display_dropdown = menu.get_dropdown_by_name("display", make_display_options_dropdown())
+
+        display_dropdown.topics.insert(
+            0,
+            PageMenuTopic(
+                title=_("Filter"),
+                entries=[
+                    PageMenuEntry(
+                        title=_("Filter view"),
+                        icon_name=StaticIcon(
+                            IconNames.filters_set
+                            if html.form_submitted("options")
+                            else IconNames.filter
+                        ),
+                        item=PageMenuSidePopup(self._render_filter_form()),
+                        name="filters",
+                        is_shortcut=True,
+                    ),
+                ],
+            ),
+        )
+
+        display_dropdown.topics.insert(
+            0,
+            PageMenuTopic(
+                title=_("Details"),
+                entries=[
+                    PageMenuEntry(
+                        title=_("Show details"),
+                        icon_name=StaticIcon(
+                            IconNames.toggle_on if self._show_details else IconNames.toggle_off
+                        ),
+                        item=make_simple_link(
+                            makeactionuri(
+                                request,
+                                transactions.get(),
+                                [
+                                    ("show_details", "0" if self._show_details else "1"),
+                                ],
+                            )
+                        ),
+                        name="show_details",
+                        css_classes=["toggle"],
+                    ),
+                    PageMenuEntry(
+                        title=_("Show object type"),
+                        icon_name=StaticIcon(
+                            IconNames.toggle_on if self._show_object_type else IconNames.toggle_off
+                        ),
+                        item=make_simple_link(
+                            makeactionuri(
+                                request,
+                                transactions.get(),
+                                [
+                                    ("show_object_type", "0" if self._show_object_type else "1"),
+                                ],
+                            )
+                        ),
+                        name="show_object_type",
+                        css_classes=["toggle"],
+                    ),
+                    PageMenuEntry(
+                        title=_("Show object"),
+                        icon_name=StaticIcon(
+                            IconNames.toggle_on if self._show_object else IconNames.toggle_off
+                        ),
+                        item=make_simple_link(
+                            makeactionuri(
+                                request,
+                                transactions.get(),
+                                [
+                                    ("show_object", "0" if self._show_object else "1"),
+                                ],
+                            )
+                        ),
+                        name="show_object",
+                        css_classes=["toggle"],
+                    ),
+                ],
+            ),
+        )
+
+    def _render_filter_form(self) -> HTML:
+        with output_funnel.plugged():
+            self._display_audit_log_options()
+            return HTML.without_escaping(output_funnel.drain())
+
+    @override
+    def action(self, config: Config) -> ActionResult:
+        check_csrf_token()
+        if not transactions.check_transaction(request):
+            return None
+
+        if request.var("_action") == "clear":
+            user.need_permission("wato.auditlog")
+            user.need_permission("wato.clear_auditlog")
+            user.need_permission("wato.edit")
+            return self._clear_audit_log_after_confirm()
+
+        if request.var("_action") == "csv":
+            user.need_permission("wato.auditlog")
+            return self._export_audit_log(self._parse_audit_log())
+
+        return redirect(makeuri(request, []))
+
+    @override
+    def page(self, config: Config) -> None:
+        with html.form_context("fileselection_form", method="POST"):
+            if self._request_data.is_error() or not self._request_data.ok.selected_filename:
+                html.write_text_permissive(_("Please choose an audit log to view:"))
+                html.br()
+                html.br()
+            value: IncomingData = DEFAULT_VALUE
+            if self._request_data.is_ok() and self._request_data.ok.selected_filename:
+                value = RawDiskData(self._request_data.ok.selected_filename)
+            render_form_spec(
+                form_spec=self._fs_file_selection(),
+                field_id=self._filename_selection_id(),
+                value=value,
+                do_validate=False,
+            )
+            html.br()
+            html.button(varname="_view_log", title=_("View"), cssclass="hot")
+            html.hidden_fields()
+
+        if self._request_data.is_ok() and self._request_data.ok.selected_filename:
+            self._show_audit_log()
+
+    def _fs_file_selection(self) -> SingleChoiceExtended[str]:
+        return SingleChoiceExtended(
+            title=Title("File selection"),
+            elements=self._get_audit_log_files(),
+            no_elements_text=Message(""),
+        )
+
+    def _get_audit_log_files(self) -> list[SingleChoiceElementExtended]:
+        """
+        Collect all audit log files in ~/var/checkmk/wato/log and sort like:
+
+        wato_audit.log (current)
+        wato_audit.log.2023-10-24-2
+        wato_audit.log.2023-10-24
+        wato_audit.log.2023-10-23-2
+        wato_audit.log.2023-10-23
+        wato_audit.log.2023-09-23
+        """
+        return sorted(
+            [
+                SingleChoiceElementExtended(
+                    name=f.name,
+                    title=Title(  # astrein: disable=localization-checker
+                        f.name
+                        if f.name != "wato_audit.log"
+                        else "wato_audit.log (%s)" % _("current"),
+                    ),
+                )
+                for f in (wato_var_dir() / "log").glob("wato_audit.*")
+            ],
+            key=lambda x: repr(x.title).split(".")[-1],
+            reverse=True,
+        )
+
+    def _show_audit_log(self) -> None:
+        audit = self._parse_audit_log()
+
+        if not audit:
+            html.show_message(_("Found no matching entry."))
+
+        elif self._options["display"] == "daily":
+            self._display_daily_audit_log(audit)
+
+        else:
+            self._display_multiple_days_audit_log(audit)
+
+    def _display_daily_audit_log(self, log: list[AuditLogStore.Entry]) -> None:
+        log, times = self._get_next_daily_paged_log(log)
+
+        self._display_page_controls(*times)
+
+        if display_options.enabled(display_options.T):
+            html.h3(_("Audit log for %(date)s") % {"date": render.date(times[0])})
+
+        self._display_log(log)
+
+        self._display_page_controls(*times)
+
+    def _display_multiple_days_audit_log(self, log: list[AuditLogStore.Entry]) -> None:
+        log = self._get_multiple_days_log_entries(log)
+
+        if display_options.enabled(display_options.T):
+            html.h3(
+                _("Audit log for %(date)s and %(days)d days ago")
+                % {"date": render.date(self._get_start_date()), "days": self._options["display"][1]}
+            )
+
+        self._display_log(log)
+
+    def _display_log(self, log: list[AuditLogStore.Entry]) -> None:
+        with table_element(
+            css="data wato auditlog audit",
+            limit=0,
+            sortable=False,
+            searchable=False,
+        ) as table:
+            for entry in log:
+                table.row()
+                table.cell(
+                    _("Time"),
+                    HTMLWriter.render_nobr(render.date_and_time(float(entry.time))),
+                    css=["narrow"],
+                )
+                user_txt = ("<i>%s</i>" % _("internal")) if entry.user_id == "-" else entry.user_id
+                table.cell(_("User"), user_txt, css=["nobreak narrow"])
+
+                if self._show_object_type:
+                    table.cell(
+                        _("Object type"),
+                        entry.object_ref.object_type.name if entry.object_ref else "",
+                        css=["narrow"],
+                    )
+                if self._show_object:
+                    table.cell(
+                        _("Object"), render_object_ref(entry.object_ref) or "", css=["narrow"]
+                    )
+
+                text = HTML.without_escaping(
+                    escaping.escape_text(entry.text).replace("\n", "<br>\n")
+                )
+                table.cell(_("Summary"), text)
+
+                if self._show_details:
+                    diff_text = HTML.without_escaping(
+                        escaping.escape_text(entry.diff_text).replace("\n", "<br>\n")
+                        if entry.diff_text
+                        else ""
+                    )
+                    table.cell(_("Details"), diff_text)
+
+    def _get_next_daily_paged_log(
+        self, log: list[AuditLogStore.Entry]
+    ) -> tuple[list[AuditLogStore.Entry], tuple[int, int, int | None, int | None]]:
+        start = self._get_start_date()
+
+        while True:
+            log_today, times = self._paged_log_from(log, start)
+            if len(log) == 0 or len(log_today) > 0:
+                return log_today, times
+            # No entries today, but log not empty -> go back in time
+            start -= 24 * 3600
+
+    def _get_start_date(self) -> int:
+        if self._options["start"] == "now":
+            st = time.localtime()
+            return int(
+                time.mktime(time.struct_time((st.tm_year, st.tm_mon, st.tm_mday, 0, 0, 0, 0, 0, 0)))
+            )
+        return int(self._options["start"][1])
+
+    def _get_multiple_days_log_entries(
+        self, log: list[AuditLogStore.Entry]
+    ) -> list[AuditLogStore.Entry]:
+        start_time = self._get_start_date() + 86399
+        end_time = start_time - ((self._options["display"][1] * 86400) + 86399)
+
+        logs = []
+
+        for entry in log:
+            if entry[0] <= start_time and entry[0] >= end_time:
+                logs.append(entry)
+
+        return logs
+
+    def _paged_log_from(
+        self, log: list[AuditLogStore.Entry], start: int
+    ) -> tuple[list[AuditLogStore.Entry], tuple[int, int, int | None, int | None]]:
+        start_time, end_time = self._get_timerange(start)
+        previous_log_time = None
+        next_log_time = None
+        first_log_index = None
+        last_log_index = None
+        for index, entry in enumerate(log):
+            if entry.time >= end_time:
+                # This log is too new
+                continue
+            if first_log_index is None and start_time <= entry.time < end_time:
+                # This is a log for this day. Save the first index
+                if first_log_index is None:
+                    first_log_index = index
+
+                    # When possible save the timestamp of the previous log
+                    if index > 0:
+                        next_log_time = int(log[index - 1][0])
+
+            elif entry.time < start_time and last_log_index is None:
+                last_log_index = index
+                # This is the next log after this day
+                previous_log_time = int(entry[0])
+                # Finished!
+                break
+
+        if last_log_index is None:
+            last_log_index = len(log)
+
+        return log[first_log_index:last_log_index], (
+            start_time,
+            end_time,
+            previous_log_time,
+            next_log_time,
+        )
+
+    def _display_page_controls(
+        self,
+        start_time: int,  # noqa: ARG002
+        end_time: int,  # noqa: ARG002
+        previous_log_time: int | None,
+        next_log_time: int | None,
+    ) -> None:
+        html.open_div(class_="paged_controls")
+
+        def time_url_args(t: int) -> list[tuple[str, int | str | None]]:
+            return [
+                ("audit_options_start_1_day", time.strftime("%d", time.localtime(t))),
+                ("audit_options_start_1_month", time.strftime("%m", time.localtime(t))),
+                ("audit_options_start_1_year", time.strftime("%Y", time.localtime(t))),
+                ("audit_options_start_sel", "1"),
+            ]
+
+        if next_log_time is not None:
+            html.icon_button(
+                makeactionuri(
+                    request,
+                    transactions.get(),
+                    [
+                        ("audit_options_start_sel", "0"),
+                    ],
+                ),
+                _("Most recent events"),
+                StaticIcon(IconNames.start),
+            )
+
+            html.icon_button(
+                makeactionuri(
+                    request,
+                    transactions.get(),
+                    time_url_args(next_log_time),
+                ),
+                "{}: {}".format(_("Newer events"), render.date(next_log_time)),
+                StaticIcon(IconNames.back),
+            )
+        else:
+            html.empty_icon_button()
+            html.empty_icon_button()
+
+        if previous_log_time is not None:
+            html.icon_button(
+                makeactionuri(
+                    request,
+                    transactions.get(),
+                    time_url_args(previous_log_time),
+                ),
+                "{}: {}".format(_("Older events"), render.date(previous_log_time)),
+                StaticIcon(IconNames.forth),
+            )
+        else:
+            html.empty_icon_button()
+
+        html.close_div()
+
+    def _get_timerange(self, t: int) -> tuple[int, int]:
+        st = time.localtime(int(t))
+        start = int(
+            time.mktime(time.struct_time((st[0], st[1], st[2], 0, 0, 0, st[6], st[7], st[8])))
+        )
+        end = start + 86399
+        return start, end
+
+    def _display_audit_log_options(self) -> None:
+        if display_options.disabled(display_options.C):
+            return
+
+        with html.form_context("options", method="POST"):
+            self._show_audit_log_options_controls()
+            html.open_div(class_="side_popup_content")
+            html.show_user_errors()
+            new_options = copy.deepcopy(self._options)  # to detect changes in the form
+            new_options.pop("sel", None)
+            render_form_spec(
+                self._audit_log_options_fs(),
+                self._audit_options_id(),
+                RawDiskData(new_options),
+                self._request_data.is_ok() and bool(self._request_data.ok.audit_log_options),
+            )
+            html.close_div()
+            html.hidden_fields()
+
+    def _show_audit_log_options_controls(self) -> None:
+        html.open_div(class_="side_popup_controls")
+
+        html.open_div(class_="update_buttons")
+        html.button("apply", _("Apply"), "submit")
+        html.buttonlink(
+            makeuri(
+                request,
+                [],
+                remove_prefix="audit_options",
+            ),
+            _("Reset"),
+        )
+        html.close_div()
+
+        html.close_div()
+
+    def _audit_log_options_fs(self) -> Dictionary:
+        object_types = [
+            SingleChoiceElementExtended[Any](name="", title=Title("All object types")),
+            SingleChoiceElementExtended[Any](name=None, title=Title("No object type")),
+        ] + [
+            SingleChoiceElementExtended[Any](
+                name=t.name,
+                title=Title(t.name),  # astrein: disable=localization-checker
+            )
+            for t in ObjectRefType
+        ]
+
+        users = load_users()
+        user_choices: list[SingleChoiceElementExtended] = [
+            SingleChoiceElementExtended(name=None, title=Title("All users"))
+        ] + sorted(
+            [SingleChoiceElementExtended(name="-", title=Title("internal"))]
+            + [
+                SingleChoiceElementExtended(
+                    name=name,
+                    title=Title(name),  # astrein: disable=localization-checker
+                )
+                for (name, us) in users.items()
+            ],
+            key=lambda x: str(x.title),
+        )
+
+        all_options = [
+            (
+                "object_type",
+                SingleChoiceExtended[Any](
+                    title=Title("Object type"), elements=object_types, prefill=DefaultValue("")
+                ),
+            ),
+            (
+                "object_ident",
+                String(title=Title("Object"), prefill=DefaultValue("")),
+            ),
+            (
+                "user_id",
+                SingleChoiceExtended(
+                    title=Title("User"), elements=user_choices, prefill=DefaultValue(None)
+                ),
+            ),
+            (
+                "filter_regex",
+                create_regex(
+                    title=Title("Filter pattern (RegExp)"),
+                    scope=MatchingScope.INFIX,
+                    prefill=DefaultValue(""),
+                ),
+            ),
+            (
+                "start",
+                enable_deprecated_cascading_elements(
+                    wrapped_form_spec=CascadingSingleChoiceExtended(
+                        title=Title("Start log from"),
+                        prefill=DefaultValue("now"),
+                        elements=[
+                            CascadingSingleChoiceElementExtended(
+                                name="now",
+                                title=Title("Current date"),
+                                parameter_form=FixedValue(value=True, label=Label("")),
+                            ),
+                            CascadingSingleChoiceElementExtended(
+                                name="time",
+                                title=Title("Specific date"),
+                                parameter_form=LegacyValueSpec.wrap(AbsoluteDate()),
+                            ),
+                        ],
+                    ),
+                    special_value_mapping=[
+                        CascadingDataConversion(
+                            name_in_form_spec="now", value_on_disk="now", has_form_spec=False
+                        )
+                    ],
+                ),
+            ),
+            (
+                "display",
+                enable_deprecated_cascading_elements(
+                    wrapped_form_spec=CascadingSingleChoiceExtended(
+                        title=Title("Display mode of entries"),
+                        prefill=DefaultValue("daily"),
+                        elements=[
+                            CascadingSingleChoiceElement(
+                                name="daily",
+                                title=Title("Daily paged display"),
+                                parameter_form=FixedValue(value=True, label=Label("")),
+                            ),
+                            CascadingSingleChoiceElement(
+                                name="number_of_days",
+                                title=Title("Number of days from now (single page)"),
+                                parameter_form=LegacyValueSpec.wrap(
+                                    IntegerVS(minvalue=1, unit=_("days"), default_value=1)
+                                ),
+                            ),
+                        ],
+                    ),
+                    special_value_mapping=[
+                        CascadingDataConversion(
+                            name_in_form_spec="daily", value_on_disk="daily", has_form_spec=False
+                        ),
+                    ],
+                ),
+            ),
+        ]
+
+        return Dictionary(
+            title=Title("Display options"),
+            elements={
+                name: DictElement(required=True, parameter_form=fs) for name, fs in all_options
+            },
+        )
+
+    def _clear_audit_log_after_confirm(self) -> ActionResult:
+        AuditLogStore().clear()
+        flash(_("Archived audit log"))
+        return redirect(self.mode_url())
+
+    def _export_audit_log(self, audit: list[AuditLogStore.Entry]) -> ActionResult:
+        response.set_content_type("text/csv")
+
+        if self._options["display"] == "daily":
+            filename = (
+                f"wato-auditlog-{render.date(time.time())}_{render.time_of_day(time.time())}.csv"
+            )
+        else:
+            filename = "wato-auditlog-{}_{}_days.csv".format(
+                render.date(time.time()),
+                self._options["display"][1],
+            )
+
+        response.set_content_disposition(ContentDispositionType.ATTACHMENT, filename)
+
+        titles = [
+            _("Date"),
+            _("Time"),
+            _("Object type"),
+            _("Object"),
+            _("User"),
+            _("Action"),
+            _("Summary"),
+        ]
+
+        if self._show_details:
+            titles.append(_("Details"))
+
+        resp = []
+
+        resp.append(",".join(titles) + "\n")
+        for entry in audit:
+            columns = [
+                render.date(int(entry.time)),
+                render.time_of_day(int(entry.time)),
+                entry.object_ref.object_type.name if entry.object_ref else "",
+                entry.object_ref.ident if entry.object_ref else "",
+                entry.user_id,
+                entry.action,
+                '"' + escaping.strip_tags(entry.text).replace('"', "'") + '"',
+            ]
+
+            if self._show_details:
+                columns.append('"' + escaping.strip_tags(entry.diff_text).replace('"', "'") + '"')
+
+            resp.append(",".join(columns) + "\n")
+
+        response.set_data("".join(resp))
+
+        return FinalizeRequest(code=200)
+
+    def _parse_audit_log(self) -> list[AuditLogStore.Entry]:
+        options: AuditLogFilterRaw = {
+            "object_type": self._options.get("object_type"),
+            "object_ident": self._options.get("object_ident"),
+            "user_id": self._options.get("user_id"),
+            "filter_regex": self._options.get("filter_regex"),
+        }
+
+        entries_filter = build_audit_log_filter(options)
+        if not self._request_data.is_ok() or not self._request_data.ok.selected_filename:
+            return []
+        return list(
+            reversed(
+                AuditLogStore(
+                    wato_var_dir() / "log" / self._request_data.ok.selected_filename
+                ).read(entries_filter)
+            )
+        )

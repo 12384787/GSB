@@ -1,0 +1,12 @@
+title: Microsoft Azure MySQL Database: CPU Utilization
+agents: azure_v2
+catalog: cloud/azure
+license: GPLv2
+distribution: check_mk
+description:
+ This check reports the cpu utilization in percent.
+ You can configure levels using the rule "CPU utilization (single value)".
+
+discovery:
+ One service is created for each database if the required metric
+ (average_cpu_percent) is given.

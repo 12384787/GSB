@@ -1,0 +1,17 @@
+title: AVM Fritz!Box: Network Link
+agents: fritzbox
+catalog: hw/network/avm
+license: GPLv2
+distribution: check_mk
+description:
+ This check monitors the the network link. It goes CRITICAL if the the link
+ or the physical link are not up.
+
+ The check uses data provided by the fritzbox special agent. You need to
+ configure this agent to be used for the Fritz!Box you like to monitor. The
+ special agent uses uPnP to get the needed information from the device.
+
+discovery:
+ One service is created for each system if the agent has a section
+ {<<<fritz>>>} and the keys {NewLinkStatus} and {NewPhysicalLinkStatus} are
+ provided in this section.

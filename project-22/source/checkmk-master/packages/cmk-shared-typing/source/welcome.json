@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2019-09/schema",
+  "type": "object",
+  "title": "Welcome page",
+  "properties": {
+    "cards": {
+      "type": "object",
+      "$ref": "#/$defs/welcome_cards"
+    },
+    "is_start_url": {
+      "type": "boolean"
+    },
+    "stage_information": {
+      "type": "object",
+      "$ref": "#/$defs/stage_information"
+    }
+  },
+  "required": ["urls", "is_start_url", "stage_information"],
+  "$defs": {
+    "welcome_cards": {
+      "type": "object",
+      "properties": {
+        "add_folder": { "type": "string" },
+        "checkmk_ai": { "type": "string" },
+        "checkmk_docs": { "type": "string" },
+        "checkmk_forum": { "type": "string" },
+        "checkmk_best_practices": { "type": "string" },
+        "checkmk_trainings": { "type": "string" },
+        "checkmk_webinars": { "type": "string" },
+        "create_contactgroups": { "type": "string" },
+        "users": { "type": "string" },
+        "assign_host_to_contactgroups": { "type": "string" },
+        "setup_backup": { "type": "string" },
+        "setup_folder_structure": { "type": "string" },
+        "start_page": { "type": "string" },
+        "scale_monitoring": { "type": "string" },
+        "fine_tune_monitoring": { "type": "string" },
+        "license_site": { "type": "string" },
+        "add_host": { "type": "string" },
+        "network_devices": { "type": "string" },
+        "relays": { "type": "string" },
+        "aws_quick_setup": { "type": "string" },
+        "azure_quick_setup": { "type": "string" },
+        "gcp_quick_setup": { "type": "string" },
+        "synthetic_monitoring": { "type": "string" },
+        "opentelemetry": { "type": "string" },
+        "activate_changes": { "type": "string" },
+        "setup_hosts": { "type": "string" },
+        "main_dashboard": { "type": "string" },
+        "problem_dashboard": { "type": "string" },
+        "unhandled_service_problems": { "type": "string" },
+        "time_periods": { "type": "string" },
+        "host_groups": { "type": "string" },
+        "add_notification_rule": { "type": "string" },
+        "test_notifications": { "type": "string" },
+        "add_custom_dashboard": { "type": "string" },
+        "all_dashboards": { "type": "string" },
+        "mark_step_completed": { "type": "string" },
+        "get_stage_information": { "type": "string" },
+        "intro_users": { "type": "string" },
+        "intro_notifications": { "type": "string" }
+      },
+      "required": [
+        "add_folder",
+        "checkmk_ai",
+        "checkmk_docs",
+        "checkmk_forum",
+        "checkmk_best_practices",
+        "checkmk_trainings",
+        "checkmk_webinars",
+        "create_contactgroups",
+        "users",
+        "assign_host_to_contactgroups",
+        "setup_backup",
+        "setup_folder_structure",
+        "start_page",
+        "scale_monitoring",
+        "fine_tune_monitoring",
+        "add_host",
+        "aws_quick_setup",
+        "azure_quick_setup",
+        "gcp_quick_setup",
+        "activate_changes",
+        "setup_hosts",
+        "main_dashboard",
+        "problem_dashboard",
+        "unhandled_service_problems",
+        "time_periods",
+        "host_groups",
+        "add_notification_rule",
+        "test_notifications",
+        "add_custom_dashboard",
+        "all_dashboards",
+        "mark_step_completed",
+        "get_stage_information",
+        "intro_users",
+        "intro_notifications"
+      ]
+    },
+    "stage_information": {
+      "type": "object",
+      "properties": {
+        "finished": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "add_host",
+              "activate_changes",
+              "adjust_services",
+              "assign_responsibilities",
+              "enable_notifications",
+              "create_dashboard"
+            ]
+          }
+        }
+      },
+      "required": ["finished"]
+    }
+  }
+}

@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<table role="presentation"
+       width="100%"
+       align="center"
+       style="margin:0 auto;
+              border-collapse:collapse;
+              mso-table-lspace:0pt;
+              mso-table-rspace:0pt;
+              max-width:600px;
+              font-size:14px">
+    <tr>
+        <td height="20" style="line-height:20px;font-size:0;">&nbsp;</td>
+    </tr>
+    <tr>
+        <td colspan="2"
+            style="font-size:18px;
+                   font-weight:600;
+                   text-align:left;
+                   padding-bottom:5px;
+                   line-height:1.4">
+            <img class="section-icon"
+                 src="cid:overview.png"
+                 alt="Event overview"
+                 width="18"
+                 height="19"
+                 style="display:inline-block;
+                        vertical-align:middle;
+                        border:0;
+                        margin-right:4px">
+            Event overview
+        </td>
+    </tr>
+    <tr>
+        <td width="120" style="padding:5px 0;font-weight:600;line-height:1.4;">Event date:</td>
+        <td style="padding:5px 0;line-height:1.4;">
+            {% if service_notification %}
+                {{ data.LASTSERVICESTATECHANGE_LOCAL if data.get("LASTSERVICESTATECHANGE_LOCAL") else (data.LASTSERVICESTATECHANGE | timestamp() if data.get('LASTSERVICESTATECHANGE') else 'N/A') }}
+            {% else %}
+                {{ data.LASTHOSTSTATECHANGE_LOCAL if data.get("LASTHOSTSTATECHANGE_LOCAL") else (data.LASTHOSTSTATECHANGE | timestamp() if data.get('LASTHOSTSTATECHANGE') else 'N/A') }}
+            {% endif %}
+        </td>
+    </tr>
+    {% if "address" in elements %}
+        <tr>
+            <td width="120" style="padding:5px 0;font-weight:600;line-height:1.4;">Address:</td>
+            <td style="padding:5px 0;line-height:1.4;">{{ data.get('HOSTADDRESS', 'N/A') }}</td>
+        </tr>
+    {% endif %}
+    {% if "omdsite" in elements %}
+        <tr>
+            <td width="120" style="padding:5px 0;font-weight:600;line-height:1.4;">Site:</td>
+            <td style="padding:5px 0;line-height:1.4;">{{ data.get('OMD_SITE', 'N/A') }}</td>
+        </tr>
+    {% endif %}
+    <tr>
+        <td width="120" style="padding:5px 0;font-weight:600;line-height:1.4;">Summary:</td>
+        <td style="padding:5px 0;line-height:1.4;">
+            {% if service_notification %}
+                {{ macros.replace_statemarker(data.get('SERVICEOUTPUT_HTML', '')) }}
+            {% else %}
+                {{ macros.replace_statemarker(data.get('HOSTOUTPUT_HTML', '')) }}
+            {% endif %}
+        </td>
+    </tr>
+    {% if data.get("NOTIFICATIONTYPE", "").startswith("ALERTHANDLER") %}
+        <tr>
+            <td width="120" style="padding:5px 0;font-weight:600;line-height:1.4;">Name of alert handler:</td>
+            <td style="padding:5px 0;line-height:1.4;">{{ data.get('ALERTHANDLERNAME', '') }}</td>
+        </tr>
+        <tr>
+            <td width="120" style="padding:5px 0;font-weight:600;line-height:1.4;">Output of alert handler:</td>
+            <td style="padding:5px 0;line-height:1.4;">{{ data.get('ALERTHANDLEROUTPUT', '') }}</td>
+        </tr>
+    {% endif %}
+    {% if service_notification %}
+        <tr>
+            <td width="120" style="padding:5px 0;font-weight:600;line-height:1.4;">Service details:</td>
+            <td>&nbsp;</td>
+        </tr>
+        </table>
+        <table role="presentation"
+               width="100%"
+               align="center"
+               style="max-width:600px;
+                      border-collapse:collapse;
+                      font-size:14px;
+                      margin:0 auto">
+            <tr>
+                <td style="background-color:#f6f6f6;
+                           padding:10px;
+                           word-wrap:break-word;
+                           overflow-wrap:break-word;
+                           word-break:break-word;
+                           line-height:1.4">
+                    {% if data.get("LONGSERVICEOUTPUT_HTML") %}
+                        {{ macros.replace_statemarker(data.get('LONGSERVICEOUTPUT_HTML')) }}
+                    {% else %}
+                        No details available
+                    {% endif %}
+                </td>
+            </tr>
+        </table>
+    {% else %}
+        </table>
+    {% endif %}

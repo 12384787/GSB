@@ -1,0 +1,5 @@
+*.cfg
+*.yml
+*.log
+!perf/docker-compose.yml
+!files/migration_corpus/**/*.cfg

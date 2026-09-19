@@ -1,0 +1,164 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+
+<script setup lang="ts">
+import CmkAlertBox from 'cmk-ui-library/components/CmkAlertBox.vue'
+import CmkCollapsible from 'cmk-ui-library/components/CmkCollapsible/CmkCollapsible.vue'
+import CmkCollapsibleTitle from 'cmk-ui-library/components/CmkCollapsible/CmkCollapsibleTitle.vue'
+import CmkMultitoneIcon from 'cmk-ui-library/components/CmkIcon/CmkMultitoneIcon.vue'
+import type { CmkMultitoneIconColor, OneColorIcons } from 'cmk-ui-library/components/CmkIcon/types'
+import CmkIconButton from 'cmk-ui-library/components/CmkIconButton.vue'
+import CmkSkeleton from 'cmk-ui-library/components/CmkSkeleton.vue'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import type { TranslatedString } from 'cmk-ui-library/lib/i18nString'
+import { computed, nextTick, ref, useTemplateRef } from 'vue'
+
+import type { TSidebarSnapin } from '@/sidebar/lib/type-defs'
+import { getInjectedSidebar } from '@/sidebar/provider/sidebar'
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+declare const cmk: any
+
+const { _t } = usei18n()
+
+interface SidebarSnapinProps extends TSidebarSnapin {
+  isDragged?: boolean | undefined
+}
+
+const props = defineProps<SidebarSnapinProps>()
+const sidebar = getInjectedSidebar()
+const snapinOpen = ref(props.open || false)
+const snapinContent = ref<string | null>(null)
+const snapinContentElement = useTemplateRef('snapin-content')
+
+sidebar.onUpdateSnapinContent((contents) => {
+  if (typeof contents[props.name] === 'string') {
+    snapinContent.value = contents[props.name] as string
+
+    void nextTick(() => {
+      if (snapinContentElement.value) {
+        cmk.utils.execute_javascript_by_object(snapinContentElement.value)
+      }
+    })
+  }
+})
+
+const showMoreHover = ref<boolean>(false)
+
+const showMoreColor = computed(() => {
+  return (showMoreHover.value ? 'success' : 'font') as CmkMultitoneIconColor
+})
+const showMoreIcon = computed(() => {
+  return (sidebar.showMoreIsActive(props.name) ? 'show-less' : 'show-more') as OneColorIcons
+})
+
+async function onToggle() {
+  snapinOpen.value = !snapinOpen.value
+  await sidebar.persistSnapinToggleState(props.name, snapinOpen.value ? 'open' : 'closed')
+}
+</script>
+
+<template>
+  <div
+    :id="`snapin_${props.name}`"
+    class="sidebar-snapin__container"
+    :class="{ 'sidebar-snapin--drag-active': props.isDragged ?? false }"
+  >
+    <CmkCollapsibleTitle
+      :open="snapinOpen"
+      :title="props.title as TranslatedString"
+      @toggle-open="onToggle"
+    />
+    <button
+      v-if="props.has_show_more_items && snapinOpen"
+      class="sidebar-snapin__show-more"
+      @click="sidebar.toggleShowMoreLess(props.name)"
+      @mouseenter="showMoreHover = true"
+      @mouseleave="showMoreHover = false"
+    >
+      <CmkMultitoneIcon :name="showMoreIcon" :primary-color="showMoreColor" />
+    </button>
+    <CmkCollapsible :open="snapinOpen">
+      <div class="sidebar-snapin__content-wrapper">
+        <CmkSkeleton v-if="!snapinContent && snapinContent !== ''" class="sidebar-snapin__skel" />
+        <!-- eslint-disable vue/no-v-html-->
+        <template v-else>
+          <CmkAlertBox v-if="snapinContent === ''" variant="info">
+            {{ _t('No data recieved') }}
+          </CmkAlertBox>
+          <div
+            v-else
+            ref="snapin-content"
+            :class="{ more: sidebar.showMoreIsActive(props.name) }"
+            v-html="snapinContent"
+          ></div>
+        </template>
+        <CmkIconButton
+          class="sidebar-snapin__delete"
+          name="delete"
+          @click="sidebar.removeSnapin(props.name)"
+        />
+      </div>
+    </CmkCollapsible>
+  </div>
+</template>
+
+<style scoped>
+.sidebar-snapin__container {
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--dimension-4) var(--dimension-7) 0 var(--dimension-7);
+  position: relative;
+  cursor: grab;
+
+  &.sidebar-snapin--drag-active {
+    opacity: 0.2;
+  }
+
+  .sidebar-snapin__show-more {
+    border: 0;
+    background: none;
+    padding: 0;
+    margin: 0;
+    position: absolute;
+    top: var(--dimension-6);
+    right: var(--dimension-7);
+  }
+
+  .sidebar-snapin__content-wrapper {
+    border-bottom: 1px solid var(--default-border-color);
+    padding: 0 0 var(--dimension-2) 0;
+    margin-bottom: var(--dimension-3);
+    display: flex;
+    flex-direction: column;
+
+    /* stylelint-disable selector-pseudo-class-no-unknown */
+    :deep(input),
+    :deep(textarea),
+    :deep(select) {
+      cursor: auto;
+    }
+    /* stylelint-enable selector-pseudo-class-no-unknown */
+
+    .sidebar-snapin__delete {
+      opacity: 0;
+      margin-top: var(--dimension-3);
+      align-self: flex-end;
+    }
+
+    .sidebar-snapin__skel {
+      height: 25px !important;
+      border-radius: var(--border-radius);
+    }
+  }
+
+  &:hover {
+    .sidebar-snapin__delete {
+      opacity: 1;
+    }
+  }
+}
+</style>

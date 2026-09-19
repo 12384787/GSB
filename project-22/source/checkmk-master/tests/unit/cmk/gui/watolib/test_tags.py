@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+from collections.abc import Iterator, Mapping
+
+import pytest
+from pytest_mock import MockerFixture
+
+import cmk.gui.nagvis._hosttags
+from cmk.ccc.site import SiteId
+from cmk.gui.logged_in import user
+from cmk.gui.watolib.hosts_and_folders import folder_tree
+from cmk.gui.watolib.pending_changes import NoopPendingChangesStore, PendingChanges
+from cmk.gui.watolib.tags import (
+    change_host_tags,
+    OperationRemoveTagGroup,
+    TagCleanupMode,
+    TagConfigFile,
+)
+from cmk.gui.watolib.utils import multisite_dir
+from cmk.livestatus_client import SiteConfigurations
+from cmk.ruleset_matcher import tags
+from cmk.ruleset_matcher.tags import TagGroupID, TagID
+
+
+def _noop_pending_changes() -> PendingChanges:
+    return PendingChanges(
+        activation_sites=SiteConfigurations({}),
+        local_site=SiteId("NO_SITE"),
+        acting_user=None,
+        store=NoopPendingChangesStore(),
+        hooks=(),
+    )
+
+
+def _tag_test_cfg() -> Mapping[str, object]:
+    return {
+        "tag_groups": [
+            {
+                "id": "criticality",
+                "title": "Criticality",
+                "tags": [
+                    {"id": "prod", "title": "Productive system", "aux_tags": ["bla"]},
+                    {"id": "critical", "title": "Business critical", "aux_tags": []},
+                    {"id": "test", "title": "Test system", "aux_tags": []},
+                    {
+                        "id": "offline",
+                        "title": "Do not monitor this host",
+                        "aux_tags": [],
+                    },
+                ],
+            },
+            {
+                "id": "networking",
+                "title": "Networking Segment",
+                "tags": [
+                    {
+                        "id": "lan",
+                        "title": "Local network (low latency)",
+                        "aux_tags": [],
+                    },
+                    {"id": "wan", "title": "WAN (high latency)", "aux_tags": []},
+                    {
+                        "id": "dmz",
+                        "title": "DMZ (low latency, secure access)",
+                        "aux_tags": [],
+                    },
+                ],
+            },
+        ],
+        "aux_tags": [{"id": "bla", "title": "bläää"}],
+    }
+
+
+@pytest.fixture()
+def test_cfg() -> Iterator[tags.TagConfig]:
+    multisite_dir().mkdir(parents=True, exist_ok=True)
+    tags_mk = multisite_dir() / "tags.mk"
+    hosttags_mk = multisite_dir() / "hosttags.mk"
+
+    with tags_mk.open("w", encoding="utf-8") as f:
+        f.write(
+            """# Created by WATO
+# encoding: utf-8
+
+wato_tags = %s
+"""
+            % repr(_tag_test_cfg())
+        )
+
+    with hosttags_mk.open("w", encoding="utf-8") as f:
+        f.write("")
+
+    cfg = tags.TagConfig.from_config(TagConfigFile().load_for_reading())
+
+    yield cfg
+
+    if tags_mk.exists():
+        tags_mk.unlink()
+
+
+def test_tag_config_load(test_cfg: tags.TagConfig) -> None:
+    assert len(test_cfg.tag_groups) == 2
+    assert len(test_cfg.aux_tag_list.get_tags()) == 1
+
+
+@pytest.mark.usefixtures("test_cfg")
+def test_tag_config_save(mocker: MockerFixture) -> None:
+    export_mock = mocker.patch.object(cmk.gui.nagvis._hosttags, "_export_hosttags_to_php")  # noqa: SLF001
+
+    config_file = TagConfigFile()
+    base_config_mock = mocker.patch.object(config_file, "_save_base_config")
+
+    cfg = tags.TagConfig()
+    cfg.insert_tag_group(
+        tags.TagGroup.from_config(
+            {
+                "id": TagGroupID("tgid2"),
+                "topic": "Topics",
+                "title": "titlor",
+                "tags": [{"id": TagID("tgid2"), "title": "tagid2", "aux_tags": []}],
+            }
+        )
+    )
+    config_file.save(cfg.get_dict_format(), pprint_value=False)
+
+    export_mock.assert_called_once()
+    base_config_mock.assert_called_once()
+
+    cfg = tags.TagConfig.from_config(config_file.load_for_reading())
+    assert len(cfg.tag_groups) == 1
+    assert cfg.tag_groups[0].id == "tgid2"
+
+
+@pytest.mark.usefixtures("test_cfg", "with_admin_login")
+def test_change_host_tags_removes_tag_group_from_folder() -> None:
+    """A tag group explicitly set on a folder must be removable
+
+    The removal has to be persisted, so the folder is re-read from disk here.
+    """
+    tree = folder_tree()
+    tree.root_folder().create_subfolder(
+        "test_tag_group_removal",
+        title="Test tag group removal",
+        attributes={"tag_criticality": TagID("test")},
+        pprint_value=False,
+        pending_changes=_noop_pending_changes(),
+        acting_user=user,
+    )
+
+    affected_folders, affected_hosts, _affected_rulesets = change_host_tags(
+        tree,
+        OperationRemoveTagGroup(TagGroupID("criticality")),
+        TagCleanupMode.REMOVE,
+        pprint_value=False,
+        debug=False,
+        pending_changes=_noop_pending_changes(),
+    )
+
+    assert [folder.name() for folder in affected_folders] == ["test_tag_group_removal"]
+    assert not affected_hosts
+
+    tree.invalidate_caches()
+    assert "tag_criticality" not in tree.folder("test_tag_group_removal").attributes

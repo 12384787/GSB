@@ -1,0 +1,38 @@
+load("@aspect_rules_py//py:defs.bzl", "py_library")
+load("//bazel/rules:doctest.bzl", "py_doc_test")
+
+py_library(
+    name = "configlib",
+    srcs = glob(["**/*.py"]),
+    imports = ["../../.."],
+    visibility = [
+        "//cmk:__pkg__",
+        "//cmk/base:__subpackages__",
+        "//cmk/config_anonymizer:__pkg__",
+        "//non-free/packages/cmk-bakery:__pkg__",
+        "//tests:__subpackages__",
+    ],
+    deps = [
+        "//cmk/base/default_config:default-config",
+        "//cmk/piggyback:backend",
+        "//cmk/rrd",
+        "//cmk/utils",
+        "//packages/cmk-ccc:exceptions",
+        "//packages/cmk-ccc:hostaddress",
+        "//packages/cmk-ccc:translations",
+        "//packages/cmk-check-engine:fetchers",
+        "//packages/cmk-check-engine:snmplib",
+        "//packages/cmk-check-engine/cmk/checkengine/checking",
+        "//packages/cmk-check-engine/cmk/checkengine/discovery",
+        "//packages/cmk-check-engine/cmk/checkengine/plugins",
+        "//packages/cmk-events",
+        "//packages/cmk-logwatch:config",
+        "//packages/cmk-plugin-apis:agent_based",
+    ],
+)
+
+py_doc_test(
+    name = "doctest",
+    size = "small",
+    srcs = [":configlib"],
+)

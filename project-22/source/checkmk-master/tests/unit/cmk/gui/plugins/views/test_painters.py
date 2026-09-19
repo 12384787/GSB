@@ -1,0 +1,1658 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="no-untyped-call"
+# mypy: disable-error-code="no-untyped-def"
+
+import datetime
+from collections.abc import Sequence
+from functools import partial
+from pathlib import Path
+from typing import Literal
+from zoneinfo import ZoneInfo
+
+import pytest
+import time_machine
+
+from cmk.ccc.user import UserId
+from cmk.gui import sites
+from cmk.gui.config import active_config
+from cmk.gui.http import request
+from cmk.gui.logged_in import user
+from cmk.gui.painter.v0 import all_painters
+from cmk.gui.painter.v0.painters import _paint_custom_notes
+from cmk.gui.type_defs import ColumnSpec, Row
+from cmk.gui.utils.roles import UserPermissions
+from cmk.gui.view import View
+from cmk.gui.views.page_edit_view import painters_of_datasource
+from cmk.gui.visual_link import render_link_to_view
+from cmk.inventory.structured_data import deserialize_tree
+from cmk.livestatus_client.testing import MockLiveStatusConnection
+from cmk.utils.paths import default_config_dir
+from cmk.web.utils.html import HTML
+from cmk.web.utils.icons import DynamicIconName
+
+
+@pytest.fixture(name="live")
+def fixture_livestatus_test_config(
+    mock_livestatus: MockLiveStatusConnection,
+) -> MockLiveStatusConnection:
+    live = mock_livestatus
+    live.set_sites(["NO_SITE"])
+    live.add_table(
+        "hosts",
+        [
+            {
+                "host_name": "abc",
+                "name": "abc",
+                "alias": "abc",
+                "address": "server.example.com",
+                "custom_variables": {
+                    "FILENAME": "/wato/hosts.mk",
+                    "ADDRESS_FAMILY": "4",
+                    "ADDRESS_4": "127.0.0.1",
+                    "ADDRESS_6": "",
+                    "TAGS": "/wato/ auto-piggyback cmk-agent ip-v4 ip-v4-only lan no-snmp prod site:abc tcp",
+                },
+                "contacts": [],
+                "contact_groups": ["all"],
+                "filename": "/wato/hosts.mk",
+            }
+        ],
+    )
+
+    # Initiate status query here to make it not trigger in the tests
+    with live(expect_status_query=True):
+        sites.live()
+
+    return live
+
+
+@pytest.mark.usefixtures("load_config")
+def test_registered_painters() -> None:
+    painters = all_painters(active_config.tags.tag_groups).keys()
+    expected_painters = {
+        "aggr_acknowledged",
+        "aggr_assumed_state",
+        "aggr_group",
+        "aggr_hosts",
+        "aggr_hosts_services",
+        "aggr_icons",
+        "aggr_in_downtime",
+        "aggr_name",
+        "aggr_output",
+        "aggr_real_state",
+        "aggr_state",
+        "aggr_state_num",
+        "aggr_treestate",
+        "aggr_treestate_boxed",
+        "aggr_treestate_frozen_diff",
+        "alert_stats_crit",
+        "alert_stats_ok",
+        "alert_stats_problem",
+        "alert_stats_unknown",
+        "alert_stats_warn",
+        "alias",
+        "check_manpage",
+        "comment_author",
+        "comment_comment",
+        "comment_entry_type",
+        "comment_expires",
+        "comment_id",
+        "comment_time",
+        "comment_what",
+        "crash_host",
+        "crash_item",
+        "crash_service_name",
+        "crash_check_type",
+        "crash_exception",
+        "crash_ident",
+        "crash_time",
+        "crash_type",
+        "crash_source",
+        "crash_version",
+        "downtime_author",
+        "downtime_comment",
+        "downtime_duration",
+        "downtime_end_time",
+        "downtime_entry_time",
+        "downtime_fixed",
+        "downtime_id",
+        "downtime_origin",
+        "downtime_start_time",
+        "downtime_type",
+        "downtime_what",
+        "event_application",
+        "event_comment",
+        "event_contact",
+        "event_contact_groups",
+        "event_count",
+        "event_effective_contact_groups",
+        "event_facility",
+        "event_first",
+        "event_history_icons",
+        "event_host",
+        "event_host_in_downtime",
+        "event_icons",
+        "event_id",
+        "event_ipaddress",
+        "event_last",
+        "event_match_groups",
+        "event_owner",
+        "event_phase",
+        "event_pid",
+        "event_priority",
+        "event_rule_id",
+        "event_sl",
+        "event_state",
+        "event_text",
+        "hg_alias",
+        "hg_name",
+        "hg_num_hosts_down",
+        "hg_num_hosts_pending",
+        "hg_num_hosts_unreach",
+        "hg_num_hosts_up",
+        "hg_num_services",
+        "hg_num_services_crit",
+        "hg_num_services_ok",
+        "hg_num_services_pending",
+        "hg_num_services_unknown",
+        "hg_num_services_warn",
+        "history_addinfo",
+        "history_line",
+        "history_time",
+        "history_what",
+        "history_what_explained",
+        "history_who",
+        "host",
+        "host_acknowledged",
+        "host_address",
+        "host_address_families",
+        "host_address_family",
+        "host_addresses",
+        "host_addresses_additional",
+        "host_attempt",
+        "host_black",
+        "host_check_age",
+        "host_check_command",
+        "host_check_command_expanded",
+        "host_check_duration",
+        "host_check_interval",
+        "host_check_latency",
+        "host_check_type",
+        "host_childs",
+        "host_comments",
+        "host_contact_groups",
+        "host_contacts",
+        "host_custom_notes",
+        "host_custom_variable",
+        "host_custom_vars",
+        "host_docker_node",
+        "host_filename",
+        "host_flapping",
+        "host_graphs",
+        "host_group_memberlist",
+        "host_icons",
+        "host_in_downtime",
+        "host_in_notifper",
+        "host_ipv4_address",
+        "host_ipv6_address",
+        "host_is_active",
+        "host_is_stale",
+        "host_kubernetes_cluster",
+        "host_kubernetes_daemonset",
+        "host_kubernetes_deployment",
+        "host_kubernetes_namespace",
+        "host_kubernetes_node",
+        "host_kubernetes_statefulset",
+        "host_labels",
+        "host_last_notification",
+        "host_next_check",
+        "host_next_notification",
+        "host_normal_interval",
+        "host_notes_url",
+        "host_notification_number",
+        "host_notification_postponement_reason",
+        "host_notifications_enabled",
+        "host_notifper",
+        "host_parents",
+        "host_perf_data",
+        "host_plugin_output",
+        "host_pnpgraph",
+        "host_retry_interval",
+        "host_servicelevel",
+        "host_services",
+        "host_specific_metric",
+        "host_staleness",
+        "host_state",
+        "host_state_age",
+        "host_state_onechar",
+        "host_tag_address_family",
+        "host_tag_agent",
+        "host_tag_piggyback",
+        "host_tag_snmp_ds",
+        "host_tags",
+        "host_tags_with_titles",
+        "host_with_state",
+        "hostgroup_hosts",
+        "log_attempt",
+        "log_command",
+        "log_comment",
+        "log_contact_name",
+        "log_date",
+        "log_details_history",
+        "log_icon",
+        "log_lineno",
+        "log_message",
+        "log_options",
+        "log_plugin_output",
+        "log_state",
+        "log_state_info",
+        "log_state_type",
+        "log_time",
+        "log_type",
+        "log_what",
+        "num_problems",
+        "num_services",
+        "num_services_crit",
+        "num_services_ok",
+        "num_services_pending",
+        "num_services_unknown",
+        "num_services_warn",
+        "perfometer",
+        "service_custom_variable",
+        "service_description",
+        "service_discovery_check",
+        "service_discovery_service",
+        "service_discovery_state",
+        "service_display_name",
+        "service_graphs",
+        "service_icons",
+        "service_labels",
+        "service_specific_metric",
+        "service_state",
+        "service_tags",
+        "service_tags_with_titles",
+        "sg_alias",
+        "sg_name",
+        "sg_num_services",
+        "sg_num_services_crit",
+        "sg_num_services_ok",
+        "sg_num_services_pending",
+        "sg_num_services_unknown",
+        "sg_num_services_warn",
+        "sg_services",
+        "site_icon",
+        "sitealias",
+        "sitename_plain",
+        "svc_acknowledged",
+        "svc_attempt",
+        "svc_check_age",
+        "svc_check_cache_info",
+        "svc_check_command",
+        "svc_check_command_expanded",
+        "svc_check_duration",
+        "svc_check_interval",
+        "svc_check_latency",
+        "svc_check_period",
+        "svc_check_type",
+        "svc_comments",
+        "svc_contact_groups",
+        "svc_contacts",
+        "svc_custom_notes",
+        "svc_custom_vars",
+        "svc_flapping",
+        "svc_group_memberlist",
+        "svc_in_downtime",
+        "svc_in_notifper",
+        "svc_is_active",
+        "svc_is_stale",
+        "svc_last_notification",
+        "svc_last_time_ok",
+        "svc_long_plugin_output",
+        "svc_metrics",
+        "svc_next_check",
+        "svc_next_notification",
+        "svc_normal_interval",
+        "svc_notes_url",
+        "svc_notification_number",
+        "svc_notification_postponement_reason",
+        "svc_notifications_enabled",
+        "svc_notifper",
+        "svc_perf_data",
+        "svc_perf_val01",
+        "svc_perf_val02",
+        "svc_perf_val03",
+        "svc_perf_val04",
+        "svc_perf_val05",
+        "svc_perf_val06",
+        "svc_perf_val07",
+        "svc_perf_val08",
+        "svc_perf_val09",
+        "svc_perf_val10",
+        "svc_plugin_output",
+        "svc_pnpgraph",
+        "svc_retry_interval",
+        "svc_servicelevel",
+        "svc_staleness",
+        "svc_state_age",
+        "wato_folder_abs",
+        "wato_folder_plain",
+        "wato_folder_rel",
+    }
+
+    # Depending on the sandbox of this test there might be
+    # more painters created by invenory_ui plug-ins.
+    assert {p for p in painters if not p.startswith("inv")} == expected_painters
+
+
+@pytest.fixture(name="service_painter_idents")
+def fixture_service_painter_names() -> list[str]:
+    return sorted(painters_of_datasource("services", UserPermissions({}, {}, {}, [])).keys())
+
+
+@pytest.mark.usefixtures("request_context", "patch_theme")
+def test_service_painters(
+    service_painter_idents: Sequence[str], live: MockLiveStatusConnection
+) -> None:
+    with (
+        live(expect_status_query=False),
+        request.stashed_vars(),
+        time_machine.travel(datetime.datetime(2018, 4, 15, 16, 50, tzinfo=ZoneInfo("CET"))),
+    ):
+        request.del_vars()
+
+        for painter_ident in service_painter_idents:
+            _test_painter(painter_ident, live)
+
+
+def _test_painter(painter_ident: str, live: MockLiveStatusConnection) -> None:
+    _set_expected_queries(painter_ident, live)
+
+    name, params = _painter_name_spec(painter_ident)
+
+    view = View(
+        view_name="",
+        view_spec={
+            "group_painters": [],
+            "painters": [ColumnSpec(name=name, parameters=params)],
+            "sorters": [],
+            "datasource": "services",
+            "browser_reload": 30,
+            "column_headers": "pergroup",
+            "description": "",
+            "hidden": False,
+            "hidebutton": False,
+            "layout": "table",
+            "mustsearch": False,
+            "name": "allhosts",
+            "num_columns": 3,
+            "owner": UserId.builtin(),
+            "play_sounds": False,
+            "public": True,
+            "title": "Test view",
+            "topic": "overview",
+            "sort_index": 20,
+            "icon": DynamicIconName("folder"),
+            "user_sortable": True,
+            "single_infos": [],
+            "context": {},
+            "link_from": {},
+            "add_context_to_title": True,
+            "is_show_more": False,
+            "packaged": False,
+            "main_menu_search_terms": [],
+        },
+        context={},
+        user_permissions=(user_permissions := UserPermissions({}, {}, {}, [])),
+    )
+
+    row = _service_row()
+    for cell in view.row_cells:
+        _tdclass, content = cell.render(
+            row,
+            partial(render_link_to_view, request=request, user_permissions=user_permissions),
+            user,
+        )
+        assert isinstance(content, str | HTML)
+
+        if isinstance(content, str) and "<" in content:
+            raise ValueError(
+                f"Painter: {painter_ident} Found HTML tag in "
+                f"str content (will be escaped!): {content}"
+            )
+
+
+# TODO: Better move to livestatus mock?
+def _service_row():
+    return {
+        "host_accept_passive_checks": 0,
+        "host_acknowledged": 0,
+        "host_action_url_expanded": "",
+        "host_active_checks_enabled": 1,
+        "host_address": "127.0.0.1",
+        "host_alias": "abc",
+        "host_check_command": "check-mk-host-smart",
+        "host_check_command_expanded": "check-mk-host-smart!",
+        "host_check_interval": 0.1,
+        "host_check_type": 0,
+        "host_childs": [],
+        "host_comments_with_extra_info": [],
+        "host_comments_with_info": [],
+        "host_contact_groups": ["all"],
+        "host_contacts": [],
+        "host_current_attempt": 1,
+        "host_current_notification_number": 0,
+        "host_custom_variable_names": [
+            "FILENAME",
+            "ADDRESS_FAMILY",
+            "ADDRESS_4",
+            "ADDRESS_6",
+            "TAGS",
+        ],
+        "host_custom_variable_values": [
+            "/wato/hosts.mk",
+            "4",
+            "127.0.0.1",
+            "",
+            "/wato/ auto-piggyback cmk-agent ip-v4 ip-v4-only lan no-snmp prod site:stable tcp",
+        ],
+        "host_custom_variables": {
+            "ADDRESS_4": "127.0.0.1",
+            "ADDRESS_6": "",
+            "ADDRESS_FAMILY": "4",
+            "FILENAME": "/wato/hosts.mk",
+            "TAGS": "/wato/ auto-piggyback cmk-agent ip-v4 "
+            "ip-v4-only lan no-snmp prod site:stable "
+            "tcp",
+        },
+        "host_downtimes_with_extra_info": [],
+        "host_execution_time": 1.8e-07,
+        "host_filename": "/wato/hosts.mk",
+        "host_groups": ["check_mk"],
+        "host_has_been_checked": 1,
+        "host_icon_image": "",
+        "host_in_check_period": 1,
+        "host_in_notification_period": 1,
+        "host_in_service_period": 1,
+        "host_inventory": deserialize_tree(
+            {
+                "hardware": {
+                    "memory": {
+                        "total_ram_usable": 33283784704,
+                        "total_swap": 1023406080,
+                        "total_vmalloc": 35184372087808,
+                    }
+                },
+                "networking": {
+                    "addresses": [
+                        {"address": "127.0.0.1", "device": "lo", "type": "ipv4"},
+                        {"address": "::1", "device": "lo", "type": "ipv6"},
+                        {"address": "10.1.1.100", "device": "wlp59s0", "type": "ipv4"},
+                        {
+                            "address": "fe80::522e:4d07:26aa:5ac5",
+                            "device": "wlp59s0",
+                            "type": "ipv6",
+                        },
+                        {"address": "172.17.0.1", "device": "docker0", "type": "ipv4"},
+                        {"address": "fe80::42:9aff:fef7:8238", "device": "docker0", "type": "ipv6"},
+                        {
+                            "address": "fe80::d465:a5ff:fe86:4139",
+                            "device": "vethb457925",
+                            "type": "ipv6",
+                        },
+                        {
+                            "address": "fe80::60c9:43ff:fe93:4be",
+                            "device": "veth0be86fc",
+                            "type": "ipv6",
+                        },
+                    ],
+                    "available_ethernet_ports": 1,
+                    "hostname": "klappspaten",
+                    "interfaces": [
+                        {
+                            "alias": "lo",
+                            "available": None,
+                            "description": "lo",
+                            "index": 1,
+                            "oper_status": 1,
+                            "phys_address": "00:00:00:00:00:00",
+                            "port_type": 24,
+                            "speed": 0,
+                        },
+                        {
+                            "alias": "docker0",
+                            "available": False,
+                            "description": "docker0",
+                            "index": 2,
+                            "oper_status": 1,
+                            "phys_address": "02:42:9A:F7:82:38",
+                            "port_type": 6,
+                            "speed": 0,
+                        },
+                        {
+                            "alias": "vboxnet0",
+                            "available": True,
+                            "description": "vboxnet0",
+                            "index": 3,
+                            "oper_status": 2,
+                            "phys_address": "0A:00:27:00:00:00",
+                            "port_type": 6,
+                            "speed": 10000000,
+                        },
+                        {
+                            "alias": "wlp59s0",
+                            "available": False,
+                            "description": "wlp59s0",
+                            "index": 6,
+                            "oper_status": 1,
+                            "phys_address": "3C:58:C2:FF:34:8F",
+                            "port_type": 6,
+                            "speed": 0,
+                        },
+                    ],
+                    "total_ethernet_ports": 3,
+                    "total_interfaces": 6,
+                },
+                "software": {
+                    "applications": {
+                        "check_mk": {
+                            "agent_version": "2.0.0b5",
+                            "cluster": {"is_cluster": False},
+                            "num_sites": 11,
+                            "num_versions": 22,
+                            "sites": [
+                                {
+                                    "apache": "stopped",
+                                    "autostart": False,
+                                    "check_helper_usage": 1.48e-321,
+                                    "check_mk_helper_usage": 0.0,
+                                    "checker_helper_usage": 2.25692e-30,
+                                    "cmc": "stopped",
+                                    "crontab": "stopped",
+                                    "dcd": "stopped",
+                                    "fetcher_helper_usage": 0.0207974,
+                                    "liveproxyd": "stopped",
+                                    "livestatus_usage": 1.48e-321,
+                                    "mkeventd": "stopped",
+                                    "mknotifyd": "stopped",
+                                    "num_hosts": "3",
+                                    "num_services": "79",
+                                    "rrdcached": "stopped",
+                                    "site": "heute",
+                                    "stunnel": "not existent",
+                                    "used_version": "2021.03.18.cee",
+                                    "xinetd": "not existent",
+                                },
+                                {
+                                    "apache": "stopped",
+                                    "autostart": False,
+                                    "check_helper_usage": 1.48e-321,
+                                    "check_mk_helper_usage": 0.014576800000000001,
+                                    "checker_helper_usage": 0.0,
+                                    "cmc": "stopped",
+                                    "crontab": "stopped",
+                                    "dcd": "stopped",
+                                    "fetcher_helper_usage": 0.0,
+                                    "liveproxyd": "stopped",
+                                    "livestatus_usage": 4.94e-322,
+                                    "mkeventd": "stopped",
+                                    "mknotifyd": "stopped",
+                                    "num_hosts": "1",
+                                    "num_services": "74",
+                                    "rrdcached": "stopped",
+                                    "site": "old",
+                                    "stunnel": "not existent",
+                                    "used_version": "1.6.0-2021.03.19.cee",
+                                    "xinetd": "not existent",
+                                },
+                                {
+                                    "apache": "running",
+                                    "autostart": False,
+                                    "check_helper_usage": 1.1957599999999999e-11,
+                                    "check_mk_helper_usage": 0.0,
+                                    "checker_helper_usage": 2.55739e-36,
+                                    "cmc": "running",
+                                    "crontab": "running",
+                                    "dcd": "running",
+                                    "fetcher_helper_usage": 0.529738,
+                                    "liveproxyd": "running",
+                                    "livestatus_usage": 9.345909999999999e-06,
+                                    "mkeventd": "running",
+                                    "mknotifyd": "running",
+                                    "num_hosts": "1",
+                                    "num_services": "69",
+                                    "rrdcached": "running",
+                                    "site": "abc",
+                                    "stunnel": "not existent",
+                                    "used_version": "2.0.0-2021.03.31.cee",
+                                    "xinetd": "not existent",
+                                },
+                                {
+                                    "apache": "stopped",
+                                    "autostart": False,
+                                    "check_helper_usage": 0.0,
+                                    "check_mk_helper_usage": 0.0,
+                                    "checker_helper_usage": 1.3319e-41,
+                                    "cmc": "stopped",
+                                    "crontab": "stopped",
+                                    "dcd": "stopped",
+                                    "fetcher_helper_usage": 0.0208051,
+                                    "liveproxyd": "stopped",
+                                    "livestatus_usage": 25.0,
+                                    "mkeventd": "stopped",
+                                    "mknotifyd": "stopped",
+                                    "num_hosts": "1",
+                                    "num_services": "53",
+                                    "rrdcached": "stopped",
+                                    "site": "stable_slave_1",
+                                    "stunnel": "stopped",
+                                    "used_version": "2.0.0-2021.03.31.cee",
+                                    "xinetd": "stopped",
+                                },
+                                {
+                                    "apache": "running",
+                                    "cmc": "running",
+                                    "crontab": "running",
+                                    "dcd": "running",
+                                    "liveproxyd": "running",
+                                    "mkeventd": "running",
+                                    "mknotifyd": "running",
+                                    "rrdcached": "running",
+                                    "site": "beta",
+                                    "stunnel": "not existent",
+                                    "xinetd": "not existent",
+                                },
+                                {
+                                    "apache": "running",
+                                    "cmc": "running",
+                                    "crontab": "running",
+                                    "dcd": "running",
+                                    "liveproxyd": "running",
+                                    "mkeventd": "running",
+                                    "mknotifyd": "running",
+                                    "rrdcached": "running",
+                                    "site": "beta_slave_1",
+                                    "stunnel": "not existent",
+                                    "xinetd": "running",
+                                },
+                                {
+                                    "apache": "stopped",
+                                    "cmc": "stopped",
+                                    "crontab": "stopped",
+                                    "dcd": "stopped",
+                                    "liveproxyd": "stopped",
+                                    "mkeventd": "stopped",
+                                    "mknotifyd": "stopped",
+                                    "rrdcached": "stopped",
+                                    "site": "beta_slave_2",
+                                    "stunnel": "stopped",
+                                    "xinetd": "stopped",
+                                },
+                                {
+                                    "apache": "running",
+                                    "cmc": "running",
+                                    "crontab": "running",
+                                    "dcd": "running",
+                                    "liveproxyd": "running",
+                                    "mkeventd": "running",
+                                    "mknotifyd": "running",
+                                    "rrdcached": "running",
+                                    "site": "crawl_central",
+                                    "stunnel": "not existent",
+                                    "xinetd": "running",
+                                },
+                                {
+                                    "apache": "stopped",
+                                    "autostart": False,
+                                    "cmc": "stopped",
+                                    "crontab": "stopped",
+                                    "dcd": "stopped",
+                                    "liveproxyd": "stopped",
+                                    "mkeventd": "stopped",
+                                    "mknotifyd": "stopped",
+                                    "rrdcached": "stopped",
+                                    "site": "heute_slave_1",
+                                    "stunnel": "stopped",
+                                    "used_version": "2021.03.12.cee",
+                                    "xinetd": "stopped",
+                                },
+                                {
+                                    "apache": "running",
+                                    "cmc": "running",
+                                    "crontab": "running",
+                                    "dcd": "running",
+                                    "liveproxyd": "running",
+                                    "mkeventd": "running",
+                                    "mknotifyd": "running",
+                                    "rrdcached": "running",
+                                    "site": "lmtest",
+                                    "stunnel": "not existent",
+                                    "xinetd": "not existent",
+                                },
+                                {
+                                    "apache": "stopped",
+                                    "cmc": "stopped",
+                                    "crontab": "stopped",
+                                    "dcd": "stopped",
+                                    "liveproxyd": "stopped",
+                                    "mkeventd": "stopped",
+                                    "mknotifyd": "stopped",
+                                    "rrdcached": "stopped",
+                                    "site": "stable2",
+                                    "stunnel": "not existent",
+                                    "xinetd": "not existent",
+                                },
+                                {"autostart": False, "site": "cmk", "used_version": ""},
+                            ],
+                            "versions": [
+                                {
+                                    "demo": False,
+                                    "edition": "cee",
+                                    "num_sites": 0,
+                                    "number": "1.6.0-2021.01.11",
+                                    "version": "1.6.0-2021.01.11.cee",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cee",
+                                    "num_sites": 0,
+                                    "number": "1.6.0-2021.03.03",
+                                    "version": "1.6.0-2021.03.03.cee",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cee",
+                                    "num_sites": 0,
+                                    "number": "1.6.0-2021.03.11",
+                                    "version": "1.6.0-2021.03.11.cee",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cee",
+                                    "num_sites": 1,
+                                    "number": "1.6.0-2021.03.19",
+                                    "version": "1.6.0-2021.03.19.cee",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cme",
+                                    "num_sites": 0,
+                                    "number": "1.6.0p19",
+                                    "version": "1.6.0p19.cme",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cee",
+                                    "num_sites": 0,
+                                    "number": "2.0.0-2021.02.03",
+                                    "version": "2.0.0-2021.02.03.cee",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cee",
+                                    "num_sites": 0,
+                                    "number": "2.0.0-2021.03.02",
+                                    "version": "2.0.0-2021.03.02.cee",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cee",
+                                    "num_sites": 0,
+                                    "number": "2.0.0-2021.03.08",
+                                    "version": "2.0.0-2021.03.08.cee",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cee",
+                                    "num_sites": 0,
+                                    "number": "2.0.0-2021.03.09",
+                                    "version": "2.0.0-2021.03.09.cee",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cee",
+                                    "num_sites": 0,
+                                    "number": "2.0.0-2021.03.10",
+                                    "version": "2.0.0-2021.03.10.cee",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cee",
+                                    "num_sites": 0,
+                                    "number": "2.0.0-2021.03.11",
+                                    "version": "2.0.0-2021.03.11.cee",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cee",
+                                    "num_sites": 0,
+                                    "number": "2.0.0-2021.03.17",
+                                    "version": "2.0.0-2021.03.17.cee",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cee",
+                                    "num_sites": 0,
+                                    "number": "2.0.0-2021.03.18",
+                                    "version": "2.0.0-2021.03.18.cee",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cee",
+                                    "num_sites": 0,
+                                    "number": "2.0.0-2021.03.29",
+                                    "version": "2.0.0-2021.03.29.cee",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cee",
+                                    "num_sites": 2,
+                                    "number": "2.0.0-2021.03.31",
+                                    "version": "2.0.0-2021.03.31.cee",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cee",
+                                    "num_sites": 0,
+                                    "number": "2.0.0",
+                                    "version": "2.0.0.cee",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cre",
+                                    "num_sites": 0,
+                                    "number": "2.0.0",
+                                    "version": "2.0.0.cre",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cme",
+                                    "num_sites": 0,
+                                    "number": "2.0.0i1",
+                                    "version": "2.0.0i1.cme",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cme",
+                                    "num_sites": 0,
+                                    "number": "2.0.0p1",
+                                    "version": "2.0.0p1.cme",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cee",
+                                    "num_sites": 0,
+                                    "number": "2021.03.05",
+                                    "version": "2021.03.05.cee",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cee",
+                                    "num_sites": 1,
+                                    "number": "2021.03.12",
+                                    "version": "2021.03.12.cee",
+                                },
+                                {
+                                    "demo": False,
+                                    "edition": "cee",
+                                    "num_sites": 1,
+                                    "number": "2021.03.18",
+                                    "version": "2021.03.18.cee",
+                                },
+                            ],
+                        }
+                    }
+                },
+            }
+        ),
+        "host_is_flapping": 0,
+        "host_label_sources": {"cmk/check_mk_server": "discovered", "cmk/os_family": "discovered"},
+        "host_labels": {"cmk/check_mk_server": "yes", "cmk/os_family": "linux"},
+        "host_last_check": 1617468248,
+        "host_last_notification": 0,
+        "host_last_state_change": 1617452715,
+        "host_latency": 0,
+        "host_max_check_attempts": 1,
+        "host_metrics": [],
+        "host_modified_attributes_list": [],
+        "host_name": "abc",
+        "host_next_check": 1617468259,
+        "host_next_notification": 1617452715,
+        "host_notes_url_expanded": "",
+        "host_notification_period": "24X7",
+        "host_notification_postponement_reason": "",
+        "host_notifications_enabled": 1,
+        "host_num_services": 69,
+        "host_num_services_crit": 5,
+        "host_num_services_ok": 62,
+        "host_num_services_pending": 0,
+        "host_num_services_unknown": 1,
+        "host_num_services_warn": 1,
+        "host_parents": [],
+        "host_perf_data": "",
+        "host_plugin_output": "Packet received via smart PING",
+        "host_pnpgraph_present": 0,
+        "host_retry_interval": 0.1,
+        "host_scheduled_downtime_depth": 0,
+        "host_services_with_state": [
+            ["Uptime", 0, 1],
+            ["Systemd Timesyncd Time", 0, 1],
+            ["TCP Connections", 0, 1],
+            ["Systemd Service Summary", 0, 1],
+            ["OMD stable2 status", 2, 1],
+            ["OMD crawl_central status", 0, 1],
+            ["Interface 7", 3, 1],
+            ["Interface 2", 0, 1],
+            ["OMD beta_slave_1 status", 0, 1],
+            ["Temperature Zone 13", 0, 1],
+            ["Temperature Zone 8", 0, 1],
+            ["OMD heute_slave_1 apache", 0, 1],
+            ["OMD stable_slave_1 performance", 0, 1],
+            ["OMD old performance", 0, 1],
+            ["Kernel Performance", 0, 1],
+            ["Filesystem /opt/omd/sites/stable/tmp", 0, 1],
+            ["OMD stable_slave_1 apache", 0, 1],
+            ["Temperature Zone 2", 0, 1],
+            ["Temperature Zone 9", 0, 1],
+            ["Filesystem /opt/omd/sites/heute/tmp", 0, 1],
+            ["Mount options of /", 0, 1],
+            ["Nullmailer Queue", 2, 1],
+            ["Filesystem /", 0, 1],
+            ["Site stable_slave_1 statistics", 0, 1],
+            ["Memory", 0, 1],
+            ["Mount options of /boot/efi", 0, 1],
+            ["Interface 3", 2, 1],
+            ["Number of threads", 1, 1],
+            ["Temperature Zone 10", 0, 1],
+            ["Temperature Zone 5", 0, 1],
+            ["Check_MK HW/SW Inventory", 0, 1],
+            ["OMD stable apache", 0, 1],
+            ["CPU load", 0, 1],
+            ["Temperature Zone 11", 0, 1],
+            ["Check_MK Discovery", 0, 1],
+            ["Temperature Zone 6", 0, 1],
+            ["Temperature Zone 0", 0, 1],
+            ["Disk IO SUMMARY", 0, 1],
+            ["Filesystem /boot", 0, 1],
+            ["OMD stable performance", 2, 1],
+            ["Temperature Zone 3", 0, 1],
+            ["Filesystem /boot/efi", 0, 1],
+            ["Temperature Zone 1", 0, 1],
+            ["Temperature Zone 4", 0, 1],
+            ["Site heute statistics", 0, 1],
+            ["Temperature Zone 12", 0, 1],
+            ["Temperature Zone 7", 0, 1],
+            ["OMD heute apache", 0, 1],
+            ["Filesystem /opt/omd/sites/stable_slave_1/tmp", 0, 1],
+            ["mysärvice", 0, 1],
+            ["OMD heute Notification Spooler", 0, 1],
+            ["CPU utilization", 0, 1],
+            ["OMD heute Event Console", 0, 1],
+            ["OMD old Event Console", 0, 1],
+            ["OMD lmtest status", 0, 1],
+            ["OMD stable Event Console", 0, 1],
+            ["Filesystem /opt/omd/sites/old/tmp", 0, 1],
+            ["OMD stable_slave_1 Event Console", 0, 1],
+            ["OMD old Notification Spooler", 0, 1],
+            ["OMD stable Notification Spooler", 0, 1],
+            ["OMD heute performance", 0, 1],
+            ["OMD stable_slave_1 Notification Spooler", 0, 1],
+            ["Mount options of /boot", 0, 1],
+            ["Check_MK", 0, 1],
+            ["Site old statistics", 0, 1],
+            ["OMD old apache", 0, 1],
+            ["Site stable statistics", 0, 1],
+            ["OMD beta status", 0, 1],
+            ["OMD beta_slave_2 status", 2, 1],
+        ],
+        "host_services_with_state_filtered": [
+            ["Uptime", 0, 1],
+            ["Systemd Timesyncd Time", 0, 1],
+            ["TCP Connections", 0, 1],
+            ["Systemd Service Summary", 0, 1],
+            ["OMD stable2 status", 2, 1],
+            ["OMD crawl_central status", 0, 1],
+            ["Interface 7", 3, 1],
+            ["Interface 2", 0, 1],
+            ["OMD beta_slave_1 status", 0, 1],
+            ["Temperature Zone 13", 0, 1],
+            ["Temperature Zone 8", 0, 1],
+            ["OMD heute_slave_1 apache", 0, 1],
+            ["OMD stable_slave_1 performance", 0, 1],
+            ["OMD old performance", 0, 1],
+            ["Kernel Performance", 0, 1],
+            ["Filesystem /opt/omd/sites/stable/tmp", 0, 1],
+            ["OMD stable_slave_1 apache", 0, 1],
+            ["Temperature Zone 2", 0, 1],
+            ["Temperature Zone 9", 0, 1],
+            ["Filesystem /opt/omd/sites/heute/tmp", 0, 1],
+            ["Mount options of /", 0, 1],
+            ["Nullmailer Queue", 2, 1],
+            ["Filesystem /", 0, 1],
+            ["Site stable_slave_1 statistics", 0, 1],
+            ["Memory", 0, 1],
+            ["Mount options of /boot/efi", 0, 1],
+            ["Interface 3", 2, 1],
+            ["Number of threads", 1, 1],
+            ["Temperature Zone 10", 0, 1],
+            ["Temperature Zone 5", 0, 1],
+            ["Check_MK HW/SW Inventory", 0, 1],
+            ["OMD stable apache", 0, 1],
+            ["CPU load", 0, 1],
+            ["Temperature Zone 11", 0, 1],
+            ["Check_MK Discovery", 0, 1],
+            ["Temperature Zone 6", 0, 1],
+            ["Temperature Zone 0", 0, 1],
+            ["Disk IO SUMMARY", 0, 1],
+            ["Filesystem /boot", 0, 1],
+            ["OMD stable performance", 2, 1],
+            ["Temperature Zone 3", 0, 1],
+            ["Filesystem /boot/efi", 0, 1],
+            ["Temperature Zone 1", 0, 1],
+            ["Temperature Zone 4", 0, 1],
+            ["Site heute statistics", 0, 1],
+            ["Temperature Zone 12", 0, 1],
+            ["Temperature Zone 7", 0, 1],
+            ["OMD heute apache", 0, 1],
+            ["Filesystem /opt/omd/sites/stable_slave_1/tmp", 0, 1],
+            ["mysärvice", 0, 1],
+            ["OMD heute Notification Spooler", 0, 1],
+            ["CPU utilization", 0, 1],
+            ["OMD heute Event Console", 0, 1],
+            ["OMD old Event Console", 0, 1],
+            ["OMD lmtest status", 0, 1],
+            ["OMD stable Event Console", 0, 1],
+            ["Filesystem /opt/omd/sites/old/tmp", 0, 1],
+            ["OMD stable_slave_1 Event Console", 0, 1],
+            ["OMD old Notification Spooler", 0, 1],
+            ["OMD stable Notification Spooler", 0, 1],
+            ["OMD heute performance", 0, 1],
+            ["OMD stable_slave_1 Notification Spooler", 0, 1],
+            ["Mount options of /boot", 0, 1],
+            ["Check_MK", 0, 1],
+            ["Site old statistics", 0, 1],
+            ["OMD old apache", 0, 1],
+            ["Site stable statistics", 0, 1],
+            ["OMD beta status", 0, 1],
+            ["OMD beta_slave_2 status", 2, 1],
+        ],
+        "host_staleness": 0.666667,
+        "host_state": 0,
+        "host_structured_status": b"{'software': {'applications': {'check_mk': {'sit"
+        b"es': [{'site': 'heute', 'num_hosts': '3', 'num_s"
+        b"ervices': '79', 'check_helper_usage': 1.48e-321,"
+        b" 'check_mk_helper_usage': 0.0, 'fetcher_helper_u"
+        b"sage': 0.0207974, 'checker_helper_usage': 2.2569"
+        b"2e-30, 'livestatus_usage': 1.48e-321, 'cmc': 'st"
+        b"opped', 'dcd': 'stopped', 'liveproxyd': 'stopped"
+        b"', 'mknotifyd': 'stopped', 'apache': 'stopped', "
+        b"'crontab': 'stopped', 'mkeventd': 'stopped', 'rr"
+        b"dcached': 'stopped', 'stunnel': 'not existent', "
+        b"'xinetd': 'not existent'}, {'site': 'old', 'num_"
+        b"hosts': '1', 'num_services': '74', 'check_helper"
+        b"_usage': 1.48e-321, 'check_mk_helper_usage': 0.0"
+        b"14576800000000001, 'fetcher_helper_usage': 0.0, "
+        b"'checker_helper_usage': 0.0, 'livestatus_usage':"
+        b" 4.94e-322, 'cmc': 'stopped', 'dcd': 'stopped', "
+        b"'liveproxyd': 'stopped', 'mknotifyd': 'stopped',"
+        b" 'apache': 'stopped', 'crontab': 'stopped', 'mke"
+        b"ventd': 'stopped', 'rrdcached': 'stopped', 'stun"
+        b"nel': 'not existent', 'xinetd': 'not existent'},"
+        b" {'site': 'abc', 'num_hosts': '1', 'num_servi"
+        b"ces': '69', 'check_helper_usage': 1.195759999999"
+        b"9999e-11, 'check_mk_helper_usage': 0.0, 'fetcher"
+        b"_helper_usage': 0.529738, 'checker_helper_usage'"
+        b": 2.55739e-36, 'livestatus_usage': 9.34590999999"
+        b"9999e-06, 'cmc': 'running', 'dcd': 'running', 'l"
+        b"iveproxyd': 'running', 'mknotifyd': 'running', '"
+        b"apache': 'running', 'crontab': 'running', 'mkeve"
+        b"ntd': 'running', 'rrdcached': 'running', 'stunne"
+        b"l': 'not existent', 'xinetd': 'not existent'}, {"
+        b"'site': 'stable_slave_1', 'num_hosts': '1', 'num"
+        b"_services': '53', 'check_helper_usage': 0.0, 'ch"
+        b"eck_mk_helper_usage': 0.0, 'fetcher_helper_usage"
+        b"': 0.0208051, 'checker_helper_usage': 1.3319e-41"
+        b", 'livestatus_usage': 25.0, 'cmc': 'stopped', 'd"
+        b"cd': 'stopped', 'liveproxyd': 'stopped', 'mknoti"
+        b"fyd': 'stopped', 'apache': 'stopped', 'crontab':"
+        b" 'stopped', 'mkeventd': 'stopped', 'rrdcached': "
+        b"'stopped', 'stunnel': 'stopped', 'xinetd': 'stop"
+        b"ped'}, {'site': 'beta', 'cmc': 'running', 'dcd':"
+        b" 'running', 'liveproxyd': 'running', 'mknotifyd'"
+        b": 'running', 'apache': 'running', 'crontab': 'ru"
+        b"nning', 'mkeventd': 'running', 'rrdcached': 'run"
+        b"ning', 'stunnel': 'not existent', 'xinetd': 'not"
+        b" existent'}, {'site': 'beta_slave_1', 'cmc': 'ru"
+        b"nning', 'dcd': 'running', 'liveproxyd': 'running"
+        b"', 'mknotifyd': 'running', 'apache': 'running', "
+        b"'crontab': 'running', 'mkeventd': 'running', 'rr"
+        b"dcached': 'running', 'stunnel': 'not existent', "
+        b"'xinetd': 'running'}, {'site': 'beta_slave_2', '"
+        b"cmc': 'stopped', 'dcd': 'stopped', 'liveproxyd':"
+        b" 'stopped', 'mknotifyd': 'stopped', 'apache': 's"
+        b"topped', 'crontab': 'stopped', 'mkeventd': 'stop"
+        b"ped', 'rrdcached': 'stopped', 'stunnel': 'stoppe"
+        b"d', 'xinetd': 'stopped'}, {'site': 'crawl_centra"
+        b"l', 'cmc': 'running', 'dcd': 'running', 'livepro"
+        b"xyd': 'running', 'mknotifyd': 'running', 'apache"
+        b"': 'running', 'crontab': 'running', 'mkeventd': "
+        b"'running', 'rrdcached': 'running', 'stunnel': 'n"
+        b"ot existent', 'xinetd': 'running'}, {'site': 'he"
+        b"ute_slave_1', 'cmc': 'stopped', 'dcd': 'stopped'"
+        b", 'liveproxyd': 'stopped', 'mknotifyd': 'stopped"
+        b"', 'apache': 'stopped', 'crontab': 'stopped', 'm"
+        b"keventd': 'stopped', 'rrdcached': 'stopped', 'st"
+        b"unnel': 'stopped', 'xinetd': 'stopped'}, {'site'"
+        b": 'lmtest', 'cmc': 'running', 'dcd': 'running', "
+        b"'liveproxyd': 'running', 'mknotifyd': 'running',"
+        b" 'apache': 'running', 'crontab': 'running', 'mke"
+        b"ventd': 'running', 'rrdcached': 'running', 'stun"
+        b"nel': 'not existent', 'xinetd': 'not existent'},"
+        b" {'site': 'stable2', 'cmc': 'stopped', 'dcd': 's"
+        b"topped', 'liveproxyd': 'stopped', 'mknotifyd': '"
+        b"stopped', 'apache': 'stopped', 'crontab': 'stopp"
+        b"ed', 'mkeventd': 'stopped', 'rrdcached': 'stoppe"
+        b"d', 'stunnel': 'not existent', 'xinetd': 'not ex"
+        b"istent'}]}}}}\n",
+        "host_tags": {
+            "address_family": "ip-v4-only",
+            "agent": "cmk-agent",
+            "criticality": "prod",
+            "ip-v4": "ip-v4",
+            "networking": "lan",
+            "piggyback": "auto-piggyback",
+            "site": "abc",
+            "snmp_ds": "no-snmp",
+            "tcp": "tcp",
+        },
+        "rrddata:sys:sys.average:1614553200:1617228000:60": [0, 0, 0],
+        "rrddata:sys:sys.average:1616367600:1616968800:60": [0, 0, 0],
+        "rrddata:system:system.average:1614553200:1617228000:60": [0, 0, 0],
+        "rrddata:system:system.average:1616367600:1616968800:60": [0, 0, 0],
+        "service_accept_passive_checks": 1,
+        "service_acknowledged": 0,
+        "service_action_url_expanded": "",
+        "service_active_checks_enabled": 0,
+        "service_cache_interval": 0,
+        "service_cached_at": 0,
+        "service_check_command": "check_mk-lnx_if",
+        "service_check_command_expanded": "",
+        "service_check_interval": 1,
+        "service_check_period": "24X7",
+        "service_check_type": 1,
+        "service_comments_with_extra_info": [],
+        "service_comments_with_info": [],
+        "service_contact_groups": ["all"],
+        "service_contacts": [],
+        "service_current_attempt": 1,
+        "service_current_notification_number": 0,
+        "service_custom_variable_names": ["DING"],
+        "service_custom_variable_values": ["DONG"],
+        "service_custom_variables": {"DING": "DONG"},
+        "service_description": "Interface 3",
+        "service_display_name": "Interface 3",
+        "service_downtimes": [],
+        "service_downtimes_with_extra_info": [],
+        "service_execution_time": 2.6e-08,
+        "service_groups": [],
+        "service_has_been_checked": 1,
+        "service_host_name": "abc",
+        "service_icon_image": "",
+        "service_in_check_period": 1,
+        "service_in_notification_period": 1,
+        "service_in_passive_check_period": 1,
+        "service_in_service_period": 1,
+        "service_is_flapping": 0,
+        "service_label_sources": {},
+        "service_labels": {},
+        "service_last_check": 1617468196,
+        "service_last_notification": 0,
+        "service_last_state_change": 1617309051,
+        "service_last_time_ok": 1617302582,
+        "service_latency": 0,
+        "service_long_plugin_output": "[vboxnet0]\\nOperational state: "
+        "down(!!)\\nMAC: 0A:00:27:00:00:00\\nSpeed: 10 "
+        "MBit/s (expected: 0 Bit/s)(!)",
+        "service_max_check_attempts": 1,
+        "service_metrics": [
+            "outdisc",
+            "outnucast",
+            "outqlen",
+            "in",
+            "out",
+            "inmcast",
+            "inbcast",
+            "inerr",
+            "indisc",
+            "inucast",
+            "innucast",
+            "outmcast",
+            "outbcast",
+            "outerr",
+            "outucast",
+        ],
+        "service_modified_attributes_list": [],
+        "service_next_check": 0,
+        "service_next_notification": 1617309051,
+        "service_notes_url_expanded": "",
+        "service_notification_period": "24X7",
+        "service_notification_postponement_reason": "",
+        "service_notifications_enabled": 1,
+        "service_perf_data": "",
+        "service_plugin_output": "[vboxnet0], (down)(!!), MAC: 0A:00:27:00:00:00, "
+        "Speed: 10 MBit/s (expected: 0 Bit/s)(!)",
+        "service_pnpgraph_present": 1,
+        "service_retry_interval": 1,
+        "service_scheduled_downtime_depth": 0,
+        "service_service_description": "Interface 3",
+        "service_staleness": 0.933333,
+        "service_state": 2,
+        "service_tags": {},
+        "site": "NO_SITE",
+        "forecast_aggr_3c659189-29f3-411a-8456-6a07fdae4d51": None,
+        "forecast_aggr_3c659189-29f3-411a-8456-6a07fdae4d51_max": None,
+        "hist_aggr_e13957f5-1b0b-43a7-a452-3bff7187542e": None,
+        "hist_aggr_e13957f5-1b0b-43a7-a452-3bff7187542e_max": None,
+    }
+
+
+def _painter_name_spec(painter_ident):
+    if painter_ident == "service_custom_variable":
+        return painter_ident, {"ident": "DING"}
+    if painter_ident == "host_custom_variable":
+        return painter_ident, {"ident": "FILENAME"}
+    if painter_ident == "svc_metrics_hist":
+        return painter_ident, {"uuid": "e13957f5-1b0b-43a7-a452-3bff7187542e"}
+    if painter_ident == "svc_metrics_forecast":
+        return painter_ident, {"uuid": "3c659189-29f3-411a-8456-6a07fdae4d51"}
+    if painter_ident == "sla_fixed":
+        return painter_ident, {
+            "layout_options": {"full_title": False, "hide_subresults": False, "summary": "off"},
+            "sla_config": (
+                "sla_configuration_1",
+                {
+                    "service_outage_count_painter": {"display_type": "timespan"},
+                    "service_state_percentage_painter": {
+                        "display_type": "timespan",
+                        "float_precision": 0,
+                    },
+                },
+            ),
+            "timerange_spec": "m1",
+        }
+    if painter_ident == "sla_specific":
+        return painter_ident, {
+            "layout_options": {"full_title": False, "hide_subresults": False, "summary": "off"},
+            "sla_config": (
+                "sla_configuration_1",
+                {
+                    "service_outage_count_painter": {"display_type": "timespan"},
+                    "service_state_percentage_painter": {
+                        "display_type": "timespan",
+                        "float_precision": 0,
+                    },
+                },
+            ),
+            "timerange_spec": "m1",
+        }
+    return painter_ident, {}
+
+
+def _set_expected_queries(painter_ident, live):
+    if painter_ident == "inv":
+        # TODO: Why is it querying twice?
+        live.expect_query(
+            "GET hosts\nColumns: host_name\nLocaltime: 1523811000\nOutputFormat: json\nKeepAlive: on\nResponseHeader: fixed16"
+        )
+        return
+    if painter_ident in ("service_graphs", "svc_pnpgraph", "host_graphs", "host_pnpgraph"):
+        # Every graph painter renders through the engine, which resolves the metric names
+        # during the render. The row carries a service_description, so the host painters
+        # address the same service as the service ones.
+        live.expect_query(
+            "GET services\nColumns: host_name description perf_data metrics check_command\n"
+            "Filter: host_name = abc\nFilter: description = Interface 3\nAnd: 2"
+        )
+        return
+    if painter_ident == "svc_long_plugin_output":
+        # The size limit comes from the cached site states, not a per-render query.
+        live.add_table(
+            "status",
+            [
+                {
+                    "max_long_output_size": 2000,
+                }
+            ],
+        )
+        return
+
+
+def _load_notes_into_files(notes_dirs: list[Path], notes: list[dict[str, object]]) -> list[str]:
+    expected_notes: list[str] = []
+
+    for path in notes_dirs:
+        path.mkdir(parents=True, exist_ok=True)
+
+    for note in notes:
+        with open(str(note["file"]), "w") as f:
+            f.write(str(note["content"]))
+            if note["on_response"]:
+                expected_notes.append(str(note["content"]))
+
+    return expected_notes
+
+
+@pytest.mark.parametrize(
+    "notes_type, notes_dir, notes_file, row, notes",
+    [
+        pytest.param(
+            "service",
+            default_config_dir / "notes/services" / "heute",
+            default_config_dir / "notes/services" / "heute" / "SomeService",
+            {
+                "host_address": "127.0.0.1",
+                "service_description": "SomeService",
+                "host_name": "heute",
+                "site": "NO_SITE",
+            },
+            ["A Service note", "One more service note"],
+            id="Service note for dedicated host",
+        ),
+        pytest.param(
+            "service",
+            default_config_dir / "notes/services" / "*",
+            default_config_dir / "notes/services" / "*" / "AnotherService",
+            {
+                "host_address": "127.0.0.1",
+                "service_description": "AnotherService",
+                "host_name": "some_host",
+                "site": "NO_SITE",
+            },
+            ["Another service note", "Last service note"],
+            id="Service note for multiple hosts",
+        ),
+        pytest.param(
+            "host",
+            default_config_dir / "notes/hosts",
+            default_config_dir / "notes/hosts" / "this_host",
+            {
+                "host_address": "127.0.0.1",
+                "host_name": "this_host",
+                "site": "NO_SITE",
+            },
+            ["First host node", "Second host node"],
+            id="A host note for dedicated host",
+        ),
+        pytest.param(
+            "host",
+            default_config_dir / "notes/hosts",
+            default_config_dir / "notes/hosts" / "*",
+            {
+                "host_address": "127.0.0.1",
+                "host_name": "another_host",
+                "site": "NO_SITE",
+            },
+            ["First host node", "Second host node", "And so on"],
+            id="A host note for multiple hosts",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("request_context")
+def test_paint_custom_notes(
+    notes_type: Literal["host", "service"],
+    notes_dir: Path,
+    notes_file: Path,
+    row: Row,
+    notes: list[str],
+) -> None:
+    notes_dir.mkdir(parents=True)
+    with open(notes_file, "w") as f:
+        f.write("<hr>".join(notes))
+
+    assert notes_file.read_text() == str(
+        _paint_custom_notes(notes_type, row, config=active_config)[1]
+    )
+
+
+@pytest.mark.parametrize(
+    "object_type, host_name, service_name, notes_dirs, notes",
+    [
+        pytest.param(
+            "host",
+            "localhost",
+            "",
+            [
+                default_config_dir / "notes/hosts",
+            ],
+            [
+                {
+                    "file": default_config_dir / "notes/hosts" / "localhost",
+                    "content": "Notes for host localhost",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/hosts" / "*ost",
+                    "content": "Notes for hosts ending with ost",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/hosts" / "*",
+                    "content": "Notes for all hosts",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/hosts" / "ost",
+                    "content": "This note should be ignored",
+                    "on_response": False,
+                },
+            ],
+            id="Inclusion of host notes files",
+        ),
+        pytest.param(
+            "service",
+            "localhost",
+            "Uptime",
+            [
+                default_config_dir / "notes/services" / "*",
+                default_config_dir / "notes/services" / "*ost",
+                default_config_dir / "notes/services/localhost",
+                default_config_dir / "notes/services/no_match",
+            ],
+            [
+                {
+                    "file": default_config_dir / "notes/services" / "localhost" / "Pendorcho",
+                    "content": "This note should be ignored (localhost:Pendorcho)",
+                    "on_response": False,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "localhost" / "Uptime",
+                    "content": "Notes for service Uptime on host localhost",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "localhost" / "*time",
+                    "content": "Notes for services ending with time on host localhost",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "localhost" / "*",
+                    "content": "Notes for all services on host localhost",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "*ost" / "Pendorcho",
+                    "content": "This note should be ignored (*ost:Pendorcho)",
+                    "on_response": False,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "*ost" / "Uptime",
+                    "content": "Notes for service Uptime on hosts ending with ost",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "*ost" / "*time",
+                    "content": "Notes for services ending with time on hosts ending with ost",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "*ost" / "*",
+                    "content": "Notes for all services on hosts ending with ost",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "*" / "Pendorcho",
+                    "content": "This note should be ignored (*:Pendorcho)",
+                    "on_response": False,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "*" / "Uptime",
+                    "content": "Notes for service Uptime on hosts ending with ost",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "*" / "*time",
+                    "content": "Notes for services ending with time on hosts ending with ost",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "*" / "*",
+                    "content": "Notes for all services on hosts ending with ost",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "no_match" / "Pendorcho",
+                    "content": "This note should be ignored (no_match:Pendorcho)",
+                    "on_response": False,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "no_match" / "Uptime",
+                    "content": "This note should be ignored (no_match:Uptime)",
+                    "on_response": False,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "no_match" / "*time",
+                    "content": "This note should be ignored (no_match:*time)",
+                    "on_response": False,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "no_match" / "*",
+                    "content": "This note should be ignored (no_match:*)",
+                    "on_response": False,
+                },
+            ],
+            id="Inclusion of service notes files",
+        ),
+        pytest.param(
+            "host",
+            "localhost",
+            "",
+            [
+                default_config_dir / "notes/hosts",
+            ],
+            [
+                {
+                    "file": default_config_dir / "notes/hosts" / "localhost",
+                    "content": "this note contains javascript <script>alert('hello')</script>",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/hosts" / "*ost",
+                    "content": "this note contains a table <table><tr><td>cell1</td><td>cell2</td></tr></table>",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/hosts" / "*",
+                    "content": 'This note contains a paragraph with some style <p style="color: red">paragraph</p>',
+                    "on_response": True,
+                },
+            ],
+            id="HTML content on hosts notes",
+        ),
+        pytest.param(
+            "service",
+            "localhost",
+            "Uptime",
+            [
+                default_config_dir / "notes/services" / "*",
+                default_config_dir / "notes/services" / "*ost",
+                default_config_dir / "notes/services/localhost",
+                default_config_dir / "notes/services/no_match",
+            ],
+            [
+                {
+                    "file": default_config_dir / "notes/services" / "localhost" / "Uptime",
+                    "content": "this note contains javascript <script>alert('hello')</script>",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "localhost" / "*time",
+                    "content": "this note contains a table <table><tr><td>cell1</td><td>cell2</td></tr></table>",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "localhost" / "*",
+                    "content": 'This note contains a paragraph with some style <p style="color: red">paragraph</p>',
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "*ost" / "Uptime",
+                    "content": "This note has a <strong>tag</strong>",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "*ost" / "*time",
+                    "content": "<h1>This</h1> is a heading",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "*ost" / "*",
+                    "content": '<table border="1"><tr style="background-color:#d35400"><th>Title</th></tr><tr><td>Content</td</tr></table>',
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "*" / "Uptime",
+                    "content": "<script>alert('hello')</script>",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "*" / "*time",
+                    "content": "multi </br> line </br> note",
+                    "on_response": True,
+                },
+                {
+                    "file": default_config_dir / "notes/services" / "*" / "*",
+                    "content": "even broken <tags> are allowed",
+                    "on_response": True,
+                },
+            ],
+            id="HTML content on services notes",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("request_context")
+def test_paint_custom_notes_file_inclusion_and_html_tags(
+    object_type: Literal["host", "service"],
+    host_name: str,
+    service_name: str | None,
+    notes_dirs: list[Path],
+    notes: list[dict[str, object]],
+) -> None:
+    expected_notes: list[str] = _load_notes_into_files(notes_dirs, notes)
+
+    row: Row = {
+        "host_name": host_name,
+        "service_description": service_name,
+        "site": "NO_SITE",
+        "host_address": "127.0.0.1",
+    }
+
+    displayed_custom_notes = _paint_custom_notes(object_type, row, config=active_config)[1]
+    assert isinstance(displayed_custom_notes, HTML)
+
+    notes_as_string = str(displayed_custom_notes)
+    expected_string = str(HTML.without_escaping("<hr>".join(expected_notes)))
+
+    assert expected_string == notes_as_string

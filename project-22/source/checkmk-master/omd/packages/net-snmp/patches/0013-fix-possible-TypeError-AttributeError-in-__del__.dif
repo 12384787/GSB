@@ -1,0 +1,22 @@
+diff --git a/python/netsnmp/client.py b/python/netsnmp/client.py
+index daf11a4c4..4aae1876f 100644
+--- a/python/netsnmp/client.py
++++ b/python/netsnmp/client.py
+@@ -217,8 +217,15 @@ class Session(object):
+         return res
+
+     def __del__(self):
+-        res = netsnmp.client_intf.delete_session(self)
+-        return res
++        try:
++            res = netsnmp.client_intf.delete_session(self)
++            return res
++        except (AttributeError, TypeError):
++            # Saw this exception:
++            # Exception TypeError: "'NoneType' object is not callable" in <bound method Session.__del__ of <netsnmp.client.Session object at 0x7f173765f890>> ignored
++            # Exception AttributeError: "'NoneType' object has no attribute 'delete_session'"
++            # Add the exception handler here to catch this problem.
++            pass
+
+     def __str__(self) -> str:
+         return obj_to_str(self)

@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+# mypy: disable-error-code="type-arg"
+
+"""some fixtures related to e2e tests and playwright"""
+
+import logging
+from collections import defaultdict
+from collections.abc import Iterator
+from contextlib import AbstractContextManager
+from typing import Any
+
+import pytest
+from faker import Faker
+from playwright.sync_api import BrowserContext, Page
+
+from tests.system.gui.testlib.api_helpers import LOCALHOST_IPV4
+from tests.system.gui.testlib.host_details import HostDetails
+from tests.system.gui.testlib.playwright.helpers import CmkCredentials
+from tests.system.gui.testlib.playwright.plugin import PageGetter
+from tests.system.gui.testlib.playwright.pom.customize.edit_dashboard import EditDashboards
+from tests.system.gui.testlib.playwright.pom.graphing.fixtures import (
+    fixture_combined_graphs_page,
+    fixture_combined_graphs_page_all_services,
+    fixture_custom_graph_for_editing,
+    fixture_dashboard_action_menu_surfaces,
+    fixture_dashboard_with_action_menu_widgets,
+    fixture_graph_collection,
+    fixture_graph_hosts_high_density,
+    fixture_graph_hosts_with_varying_data,
+    fixture_graph_rrd_dst_boundary,
+    fixture_graph_rrd_with_gaps,
+    fixture_javascript_errors,
+    fixture_requested_urls,
+    fixture_rrd_metric_source,
+    fixture_saved_custom_graph,
+    fixture_scatterplot_widget,
+    fixture_service_graphs,
+    fixture_service_graphs_hover_popup,
+)
+from tests.system.gui.testlib.playwright.pom.login import LoginPage
+from tests.system.gui.testlib.playwright.pom.monitor.custom_dashboard import CustomDashboard
+from tests.system.gui.testlib.playwright.pom.monitor.dashboard import DashboardMobile, MainDashboard
+from tests.system.gui.testlib.playwright.pom.monitor.hosts_dashboard import LinuxHostsDashboard
+from tests.system.gui.testlib.playwright.pom.page import CmkPage
+from tests.system.gui.testlib.playwright.pom.setup.fixtures import notification_user
+from tests.system.gui.testlib.playwright.pom.setup.hosts import AddHost, SetupHost
+from tests.system.gui.testlib.playwright.pom.setup.licensing import Licensing
+from tests.testlib.common.repo import repo_path
+from tests.testlib.common.utils2 import is_cleanup_enabled, run
+from tests.testlib.emails import EmailManager
+from tests.testlib.notifications import create_host, create_notification_host, NotificationTarget
+from tests.testlib.pytest_helpers.calls import exit_pytest_on_exceptions
+from tests.testlib.site import (
+    ADMIN_USER,
+    get_site_factory,
+    Site,
+    SiteFactory,
+)
+
+logger = logging.getLogger(__name__)
+
+# `unique` only dedupes within its own Faker, so the whole session has to share one.
+_unique_faker = Faker().unique
+
+
+# Importing the fixtures into this conftest is what registers them with pytest;
+# these lists only keep the imports from being flagged as unused.
+setup_fixtures = [notification_user]
+graphing_fixtures = [
+    fixture_combined_graphs_page,
+    fixture_combined_graphs_page_all_services,
+    fixture_custom_graph_for_editing,
+    fixture_dashboard_action_menu_surfaces,
+    fixture_dashboard_with_action_menu_widgets,
+    fixture_graph_collection,
+    fixture_graph_hosts_high_density,
+    fixture_graph_hosts_with_varying_data,
+    fixture_graph_rrd_dst_boundary,
+    fixture_graph_rrd_with_gaps,
+    fixture_javascript_errors,
+    fixture_requested_urls,
+    fixture_rrd_metric_source,
+    fixture_saved_custom_graph,
+    fixture_scatterplot_widget,
+    fixture_service_graphs,
+    fixture_service_graphs_hover_popup,
+]
+
+
+@pytest.fixture(name="site_factory", scope="session")
+def _site_factory() -> SiteFactory:
+    """Return the site factory object."""
+    return get_site_factory(prefix="gui_e2e_")
+
+
+@pytest.fixture(name="test_site", scope="session")
+def fixture_test_site(request: pytest.FixtureRequest, site_factory: SiteFactory) -> Iterator[Site]:
+    """Return the central Checkmk site object."""
+    is_cloud = site_factory.edition.is_cloud_edition()
+    if is_cloud:
+        from tests.testlib.system.cloud.utils import (  # type: ignore[import-untyped, unused-ignore, import-not-found]
+            create_cloud_initial_config,
+        )
+
+        create_cloud_initial_config()
+    with exit_pytest_on_exceptions(
+        exit_msg=f"Failure in site creation using fixture '{__file__}::{request.fixturename}'!"
+    ):
+        yield from site_factory.get_test_site(
+            name="central",
+            lifecycle_wrapper=_cloud_lifecycle_wrapper if is_cloud else None,
+        )
+
+
+def _cloud_lifecycle_wrapper(site: Site) -> AbstractContextManager[None]:
+    from tests.testlib.system.cloud.utils import (  # type: ignore[import-untyped, unused-ignore, import-not-found]
+        cloud_environment,
+    )
+
+    ctx: AbstractContextManager[None] = cloud_environment(site.apache_port)
+    return ctx
+
+
+@pytest.fixture(name="remote_site_wato_disabled")
+def fixture_remote_site_wato_disabled(
+    test_site: Site, request: pytest.FixtureRequest, site_factory: SiteFactory
+) -> Iterator[Site]:
+    """Return a second Checkmk site object for a distributed setup.
+
+    WATO is disabled on the remote site (disable_remote_configuration=True).
+    """
+    try:
+        with site_factory.connected_remote_site(
+            "remote", test_site, request.node.name
+        ) as remote_site:
+            yield remote_site
+    except BaseException as exc:
+        exc.add_note("Error in remote site creation / connection! Failing test case run...")
+        raise exc
+
+
+@pytest.fixture(name="credentials", scope="session")
+def fixture_credentials(test_site: Site) -> CmkCredentials:
+    """Return admin user credentials of the Checkmk site."""
+    return CmkCredentials(username=ADMIN_USER, password=test_site.admin_password)
+
+
+@pytest.fixture(name="dashboard_page")
+def fixture_dashboard_page(
+    cmk_page: Page, test_site: Site, credentials: CmkCredentials
+) -> MainDashboard:
+    """Entrypoint to test browser GUI. Navigates to 'Main Dashboard'."""
+    return navigate_to_page(cmk_page, test_site.internal_url, credentials, MainDashboard)
+
+
+@pytest.fixture(name="cloned_linux_hosts_dashboard")
+def fixture_cloned_linux_hosts_dashboard(
+    dashboard_page: MainDashboard,
+) -> Iterator[CustomDashboard]:
+    """A customized copy of the built-in 'Linux hosts' dashboard, open and ready for edits.
+
+    A built-in dashboard takes no widgets of its own, so any test adding one works on a clone.
+    """
+    linux_hosts_dashboard = LinuxHostsDashboard(dashboard_page.page)
+    # Clones sharing the source's title compete for one ID and shadow the built-in.
+    clone_title = f"{linux_hosts_dashboard.page_title} {_unique_faker.first_name()}"
+    linux_hosts_dashboard.clone_dashboard(clone_title, clone_title.lower().replace(" ", "_"))
+
+    try:
+        yield CustomDashboard(linux_hosts_dashboard.page, clone_title, navigate_to_page=False)
+    finally:
+        if is_cleanup_enabled():
+            dashboard_page.go("edit_dashboards.py", wait_until="load")
+            edit_dashboards = EditDashboards(dashboard_page.page, navigate_to_page=False)
+            edit_dashboards.delete_dashboard(clone_title)
+
+
+@pytest.fixture(name="dashboard_page_mobile")
+def fixture_dashboard_page_mobile(
+    cmk_page: Page, test_site: Site, credentials: CmkCredentials
+) -> DashboardMobile:
+    """Entrypoint to test browser GUI in mobile view. Navigates to 'Main Dashboard'."""
+    return navigate_to_page(cmk_page, test_site.internal_url_mobile, credentials, DashboardMobile)
+
+
+@pytest.fixture(name="licensing_page")
+def _licensing_page(cmk_page: Page, test_site: Site, credentials: CmkCredentials) -> Licensing:
+    """Entrypoint to test browser GUI. Navigates to 'Licensing page'."""
+    return navigate_to_page(cmk_page, test_site.internal_url, credentials, Licensing)
+
+
+def navigate_to_page[TCmkPage: CmkPage](
+    page: Page,
+    url: str,
+    credentials: CmkCredentials,
+    page_type: type[TCmkPage],
+) -> TCmkPage:
+    """Navigate to a page.
+
+    Performs a login to Checkmk site, if necessary.
+    """
+    page.goto(url, wait_until="load")
+
+    if "login.py" in page.url:
+        # Log in to the site if not already logged in.
+        LoginPage(page, site_url=url, navigate_to_page=False).login(credentials)
+
+    return page_type(page, navigate_to_page=True)
+
+
+@pytest.fixture(name="new_browser_context_and_page")
+def fixture_new_browser_context_and_page(
+    context: BrowserContext, get_new_page: PageGetter
+) -> tuple[BrowserContext, Page]:
+    """Create a new browser context from the existing browser session and return a new page.
+
+    In the case a fresh browser context is required, use this fixture.
+
+    NOTE: fresh context requires a login to the Checkmk site. Refer to `LoginPage` for details.
+    """
+    return context, get_new_page(context)
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Work around playwright-pytest#195: group tests by function, not by browser session.
+
+    Link: https://github.com/microsoft/playwright-pytest/issues/195
+
+    playwright-pytest parametrizes 'browser_name' at session scope, which causes pytest
+    to interleave parametrized test cases across functions. This stable sort restores the
+    expected behavior of running all cases for one function before moving to the next.
+    """
+    items.sort(
+        key=lambda item: (
+            str(item.fspath),
+            getattr(item, "originalname", item.name.split("[")[0]),
+        )
+    )
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--update-rules",
+        action="store_true",
+        default=False,
+        help="Store updated rule output as static references: rules already stored as reference"
+        "are updated and new ones are added.",
+    )
+
+
+@pytest.fixture(name="created_host")
+def fixture_host(
+    dashboard_page: MainDashboard, request: pytest.FixtureRequest, test_site: Site
+) -> Iterator[HostDetails]:
+    """Create a host and delete it after the test.
+
+    This fixture uses indirect pytest parametrization to define host details.
+    """
+    host_details = request.param
+    add_host_page = AddHost(dashboard_page.page)
+    add_host_page.create_host(host_details, test_site)
+    yield host_details
+    setup_host_page = SetupHost(dashboard_page.page)
+    setup_host_page.select_hosts([host_details.name])
+    setup_host_page.delete_selected_hosts()
+    setup_host_page.activate_changes(test_site)
+
+
+@pytest.fixture(name="agent_dump_hosts", scope="module")
+def _create_hosts_using_data_from_agent_dump(test_site: Site) -> Iterator:
+    """Create hosts which will use data from agent dump.
+
+    Copy the agent dump to the test site, create a rule to read agent-output data from it,
+    then add hosts and wait for services update. Create 3 hosts using linux agent dump and one
+    host using windows dump. Delete all the created objects at the end of the session.
+    """
+    python_script_name = "generate_windows_and_linux_dumps.py"
+    python_script_path = repo_path() / "tests/scripts" / python_script_name
+    test_site_dump_path = test_site.path("var/check_mk/dumps")
+    data_source_dump_path = repo_path() / "tests" / "system" / "gui" / "data"
+    faker = Faker()
+
+    rule_id: str | None = None
+    created_hosts_list: list[str] = []
+    try:
+        logger.info("Create a folder '%s' for dumps inside test site", test_site_dump_path)
+        if not test_site.is_dir(test_site_dump_path):
+            test_site.makedirs(test_site_dump_path)
+
+        logger.info("Create a rule to read agent-output data from file")
+        rule_id = test_site.openapi.rules.create(
+            ruleset_name="datasource_programs",
+            value=f"python3 {test_site_dump_path}/{python_script_name} {test_site_dump_path}/<HOST>",
+        )
+
+        assert (
+            run(
+                ["cp", "-f", str(python_script_path), str(test_site_dump_path)],
+                sudo=True,
+            ).returncode
+            == 0
+        ), f"Error copying '{python_script_path}' file"
+
+        dump_path_to_host_name_dict = defaultdict(list)
+
+        for dump_path in data_source_dump_path.iterdir():
+            if "linux" in dump_path.name:  # noqa: SIM108
+                hosts_count = 3
+            else:
+                hosts_count = 1
+            for _ in range(hosts_count):
+                host_name = faker.unique.hostname()
+                logger.info("Copy a dump to the new folder")
+                assert (
+                    run(
+                        ["cp", "-f", str(dump_path), f"{test_site_dump_path}/{host_name}"],
+                        sudo=True,
+                    ).returncode
+                    == 0
+                ), f"Error copying '{dump_path}' file"
+                dump_path_to_host_name_dict[dump_path.name].append(host_name)
+
+        created_hosts_list = [
+            value for sublist in dump_path_to_host_name_dict.values() for value in sublist
+        ]
+        hosts_dict = [
+            {
+                "host_name": host_name,
+                "folder": "/",
+                "attributes": {
+                    "ipaddress": LOCALHOST_IPV4,
+                    "tag_agent": "cmk-agent",
+                },
+            }
+            for host_name in created_hosts_list
+        ]
+
+        logger.info("Creating hosts...")
+        test_site.openapi.hosts.bulk_create(hosts_dict)
+
+        logger.info("Discovering services and waiting for completion...")
+        test_site.openapi.service_discovery.run_bulk_discovery_and_wait_for_completion(
+            created_hosts_list
+        )
+        test_site.openapi.changes.activate_and_wait_for_completion()
+
+        logger.info("Schedule the 'Check_MK' service")
+        for host_name in created_hosts_list:
+            test_site.reschedule_services(host_name, 3, strict=False)
+
+        yield dump_path_to_host_name_dict
+    finally:
+        if is_cleanup_enabled():
+            logger.info("Clean up: delete the host(s) and the rule")
+            test_site.openapi.hosts.bulk_delete(created_hosts_list, ignore_missing=True)
+            if rule_id is not None:
+                test_site.openapi.rules.delete(rule_id)
+            test_site.openapi.changes.activate_and_wait_for_completion()
+            test_site.delete_dir(test_site_dump_path)
+
+
+@pytest.fixture(name="linux_hosts", scope="module")
+def fixture_linux_hosts(agent_dump_hosts: dict[str, list]) -> list[str]:
+    """Return the list of linux hosts created using agent dump."""
+    return agent_dump_hosts["linux-2.4.0-2024.08.27"]
+
+
+@pytest.fixture(name="windows_hosts", scope="module")
+def fixture_windows_hosts(agent_dump_hosts: dict[str, list]) -> list[str]:
+    """Return the list of windows hosts created using agent dump."""
+    return agent_dump_hosts["windows-2.3.0p10"]
+
+
+@pytest.fixture(name="configured_host")
+def fixture_configured_host(test_site: Site) -> Iterator[str]:
+    """Return the name of a host that exists in the configuration, without any agent data."""
+    with create_host(test_site, _unique_faker.hostname()) as host_name:
+        yield host_name
+
+
+@pytest.fixture(name="notification_host")
+def fixture_notification_host(test_site: Site) -> Iterator[NotificationTarget]:
+    """Return a host with a service whose state the test controls."""
+    with create_notification_host(test_site, _unique_faker.hostname()) as notification_host:
+        yield notification_host
+
+
+@pytest.fixture(name="email_manager", scope="session")
+def _email_manager() -> Iterator[EmailManager]:
+    """Create EmailManager instance.
+
+    EmailManager handles setting up and tearing down Postfix SMTP-server, which is configured
+    to redirect emails to a local Maildir. It also provides methods to check and wait for emails.
+    """
+    with EmailManager() as email_manager:
+        yield email_manager
+
+
+def _create_bulk_hosts(
+    site: Site, num_hosts: int, test_site: Site, activate: bool = False
+) -> Iterator[list[dict[str, Any]]]:
+    """Helper function to create hosts in bulk on the specified site.
+
+    Args:
+        site: The test site where hosts will be created. Could be central or remote.
+        num_hosts: Number of hosts to create.
+        test_site: The fixture for central test site.
+        activate: Whether to activate changes after host creation.
+
+    Yields:
+        List of the hosts that been created.
+    """
+    faker = Faker()
+
+    hosts_list = [faker.unique.hostname() for _ in range(num_hosts)]
+    entries = [
+        {
+            "host_name": host,
+            "folder": "/",
+            "attributes": {
+                "ipaddress": LOCALHOST_IPV4,
+                "site": site.id,
+                "tag_agent": "no-agent",
+            },
+        }
+        for host in hosts_list
+    ]
+
+    try:
+        created_hosts = test_site.openapi.hosts.bulk_create(entries=entries, bake_agent=False)
+        if activate:
+            test_site.openapi.changes.activate_and_wait_for_completion()
+
+        yield created_hosts
+    finally:
+        test_site.openapi.hosts.bulk_delete(hosts_list, ignore_missing=True)
+        test_site.openapi.changes.activate_and_wait_for_completion()
+
+
+@pytest.fixture(name="bulk_create_hosts_central_site")
+def fixture_bulk_create_hosts_central_site(
+    request: pytest.FixtureRequest, test_site: Site
+) -> Iterator[list[dict[str, Any]]]:
+    """Create hosts in bulk on test_site, parametrized by number."""
+    if isinstance(request.param, tuple):
+        num_hosts, activate = request.param
+    else:
+        num_hosts = int(request.param)
+        activate = False
+    yield from _create_bulk_hosts(test_site, num_hosts, test_site, activate)
+
+
+@pytest.fixture(name="bulk_create_hosts_remote_site")
+def fixture_bulk_create_hosts_remote_site(
+    request: pytest.FixtureRequest, remote_site_wato_disabled: Site, test_site: Site
+) -> Iterator[list[dict[str, Any]]]:
+    """Create hosts in bulk on remote_site, parametrized by number."""
+    if isinstance(request.param, tuple):
+        num_hosts, activate = request.param
+    else:
+        num_hosts = int(request.param)
+        activate = False
+    yield from _create_bulk_hosts(remote_site_wato_disabled, num_hosts, test_site, activate)

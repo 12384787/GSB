@@ -1,0 +1,487 @@
+// Copyright (C) 2026 Checkmk GmbH
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::config::defines::keys;
+use crate::config::yaml::{Get, Yaml};
+use crate::types::{DescriptorSid, InstanceAlias, InstanceName, ServiceName, ServiceType, Sid};
+
+#[derive(PartialEq, Debug, Clone)]
+pub struct Descriptor {
+    service_name: ServiceName,
+    service_type: Option<ServiceType>,
+    instance_name: Option<InstanceName>,
+    sid: Option<DescriptorSid>,
+}
+
+#[derive(PartialEq, Debug, Clone)]
+pub enum TargetId {
+    Descriptor(Descriptor),
+    Sid(Sid),
+    Alias(InstanceAlias),
+}
+
+impl TargetId {
+    pub fn service_name(&self) -> Option<&ServiceName> {
+        match self {
+            TargetId::Descriptor(descriptor) => Some(&descriptor.service_name),
+            _ => None,
+        }
+    }
+
+    pub fn instance_name(&self) -> Option<&InstanceName> {
+        match self {
+            TargetId::Descriptor(descriptor) => descriptor.instance_name.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn descriptor_sid(&self) -> Option<&DescriptorSid> {
+        match self {
+            TargetId::Descriptor(descriptor) => descriptor.sid.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn service_type(&self) -> Option<&ServiceType> {
+        match self {
+            TargetId::Descriptor(descriptor) => descriptor.service_type.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn standalone_sid(&self) -> Option<&Sid> {
+        match self {
+            TargetId::Sid(sid) => Some(sid),
+            _ => None,
+        }
+    }
+
+    pub fn raw_sid(&self) -> Option<&str> {
+        match self {
+            TargetId::Sid(sid) => Some(sid.as_ref()),
+            TargetId::Descriptor(d) => {
+                let s = &d.sid;
+                s.as_ref().map(<&str>::from)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn alias(&self) -> Option<&InstanceAlias> {
+        match self {
+            TargetId::Alias(alias) => Some(alias),
+            _ => None,
+        }
+    }
+
+    pub fn display_name(&self) -> String {
+        match &self {
+            TargetId::Alias(alias) => alias.to_string(),
+            TargetId::Sid(sid) => sid.to_string(),
+            TargetId::Descriptor(descriptor) => descriptor
+                .instance_name
+                .as_ref()
+                .map_or_else(|| descriptor.service_name.to_string(), ToString::to_string),
+        }
+    }
+
+    /// Whether both targets name the same thing, ignoring case: an operator may
+    /// write `service_name: PROD` in one place and `prod` in another, and yaml
+    /// upper-cases only a sid and an instance_name.
+    ///
+    /// Compares every identifying field, `service_type` included, so it is as
+    /// strict as `PartialEq` apart from case.
+    pub fn eq_ignore_case(&self, other: &Self) -> bool {
+        match (self, other) {
+            (TargetId::Sid(a), TargetId::Sid(b)) => same_text(a, b),
+            (TargetId::Alias(a), TargetId::Alias(b)) => same_text(a, b),
+            (TargetId::Descriptor(a), TargetId::Descriptor(b)) => {
+                same_text(&a.service_name, &b.service_name)
+                    && same_name(a.service_type.as_ref(), b.service_type.as_ref())
+                    && same_name(a.instance_name.as_ref(), b.instance_name.as_ref())
+                    && same_name(a.sid.as_ref(), b.sid.as_ref())
+            }
+            _ => false,
+        }
+    }
+
+    /// returns None if no target information is found in the yaml, otherwise returns a TargetId
+    pub fn from_yaml(yaml: &Yaml) -> anyhow::Result<Option<Self>> {
+        if yaml.is_badvalue() {
+            return Ok(None);
+        }
+
+        let conn = {
+            let c = yaml.get(keys::CONNECTION);
+            if c.is_badvalue() {
+                None
+            } else {
+                Some(c)
+            }
+        };
+
+        let service_name = TargetId::get_string(keys::SERVICE_NAME, yaml, conn)
+            .as_deref()
+            .map(ServiceName::from);
+        let service_type =
+            TargetId::get_string(keys::SERVICE_TYPE, yaml, conn).map(ServiceType::from);
+        let instance_name = TargetId::get_string(keys::INSTANCE_NAME, yaml, conn)
+            .as_deref()
+            .map(InstanceName::from);
+        let sid = TargetId::get_string(keys::SID, yaml, conn)
+            .and_then(|s| resolve_env_ref(&s))
+            .and_then(|s| s.to_uppercase().into());
+        let alias = yaml
+            .get_string(keys::ALIAS)
+            .and_then(|s| resolve_env_ref(&s))
+            .map(InstanceAlias::from);
+
+        let result = TargetIdBuilder::new()
+            .service_name(service_name.as_ref())
+            .service_type(service_type.as_ref())
+            .instance_name(instance_name.as_ref())
+            .sid(sid.as_deref())
+            .alias(alias.as_ref())
+            .build();
+        Ok(result)
+    }
+    /// Gets a string value from the primary YAML, falling back to the backup YAML if the key is not found in the primary.
+    /// This API is mandatory to support backward compatibility with old configs where connection
+    /// contains also target information. It should be used for all target related keys that can be defined in both places.
+    fn get_string(name: &str, main: &Yaml, fallback: Option<&Yaml>) -> Option<String> {
+        main.get_string(name)
+            .or_else(|| fallback.and_then(|bk| bk.get_string(name)))
+    }
+}
+
+/// Whether two names are the same, ignoring case.
+fn same_text<A: ToString, B: ToString>(a: &A, b: &B) -> bool {
+    a.to_string().to_lowercase() == b.to_string().to_lowercase()
+}
+
+/// Whether two optional names are the same, ignoring case. Two absent names are
+/// the same; one absent and one set are not.
+fn same_name<A: ToString, B: ToString>(a: Option<&A>, b: Option<&B>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => same_text(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// If `value` starts with `$`, treat it as an env var reference and resolve it.
+/// Returns `None` if the env var is not set, otherwise returns the resolved value.
+/// Non-env-ref values are returned as-is.
+pub fn resolve_env_ref(value: &str) -> Option<String> {
+    if let Some(var_name) = value.strip_prefix('$') {
+        match std::env::var(var_name) {
+            Ok(v) if !v.is_empty() => Some(v),
+            _ => {
+                log::info!("env var ${var_name} not set, treating as absent");
+                None
+            }
+        }
+    } else {
+        Some(value.to_string())
+    }
+}
+
+pub struct TargetIdBuilder {
+    service_name: Option<ServiceName>,
+    sid: Option<String>,
+    alias: Option<InstanceAlias>,
+    instance_name: Option<InstanceName>,
+    service_type: Option<ServiceType>,
+}
+
+/// The builder pattern is used to create a TargetId from various optional fields.
+/// The priority for determining the TargetId type is as follows:
+/// Alias -> ServiceName -> Sid -> NoId
+impl TargetIdBuilder {
+    pub fn new() -> Self {
+        Self {
+            service_name: None,
+            sid: None,
+            alias: None,
+            instance_name: None,
+            service_type: None,
+        }
+    }
+    pub fn service_name(mut self, service_name: Option<&ServiceName>) -> Self {
+        self.service_name = service_name.cloned();
+        self
+    }
+
+    pub fn sid(mut self, sid: Option<&str>) -> Self {
+        self.sid = sid.map(|s| s.to_string());
+        self
+    }
+
+    /// Top priority, if alias is set, it will be used as TargetId,
+    /// otherwise the builder will check for service_name and sid to determine the TargetId type.
+    pub fn alias(mut self, alias: Option<&InstanceAlias>) -> Self {
+        self.alias = alias.cloned();
+        self
+    }
+
+    pub fn instance_name(mut self, instance_name: Option<&InstanceName>) -> Self {
+        self.instance_name = instance_name.cloned();
+        self
+    }
+    pub fn service_type(mut self, service_type: Option<&ServiceType>) -> Self {
+        self.service_type = service_type.cloned();
+        self
+    }
+
+    pub fn build(self) -> Option<TargetId> {
+        if let Some(alias) = self.alias {
+            return Some(TargetId::Alias(alias));
+        }
+
+        if let Some(service_name) = self.service_name {
+            return Some(TargetId::Descriptor(Descriptor {
+                service_name,
+                service_type: self.service_type,
+                instance_name: self.instance_name,
+                sid: self.sid.map(DescriptorSid::from),
+            }));
+        }
+
+        self.sid.map(|sid| TargetId::Sid(Sid::from(sid)))
+    }
+}
+
+impl Default for TargetIdBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::yaml::test_tools::create_yaml;
+    use crate::types::Sid;
+
+    #[test]
+    fn test_default() {
+        assert!(TargetIdBuilder::default().build().is_none());
+    }
+
+    #[test]
+    fn test_eq_ignore_case_compares_every_field() {
+        let sid = |s: &str| TargetId::Sid(Sid::from(s));
+        assert!(sid("XE").eq_ignore_case(&sid("xe")));
+        assert!(!sid("XE").eq_ignore_case(&sid("XE2")));
+
+        let alias = |s: &str| TargetId::Alias(InstanceAlias::from(s.to_string()));
+        assert!(alias("My_Alias").eq_ignore_case(&alias("my_alias")));
+
+        // Variants never match across kinds, whatever the name.
+        assert!(!sid("XE").eq_ignore_case(&alias("xe")));
+
+        let descriptor = |service: &str, instance: Option<&str>| {
+            TargetId::Descriptor(create_descriptor(service, instance, None))
+        };
+        assert!(descriptor("SRV", Some("INST")).eq_ignore_case(&descriptor("srv", Some("inst"))));
+        // A field set on one side only is a different target.
+        assert!(!descriptor("srv", Some("inst")).eq_ignore_case(&descriptor("srv", None)));
+        assert!(!descriptor("a", None).eq_ignore_case(&descriptor("b", None)));
+    }
+
+    fn create_descriptor(
+        service_name: &str,
+        instance_name: Option<&str>,
+        sid: Option<&str>,
+    ) -> Descriptor {
+        Descriptor {
+            service_name: ServiceName::from(service_name),
+            service_type: None,
+            instance_name: instance_name.map(InstanceName::from),
+            sid: sid.map(DescriptorSid::from),
+        }
+    }
+
+    #[test]
+    fn test_service_name_from_descriptor() {
+        let descriptor = create_descriptor("my_service", None, None);
+        let target_id = TargetId::Descriptor(descriptor);
+
+        assert_eq!(
+            target_id.service_name().map(|s| s.to_string()),
+            Some("my_service".to_string())
+        );
+    }
+
+    #[test]
+    fn test_service_name_from_sid() {
+        let target_id = TargetId::Sid(Sid::from("ORCL"));
+        assert!(target_id.service_name().is_none());
+    }
+
+    #[test]
+    fn test_service_name_from_alias() {
+        let target_id = TargetId::Alias(InstanceAlias::from("my_alias".to_string()));
+        assert!(target_id.service_name().is_none());
+    }
+
+    #[test]
+    fn test_instance_name_from_descriptor_with_instance() {
+        let descriptor = create_descriptor("service", Some("instance"), None);
+        let target_id = TargetId::Descriptor(descriptor);
+
+        assert_eq!(
+            target_id.instance_name().map(|s| s.to_string()),
+            Some("INSTANCE".to_string())
+        );
+    }
+
+    #[test]
+    fn test_instance_name_from_descriptor_without_instance() {
+        let descriptor = create_descriptor("service", None, None);
+        let target_id = TargetId::Descriptor(descriptor);
+
+        assert!(target_id.instance_name().is_none());
+    }
+
+    #[test]
+    fn test_instance_name_from_non_descriptor() {
+        assert!(TargetId::Sid(Sid::from("ORCL")).instance_name().is_none());
+        assert!(TargetId::Alias(InstanceAlias::from("alias".to_string()))
+            .instance_name()
+            .is_none());
+    }
+
+    #[test]
+    fn test_sid_from_descriptor_with_sid() {
+        let descriptor = create_descriptor("service", None, Some("ORCL"));
+        let target_id = TargetId::Descriptor(descriptor);
+
+        assert_eq!(
+            target_id.descriptor_sid().map(|s| s.to_string()),
+            Some("ORCL".to_string())
+        );
+        assert!(target_id.standalone_sid().is_none());
+    }
+
+    #[test]
+    fn test_sid_from_descriptor_without_sid() {
+        let descriptor = create_descriptor("service", None, None);
+        let target_id = TargetId::Descriptor(descriptor);
+
+        assert!(target_id.descriptor_sid().is_none());
+        assert!(target_id.standalone_sid().is_none());
+    }
+
+    #[test]
+    fn test_sid_from_sid() {
+        let target_id = TargetId::Sid(Sid::from("ORCL"));
+        assert_eq!(
+            target_id.standalone_sid().map(|s| s.to_string()),
+            Some("ORCL".to_string())
+        );
+        assert!(target_id.descriptor_sid().is_none());
+    }
+
+    #[test]
+    fn test_sid_from_alias() {
+        let target_id = TargetId::Alias(InstanceAlias::from("alias".to_string()));
+        assert!(target_id.standalone_sid().is_none());
+        assert!(target_id.descriptor_sid().is_none());
+    }
+
+    #[test]
+    fn test_alias_from_alias() {
+        let target_id = TargetId::Alias(InstanceAlias::from("my_alias".to_string()));
+        assert_eq!(
+            target_id.alias().map(|s| s.to_string()),
+            Some("my_alias".to_string())
+        );
+    }
+
+    #[test]
+    fn test_alias_from_non_alias() {
+        let descriptor = create_descriptor("service", None, None);
+        assert!(TargetId::Descriptor(descriptor).alias().is_none());
+        assert!(TargetId::Sid(Sid::from("ORCL")).alias().is_none());
+    }
+
+    mod data {
+
+        pub const CONNECTION_FULL: &str = r#"
+connection:
+  hostname: "alice"
+  port: 9999
+  timeout: 341
+  tns_admin: "/path/to/oracle/config/files/" # optional, default: agent plugin config folder. Points to the location of sqlnet.ora and tnsnames.ora
+  oracle_local_registry: "/etc/oracle/olr.loc" # optional, default: folder of oracle configuration files like oratab
+  # not defined in docu, reserved for a future use
+  service_name: service_NAME  #
+  service_type: dedicated # dedicated or shared
+  instance_name: instance_NAME
+  engine: std
+"#;
+
+        pub const CONNECTION_WITH_SID: &str = r#"
+connection:
+  hostname: "localhost"
+  port: 1521
+  sid: FREE
+"#;
+
+        pub const CONNECTION_WITH_LOWERCASE_SID: &str = r#"
+connection:
+  hostname: "localhost"
+  port: 1521
+  sid: free
+"#;
+    }
+
+    #[test]
+    fn test_target_full() {
+        assert_eq!(
+            TargetId::from_yaml(&create_yaml(data::CONNECTION_FULL))
+                .unwrap()
+                .unwrap(),
+            TargetIdBuilder::new()
+                .service_name(Some(&ServiceName::from("service_NAME")))
+                .service_type(Some(&ServiceType::from("dedicated")))
+                .instance_name(Some(&InstanceName::from("instance_NAME")))
+                .build()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_target_with_only_sid() {
+        let target = TargetId::from_yaml(&create_yaml(data::CONNECTION_WITH_SID))
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.standalone_sid(), Some(&Sid::from("FREE")));
+        assert_eq!(target.service_name(), None);
+        assert_eq!(target.instance_name(), None);
+    }
+
+    /// SIDs are case-insensitive in Oracle; `from_yaml` upper-cases them so a config
+    /// value and the process-detected SID resolve to the same instance.
+    #[test]
+    fn test_target_sid_is_uppercased() {
+        let target = TargetId::from_yaml(&create_yaml(data::CONNECTION_WITH_LOWERCASE_SID))
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.standalone_sid(), Some(&Sid::from("FREE")));
+    }
+}

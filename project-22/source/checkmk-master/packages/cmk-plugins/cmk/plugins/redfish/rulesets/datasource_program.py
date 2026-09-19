@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+# Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+"""rule for assigning the special agent to host objects"""
+
+# mypy: disable-error-code="type-arg"
+
+from collections.abc import Mapping
+
+from cmk.plugins.redfish.lib import REDFISH_SECTIONS
+from cmk.rulesets.v1 import Help, Title
+from cmk.rulesets.v1.form_specs import (
+    CascadingSingleChoice,
+    CascadingSingleChoiceElement,
+    DefaultValue,
+    DictElement,
+    Dictionary,
+    FixedValue,
+    Integer,
+    Password,
+    SingleChoice,
+    SingleChoiceElement,
+    String,
+    TimeMagnitude,
+    TimeSpan,
+    validators,
+)
+from cmk.rulesets.v1.rule_specs import SpecialAgent, Topic
+
+
+def _auth_elements() -> Mapping[str, DictElement]:
+    return {
+        "user": DictElement(
+            parameter_form=String(
+                title=Title("Username"),
+            ),
+            required=True,
+        ),
+        "password": DictElement(
+            parameter_form=Password(
+                title=Title("Password"),
+            ),
+            required=True,
+        ),
+    }
+
+
+def _connection_elements() -> Mapping[str, DictElement]:
+    return {
+        "port": DictElement(
+            required=True,
+            parameter_form=Integer(
+                title=Title("TCP Port"),
+                help_text=Help("Port number for connection to the REST API. Usually 443 (TLS)"),
+                prefill=DefaultValue(443),
+                custom_validate=(validators.NetworkPort(),),
+            ),
+        ),
+        "proto": DictElement(
+            required=True,
+            parameter_form=SingleChoice(
+                title=Title("Protocol"),
+                prefill=DefaultValue("https"),
+                help_text=Help("Protocol for the connection to the REST API."),
+                elements=[
+                    SingleChoiceElement(
+                        name="https",
+                        title=Title("https"),
+                    ),
+                    SingleChoiceElement(
+                        name="http",
+                        title=Title("http (insecure)"),
+                    ),
+                ],
+            ),
+        ),
+        "retries": DictElement(
+            required=True,
+            parameter_form=Integer(
+                title=Title("Number of connection retries"),
+                help_text=Help("Number of retry attempts made by the special agent."),
+                prefill=DefaultValue(2),
+                custom_validate=(validators.NumberInRange(min_value=1, max_value=20),),
+            ),
+        ),
+        "timeout": DictElement(
+            required=True,
+            parameter_form=TimeSpan(
+                title=Title("Timeout for connection"),
+                help_text=Help(
+                    "Number of seconds for a single connection attempt before it times out."
+                ),
+                prefill=DefaultValue(3.0),
+                displayed_magnitudes=(TimeMagnitude.SECOND,),
+                custom_validate=(validators.NumberInRange(min_value=1, max_value=90),),
+            ),
+        ),
+    }
+
+
+def migrate_redfish_common(data: object) -> Mapping[str, object]:
+    """Add the defaults for the now mandatory fields"""
+    if not isinstance(data, Mapping):
+        raise TypeError(data)
+    return {
+        "user": data["user"],
+        "password": data["password"],
+        "port": data.get("port", 443),
+        "proto": p if isinstance(p := data.get("proto", "https"), str) else p[0],
+        "retries": data.get("retries", 2),
+        "timeout": float(data.get("timeout", 3.0)),
+    }
+
+
+def _valuespec_special_agents_redfish_power() -> Dictionary:
+    return Dictionary(
+        title=Title("Redfish compatible power equipment (PDU)"),
+        elements={
+            **_auth_elements(),
+            **_connection_elements(),
+        },
+        migrate=migrate_redfish_common,
+    )
+
+
+rule_spec_redfish_power_datasource_programs = SpecialAgent(
+    name="redfish_power",
+    title=Title("Redfish compatible power equipment (PDU)"),
+    topic=Topic.SERVER_HARDWARE,
+    parameter_form=_valuespec_special_agents_redfish_power,
+    help_text=Help(
+        "This rule configures the Redfish integration to query PDUs via the Redfish REST API."
+    ),
+)
+
+
+def _fetching_settings() -> DictElement:
+    return DictElement(
+        required=False,
+        parameter_form=Dictionary(
+            title=Title("Fetching setting for individual sections"),
+            help_text=Help(
+                "If sections cannot be fetched or take a long time, you can configure them to be fetched"
+                " not as often or not at all."
+            ),
+            elements={
+                s.name: DictElement(
+                    required=True,
+                    parameter_form=CascadingSingleChoice(
+                        title=s.title,
+                        prefill=DefaultValue("always"),
+                        elements=[
+                            CascadingSingleChoiceElement(
+                                name="always",
+                                title=Title("Always"),
+                                parameter_form=FixedValue(value=0.0),
+                            ),
+                            CascadingSingleChoiceElement(
+                                name="cached",
+                                title=Title("Cache this section"),
+                                parameter_form=TimeSpan(
+                                    displayed_magnitudes=(
+                                        TimeMagnitude.MINUTE,
+                                        TimeMagnitude.HOUR,
+                                    )
+                                ),
+                            ),
+                            CascadingSingleChoiceElement(
+                                name="never",
+                                title=Title("Never"),
+                                parameter_form=FixedValue(value=-1.0),
+                            ),
+                        ],
+                    ),
+                )
+                for s in REDFISH_SECTIONS
+            },
+        ),
+    )
+
+
+def _system_retry_settings() -> DictElement:
+    return DictElement(
+        required=False,
+        parameter_form=Dictionary(
+            title=Title("Retry fetching system data"),
+            help_text=Help(
+                "Some management controllers intermittently fail the central "
+                "'/redfish/v1/Systems' request (e.g. HTTP 503 or 404). Without a retry the "
+                "system-related services (CPUs, memory, storage, drives, volumes, network "
+                "interfaces) would briefly disappear. The special agent retries this request "
+                "and, if it still fails, aborts the run so the previously monitored data is "
+                "kept instead of dropping those services. Setting the number of retries to 0 "
+                "disables retrying (abort immediately)."
+            ),
+            elements={
+                "count": DictElement(
+                    required=True,
+                    parameter_form=Integer(
+                        title=Title("Number of retries"),
+                        prefill=DefaultValue(3),
+                        custom_validate=(validators.NumberInRange(min_value=0, max_value=10),),
+                    ),
+                ),
+                "delay": DictElement(
+                    required=True,
+                    parameter_form=TimeSpan(
+                        title=Title("Delay between retries"),
+                        prefill=DefaultValue(2.0),
+                        displayed_magnitudes=(TimeMagnitude.SECOND,),
+                        custom_validate=(validators.NumberInRange(min_value=0, max_value=30),),
+                    ),
+                ),
+            },
+        ),
+    )
+
+
+def migrate_redfish(data: object) -> Mapping[str, object]:
+    if not isinstance(data, Mapping):
+        raise TypeError(data)
+    if "fetching" in data:
+        existing_fetching = {s.name: ("always", 0.0) for s in REDFISH_SECTIONS}
+        existing_fetching.update(data["fetching"])
+        result = {**data, "fetching": existing_fetching}
+        result.pop("debug", None)
+        return result
+
+    enabled_sections = data.get("sections", [s.name for s in REDFISH_SECTIONS])
+    disabled_sections = data.get("disabled_sections", ())
+    cached_sections = [
+        (name.removeprefix("cache_time_"), interval)
+        for name, interval in data.get("cached_sections", {}).items()
+    ]
+
+    fetching = {
+        **dict.fromkeys(enabled_sections, ("always", 0.0)),
+        **dict.fromkeys(disabled_sections, ("never", -1.0)),
+        **{n: ("cached", float(i)) for n, i in cached_sections},
+    }
+    return {
+        **migrate_redfish_common(data),
+        **(
+            {}
+            if all(mode == "always" for (mode, _) in fetching.values())
+            else {"fetching": fetching}
+        ),
+        **({"system_retry": data["system_retry"]} if "system_retry" in data else {}),
+    }
+
+
+def _valuespec_special_agents_redfish() -> Dictionary:
+    return Dictionary(
+        title=Title("Redfish compatible management controller"),
+        elements={
+            **_auth_elements(),
+            "fetching": _fetching_settings(),
+            "system_retry": _system_retry_settings(),
+            **_connection_elements(),
+        },
+        migrate=migrate_redfish,
+    )
+
+
+rule_spec_redfish_datasource_programs = SpecialAgent(
+    name="redfish",
+    title=Title("Redfish compatible management controller"),
+    topic=Topic.SERVER_HARDWARE,
+    parameter_form=_valuespec_special_agents_redfish,
+    help_text=Help(
+        "This rule configures the Redfish integration to query a management controller via the Redfish REST API."
+    ),
+)

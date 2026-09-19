@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+
+from collections.abc import Mapping
+from typing import Any
+
+from cmk.agent_based.v2 import (
+    check_levels,
+    CheckPlugin,
+    CheckResult,
+    DiscoveryResult,
+    InventoryPlugin,
+    render,
+)
+from cmk.plugins.azure_v2.agent_based.lib import (
+    check_connections,
+    check_cpu,
+    check_memory,
+    CheckFunctionWithoutItem,
+    create_check_metrics_function_single,
+    create_discover_by_metrics_function,
+    create_discover_by_metrics_function_single,
+    create_inventory_function,
+    MetricData,
+    Resource,
+)
+
+DB_MYSQL_RESOURCE_TYPES = ["Microsoft.DBforMySQL/servers", "Microsoft.DBforMySQL/flexibleServers"]
+
+
+inventory_plugin_azure_mysql = InventoryPlugin(
+    name="azure_v2_mysql",
+    sections=["azure_v2_servers"],
+    inventory_function=create_inventory_function(),
+)
+
+
+def discover_azure_mysql_memory(section: Resource) -> DiscoveryResult:
+    yield from create_discover_by_metrics_function(
+        "average_memory_percent", resource_types=DB_MYSQL_RESOURCE_TYPES
+    )({"Memory": section})
+
+
+def check_azure_mysql_memory(
+    item: str,  # noqa: ARG001
+    params: Mapping[str, object],
+    section: Resource,
+) -> CheckResult:
+    yield from check_memory()("Memory", params, {"Memory": section})
+
+
+check_plugin_azure_mysql_memory = CheckPlugin(
+    name="azure_v2_mysql_memory",
+    sections=["azure_v2_servers"],
+    service_name="Azure/DB for MySQL %s",
+    discovery_function=discover_azure_mysql_memory,
+    check_function=check_azure_mysql_memory,
+    check_ruleset_name="memory_utilization",
+    check_default_parameters={"levels": (80.0, 90.0)},
+)
+
+
+check_plugin_azure_mysql_cpu = CheckPlugin(
+    name="azure_v2_mysql_cpu",
+    sections=["azure_v2_servers"],
+    service_name="Azure/DB for MySQL CPU",
+    discovery_function=create_discover_by_metrics_function_single(
+        "average_cpu_percent", resource_types=DB_MYSQL_RESOURCE_TYPES
+    ),
+    check_function=check_cpu(),
+    check_ruleset_name="cpu_utilization",
+    check_default_parameters={"util": (65.0, 90.0)},
+)
+
+
+def discover_azure_mysql_replication(section: Resource) -> DiscoveryResult:
+    yield from create_discover_by_metrics_function(
+        "maximum_seconds_behind_master",  # single server metric name
+        "maximum_replication_lag",  # flexible server metric name
+        resource_types=DB_MYSQL_RESOURCE_TYPES,
+    )({"Replication": section})
+
+
+def check_replication() -> CheckFunctionWithoutItem:
+    return create_check_metrics_function_single(
+        [
+            MetricData(
+                "maximum_seconds_behind_master",  # single server metric name
+                "replication_lag",
+                "Replication lag",
+                render.timespan,
+                upper_levels_param="levels",
+            ),
+            MetricData(
+                "maximum_replication_lag",  # flexible server metric name
+                "replication_lag",
+                "Replication lag",
+                render.timespan,
+                upper_levels_param="levels",
+            ),
+        ]
+    )
+
+
+def check_azure_mysql_replication(
+    item: str,  # noqa: ARG001
+    params: Mapping[str, Any],
+    section: Resource,
+) -> CheckResult:
+    yield from check_replication()(params, section)
+
+
+check_plugin_azure_mysql_replication = CheckPlugin(
+    name="azure_v2_mysql_replication",
+    sections=["azure_v2_servers"],
+    service_name="Azure/DB for MySQL %s",
+    discovery_function=discover_azure_mysql_replication,
+    check_function=check_azure_mysql_replication,
+    check_ruleset_name="replication_lag",
+    check_default_parameters={"levels": (60, 600)},
+)
+
+check_plugin_azure_mysql_connections = CheckPlugin(
+    name="azure_v2_mysql_connections",
+    sections=["azure_v2_servers"],
+    service_name="Azure/DB for MySQL Connections",
+    discovery_function=create_discover_by_metrics_function_single(
+        "average_active_connections",
+        "total_connections_failed",  # single server metric name
+        "total_aborted_connections",  # flexible server metric name
+        resource_types=DB_MYSQL_RESOURCE_TYPES,
+    ),
+    check_function=check_connections(),
+    check_ruleset_name="azure_v2_database_connections",
+    check_default_parameters={"failed_connections": (1, 1)},
+)
+
+check_plugin_azure_mysql_network = CheckPlugin(
+    name="azure_v2_mysql_network",
+    sections=["azure_v2_servers"],
+    service_name="Azure/DB for MySQL Network",
+    discovery_function=create_discover_by_metrics_function_single(
+        "total_network_bytes_ingress",
+        "total_network_bytes_egress",
+        resource_types=DB_MYSQL_RESOURCE_TYPES,
+    ),
+    check_function=create_check_metrics_function_single(
+        [
+            MetricData(
+                "total_network_bytes_ingress",
+                "ingress",
+                "Network in",
+                render.bytes,
+                upper_levels_param="ingress_levels",
+            ),
+            MetricData(
+                "total_network_bytes_egress",
+                "egress",
+                "Network out",
+                render.bytes,
+                upper_levels_param="egress_levels",
+            ),
+        ],
+        check_levels=check_levels,
+    ),
+    check_ruleset_name="azure_v2_db_network",
+    check_default_parameters={},
+)
+
+
+check_plugin_azure_mysql_storage = CheckPlugin(
+    name="azure_v2_mysql_storage",
+    sections=["azure_v2_servers"],
+    service_name="Azure/DB for MySQL Storage",
+    discovery_function=create_discover_by_metrics_function_single(
+        "average_io_consumption_percent",
+        "average_serverlog_storage_percent",
+        "average_storage_percent",
+        resource_types=DB_MYSQL_RESOURCE_TYPES,
+    ),
+    check_function=create_check_metrics_function_single(
+        [
+            MetricData(
+                "average_io_consumption_percent",
+                "io_consumption_percent",
+                "IO",
+                render.percent,
+                upper_levels_param="io_consumption",
+            ),
+            MetricData(
+                "average_storage_percent",
+                "storage_percent",
+                "Storage",
+                render.percent,
+                upper_levels_param="storage",
+            ),
+            MetricData(
+                "average_serverlog_storage_percent",
+                "serverlog_storage_percent",
+                "Server log storage",
+                render.percent,
+                upper_levels_param="serverlog_storage",
+            ),
+        ],
+        check_levels=check_levels,
+    ),
+    check_ruleset_name="azure_v2_db_storage",
+    check_default_parameters={},
+)

@@ -1,0 +1,10 @@
+{
+  "number": 22,
+  "repository": "Checkmk/checkmk",
+  "url": "https://github.com/Checkmk/checkmk",
+  "description": "Checkmk - Best-in-class infrastructure & application monitoring",
+  "language": "Python",
+  "stars": 2368,
+  "default_branch": "main",
+  "source_zip_url": "https://github.com/Checkmk/checkmk/archive/refs/heads/main.zip"
+}

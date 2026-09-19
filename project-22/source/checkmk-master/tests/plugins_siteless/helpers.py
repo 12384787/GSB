@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="no-untyped-call"
+# mypy: disable-error-code="no-untyped-def"
+# mypy: disable-error-code="type-arg"
+
+import json
+import logging
+import os
+import pprint
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from pathlib import Path
+from typing import override
+
+import cmk.ccc.resulttype as result
+import cmk.utils.paths
+from cmk.base.checkers import (
+    CMKParser,
+    CMKSummarizer,
+    DiscoveryPluginMapper,
+    HostLabelPluginMapper,
+    SectionPluginMapper,
+)
+from cmk.ccc.exceptions import OnError
+from cmk.ccc.hostaddress import HostName
+from cmk.ccc.resulttype import OK
+from cmk.checkengine.checkerplugin import ConfiguredService
+from cmk.checkengine.discovery import ABCDiscoveryConfig, AutochecksStore, commandline_discovery
+from cmk.checkengine.fetcher_abc import Mode
+from cmk.checkengine.filecache import AgentFileCache, FileCacheMode, MaxAge
+from cmk.checkengine.helper_interface import SourceInfo
+from cmk.checkengine.parser import NO_SELECTION, ParserConfig
+from cmk.checkengine.plugins import AgentBasedPlugins, CheckPluginName
+from cmk.checkengine.specs.parameters import TimespecificParameters, TimespecificParameterSet
+from cmk.checkengine.submitters import FormattedSubmittee, Submitter
+from cmk.checkengine.summarize import SummaryConfig
+from cmk.piggyback.backend import Config as PiggybackConfig
+from cmk.ruleset_matcher.matcher import RulesetMatcher
+from cmk.utils.everythingtype import EVERYTHING
+from tests.testlib.common.repo import qa_test_data_path
+
+LOGGER = logging.getLogger(__name__)
+DATA_DIR = qa_test_data_path() / "plugins_siteless"
+DUMPS_DIR = DATA_DIR / "agent_data"
+SERVICES_STATES_DIR = DATA_DIR / "services_states"
+
+
+class BasicSubmitter(Submitter):
+    """Patches the submission of check results to the core.
+
+    Instead of submitting, we just store the results in an attribute for later use.
+    """
+
+    def __init__(self, hostname_: HostName) -> None:
+        super().__init__(hostname_, perfdata_format="standard", show_perfdata=True)
+        self.results: list[FormattedSubmittee] = []
+
+    @override
+    def _submit(self, formatted_submittees: Iterable[FormattedSubmittee]) -> None:
+        self.results.extend(formatted_submittees)
+
+
+def get_raw_data(dump_path: Path) -> OK:
+    agent_cache = AgentFileCache(
+        base_path=Path("/"),
+        relative_path_template=str(dump_path),
+        max_age=MaxAge.unlimited(),
+        simulation=False,
+        use_only_cache=True,
+        file_cache_mode=FileCacheMode.READ,
+    )
+
+    fetched_data = agent_cache.read(Mode.CHECKING)
+    assert fetched_data
+    LOGGER.debug("fetched_data: %s\n\n", fetched_data)
+    return result.OK(fetched_data)
+
+
+def parser(config: ParserConfig) -> CMKParser:
+    return CMKParser(
+        config=config,
+        selected_sections=NO_SELECTION,
+        keep_outdated=False,
+    )
+
+
+def summarizer(hostname_: HostName) -> CMKSummarizer:
+    def _summary_config(host_name: HostName, source_id: str) -> SummaryConfig:  # noqa: ARG001
+        return SummaryConfig(
+            exit_spec={},
+            piggyback_config=PiggybackConfig(host_name, ()),
+            expect_data=False,
+        )
+
+    return CMKSummarizer(
+        hostname_,
+        _summary_config,
+        override_non_ok_state=None,
+    )
+
+
+def get_agent_data_filenames() -> list[str]:
+    assert DUMPS_DIR.exists()
+    return [p for p in os.listdir(DUMPS_DIR) if os.path.isfile(os.path.join(DUMPS_DIR, p))]
+
+
+def store_services_states(
+    checks_result: list[FormattedSubmittee], services_states_filename: str
+) -> None:
+    services_states_dict = {
+        service.name: {"expected_state": service.state} for service in checks_result
+    }
+    services_states_path = SERVICES_STATES_DIR / (services_states_filename + ".json")
+    assert services_states_path.parent.exists()
+    services_states_path.write_text(json.dumps(services_states_dict, indent=2))
+
+
+def _load_expected_states(file_name: str) -> Mapping[str, int]:
+    services_states_path = SERVICES_STATES_DIR / f"{file_name}.json"
+    raw = json.loads(services_states_path.read_text())
+    return {str(k): int(v["expected_state"]) for k, v in raw.items()}
+
+
+def compare_services_states(
+    checks_result: list[FormattedSubmittee], services_states_filename: str
+) -> None:
+    expected_services_states = _load_expected_states(services_states_filename)
+    actual_states = {s.name: s.state for s in checks_result}
+    LOGGER.info(
+        "%s services executed. Services' states:\n%s",
+        len(checks_result),
+        pprint.pformat(actual_states),
+    )
+    LOGGER.debug(
+        "Services' details:\n%s", pprint.pformat({s.name: s.details for s in checks_result})
+    )
+    assert actual_states == expected_services_states, (
+        f"\nActual-states\n:"
+        f"{pprint.pformat(actual_states)}\n"
+        f"\nExpected-states:\n"
+        f"{pprint.pformat(expected_services_states)}\n"
+        f"\nDiff:\n"
+        f"{pprint.pformat(set(actual_states.items()) ^ set(expected_services_states.items()))}\n"
+    )
+
+
+class _EmptyDiscoveryConfig(ABCDiscoveryConfig):
+    @override
+    def __call__(
+        self, host_name: object, rule_set_name: object, rule_set_type: str
+    ) -> Mapping[str, object] | Sequence[Mapping[str, object]]:
+        return [] if rule_set_type == "all" else {}
+
+
+class _SitelessAutochecksConfig:
+    """Minimal AutochecksConfig for the siteless discovery: no disabled-services rules, no
+    clustering and no service labels are configured in this context."""
+
+    def __init__(
+        self,
+        check_plugin_ignored: Callable[[HostName, CheckPluginName], bool],
+        check_plugins,
+    ) -> None:
+        self._check_plugin_ignored = check_plugin_ignored
+        self._check_plugins = check_plugins
+
+    def ignore_plugin(self, host_name: HostName, plugin_name: CheckPluginName) -> bool:
+        return self._check_plugin_ignored(host_name, plugin_name)
+
+    def ignore_service(self, host_name, entry) -> bool:  # noqa: ARG002
+        return False
+
+    def effective_host(self, host_name: HostName, entry) -> HostName:  # noqa: ARG002
+        return host_name
+
+    def service_description(self, host_name, entry):  # noqa: ARG002
+        service_name = self._check_plugins[entry.check_plugin_name].service_name
+        return service_name if entry.item is None else service_name % entry.item
+
+    def service_labels(self, host_name, entry) -> Mapping[str, str]:  # noqa: ARG002
+        return {}
+
+
+def discover_services(
+    hostname: HostName,
+    agent_data_filename: str,
+    parser_config: ParserConfig,
+    ruleset_matcher: RulesetMatcher,
+    check_plugin_ignored: Callable[[HostName, CheckPluginName], bool],
+    agent_based_plugins: AgentBasedPlugins,
+    source_info: SourceInfo,
+) -> Sequence[ConfiguredService]:
+    def _fetcher():
+        return lambda *a, **ka: [(source_info, get_raw_data(DUMPS_DIR / agent_data_filename))]  # noqa: ARG005
+
+    commandline_discovery(
+        hostname,
+        clear_ruleset_matcher_caches=ruleset_matcher.clear_caches,
+        parser=parser(parser_config),
+        fetcher=_fetcher(),
+        section_plugins=SectionPluginMapper(
+            {**agent_based_plugins.agent_sections, **agent_based_plugins.snmp_sections}
+        ),
+        section_error_handling=lambda *a: "",  # noqa: ARG005
+        host_label_plugins=HostLabelPluginMapper(
+            discovery_config=_EmptyDiscoveryConfig(),
+            sections={
+                **agent_based_plugins.agent_sections,
+                **agent_based_plugins.snmp_sections,
+            },
+        ),
+        plugins=DiscoveryPluginMapper(
+            discovery_config=_EmptyDiscoveryConfig(),
+            check_plugins=agent_based_plugins.check_plugins,
+        ),
+        run_plugin_names=EVERYTHING,
+        autochecks_config=_SitelessAutochecksConfig(
+            check_plugin_ignored, agent_based_plugins.check_plugins
+        ),
+        enforced_services=frozenset(),
+        arg_only_new=False,
+        only_host_labels=False,
+        on_error=OnError.RAISE,
+        autochecks_dir=cmk.utils.paths.autochecks_dir,
+        discovered_host_labels_dir=cmk.utils.paths.discovered_host_labels_dir,
+    )
+
+    autochecks_store = AutochecksStore(hostname, cmk.utils.paths.autochecks_dir)
+    autochecks = autochecks_store.read()
+
+    discovered_services = [
+        ConfiguredService(
+            check_plugin_name=autocheck.check_plugin_name,
+            item=autocheck.item,
+            description=agent_based_plugins.check_plugins[autocheck.check_plugin_name].service_name
+            if autocheck.item is None
+            else agent_based_plugins.check_plugins[autocheck.check_plugin_name].service_name
+            % autocheck.item,
+            parameters=TimespecificParameters(
+                [
+                    TimespecificParameterSet.from_parameters(autocheck.parameters),
+                    TimespecificParameterSet.from_parameters(
+                        agent_based_plugins.check_plugins[
+                            autocheck.check_plugin_name
+                        ].check_default_parameters
+                        or {}
+                    ),
+                ]
+            ),
+            discovered_parameters=autocheck.parameters,
+            labels=autocheck.service_labels,
+            discovered_labels=autocheck.service_labels,
+            is_enforced=False,
+        )
+        for autocheck in autochecks
+    ]
+    LOGGER.info(
+        "%s services discovered:\n%s",
+        len(discovered_services),
+        pprint.pformat(sorted([str(service.description) for service in discovered_services])),
+    )
+    return discovered_services

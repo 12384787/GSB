@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+
+from collections.abc import Mapping
+from typing import Any
+
+from cmk.agent_based.v2 import (
+    CheckPlugin,
+    CheckResult,
+    DiscoveryResult,
+    SimpleSNMPSection,
+    SNMPTree,
+)
+from cmk.plugins.didactum.lib import (
+    check_didactum_sensors_humidity,
+    check_didactum_sensors_temp,
+    check_didactum_sensors_voltage,
+    DETECT_DIDACTUM,
+    discover_didactum_sensors,
+    parse_didactum_sensors,
+    Section,
+)
+from cmk.plugins.lib.temperature import TempParamType
+
+# .1.3.6.1.4.1.46501.5.2.1.5.201001 Onboard Temperature --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogName.201001
+# .1.3.6.1.4.1.46501.5.2.1.5.201002 Analog-1 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogName.201002
+# .1.3.6.1.4.1.46501.5.2.1.5.201003 Analog-2 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogName.201003
+# .1.3.6.1.4.1.46501.5.2.1.5.203001 Onboard Voltage DC --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogName.203001
+# .1.3.6.1.4.1.46501.5.2.1.6.201001 normal --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogState.201001
+# .1.3.6.1.4.1.46501.5.2.1.6.201002 normal --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogState.201002
+# .1.3.6.1.4.1.46501.5.2.1.6.201003 normal --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogState.201003
+# .1.3.6.1.4.1.46501.5.2.1.6.203001 normal --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogState.203001
+# .1.3.6.1.4.1.46501.5.2.1.7.201001 28.9 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogValue.201001
+# .1.3.6.1.4.1.46501.5.2.1.7.201002 22.8 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogValue.201002
+# .1.3.6.1.4.1.46501.5.2.1.7.201003 21.1 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogValue.201003
+# .1.3.6.1.4.1.46501.5.2.1.7.203001 12.4 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogValue.203001
+# .1.3.6.1.4.1.46501.5.2.1.10.201001 0.0 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogLowAlarm.201001
+# .1.3.6.1.4.1.46501.5.2.1.10.201002 13.0 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogLowAlarm.201002
+# .1.3.6.1.4.1.46501.5.2.1.10.201003 13.0 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogLowAlarm.201003
+# .1.3.6.1.4.1.46501.5.2.1.10.203001 9.0 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogLowAlarm.203001
+# .1.3.6.1.4.1.46501.5.2.1.11.201001 5.0 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogLowWarning.201001
+# .1.3.6.1.4.1.46501.5.2.1.11.201002 15.0 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogLowWarning.201002
+# .1.3.6.1.4.1.46501.5.2.1.11.201003 15.0 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogLowWarning.201003
+# .1.3.6.1.4.1.46501.5.2.1.11.203001 11.0 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogLowWarning.203001
+# .1.3.6.1.4.1.46501.5.2.1.12.201001 45.0 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogHighWarning.201001
+# .1.3.6.1.4.1.46501.5.2.1.12.201002 27.0 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogHighWarning.201002
+# .1.3.6.1.4.1.46501.5.2.1.12.201003 27.0 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogHighWarning.201003
+# .1.3.6.1.4.1.46501.5.2.1.12.203001 13.0 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogHighWarning.203001
+# .1.3.6.1.4.1.46501.5.2.1.13.201001 50.0 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogHighAlarm.201001
+# .1.3.6.1.4.1.46501.5.2.1.13.201002 29.0 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogHighAlarm.201002
+# .1.3.6.1.4.1.46501.5.2.1.13.201003 29.0 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogHighAlarm.201003
+# .1.3.6.1.4.1.46501.5.2.1.13.203001 14.0 --> DIDACTUM-SYSTEM-MIB::ctlInternalSensorsAnalogHighAlarm.203001
+
+
+snmp_section_didactum_sensors_analog = SimpleSNMPSection(
+    name="didactum_sensors_analog",
+    detect=DETECT_DIDACTUM,
+    fetch=SNMPTree(
+        base=".1.3.6.1.4.1.46501.5.2.1",
+        oids=["4", "5", "6", "7", "10", "11", "12", "13"],
+    ),
+    parse_function=parse_didactum_sensors,
+)
+
+
+def discover_didactum_sensors_analog_temp(section: Section) -> DiscoveryResult:
+    yield from discover_didactum_sensors(section, "temperature")
+
+
+def check_didactum_sensors_analog_temp(
+    item: str, params: TempParamType, section: Section
+) -> CheckResult:
+    yield from check_didactum_sensors_temp(
+        item, params, section, unique_name=f"didactum_sensors_analog_temp.{item}"
+    )
+
+
+check_plugin_didactum_sensors_analog = CheckPlugin(
+    name="didactum_sensors_analog",
+    service_name="Temperature %s",
+    discovery_function=discover_didactum_sensors_analog_temp,
+    check_function=check_didactum_sensors_analog_temp,
+    check_ruleset_name="temperature",
+    check_default_parameters={},
+)
+
+
+def discover_didactum_sensors_analog_humidity(section: Section) -> DiscoveryResult:
+    yield from discover_didactum_sensors(section, "humidity")
+
+
+def check_didactum_sensors_analog_humidity(
+    item: str, params: Mapping[str, Any], section: Section
+) -> CheckResult:
+    yield from check_didactum_sensors_humidity(item, params, section)
+
+
+check_plugin_didactum_sensors_analog_humidity = CheckPlugin(
+    name="didactum_sensors_analog_humidity",
+    service_name="Humidity %s",
+    sections=["didactum_sensors_analog"],
+    discovery_function=discover_didactum_sensors_analog_humidity,
+    check_function=check_didactum_sensors_analog_humidity,
+    check_ruleset_name="humidity",
+    check_default_parameters={},
+)
+
+
+def discover_didactum_sensors_analog_voltage(section: Section) -> DiscoveryResult:
+    yield from discover_didactum_sensors(section, "voltage")
+
+
+def check_didactum_sensors_analog_voltage(
+    item: str, params: Mapping[str, Any], section: Section
+) -> CheckResult:
+    yield from check_didactum_sensors_voltage(item, params, section)
+
+
+check_plugin_didactum_sensors_analog_voltage = CheckPlugin(
+    name="didactum_sensors_analog_voltage",
+    service_name="Phase %s",
+    sections=["didactum_sensors_analog"],
+    discovery_function=discover_didactum_sensors_analog_voltage,
+    check_function=check_didactum_sensors_analog_voltage,
+    check_ruleset_name="el_inphase",
+    check_default_parameters={},
+)

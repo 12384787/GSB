@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+# Copyright (C) 2021 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+import time
+from collections.abc import Mapping
+
+from cmk.agent_based.v1 import check_levels as check_levels_v1
+from cmk.agent_based.v2 import (
+    AgentSection,
+    CheckPlugin,
+    CheckResult,
+    render,
+    Result,
+    State,
+    StringTable,
+)
+from cmk.agent_based.v3_unstable import discover_one_service
+from cmk.plugins.kube.kube import (
+    condition_detailed_description,
+    condition_short_description,
+    get_age_levels_for,
+    VSResultAge,
+)
+from cmk.plugins.kube.schemata.api import ConditionStatus
+from cmk.plugins.kube.schemata.section import PodCondition, PodConditions
+
+
+def parse(string_table: StringTable) -> PodConditions:
+    """Parses `string_table` into a PodConditions instance"""
+    return PodConditions.model_validate_json(string_table[0][0])
+
+
+def _check_condition(
+    now: float,
+    name: str,
+    cond: PodCondition | None,
+    levels_upper: tuple[int, int] | None,
+    invert: bool = False,  # if True, alert when the condition is *False*
+) -> CheckResult:
+    if cond is not None:
+        # keep the last-seen one
+        time_diff = now - cond.last_transition_time  # type: ignore[operator]  # SUP-12170
+        if (not invert and cond.status == ConditionStatus.TRUE) or (
+            invert and cond.status == ConditionStatus.FALSE
+        ):
+            # TODO: CMK-11697
+            yield Result(state=State.OK, summary=condition_short_description(name, cond.status))
+            return
+        # Anything that isn't the expected status (TRUE for non-invert, FALSE for invert)
+        # falls through to the time-based check below: it counts against the configured
+        # timer and alerts if it persists. This covers both FALSE (e.g. still booting)
+        # and UNKNOWN (rare in practice; core Kubernetes only emits Unknown for node
+        # conditions, but custom controllers/operators may emit it for pods).
+        summary_prefix = condition_detailed_description(name, cond.status, cond.reason, cond.detail)
+        for result in check_levels_v1(
+            time_diff, levels_upper=levels_upper, render_func=render.timespan
+        ):
+            yield Result(state=result.state, summary=f"{summary_prefix} for {result.summary}")
+    else:
+        yield Result(
+            state=State.OK, summary=condition_short_description(name, ConditionStatus.FALSE)
+        )
+
+
+def _check(now: float, params: Mapping[str, VSResultAge], section: PodConditions) -> CheckResult:
+    """The Pod sets the conditions to True in this order:
+    PodScheduled -> PodInitialized -> PodContainersReady -> PodReady.
+    The Kubelet does not set PodReadyToStartContainers and PodDisruptionTarget in a specific order.
+    """
+
+    yield from _check_condition(
+        now,
+        "scheduled",
+        section.scheduled,
+        get_age_levels_for(params, "scheduled"),
+    )
+    if section.hasnetwork is not None:
+        # As of k8s version 1.28, this name was changed to PodReadyToStartContainers
+        yield from _check_condition(
+            now,
+            "hasnetwork",
+            section.hasnetwork,
+            get_age_levels_for(params, "hasnetwork"),
+        )
+    else:
+        yield from _check_condition(
+            now,
+            "readytostartcontainers",
+            section.readytostartcontainers,
+            get_age_levels_for(params, "hasnetwork"),
+        )
+    yield from _check_condition(
+        now,
+        "initialized",
+        section.initialized,
+        get_age_levels_for(params, "initialized"),
+    )
+    yield from _check_condition(
+        now,
+        "containersready",
+        section.containersready,
+        get_age_levels_for(params, "containersready"),
+    )
+    yield from _check_condition(
+        now,
+        "ready",
+        section.ready,
+        get_age_levels_for(params, "ready"),
+    )
+    if section.resizepending is not None:  # v1.33+
+        yield from _check_condition(
+            now,
+            "resizepending",
+            section.resizepending,
+            get_age_levels_for(params, "resizepending"),
+            invert=True,
+        )
+    if section.resizeinprogress is not None:  # v1.33+
+        yield from _check_condition(
+            now,
+            "resizeinprogress",
+            section.resizeinprogress,
+            get_age_levels_for(params, "resizeinprogress"),
+            invert=True,
+        )
+    # The AllContainersRestarting condition *only* shows up if at least one
+    # container in the pod spec has a `restartPolicyRules` entry with
+    # `action: RestartAllContainers`. Otherwise our section field will be None.
+    if section.allcontainersrestarting is not None:  # v1.35+
+        yield from _check_condition(
+            now,
+            "allcontainersrestarting",
+            section.allcontainersrestarting,
+            get_age_levels_for(params, "allcontainersrestarting"),
+            invert=True,
+        )
+    if (disruptiontarget := section.disruptiontarget) is not None:
+        yield Result(
+            state=State.OK,
+            summary=condition_detailed_description(
+                "disruptiontarget",
+                disruptiontarget.status,
+                disruptiontarget.reason,
+                disruptiontarget.detail,
+            ),
+        )
+
+
+def check(params: Mapping[str, VSResultAge], section: PodConditions) -> CheckResult:
+    yield from _check(time.time(), params, section)
+
+
+agent_section_kube_pod_conditions_v1 = AgentSection(
+    name="kube_pod_conditions_v1",
+    parsed_section_name="kube_pod_conditions",
+    parse_function=parse,
+)
+
+check_plugin_kube_pod_conditions = CheckPlugin(
+    name="kube_pod_conditions",
+    service_name="Condition",
+    discovery_function=discover_one_service,
+    check_function=check,
+    check_default_parameters={
+        "scheduled": "no_levels",
+        "hasnetwork": "no_levels",
+        "initialized": "no_levels",
+        "containersready": "no_levels",
+        "ready": "no_levels",
+        "resizepending": ("levels", (300, 600)),
+        "resizeinprogress": ("levels", (300, 600)),
+        "allcontainersrestarting": ("levels", (300, 600)),
+    },
+    check_ruleset_name="kube_pod_conditions",
+)

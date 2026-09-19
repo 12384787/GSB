@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+"""agent_ddn_s2a
+
+A datasource program for Data DirectNetworks Silicon Storage Appliances
+"""
+
+import argparse
+import socket
+import sys
+from collections.abc import Sequence
+
+from cmk.password_store.v1_unstable import parser_add_secret_option, resolve_secret_option
+
+# This special agent uses the S2A RCM API. Please refer to the
+# official documentation.
+
+
+SECRET_OPTION = "secret"
+
+
+def commandstring(command_txt: str, username_txt: str, password_txt: str) -> str:
+    return f"{command_txt}@{username_txt}@{password_txt}@0@0@$"
+
+
+def query(s: socket.socket, command_txt: str) -> str:
+    s.sendall(command_txt.encode())
+    response = []
+    while True:
+        next_part = s.recv(2048)
+        response.append(next_part.decode())
+        if not next_part:
+            break
+    return "".join(response)
+
+
+def main(sys_argv: Sequence[str]) -> int:
+    prog, description = __doc__.split("\n\n", maxsplit=1)
+    parser = argparse.ArgumentParser(prog=prog, description=description)
+
+    parser.add_argument("ip_address")
+    parser.add_argument("port", type=int)
+    parser.add_argument("--username", required=True)
+    parser_add_secret_option(parser, long=f"--{SECRET_OPTION}", help="The password", required=True)
+    parser.add_argument("--debug", action="store_true")
+
+    args = parser.parse_args(sys_argv)
+    _debug = args.debug
+    ip_address = args.ip_address
+    port = args.port
+    username = args.username
+    password = resolve_secret_option(args, SECRET_OPTION).reveal()
+
+    sections = [
+        ("1600", "ddn_s2a_faultsbasic"),
+        ("1000", "ddn_s2a_version"),
+        ("2500", "ddn_s2a_uptime"),
+        ("2301", "ddn_s2a_statsdelay"),
+        ("0505", "ddn_s2a_errors"),
+        ("2300", "ddn_s2a_stats"),
+    ]
+
+    for command, section in sections:
+        sys.stdout.write("<<<%s>>>\n" % section)
+        sock = socket.socket(family=socket.AF_INET, type=socket.SOCK_STREAM)
+        sock.connect((ip_address, port))
+        sys.stdout.write(query(sock, commandstring(command, username, password)) + "\n")
+        sock.close()
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,523 @@
+#!/bin/bash
+# Copyright (C) 2025 Checkmk GmbH
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+set -e
+
+JOBS=6
+readonly ALL_LINTERS=clippy
+
+# Test database endpoint and the resolve_test_endpoint /
+# export_db_vars_from_endpoint helpers (constants in
+# test-db-endpoints.conf).
+. "$(dirname "${BASH_SOURCE[0]}")/db-endpoint.sh"
+
+if
+    getopt --test >/dev/null 2>&1
+    [ $? -eq 4 ]
+then
+    # Provide better commandline with enhanced 'getopt' from util-linux
+    GETOPT_OPTIONS=(--options 'bBuFl:aRCfDTj:h' --long 'build,build-component-tests,unit-tests,check-format,lint:,all,remote-host,component-tests,format,documentation,docker-tests:,jobs:,help' --name "$(basename "$0")" --)
+else
+    # Compatibility with basic 'getopt' as found on non-Linux systems.
+    GETOPT_OPTIONS=('bBuFl:aRCfDTj:h')
+fi
+
+failure() {
+    test ${#@} -eq 0 || echo "$(basename "$0"):" "$@" >&2
+    exit 1
+}
+
+usage() {
+    echo "usage: $(basename "$0") [OPTION]..."
+    echo "Run the CI pipeline or parts of it."
+    echo "(long options only available on Linux)"
+    echo
+    echo "  -b, --build                 build executable"
+    echo "  -B, --build-component-tests build component test executables without running them"
+    echo "  -u, --unit-tests            run unit tests"
+    echo "  -F, --check-format          check for correct formatting"
+    echo "  -l L,..., --lint=L,...      run linters, 'all' means '${ALL_LINTERS}'"
+    echo "  -a, --all                   shortcut for -b -u -F -l all"
+    echo "  -C, --component-tests       run all component tests"
+    echo "  -R, --remote-host           run tests on a remote host"
+    echo "  -T VER, --docker-tests=VER"
+    echo "                              run component tests against Oracle Database in Docker (VER: 23, 12, 11)"
+    echo "  -f, --format                format sources"
+    echo "  -D, --documentation         generate documentation"
+    echo "  -j N, --jobs=N              allow N jobs at once, default is ${JOBS}"
+    echo "  -h, --help                  show this help"
+}
+
+parse_options() {
+    # Yes, all those option variables are global.
+    RUN_BUILD=no
+    RUN_BUILD_COMPONENT_TESTS=no
+    RUN_UNIT_TESTS=no
+    RUN_COMPONENT_TESTS=no
+    RUN_CHECK_FORMAT=no
+    RUN_CLIPPY=no
+    RUN_FORMAT=no
+    RUN_DOCUMENTATION=no
+    RUN_COMPONENT_TESTS_REMOTE_HOST=no
+    RUN_DOCKER_TESTS=no
+
+    if ! OPTIONS=$(getopt "${GETOPT_OPTIONS[@]}" "$@"); then
+        usage >&2
+        failure
+    fi
+    eval set -- "$OPTIONS"
+    unset OPTIONS
+
+    while true; do
+        case "$1" in
+            '-b' | '--build')
+                RUN_BUILD=yes
+                shift
+                ;;
+            '-B' | '--build-component-tests')
+                RUN_BUILD_COMPONENT_TESTS=yes
+                shift
+                ;;
+            '-u' | '--unit-tests')
+                RUN_UNIT_TESTS=yes
+                shift
+                ;;
+            '-F' | '--check-format')
+                RUN_CHECK_FORMAT=yes
+                shift
+                ;;
+            '-l' | '--lint')
+                test "$2" = "all" && LINTERS="${ALL_LINTERS}" || LINTERS="$2"
+                for LINTER in ${LINTERS//,/ }; do
+                    case ,"${ALL_LINTERS}", in
+                        *,"${LINTER}",*)
+                            FLAG="RUN_${LINTER//-/_}"
+                            eval "${FLAG^^}=yes"
+                            ;;
+                        *) failure "unknown linter: ${LINTER}" ;;
+                    esac
+                done
+                shift 2
+                ;;
+            '-a' | '--all')
+                RUN_BUILD=yes
+                RUN_UNIT_TESTS=yes
+                RUN_COMPONENT_TESTS=yes
+                RUN_CHECK_FORMAT=yes
+                RUN_CLIPPY=yes
+                shift
+                ;;
+            '-C' | '--component-tests')
+                RUN_COMPONENT_TESTS=yes
+                shift
+                ;;
+            '-R' | '--remote-host')
+                RUN_COMPONENT_TESTS_REMOTE_HOST=yes
+                shift
+                ;;
+            '-f' | '--format')
+                RUN_FORMAT=yes
+                shift
+                ;;
+            '-D' | '--documentation')
+                RUN_DOCUMENTATION=yes
+                shift
+                ;;
+            '-T' | '--docker-tests')
+                RUN_DOCKER_TESTS=yes
+                if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
+                    ORACLE_DOCKER_VERSION="$2"
+                    shift
+                fi
+                shift
+                ;;
+            '-j' | '--jobs')
+                JOBS="$2"
+                shift 2
+                ;;
+            '-h' | '--help')
+                usage
+                exit 0
+                ;;
+            '--')
+                shift
+                test ${#@} -eq 0 || failure "extra arguments:" "$@"
+                break
+                ;;
+            *) failure "internal error" ;;
+        esac
+    done
+
+    readonly RUN_BUILD RUN_BUILD_COMPONENT_TESTS RUN_UNIT_TESTS RUN_COMPONENT_TESTS RUN_CHECK_FORMAT RUN_CLIPPY RUN_FORMAT RUN_DOCUMENTATION RUN_DOCKER_TESTS ORACLE_DOCKER_VERSION JOBS
+}
+
+get_version_from_source() {
+    grep -oP '(?<=VERSION: &str = ")[^"]+' src/version.rs
+}
+
+run_build() {
+    case "$(uname)" in
+        'SunOS' | 'AIX')
+            # Strip the build-machine home prefix (first-party source paths baked
+            # in via #[track_caller] and panic locations) and the Rust sysroot
+            # (stdlib source paths) from the release binary. trim-paths in
+            # Cargo.toml is not an option: the IBM Open SDK for Rust on AIX does
+            # not have that feature stabilized (SUP-28810).
+            RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }--remap-path-prefix=${HOME}=. --remap-path-prefix=$(rustc --print sysroot)=." \
+                cargo build --release
+            ;;
+        *)
+            bazel build --cmk_version="$(get_version_from_source)" :all
+            ;;
+    esac
+}
+
+run_build_component_tests() {
+    case "$(uname)" in
+        'SunOS' | 'AIX')
+            # same flags as run_build function above, but for the test_ora_no_db test module.
+            # --message-format lets cargo tell us the exact path of the produced test
+            # executable (its "executable" field), instead of guessing it from the
+            # hash-suffixed filenames cargo leaves in target/release/deps.
+            # json-render-diagnostics keeps human-readable compiler errors/warnings on
+            # stderr alongside the JSON artifact messages on stdout.
+            test_binary="$(
+                RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }--remap-path-prefix=${HOME}=. --remap-path-prefix=$(rustc --print sysroot)=." \
+                    cargo test --release --test test_ora_no_db --no-run --message-format=json-render-diagnostics |
+                    python3 -c '
+import json, sys
+print(*[m["executable"] for m in map(json.loads, filter(str.strip, sys.stdin))
+        if m.get("reason") == "compiler-artifact"
+        and m["target"]["name"] == "test_ora_no_db"
+        and "test" in m["target"]["kind"]
+        and m["executable"]][-1:])
+'
+            )"
+            [ -n "${test_binary}" ] || failure "test_ora_no_db test executable not found"
+            cp "${test_binary}" "$(dirname "$(dirname "${test_binary}")")/test_ora_no_db_test"
+            ;;
+        *)
+            bazel build :mk-oracle-lib-test-external
+            ;;
+    esac
+}
+
+run_format() {
+    case "$(uname)" in
+        'SunOS' | 'AIX')
+            cargo fmt
+            ;;
+        *)
+            bazel run //:format "$PWD"
+            ;;
+    esac
+}
+
+run_check_format() {
+    case "$(uname)" in
+        'SunOS' | 'AIX')
+            cargo fmt --check
+            ;;
+        *)
+            bazel run //:format.check "$PWD"
+            ;;
+    esac
+}
+
+setup_tests() {
+    path_to_runtime="${PWD}/runtimes/plugins/libexec/mk-oracle-v2/oic"
+    mkdir -p "${path_to_runtime}"
+    INSTANTCLIENT_ARCHIVE="${PWD}/runtimes/downloads/instantclient_19_28.tar.gz"
+    export INSTANTCLIENT_ARCHIVE
+    MK_CONFDIR="${PWD}"
+    export MK_CONFDIR
+    MK_LIBDIR="${PWD}/runtimes"
+    export MK_LIBDIR
+}
+
+run_test_component() {
+    resolve_test_endpoint
+    setup_tests
+
+    case "$(uname)" in
+        'SunOS')
+            ORACLE_PLATFORM=SunOS gmake -C runtimes libs
+            (cd "${path_to_runtime}" && tar xzf "${INSTANTCLIENT_ARCHIVE}")
+            LD_LIBRARY_PATH="${path_to_runtime}:${LD_LIBRARY_PATH}"
+            export LD_LIBRARY_PATH
+            echo "TEST IS SKIPPED on LINUX"
+            cargo test --test "*"
+            ;;
+        'AIX')
+            ORACLE_PLATFORM=AIX /opt/freeware/bin/make -C runtimes libs
+            (cd "${path_to_runtime}" && tar xzf "${INSTANTCLIENT_ARCHIVE}")
+            LIBPATH="${path_to_runtime}:${LIBPATH}"
+            export LIBPATH
+            echo "TEST IS SKIPPED on LINUX"
+            cargo test --test "*"
+            ;;
+        *)
+            setup_oci_runtime || failure "cannot stage the Oracle client runtime"
+            bazel test :mk-oracle-lib-test-external
+            ;;
+    esac
+}
+
+# Stage the rebundled Oracle client into the runtime directory the way the
+# Agent Bakery would: build, unzip, relink libaio from the host, and make
+# it loadable. Expects setup_tests to have set path_to_runtime.
+# ATTENTION! Shell solution below is pure temporary: to be replaced with a
+# pure bazel after consulting by Bazel team
+setup_oci_runtime() {
+    bazel build //omd/packages/oci:oci_light_lin_x64 || return 1
+    local path_to_zip
+    path_to_zip="$(bazel info bazel-bin)/omd/packages/oci/oci_light_lin_x64.zip" || return 1
+    unzip -uoq "${path_to_zip}" -d "${path_to_runtime}" || return 1
+
+    # ldconfig lives in /sbin, which regular users often do not have on PATH.
+    local libaio
+    libaio=$(PATH="${PATH}:/sbin:/usr/sbin" ldconfig -p | grep libaio.so.1 | awk '{print $NF}')
+    if [ ! -e "${libaio}" ]; then
+        echo "libaio absent. Integration testing is not possible"
+        return 1
+    fi
+    ln -sf "${libaio}" "${path_to_runtime}/libaio.so.1" || return 1
+
+    export LD_LIBRARY_PATH="${path_to_runtime}:${LD_LIBRARY_PATH}"
+}
+
+# Remove the remote staging directory created by run_test_component_remote_host
+# (a caller-provided TEST_BINARY_REMOTE_PATH is left untouched).
+remove_remote_staging() {
+    [[ -n "${REMOTE_STAGING_TO_CLEAN:-}" ]] || return 0
+    # REMOTE_STAGING_TO_CLEAN is expanded client-side on purpose (the path we
+    # created); SSH_ARGS is intentionally word-split.
+    # shellcheck disable=SC2086,SC2029
+    ssh $SSH_ARGS "${HOST_ADDRESS}" "rm -rf '${REMOTE_STAGING_TO_CLEAN}'" || true
+}
+
+run_test_component_remote_host() {
+    # A test database is optional here, unlike in the other component-test
+    # runners: remote hosts without database access (Solaris/AIX) run only the
+    # no-db test binary and leave CI_ORA2_DB_TEST unset.
+    if [ -n "${CI_ORA2_DB_TEST:-}" ] || [ -n "${CI_ORA_TEST_PASSWORD:-}" ]; then
+        resolve_test_endpoint
+    else
+        echo "no test database configured; running the tests without one" >&2
+    fi
+    # SSH target: the login user comes from the environment (the CI job
+    # exposes it from the jenkins-oracle-ssh-key credential as SSH_USER);
+    # the host defaults to the CI database box (ci_host from
+    # test-db-endpoints.conf). A pre-set HOST_ADDRESS wins for manual runs
+    # against another host.
+    if [[ -z "${HOST_ADDRESS:-}" ]]; then
+        [[ -n "${SSH_USER:-}" ]] ||
+            failure "set SSH_USER (SSH login for ${ci_host}) or HOST_ADDRESS"
+        HOST_ADDRESS="${SSH_USER}@${ci_host}"
+    fi
+    SSH_ARGS=
+    [ -n "$SSH_KEYFILE" ] && SSH_ARGS="$SSH_ARGS -i $SSH_KEYFILE -o StrictHostKeyChecking=no"
+    # Stage under a unique remote directory unless the caller supplied one,
+    # so concurrent runs on the shared host never collide (and the branch
+    # name no longer has to reach this script). Created under $HOME to avoid
+    # a noexec /tmp; cleaned up on exit.
+    if [[ -z "${TEST_BINARY_REMOTE_PATH:-}" ]]; then
+        # A timestamp+PID-named directory, atomically claimed via mkdir (which
+        # fails on an existing name). mktemp would do the same job, but is not
+        # available out of the box everywhere (AIX!).
+        # shellcheck disable=SC2086
+        TEST_BINARY_REMOTE_PATH="$(ssh $SSH_ARGS "${HOST_ADDRESS}" \
+            'd="$HOME/test_ora.$(date +%Y%m%d%H%M%S).$$" && mkdir "$d" && printf "%s\n" "$d"')" ||
+            failure "could not create a remote staging directory on ${HOST_ADDRESS}"
+        REMOTE_STAGING_TO_CLEAN="${TEST_BINARY_REMOTE_PATH}"
+        trap remove_remote_staging EXIT
+    fi
+
+    : "${TEST_BINARIES:=test_ora_no_db_test test_ora_discovery_test test_ora_with_db_test}"
+    # Create test folder and directory structure emulating real deployment
+    # shellcheck disable=SC2086,SC2087,SC2029
+    ssh $SSH_ARGS "${HOST_ADDRESS}" <<EOF
+        set -e
+        mkdir -p "${TEST_BINARY_REMOTE_PATH}/runtimes/plugins/libexec/mk-oracle-v2/oic"
+        mkdir -p "${TEST_BINARY_REMOTE_PATH}/tests"
+        : >"${TEST_BINARY_REMOTE_PATH}/runtimes/plugins/libexec/mk-oracle-v2/oic/libclntsh.so"
+EOF
+    # copy Oracle DB plug-in test binaries and test data to the remote-host
+    # shellcheck disable=SC2086
+    scp $SSH_ARGS ${TEST_BINARIES} "${HOST_ADDRESS}":"${TEST_BINARY_REMOTE_PATH}/"
+    # shellcheck disable=SC2086
+    scp $SSH_ARGS -r tests/files "${HOST_ADDRESS}":"${TEST_BINARY_REMOTE_PATH}/tests/"
+    # The heredoc below is expanded locally; an unset ORACLE_HOME must stay
+    # unset on the remote host too, so its export is prepared here.
+    ORACLE_HOME_EXPORT=""
+    [ -n "${ORACLE_HOME:-}" ] && ORACLE_HOME_EXPORT="export ORACLE_HOME=\"${ORACLE_HOME}\""
+    # shellcheck disable=SC2086,SC2087,SC2029
+    ssh $SSH_ARGS "${HOST_ADDRESS}" <<EOF
+        set -e
+        cd "${TEST_BINARY_REMOTE_PATH}"
+        ${ORACLE_HOME_EXPORT}
+        export CI_ORA2_DB_TEST="${CI_ORA2_DB_TEST:-}"
+        export CI_ORA1_DB_TEST="${CI_ORA1_DB_TEST:-}"
+        export MK_CONFDIR="${TEST_BINARY_REMOTE_PATH}"
+        export MK_LIBDIR="${TEST_BINARY_REMOTE_PATH}"/runtimes
+        export TNS_ADMIN="${TEST_BINARY_REMOTE_PATH}/tests/files/tns"
+        for test_name in ${TEST_BINARIES}; do
+            chmod +x "./\${test_name}"
+            "./\${test_name}"
+        done
+EOF
+}
+
+cleanup_docker_container() {
+    local version="$1"
+    local service
+
+    # Map version to service name
+    case ${version} in
+        23) service="oracle-free" ;;
+        11) service="oracle-xe" ;;
+        12 | 12c) service="oracle-12c" ;;
+        *)
+            echo "Warning: Unknown version '${version}' for cleanup"
+            return 1
+            ;;
+    esac
+
+    echo "Stopping Docker container for Oracle ${version}..."
+    local docker_compose_file="${PWD}/tests/files/docker/docker-compose.yml"
+    docker compose -f "${docker_compose_file}" down "${service}"
+    echo "Container ${service} stopped successfully"
+}
+
+run_test_component_docker() {
+    # Check if platform supports Docker tests before doing anything
+    case "$(uname)" in
+        'SunOS' | 'AIX')
+            failure "Docker tests are not supported on $(uname)"
+            ;;
+    esac
+
+    echo "Running component tests against Oracle ${ORACLE_DOCKER_VERSION} in Docker..."
+
+    local run_db_script="${PWD}/tests/files/docker/run-db.sh"
+
+    # Start the database
+    if ! "${run_db_script}" -v "${ORACLE_DOCKER_VERSION}"; then
+        failure "Failed to start Oracle ${ORACLE_DOCKER_VERSION} database container"
+    fi
+
+    # Determine SID based on version
+    local db_sid
+    local db_service_name
+    case ${ORACLE_DOCKER_VERSION} in
+        23) db_sid="FREE" db_service_name="FREE" ;;
+        11) db_sid="XE" db_service_name="XE" ;;
+        12 | 12c) db_sid="XE" db_service_name="xe.oracle.docker" ;;
+        *)
+            cleanup_docker_container "${ORACLE_DOCKER_VERSION}"
+            failure "Unsupported Oracle version: ${ORACLE_DOCKER_VERSION}"
+            ;;
+    esac
+
+    # Set up test environment variables for Docker Oracle. Field order is
+    # host:user:password:port:instance:role:service_name:sid:custom3 per
+    # SqlDbEndpoint::from_str (src/config/authentication.rs); the format
+    # (CMK-23904) reserves the trailing slot, "_" marks an unset field.
+    # The SID field must be filled: get_sid() in the test suite unwraps it.
+    export CI_ORA2_DB_TEST="localhost:sys:oracle:1521:_:sysdba:${db_service_name}:${db_sid}:_:"
+    echo "CI_ORA2_DB_TEST set to: ${CI_ORA2_DB_TEST}"
+
+    setup_tests
+
+    if ! setup_oci_runtime; then
+        cleanup_docker_container "${ORACLE_DOCKER_VERSION}"
+        failure "cannot stage the Oracle client runtime"
+    fi
+
+    # Run tests and capture exit code
+    local test_exit_code=0
+    bazel test :mk-oracle-lib-test-external || test_exit_code=$?
+
+    # Always cleanup Docker container
+    cleanup_docker_container "${ORACLE_DOCKER_VERSION}"
+
+    # Exit with the test exit code
+    if [ ${test_exit_code} -ne 0 ]; then
+        failure "Component tests failed with exit code ${test_exit_code}"
+    fi
+
+    echo "Component tests completed successfully"
+}
+
+run_test_unit() {
+    setup_tests
+
+    case "$(uname)" in
+        'SunOS' | 'AIX')
+            cargo test --lib
+            ;;
+        *)
+            bazel test :mk-oracle-lib-test-internal
+            ;;
+    esac
+}
+
+run_clippy() {
+    case "$(uname)" in
+        'SunOS')
+            cargo clippy
+            ;;
+        'AIX')
+            echo "clippy not available on AIX - skipping."
+            ;;
+        *)
+            bazel lint :all
+            ;;
+    esac
+}
+
+run_documentation() {
+    case "$(uname)" in
+        'SunOS' | 'AIX')
+            cargo doc
+            ;;
+        *)
+            bazel build :doc
+            ;;
+    esac
+}
+
+main() {
+    # Change to the directory where this script resides, it makes many things easier
+    # and we can call this script from everywhere.
+    cd -- "${BASH_SOURCE%/*}"
+    parse_options "$@"
+    # TODO: Re-evaluate usage of --all-targets below
+    test ${RUN_BUILD} = yes && run_build
+    test ${RUN_BUILD_COMPONENT_TESTS} = yes && run_build_component_tests
+    test ${RUN_UNIT_TESTS} = yes && run_test_unit
+    test ${RUN_COMPONENT_TESTS} = yes && run_test_component
+    test ${RUN_COMPONENT_TESTS_REMOTE_HOST} = yes && run_test_component_remote_host
+    test ${RUN_DOCKER_TESTS} = yes && run_test_component_docker
+    test ${RUN_CHECK_FORMAT} = yes && run_check_format
+    test ${RUN_CLIPPY} = yes && run_clippy
+    test ${RUN_FORMAT} = yes && run_format
+    test ${RUN_DOCUMENTATION} = yes && run_documentation
+    true
+}
+
+main "$@"

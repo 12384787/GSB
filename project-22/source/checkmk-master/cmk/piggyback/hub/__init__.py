@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+# Copyright (C) 2024 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+
+from ._config import HostLocations as HostLocations
+from ._config import publish_one_shot_locations as publish_one_shot_locations
+from ._config import publish_persisted_locations_for_sites as publish_persisted_locations_for_sites
+from ._main import main as main
+from ._paths import RELATIVE_CONFIG_PATH as RELATIVE_CONFIG_PATH

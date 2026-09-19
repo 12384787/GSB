@@ -1,0 +1,71 @@
+#!groovy
+
+// file: build-mk-oracle-on-aix-and-solaris.groovy
+
+void main() {
+    check_job_parameters([
+        "VERSION",
+    ])
+
+    def versioning = load("${checkout_dir}/buildscripts/scripts/utils/versioning.groovy");
+
+    def branch_version = versioning.get_branch_version(checkout_dir);
+    def safe_branch_name = versioning.safe_branch_name();
+    def cmk_version_rc_aware = versioning.get_cmk_version(safe_branch_name, branch_version, params.VERSION);
+    def cmk_version = versioning.strip_rc_number_from_version(cmk_version_rc_aware);
+
+    inside_container_minimal(safe_branch_name: safe_branch_name) {
+        stage("Set version") {
+            dir("${checkout_dir}") {
+                // mk-oracle is not edition specific, use "ultimatemt" as it is the superset
+                versioning.configure_checkout_folder("ultimatemt", cmk_version);
+            }
+        }
+
+        parallel(["aix", "solaris"].collectEntries { distro ->
+            [("Building mk-oracle on ${distro}"): {
+                smart_stage(
+                    name: "Building mk-oracle on ${distro}",
+                    condition: true,
+                    raiseOnError: true,
+                ) {
+                        dir("${checkout_dir}") {
+                            withCredentials([
+                                // We use the same SSH key as for the aix and solaris machine
+                                sshUserPrivateKey(
+                                    credentialsId: "jenkins-aix-build-ssh-key",
+                                    keyFileVariable: 'KEYFILE'
+                                ),
+                                file(
+                                    credentialsId: "know_hosts_ssh_${distro}",
+                                    variable: 'KNOWN_HOSTS_FILE'
+                                ),
+                                usernamePassword(
+                                    credentialsId: 'oracle_test_db_user_password',
+                                    usernameVariable: 'ORACLEDB_USER',
+                                    passwordVariable: 'ORACLEDB_PASSWORD'
+                                ),
+                            ]) {
+                                sh("""
+                                    checkout_dir=${checkout_dir} \
+                                    REMOTE_USER=jenkins \
+                                    CMK_VERSION=${cmk_version} \
+                                    packages/mk-oracle/ssh-run-ci ${distro} -buB
+                                """)
+                            }
+                        }
+                }
+            }]
+        })
+    }
+
+    stage("Archive artifacts") {
+        dir("${checkout_dir}/packages/mk-oracle") {
+            // mk-oracle.* goes into the Checkmk packages
+            // test_ora_no_db_test.* only comsumed by the mk-oracle component test job.
+            archiveArtifacts(fingerprint: true, artifacts: "mk-oracle.*, test_ora_no_db_test.*");
+        }
+    }
+}
+
+return this;

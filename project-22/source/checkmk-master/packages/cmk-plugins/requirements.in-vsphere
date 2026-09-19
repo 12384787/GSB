@@ -1,0 +1,4 @@
+defusedxml
+python-dateutil
+requests
+urllib3

@@ -1,0 +1,6 @@
+# Alias: Maximum number of parallel Livestatus TCP server instances
+# Menu: Distributed Monitoring
+# Description:
+#  If Livestatus is configured to listen on a TCP port, this setting
+#  limits how many server instances can be active simultaneously.
+#  Default: 500

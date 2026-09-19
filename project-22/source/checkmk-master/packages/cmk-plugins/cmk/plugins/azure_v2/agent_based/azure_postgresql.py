@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+
+from collections.abc import Mapping
+from typing import Any
+
+from cmk.agent_based.v2 import (
+    check_levels,
+    CheckPlugin,
+    CheckResult,
+    DiscoveryResult,
+    InventoryPlugin,
+    render,
+)
+from cmk.plugins.azure_v2.agent_based.lib import (
+    check_connections,
+    check_cpu,
+    check_memory,
+    CheckFunctionWithoutItem,
+    create_check_metrics_function_single,
+    create_discover_by_metrics_function,
+    create_discover_by_metrics_function_single,
+    create_inventory_function,
+    MetricData,
+    Resource,
+)
+
+DB_POSTGRESQL_RESOURCE_TYPES = [
+    "Microsoft.DBforPostgreSQL/servers",
+    "Microsoft.DBforPostgreSQL/flexibleServers",
+]
+
+
+inventory_plugin_azure_postgresql = InventoryPlugin(
+    name="azure_v2_postgresql",
+    sections=["azure_v2_servers"],
+    inventory_function=create_inventory_function(),
+)
+
+
+def discover_azure_postgresql_memory(section: Resource) -> DiscoveryResult:
+    yield from create_discover_by_metrics_function(
+        "average_memory_percent", resource_types=DB_POSTGRESQL_RESOURCE_TYPES
+    )({"Memory": section})
+
+
+def check_azure_postgresql_memory(
+    item: str,  # noqa: ARG001
+    params: Mapping[str, object],
+    section: Resource,
+) -> CheckResult:
+    yield from check_memory()("Memory", params, {"Memory": section})
+
+
+check_plugin_azure_postgresql_memory = CheckPlugin(
+    name="azure_v2_postgresql_memory",
+    sections=["azure_v2_servers"],
+    service_name="Azure/DB for PostgreSQL %s",
+    discovery_function=discover_azure_postgresql_memory,
+    check_function=check_azure_postgresql_memory,
+    check_ruleset_name="memory_utilization",
+    check_default_parameters={
+        "levels": (80.0, 90.0),
+    },
+)
+
+
+check_plugin_azure_postgresql_cpu = CheckPlugin(
+    name="azure_v2_postgresql_cpu",
+    sections=["azure_v2_servers"],
+    service_name="Azure/DB for PostgreSQL CPU",
+    discovery_function=create_discover_by_metrics_function_single(
+        "average_cpu_percent", resource_types=DB_POSTGRESQL_RESOURCE_TYPES
+    ),
+    check_function=check_cpu(),
+    check_ruleset_name="cpu_utilization",
+    check_default_parameters={"util": (65.0, 90.0)},
+)
+
+
+def discover_azure_postgresql_replication(section: Resource) -> DiscoveryResult:
+    yield from create_discover_by_metrics_function(
+        "maximum_pg_flexible_physical_replication_delay_in_seconds",  # single server metric name
+        "maximum_physical_replication_delay_in_seconds",  # flexible server metric name
+        resource_types=DB_POSTGRESQL_RESOURCE_TYPES,
+    )({"Replication": section})
+
+
+def check_replication() -> CheckFunctionWithoutItem:
+    return create_check_metrics_function_single(
+        [
+            MetricData(
+                "maximum_pg_replica_log_delay_in_seconds",  # single server metric name
+                "replication_lag",
+                "Replication lag",
+                render.timespan,
+                upper_levels_param="levels",
+            ),
+            MetricData(
+                "maximum_physical_replication_delay_in_seconds",  # flexible server metric name
+                "replication_lag",
+                "Replication lag",
+                render.timespan,
+                upper_levels_param="levels",
+            ),
+        ]
+    )
+
+
+def check_azure_postgresql_replication(
+    item: str,  # noqa: ARG001
+    params: Mapping[str, Any],
+    section: Resource,
+) -> CheckResult:
+    yield from check_replication()(params, section)
+
+
+check_plugin_azure_postgresql_replication = CheckPlugin(
+    name="azure_v2_postgresql_replication",
+    sections=["azure_v2_servers"],
+    service_name="Azure/DB for PostgreSQL %s",
+    discovery_function=discover_azure_postgresql_replication,
+    check_function=check_azure_postgresql_replication,
+    check_ruleset_name="replication_lag",
+    check_default_parameters={
+        "levels": (60, 600),
+    },
+)
+
+
+check_plugin_azure_postgresql_connections = CheckPlugin(
+    name="azure_v2_postgresql_connections",
+    sections=["azure_v2_servers"],
+    service_name="Azure/DB for PostgreSQL Connections",
+    discovery_function=create_discover_by_metrics_function_single(
+        "average_active_connections",
+        "total_connections_failed",
+        resource_types=DB_POSTGRESQL_RESOURCE_TYPES,
+    ),
+    check_function=check_connections(),
+    check_ruleset_name="azure_v2_database_connections",
+    check_default_parameters={"failed_connections": (1, 1)},
+)
+
+
+check_plugin_azure_postgresql_network = CheckPlugin(
+    name="azure_v2_postgresql_network",
+    sections=["azure_v2_servers"],
+    service_name="Azure/DB for PostgreSQL Network",
+    discovery_function=create_discover_by_metrics_function_single(
+        "total_network_bytes_ingress",
+        "total_network_bytes_egress",
+        resource_types=DB_POSTGRESQL_RESOURCE_TYPES,
+    ),
+    check_function=create_check_metrics_function_single(
+        [
+            MetricData(
+                "total_network_bytes_ingress",
+                "ingress",
+                "Network in",
+                render.bytes,
+                upper_levels_param="ingress_levels",
+            ),
+            MetricData(
+                "total_network_bytes_egress",
+                "egress",
+                "Network out",
+                render.bytes,
+                upper_levels_param="egress_levels",
+            ),
+        ],
+        check_levels=check_levels,
+    ),
+    check_ruleset_name="azure_v2_db_network",
+    check_default_parameters={},
+)
+
+
+check_plugin_azure_postgresql_storage = CheckPlugin(
+    name="azure_v2_postgresql_storage",
+    sections=["azure_v2_servers"],
+    service_name="Azure/DB for PostgreSQL Storage",
+    discovery_function=create_discover_by_metrics_function_single(
+        "average_io_consumption_percent",  # single server metric name
+        "average_disk_iops_consumed_percentage",  # flexible server metric name
+        "average_serverlog_storage_percent",  # single server metric name
+        "average_storage_percent",
+        resource_types=DB_POSTGRESQL_RESOURCE_TYPES,
+    ),
+    check_function=create_check_metrics_function_single(
+        [
+            MetricData(
+                "average_io_consumption_percent",  # single server metric name
+                "io_consumption_percent",
+                "IO",
+                render.percent,
+                upper_levels_param="io_consumption",
+            ),
+            MetricData(
+                "average_disk_iops_consumed_percentage",  # flexible server metric name
+                "io_consumption_percent",
+                "IO",
+                render.percent,
+                upper_levels_param="io_consumption",
+            ),
+            MetricData(
+                "average_storage_percent",
+                "storage_percent",
+                "Storage",
+                render.percent,
+                upper_levels_param="storage",
+            ),
+            MetricData(
+                "average_serverlog_storage_percent",  # single server metric name
+                "serverlog_storage_percent",
+                "Server log storage",
+                render.percent,
+                upper_levels_param="serverlog_storage",
+            ),
+        ],
+        check_levels=check_levels,
+    ),
+    check_ruleset_name="azure_v2_db_storage",
+    check_default_parameters={},
+)

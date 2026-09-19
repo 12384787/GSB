@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from collections.abc import Mapping, Sequence
+
+import pytest
+
+from cmk.plugins.datadog.server_side_calls.agent_datadog import special_agent_datadog
+from cmk.server_side_calls.v1 import HostConfig, IPv4Config, Secret, URLProxy
+
+
+@pytest.mark.parametrize(
+    "params, expected_result",
+    [
+        pytest.param(
+            {
+                "instance": {
+                    "api_key": Secret(1),
+                    "app_key": Secret(2),
+                    "api_host": "api.datadoghq.eu",
+                },
+                "proxy": URLProxy(url="abc:8567"),
+                "monitors": {
+                    "tags": [
+                        "t1",
+                        "t2",
+                    ],
+                    "monitor_tags": [
+                        "mt1",
+                        "mt2",
+                    ],
+                },
+                "events": {
+                    "max_age": 456,
+                    "tags": [
+                        "t3",
+                        "t4",
+                    ],
+                    "tags_to_show": [
+                        ".*",
+                    ],
+                    "syslog_facility": ("user", 1),
+                    "syslog_priority": ("alert", 1),
+                    "service_level": ("(no Service level)", 0),
+                    "add_text": "add_text",
+                },
+                "logs": {
+                    "max_age": 456,
+                    "query": "test",
+                    "indexes": ["t3", "t4"],
+                    "text": [{"name": "name", "key": "key"}],
+                    "syslog_facility": ("user", 1),
+                    "service_level": ("(no Service level)", 0),
+                },
+            },
+            [
+                "--apikey-id",
+                Secret(1),
+                "--appkey-id",
+                Secret(2),
+                "testhost",
+                "api.datadoghq.eu",
+                "--proxy",
+                "abc:8567",
+                "--monitor_tag",
+                "t1",
+                "--monitor_tag",
+                "t2",
+                "--monitor_monitor_tag",
+                "mt1",
+                "--monitor_monitor_tag",
+                "mt2",
+                "--event_max_age",
+                "456",
+                "--event_tag",
+                "t3",
+                "--event_tag",
+                "t4",
+                "--event_tag_show",
+                ".*",
+                "--event_syslog_facility",
+                "1",
+                "--event_syslog_priority",
+                "1",
+                "--event_service_level",
+                "0",
+                "--event_add_text",
+                "--log_max_age",
+                "456",
+                "--log_query",
+                "test",
+                "--log_index",
+                "t3",
+                "--log_index",
+                "t4",
+                "--log_text_element",
+                "name:key",
+                "--log_syslog_facility",
+                "1",
+                "--log_service_level",
+                "0",
+                "--section",
+                "monitors",
+                "--section",
+                "events",
+                "--section",
+                "logs",
+            ],
+            id="full configuration",
+        ),
+        pytest.param(
+            {
+                "instance": {
+                    "api_key": Secret(3),
+                    "app_key": Secret(4),
+                    "api_host": "api.datadoghq.eu",
+                },
+                "monitors": {},
+                "events": {
+                    "max_age": 600,
+                    "syslog_facility": ("user", 1),
+                    "syslog_priority": ("alert", 1),
+                    "service_level": ("(no Service level)", 0),
+                    "add_text": "do_not_add_text",
+                },
+            },
+            [
+                "--apikey-id",
+                Secret(3),
+                "--appkey-id",
+                Secret(4),
+                "testhost",
+                "api.datadoghq.eu",
+                "--event_max_age",
+                "600",
+                "--event_syslog_facility",
+                "1",
+                "--event_syslog_priority",
+                "1",
+                "--event_service_level",
+                "0",
+                "--section",
+                "monitors",
+                "--section",
+                "events",
+            ],
+            id="first setup",
+        ),
+        pytest.param(
+            {
+                "instance": {
+                    "api_key": Secret(5),
+                    "app_key": Secret(6),
+                    "api_host": "api.datadoghq.eu",
+                },
+            },
+            [
+                "--apikey-id",
+                Secret(5),
+                "--appkey-id",
+                Secret(6),
+                "testhost",
+                "api.datadoghq.eu",
+            ],
+            id="minimal case",
+        ),
+    ],
+)
+def test_datadog_argument_parsing(
+    params: Mapping[str, object],
+    expected_result: Sequence[str],
+) -> None:
+    commands = list(
+        special_agent_datadog(
+            params,
+            HostConfig(
+                name="testhost",
+                ipv4_config=IPv4Config(address="0.0.0.1"),
+            ),
+        )
+    )
+    assert commands[0].command_arguments == expected_result

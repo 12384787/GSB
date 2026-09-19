@@ -1,0 +1,89 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+
+<script setup lang="ts">
+import { type Oauth2ConnectionConfig } from 'cmk-shared-typing/typescript/mode_oauth2_connection'
+import type { FormSpec } from 'cmk-shared-typing/typescript/vue_formspec_components'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import type { TranslatedString } from 'cmk-ui-library/lib/i18nString'
+import { immediateWatch } from 'cmk-ui-library/lib/watch.ts'
+import { computed, provide, ref } from 'vue'
+
+import type { ValidationMessages } from '@/form'
+
+import CreateOAuth2Connection from '@/mode-oauth2-connection/CreateOAuth2Connection.vue'
+import type { OAuth2FormData } from '@/mode-oauth2-connection/lib/service/oauth2-connection-api.ts'
+
+import { Oauth2ConnectionApi } from './lib/service/oauth2-connection-api'
+import { submitKey } from './lib/submitKey'
+
+const { _t } = usei18n()
+
+const props = defineProps<{
+  config: Oauth2ConnectionConfig
+  form_spec: {
+    id: string
+    spec: FormSpec
+    validation?: ValidationMessages
+    data: OAuth2FormData
+  }
+  authority_mapping: Record<string, string>
+  new: boolean
+  connector_type: 'microsoft_entra_id'
+}>()
+
+const api = new Oauth2ConnectionApi()
+
+async function submit(data: OAuth2FormData): Promise<TranslatedString | null> {
+  try {
+    const res = props.new
+      ? await api.saveOAuth2Connection(data, props.connector_type)
+      : await api.updateOAuth2Connection(data.ident, data, props.connector_type)
+    if (res.type === 'success') {
+      window.location.href = props.config.urls.back
+      return null
+    } else if (res.type === 'error' && res.validationMessages) {
+      validationRef.value = res.validationMessages
+      return _t(`Please fix the validation errors and try again.`)
+    }
+    return _t(`Failed to save OAuth2 connection`)
+  } catch {
+    return _t(`Failed to save OAuth2 connection. Please try again.`)
+  }
+}
+
+const validationRef = ref<ValidationMessages>(props.form_spec.validation ?? [])
+
+immediateWatch(
+  () => props.form_spec.data,
+  (newValue) => {
+    dataRef.value = newValue
+  }
+)
+const dataRef = ref<OAuth2FormData>(props.form_spec.data)
+provide(submitKey, submit)
+
+const initialData = props.form_spec.data
+const formSpecRef = computed(() => ({
+  id: props.form_spec.id,
+  spec: props.form_spec.spec,
+  validation: validationRef.value,
+  data: initialData
+}))
+</script>
+
+<template>
+  <CreateOAuth2Connection
+    v-model:data="dataRef"
+    :config="config"
+    :form-spec="formSpecRef"
+    :authority-mapping="authority_mapping"
+    :api="api"
+    :connector-type="connector_type"
+    :is-new="props.new"
+    @submitted="submit"
+  />
+</template>

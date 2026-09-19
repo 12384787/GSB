@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+import logging
+from enum import StrEnum
+
+from playwright.sync_api import expect, Locator
+
+logger = logging.getLogger(__name__)
+
+
+class TextInputNotProvided(Exception):
+    """Exception to be raised if search option required but not text input was provided"""
+
+
+class DropdownOptions(StrEnum):
+    """Represent the base type for the options of a dropdown menu."""
+
+
+class DropdownHelper[TDropdownOptions: DropdownOptions]:
+    """Represent a dropdown menu to choose between different options defined in a StrEnum type."""
+
+    def __init__(
+        self,
+        dropdown_name: str,
+        dropdown_box: Locator,
+        dropdown_list: Locator,
+        text_input_filter: Locator | None = None,
+    ) -> None:
+        """Initialize the dropdown menu.
+
+        Args:
+            dropdown_name: The name of the dropdown.
+            dropdown_box: The locator for the dropdown box.
+            dropdown_list: The locator for the dropdown list of options.
+            text_input_filter: The locator of the text input to filter options.
+        """
+        self.__dropdown_name = dropdown_name
+        self.__dropdown_box = dropdown_box
+        self.__dropdown_list = dropdown_list
+        self.__text_input_filter = text_input_filter
+
+    def __search_option(self, option: TDropdownOptions) -> None:
+        if self.__text_input_filter is None:
+            raise TextInputNotProvided("Text input filter locator should be provided")
+
+        self.__text_input_filter.fill(option)
+
+    def select_option(
+        self,
+        option: TDropdownOptions,
+        exact: bool = True,
+        search: bool = False,
+        expected_value: str | None = None,
+    ) -> None:
+        """Select an option from the dropdown.
+
+        Args:
+            option: The StrEnum member that represents the dropdown option to select.
+            exact: whether the option name match has to be exact or not.
+            search: whether to type the option name to filter the dropdown list before selecting.
+            expected_value: the expected text of the dropdown after selection, for validation.
+                If None, it will be validated with the option value.
+        """
+        logger.info("Select option '%s' in '%s' dropdown", option, self.__dropdown_name)
+        self.__dropdown_box.click()
+        expect(
+            self.__dropdown_list.get_by_role("option"),
+            message=f"Dropdown '{self.__dropdown_name}' has no options",
+        ).not_to_have_count(0)
+
+        if search:
+            self.__search_option(option)
+
+        self.__dropdown_list.get_by_role("option", name=option, exact=exact).click()
+        expected_value = expected_value or option
+        expect(
+            self.__dropdown_box,
+            message=f"Option '{expected_value}' not set in '{self.__dropdown_name}' dropdown",
+        ).to_have_text(expected_value)
+        # Passes immediately for dropdowns that never set the attribute.
+        expect(
+            self.__dropdown_box,
+            message=f"Dropdown '{self.__dropdown_name}' still resolving the selected option",
+        ).not_to_have_attribute("aria-busy", "true")

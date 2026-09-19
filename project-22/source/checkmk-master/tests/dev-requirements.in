@@ -1,0 +1,77 @@
+azure-mgmt-resource  # used by the release process to publish the azure image to the marketplace
+azure-mgmt-compute  # used by the release process to add a new image version
+bandit[toml,sarif]  # linter
+beautifulsoup4  # used by the GUI crawler and various tests
+checkmk-dev-tools  # provides tooling for build artifacts
+cmk-werk-zeug  # provides wrappers for Gerrit, Jenkins, Jira and the cmk-components CLI
+coverage # used by bazel coverage
+datamodel-code-generator  # used for cmk-shared-typing generation
+dill
+djlint  # jinja template linter and formatter
+docker  # used by test_docker test and mk_docker agent plugin
+dockerpty  # used by dockerized tests for opening debug shells
+fakeredis[lua]  # used for testing code which uses Redis (lua is needed for faking features like "lock")
+furo  # sphinx theme
+hypothesis    # used by unit tests
+jira # used by jira_alerter
+jsonschema
+libcst # concrete syntax trees for plugin migration helpers
+matplotlib # used by performance test plotting
+mypy # used by test/Makefile's test-mypy target
+mypy-protobuf # for mypy
+networkx # needed for py-import-cycles
+pexpect # used for update testing
+pipfile # for generating import names during int tests
+playwright  # used for in-browser testing
+polyfactory # used for generating mock data for unit tests
+pre-commit  # used to fix / find issues before committing changes
+prometheus-client # used for testing otel integration
+psycopg # used by performance test plotting
+py-import-cycles  # used in tests/Makefile
+pylsp-mypy  # mypy plugin for python-lsp-server
+pymongo  # used by mk_mongodb agent plugin
+pytest
+pytest-asyncio  # facilitate testing of async code
+pytest-benchmark  # used for performance tests
+pytest-cov  # used to generate coverage reports (run with pytest --cov)
+pytest-html  # used to generate HTML reports for test suites
+pytest-mock  # used by quite a few unit/integration tests via the mocker fixture
+pytest-random-order  # used to test resiliency
+pytest-check # used to queue failed assertions and continue test execution
+pytest-opentelemetry # instrument pytest runs
+pytest-playwright # used for the GUI system tests
+pytest-repeat # used to rerun system tests
+pytest-rerunfailures # used to rerun flaky tests
+python-lsp-server  # Note: There are extras, but the default seems sensible.
+requirements-parser # used to parse requirements.txt file for testing
+responses  # used for unit tests
+ruff
+semver
+snmpsim
+sphinx  # used for the plugin API documentation
+sphinx-autoapi  # used for automatically generating plugin API documentation
+sphinx-autodoc-typehints  # used for the plugin API documentation
+sphinx-rtd-theme  # used for the plugin API documentation
+sphinxcontrib-plantuml  # used for the API and architecture
+sphinxcontrib-spelling
+svglib  # license csv pdf generating
+telnetlib3  # used by Windows Agent tests
+time-machine # used by various unit tests. Substitute for freezegun
+twine # used to upload packages to internal PyPi mirror
+types-docker # used for type checking
+types-docutils  # used for type checking
+types-icalendar
+types-jsonschema  # used for type checking
+types-lxml  # used for type checking
+types-oauthlib  # used for type checking
+types-paramiko  # used for type checking
+types-pexpect  # used for type checking
+types-protobuf  # used for type checking
+types-psutil  # used for type checking
+types-pyasn1  # used for type checking
+types-pymysql  # used for type checking
+types-pysaml2  # used for type checking
+types-python-dateutil  # used for type checking
+types-pyyaml  # used for type checking
+types-setuptools  # used for type checking
+types-reportlab  # used for type checking

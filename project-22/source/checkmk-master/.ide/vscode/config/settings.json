@@ -1,0 +1,286 @@
+{
+  "python": {
+    "folder": {
+      "[python]": {
+        "editor.codeActionsOnSave": {
+          "source.organizeImports": "explicit",
+          "source.fixAll": "explicit"
+        },
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.formatOnSave": true
+      },
+      "python.analysis.exclude": [
+        "**/bazel*/",
+        "**/bazel-*/**",
+        "**/container_shadow_workspace_local/",
+        "**/*cache*/",
+        "**/__pycache__/**",
+        "**/.ide/**",
+        "**/.tox/**",
+        "**/.mypy_cache/**",
+        "**/.ruff_cache/**",
+        "**/.pytest_cache/**",
+        "**/.vite*/**",
+        "**/node_modules/**",
+        "**/build/**",
+        "**/dist/**",
+        "**/out/**",
+        "**/target/**",
+        "**/htmlcov/**",
+        "**/*.egg-info/**",
+        "**/doc/treasures/**",
+        "**/tests/data/**",
+        "**/tests/fixtures/**",
+        "**/qa-test-data/**",
+        "**/packages/**/.venv/",
+        ".venv/",
+        "packages/"
+      ],
+      "python.analysis.ignore": [
+        "**/bazel-*/**",
+        "**/container_shadow_workspace_local/**",
+        "**/node_modules/**",
+        "**/.tox/**"
+      ],
+      "python.analysis.autoSearchPaths": false,
+      "python.analysis.packageIndexDepths": [
+        { "name": "", "depth": 2, "includeAllSymbols": false }
+      ],
+      "python.analysis.indexing": true,
+      "python.analysis.autoImportCompletions": true,
+      "python.analysis.diagnosticMode": "openFilesOnly",
+      "python.analysis.typeCheckingMode": "off",
+      "python.analysis.useLibraryCodeForTypes": false,
+      "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+      "python.testing.pytestEnabled": false,
+      "mypy.dmypyExecutable": "${cmk-ext:workspaceFolder}/.venv/bin/dmypy",
+      "mypy.runUsingActiveInterpreter": true,
+      "mypy.configFile": ".vscode/.mypy.ini",
+      "mypy.extraArguments": ["--follow-imports=normal"],
+      "[html]": {
+        "editor.defaultFormatter": "monosans.djlint",
+        "editor.formatOnSave": true
+      },
+      "[jinja]": {
+        "editor.defaultFormatter": "monosans.djlint",
+        "editor.formatOnSave": true
+      },
+      "djlint.useVenv": true
+    },
+    "workspace": {
+      "ruff.nativeServer": "on",
+      "ruff.enable": true,
+      "ruff.path": ["${workspaceFolder}/.venv/bin/ruff"],
+      "cmk.mypy.dynamicTargets.enabled": true,
+      "cmk.bazelTests.onDemand": true
+    },
+    "user": {
+      "python.condaPath": "",
+      "python.poetryPath": "",
+      "python.pipenvPath": ""
+    },
+    "disableFolder": {
+      "mypy.enabled": false
+    },
+    "disableWorkspace": {
+      "python.languageServer": "None",
+      "ruff.enable": false
+    }
+  },
+  "frontend": {
+    "_note_master_only_": "MASTER-ONLY (do not backport to 2.5): prettier.prettierPath is forced to <unset> because the pnpm-workspace reorg (Oct 2025) removed the workspace-root node_modules/prettier symlink that the old value pointed at. Per-package node_modules is what prettier-vscode now auto-resolves.",
+    "folder": {
+      "[vue]": {
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "editor.codeActionsOnSave": {
+          "source.removeUnusedImports": "explicit",
+          "source.organizeImports": "explicit",
+          "source.fixAll.eslint": "explicit",
+          "source.fixAll.stylelint": "explicit"
+        },
+        "editor.formatOnSave": true
+      },
+      "[javascript]": {
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+          "source.removeUnusedImports": "explicit",
+          "source.organizeImports": "explicit",
+          "source.fixAll.eslint": "explicit"
+        }
+      },
+      "[typescript]": {
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+          "source.removeUnusedImports": "explicit",
+          "source.organizeImports": "explicit",
+          "source.fixAll.eslint": "explicit"
+        }
+      },
+      "[json]": {
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "editor.formatOnSave": true
+      },
+      "[css]": {
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+          "source.organizeImports": "explicit",
+          "source.fixAll.stylelint": "explicit"
+        }
+      },
+      "[scss]": {
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+          "source.organizeImports": "explicit",
+          "source.fixAll.stylelint": "explicit"
+        }
+      },
+      "[jsonc]": {
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "editor.formatOnSave": true
+      },
+      "css.validate": false,
+      "scss.validate": false,
+      "less.validate": false,
+      "eslint.useFlatConfig": true,
+      "eslint.validate": ["javascript", "typescript", "vue"],
+      "stylelint.enable": true,
+      "stylelint.validate": ["css", "scss", "vue"],
+      "prettier.useEditorConfig": false,
+      "prettier.configPath": "bazel/tools/prettier.config.cjs",
+      "vue.complete.casing.tags": "pascal",
+      "vue.complete.casing.props": "camel",
+      "typescript.preferences.preferTypeOnlyAutoImports": true,
+      "javascript.preferences.preferTypeOnlyAutoImports": true
+    },
+    "workspace": {
+      "js/ts.tsdk.path": "packages/cmk-frontend-vue/node_modules/typescript/lib"
+    },
+    "disableFolder": {
+      "eslint.enable": false,
+      "stylelint.enable": false,
+      "prettier.enable": false
+    },
+    "unsetFolder": ["prettier.prettierPath", "stylelint.configFile"],
+    "unsetWorkspace": ["prettier.prettierPath"]
+  },
+  "rust": {
+    "folder": {
+      "[rust]": {
+        "editor.formatOnSave": true
+      }
+    },
+    "workspace": {
+      "rust-analyzer.linkedProjects": [
+        "${workspaceFolder}/packages/check-cert/Cargo.toml",
+        "${workspaceFolder}/packages/check-http/Cargo.toml",
+        "${workspaceFolder}/packages/cmk-agent-ctl/Cargo.toml",
+        "${workspaceFolder}/packages/mk-oracle/Cargo.toml",
+        "${workspaceFolder}/packages/mk-sql/Cargo.toml"
+      ],
+      "rust-analyzer.check.command": "clippy"
+    },
+    "disableWorkspace": {
+      "rust-analyzer.initializeStopped": true
+    }
+  },
+  "cpp": {
+    "folder": {
+      "[cpp]": {
+        "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd",
+        "editor.formatOnSave": true
+      },
+      "[c]": {
+        "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd",
+        "editor.formatOnSave": true
+      },
+      "clangd.path": "${workspaceFolder}/bazel-bin/bazel/tools/bazel_env/bin/clangd"
+    },
+    "workspace": {
+      "clangd.arguments": [
+        "--background-index",
+        "--clang-tidy",
+        "--header-insertion=never",
+        "--completion-style=detailed",
+        "--pch-storage=memory",
+        "--compile-commands-dir=${workspaceFolder}",
+        "--limit-results=100",
+        "-j=4"
+      ],
+      "clangd.checkUpdates": false,
+      "clangd.onConfigChanged": "restart"
+    },
+    "disableWorkspace": {
+      "clangd.enable": false
+    }
+  },
+  "bazel": {
+    "folder": {
+      "bazel.buildifierExecutable": "${which:buildifier}",
+      "bazel.executable": "${which:bazelisk}"
+    }
+  },
+  "general": {
+    "folder": {
+      "editor.formatOnSave": true,
+      "git.branchProtection": ["master", "main"],
+      "files.watcherExclude": {
+        "**/bazel-bin/**": true,
+        "**/bazel-out/**": true,
+        "**/bazel-testlogs/**": true,
+        "**/bazel-master/**": true,
+        "**/.venv/**": true,
+        "**/node_modules/**": true,
+        "**/.git/objects/**": true,
+        "**/.git/subtree-cache/**": true,
+        "**/container_shadow_workspace_local/**": true,
+        "**/*cache*/**": true
+      },
+      "search.exclude": {
+        "**/bazel-bin": true,
+        "**/bazel-out": true,
+        "**/bazel-testlogs": true,
+        "**/bazel-master": true,
+        "**/.venv": true,
+        "**/node_modules": true,
+        "**/container_shadow_workspace_local": true,
+        "**/*cache*": true
+      }
+    }
+  },
+  "markdown": {
+    "folder": {
+      "[markdown]": {
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "editor.formatOnSave": true
+      }
+    }
+  },
+  "cspell": {
+    "folder": {
+      "cSpell.autocorrect": true,
+      "cSpell.enabledNotifications": {
+        "Average Word Length too Long": true,
+        "Lines too Long": true,
+        "Maximum Word Length Exceeded": true
+      },
+      "cSpell.showAutocompleteDirectiveSuggestions": true,
+      "cSpell.enabled": true,
+      "cSpell.diagnosticLevel": "Information",
+      "cSpell.dictionaryDefinitions": [
+        {
+          "name": "checkmk",
+          "path": "./.ide/vscode/config/checkmk.dict.txt",
+          "addWords": true
+        }
+      ],
+      "cSpell.dictionaries": ["checkmk"]
+    },
+    "user": {
+      "cSpell.showStatus": true
+    }
+  }
+}

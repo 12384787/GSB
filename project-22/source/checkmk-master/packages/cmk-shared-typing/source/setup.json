@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2019-09/schema",
+  "type": "object",
+  "title": "Dialog with Slidein Type Defs",
+  "properties": {
+    "agent_download": {
+      "type": "object",
+      "$ref": "#/$defs/agent_download"
+    }
+  },
+  "required": ["agent_download"],
+  "$defs": {
+    "agent_download_server_per_site": {
+      "type": "object",
+      "properties": {
+        "site_id": { "type": "string" },
+        "server": { "type": "string" }
+      },
+      "required": ["site_id", "server"]
+    },
+    "agent_download": {
+      "type": "object",
+      "properties": {
+        "user_id": { "type": "string" },
+        "output": { "type": "string" },
+        "site": { "type": "string" },
+        "server_per_site": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/agent_download_server_per_site"
+          }
+        },
+        "agent_slideout": { "$ref": "agent_slideout.json" },
+        "is_push_mode": { "type": "boolean" }
+      },
+      "required": ["user_id", "site", "server_per_site", "agent_slideout"]
+    }
+  }
+}

@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CmkTimeSeriesGraph",
+  "type": "object",
+  "properties": {
+    "size": { "$ref": "#/$defs/size" },
+    "options": { "$ref": "#/$defs/graph_options" },
+    "interaction": { "$ref": "#/$defs/interaction" },
+    "time_range": {
+      "anyOf": [{ "$ref": "#/$defs/time_range" }, { "type": "null" }]
+    },
+    "internal": { "type": "string" },
+    "add_to": {
+      "anyOf": [{ "$ref": "#/$defs/add_to" }, { "type": "null" }]
+    }
+  },
+  "required": ["size", "options", "interaction", "internal"],
+  "$defs": {
+    "size": {
+      "title": "Size",
+      "type": "object",
+      "properties": {
+        "width": { "type": "number" },
+        "height": { "type": "number" },
+        "mode": { "type": "string", "enum": ["resizable", "fixed"] }
+      },
+      "required": ["width", "height", "mode"]
+    },
+    "graph_header": {
+      "title": "GraphHeader",
+      "type": "object",
+      "properties": {
+        "title": { "type": ["string", "null"] },
+        "show_graph_time": { "type": "boolean" }
+      },
+      "required": ["title", "show_graph_time"]
+    },
+    "x_axis": {
+      "title": "XAxis",
+      "type": "object",
+      "properties": {
+        "unit": { "type": "string", "enum": ["time"] },
+        "fixed_timerange": { "type": "boolean" }
+      },
+      "required": ["unit", "fixed_timerange"]
+    },
+    "explicit_range": {
+      "title": "ExplicitRange",
+      "type": "object",
+      "properties": {
+        "min": { "type": "number" },
+        "max": { "type": "number" }
+      },
+      "required": ["min", "max"]
+    },
+    "y_axis": {
+      "title": "YAxis",
+      "type": "object",
+      "properties": {
+        "unit": { "$ref": "unit_format.json#" },
+        "explicit_range": { "$ref": "#/$defs/explicit_range" }
+      }
+    },
+    "graph_options": {
+      "title": "GraphOptions",
+      "type": "object",
+      "properties": {
+        "header": { "$ref": "#/$defs/graph_header" },
+        "name": { "type": "string" },
+        "x_axis": {
+          "anyOf": [{ "$ref": "#/$defs/x_axis" }, { "type": "null" }]
+        },
+        "y_axis": {
+          "anyOf": [{ "$ref": "#/$defs/y_axis" }, { "type": "null" }]
+        },
+        "font_size_pt": { "type": "number" }
+      },
+      "required": ["header", "name", "x_axis", "y_axis", "font_size_pt"]
+    },
+    "interaction": {
+      "title": "Interaction",
+      "type": "object",
+      "properties": {
+        "burger": { "type": "string", "enum": ["enabled", "disabled"] },
+        "zoom": { "type": "string", "enum": ["enabled", "disabled"] },
+        "panning": { "type": "string", "enum": ["enabled", "disabled"] },
+        "hover": { "type": "string", "enum": ["enabled", "disabled"] },
+        "brush": { "type": "string", "enum": ["enabled", "disabled"] },
+        "pin": { "type": "string", "enum": ["enabled", "disabled"] }
+      },
+      "required": ["burger", "zoom", "panning", "hover", "brush", "pin"]
+    },
+    "time_range": {
+      "title": "TimeRange",
+      "type": "object",
+      "properties": {
+        "start": { "type": "integer" },
+        "end": { "type": "integer" },
+        "step": { "type": "integer" }
+      },
+      "required": ["start", "end", "step"]
+    },
+    "add_to": {
+      "title": "AddTo",
+      "type": "object",
+      "properties": {
+        "type": { "type": "string" },
+        "specification": { "type": "object", "additionalProperties": true },
+        "internal": { "type": "string" }
+      },
+      "required": ["type", "specification", "internal"]
+    }
+  }
+}

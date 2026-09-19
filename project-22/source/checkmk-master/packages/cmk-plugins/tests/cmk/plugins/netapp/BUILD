@@ -1,0 +1,14 @@
+load("@cmk_requirements//:requirements.bzl", "requirement")
+load("//bazel/rules:py_cmk_test.bzl", "py_cmk_test")
+
+py_cmk_test(
+    name = "netapp-test",
+    size = "small",
+    srcs = glob(["**/*.py"]),
+    deps = [
+        "//packages/cmk-plugins/cmk/plugins/netapp",
+        requirement("netapp_ontap"),
+        requirement("polyfactory"),
+        requirement("time-machine"),
+    ],
+)

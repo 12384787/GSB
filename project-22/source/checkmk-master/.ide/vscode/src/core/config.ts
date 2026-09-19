@@ -1,0 +1,220 @@
+/**
+ * Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+import * as fs from 'fs'
+import * as path from 'path'
+import * as vscode from 'vscode'
+
+// ── Config types ──
+
+export interface CommandConfig {
+  name: string
+  command: string
+  requires?: string
+  postAction?: string
+}
+
+export interface ExtensionFamilyConfig {
+  extensions: string[]
+  required?: boolean
+  defaultPicked?: boolean
+}
+
+export type ExtensionEntry = string[] | ExtensionFamilyConfig
+export type ExtensionSets = Record<string, ExtensionEntry>
+
+export type SettingValue =
+  | string
+  | number
+  | boolean
+  | null
+  | SettingValue[]
+  | { [key: string]: SettingValue }
+
+export interface SettingsScopeEntry {
+  folderSettings?: Record<string, SettingValue>
+  workspaceSettings?: Record<string, SettingValue>
+  userSettings?: Record<string, SettingValue>
+}
+
+export type SettingsSets = Record<string, SettingsScopeEntry>
+
+// ── Functions ──
+
+export async function writeSetting(
+  key: string,
+  value: unknown,
+  target: vscode.ConfigurationTarget = vscode.ConfigurationTarget.Workspace
+): Promise<void> {
+  const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri
+  const resource = target === vscode.ConfigurationTarget.WorkspaceFolder ? wsFolder : undefined
+  const dot = key.lastIndexOf('.')
+  if (dot > 0) {
+    const section = key.substring(0, dot)
+    const leaf = key.substring(dot + 1)
+    await vscode.workspace.getConfiguration(section, resource).update(leaf, value, target)
+  } else {
+    await vscode.workspace.getConfiguration(undefined, resource).update(key, value, target)
+  }
+}
+
+export function shellEscape(s: string): string {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'"
+}
+
+interface ConfigCacheEntry {
+  path: string
+  mtimeMs: number
+  parsed: unknown
+}
+const _configCache = new Map<string, ConfigCacheEntry>()
+
+function readConfigCached(filePath: string): unknown {
+  let mtimeMs: number
+  try {
+    mtimeMs = fs.statSync(filePath).mtimeMs
+  } catch {
+    throw new Error(`config not found: ${filePath}`)
+  }
+  const cached = _configCache.get(filePath)
+  if (cached && cached.mtimeMs === mtimeMs) return cached.parsed
+  const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+  _configCache.set(filePath, { path: filePath, mtimeMs, parsed })
+  return parsed
+}
+
+export function loadConfig<T = unknown>(name: string): T {
+  // Prefer workspace config (branch-aware, always fresh)
+  const wsPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+  if (wsPath) {
+    const wsConfig = path.join(wsPath, '.ide', 'vscode', 'config', `${name}.json`)
+    if (fs.existsSync(wsConfig)) return readConfigCached(wsConfig) as T
+  }
+  // Fallback to bundled config in installed VSIX
+  return readConfigCached(path.join(__dirname, '..', 'config', `${name}.json`)) as T
+}
+
+/**
+ * Pure-JS `which`: walks $PATH with `fs.existsSync` instead of spawning a
+ * subprocess. Sub-millisecond and never stalls the extension host event
+ * loop. Results cached for the session — PATH doesn't change at runtime.
+ */
+const _whichCache = new Map<string, string>()
+function whichSync(bin: string): string {
+  if (_whichCache.has(bin)) return _whichCache.get(bin) || ''
+  const PATH = process.env.PATH || ''
+  const exts = process.platform === 'win32' ? (process.env.PATHEXT || '.EXE').split(';') : ['']
+  let resolved = ''
+  for (const dir of PATH.split(path.delimiter)) {
+    if (!dir) continue
+    for (const ext of exts) {
+      const candidate = path.join(dir, bin + ext)
+      try {
+        if (fs.existsSync(candidate)) {
+          resolved = candidate
+          break
+        }
+      } catch {
+        // ignore
+      }
+    }
+    if (resolved) break
+  }
+  _whichCache.set(bin, resolved)
+  return resolved
+}
+
+export function resolveVariables(value: SettingValue): SettingValue {
+  const wsPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+  if (!wsPath) return value
+  if (typeof value === 'string') {
+    return value
+      .replace(/\$\{cmk-ext:workspaceFolder\}/g, wsPath)
+      .replace(/\$\{which:([^}]+)\}/g, (_m, bin) => whichSync(bin))
+  }
+  if (Array.isArray(value)) {
+    return value.map((v) => resolveVariables(v))
+  }
+  if (typeof value === 'object' && value !== null) {
+    const resolved: Record<string, SettingValue> = {}
+    for (const [k, v] of Object.entries(value)) {
+      resolved[k] = resolveVariables(v)
+    }
+    return resolved
+  }
+  return value
+}
+
+export function getExtensionIds(extensionSets: ExtensionSets, name: string): string[] {
+  const entry = extensionSets[name]
+  return Array.isArray(entry) ? entry : entry?.extensions || []
+}
+
+export function isRequired(extensionSets: ExtensionSets, name: string): boolean {
+  const entry = extensionSets[name]
+  return !Array.isArray(entry) && entry?.required === true
+}
+
+export function getRequiredFamilies(extensionSets: ExtensionSets): string[] {
+  return Object.keys(extensionSets).filter((name) => isRequired(extensionSets, name))
+}
+
+export function getOptionalFamilies(extensionSets: ExtensionSets): string[] {
+  return Object.keys(extensionSets).filter((name) => !isRequired(extensionSets, name))
+}
+
+export function isDefaultPicked(extensionSets: ExtensionSets, name: string): boolean {
+  const entry = extensionSets[name]
+  if (Array.isArray(entry)) return true
+  return entry?.defaultPicked !== false
+}
+
+export interface ScopedSetting {
+  key: string
+  value: unknown
+  target: vscode.ConfigurationTarget
+}
+
+export function getDisableSettings(name: string): ScopedSetting[] {
+  const settings = loadConfig<Record<string, Record<string, Record<string, unknown>>>>('settings')
+  const entry = settings[name]
+  if (!entry) return []
+  const result: ScopedSetting[] = []
+  for (const [key, value] of Object.entries(entry.disableFolder || {})) {
+    result.push({ key, value, target: vscode.ConfigurationTarget.WorkspaceFolder })
+  }
+  for (const [key, value] of Object.entries(entry.disableWorkspace || {})) {
+    result.push({ key, value, target: vscode.ConfigurationTarget.Workspace })
+  }
+  for (const [key, value] of Object.entries(entry.disableUser || {})) {
+    result.push({ key, value, target: vscode.ConfigurationTarget.Global })
+  }
+  return result
+}
+
+// Returns the "active" values for keys that also appear in disableFolder/Workspace/User.
+// These should be applied automatically on profile activation so the editor reflects the
+// recommended state without requiring the user to click "Apply" in the dashboard.
+export function getEnableSettings(name: string): ScopedSetting[] {
+  const settings = loadConfig<Record<string, Record<string, Record<string, unknown>>>>('settings')
+  const entry = settings[name]
+  if (!entry) return []
+  const result: ScopedSetting[] = []
+  const pairs: Array<[string, string, vscode.ConfigurationTarget]> = [
+    ['folder', 'disableFolder', vscode.ConfigurationTarget.WorkspaceFolder],
+    ['workspace', 'disableWorkspace', vscode.ConfigurationTarget.Workspace],
+    ['user', 'disableUser', vscode.ConfigurationTarget.Global]
+  ]
+  for (const [activeSec, disableSec, target] of pairs) {
+    const active = entry[activeSec] || {}
+    const disabled = entry[disableSec] || {}
+    for (const key of Object.keys(disabled)) {
+      if (key in active) {
+        result.push({ key, value: resolveVariables(active[key] as SettingValue), target })
+      }
+    }
+  }
+  return result
+}

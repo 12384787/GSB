@@ -1,0 +1,86 @@
+<!--
+Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import CmkInput from 'cmk-ui-library/components/user-input/CmkInput.vue'
+import usei18n from 'cmk-ui-library/lib/i18n'
+
+import ContentSpacer from '@/dashboard/components/ContentSpacer.vue'
+
+import GeneralProperties from '../../../components/DashboardSettings/GeneralProperties.vue'
+import FieldComponent from '../../../components/TableForm/FieldComponent.vue'
+import FieldDescription from '../../../components/TableForm/FieldDescription.vue'
+import TableForm from '../../../components/TableForm/TableForm.vue'
+import TableFormRow from '../../../components/TableForm/TableFormRow.vue'
+
+const { _t } = usei18n()
+
+interface GeneralSettingsProps {
+  nameValidationErrors: string[]
+  uniqueIdValidationErrors: string[]
+  dashboardType: string
+  originalDashboardId: string
+  loggedInUser: string
+}
+
+defineProps<GeneralSettingsProps>()
+const name = defineModel<string>('name', { required: true })
+const description = defineModel<string>('description', { required: true, default: '' })
+const addFilterSuffix = defineModel<boolean>('addFilterSuffix', {
+  required: false,
+  default: undefined
+})
+const createUniqueId = defineModel<boolean>('createUniqueId', { required: true })
+const uniqueId = defineModel<string>('uniqueId', { required: true })
+const dashboardIcon = defineModel<string | null>('dashboardIcon', {
+  required: false,
+  default: null
+})
+const dashboardEmblem = defineModel<string | null>('dashboardEmblem', {
+  required: false,
+  default: null
+})
+</script>
+
+<template>
+  <TableForm>
+    <TableFormRow>
+      <FieldDescription>{{ _t('Dashboard type') }}</FieldDescription>
+      <FieldComponent>{{ dashboardType }}</FieldComponent>
+    </TableFormRow>
+  </TableForm>
+
+  <ContentSpacer />
+
+  <GeneralProperties
+    v-model:name="name"
+    v-model:create-unique-id="createUniqueId"
+    v-model:unique-id="uniqueId"
+    v-model:dashboard-icon="dashboardIcon"
+    v-model:dashboard-emblem="dashboardEmblem"
+    v-model:add-filter-suffix="addFilterSuffix"
+    :name-validation-errors="nameValidationErrors"
+    :unique-id-validation-errors="uniqueIdValidationErrors"
+    :original-dashboard-id="originalDashboardId"
+    :logged-in-user="loggedInUser"
+  />
+
+  <ContentSpacer />
+
+  <TableForm>
+    <TableFormRow>
+      <FieldDescription>{{ _t('Description') }}</FieldDescription>
+      <FieldComponent>
+        <CmkInput
+          v-model="description"
+          :placeholder="_t('Enter description')"
+          :aria-label="_t('Enter description')"
+          type="text"
+          field-size="large"
+        />
+      </FieldComponent>
+    </TableFormRow>
+  </TableForm>
+</template>

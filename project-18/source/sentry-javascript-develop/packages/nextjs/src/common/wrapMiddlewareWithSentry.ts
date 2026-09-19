@@ -1,0 +1,91 @@
+import {
+  captureException,
+  getActiveSpan,
+  getCurrentScope,
+  getRootSpan,
+  handleCallbackErrors,
+  setCapturedScopesOnSpan,
+  winterCGRequestToRequestData,
+  withIsolationScope,
+} from '@sentry/core';
+import { flushSafelyWithTimeout, waitUntil } from '../common/utils/responseEnd';
+import { isSentryTunnelRequest } from '../common/utils/tunnelPathnameMatch';
+import type { EdgeRouteHandler } from '../edge/types';
+
+/**
+ * Wraps Next.js middleware with Sentry error instrumentation.
+ *
+ * The middleware transaction itself is created by Next.js' native OpenTelemetry instrumentation
+ * (the `Middleware.execute` span, normalized by `enhanceMiddlewareRootSpan`), so this wrapper no
+ * longer starts its own span. It only forks an isolation scope, captures errors, and flushes.
+ *
+ * @param middleware The middleware handler.
+ * @returns a wrapped middleware handler.
+ */
+export function wrapMiddlewareWithSentry<H extends EdgeRouteHandler>(
+  middleware: H,
+): (...params: Parameters<H>) => Promise<ReturnType<H>> {
+  return new Proxy(middleware, {
+    apply: async (wrappingTarget, thisArg, args: Parameters<H>) => {
+      const tunnelRoute =
+        '_sentryRewritesTunnelPath' in globalThis
+          ? (globalThis as Record<string, unknown>)._sentryRewritesTunnelPath
+          : undefined;
+
+      // TODO: This can never work with Turbopack, need to remove it for consistency between builds.
+      if (tunnelRoute && typeof tunnelRoute === 'string') {
+        const req: unknown = args[0];
+        if (req instanceof Request && isSentryTunnelRequest(req, tunnelRoute)) {
+          // Create a simple response that mimics NextResponse.next() so we don't need to import Next.js internals here
+          // https://github.com/vercel/next.js/blob/c12c9c1f78ad384270902f0890dc4cd341408105/packages/next/src/server/web/spec-extension/response.ts#L146
+          return new Response(null, {
+            status: 200,
+            headers: {
+              'x-middleware-next': '1',
+            },
+          }) as ReturnType<H>;
+        }
+      }
+
+      // TODO: We still should add central isolation scope creation for when our build-time instrumentation does not work anymore with turbopack.
+      return withIsolationScope(isolationScope => {
+        const req: unknown = args[0];
+        const currentScope = getCurrentScope();
+
+        if (req instanceof Request) {
+          isolationScope.setSDKProcessingMetadata({
+            normalizedRequest: winterCGRequestToRequestData(req),
+          });
+          currentScope.setTransactionName(`middleware ${req.method}`);
+        } else {
+          currentScope.setTransactionName('middleware');
+        }
+
+        const activeSpan = getActiveSpan();
+        if (activeSpan) {
+          // If there is an active span, the native Next.js OTEL instrumentation created the middleware root span.
+          // Bind our forked scopes to it so the transaction picks up the isolation scope instead of the global one.
+          const rootSpan = getRootSpan(activeSpan);
+          if (rootSpan) {
+            setCapturedScopesOnSpan(rootSpan, currentScope, isolationScope);
+          }
+        }
+
+        return handleCallbackErrors(
+          () => wrappingTarget.apply(thisArg, args),
+          error => {
+            captureException(error, {
+              mechanism: {
+                type: 'auto.function.nextjs.wrap_middleware',
+                handled: false,
+              },
+            });
+          },
+          () => {
+            waitUntil(flushSafelyWithTimeout());
+          },
+        );
+      });
+    },
+  });
+}

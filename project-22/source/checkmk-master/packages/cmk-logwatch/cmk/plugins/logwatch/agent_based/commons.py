@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+# Copyright (C) 2019 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+# mypy: disable-error-code="explicit-any"
+# mypy: disable-error-code="no-any-return"
+
+#########################################################################################
+#                                                                                       #
+#                                 !!   W A T C H   O U T   !!                           #
+#                                                                                       #
+#   The logwatch plug-in is notorious for being an exception to just about every rule   #
+#   or best practice that applies to check plug-in development.                         #
+#   It is highly discouraged to use this a an example!                                  #
+#                                                                                       #
+#########################################################################################
+
+import re
+from collections.abc import Callable, Container, Iterable, Mapping, MutableMapping, Sequence
+from dataclasses import dataclass
+from re import Pattern
+from typing import Any, Literal, NamedTuple, TypedDict
+
+from cmk.agent_based.v2 import CheckResult, Result, State
+from cmk.logwatch.config import (
+    CommonLogwatchEc,
+    ParameterLogwatchEc,
+    ParameterLogwatchRules,
+    StateMap,
+)
+
+
+class ItemData(TypedDict):
+    attr: str
+    lines: dict[str, list[str]]
+
+
+class Section(NamedTuple):
+    errors: Sequence[str]
+    logfiles: Mapping[str, ItemData]
+
+
+class PreDictLogwatchEc(CommonLogwatchEc):
+    service_level: tuple[Literal["cmk_postprocessed"], Literal["service_level"], None]
+    host_name: tuple[Literal["cmk_postprocessed"], Literal["host_name"], None]
+    is_preview: tuple[Literal["cmk_postprocessed"], Literal["is_preview"], None]
+
+
+class ParameterLogwatchGroups(TypedDict):
+    grouping_patterns: list[tuple[str, tuple[str, str]]]
+    host_name: str
+
+
+ClusterSection = dict[str | None, Section]
+
+
+def update_seen_batches(
+    value_store: MutableMapping[str, Any],
+    cluster_section: ClusterSection,
+    logfiles: Iterable[str],
+) -> Container[str]:
+    # Watch out: we cannot write an empty set to the value_store :-(
+    seen_batches = value_store.get("seen_batches", ())
+    value_store["seen_batches"] = tuple(
+        batch_id
+        for node_section in cluster_section.values()
+        for logfile in logfiles
+        if (logfile_data := node_section.logfiles.get(logfile)) is not None
+        for batch_id in logfile_data["lines"]
+    )
+    return seen_batches
+
+
+def extract_unseen_lines(
+    batches_of_lines: Mapping[str, list[str]],
+    seen_batches: Container[str],
+) -> list[str]:
+    return [
+        line
+        for batch, lines in sorted(batches_of_lines.items())
+        if batch not in seen_batches
+        for line in lines
+    ]
+
+
+def discoverable_items(*sections: Section) -> list[str]:
+    """only consider files which are 'ok' on at least one node or 'cannotopen' to notify about
+    unreadable files"""
+    return sorted(
+        {
+            item
+            for node_data in sections
+            for item, item_data in node_data.logfiles.items()
+            if item_data["attr"] == "ok" or item_data["attr"] == "cannotopen"
+        }
+    )
+
+
+class LogFileFilter:
+    @staticmethod
+    def _match_all(_logfile: str) -> Literal[True]:
+        return True
+
+    @staticmethod
+    def _match_nothing(_logfile: str) -> Literal[False]:
+        return False
+
+    def __init__(self, rules: Sequence[ParameterLogwatchEc]) -> None:
+        self._expressions: tuple[Pattern[str], ...] = ()
+        self.is_forwarded: Callable[[str], bool]
+        if not rules:
+            # forwarding disabled
+            self.is_forwarded = self._match_nothing
+            return
+
+        if not next((p["activation"] for p in rules if "activation" in p), True):
+            # forwarding disabled
+            self.is_forwarded = self._match_nothing
+            return
+
+        params = rules[0]
+        if "restrict_logfiles" not in params:
+            # matches all logs on this host
+            self.is_forwarded = self._match_all
+            return
+
+        self._expressions = tuple(re.compile(pattern) for pattern in params["restrict_logfiles"])
+        self.is_forwarded = self._match_patterns
+
+    def _match_patterns(self, logfile: str) -> bool:
+        return any(rgx.match(logfile) for rgx in self._expressions)
+
+
+@dataclass(frozen=True)
+class ReclassifyParameters:
+    patterns: Sequence[tuple[Literal["C", "W", "O", "I"], str, str]]
+    states: StateMap
+
+
+def compile_reclassify_params(params: Sequence[ParameterLogwatchRules]) -> ReclassifyParameters:
+    patterns: list[tuple[Literal["C", "W", "O", "I"], str, str]] = []
+    states: StateMap = {}
+
+    for rule in params:
+        if isinstance(rule, dict):
+            patterns.extend(rule["reclassify_patterns"])
+            if "reclassify_states" in rule:
+                # (mo) wondering during migration: doesn't this mean the last one wins?
+                states = rule["reclassify_states"]
+        else:
+            patterns.extend(rule)  # type: ignore[unreachable]
+
+    return ReclassifyParameters(patterns, states)
+
+
+# the `str` is a hack to account for the poorly typed `old_level` below.
+_STATE_CHANGE_MAP: Mapping[str, Literal["c_to", "w_to", "o_to", "._to"]] = {
+    "C": "c_to",
+    "W": "w_to",
+    "O": "o_to",
+    ".": "._to",
+}
+
+
+def reclassify(
+    reclassify_parameters: ReclassifyParameters,
+    text: str,
+    old_level: str,
+) -> str:
+    # Reclassify state if a given regex pattern matches
+    # A match overrules the previous state->state reclassification
+    for level, pattern, _ in reclassify_parameters.patterns:
+        # not necessary to validate regex: already done by GUI
+        if re.search(pattern, text, flags=re.UNICODE):
+            return level
+
+    # Reclassify state to another state
+    try:
+        return reclassify_parameters.states[_STATE_CHANGE_MAP[old_level.upper()]]
+    except KeyError:
+        return old_level
+
+
+def check_errors(cluster_section: Mapping[str | None, Section]) -> Iterable[Result]:
+    """
+    >>> cluster_section = {
+    ...     None: Section(errors=["error w/o node info"], logfiles={}),
+    ...     "node": Section(errors=["some error"], logfiles={}),
+    ... }
+    >>> for r in check_errors(cluster_section):
+    ...     print((r.state, r.summary))
+    (<State.UNKNOWN: 3>, 'error w/o node info')
+    (<State.UNKNOWN: 3>, '[node] some error')
+    """
+    for node, node_data in cluster_section.items():
+        for error_msg in node_data.errors:
+            yield Result(
+                state=State.UNKNOWN,
+                summary=error_msg if node is None else f"[{node}] {error_msg}",
+            )
+
+
+def get_unreadable_logfiles(
+    logfile: str, section: Mapping[str | None, Section]
+) -> Sequence[tuple[str, str | None]]:
+    """
+    >>> section = Section(errors=[], logfiles={"log1": ItemData(attr="cannotopen", lines={})})
+    >>> list(get_unreadable_logfiles("log1", {"node":section }))
+    [('log1', 'node')]
+    >>> section = Section(errors=[], logfiles={"log1": ItemData(attr="cannotopen", lines={})})
+    >>> list(get_unreadable_logfiles("log1", {None:section }))
+    [('log1', None)]
+    >>> list(get_unreadable_logfiles("log1", {"node": Section(errors=[], logfiles={})}))
+    []
+    """
+    return [
+        (logfile, node)
+        for node, node_data in section.items()
+        if (logfile_data := node_data.logfiles.get(logfile))
+        and logfile_data["attr"] == "cannotopen"
+    ]
+
+
+def check_unreadable_files(
+    unreadable_logfiles: Sequence[tuple[str, str | None]], monitoring_state: State
+) -> CheckResult:
+    """
+    >>> list(check_unreadable_files([("log1", "node")], State.WARN))
+    [Result(state=<State.WARN: 1>, summary="[node] Could not read log file 'log1'")]
+    >>> list(check_unreadable_files([("log1", "node")], State.CRIT))
+    [Result(state=<State.CRIT: 2>, summary="[node] Could not read log file 'log1'")]
+    >>> list(check_unreadable_files([("log1", None)], State.CRIT))
+    [Result(state=<State.CRIT: 2>, summary="Could not read log file 'log1'")]
+    >>> list(check_unreadable_files([], State.CRIT))
+    []
+    """
+    for logfile, node in unreadable_logfiles:
+        error_msg = f"Could not read log file '{logfile}'"
+        yield Result(
+            state=monitoring_state,
+            summary=error_msg if node is None else f"[{node}] {error_msg}",
+        )

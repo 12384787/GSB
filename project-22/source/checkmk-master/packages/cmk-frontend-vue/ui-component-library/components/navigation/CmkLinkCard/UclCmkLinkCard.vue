@@ -1,0 +1,136 @@
+<!--
+Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script lang="ts">
+import { type PanelConfigFor } from '@ucl/_ucl/components/detail-page'
+import { allIconOptions } from '@ucl/_ucl/lib/icon'
+import { type SimpleIcons } from 'cmk-ui-library/components/CmkIcon'
+import {
+  type CmkLinkCardBorders,
+  type CmkLinkCardContrast
+} from 'cmk-ui-library/components/CmkLinkCard/CmkLinkCard.vue'
+
+import codeExample from './UclCmkLinkCardCodeExample.vue?raw'
+
+export const a11yData = [
+  {
+    keys: ['Tab'],
+    description:
+      'Moves keyboard focus to the card. The card is focusable and acts as a standard hyperlink.'
+  },
+  {
+    keys: [['Shift', 'Tab']],
+    description: 'Moves focus to the card from the next focusable element in reverse order.'
+  },
+  {
+    keys: ['Enter'],
+    description: 'Activates the link card, following the URL or triggering the callback.'
+  }
+]
+
+export const panelConfig = {
+  borders: {
+    type: 'list' as const,
+    title: 'Borders',
+    options: [
+      { title: 'Standard', name: 'standard' },
+      { title: 'Borderless', name: 'borderless' }
+    ],
+    initialState: 'standard'
+  },
+  contrast: {
+    type: 'list' as const,
+    title: 'Contrast',
+    options: [
+      { title: 'Standard', name: 'standard' },
+      { title: 'High', name: 'high' }
+    ],
+    initialState: 'standard'
+  },
+  title: { type: 'string' as const, title: 'Title', initialState: 'Checkmk Community' },
+  subtitle: {
+    type: 'string' as const,
+    title: 'Subtitle',
+    initialState: 'Join the discussion with other users.'
+  },
+  iconName: {
+    type: 'list' as const,
+    title: 'Icon',
+    options: allIconOptions,
+    initialState: 'checkmk-logo-min'
+  },
+  openInNewTab: { type: 'boolean' as const, title: 'Open in New Tab', initialState: true },
+  disabled: { type: 'boolean' as const, title: 'Disabled', initialState: false },
+  url: {
+    type: 'string' as const,
+    title: 'URL',
+    initialState: 'https://forum.checkmk.com',
+    help: 'Destination URL. Ignored when Disabled is true.'
+  }
+} satisfies PanelConfigFor<typeof CmkLinkCard, 'callback'>
+</script>
+
+<script setup lang="ts">
+import {
+  PanelStateCreator,
+  UclDetailPageAccessibility,
+  UclDetailPageCodeExample,
+  UclDetailPageComponent,
+  UclDetailPageDeveloperPlayground,
+  UclDetailPageHeader,
+  UclDetailPageLayout,
+  UclPropertiesPanel
+} from '@ucl/_ucl/components/detail-page'
+import CmkLinkCard from 'cmk-ui-library/components/CmkLinkCard'
+
+import UclCmkLinkCardDev from './UclCmkLinkCardDev.vue'
+
+defineProps<{ screenshotMode: boolean }>()
+
+const propState = new PanelStateCreator<typeof CmkLinkCard, 'callback'>().createRef(panelConfig)
+</script>
+
+<template>
+  <UclDetailPageLayout>
+    <UclDetailPageHeader>CmkLinkCard</UclDetailPageHeader>
+
+    <UclDetailPageComponent>
+      <div
+        style="
+          width: 100%;
+          max-width: 500px;
+          display: flex;
+          flex-direction: column;
+          gap: var(--dimension-4);
+        "
+      >
+        <CmkLinkCard
+          :title="propState.title"
+          :subtitle="propState.subtitle"
+          :icon-name="
+            propState.iconName !== 'none' ? (propState.iconName as SimpleIcons) : undefined
+          "
+          :url="propState.disabled ? undefined : propState.url"
+          :borders="propState.borders as CmkLinkCardBorders"
+          :contrast="propState.contrast as CmkLinkCardContrast"
+          :open-in-new-tab="propState.openInNewTab"
+          :disabled="propState.disabled"
+        />
+      </div>
+
+      <template #properties>
+        <UclPropertiesPanel v-model="propState" :config="panelConfig" />
+      </template>
+    </UclDetailPageComponent>
+
+    <UclDetailPageCodeExample :code="codeExample" />
+
+    <UclDetailPageAccessibility :data="a11yData" />
+
+    <UclDetailPageDeveloperPlayground>
+      <UclCmkLinkCardDev :screenshot-mode="screenshotMode" />
+    </UclDetailPageDeveloperPlayground>
+  </UclDetailPageLayout>
+</template>

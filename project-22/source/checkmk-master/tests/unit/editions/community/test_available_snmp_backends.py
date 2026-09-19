@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+
+from cmk.checkengine.snmp_backend_builder import discover_backends
+from cmk.checkengine.snmplib import SNMPBackendEnum
+
+
+def test_available_snmp_backends() -> None:
+    assert set(discover_backends()) == {
+        SNMPBackendEnum.CLASSIC,
+        SNMPBackendEnum.STORED_WALK,
+    }

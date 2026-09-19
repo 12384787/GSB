@@ -1,0 +1,114 @@
+<!--
+Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script setup lang="ts">
+import CmkAlertBox from 'cmk-ui-library/components/CmkAlertBox.vue'
+import { Api } from 'cmk-ui-library/lib/api-client'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import { ref, watch } from 'vue'
+
+import { getCsrfToken } from '@/lib/csrf'
+
+const { _t } = usei18n()
+
+const props = defineProps<{
+  activateChangesUrl: string
+  changesAction: string
+  userName: string
+}>()
+
+const restAPI = new Api('', [['Content-Type', 'application/json']])
+
+const currentChangesAction = ref<string>(props.changesAction)
+watch(
+  () => props.changesAction,
+  (val) => {
+    currentChangesAction.value = val
+  }
+)
+
+const successSlideout = ref<boolean>(false)
+const successFullPage = ref<boolean>(false)
+const error = ref<string | null>(null)
+const loading = ref<boolean>(false)
+
+async function setChangesAction(action: 'full_page' | 'slideout') {
+  loading.value = true
+  error.value = null
+  try {
+    await restAPI.put(`ajax_set_change_action.py`, {
+      _csrf_token: encodeURIComponent(getCsrfToken()),
+      action
+    })
+
+    if (action === 'full_page') {
+      successFullPage.value = true
+    } else {
+      successSlideout.value = true
+    }
+    currentChangesAction.value = action
+  } catch (e) {
+    error.value = (e as Error).message
+  }
+  loading.value = false
+}
+
+function goToFullPage() {
+  location.href = `index.py?start_url=${encodeURI(props.activateChangesUrl)}`
+}
+</script>
+<template>
+  <CmkAlertBox
+    v-if="!currentChangesAction && !loading"
+    :heading="_t('Working with a complex environment?')"
+    :main-button="{
+      title: _t('Keep quick activation'),
+      onclick: () => setChangesAction('slideout')
+    }"
+    :optional-button="{
+      title: _t('Set full activation page as default'),
+      onclick: () => setChangesAction('full_page')
+    }"
+    class="mm-user-setting-dialog"
+  >
+    {{
+      _t(
+        `In complex environments, activation issues are more common and may require closer review.\n` +
+          `The full 'Activation changes' page gives you better visibility before activating.`
+      )
+    }}
+  </CmkAlertBox>
+  <CmkAlertBox v-if="loading" variant="loading">{{ _t('Applying user setting...') }}</CmkAlertBox>
+  <CmkAlertBox
+    v-if="successSlideout"
+    variant="success"
+    :title="_t('Preference saved.')"
+    :dismissible="true"
+  >
+    {{ _t("Clicking on 'Changes' will continue to open the quick activation.") }}
+    <br />
+    {{ _t('You can change this at any time in your profile settings.') }}
+  </CmkAlertBox>
+  <CmkAlertBox
+    v-if="successFullPage"
+    variant="success"
+    :heading="_t('Preference saved.')"
+    :optional-button="{
+      title: _t('Open full activation page'),
+      onclick: goToFullPage
+    }"
+    class="mm-user-setting-dialog"
+  >
+    {{
+      _t(
+        `Clicking on 'Changes' will now open the full 'Activate changes' page.\n` +
+          `You can change this at any time in your profile settings.`
+      )
+    }}
+  </CmkAlertBox>
+  <CmkAlertBox v-if="error" variant="error" :title="_t('Could not apply user setting.')">
+    {{ error }}
+  </CmkAlertBox>
+</template>

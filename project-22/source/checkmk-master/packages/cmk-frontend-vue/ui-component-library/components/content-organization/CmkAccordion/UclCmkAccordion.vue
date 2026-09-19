@@ -1,0 +1,189 @@
+<!--
+Copyright (C) 2026 Checkmk GmbH - License: GNU General Public License v2
+This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+conditions defined in the file COPYING, which is part of this source code package.
+-->
+<script lang="ts">
+import { type Options, type PanelConfigFor, listOptions } from '@ucl/_ucl/components/detail-page'
+import type { StringArrayPropDef } from '@ucl/_ucl/types/prop-def'
+import type { SimpleIcons } from 'cmk-ui-library/components/CmkIcon'
+import { type HeadingType } from 'cmk-ui-library/components/typography/CmkHeading.vue'
+
+import codeExample from './UclCmkAccordionCodeExample.vue?raw'
+
+export const a11yData = [
+  {
+    keys: ['Tab'],
+    description: 'Moves keyboard focus to the accordion header.'
+  },
+  {
+    keys: [['Shift', 'Tab']],
+    description:
+      'Moves focus to the accordion header from the next focusable element in reverse order.'
+  },
+  {
+    keys: ['Enter', 'Space'],
+    description: 'Toggles the expansion state of the focused accordion item.'
+  }
+]
+
+export const panelConfig = {
+  minOpen: {
+    type: 'number' as const,
+    title: 'minOpen',
+    help: '0 allows all items to be collapsed, while 1 or more ensures that at least that many items are always expanded.',
+    initialState: 1
+  },
+  maxOpen: {
+    type: 'number' as const,
+    title: 'maxOpen',
+    help: '0 allows unlimited items to be expanded, while 1 restricts to only one item at a time.',
+    initialState: 1
+  },
+  openedItems: {
+    type: 'string-array' as const,
+    title: 'openedItems',
+    initialState: ['item-1'],
+    help: 'Type: string[]. IDs must match the value prop of each CmkAccordionItem. In the UCL app, enter one ID per line in the textarea, e.g.:item-1 item-2 item-3'
+  }
+} satisfies PanelConfigFor<typeof CmkAccordion, 'modelValue'> & { openedItems: StringArrayPropDef }
+export const itemPanelConfig = {
+  headerAs: {
+    type: 'list' as const,
+    title: 'headerAs',
+    options: listOptions<NonNullable<HeadingType>>({
+      h1: 'h1',
+      h2: 'h2',
+      h3: 'h3',
+      h4: 'h4'
+    }),
+    initialState: 'h3' as NonNullable<HeadingType>,
+    help: 'HTML element used to render the accordion item header.'
+  },
+  disabled: {
+    type: 'boolean' as const,
+    title: 'disabled',
+    initialState: false,
+    help: 'Disables all items in the accordion.'
+  },
+  icon: {
+    type: 'list' as const,
+    title: 'icon',
+    options: [
+      { title: 'users', name: 'users' },
+      { title: 'passwords', name: 'passwords' },
+      { title: 'notifications', name: 'notifications' }
+    ] satisfies Options<SimpleIcons>[],
+    initialState: 'users' as SimpleIcons,
+    help: 'Icon shown in front of the open/closed chevron.'
+  }
+} satisfies PanelConfigFor<typeof CmkAccordionItem, 'value'>
+</script>
+
+<script setup lang="ts">
+import {
+  PanelStateCreator,
+  UclDetailPageAccessibility,
+  UclDetailPageCodeExample,
+  UclDetailPageComponent,
+  UclDetailPageDeveloperPlayground,
+  UclDetailPageHeader,
+  UclDetailPageLayout,
+  UclPropertiesPanel
+} from '@ucl/_ucl/components/detail-page'
+import CmkAccordion from 'cmk-ui-library/components/CmkAccordion/CmkAccordion.vue'
+import CmkAccordionItem from 'cmk-ui-library/components/CmkAccordion/CmkAccordionItem.vue'
+import CmkTag from 'cmk-ui-library/components/CmkTag.vue'
+
+import UclCmkAccordionDev from './UclCmkAccordionDev.vue'
+
+defineProps<{ screenshotMode: boolean }>()
+
+const propState = new PanelStateCreator<typeof CmkAccordion, 'modelValue'>().createRef(panelConfig)
+
+const itemPropState = new PanelStateCreator<typeof CmkAccordionItem, 'value'>().createRef(
+  itemPanelConfig
+)
+</script>
+
+<template>
+  <UclDetailPageLayout>
+    <UclDetailPageHeader>CmkAccordion</UclDetailPageHeader>
+
+    <UclDetailPageComponent>
+      <CmkAccordion
+        v-model="propState.openedItems"
+        :min-open="propState.minOpen"
+        :max-open="propState.maxOpen"
+      >
+        <CmkAccordionItem
+          value="item-1"
+          :icon="itemPropState.icon"
+          :header-as="itemPropState.headerAs"
+          :disabled="itemPropState.disabled"
+        >
+          <template #header>
+            <div style="display: flex; align-items: center; gap: 8px">
+              <span>Personal Information</span>
+            </div>
+          </template>
+          <template #header-right>
+            <CmkTag size="medium" variant="fill" content="3 fields" />
+          </template>
+          <template #content>
+            <p>Manage your personal details, email address, and profile settings.</p>
+          </template>
+        </CmkAccordionItem>
+
+        <CmkAccordionItem
+          value="item-2"
+          :icon="itemPropState.icon"
+          :header-as="itemPropState.headerAs"
+          :disabled="itemPropState.disabled"
+        >
+          <template #header>
+            <div style="display: flex; align-items: center; gap: 8px">
+              <span>Security Settings</span>
+            </div>
+          </template>
+          <template #content>
+            <p>Update your password, enable 2FA, and manage security keys.</p>
+          </template>
+        </CmkAccordionItem>
+
+        <CmkAccordionItem
+          value="item-3"
+          :icon="itemPropState.icon"
+          :header-as="itemPropState.headerAs"
+          :disabled="itemPropState.disabled"
+        >
+          <template #header>
+            <div style="display: flex; align-items: center; gap: 8px">
+              <span>Notifications</span>
+            </div>
+          </template>
+          <template #content>
+            <p>Configure email digests and real-time alert preferences.</p>
+          </template>
+        </CmkAccordionItem>
+      </CmkAccordion>
+
+      <template #properties>
+        <UclPropertiesPanel v-model="propState" title="CmkAccordion" :config="panelConfig" />
+        <UclPropertiesPanel
+          v-model="itemPropState"
+          title="CmkAccordionItem"
+          :config="itemPanelConfig"
+        />
+      </template>
+    </UclDetailPageComponent>
+
+    <UclDetailPageCodeExample :code="codeExample" />
+
+    <UclDetailPageAccessibility :data="a11yData" />
+
+    <UclDetailPageDeveloperPlayground>
+      <UclCmkAccordionDev :screenshot-mode="screenshotMode" />
+    </UclDetailPageDeveloperPlayground>
+  </UclDetailPageLayout>
+</template>

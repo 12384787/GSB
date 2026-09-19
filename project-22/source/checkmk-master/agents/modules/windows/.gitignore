@@ -1,0 +1,5 @@
+distro/
+python/
+tmp/
+.idea/
+Python-*.tar.xz

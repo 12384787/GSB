@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+# Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+# This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+# conditions defined in the file COPYING, which is part of this source code package.
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from http import HTTPStatus
+from typing import Self
+
+from werkzeug.datastructures import ETags
+
+from cmk.ccc.user import UserId
+from cmk.gui.config import Config
+from cmk.gui.customer import is_provider_site
+from cmk.gui.logged_in import LoggedInUser
+from cmk.gui.openapi.restful_objects.constructors import ETagHash, hash_of_dict
+from cmk.gui.openapi.utils import ProblemException
+from cmk.gui.permissions import permission_registry
+from cmk.gui.role_types import BuiltInUserRole, CustomUserRole
+from cmk.gui.token_auth import AuthToken
+from cmk.gui.type_defs import (
+    AgentControllerCertificates,
+    CustomHostAttrSpec,
+    CustomUserAttrSpec,
+    GraphTimerange,
+    PasswordPolicy,
+    ReadOnlySpec,
+    UserSpec,
+)
+from cmk.gui.user_connection_config_types import ConfigurableUserConnectionSpec
+from cmk.gui.utils.roles import UserPermissions
+from cmk.livestatus_client import SiteConfigurations
+from cmk.ruleset_matcher.tags import TagConfig
+
+from .api_config import APIVersion
+
+
+class ETag:
+    """Represents an ETag for an object, which are used to determine if an object has changed.
+
+    The ETag is calculated from a dict, which should contain all values that are needed to fully
+    describe the state of the object."""
+
+    __slots__ = ("_values",)
+
+    def __init__(self, values: dict[str, object]) -> None:
+        self._values = values
+
+    def hash(self) -> ETagHash:
+        """Calculate the ETag hash from the values."""
+        return hash_of_dict(self._values)
+
+
+@dataclass(kw_only=True, slots=True, frozen=True)
+class ApiETagHandler:
+    enabled: bool
+    if_match: ETags
+
+    def verify(self, etag: ETag) -> None:
+        """Check if the ETag matches the If-Match header."""
+        if not self.if_match:
+            raise ProblemException(
+                HTTPStatus.PRECONDITION_REQUIRED,
+                "Precondition required",
+                "If-Match header required for this operation. See documentation.",
+            )
+
+        # this is equivalent to `contains`, but we skip calculating the hash in case of a star tag
+        if self.if_match.star_tag or self.if_match.is_strong(etag.hash()):
+            return
+
+        raise ProblemException(
+            HTTPStatus.PRECONDITION_FAILED,
+            "Precondition failed",
+            f"ETag didn't match. Expected {etag}. Probable cause: Object changed by another user.",
+        )
+
+
+@dataclass(kw_only=True, slots=True, frozen=True)
+class ApiConfig:
+    """Contains parts of the configuration that are relevant for API endpoints."""
+
+    # Feel free to add more values here, if required. We don't want to use the `active_config`.
+    # But we also want to limit this to values that are actually used throughout the API.
+    agent_controller_certificates: AgentControllerCertificates
+    debug: bool
+    default_temperature_unit: str
+    graph_timeranges: list[GraphTimerange]
+    is_provider_site: bool
+    liveproxyd_enabled: bool
+    password_policy: PasswordPolicy
+    sites: SiteConfigurations
+    tags: TagConfig
+    ui_theme: str
+    wato_enabled: bool
+    wato_hide_folders_without_read_permissions: bool
+    wato_host_attrs: Sequence[CustomHostAttrSpec]
+    wato_icon_categories: list[tuple[str, str]]
+    wato_max_snapshots: int
+    wato_pprint_config: bool
+    wato_read_only: ReadOnlySpec
+    wato_use_git: bool
+    roles: Mapping[str, CustomUserRole | BuiltInUserRole]
+    wato_user_attrs: Sequence[CustomUserAttrSpec]
+    multisite_users: Mapping[str, UserSpec]
+    default_user_profile: UserSpec
+    user_connections: Sequence[ConfigurableUserConnectionSpec]
+
+    @classmethod
+    def from_config(cls, config: Config) -> Self:
+        return cls(
+            agent_controller_certificates=config.agent_controller_certificates,
+            debug=config.debug,
+            default_temperature_unit=config.default_temperature_unit,
+            graph_timeranges=config.graph_timeranges,
+            is_provider_site=is_provider_site(config),
+            liveproxyd_enabled=config.liveproxyd_enabled,
+            password_policy=config.password_policy,
+            sites=config.sites,
+            tags=config.tags,
+            ui_theme=config.ui_theme,
+            wato_enabled=config.wato_enabled,
+            wato_hide_folders_without_read_permissions=config.wato_hide_folders_without_read_permissions,
+            wato_host_attrs=config.wato_host_attrs,
+            wato_icon_categories=config.wato_icon_categories,
+            wato_max_snapshots=config.wato_max_snapshots,
+            wato_pprint_config=config.wato_pprint_config,
+            wato_read_only=config.wato_read_only,
+            wato_use_git=config.wato_use_git,
+            roles=config.roles,
+            wato_user_attrs=config.wato_user_attrs,
+            multisite_users=config.multisite_users,
+            default_user_profile=config.default_user_profile,
+            user_connections=config.user_connections,
+        )
+
+    def user_permissions(self) -> UserPermissions:
+        return UserPermissions(
+            roles=self.roles,
+            permissions=permission_registry,
+            user_roles={
+                UserId(user_id): user["roles"] for user_id, user in self.multisite_users.items()
+            },
+            default_user_profile_roles=self.default_user_profile["roles"],
+        )
+
+
+@dataclass(kw_only=True, slots=True, frozen=True)
+class ApiContext:
+    config: ApiConfig
+    version: APIVersion
+    etag: ApiETagHandler
+    host_url: str
+    # The user the request authenticated as. This is the actual LoggedInUser
+    # (including the pseudo users with no user id, e.g. LoggedInSuperUser for the
+    # site-internal secret used by the DCD daemon), not a user rebuilt from the
+    # user id - a None user id maps to several identities with opposite permissions.
+    user: LoggedInUser
+    token: AuthToken | None
+
+    @classmethod
+    def new(
+        cls,
+        config: Config,
+        version: APIVersion,
+        etag_if_match: ETags,
+        host_url: str,
+        user: LoggedInUser,
+        token: AuthToken | None,
+    ) -> Self:
+        return cls(
+            config=ApiConfig.from_config(config),
+            version=version,
+            etag=ApiETagHandler(
+                enabled=config.rest_api_etag_locking,
+                if_match=etag_if_match,
+            ),
+            host_url=host_url,
+            user=user,
+            token=token,
+        )

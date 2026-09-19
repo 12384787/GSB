@@ -1,0 +1,185 @@
+/**
+ * Copyright (C) 2025 Checkmk GmbH - License: GNU General Public License v2
+ * This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
+ * conditions defined in the file COPYING, which is part of this source code package.
+ */
+import type { ConfiguredFilters } from 'cmk-ui-library/components/filter'
+import usei18n from 'cmk-ui-library/lib/i18n'
+import { useDebounceFn } from 'cmk-ui-library/lib/useDebounce'
+import { type Ref, ref, watch } from 'vue'
+
+import {
+  type DataRangeType,
+  useDataRangeInput
+} from '@/dashboard/components/Wizard/components/DataRangeInput/useDataRangeInput'
+import {
+  type UseWidgetVisualizationOptions,
+  useWidgetVisualizationProps
+} from '@/dashboard/components/Wizard/components/WidgetVisualization/useWidgetVisualization'
+import type {
+  TopListContent,
+  UseWidgetHandler,
+  WidgetProps
+} from '@/dashboard/components/Wizard/types'
+import { useInjectDashboardConstants } from '@/dashboard/composables/useProvideDashboardConstants'
+import { computePreviewWidgetTitle } from '@/dashboard/composables/useWidgetTitles'
+import type { WidgetSpec } from '@/dashboard/types/widget'
+import { determineWidgetEffectiveFilterContext } from '@/dashboard/utils'
+
+const { _t } = usei18n()
+
+const MAX_ENTRIES = 50
+
+const CONTENT_TYPE = 'top_list'
+export interface UseTopList extends UseWidgetHandler, UseWidgetVisualizationOptions {
+  //Data settings
+  dataRangeType: Ref<DataRangeType>
+  dataRangeSymbol: Ref<string>
+  dataRangeMin: Ref<number>
+  dataRangeMax: Ref<number>
+
+  rankingOrder: Ref<'high' | 'low'>
+  limitTo: Ref<number>
+  showServiceName: Ref<boolean>
+  showBarVisualization: Ref<boolean>
+
+  MAX_ENTRIES: number
+  limitToValidationErrors: Ref<string[]>
+
+  widgetProps: Ref<WidgetProps>
+}
+
+export const useTopList = async (
+  metric: string,
+  filters: ConfiguredFilters,
+  currentSpec?: WidgetSpec | null
+): Promise<UseTopList> => {
+  const constants = useInjectDashboardConstants()
+  const currentContent =
+    currentSpec?.content?.type === CONTENT_TYPE ? (currentSpec?.content as TopListContent) : null
+
+  const {
+    type: dataRangeType,
+    symbol: dataRangeSymbol,
+    maximum: dataRangeMax,
+    minimum: dataRangeMin,
+    dataRangeProps
+  } = useDataRangeInput(currentContent?.display_range)
+
+  const rankingOrder = ref<'high' | 'low'>(currentContent?.ranking_order ?? 'high')
+
+  const limitTo = ref<number>(currentContent?.limit_to ?? 10)
+  const showServiceName = ref<boolean>(currentContent?.columns?.show_service_description ?? true)
+  const showBarVisualization = ref<boolean>(currentContent?.columns?.show_bar_visualization ?? true)
+
+  const {
+    title,
+    showTitle,
+    showTitleBackground,
+    showWidgetBackground,
+    titleUrlEnabled,
+    titleUrl,
+    validate: validateTitle,
+    titleUrlValidationErrors,
+    titleMacros,
+    widgetGeneralSettings
+  } = useWidgetVisualizationProps('$DEFAULT_TITLE$', currentSpec?.general_settings, CONTENT_TYPE)
+
+  const limitToValidationErrors = ref<string[]>([])
+
+  const widgetProps = ref<WidgetProps>()
+
+  const validate = (): boolean => {
+    limitToValidationErrors.value = []
+
+    if (limitTo.value > MAX_ENTRIES) {
+      limitToValidationErrors.value.push(_t('Value out of range'))
+    }
+
+    validateTitle()
+
+    return titleUrlValidationErrors.value.length + limitToValidationErrors.value.length === 0
+  }
+
+  const _generateContent = (): TopListContent => {
+    return {
+      type: CONTENT_TYPE,
+      metric: metric,
+      columns: {
+        show_bar_visualization: showBarVisualization.value,
+        show_service_description: showServiceName.value
+      },
+      display_range: dataRangeProps.value,
+      ranking_order: rankingOrder.value,
+      limit_to: limitTo.value
+    }
+  }
+
+  const _computeWidgetProps = async (): Promise<WidgetProps> => {
+    const content = _generateContent()
+    const [effectiveTitle, effectiveFilterContext] = await Promise.all([
+      computePreviewWidgetTitle({
+        generalSettings: widgetGeneralSettings.value,
+        content,
+        effectiveFilters: filters
+      }),
+      determineWidgetEffectiveFilterContext(content, filters, constants)
+    ])
+
+    return {
+      general_settings: widgetGeneralSettings.value,
+      content,
+      effectiveTitle,
+      effective_filter_context: effectiveFilterContext
+    }
+  }
+
+  const _updateWidgetProps = async () => {
+    widgetProps.value = await _computeWidgetProps()
+  }
+
+  watch(
+    [
+      widgetGeneralSettings,
+      showBarVisualization,
+      showServiceName,
+      dataRangeProps,
+      rankingOrder,
+      limitTo
+    ],
+    useDebounceFn(() => {
+      void _updateWidgetProps()
+    }, 300),
+    { deep: true }
+  )
+
+  await _updateWidgetProps()
+
+  return {
+    dataRangeType,
+    dataRangeSymbol,
+    dataRangeMin,
+    dataRangeMax,
+
+    rankingOrder,
+    limitTo,
+    showServiceName,
+    showBarVisualization,
+
+    title,
+    showTitle,
+    showTitleBackground,
+    showWidgetBackground,
+    titleUrlEnabled,
+    titleUrl,
+
+    MAX_ENTRIES,
+    titleUrlValidationErrors,
+    titleMacros,
+    limitToValidationErrors,
+    validate,
+
+    widgetProps: widgetProps as Ref<WidgetProps>,
+    getSubmitProps: _computeWidgetProps
+  }
+}
