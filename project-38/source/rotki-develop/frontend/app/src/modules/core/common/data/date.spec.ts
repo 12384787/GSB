@@ -1,0 +1,132 @@
+import dayjs from 'dayjs';
+import { describe, expect, it } from 'vitest';
+import {
+  convertFromTimestamp,
+  convertToTimestamp,
+  dateBoundParser,
+  getDayNames,
+  setupDayjs,
+} from '@/modules/core/common/data/date';
+import { DateFormat } from '@/modules/core/common/date-format';
+
+describe('date-utils', () => {
+  setupDayjs();
+
+  describe('convertToTimestamp', () => {
+    it('should convert a date to a timestamp correctly', () => {
+      const date = '02/01/2023 12:34:56';
+      const expectedTimestamp = dayjs('2023-01-02T12:34:56').unix();
+      expect(convertToTimestamp(date, DateFormat.DateMonthYearHourMinuteSecond)).toBe(expectedTimestamp);
+    });
+
+    it('should handle milliseconds correctly when enabled', () => {
+      const dateWithMilliseconds = '01/02/2023 12:34:56.789';
+      const expectedTimestamp = dayjs('2023-02-01T12:34:56.789').valueOf();
+      expect(convertToTimestamp(dateWithMilliseconds, DateFormat.DateMonthYearHourMinuteSecond, true)).toBe(
+        expectedTimestamp,
+      );
+    });
+
+    it('should still produce a timestamp for a leap second, rather than NaN', () => {
+      const leapSecondDate = '30/06/2015 23:59:60';
+      const timestamp = convertToTimestamp(leapSecondDate, DateFormat.DateMonthYearHourMinuteSecond);
+      expect(timestamp).toBeGreaterThan(0);
+    });
+
+    it('should return NaN for dates with incorrect format', () => {
+      const incorrectFormatDate = '2023-02-01';
+      expect(convertToTimestamp(incorrectFormatDate, DateFormat.DateMonthYearHourMinuteSecond)).toBeNaN();
+    });
+
+    it('should return NaN for null or empty date input', () => {
+      expect(convertToTimestamp('', DateFormat.DateMonthYearHourMinuteSecond)).toBeNaN();
+    });
+  });
+
+  describe('convertFromTimestamp', () => {
+    it('should convert a UNIX timestamp to a date string correctly', () => {
+      const timestamp = dayjs('2023-04-15T12:34:56').unix();
+      const expectedDate = '15/04/2023 12:34:56';
+      expect(convertFromTimestamp(timestamp, DateFormat.DateMonthYearHourMinuteSecond)).toBe(expectedDate);
+    });
+
+    it('should convert a timestamp with milliseconds to a date string correctly', () => {
+      const timestampWithMilliseconds = dayjs('2023-04-15T12:34:56.789').valueOf();
+      const expectedDateWithMilliseconds = '15/04/2023 12:34:56.789';
+      expect(convertFromTimestamp(timestampWithMilliseconds, DateFormat.DateMonthYearHourMinuteSecond, true)).toBe(
+        expectedDateWithMilliseconds,
+      );
+    });
+
+    it('should handle the start of UNIX epoch correctly', () => {
+      const startOfUnixEpoch = 0;
+      const expectedDate = '01/01/1970'; // UTC time
+      expect(convertFromTimestamp(startOfUnixEpoch, DateFormat.DateMonthYearHourMinuteSecond)).toBe(expectedDate);
+    });
+
+    it('should handle the turn of the millennium correctly', () => {
+      const turnOfMillennium = dayjs('2000-01-01T00:00:00').unix();
+      const expectedDate = '01/01/2000';
+      expect(convertFromTimestamp(turnOfMillennium, DateFormat.DateMonthYearHourMinuteSecond)).toBe(expectedDate);
+    });
+
+    it('should handle negative timestamps, being dates before the UNIX epoch, correctly', () => {
+      const negativeTimestamp = dayjs('1969-12-31T23:59:59').unix();
+      const expectedDate = '31/12/1969 23:59:59';
+      expect(convertFromTimestamp(negativeTimestamp, DateFormat.DateMonthYearHourMinuteSecond)).toBe(expectedDate);
+    });
+
+    it('should handle far future timestamps correctly', () => {
+      const farFutureTimestamp = dayjs('9999-12-31T23:59:59').unix();
+      const expectedDate = '31/12/9999 23:59:59';
+      expect(convertFromTimestamp(farFutureTimestamp, DateFormat.DateMonthYearHourMinuteSecond)).toBe(expectedDate);
+    });
+
+    it('should handle times one second before midnight correctly', () => {
+      const timestampJustBeforeMidnight = dayjs('2023-04-15T23:59:59').unix();
+      const expectedDate = '15/04/2023 23:59:59';
+      expect(convertFromTimestamp(timestampJustBeforeMidnight, DateFormat.DateMonthYearHourMinuteSecond)).toBe(
+        expectedDate,
+      );
+    });
+  });
+
+  describe('getDayNames', () => {
+    const result = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+    it('should work in current timezone', () => {
+      expect(getDayNames('en')).toStrictEqual(result);
+    });
+
+    it('should work in New York timezone', () => {
+      // eslint-disable-next-line no-extend-native -- the case pins the host timezone; the offset is restored before the test ends
+      Date.prototype.getTimezoneOffset = function (): number {
+        return -240;
+      };
+
+      expect(getDayNames('en')).toStrictEqual(result);
+
+      // eslint-disable-next-line no-extend-native -- the case pins the host timezone; the offset is restored before the test ends
+      Date.prototype.getTimezoneOffset = function (): number {
+        return 0;
+      };
+    });
+  });
+  describe('dateBoundParser', () => {
+    const parse = dateBoundParser(ref(DateFormat.DateMonthYearHourMinuteSecond));
+
+    it('should read a written date into the timestamp a filter bound stores', () => {
+      expect(parse('15/01/2024')).toBe(dayjs('2024-01-15T00:00:00').unix().toString());
+    });
+
+    it('should refuse text that is not a date', () => {
+      expect(parse('not a date')).toBeUndefined();
+    });
+
+    it('should refuse a date in the future, which the backend answers with a 400', () => {
+      const nextYear = dayjs().add(1, 'year');
+
+      expect(parse(nextYear.format('DD/MM/YYYY'))).toBeUndefined();
+    });
+  });
+});

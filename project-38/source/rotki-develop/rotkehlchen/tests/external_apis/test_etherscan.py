@@ -1,0 +1,513 @@
+import os
+from http import HTTPStatus
+from unittest.mock import patch
+
+import pytest
+from eth_utils import to_checksum_address
+
+from rotkehlchen.chain.accounts import BlockchainAccountData
+from rotkehlchen.chain.ethereum.constants import ETHEREUM_GENESIS
+from rotkehlchen.chain.evm.constants import GENESIS_HASH, ZERO_ADDRESS
+from rotkehlchen.chain.evm.types import string_to_evm_address
+from rotkehlchen.chain.structures import TimestampOrBlockRange
+from rotkehlchen.db.cache import DBCacheStatic
+from rotkehlchen.db.dbhandler import DBHandler
+from rotkehlchen.db.evmtx import DBEvmTx
+from rotkehlchen.db.filtering import EvmTransactionsFilterQuery
+from rotkehlchen.errors.misc import RemoteError, RequestTooLargeError
+from rotkehlchen.externalapis.etherscan import (
+    ETHERSCAN_PAGINATION_LIMIT,
+    ETHERSCAN_TIER_BY_DAILY_LIMIT,
+    Etherscan,
+)
+from rotkehlchen.externalapis.etherscan_like import HasChainActivity
+from rotkehlchen.serialization.deserialize import deserialize_evm_transaction
+from rotkehlchen.tests.utils.factories import make_evm_address
+from rotkehlchen.tests.utils.mock import MockResponse
+from rotkehlchen.types import (
+    ChainID,
+    EvmInternalTransaction,
+    EvmTransaction,
+    ExternalService,
+    ExternalServiceApiCredentials,
+    SupportedBlockchain,
+    Timestamp,
+    deserialize_evm_tx_hash,
+)
+
+
+@pytest.fixture(name='temp_etherscan')
+def fixture_temp_etherscan(function_scope_messages_aggregator, tmpdir_factory, sql_vm_instructions_cb):  # noqa: E501
+    directory = tmpdir_factory.mktemp('someuserdata')
+    db = DBHandler(
+        user_data_dir=directory,
+        password='123',
+        msg_aggregator=function_scope_messages_aggregator,
+        initial_settings=None,
+        sql_vm_instructions_cb=sql_vm_instructions_cb,
+        resume_from_backup=False,
+    )
+
+    # Test with etherscan API key
+    api_key = os.environ.get('ETHERSCAN_API_KEY', None)
+    if not api_key:
+        api_key = '8JT7WQBB2VQP5C3416Y8X3S8GBA3CVZKP4'
+
+    with db.user_write() as write_cursor:
+        db.add_external_service_credentials(
+            write_cursor=write_cursor,
+            credentials=[
+                ExternalServiceApiCredentials(service=ExternalService.ETHERSCAN, api_key=api_key),
+            ])
+
+    with patch.object(Etherscan, 'detect_api_key_tier', return_value=None):
+        return Etherscan(database=db, msg_aggregator=function_scope_messages_aggregator)
+
+
+def patch_etherscan(etherscan, response_msg):
+    count = 0
+
+    def mock_requests_get(*args, **kwargs):  # pylint: disable=unused-argument
+        nonlocal count
+        if count == 0:
+            response = f'{{"status":"0","message":"NOTOK","result":"{response_msg}"}}'
+        else:
+            response = '{"jsonrpc":"2.0","id":1,"result":"0x1337"}'
+
+        count += 1
+        return MockResponse(200, response)
+
+    return patch.object(etherscan.session, 'get', wraps=mock_requests_get)
+
+
+def test_maximum_rate_limit_reached(temp_etherscan, **kwargs):  # pylint: disable=unused-argument
+    """
+    Test that we can handle etherscan's rate limit response properly
+
+    Regression test for https://github.com/rotki/rotki/issues/772"
+    """
+    etherscan_patch = patch_etherscan(
+        etherscan=temp_etherscan,
+        response_msg='Max calls per sec rate limit reached (5/sec)',
+    )
+
+    with etherscan_patch:
+        result = temp_etherscan.eth_call(
+            SupportedBlockchain.ETHEREUM,
+            '0x4678f0a6958e4D2Bc4F1BAF7Bc52E8F3564f3fE4',
+            '0xc455279100000000000000000000000027a2eaaa8bebea8d23db486fb49627c165baacb5',
+        )
+
+    assert result == '0x1337'
+
+
+def test_maximum_daily_rate_limit_reached(temp_etherscan, **kwargs):  # pylint: disable=unused-argument
+    """Test that etherscan's daily rate limit raises a RemoteError"""
+    etherscan_patch = patch_etherscan(
+        etherscan=temp_etherscan,
+        response_msg='Max daily rate limit reached. 110000 (100%) of 100000 day/limit',
+    )
+
+    with pytest.raises(RemoteError), etherscan_patch:
+        temp_etherscan.eth_call(
+            SupportedBlockchain.ETHEREUM,
+            '0x4678f0a6958e4D2Bc4F1BAF7Bc52E8F3564f3fE4',
+            '0xc455279100000000000000000000000027a2eaaa8bebea8d23db486fb49627c165baacb5',
+        )
+
+
+def test_detect_api_key_tier_caches_and_reuses_value(temp_etherscan: Etherscan) -> None:
+    temp_etherscan._delete_cached_api_key_tier()
+    with patch.object(
+        temp_etherscan,
+        '_query',
+        return_value={'creditLimit': 500000},
+    ) as query_mock:
+        temp_etherscan.detect_api_key_tier()
+
+    assert temp_etherscan._rate_limiter.rps == 20.0
+    assert temp_etherscan._rate_limiter.capacity == 20
+    with temp_etherscan.db.conn.read_ctx() as cursor:
+        assert temp_etherscan.db.get_static_cache(
+            cursor=cursor,
+            name=DBCacheStatic.ETHERSCAN_API_KEY_TIER,
+        ) == 'advanced'
+
+    temp_etherscan._rate_limiter.reset(rps=3.0, capacity=3)
+    temp_etherscan.detect_api_key_tier()
+    assert query_mock.call_count == 1
+    assert temp_etherscan._rate_limiter.rps == 20.0
+    assert temp_etherscan._rate_limiter.capacity == 20
+
+
+def test_detect_api_key_tier_does_not_warn_for_missing_key(
+        function_scope_messages_aggregator,
+        tmpdir_factory,
+        sql_vm_instructions_cb,
+) -> None:
+    database = DBHandler(
+        user_data_dir=tmpdir_factory.mktemp('keyless-userdata'),
+        password='123',
+        msg_aggregator=function_scope_messages_aggregator,
+        initial_settings=None,
+        sql_vm_instructions_cb=sql_vm_instructions_cb,
+        resume_from_backup=False,
+    )
+    with patch.object(database.msg_aggregator, 'add_missing_key_message') as warning_mock:
+        etherscan = Etherscan(database=database, msg_aggregator=database.msg_aggregator)
+        warning_mock.assert_not_called()
+        assert etherscan._get_api_key_for_chain(ChainID.ETHEREUM) is None
+        warning_mock.assert_called_once_with(ExternalService.ETHERSCAN)
+
+
+def test_api_key_change_invalidates_cached_tier(temp_etherscan: Etherscan) -> None:
+    temp_etherscan._cache_api_key_tier(tier=ETHERSCAN_TIER_BY_DAILY_LIMIT[500000])
+    with patch.object(temp_etherscan, '_query', return_value={'creditLimit': 200000}):
+        temp_etherscan.on_api_key_changed()
+
+    assert temp_etherscan._rate_limiter.rps == 10.0
+    assert temp_etherscan._rate_limiter.capacity == 10
+    with temp_etherscan.db.conn.read_ctx() as cursor:
+        assert temp_etherscan.db.get_static_cache(
+            cursor=cursor,
+            name=DBCacheStatic.ETHERSCAN_API_KEY_TIER,
+        ) == 'standard'
+
+
+def test_etherscan_uses_account_pagination_limit(temp_etherscan: Etherscan) -> None:
+    assert temp_etherscan._get_account_pagination_options(action='txlist', options={}) == {
+        'page': '1',
+        'offset': str(ETHERSCAN_PAGINATION_LIMIT),
+    }
+    assert temp_etherscan._get_account_pagination_options(action='txlistinternal', options={}) == {
+        'page': '1',
+        'offset': str(ETHERSCAN_PAGINATION_LIMIT),
+    }
+    assert temp_etherscan._get_account_pagination_options(action='tokentx', options={}) == {
+        'page': '1',
+        'offset': str(ETHERSCAN_PAGINATION_LIMIT),
+    }
+    assert temp_etherscan._get_account_pagination_options(action='txsBeaconWithdrawal', options={}) == {  # noqa: E501
+        'page': '1',
+        'offset': str(ETHERSCAN_PAGINATION_LIMIT),
+    }
+    assert temp_etherscan._get_account_pagination_options(action='getminedblocks', options={}) == {
+        'page': '1',
+        'offset': str(ETHERSCAN_PAGINATION_LIMIT),
+    }
+    assert temp_etherscan._get_account_pagination_options(
+        action='getLogs',
+        options={},
+    ) is None
+
+
+def test_maybe_paginate_page_sizes(temp_etherscan: Etherscan) -> None:
+    """Pagination continues only on an exactly full page: a short one is the last
+    page and an oversized one means the server ignored the requested page size
+    (blockscout's getminedblocks), leaving nothing to advance. Endpoints without
+    block range filtering paginate by page number instead of startblock."""
+    options = {'startblock': '0', 'endblock': '100', 'offset': '1000'}
+
+    def make_result(size: int) -> list[dict[str, str]]:
+        return [{'blockNumber': '42'}] * size
+
+    assert temp_etherscan._maybe_paginate(result=make_result(999), options=options.copy()) is None
+    assert temp_etherscan._maybe_paginate(result=make_result(1500), options=options.copy()) is None
+    assert temp_etherscan._maybe_paginate(
+        result=make_result(1000),
+        options=options.copy(),
+    ) == options | {'startblock': '42'}
+    assert temp_etherscan._maybe_paginate(
+        result=make_result(1000),
+        options=options | {'blocktype': 'blocks', 'page': '1'},
+    ) == options | {'blocktype': 'blocks', 'page': '2'}
+
+
+def test_validated_blocks_pagination(temp_etherscan: Etherscan) -> None:
+    """Full pages of validated blocks must be followed up by incrementing the page
+    number: getminedblocks supports no block range filtering, so startblock
+    re-anchoring cannot advance it. The query also used to send no offset at all,
+    stopping after the first page on any tier whose server-side page size differed
+    from ETHERSCAN_PAGINATION_LIMIT."""
+    pages = {
+        '1': [{'blockNumber': str(n)} for n in range(ETHERSCAN_PAGINATION_LIMIT)],
+        '2': [{'blockNumber': str(ETHERSCAN_PAGINATION_LIMIT)}],
+    }
+
+    def mock_query(chain_id, module, action, options):  # pylint: disable=unused-argument
+        assert options['offset'] == str(ETHERSCAN_PAGINATION_LIMIT)
+        return pages[options['page']]
+
+    with patch.object(temp_etherscan, '_query', side_effect=mock_query):
+        blocks = temp_etherscan.get_validated_blocks(
+            address=ZERO_ADDRESS,
+            period=TimestampOrBlockRange(range_type='blocks', from_value=0, to_value=10**9),
+        )
+
+    assert [x['blockNumber'] for x in blocks] == [str(n) for n in range(ETHERSCAN_PAGINATION_LIMIT + 1)]  # noqa: E501
+
+
+def test_withdrawals_exact_page_size_preserves_touched_validators(
+        temp_etherscan: Etherscan,
+) -> None:
+    """An empty page after a full withdrawals page must finalize the accumulated results."""
+    temp_etherscan.pagination_limit = 2
+    withdrawals = [{
+        'validatorIndex': str(idx),
+        'blockNumber': str(idx),
+        'timestamp': str(idx),
+        'amount': '1',
+        'withdrawalIndex': str(idx),
+    } for idx in range(1, 3)]
+
+    with patch.object(temp_etherscan, '_query', side_effect=[withdrawals, []]):
+        assert temp_etherscan.get_withdrawals(
+            address=ZERO_ADDRESS,
+            period=TimestampOrBlockRange(range_type='blocks', from_value=0, to_value=10),
+        ) == {1, 2}
+
+
+def test_get_logs_dedup_keeps_no_duplicates(temp_etherscan: Etherscan) -> None:
+    """Regression test for the get_logs overlap dedup.
+
+    When etherscan returns the 1000-log page cap, pagination re-queries from the last returned
+    block, so the boundary block's logs come back again. get_logs must remove exactly those
+    duplicates from the accumulator (`existing_events`). It used to pop the *last* list element
+    instead of the matched one, which left duplicates whenever the boundary block contributed
+    more than one log to the accumulator.
+    """
+    # accumulator from the previous page (already deserialized to ints), ending in the boundary
+    # block 100 with three logs.
+    existing_events = [
+        {'blockNumber': 99, 'logIndex': 0, 'transactionHash': '0xhash_99_0'},
+        {'blockNumber': 100, 'logIndex': 0, 'transactionHash': '0xhash_100_0'},
+        {'blockNumber': 100, 'logIndex': 1, 'transactionHash': '0xhash_100_1'},
+        {'blockNumber': 100, 'logIndex': 2, 'transactionHash': '0xhash_100_2'},
+    ]
+
+    def raw(block: int, log_index: int) -> dict:  # an etherscan log as returned by _query (hex)
+        return {
+            'blockNumber': hex(block),
+            'logIndex': hex(log_index),
+            'transactionHash': f'0xhash_{block}_{log_index}',
+            'address': ZERO_ADDRESS,
+            'timeStamp': '0x1',
+            'gasPrice': '0x1',
+            'gasUsed': '0x1',
+            'transactionIndex': '0x1',
+        }
+
+    # the re-queried page: boundary block 100 again (0,1,2 are dupes, 3,4 new) then block 101
+    new_events_raw = [raw(100, i) for i in range(5)] + [raw(101, 0)]
+    with patch.object(temp_etherscan, '_query', return_value=new_events_raw):
+        new_events = temp_etherscan.get_logs(
+            chain_id=ChainID.ETHEREUM,
+            contract_address=ZERO_ADDRESS,
+            topics=[],
+            from_block=100,
+            to_block=200,
+            existing_events=existing_events,
+        )
+
+    # the caller does events.extend(new_events); the resulting full set must have no duplicates
+    combined = [
+        (e['blockNumber'], e['logIndex'], e['transactionHash'])
+        for e in existing_events + new_events
+    ]
+    assert len(combined) == len(set(combined)), 'duplicate logs leaked through the overlap dedup'
+    assert set(combined) == {
+        (99, 0, '0xhash_99_0'),
+        (100, 0, '0xhash_100_0'),
+        (100, 1, '0xhash_100_1'),
+        (100, 2, '0xhash_100_2'),
+        (100, 3, '0xhash_100_3'),
+        (100, 4, '0xhash_100_4'),
+        (101, 0, '0xhash_101_0'),
+    }
+
+
+def test_deserialize_transaction_from_etherscan():
+    # Make sure that a missing to address due to contract creation is handled
+    data = {'blockNumber': 54092, 'timeStamp': 1439048640, 'hash': '0x9c81f44c29ff0226f835cd0a8a2f2a7eca6db52a711f8211b566fd15d3e0e8d4', 'nonce': 0, 'blockHash': '0xd3cabad6adab0b52ea632c386ea19403680571e682c62cb589b5abcd76de2159', 'transactionIndex': 0, 'from': '0x5153493bB1E1642A63A098A65dD3913daBB6AE24', 'to': '', 'value': 11901464239480000000000000, 'gas': 2000000, 'gasPrice': 10000000000000, 'isError': 0, 'txreceipt_status': '', 'input': '0x313233', 'contractAddress': '0xde0b295669a9fd93d5f28d9ec85e40f4cb697bae', 'cumulativeGasUsed': 1436963, 'gasUsed': 1436963, 'confirmations': 8569454}  # noqa: E501
+    chain_id = ChainID.ETHEREUM
+    transaction, _ = deserialize_evm_transaction(
+        data=data,
+        internal=False,
+        chain_id=chain_id,
+        evm_inquirer=None,
+    )
+    assert transaction == EvmTransaction(
+        tx_hash=deserialize_evm_tx_hash(data['hash']),
+        chain_id=chain_id,
+        timestamp=1439048640,
+        block_number=54092,
+        from_address='0x5153493bB1E1642A63A098A65dD3913daBB6AE24',
+        to_address=None,
+        value=11901464239480000000000000,
+        gas=2000000,
+        gas_price=10000000000000,
+        gas_used=1436963,
+        input_data=bytes.fromhex(data['input'][2:]),
+        nonce=0,
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+def test_etherscan_get_transactions_genesis_block(eth_transactions):
+    """Test that the genesis transactions are correctly returned"""
+    account = to_checksum_address('0xC951900c341aBbb3BAfbf7ee2029377071Dbc36A')
+    db = eth_transactions.database
+    with db.user_write() as cursor:
+        db.add_blockchain_accounts(
+            write_cursor=cursor,
+            account_data=[
+                BlockchainAccountData(chain=SupportedBlockchain.ETHEREUM, address=account),
+            ],
+        )
+    eth_transactions.single_address_query_transactions(
+        address=account,
+        start_ts=ETHEREUM_GENESIS,
+        end_ts=Timestamp(1451606400),
+    )
+    dbtx = DBEvmTx(database=db)
+    with db.conn.read_ctx() as cursor:
+        regular_tx_in_db = dbtx.get_transactions(
+            cursor=cursor,
+            filter_=EvmTransactionsFilterQuery.make(),
+        )
+        parent_tx_id = cursor.execute(
+            'SELECT identifier FROM evm_transactions WHERE tx_hash=? AND chain_id=?',
+            (GENESIS_HASH, ChainID.ETHEREUM.serialize_for_db()),
+        ).fetchone()[0]
+        internal_tx_in_db = dbtx.get_evm_internal_transactions(
+            parent_tx_hash=GENESIS_HASH,
+            blockchain=SupportedBlockchain.ETHEREUM,
+            parent_tx_id=parent_tx_id,
+        )
+
+        assert dbtx.get_evm_internal_transactions(  # filter using from_address
+            parent_tx_hash=GENESIS_HASH,
+            blockchain=SupportedBlockchain.ETHEREUM,
+            parent_tx_id=parent_tx_id,
+            from_address=ZERO_ADDRESS,
+        ) == dbtx.get_evm_internal_transactions(  # filter using to_address
+            parent_tx_hash=GENESIS_HASH,
+            blockchain=SupportedBlockchain.ETHEREUM,
+            parent_tx_id=parent_tx_id,
+            to_address=string_to_evm_address('0xC951900c341aBbb3BAfbf7ee2029377071Dbc36A'),
+        ) == dbtx.get_evm_internal_transactions(  # filter using both from_address and to_address
+            parent_tx_hash=GENESIS_HASH,
+            blockchain=SupportedBlockchain.ETHEREUM,
+            parent_tx_id=parent_tx_id,
+            from_address=ZERO_ADDRESS,
+            to_address=string_to_evm_address('0xC951900c341aBbb3BAfbf7ee2029377071Dbc36A'),
+        ) == internal_tx_in_db  # filter using none of from_address and to_address
+
+        assert dbtx.get_evm_internal_transactions(  # filter using different from_address
+            parent_tx_hash=GENESIS_HASH,
+            blockchain=SupportedBlockchain.ETHEREUM,
+            parent_tx_id=parent_tx_id,
+            from_address=string_to_evm_address('0xC951900c341aBbb3BAfbf7ee2029377071Dbc36A'),
+        ) == dbtx.get_evm_internal_transactions(  # filter using different to_address
+            parent_tx_hash=GENESIS_HASH,
+            blockchain=SupportedBlockchain.ETHEREUM,
+            parent_tx_id=parent_tx_id,
+            to_address=ZERO_ADDRESS,
+        ) == []
+
+    assert regular_tx_in_db == [
+        EvmTransaction(
+            tx_hash=GENESIS_HASH,
+            chain_id=ChainID.ETHEREUM,
+            timestamp=ETHEREUM_GENESIS,
+            block_number=0,
+            from_address=ZERO_ADDRESS,
+            to_address=None,
+            value=0,
+            gas=0,
+            gas_price=0,
+            gas_used=0,
+            input_data=b'',
+            nonce=0,
+        ), EvmTransaction(
+            tx_hash=deserialize_evm_tx_hash('0x352b93ac19dfbfd65d4d8385cded959d7a156c3f352a71a5a49560b088e1c8df'),
+            chain_id=ChainID.ETHEREUM,
+            timestamp=Timestamp(1443534531),
+            block_number=307793,
+            from_address='0xC951900c341aBbb3BAfbf7ee2029377071Dbc36A',
+            to_address='0x2910543Af39abA0Cd09dBb2D50200b3E800A63D2',
+            value=327400000000000000000,
+            gas=50000,
+            gas_price=1171602790622,
+            gas_used=21612,
+            input_data=b'EN06ENDWG',
+            nonce=0,
+        ),
+    ]
+
+    assert internal_tx_in_db == [
+        EvmInternalTransaction(
+            parent_tx_hash=GENESIS_HASH,
+            chain_id=ChainID.ETHEREUM,
+            trace_id=0,
+            from_address=ZERO_ADDRESS,
+            to_address='0xC951900c341aBbb3BAfbf7ee2029377071Dbc36A',
+            value=327600000000000000000,
+            gas=0,
+            gas_used=0,
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+def test_has_activity(temp_etherscan: Etherscan) -> None:
+    """Test to check if an address has any activity on ethereum mainnet"""
+    assert temp_etherscan.has_activity(ChainID.ETHEREUM, string_to_evm_address('0x95222290DD7278Aa3Ddd389Cc1E1d165CC4BAfe5')) == HasChainActivity.TRANSACTIONS  # noqa: E501
+    assert temp_etherscan.has_activity(ChainID.ETHEREUM, string_to_evm_address('0x725E35e01bbEDadd6ac13cE1c4a98bA4Cf00dF21')) == HasChainActivity.TRANSACTIONS  # noqa: E501
+    assert temp_etherscan.has_activity(ChainID.ETHEREUM, string_to_evm_address('0x3C69Bc9B9681683890ad82953Fe67d13Cd91D5EE')) == HasChainActivity.BALANCE  # noqa: E501
+    assert temp_etherscan.has_activity(ChainID.ETHEREUM, string_to_evm_address('0x014cd0535b2Ea668150a681524392B7633c8681c')) == HasChainActivity.TOKENS  # noqa: E501
+    assert temp_etherscan.has_activity(ChainID.ETHEREUM, string_to_evm_address('0x6c66149E65c517605e0a2e4F707550ca342f9c1B')) == HasChainActivity.NONE  # noqa: E501
+
+
+def test_eth_call_historical_block_refused(temp_etherscan: Etherscan) -> None:
+    """Etherscan silently executes eth_call at the latest block when given a block tag,
+    so historical calls must be refused instead of returning wrong data"""
+    with (
+        patch.object(temp_etherscan, '_query_rpc_method') as query_mock,
+        pytest.raises(RemoteError, match='does not support eth_call at a past block'),
+    ):
+        temp_etherscan.eth_call(
+            chain_id=ChainID.ETHEREUM,
+            to_address=string_to_evm_address('0x6B175474E89094C44Da98b954EedeAC495271d0F'),
+            input_data='0x18160ddd',
+            block_identifier=10000000,
+        )
+
+    assert query_mock.call_count == 0
+    with patch.object(temp_etherscan, '_query_rpc_method', return_value='0x1') as query_mock:
+        assert temp_etherscan.eth_call(  # latest is still queried, without a tag
+            chain_id=ChainID.ETHEREUM,
+            to_address=(dai := string_to_evm_address('0x6B175474E89094C44Da98b954EedeAC495271d0F')),  # noqa: E501
+            input_data='0x18160ddd',
+        ) == '0x1'
+
+    assert query_mock.call_args.kwargs['options'] == {'to': dai, 'data': '0x18160ddd'}
+
+
+def test_query_timeout_asks_for_a_smaller_range(temp_etherscan: Etherscan) -> None:
+    """Etherscan answers an oversized range with a null result and a request to shrink it.
+
+    That must surface as RequestTooLargeError so callers split the range, rather than as a
+    generic malformed-response error that just aborts the query.
+    """
+    with patch.object(
+        temp_etherscan.session,
+        'get',
+        return_value=MockResponse(HTTPStatus.OK, '{"status":"0","message":"Query Timeout occurred. Please select a smaller result dataset","result":null}'),  # noqa: E501
+    ), pytest.raises(RequestTooLargeError, match='Query Timeout'):
+        temp_etherscan._query(
+            chain_id=ChainID.GNOSIS,
+            module='account',
+            action='tokentx',
+            options={'address': make_evm_address()},
+        )

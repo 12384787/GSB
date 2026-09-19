@@ -1,0 +1,112 @@
+import type { Nullable } from '@rotki/common';
+import type { PurgeableModule } from '@/modules/core/common/modules';
+import { EvmTokensRecord } from '@/modules/balances/types/balances';
+import { BlockchainBalances, type FetchBlockchainBalancePayload } from '@/modules/balances/types/blockchain-balances';
+import { api } from '@/modules/core/api/rotki-api';
+import { VALID_WITH_PARAMS_SESSION_AND_EXTERNAL_SERVICE } from '@/modules/core/api/utils';
+import { type PendingTask, PendingTaskSchema } from '@/modules/core/tasks/types';
+
+/**
+ * Tag the cache-only read carries so logging out can cancel whatever is still in flight.
+ *
+ * @remarks
+ * A plain GET has no owner to settle it the way the orchestrator settles a backend task, so
+ * without this its response lands after logout and `processBalanceResult` writes one user's
+ * balances into the next user's store.
+ */
+export const BALANCE_HYDRATION_TAG = 'balance-hydration';
+
+interface UseBlockchainBalancesApiReturn {
+  queryBlockchainBalances: (payload: FetchBlockchainBalancePayload, valueThreshold?: string) => Promise<BlockchainBalances>;
+  refreshBlockchainBalances: (payload: FetchBlockchainBalancePayload) => Promise<PendingTask>;
+  queryXpubBalances: (payload: FetchBlockchainBalancePayload) => Promise<PendingTask>;
+  fetchDetectedTokens: (chain: string, addresses: string[] | null) => Promise<EvmTokensRecord>;
+  fetchDetectedTokensTask: (chain: string, addresses: string[]) => Promise<PendingTask>;
+  deleteModuleData: (module?: Nullable<PurgeableModule>) => Promise<boolean>;
+}
+
+export function useBlockchainBalancesApi(): UseBlockchainBalancesApiReturn {
+  const queryBlockchainBalances = async ({ addresses, blockchain }: FetchBlockchainBalancePayload, valueThreshold?: string): Promise<BlockchainBalances> => {
+    let url = '/balances/blockchains';
+    if (blockchain)
+      url += `/${blockchain}`;
+
+    const response = await api.get<BlockchainBalances>(url, {
+      query: {
+        addresses,
+        onlyCache: true,
+        valueThreshold,
+      },
+      tags: [BALANCE_HYDRATION_TAG],
+      validStatuses: VALID_WITH_PARAMS_SESSION_AND_EXTERNAL_SERVICE,
+    });
+    return BlockchainBalances.parse(response);
+  };
+
+  const refreshBlockchainBalances = async ({ addresses, blockchain }: FetchBlockchainBalancePayload): Promise<PendingTask> => {
+    let url = '/balances/blockchains';
+    if (blockchain)
+      url += `/${blockchain}`;
+
+    const response = await api.post<PendingTask>(url, {
+      addresses,
+      asyncQuery: true,
+    }, {
+      validStatuses: VALID_WITH_PARAMS_SESSION_AND_EXTERNAL_SERVICE,
+    });
+    return PendingTaskSchema.parse(response);
+  };
+
+  const queryXpubBalances = async ({ addresses, blockchain }: FetchBlockchainBalancePayload): Promise<PendingTask> => {
+    const response = await api.get<PendingTask>(`/blockchains/${blockchain}/xpub`, {
+      query: {
+        asyncQuery: true,
+        xpub: addresses && addresses.length > 0 ? addresses[0] : undefined,
+      },
+      validStatuses: VALID_WITH_PARAMS_SESSION_AND_EXTERNAL_SERVICE,
+    });
+    return PendingTaskSchema.parse(response);
+  };
+
+  const fetchDetectedTokensTask = async (chain: string, addresses: string[]): Promise<PendingTask> => {
+    const response = await api.post<PendingTask>(
+      `/blockchains/${chain}/tokens/detect`,
+      {
+        addresses,
+        asyncQuery: true,
+      },
+      {
+        validStatuses: VALID_WITH_PARAMS_SESSION_AND_EXTERNAL_SERVICE,
+      },
+    );
+    return PendingTaskSchema.parse(response);
+  };
+
+  const fetchDetectedTokens = async (chain: string, addresses: string[] | null): Promise<EvmTokensRecord> => {
+    const response = await api.post<EvmTokensRecord>(
+      `/blockchains/${chain}/tokens/detect`,
+      {
+        addresses,
+        onlyCache: true,
+      },
+      {
+        validStatuses: VALID_WITH_PARAMS_SESSION_AND_EXTERNAL_SERVICE,
+      },
+    );
+    return EvmTokensRecord.parse(response);
+  };
+
+  const deleteModuleData = async (module: Nullable<PurgeableModule> = null): Promise<boolean> => {
+    const url = module ? `/blockchains/eth/modules/${module}/data` : `/blockchains/eth/modules/data`;
+    return api.delete<boolean>(url);
+  };
+
+  return {
+    deleteModuleData,
+    fetchDetectedTokens,
+    fetchDetectedTokensTask,
+    queryBlockchainBalances,
+    queryXpubBalances,
+    refreshBlockchainBalances,
+  };
+}

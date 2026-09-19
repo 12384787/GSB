@@ -1,0 +1,1074 @@
+import datetime
+from contextlib import suppress
+from typing import TYPE_CHECKING, Any, get_args
+from unittest.mock import MagicMock, call, patch
+
+import pytest
+
+from rotkehlchen.accounting.structures.balance import BalanceType
+from rotkehlchen.assets.asset import Asset, EvmToken
+from rotkehlchen.assets.utils import _query_or_get_given_token_info, get_or_create_evm_token
+from rotkehlchen.chain.ethereum.tokens import EthereumTokens
+from rotkehlchen.chain.evm.decoding.aave.constants import CPT_AAVE_V3
+from rotkehlchen.chain.evm.decoding.summer_fi.constants import CPT_SUMMER_FI
+from rotkehlchen.chain.evm.tokens import (
+    ETHERSCAN_MAX_ARGUMENTS_TO_CONTRACT,
+    EvmTokensWithProxies,
+    generate_multicall_chunks,
+    get_rpc_first_chunk_size_call_order,
+)
+from rotkehlchen.chain.evm.types import string_to_evm_address
+from rotkehlchen.chain.structures import EvmTokenDetectionData
+from rotkehlchen.constants import ONE, ZERO
+from rotkehlchen.constants.assets import A_CRV, A_DAI, A_ETH, A_OMG, A_WETH
+from rotkehlchen.constants.resolver import evm_address_to_identifier
+from rotkehlchen.db.constants import EVM_ACCOUNTS_DETAILS_TOKENS
+from rotkehlchen.db.history_events import DBHistoryEvents
+from rotkehlchen.errors.misc import InputError, RemoteError, RequestTooLargeError
+from rotkehlchen.fval import FVal
+from rotkehlchen.globaldb.handler import GlobalDBHandler
+from rotkehlchen.history.events.structures.base import HistoryEvent
+from rotkehlchen.history.events.structures.evm_event import EvmEvent
+from rotkehlchen.history.events.structures.types import HistoryEventSubType, HistoryEventType
+from rotkehlchen.inquirer import Inquirer
+from rotkehlchen.tests.utils.constants import A_GNOSIS_EURE, A_LPT
+from rotkehlchen.tests.utils.factories import make_evm_address, make_evm_tx_hash
+from rotkehlchen.types import (
+    SUPPORTED_CHAIN_IDS,
+    ChainID,
+    ChecksumEvmAddress,
+    Location,
+    SupportedBlockchain,
+    TimestampMS,
+    TokenKind,
+)
+from rotkehlchen.utils.misc import ts_now
+
+if TYPE_CHECKING:
+    from rotkehlchen.chain.aggregator import ChainsAggregator
+    from rotkehlchen.chain.ethereum.node_inquirer import EthereumInquirer
+    from rotkehlchen.chain.gnosis.manager import GnosisManager
+    from rotkehlchen.db.dbhandler import DBHandler
+
+
+ERC20_INFO_RESPONSE = ((True, b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x06'), (True, b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00 \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x04USDT\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'), (True, b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00 \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\nTether USD\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'))  # noqa: E501
+ERC721_INFO_RESPONSE = ((True, b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00 \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x06BLOCKS\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'), (True, b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00 \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\nArt Blocks\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'))  # noqa: E501
+
+
+@pytest.fixture(name='tokens')
+def fixture_ethereumtokens(ethereum_inquirer, database, inquirer):  # pylint: disable=unused-argument
+    return EthereumTokens(database, ethereum_inquirer)
+
+
+@pytest.mark.parametrize('use_clean_caching_directory', [True])
+def test_cached_tokens_detection_uses_cached_proxy_mapping_without_rpc(
+        tokens: EthereumTokens,
+        database: DBHandler,
+) -> None:
+    owner = make_evm_address()
+    proxy = make_evm_address()
+    with database.user_write() as write_cursor:
+        database.save_tokens_for_address(
+            write_cursor=write_cursor,
+            address=owner,
+            blockchain=SupportedBlockchain.ETHEREUM,
+            tokens=[A_DAI],
+        )
+        database.save_tokens_for_address(
+            write_cursor=write_cursor,
+            address=proxy,
+            blockchain=SupportedBlockchain.ETHEREUM,
+            tokens=[A_WETH],
+        )
+
+    proxies_inquirer = tokens.evm_inquirer.proxies_inquirer
+    with (
+        patch.object(proxies_inquirer, 'get_or_query_ds_proxy', return_value={owner: {proxy}}),
+        patch.object(proxies_inquirer, 'get_or_query_liquity_proxy', return_value={}),
+        patch.object(proxies_inquirer, 'get_or_query_summer_fi_proxy', return_value={}),
+    ):
+        proxies_inquirer.query_address_for_proxies(owner)
+
+    with patch.object(tokens.evm_inquirer, 'multicall') as multicall:
+        detected_tokens = tokens.detect_tokens(only_cache=True, addresses=[owner])
+
+    multicall.assert_not_called()
+    assert (owner_tokens := detected_tokens[owner][0]) is not None
+    assert set(owner_tokens) == {A_DAI, A_WETH}
+
+    with database.user_write() as write_cursor:
+        database.delete_data_for_evm_address(
+            write_cursor=write_cursor,
+            address=owner,
+            blockchain=SupportedBlockchain.ETHEREUM,
+        )
+        assert write_cursor.execute(
+            'SELECT COUNT(*) FROM evm_account_proxies WHERE account=?',
+            (owner,),
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ignored_assets', [[A_LPT]])
+@pytest.mark.parametrize('ethereum_modules', [['makerdao_vaults']])
+@pytest.mark.parametrize('ethereum_accounts', [[
+    '0x8d89170b92b2Be2C08d57C48a7b190a2f146720f',
+    '0xB756AD52f3Bf74a7d24C67471E0887436936504C',
+    '0xc32cac63823B556E6Ebf61bB74149f08Bf1AAb34',
+]])
+@pytest.mark.parametrize('mocked_proxies', [{
+    'dsr': {
+        '0xc32cac63823B556E6Ebf61bB74149f08Bf1AAb34': '0x394C1D68498DEB24AC9F5502DD5450a0353e17dc',
+    },
+}])
+@pytest.mark.parametrize('should_mock_price_queries', [True])
+@pytest.mark.parametrize('should_mock_current_price_queries', [True])
+@pytest.mark.parametrize('default_mock_price_value', [ONE])
+@pytest.mark.freeze_time('2023-02-18 22:31:11 GMT')
+def test_detect_tokens_for_addresses(rotkehlchen_api_server, ethereum_accounts):
+    """
+    Detect tokens, query balances and check that ignored assets are not queried.
+
+    This is going to be a bit slow test since it actually queries etherscan without any mocks.
+    By doing so we can test that the whole behavior with etherscan works fine and our
+    chosen chunk length for it is also acceptable.
+
+    USD price queries are mocked so we don't care about the result.
+    Just check that all prices are included
+    """
+    addr1, addr2, addr3 = ethereum_accounts
+    addr3_proxy = string_to_evm_address('0x394C1D68498DEB24AC9F5502DD5450a0353e17dc')
+    addr1_proxy = string_to_evm_address('0x32C50edBF3ffEC14Fc345A399d1e52B2A9eFAAb3')
+    a_aave_weth = Asset('eip155:1/erc20:0x4d5F47FA6A74757f35C14fD3a6Ef8E3C9BC514E8')
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+
+    # Add a summer.fi proxy account creation event for proxy address detection
+    with rotki.data.db.conn.write_ctx() as write_cursor:
+        DBHistoryEvents(rotki.data.db).add_history_event(
+            write_cursor=write_cursor,
+            event=EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(1700000000000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.INFORMATIONAL,
+                event_subtype=HistoryEventSubType.CREATE,
+                asset=A_ETH,
+                amount=ZERO,
+                location_label=addr1,
+                counterparty=CPT_SUMMER_FI,
+                extra_data={'proxy_address': addr1_proxy},
+            ),
+        )
+
+    tokens = rotki.chains_aggregator.ethereum.tokens
+    tokens.evm_inquirer.multicall = MagicMock(side_effect=tokens.evm_inquirer.multicall)
+    Inquirer.find_main_currency_prices = MagicMock(side_effect=Inquirer.find_main_currency_prices)
+    with (
+        patch(
+            target='rotkehlchen.chain.evm.tokens.EvmTokens._query_new_tokens',
+            wraps=super(EvmTokensWithProxies, tokens)._query_new_tokens,
+        ) as query_new_tokens_patch,
+        patch(
+            target='rotkehlchen.chain.ethereum.tokens.EthereumTokens.maybe_detect_proxies_tokens',
+            wraps=tokens.maybe_detect_proxies_tokens,
+        ) as maybe_detect_proxies_tokens_patch,
+        patch(
+            target='rotkehlchen.globaldb.handler.GlobalDBHandler.get_token_detection_data',
+            side_effect=lambda *args, **kwargs: ([  # mock the returned list to avoid changing this test with every assets version  # noqa: E501
+                EvmTokenDetectionData(
+                    identifier=A_WETH.identifier,
+                    address=string_to_evm_address('0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'),
+                    decimals=18,
+                ), EvmTokenDetectionData(
+                    identifier=A_LPT.identifier,
+                    address=string_to_evm_address('0x58b6A8A3302369DAEc383334672404Ee733aB239'),
+                    decimals=18,
+                ), EvmTokenDetectionData(
+                    identifier=A_OMG.identifier,
+                    address=string_to_evm_address('0xd26114cd6EE289AccF82350c8d8487fedB8A0C07'),
+                    decimals=18,
+                ), EvmTokenDetectionData(
+                    identifier=A_DAI.identifier,
+                    address=string_to_evm_address('0x6B175474E89094C44Da98b954EedeAC495271d0F'),
+                    decimals=18,
+                ), EvmTokenDetectionData(
+                    identifier=a_aave_weth.identifier,
+                    address=string_to_evm_address('0x4d5F47FA6A74757f35C14fD3a6Ef8E3C9BC514E8'),
+                    decimals=18,
+                ),
+            ], []),
+        ),
+    ):
+        detection_result = tokens.detect_tokens(False, [addr1, addr2, addr3])
+
+    assert query_new_tokens_patch.call_count == 2  # once for normal addresses, once for the proxy
+    # first called for normal addresses (uses positional arg)
+    assert query_new_tokens_patch.call_args_list[0] == call([addr1, addr2, addr3])
+    # then called for the proxy addresses (uses kwarg, addresses may not always be in the same order)  # noqa: E501
+    assert set(query_new_tokens_patch.call_args_list[1].kwargs['addresses']) == {addr1_proxy, addr3_proxy}  # noqa: E501
+    assert maybe_detect_proxies_tokens_patch.call_count == 1  # ensure this isn't called again when detecting tokens for the proxy.  # noqa: E501
+
+    assert A_WETH in detection_result[addr3][0], 'WETH is owned by the proxy, but should be returned in the proxy owner address'  # noqa: E501
+    assert a_aave_weth in detection_result[addr1][0], 'aave WETH is owned by the summer fi proxy but should be returned in the proxy owner address'  # noqa: E501
+    assert tokens.evm_inquirer.multicall.call_count == 0, 'multicall should not be used for tokens detection'  # noqa: E501
+
+    with rotki.data.db.conn.write_ctx() as write_cursor:
+        write_cursor.execute(  # Add a token that there are no actual balances for
+            'INSERT OR REPLACE INTO evm_accounts_details '
+            '(account, chain_id, key, value) VALUES (?, ?, ?, ?)',
+            (addr1, ChainID.ETHEREUM.serialize_for_db(), EVM_ACCOUNTS_DETAILS_TOKENS, A_CRV.identifier),  # noqa: E501
+        )
+
+    result, token_usd_prices = tokens.query_tokens_for_addresses(
+        [addr1, addr2, addr3, addr3_proxy],
+    )
+    assert tokens.evm_inquirer.multicall.call_count >= 1, 'multicall should have been used for balances query'  # noqa: E501
+    assert len(result[addr1]) >= 1
+    balance = result[addr1][A_OMG]
+    assert isinstance(balance, FVal)
+    assert balance == FVal('0.036108311660753218')
+    assert len(result[addr2]) >= 1
+    assert len(result[addr3]) >= 1
+    assert len(result[addr3_proxy]) >= 1
+    assert A_WETH in result[addr3_proxy], 'WETH (which is owned by the proxy) is in the result of the proxy'  # noqa: E501
+    assert A_WETH not in result[addr3], 'WETH is not in the result of the proxy owner address'
+
+    # test that ignored assets are not queried
+    assert A_LPT not in result[addr1] and A_LPT not in result[addr2]
+    found_tokens = set(result[addr1].keys()).union(
+        set(result[addr2].keys()),
+    ).union(
+        set(result[addr3].keys()),
+    ).union(
+        set(result[addr3_proxy].keys()),
+    )
+    assert len(token_usd_prices) == len(found_tokens)
+
+    # Confirm that prices were not queried for a token in evm_accounts_details that has no balance.
+    assert A_CRV not in found_tokens
+    assert all(asset in found_tokens for asset in Inquirer.find_main_currency_prices.call_args_list[0][0][0])  # noqa: E501
+
+
+def test_generate_chunks():
+    generated_chunks = generate_multicall_chunks(
+        chunk_length=17,
+        addresses_to_tokens={
+            'acc1': ['token1'],
+            'acc2': ['token2', 'token3', 'token4', 'token5', 'token6'],
+            'acc3': ['token7', 'token8', 'token9', 'token10', 'token11', 'token12', 'token13', 'token14', 'token15', 'token16'],  # noqa: E501
+        },
+    )
+    expected_chunks = [
+        [
+            ('acc1', ['token1']),
+            ('acc2', ['token2', 'token3']),
+        ],
+        [
+            ('acc2', ['token4', 'token5', 'token6']),
+        ],
+        [
+            ('acc3', ['token7', 'token8', 'token9', 'token10', 'token11', 'token12', 'token13', 'token14', 'token15', 'token16']),  # noqa: E501
+        ],
+    ]
+    assert generated_chunks == expected_chunks
+
+
+def test_get_rpc_first_chunk_size_call_order_uses_rpc_order_when_disconnected() -> None:
+    rpc_node_1 = MagicMock(name='rpc_node_1')
+    rpc_node_2 = MagicMock(name='rpc_node_2')
+    evm_inquirer = MagicMock()
+    evm_inquirer.connected_to_any_node.return_value = False
+    evm_inquirer.default_call_order.return_value = [rpc_node_1, rpc_node_2]
+    evm_inquirer.indexers_node = MagicMock(name='indexer_node')
+
+    chunk_size, returned_call_order = get_rpc_first_chunk_size_call_order(
+        evm_inquirer=evm_inquirer,
+        web3_node_chunk_size=999,
+    )
+
+    evm_inquirer.default_call_order.assert_called_once_with(skip_indexers=True)
+    assert chunk_size == 999
+    assert returned_call_order == [rpc_node_1, rpc_node_2, evm_inquirer.indexers_node]
+
+
+def test_get_rpc_first_chunk_size_call_order_uses_indexer_when_no_rpc_nodes() -> None:
+    evm_inquirer = MagicMock()
+    evm_inquirer.connected_to_any_node.return_value = False
+    evm_inquirer.default_call_order.return_value = []
+    evm_inquirer.INDEXER_CHUNK_SIZE = 111
+    evm_inquirer.chain_id = ChainID.HYPERLIQUID
+    evm_inquirer.indexers_node = MagicMock()
+
+    chunk_size, returned_call_order = get_rpc_first_chunk_size_call_order(
+        evm_inquirer=evm_inquirer,
+        web3_node_chunk_size=999,
+    )
+
+    evm_inquirer.default_call_order.assert_called_once_with(skip_indexers=True)
+    assert chunk_size == 111
+    assert returned_call_order == [evm_inquirer.indexers_node]
+
+
+def test_get_token_balances_propagates_request_too_large(tokens: EthereumTokens) -> None:
+    detection_data = EvmTokenDetectionData(
+        identifier='eip155:1/erc20:0x0000000000000000000000000000000000000001',
+        address=string_to_evm_address('0x0000000000000000000000000000000000000001'),
+        decimals=18,
+    )
+    with patch(
+        'rotkehlchen.chain.evm.contracts.EvmContract.call',
+        side_effect=RequestTooLargeError('out of gas'),
+    ), pytest.raises(RequestTooLargeError):
+        tokens.get_token_balances(
+            address=make_evm_address(),
+            tokens=[detection_data],
+            call_order=[],
+        )
+
+
+def test_query_chunks_retries_with_smaller_chunks(tokens: EthereumTokens) -> None:
+    token_data = [
+        EvmTokenDetectionData(
+            identifier=f'eip155:1/erc20:0x{i:040x}',
+            address=string_to_evm_address(f'0x{i:040x}'),
+            decimals=18,
+        ) for i in range(1, 6)
+    ]
+    queried_chunk_sizes: list[int] = []
+    tokens.INDEXER_CHUNK_SIZE = 2
+
+    def mocked_get_token_balances(
+            address: ChecksumEvmAddress,
+            tokens: list[EvmTokenDetectionData],
+            call_order: list[Any],
+    ) -> dict[Asset, FVal]:
+        queried_chunk_sizes.append(len(tokens))
+        if len(tokens) > 2:
+            raise RequestTooLargeError('chunk too big')
+
+        return {}
+
+    with patch.object(tokens, 'get_token_balances', side_effect=mocked_get_token_balances):
+        result = tokens._query_chunks(
+            address=make_evm_address(),
+            tokens=token_data,
+            chunk_size=4,
+            call_order=[],
+        )
+
+    assert result.balances == {}
+    assert result.had_failures is False
+    assert queried_chunk_sizes == [4, 2, 2, 1]
+
+
+def test_query_chunks_marks_failure_on_remote_error(tokens: EthereumTokens) -> None:
+    """A RemoteError on a chunk must mark the address as failed (so its cached tokens are
+    not overwritten) while balances from the other chunks are still collected."""
+    token_data = [
+        EvmTokenDetectionData(
+            identifier=f'eip155:1/erc20:0x{i:040x}',
+            address=string_to_evm_address(f'0x{i:040x}'),
+            decimals=18,
+        ) for i in range(1, 5)
+    ]
+
+    def mocked_get_token_balances(
+            address: ChecksumEvmAddress,
+            tokens: list[EvmTokenDetectionData],
+            call_order: list[Any],
+    ) -> dict[Asset, FVal]:
+        if any(token.identifier == token_data[0].identifier for token in tokens):
+            raise RemoteError('all nodes failed')
+
+        return {Asset(tokens[0].identifier): ONE}
+
+    with patch.object(tokens, 'get_token_balances', side_effect=mocked_get_token_balances):
+        result = tokens._query_chunks(
+            address=make_evm_address(),
+            tokens=token_data,
+            chunk_size=2,
+            call_order=[],
+        )
+
+    assert result.had_failures is True
+    assert result.balances == {Asset(token_data[2].identifier): ONE}
+
+
+def test_query_chunks_retries_with_reduced_rpc_chunks(tokens: EthereumTokens) -> None:
+    """Ensure oversized RPC chunks are retried with smaller RPC-sized chunks first.
+
+    This test does not assert indexer-only fallback. It verifies the split sequence keeps the
+    original RPC-first call order while reducing chunk size (150 -> 110 -> 40).
+    """
+    token_data = [
+        EvmTokenDetectionData(
+            identifier=f'eip155:1/erc20:{(address := make_evm_address())}',
+            address=address,
+            decimals=18,
+        ) for _ in range(150)
+    ]
+    rpc_call_order = [MagicMock(name='rpc_node'), tokens.evm_inquirer.indexers_node]
+    queried_calls: list[tuple[int, list[Any]]] = []
+
+    def mocked_get_token_balances(
+            address: ChecksumEvmAddress,
+            tokens: list[EvmTokenDetectionData],
+            call_order: list[Any],
+    ) -> dict[Asset, FVal]:
+        queried_calls.append((len(tokens), call_order))
+        if call_order == rpc_call_order and len(tokens) > ETHERSCAN_MAX_ARGUMENTS_TO_CONTRACT:
+            raise RequestTooLargeError('chunk too big for fallback indexer')
+
+        return {}
+
+    with patch.object(tokens, 'get_token_balances', side_effect=mocked_get_token_balances):
+        result = tokens._query_chunks(
+            address=make_evm_address(),
+            tokens=token_data,
+            chunk_size=460,
+            call_order=rpc_call_order,  # type: ignore
+        )
+
+    assert result.balances == {}
+    assert result.had_failures is False
+    assert queried_calls[0] == (150, rpc_call_order)
+    assert queried_calls[1] == (110, rpc_call_order)
+    assert queried_calls[2] == (40, rpc_call_order)
+
+
+def test_query_chunks_prefers_rpc_split(tokens: EthereumTokens) -> None:
+    """Ensure RequestTooLargeError triggers RPC-path splitting before any indexer-only fallback.
+
+    The test forces an oversize failure for RPC-sized chunks and verifies follow-up retries
+    continue using the original RPC-first call order (not `[indexers_node]`).
+    """
+    token_data = [
+        EvmTokenDetectionData(
+            identifier=f'eip155:1/erc20:{(address := make_evm_address())}',
+            address=address,
+            decimals=18,
+        ) for _ in range(150)
+    ]
+    rpc_node = MagicMock(name='rpc_node')
+    call_order = [rpc_node, tokens.evm_inquirer.indexers_node]
+    queried_call_orders: list[list[Any]] = []
+
+    def mocked_get_token_balances(
+            address: ChecksumEvmAddress,
+            tokens: list[EvmTokenDetectionData],
+            call_order: list[Any],
+    ) -> dict[Asset, FVal]:
+        queried_call_orders.append(call_order)
+        if len(tokens) > ETHERSCAN_MAX_ARGUMENTS_TO_CONTRACT:
+            raise RequestTooLargeError('too large on first pass')
+
+        return {Asset(tokens[0].identifier): ONE}
+
+    with patch.object(tokens, 'get_token_balances', side_effect=mocked_get_token_balances):
+        result = tokens._query_chunks(
+            address=make_evm_address(),
+            tokens=token_data,
+            chunk_size=460,
+            call_order=call_order,  # type: ignore
+        )
+
+    assert len(result.balances) >= 1
+    assert result.had_failures is False
+    assert all(x != [tokens.evm_inquirer.indexers_node] for x in queried_call_orders)
+
+
+def test_query_chunks_uses_indexer_chunk_size_before_single_token_fallback(tokens: EthereumTokens) -> None:  # noqa: E501
+    token_data = [
+        EvmTokenDetectionData(
+            identifier=f'eip155:1/erc20:{(address := make_evm_address())}',
+            address=address,
+            decimals=18,
+        ) for _ in range(120)
+    ]
+    rpc_call_order = [MagicMock(name='rpc_node'), tokens.evm_inquirer.indexers_node]
+    queried_calls: list[tuple[int, list[Any]]] = []
+
+    def mocked_get_token_balances(
+            address: ChecksumEvmAddress,
+            tokens: list[EvmTokenDetectionData],
+            call_order: list[Any],
+    ) -> dict[Asset, FVal]:
+        queried_calls.append((len(tokens), call_order))
+        if call_order == rpc_call_order:
+            raise RequestTooLargeError('rpc too large')
+
+        return {}
+
+    with patch.object(tokens, 'get_token_balances', side_effect=mocked_get_token_balances):
+        result = tokens._query_chunks(
+            address=make_evm_address(),
+            tokens=token_data,
+            chunk_size=460,
+            call_order=rpc_call_order,  # type: ignore
+        )
+
+    assert result.balances == {}
+    assert result.had_failures is False
+    indexer_calls = [
+        size for size, used_call_order in queried_calls
+        if used_call_order == [tokens.evm_inquirer.indexers_node]
+    ]
+    assert indexer_calls == [tokens.INDEXER_CHUNK_SIZE, 120 - tokens.INDEXER_CHUNK_SIZE]
+    assert all(size <= tokens.INDEXER_CHUNK_SIZE for size in indexer_calls)
+    assert all(size > 1 for size in indexer_calls)
+
+
+def test_query_new_tokens_keeps_cache_on_failures(tokens: EthereumTokens) -> None:
+    tracked_address = make_evm_address()
+    existing_token = A_DAI
+
+    with tokens.db.user_write() as write_cursor:
+        tokens.db.save_tokens_for_address(
+            write_cursor=write_cursor,
+            address=tracked_address,
+            blockchain=tokens.evm_inquirer.blockchain,
+            tokens=[existing_token],
+        )
+
+    with (
+        patch.object(GlobalDBHandler, 'get_token_detection_data', return_value=([], [])),
+        patch.object(
+            tokens,
+            '_detect_tokens',
+            return_value=({tracked_address: []}, {tracked_address}, {}),
+        ),
+        patch.object(tokens, 'maybe_detect_proxies_tokens', return_value=None),
+    ):
+        tokens._query_new_tokens(addresses=[tracked_address])
+
+    with tokens.db.conn.read_ctx() as cursor:
+        saved_tokens, _ = tokens.db.get_tokens_for_address(
+            cursor=cursor,
+            address=tracked_address,
+            blockchain=tokens.evm_inquirer.blockchain,
+            token_exceptions=tokens._per_chain_token_exceptions(),
+        )
+
+    assert saved_tokens is not None
+    assert saved_tokens == [existing_token]
+
+
+def test_query_new_tokens_skips_save_on_partial_failures(tokens: EthereumTokens) -> None:
+    tracked_address = make_evm_address()
+    existing_token = A_DAI
+    partial_token = A_WETH
+
+    with tokens.db.user_write() as write_cursor:
+        tokens.db.save_tokens_for_address(
+            write_cursor=write_cursor,
+            address=tracked_address,
+            blockchain=tokens.evm_inquirer.blockchain,
+            tokens=[existing_token],
+        )
+
+    with (
+        patch.object(GlobalDBHandler, 'get_token_detection_data', return_value=([], [])),
+        patch.object(
+            tokens,
+            '_detect_tokens',
+            return_value=({tracked_address: [partial_token]}, {tracked_address}, {}),
+        ),
+        patch.object(tokens, 'maybe_detect_proxies_tokens', return_value=None),
+    ):
+        tokens._query_new_tokens(addresses=[tracked_address])
+
+    with tokens.db.conn.read_ctx() as cursor:
+        saved_tokens, _ = tokens.db.get_tokens_for_address(
+            cursor=cursor,
+            address=tracked_address,
+            blockchain=tokens.evm_inquirer.blockchain,
+            token_exceptions=tokens._per_chain_token_exceptions(),
+        )
+
+    assert saved_tokens is not None
+    assert saved_tokens == [existing_token]
+
+
+def test_last_queried_ts(tokens, freezer):
+    """
+    Checks that after detecting evm tokens last_queried_timestamp is updated and there
+    are no duplicates.
+    Note: It is hard to VCR because https://github.com/orgs/rotki/projects/11/views/2?pane=issue&itemId=70915550
+    """
+    # We don't need to query the chain here, so mock tokens list
+    evm_tokens_patch = patch(
+        'rotkehlchen.globaldb.handler.GlobalDBHandler.get_token_detection_data',
+        new=lambda chain_id=ChainID.ETHEREUM, exceptions=None, protocol=None: ([], []),
+    )
+    beginning = ts_now()
+    address = '0x4bBa290826C253BD854121346c370a9886d1bC26'
+    with evm_tokens_patch:
+        # Detect for the first time
+        tokens.detect_tokens(
+            only_cache=False,
+            addresses=[address],
+        )
+        with tokens.db.conn.read_ctx() as cursor:
+            after_first_query = cursor.execute(
+                'SELECT key, value FROM evm_accounts_details',
+            ).fetchall()
+            assert len(after_first_query) == 1
+            assert after_first_query[0][0] == 'last_queried_timestamp'
+            assert int(after_first_query[0][1]) >= beginning
+
+        continuation = beginning + 10
+        freezer.move_to(datetime.datetime.fromtimestamp(continuation, tz=datetime.UTC))
+        # Detect again
+        tokens.detect_tokens(
+            only_cache=False,
+            addresses=['0x4bBa290826C253BD854121346c370a9886d1bC26'],
+        )
+
+        with tokens.db.conn.read_ctx() as cursor:
+            # Check that last_queried_timestamp was updated and that there are no duplicates
+            after_second_query = cursor.execute(
+                'SELECT key, value FROM evm_accounts_details',
+            ).fetchall()
+            assert len(after_second_query) == 1
+            assert after_second_query[0][0] == 'last_queried_timestamp'
+            assert int(after_second_query[0][1]) >= continuation
+
+
+def test_query_new_tokens_caches_balances_without_duplicates(tokens: EthereumTokens) -> None:
+    tracked_address = make_evm_address()
+    detected_balance = FVal('12.34')
+    detected_token = EvmToken(A_DAI.identifier)
+    first_detected_balances = {
+        tracked_address: {
+            detected_token: detected_balance,
+        },
+    }
+    second_detected_balances: dict[ChecksumEvmAddress, dict[EvmToken, FVal]] = {
+        tracked_address: {},
+    }
+    chain = tokens.evm_inquirer.blockchain.serialize()
+    category = BalanceType.ASSET.serialize_for_db()
+
+    with tokens.db.user_write() as write_cursor:
+        write_cursor.execute(
+            'INSERT OR REPLACE INTO blockchain_balances_cache('
+            'blockchain, address, asset, label, category, amount'
+            ') VALUES (?, ?, ?, ?, ?, ?)',
+            (chain, tracked_address, A_WETH.identifier, 'protocol label', category, '1'),
+        )
+
+    with (
+        patch.object(GlobalDBHandler, 'get_token_detection_data', return_value=([], [])),
+        patch.object(
+            tokens,
+            '_detect_tokens',
+            side_effect=[
+                ({tracked_address: [detected_token]}, set(), first_detected_balances),
+                ({tracked_address: []}, set(), second_detected_balances),
+            ],
+        ),
+        patch.object(tokens, 'maybe_detect_proxies_tokens', return_value=None),
+    ):
+        tokens._query_new_tokens(addresses=[tracked_address])
+        tokens._query_new_tokens(addresses=[tracked_address])
+
+    with tokens.db.conn.read_ctx() as cursor:
+        cached_rows = cursor.execute(
+            'SELECT asset, label, amount FROM blockchain_balances_cache WHERE blockchain=? '
+            'AND address=? ORDER BY asset, label',
+            (chain, tracked_address),
+        ).fetchall()
+
+    assert len(cached_rows) == 1
+    assert cached_rows[0] == (A_WETH.identifier, 'protocol label', '1')
+
+
+def test_query_new_tokens_caches_protocol_and_liability_balances(tokens: EthereumTokens) -> None:
+    tracked_address = make_evm_address()
+    aave_token = EvmToken('eip155:1/erc20:0x98C23E9d8f34FEFb1B7BD6a91B7FF122F4e16F5c')
+    debt_token = EvmToken('eip155:1/erc20:0x72E95b8931767C79bA4EeE721354d6E99a61D004')
+    detected_balances = {
+        tracked_address: {
+            aave_token: FVal('1.2'),
+            debt_token: FVal('3.4'),
+        },
+    }
+    chain = tokens.evm_inquirer.blockchain.serialize()
+
+    with (
+        patch.object(GlobalDBHandler, 'get_token_detection_data', return_value=([], [])),
+        patch.object(
+            tokens,
+            '_detect_tokens',
+            return_value=({tracked_address: [aave_token, debt_token]}, set(), detected_balances),
+        ),
+        patch.object(tokens, 'maybe_detect_proxies_tokens', return_value=None),
+    ):
+        tokens._query_new_tokens(addresses=[tracked_address])
+
+    with tokens.db.conn.read_ctx() as cursor:
+        cached_rows = cursor.execute(
+            'SELECT asset, label, category, amount FROM blockchain_balances_cache '
+            'WHERE blockchain=? AND address=? ORDER BY asset',
+            (chain, tracked_address),
+        ).fetchall()
+
+    assert cached_rows == [
+        (debt_token.identifier, CPT_AAVE_V3, BalanceType.LIABILITY.serialize_for_db(), '3.4'),
+        (aave_token.identifier, CPT_AAVE_V3, BalanceType.ASSET.serialize_for_db(), '1.2'),
+    ]
+
+
+def test_cache_is_per_token_type(ethereum_inquirer):
+    """This test makes sure that different info cache is used per token type."""
+    address = make_evm_address()
+
+    def query_token_info(token_kind):
+        """
+        Util function to request token info. Doesn't pass name, symbol or decimals because they
+        should be retrieved from the chain (chain calls are mocked below).
+        """
+        return _query_or_get_given_token_info(
+            chain_inquirer=ethereum_inquirer,
+            address=address,
+            name=None,
+            symbol=None,
+            decimals=None,
+            token_kind=token_kind,
+        )
+
+    def patch_multicall_2(return_value):
+        """
+        This patch method together with ERC20_INFO_RESPONSE and ERC721_INFO_RESPONSE mocks
+        tokens info.
+        """
+        return patch.object(
+            ethereum_inquirer,
+            'multicall_2',
+            return_value=return_value,
+        )
+
+    with patch_multicall_2(ERC20_INFO_RESPONSE):
+        erc20_token_data = query_token_info(TokenKind.ERC20)
+
+    with patch_multicall_2(ERC721_INFO_RESPONSE):
+        erc721_token_data = query_token_info(TokenKind.ERC721)
+
+    with patch.object(  # disable chain calls
+        ethereum_inquirer,
+        'multicall_2',
+        new=MagicMock(side_effect=AssertionError('Chain calls should not be made')),
+    ):
+        erc20_cached_data = query_token_info(TokenKind.ERC20)
+        erc721_cached_data = query_token_info(TokenKind.ERC721)
+
+    assert erc20_token_data == erc20_cached_data == ('Tether USD', 'USDT', 6, TokenKind.ERC20)
+    assert erc721_token_data == erc721_cached_data == ('Art Blocks', 'BLOCKS', 0, TokenKind.ERC721)
+
+
+@pytest.mark.parametrize('number_of_eth_accounts', [1])
+def test_old_curve_gauge(ethereum_inquirer: EthereumInquirer):
+    """Test that querying new and old gauges get the data correctly.
+    Old one should pick the default values provided and the new one should
+    get the values from the chain
+    """
+    # old gauge
+    gauge_address = string_to_evm_address('0xC2b1DF84112619D190193E48148000e3990Bf627')
+    with suppress(InputError):
+        GlobalDBHandler.delete_asset_by_identifier(evm_address_to_identifier(
+            address=gauge_address,
+            chain_id=ChainID.ETHEREUM,
+        ))
+
+    gauge_token = get_or_create_evm_token(
+        userdb=ethereum_inquirer.database,
+        evm_address=gauge_address,
+        chain_id=ethereum_inquirer.chain_id,
+        evm_inquirer=ethereum_inquirer,
+        decimals=18,
+        name='USDK Gauge Deposit',
+        symbol='USDK curve-gauge',
+    )
+    assert gauge_token.name == 'USDK Gauge Deposit'
+    assert gauge_token.symbol == 'USDK curve-gauge'
+    assert gauge_token.decimals == 18
+
+    # new gauge
+    gauge_address = string_to_evm_address('0x182B723a58739a9c974cFDB385ceaDb237453c28')
+    with suppress(InputError):
+        GlobalDBHandler.delete_asset_by_identifier(evm_address_to_identifier(
+            address=gauge_address,
+            chain_id=ChainID.ETHEREUM,
+        ))
+
+    gauge_token = get_or_create_evm_token(
+        userdb=ethereum_inquirer.database,
+        evm_address=gauge_address,
+        chain_id=ethereum_inquirer.chain_id,
+        evm_inquirer=ethereum_inquirer,
+        fallback_decimals=18,
+        fallback_name='stETH Gauge Deposit',
+        fallback_symbol='stETH curve-gauge',
+    )
+    assert gauge_token.name == 'Curve.fi steCRV Gauge Deposit'
+    assert gauge_token.symbol == 'steCRV-gauge'
+    assert gauge_token.decimals == 18
+
+
+@pytest.mark.parametrize('number_of_eth_accounts', [1])
+def test_chain_is_not_queried_when_details(ethereum_inquirer: EthereumInquirer):
+    """Test that if we provide the values of name, decimals and symbol we don't query
+    the chain without need
+    """
+    lido_address = string_to_evm_address('0x5A98FcBEA516Cf06857215779Fd812CA3beF1B32')
+    with suppress(InputError):
+        GlobalDBHandler.delete_asset_by_identifier(evm_address_to_identifier(
+            address=lido_address,
+            chain_id=ChainID.ETHEREUM,
+        ))
+
+    with patch(
+        'rotkehlchen.assets.utils._query_or_get_given_token_info',
+        side_effect=_query_or_get_given_token_info,
+    ) as patched_query:
+        new_token = get_or_create_evm_token(
+            userdb=ethereum_inquirer.database,
+            evm_address=lido_address,
+            chain_id=ethereum_inquirer.chain_id,
+            evm_inquirer=ethereum_inquirer,
+            decimals=17,
+            name='new LDO',
+            symbol='nLDO',
+        )
+        assert patched_query.call_count == 0
+
+    assert new_token.name == 'new LDO'
+    assert new_token.symbol == 'nLDO'
+    assert new_token.decimals == 17
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('gnosis_accounts', [['0x7bF5421a72E9bcDA25A706450af95D5645C9d33f']])
+def test_monerium_queries(
+        gnosis_manager: GnosisManager,
+        gnosis_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,
+        allow_gnosis_etherscan: None,
+):
+    """Test that we query balances for the new monerium eure but not the old one"""
+    new_eure = get_or_create_evm_token(  # ensure that the new eure is in the db
+        userdb=gnosis_manager.node_inquirer.database,
+        evm_address=string_to_evm_address('0x420CA0f9B9b604cE0fd9C18EF134C705e5Fa3430'),
+        chain_id=(chain_id := gnosis_manager.node_inquirer.chain_id),
+        evm_inquirer=gnosis_manager.node_inquirer,
+    )
+    with patch(
+        'rotkehlchen.globaldb.handler.GlobalDBHandler.get_token_detection_data',
+        new=lambda *args, **kwargs: ([
+            EvmTokenDetectionData(
+                identifier=new_eure.identifier,
+                address=new_eure.evm_address,
+                decimals=new_eure.decimals,  # type: ignore
+            ), EvmTokenDetectionData(
+                identifier=A_GNOSIS_EURE.identifier,
+                address=string_to_evm_address('0xcB444e90D8198415266c6a2724b7900fb12FC56E'),
+                decimals=18,
+            ),
+        ], []),
+    ):
+        tokens = gnosis_manager.tokens.detect_tokens(
+            only_cache=False,
+            addresses=gnosis_accounts,
+        )[gnosis_accounts[0]][0]
+        assert new_eure in tokens  # type: ignore
+
+    # insert the old eure and see that is not queried
+    with gnosis_manager.node_inquirer.database.user_write() as write_cursor:
+        write_cursor.execute(
+            'INSERT OR REPLACE INTO evm_accounts_details '
+            '(account, chain_id, key, value) VALUES (?, ?, ?, ?)',
+            (
+                gnosis_accounts[0],
+                chain_id.serialize_for_db(),
+                EVM_ACCOUNTS_DETAILS_TOKENS,
+                A_GNOSIS_EURE.identifier,
+            ),
+        )
+
+    tokens_second_query = gnosis_manager.tokens.query_tokens_for_addresses(
+        addresses=gnosis_accounts,
+    )[0][gnosis_accounts[0]]
+    assert new_eure in tokens_second_query
+    assert A_GNOSIS_EURE not in tokens_second_query
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0xbe4f0cdf3834bD876813A1037137DcFAD79AcD99']])
+def test_erc721_token_ownership_verification(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        database: DBHandler,
+):
+    """Test that when a user has historical events for two NFTs from the same collection
+    but only currently owns one, we correctly identify only the currently owned NFT.
+    """
+    token_7776 = get_or_create_evm_token(
+        userdb=ethereum_inquirer.database,
+        evm_inquirer=ethereum_inquirer,
+        evm_address=(collection_address := string_to_evm_address('0xD3D9ddd0CF0A5F0BFB8f7fcEAe075DF687eAEBaB')),  # noqa: E501
+        chain_id=ChainID.ETHEREUM,
+        token_kind=TokenKind.ERC721,
+        collectible_id='7776',
+    )
+    token_7809 = get_or_create_evm_token(
+        userdb=ethereum_inquirer.database,
+        evm_inquirer=ethereum_inquirer,
+        evm_address=collection_address,
+        chain_id=ChainID.ETHEREUM,
+        token_kind=TokenKind.ERC721,
+        collectible_id='7809',
+    )
+    # regression test: broken erc721 implementations to ensure token detection
+    # doesn't fail when ownerOf calls return empty or fail
+    broken_erc721_token_1 = get_or_create_evm_token(
+        userdb=ethereum_inquirer.database,
+        evm_address=string_to_evm_address('0x0E3A2A1f2146d86A604adc220b4967A898D7Fe07'),
+        chain_id=ChainID.ETHEREUM,
+        token_kind=TokenKind.ERC721,
+        collectible_id='1',
+        name='BROKEN #1',
+        symbol='BROKEN',
+    )
+    broken_erc721_token_2 = get_or_create_evm_token(
+        userdb=ethereum_inquirer.database,
+        evm_address=string_to_evm_address('0xFaC7BEA255a6990f749363002136aF6556b31e04'),
+        chain_id=ChainID.ETHEREUM,
+        token_kind=TokenKind.ERC721,
+        collectible_id='2',
+        name='BROKEN #2',
+        symbol='BROKEN',
+    )
+
+    with database.conn.write_ctx() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[HistoryEvent(
+                group_identifier='xxx',
+                sequence_index=0,
+                timestamp=TimestampMS(1645260370000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                location_label=(user_address := ethereum_accounts[0]),
+                amount=ONE,
+                asset=token_7776,
+            ), HistoryEvent(
+                group_identifier='xxy',
+                sequence_index=0,
+                timestamp=TimestampMS(1645260470000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.SPEND,
+                event_subtype=HistoryEventSubType.NONE,
+                amount=ONE,
+                location_label=user_address,
+                asset=token_7776,
+            ), HistoryEvent(
+                group_identifier='xyx',
+                sequence_index=0,
+                timestamp=TimestampMS(1645260570000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                amount=ONE,
+                location_label=user_address,
+                asset=token_7776,
+            ), HistoryEvent(
+                group_identifier='yxx',
+                sequence_index=0,
+                timestamp=TimestampMS(1645260670000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                amount=ONE,
+                location_label=user_address,
+                asset=token_7809,
+            ), HistoryEvent(
+                group_identifier='yyx',
+                sequence_index=0,
+                timestamp=TimestampMS(1645260770000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.SPEND,
+                event_subtype=HistoryEventSubType.NONE,
+                amount=ONE,
+                location_label=user_address,
+                asset=token_7809,
+            ), HistoryEvent(
+                group_identifier='yyy',
+                sequence_index=0,
+                timestamp=TimestampMS(1645260870000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                amount=ONE,
+                location_label=user_address,
+                asset=token_7809,
+            ), HistoryEvent(
+                group_identifier='1x',
+                sequence_index=0,
+                timestamp=TimestampMS(1645360870000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                amount=ONE,
+                location_label=user_address,
+                asset=broken_erc721_token_1,
+            ), HistoryEvent(
+                group_identifier='2x',
+                sequence_index=0,
+                timestamp=TimestampMS(1645460870000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                amount=ONE,
+                location_label=user_address,
+                asset=broken_erc721_token_2,
+            )],
+        )
+
+    # regression test: dai token added here to ensure detected erc20 tokens
+    # aren't removed when erc721 tokens are detected
+    # see https://github.com/orgs/rotki/projects/11/views/2?pane=issue&itemId=112828923
+    with patch(
+            'rotkehlchen.chain.ethereum.tokens.EthereumTokens._detect_tokens',
+            return_value=({ethereum_accounts[0]: [A_DAI]}, set(), {ethereum_accounts[0]: {A_DAI: ONE}}),  # noqa: E501
+    ):
+        user_tokens = EthereumTokens(database, ethereum_inquirer).detect_tokens(
+            only_cache=False,
+            addresses=ethereum_accounts,
+        )
+        assert user_tokens[user_address][0] == [A_DAI, token_7776]
+
+
+def test_superfluid_constant_flow_nfts_are_in_token_exceptions(
+        blockchain: ChainsAggregator,
+        globaldb: GlobalDBHandler,
+) -> None:
+    for chain_id in get_args(SUPPORTED_CHAIN_IDS):
+        manager = getattr(blockchain, chain_id.to_name())
+        for token in manager.tokens.token_exceptions:
+            get_or_create_evm_token(
+                userdb=blockchain.database,
+                evm_address=token,
+                chain_id=chain_id,
+                token_kind=TokenKind.ERC721,
+                symbol='xxx',
+                name='yyy',
+                decimals=18,
+            )
+
+        _, erc721_tokens = globaldb.get_token_detection_data(
+            chain_id=chain_id,
+            exceptions=(exceptions := manager.tokens._per_chain_token_exceptions()),
+        )
+        assert all(i.address not in exceptions for i in erc721_tokens)

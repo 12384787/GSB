@@ -1,0 +1,37 @@
+from enum import auto
+from typing import TYPE_CHECKING, Literal
+
+from rotkehlchen.utils.mixins.enums import SerializableEnumNameMixin
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+class IgnoredAssetsHandling(SerializableEnumNameMixin):
+    NONE = auto()
+    EXCLUDE = auto()
+    SHOW_ONLY = auto()
+
+    def operator(self) -> Literal['IN', 'NOT IN']:
+        """Caller should make sure this is narrowed between exclude and show only"""
+        if self == IgnoredAssetsHandling.EXCLUDE:
+            return 'NOT IN'
+        return 'IN'
+
+    def get_should_skip_handler(self) -> Callable[[str, set[str]], bool]:
+        """Returns a function that can be used to check if an ignored asset should be skipped.
+        The caller of this function knowingly load the entire ignored assets in memory and use
+        this function to include/exclude the ignored assets. This is because the ignored assets are
+        stored in a different database and we avoid attaching/detaching the DB here due to:
+        #7533 and https://github.com/orgs/rotki/projects/11/views/2?pane=issue&itemId=69334133
+
+        The returned callable takes the asset identifier as a str, not an Asset, deliberately.
+        All call sites pass raw identifiers straight out of the DB, so there is nothing to
+        resolve and no Asset object needs to be built.
+
+        TODO: Improve this to avoid loading the entire ignored assets in memory"""
+        if self == IgnoredAssetsHandling.EXCLUDE:
+            return lambda asset, ignored_assets: asset in ignored_assets
+        if self == IgnoredAssetsHandling.SHOW_ONLY:
+            return lambda asset, ignored_assets: asset not in ignored_assets
+        return lambda asset, ignored_assets: False

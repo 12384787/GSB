@@ -1,0 +1,88 @@
+import { cleanupContext, createLoggedInContext, type SharedTestContext, test } from '../../fixtures/test-fixtures';
+import { AddressBookPage } from '../../pages/address-book-page';
+
+const DEFAULT_PAGE_SIZE = 10;
+
+const ADDR_PRIVATE = '0x1111111111111111111111111111111111111111';
+
+test.describe.serial('address book', () => {
+  let ctx: SharedTestContext;
+  let page: AddressBookPage;
+
+  test.beforeAll(async ({ browser, request }) => {
+    ctx = await createLoggedInContext(browser, request, { disableModules: true });
+    page = new AddressBookPage(ctx.sharedPage);
+    await page.visit();
+    // The global book carries ~500 shared entries; the private scope is per-user and empty.
+    await page.selectScope('private');
+  });
+
+  test.afterAll(async () => {
+    await cleanupContext(ctx);
+  });
+
+  test('switches between global and private scopes', async () => {
+    await page.selectScope('global');
+    await page.expectScopeActive('global');
+    await page.selectScope('private');
+    await page.expectScopeActive('private');
+  });
+
+  test('creates a private entry', async () => {
+    await page.addEntry({ address: ADDR_PRIVATE, name: 'private one' });
+    await page.expectRow(ADDR_PRIVATE, 'private one');
+  });
+
+  test('edits an entry', async () => {
+    await page.editEntry(ADDR_PRIVATE, 'private renamed');
+    await page.expectRow(ADDR_PRIVATE, 'private renamed');
+  });
+
+  test('deletes an entry', async () => {
+    await page.deleteEntry(ADDR_PRIVATE);
+    await page.expectNoRow(ADDR_PRIVATE);
+  });
+
+  test('shows validation errors when required fields are empty', async () => {
+    await page.openAddDialog();
+    await page.submitDialog();
+    await page.expectRequiredErrors();
+    await page.cancelDialog();
+  });
+
+  test('cancel button closes the dialog', async () => {
+    await page.openAddDialog();
+    await page.cancelDialog();
+  });
+
+  test('paginates once the entries outgrow a page', async () => {
+    for (let i = 0; i < DEFAULT_PAGE_SIZE + 1; i++) {
+      // Encode i in the address prefix so each entry has a unique value.
+      const addr = `0x${i.toString(16).padStart(2, '0')}${'b'.repeat(38)}`;
+      const name = `entry-${i.toString().padStart(2, '0')}`;
+      await page.addEntry({ address: addr, name });
+    }
+
+    await page.expectVisibleRowCount(DEFAULT_PAGE_SIZE);
+    await page.expectNextPageEnabled(true);
+
+    await page.goToNextPage();
+    await page.expectAtLeastVisibleRows(1);
+    await page.expectNextPageEnabled(false);
+  });
+
+  // Runs on the 11 entries left by the pagination test, so there is plenty to exclude.
+  test('filters the entries by name', async () => {
+    await page.filterByName('entry-03');
+    await page.expectVisibleRowCount(1);
+    await page.expectRowByName('entry-03');
+
+    // The negative control: entry-03 was already on the page, so a no-op filter would have passed.
+    await page.clearFilters();
+    await page.filterByName('no-such-entry');
+    await page.expectVisibleRowCount(0);
+
+    await page.clearFilters();
+    await page.expectVisibleRowCount(10);
+  });
+});

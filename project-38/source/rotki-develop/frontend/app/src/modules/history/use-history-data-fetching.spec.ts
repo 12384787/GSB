@@ -1,0 +1,207 @@
+import type { LocationLabel } from '@/modules/core/common/location';
+import type { TransactionStatus, useHistoryEventsApi } from '@/modules/history/api/events/use-history-events-api';
+import { Priority } from '@rotki/common';
+import { createMock } from '@test/utils/create-mock';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { useHistoryStore } from '@/modules/history/use-history-store';
+import '@test/i18n';
+
+const mockFetchAssociatedLocationsApi = vi.fn();
+const mockFetchLocationLabelsApi = vi.fn();
+const mockGetTransactionStatusSummary = vi.fn();
+const mockNotifyError = vi.fn();
+const mockLoggerError = vi.fn();
+const mockGetErrorMessage = vi.fn((e: unknown): string => (e instanceof Error ? e.message : String(e)));
+
+vi.mock('@/modules/history/api/use-history-api', () => ({
+  useHistoryApi: vi.fn((): { fetchAssociatedLocations: typeof mockFetchAssociatedLocationsApi; fetchLocationLabels: typeof mockFetchLocationLabelsApi } => ({
+    fetchAssociatedLocations: mockFetchAssociatedLocationsApi,
+    fetchLocationLabels: mockFetchLocationLabelsApi,
+  })),
+}));
+
+vi.mock('@/modules/history/api/events/use-history-events-api', () => ({
+  useHistoryEventsApi: vi.fn(() => createMock<ReturnType<typeof useHistoryEventsApi>>({
+    getTransactionStatusSummary: mockGetTransactionStatusSummary,
+  })),
+}));
+
+vi.mock('@/modules/core/notifications/use-notifications', () => ({
+  useNotifications: vi.fn((): { notifyError: typeof mockNotifyError } => ({
+    notifyError: mockNotifyError,
+  })),
+}));
+
+vi.mock('@/modules/core/common/logging/logging', () => ({
+  logger: {
+    error: (...args: unknown[]): void => { mockLoggerError(...args); },
+  },
+}));
+
+vi.mock('@/modules/core/common/logging/error-handling', () => ({
+  getErrorMessage: (e: unknown): string => mockGetErrorMessage(e),
+}));
+
+const { useHistoryDataFetching } = await import('./use-history-data-fetching');
+
+describe('useHistoryDataFetching', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    vi.clearAllMocks();
+  });
+
+  describe('fetchAssociatedLocations', () => {
+    it('should call the API and set store state on success', async () => {
+      const locations: string[] = ['kraken', 'binance', 'blockchain'];
+      mockFetchAssociatedLocationsApi.mockResolvedValue(locations);
+
+      const { fetchAssociatedLocations } = useHistoryDataFetching();
+      await fetchAssociatedLocations();
+
+      expect(mockFetchAssociatedLocationsApi).toHaveBeenCalledOnce();
+
+      const store = useHistoryStore();
+      const { associatedLocations } = storeToRefs(store);
+      expect(get(associatedLocations)).toEqual(locations);
+    });
+
+    it('should log error and show notification on failure', async () => {
+      const error = new Error('Network failure');
+      mockFetchAssociatedLocationsApi.mockRejectedValue(error);
+
+      const { fetchAssociatedLocations } = useHistoryDataFetching();
+      await fetchAssociatedLocations();
+
+      expect(mockLoggerError).toHaveBeenCalledWith(error);
+      expect(mockGetErrorMessage).toHaveBeenCalledWith(error);
+      expect(mockNotifyError).toHaveBeenCalledOnce();
+      expect(mockNotifyError).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(String),
+        { priority: Priority.NORMAL },
+      );
+    });
+  });
+
+  describe('fetchLocationLabels', () => {
+    it('should call the API and set store state on success', async () => {
+      const labels: LocationLabel[] = [
+        { location: 'kraken', locationLabel: 'My Exchange' },
+        { location: 'binance', locationLabel: 'Cold Wallet' },
+      ];
+      mockFetchLocationLabelsApi.mockResolvedValue(labels);
+
+      const { fetchLocationLabels } = useHistoryDataFetching();
+      await fetchLocationLabels();
+
+      expect(mockFetchLocationLabelsApi).toHaveBeenCalledOnce();
+
+      const store = useHistoryStore();
+      const { locationLabels } = storeToRefs(store);
+      expect(get(locationLabels)).toEqual(labels);
+    });
+
+    it('should log error and show notification on failure', async () => {
+      const error = new Error('API error');
+      mockFetchLocationLabelsApi.mockRejectedValue(error);
+
+      const { fetchLocationLabels } = useHistoryDataFetching();
+      await fetchLocationLabels();
+
+      expect(mockLoggerError).toHaveBeenCalledWith(error);
+      expect(mockGetErrorMessage).toHaveBeenCalledWith(error);
+      expect(mockNotifyError).toHaveBeenCalledOnce();
+      expect(mockNotifyError).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(String),
+        { priority: Priority.NORMAL },
+      );
+    });
+  });
+
+  describe('fetchTransactionStatusSummary', () => {
+    it('should call the API and set store state on success', async () => {
+      const status: TransactionStatus = {
+        evmLastQueriedTs: 1000,
+        exchangesLastQueriedTs: 2000,
+        hasEvmAccounts: true,
+        hasExchangesAccounts: false,
+        undecodedTxCount: 5,
+      };
+      mockGetTransactionStatusSummary.mockResolvedValue(status);
+
+      const { fetchTransactionStatusSummary } = useHistoryDataFetching();
+      await fetchTransactionStatusSummary();
+
+      expect(mockGetTransactionStatusSummary).toHaveBeenCalledOnce();
+
+      const store = useHistoryStore();
+      const { transactionStatusSummary } = storeToRefs(store);
+      expect(get(transactionStatusSummary)).toEqual(status);
+    });
+
+    it('should log error but not show notification on failure', async () => {
+      const error = new Error('Status fetch failed');
+      mockGetTransactionStatusSummary.mockRejectedValue(error);
+
+      const { fetchTransactionStatusSummary } = useHistoryDataFetching();
+      await fetchTransactionStatusSummary();
+
+      expect(mockLoggerError).toHaveBeenCalledWith(error);
+      expect(mockNotifyError).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('concurrent reads', () => {
+    it('should issue one request when the location set is read concurrently, as a flow ending produces several boundary reads at once', async () => {
+      let release: (value: string[]) => void = () => {};
+      mockFetchAssociatedLocationsApi.mockReturnValue(new Promise<string[]>((resolve) => {
+        release = resolve;
+      }));
+
+      const { fetchAssociatedLocations } = useHistoryDataFetching();
+      const first = fetchAssociatedLocations();
+      const second = fetchAssociatedLocations();
+      const third = useHistoryDataFetching().fetchAssociatedLocations();
+
+      release(['kraken']);
+      await Promise.all([first, second, third]);
+
+      expect(mockFetchAssociatedLocationsApi).toHaveBeenCalledOnce();
+      expect(get(storeToRefs(useHistoryStore()).associatedLocations)).toEqual(['kraken']);
+    });
+
+    it('should read again once the previous read has settled, so joining does not become caching', async () => {
+      mockFetchAssociatedLocationsApi.mockResolvedValue(['kraken']);
+
+      const { fetchAssociatedLocations } = useHistoryDataFetching();
+      await fetchAssociatedLocations();
+      await fetchAssociatedLocations();
+
+      expect(mockFetchAssociatedLocationsApi).toHaveBeenCalledTimes(2);
+    });
+
+    it('should keep the two location reads independent', async () => {
+      mockFetchAssociatedLocationsApi.mockResolvedValue(['kraken']);
+      mockFetchLocationLabelsApi.mockResolvedValue([]);
+
+      const { fetchAssociatedLocations, fetchLocationLabels } = useHistoryDataFetching();
+      await Promise.all([fetchAssociatedLocations(), fetchLocationLabels()]);
+
+      expect(mockFetchAssociatedLocationsApi).toHaveBeenCalledOnce();
+      expect(mockFetchLocationLabelsApi).toHaveBeenCalledOnce();
+    });
+
+    it('should clear the slot a failed read held, rather than leave later reads joining a dead promise', async () => {
+      mockFetchAssociatedLocationsApi.mockRejectedValueOnce(new Error('boom'));
+      const { fetchAssociatedLocations } = useHistoryDataFetching();
+      await fetchAssociatedLocations();
+
+      mockFetchAssociatedLocationsApi.mockResolvedValue(['kraken']);
+      await fetchAssociatedLocations();
+
+      expect(mockFetchAssociatedLocationsApi).toHaveBeenCalledTimes(2);
+      expect(get(storeToRefs(useHistoryStore()).associatedLocations)).toEqual(['kraken']);
+    });
+  });
+});

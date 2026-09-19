@@ -1,0 +1,750 @@
+import logging
+import os
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
+
+import pytest
+import requests
+
+from rotkehlchen.accounting.mixins.event import AccountingEventType
+from rotkehlchen.api.session_store import SessionStore
+from rotkehlchen.chain.decoding.constants import CPT_GAS
+from rotkehlchen.chain.ethereum.constants import EVM_INDEXERS_NODE_NAME
+from rotkehlchen.chain.evm.types import NodeName, WeightedNode
+from rotkehlchen.chain.mixins.rpc_nodes import RPCNode
+from rotkehlchen.constants.misc import DEFAULT_MAX_LOG_BACKUP_FILES, DEFAULT_SQL_VM_INSTRUCTIONS_CB
+from rotkehlchen.fval import FVal
+from rotkehlchen.tests.utils.api import (
+    api_url_for,
+    assert_error_response,
+    assert_proper_response,
+    assert_proper_sync_response_with_result,
+)
+from rotkehlchen.tests.utils.factories import make_evm_address
+from rotkehlchen.types import ChainID, Location, SupportedBlockchain
+from rotkehlchen.utils.misc import get_system_spec
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from rotkehlchen.api.server import APIServer
+
+
+def generate_expected_info(
+        expected_version: str,
+        data_dir: Path,
+        latest_version: str | None = None,
+        accept_unauthenticated_api: bool = False,
+        download_url: str | None = None,
+        session_auth: bool = False,
+) -> dict[str, Any]:
+    return {
+        'version': {
+            'our_version': expected_version,
+            'latest_version': latest_version,
+            'download_url': download_url,
+        },
+        'data_directory': str(data_dir),
+        'log_level': 'DEBUG',
+        'accept_unauthenticated_api': accept_unauthenticated_api,
+        'session_auth': session_auth,
+        'backend_default_arguments': {
+            'max_logfiles_num': 3,
+            'max_size_in_mb_all_logs': 300,
+            'sqlite_instructions': DEFAULT_SQL_VM_INSTRUCTIONS_CB,
+        },
+    }
+
+
+def test_query_info_version_when_up_to_date(rotkehlchen_api_server: APIServer) -> None:
+    """Test that endpoint to query the rotki version works if no new version is available"""
+    expected_version = '1.1.0'
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+
+    def patched_get_system_spec() -> dict[str, Any]:
+        return {'rotkehlchen': f'v{expected_version}'}
+
+    def patched_get_latest_release(_klass: Any) -> tuple[str, str]:
+        return expected_version, f'https://github.com/rotki/rotki/releases/tag/{expected_version}'
+    release_patch = patch(
+        'rotkehlchen.externalapis.github.Github.get_latest_release',
+        patched_get_latest_release,
+    )
+    version_patch = patch(
+        'rotkehlchen.utils.version_check.get_system_spec',
+        patched_get_system_spec,
+    )
+
+    with version_patch, release_patch:
+        response = requests.get(
+            api_url_for(
+                rotkehlchen_api_server,
+                'inforesource',
+            ),
+        )
+
+    result = assert_proper_sync_response_with_result(response)
+    assert result == generate_expected_info(expected_version, rotki.data_dir)
+
+    with version_patch, release_patch:
+        response = requests.get(
+            url=api_url_for(
+                rotkehlchen_api_server,
+                'inforesource',
+            ),
+            params={
+                'check_for_updates': True,
+            },
+        )
+
+    result = assert_proper_sync_response_with_result(response)
+    assert result == generate_expected_info(expected_version, rotki.data_dir, latest_version=expected_version)  # noqa: E501
+
+    with version_patch, release_patch, patch.dict(os.environ, {'ROTKI_ACCEPT_UNAUTHENTICATED_API': 'whatever'}):  # noqa: E501
+        response = requests.get(
+            url=api_url_for(
+                rotkehlchen_api_server,
+                'inforesource',
+            ),
+        )
+
+    result = assert_proper_sync_response_with_result(response)
+    assert result == generate_expected_info(
+        expected_version=expected_version,
+        data_dir=rotki.data_dir,
+        accept_unauthenticated_api=True,
+    )
+
+    # The retired ROTKI_ACCEPT_DOCKER_RISK must not carry over. Operators who set it to
+    # silence the old docker warning have to see the new one once, otherwise they never
+    # learn that session authentication exists.
+    with version_patch, release_patch, patch.dict(os.environ, {'ROTKI_ACCEPT_DOCKER_RISK': 'whatever'}):  # noqa: E501
+        response = requests.get(
+            url=api_url_for(
+                rotkehlchen_api_server,
+                'inforesource',
+            ),
+        )
+
+    result = assert_proper_sync_response_with_result(response)
+    assert result == generate_expected_info(
+        expected_version=expected_version,
+        data_dir=rotki.data_dir,
+    )
+
+    # session_auth mirrors the signing key the deployment was given. Set it on the
+    # live rest_api since it is read from the environment at construction time. The
+    # store goes with it since the cookie gate asserts they are built together.
+    rest_api = rotkehlchen_api_server.rest_api
+    session_key = b'a-session-key'
+    session_store = SessionStore(
+        db_path=rotki.data_dir / 'test_session.db',
+        session_key=session_key,
+    )
+    with (
+        version_patch,
+        release_patch,
+        patch.object(rest_api, 'session_key', session_key),
+        patch.object(rest_api, 'session_store', session_store),
+    ):
+        response = requests.get(
+            url=api_url_for(
+                rotkehlchen_api_server,
+                'inforesource',
+            ),
+        )
+
+    result = assert_proper_sync_response_with_result(response)
+    assert result == generate_expected_info(
+        expected_version=expected_version,
+        data_dir=rotki.data_dir,
+        session_auth=True,
+    )
+
+
+def test_query_ping(rotkehlchen_api_server: APIServer) -> None:
+    """Test that the ping endpoint works"""
+    expected_result = True
+    expected_message = ''
+
+    response = requests.get(api_url_for(rotkehlchen_api_server, 'pingresource'))
+    assert_proper_response(response)
+    response_json = response.json()
+    assert len(response_json) == 2
+    assert response_json['result'] == expected_result
+    assert response_json['message'] == expected_message
+
+
+def test_query_version_when_update_required(rotkehlchen_api_server: APIServer) -> None:
+    """
+    Test that endpoint to query app version and available updates works
+    when a new version is available.
+    """
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+
+    def patched_get_latest_release(_klass: Any) -> tuple[str, str]:
+        new_latest = 'v99.99.99'
+        return new_latest, f'https://github.com/rotki/rotki/releases/tag/{new_latest}'
+
+    release_patch = patch(
+        'rotkehlchen.externalapis.github.Github.get_latest_release',
+        patched_get_latest_release,
+    )
+    with release_patch:
+        response = requests.get(
+            url=api_url_for(
+                rotkehlchen_api_server,
+                'inforesource',
+            ),
+            params={
+                'check_for_updates': True,
+            },
+        )
+
+    result = assert_proper_sync_response_with_result(response)
+    our_version = get_system_spec()['rotkehlchen']
+    assert result == generate_expected_info(
+        expected_version=our_version,
+        data_dir=rotki.data_dir,
+        latest_version='99.99.99',
+        download_url='https://github.com/rotki/rotki/releases/tag/v99.99.99',
+    )
+
+
+@pytest.mark.parametrize('ethereum_manager_connect_at_start', ['DEFAULT'])
+def test_manage_nodes(rotkehlchen_api_server: APIServer) -> None:
+    """Test that list of nodes can be correctly updated and queried"""
+    database = rotkehlchen_api_server.rest_api.rotkehlchen.data.db
+    blockchain = SupportedBlockchain.ETHEREUM
+    blockchain_key = blockchain.serialize()
+    nodes_at_start = len(database.get_rpc_nodes(blockchain=blockchain, only_active=True))
+    nodes_count_at_start = len(database.get_rpc_nodes(blockchain=blockchain))
+    response = requests.get(
+        api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain=blockchain_key),
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert len(result) == nodes_count_at_start
+    node_to_delete = next(node for node in result if node['name'] != EVM_INDEXERS_NODE_NAME)
+    for node in result:
+        if node['name'] != EVM_INDEXERS_NODE_NAME:
+            assert node['endpoint'] != ''
+        else:
+            assert node['identifier'] == 1
+        if node['active']:
+            assert node['weight'] != 0
+
+    # try to delete a node
+    response = requests.delete(
+        api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain=blockchain_key),
+        json={'identifier': node_to_delete['identifier']},
+    )
+    assert_proper_response(response)
+    # check that is not anymore in the returned list
+    response = requests.get(
+        api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain=blockchain_key),
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert not any(node['identifier'] == node_to_delete['identifier'] for node in result)
+
+    # now try to add it again
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain=blockchain_key),
+        json={
+            'name': node_to_delete['name'],
+            'endpoint': node_to_delete['endpoint'],
+            'owned': node_to_delete['owned'],
+            'weight': '20',
+            'active': True,
+        },
+    )
+    assert_proper_response(response)
+    response = requests.get(
+        api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain=blockchain_key),
+    )
+    result = assert_proper_sync_response_with_result(response)
+    restored_node = next(node for node in result if node['name'] == node_to_delete['name'])
+    assert FVal(restored_node['weight']) == 20
+    assert restored_node['active'] is True
+    assert restored_node['endpoint'] == node_to_delete['endpoint']
+    assert restored_node['owned'] is node_to_delete['owned']
+    assert restored_node['blockchain'] == blockchain_key
+
+    node_to_edit = next(
+        node for node in result
+        if (
+            node['name'] != EVM_INDEXERS_NODE_NAME and
+            node['identifier'] != restored_node['identifier']
+        )
+    )
+
+    # Try to add an empty name
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain=blockchain_key),
+        json={
+            'name': '',
+            'endpoint': '1inch.io',
+            'owned': False,
+            'weight': '0.3',
+            'active': True,
+        },
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg="Name can't be empty",
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # try to edit an unknown node
+    response = requests.patch(
+        api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain=blockchain_key),
+        json={
+            'identifier': 666,
+            'name': '1inch',
+            'endpoint': 'ewarwae',
+            'owned': True,
+            'weight': '40',
+            'active': True,
+        },
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg="Node with identifier 666 doesn't exist",
+        status_code=HTTPStatus.CONFLICT,
+    )
+
+    # try to edit a node's endpoint
+    response = requests.patch(
+        api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain=blockchain_key),
+        json={
+            'identifier': node_to_edit['identifier'],
+            'name': 'ankr',
+            'endpoint': 'ewarwae',
+            'owned': True,
+            'weight': '20',
+            'active': True,
+        },
+    )
+    assert_proper_response(response)
+    response = requests.get(
+        api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain=blockchain_key),
+    )
+    result = assert_proper_sync_response_with_result(response)
+    for node in result:
+        if node['identifier'] == node_to_edit['identifier']:
+            assert FVal(node['weight']) == 20
+            assert node['name'] == 'ankr'
+            assert node['active'] is True
+            assert node['endpoint'] == 'ewarwae'
+            assert node['owned'] is True
+            assert node['blockchain'] == blockchain_key
+            break
+
+    # try to edit a node's name
+    response = requests.patch(
+        api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain=blockchain_key),
+        json={
+            'identifier': node_to_edit['identifier'],
+            'name': 'anchor',
+            'endpoint': 'ewarwae',
+            'owned': True,
+            'weight': '20',
+            'active': True,
+        },
+    )
+    assert_proper_response(response)
+    response = requests.get(
+        api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain=blockchain_key),
+    )
+    result = assert_proper_sync_response_with_result(response)
+    for node in result:
+        if node['identifier'] == node_to_edit['identifier']:
+            assert FVal(node['weight']) == 20
+            assert node['name'] == 'anchor'
+            assert node['active'] is True
+            assert node['endpoint'] == 'ewarwae'
+            assert node['owned'] is True
+            assert node['blockchain'] == blockchain_key
+            break
+
+    # add a new node with duplicated endpoint/chain, should fail due to constraint in the db
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain=blockchain_key),
+        json={
+            'name': 'my_super_node',
+            'endpoint': 'ewarwae',
+            'owned': True,
+            'weight': '0.3',
+            'active': True,
+        },
+    )
+    result = assert_error_response(
+        response=response,
+        contained_in_msg='Node for ethereum with endpoint ewarwae already exists in db',
+        status_code=HTTPStatus.CONFLICT,
+    )
+    # add a new node that should be correct
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain=blockchain_key),
+        json={
+            'name': 'my_super_node',
+            'endpoint': 'ewarwae.com',
+            'owned': True,
+            'weight': '0.3',
+            'active': True,
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+
+    # set active to false and see that we have the expected amount of nodes
+    with database.conn.read_ctx() as cursor:
+        target_id = cursor.execute(
+            "SELECT identifier from rpc_nodes WHERE name='my_super_node'",
+        ).fetchone()[0]
+
+    response = requests.patch(
+        api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain=blockchain_key),
+        json={
+            'identifier': target_id,
+            'name': 'myetherwallet',
+            'endpoint': 'https://https://nodes.mewapi.io/rpc/eth.cloud.ava.do/',
+            'owned': False,
+            'weight': '10',
+            'active': False,
+        },
+    )
+    assert nodes_at_start - len(database.get_rpc_nodes(blockchain=blockchain, only_active=True)) == 0  # noqa: E501
+    response = requests.get(
+        api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain=blockchain_key),
+    )
+    result = assert_proper_sync_response_with_result(response)
+    # Check that the rebalancing didn't get affected by the owned node
+    for node in result:
+        if node['name'] == 'anchor':
+            assert FVal(node['weight']) == 20
+            break
+
+    # and now let's replicate https://github.com/rotki/rotki/issues/4769 by
+    # editing all nodes to have 0% weight.
+    response = requests.get(
+        api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain=blockchain_key),
+    )
+    result = assert_proper_sync_response_with_result(response)
+    for node in result:
+        response = requests.patch(
+            api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain=node['blockchain']),
+            json={
+                'identifier': node['identifier'],
+                'name': node['name'],
+                'endpoint': node['endpoint'],
+                'owned': node['owned'],
+                'weight': '0',
+                'active': node['active'],
+            },
+        )
+        assert_proper_response(response)
+
+
+def test_rpc_nodes_is_archive_field(rotkehlchen_api_server: APIServer) -> None:
+    """Test that is_archive field is correctly returned for RPC nodes.
+
+    Tests all three cases:
+    - is_archive=True for connected archive node
+    - is_archive=False for connected non-archive node
+    - is_archive=None for node not currently connected
+    """
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    archive_node = WeightedNode(
+        identifier=100,
+        node_info=NodeName(
+            name='archive_node',
+            endpoint='https://archive.example.com',
+            owned=False,
+            blockchain=SupportedBlockchain.ETHEREUM,
+        ),
+        weight=FVal('0.3'),
+        active=True,
+    )
+    non_archive_node = WeightedNode(
+        identifier=101,
+        node_info=NodeName(
+            name='non_archive_node',
+            endpoint='https://non-archive.example.com',
+            owned=False,
+            blockchain=SupportedBlockchain.ETHEREUM,
+        ),
+        weight=FVal('0.3'),
+        active=True,
+    )
+    not_connected_node = WeightedNode(
+        identifier=102,
+        node_info=NodeName(
+            name='not_connected_node',
+            endpoint='https://not-connected.example.com',
+            owned=False,
+            blockchain=SupportedBlockchain.ETHEREUM,
+        ),
+        weight=FVal('0.3'),
+        active=True,
+    )
+
+    for node in (archive_node, non_archive_node, not_connected_node):
+        rotki.data.db.add_rpc_node(node)
+
+    ethereum_inquirer = rotki.chains_aggregator.ethereum.node_inquirer
+    for node, is_archive in ((archive_node, True), (non_archive_node, False)):
+        web3, _ = ethereum_inquirer._init_web3(node.node_info)
+        ethereum_inquirer.rpc_mapping[node.node_info] = RPCNode(
+            rpc_client=web3,
+            is_pruned=False,
+            is_archive=is_archive,
+        )
+
+    result = assert_proper_sync_response_with_result(requests.get(api_url_for(
+        api_server=rotkehlchen_api_server,
+        endpoint='rpcnodesresource',
+        blockchain=SupportedBlockchain.ETHEREUM.serialize(),
+    )))
+    for node in result:
+        if node['name'] == 'archive_node':
+            assert node['is_archive'] is True
+        elif node['name'] == 'non_archive_node':
+            assert node['is_archive'] is False
+        elif node['name'] == 'not_connected_node':
+            assert 'is_archive' not in node
+
+
+def test_rpc_nodes_runtime_status_fields(rotkehlchen_api_server: APIServer) -> None:
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    node = WeightedNode(
+        identifier=100,
+        node_info=NodeName(
+            name='rate_limited_node',
+            endpoint='https://rate-limited.example.com',
+            owned=False,
+            blockchain=SupportedBlockchain.ETHEREUM,
+        ),
+        weight=FVal('0.3'),
+        active=True,
+    )
+    rotki.data.db.add_rpc_node(node)
+
+    inquirer = rotki.chains_aggregator.ethereum.node_inquirer
+    inquirer.mark_node_rate_limited(node.node_info, '429')
+
+    result = assert_proper_sync_response_with_result(requests.get(api_url_for(
+        api_server=rotkehlchen_api_server,
+        endpoint='rpcnodesresource',
+        blockchain=SupportedBlockchain.ETHEREUM.serialize(),
+    )))
+    serialized_node = next(entry for entry in result if entry['name'] == node.node_info.name)
+    assert serialized_node['runtime_status'] == 'cooling_down'
+    assert serialized_node['ready'] is False
+    assert serialized_node['cooldown_until'] is not None
+    assert serialized_node['last_error'] is not None
+    assert serialized_node['last_error_kind'] == 'rate_limited'
+    assert 'last_success_timestamp' in serialized_node
+
+
+@pytest.mark.parametrize('max_size_in_mb_all_logs', [659])
+def test_configuration(rotkehlchen_api_server: APIServer) -> None:
+    """Test that the configuration endpoint returns the expected information"""
+    response = requests.get(api_url_for(rotkehlchen_api_server, 'configurationsresource'))
+    result = assert_proper_sync_response_with_result(response)
+    assert result['max_size_in_mb_all_logs']['value'] == 659
+    assert result['max_size_in_mb_all_logs']['is_default'] is False
+    assert result['max_logfiles_num']['is_default'] is True
+    assert result['max_logfiles_num']['value'] == DEFAULT_MAX_LOG_BACKUP_FILES
+    assert result['sqlite_instructions']['is_default'] is True
+    assert result['sqlite_instructions']['value'] == DEFAULT_SQL_VM_INSTRUCTIONS_CB
+    assert result['loglevel']['value'] == 'DEBUG'
+    assert result['loglevel']['is_default'] is True
+
+
+def test_update_log_level(
+        rotkehlchen_api_server: APIServer,
+        caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test updating log level via configuration endpoint"""
+    logger = logging.getLogger()
+    initial_loglevel = logger.level
+    try:
+        assert_error_response(  # Test invalid log level
+            response=requests.put(
+                api_url_for(rotkehlchen_api_server, 'configurationsresource'),
+                json={'loglevel': 'invalid'},
+            ),
+            contained_in_msg='Invalid log level',
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+        assert assert_proper_sync_response_with_result(requests.put(  # Switch to trace level
+            api_url_for(rotkehlchen_api_server, 'configurationsresource'),
+            json={'loglevel': (given_loglevel := 'TRACE')},
+        ))['loglevel']['value'] == given_loglevel
+
+        test_logger = logging.getLogger('rotkehlchen.test')
+        test_logger.trace('Test trace message')  # type: ignore[attr-defined]
+        assert 'Test trace message' in caplog.text
+        assert 'logger.trace' not in caplog.text
+    finally:
+        # Reset global log level so this test does not affect other tests in the same worker.
+        logger.setLevel(initial_loglevel)
+    caplog.clear()
+    test_logger.trace('Post-reset trace message')  # type: ignore[attr-defined]
+    assert 'Post-reset trace message' not in caplog.text
+
+
+def test_query_all_chain_ids(rotkehlchen_api_server: APIServer) -> None:
+    response = requests.get(api_url_for(rotkehlchen_api_server, 'allevmchainsresource'))
+    result = assert_proper_sync_response_with_result(response)
+    for chain in ChainID:
+        name, label = chain.name_and_label()
+        assert {'id': chain.value, 'name': name, 'label': label} in result
+    assert len(ChainID) == len(result)
+
+
+@pytest.mark.parametrize('have_decoders', [True])
+@pytest.mark.parametrize('added_exchanges', [(Location.KRAKEN, Location.BINANCE)])
+def test_events_mappings(rotkehlchen_api_server_with_exchanges: APIServer) -> None:
+    """
+    Test different mappings and information that we provide for rendering events information
+    - Test that the structure for types mappings is correctly generated
+    - Test that the valid locations are correctly provided to the frontend
+    """
+    response = requests.get(
+        api_url_for(
+            rotkehlchen_api_server_with_exchanges,
+            'typesmappingsresource',
+        ),
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert 'global_mappings' in result
+    assert result['entry_type_mappings'] == {
+        'eth withdrawal event': {
+            'staking': {
+                'remove asset': {
+                    'is_exit': 'stake exit',
+                    'not_exit': 'withdraw',
+                },
+            },
+        },
+    }
+    assert 'event_category_details' in result
+    for category_details in result['event_category_details'].values():
+        assert {'counterparty_mappings', 'direction', 'group'} <= category_details.keys()
+        assert category_details['group'] in result['event_category_groups']
+    assert 'event_category_groups' in result
+    for group_details in result['event_category_groups'].values():
+        assert {'icon', 'order'} == group_details.keys()
+        assert isinstance(group_details['order'], int)
+    assert 'accounting_events_icons' in result
+    received_accounting_event_types = {
+        AccountingEventType.deserialize(event_type)
+        for event_type in result['accounting_events_icons']
+    }
+    assert received_accounting_event_types == set(AccountingEventType)
+
+    response = requests.get(
+        api_url_for(
+            rotkehlchen_api_server_with_exchanges,
+            'locationresource',
+        ),
+    )
+    result = assert_proper_sync_response_with_result(response)
+    excluded_locations = {Location.TOTAL}
+    valid_locations = {location.serialize() for location in Location if location not in excluded_locations}  # noqa: E501
+    assert set(result['locations'].keys()) == valid_locations
+    for detail in result['locations'].values():
+        assert 'icon' in detail or 'image' in detail
+
+
+@pytest.mark.parametrize('have_decoders', [True])
+def test_counterparties(rotkehlchen_api_server_with_exchanges: APIServer) -> None:
+    """Test serialization of the counterparties"""
+    response = requests.get(
+        api_url_for(
+            rotkehlchen_api_server_with_exchanges,
+            'counterpartiesresource',
+        ),
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert any(counterparty_details['identifier'] == CPT_GAS for counterparty_details in result)
+    for counterparty_details in result:
+        assert 'identifier' in counterparty_details
+        assert 'label' in counterparty_details
+        assert 'icon' in counterparty_details or 'image' in counterparty_details
+        if counterparty_details['identifier'] == CPT_GAS:
+            assert counterparty_details['icon'] == 'lu-flame'
+        elif counterparty_details['identifier'] == 'jupiter':
+            assert counterparty_details['label'] == 'Jupiter'
+
+
+@pytest.mark.parametrize('base_manager_connect_at_start', ['DEFAULT'])
+@pytest.mark.parametrize('ethereum_accounts', [[make_evm_address()]])
+def test_connecting_to_node(rotkehlchen_api_server: APIServer) -> None:
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    base = rotki.chains_aggregator.base
+    drpc_node = next(
+        node for node in rotki.data.db.get_rpc_nodes(SupportedBlockchain.BASE)
+        if node.node_info.name == 'dRPC'
+    )
+    patched_connection = patch.object(
+        base.node_inquirer,
+        'attempt_connect',
+        lambda *args, **kwargs: (True, ''),
+    )
+    assert len(base.node_inquirer.get_connected_nodes()) == 0
+
+    with patched_connection:
+        rpc_url = api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain='base')
+        response = requests.post(url=rpc_url, json={'identifier': drpc_node.identifier})
+        assert_proper_sync_response_with_result(response)
+
+        # check case of a bad identifier
+        response = requests.post(url=rpc_url, json={'identifier': 999})
+        assert_error_response(
+            response=response,
+            contained_in_msg='RPC node not found',
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+        # check connecting to a non evm node
+        response = requests.post(
+            url=api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain='ksm'),
+            json={'identifier': 999},
+        )
+        assert_error_response(
+            response=response,
+            contained_in_msg='kusama nodes are connected at login',
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+    connected_nodes = []
+
+    def custom_connect(node: NodeName) -> tuple[bool, str]:
+        connected_nodes.append(node.name)
+        return True, ''
+
+    with patch.object(
+        base.node_inquirer,
+        'attempt_connect',
+        custom_connect,
+    ):  # connect to all the nodes
+        rpc_url = api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain='base')
+        response = requests.post(url=rpc_url)
+        assert_proper_sync_response_with_result(response)
+        assert len(connected_nodes) >= 4
+
+    with patch.object(
+        base.node_inquirer,
+        'attempt_connect',
+        lambda *args, **kwargs: (False, 'Custom error'),
+    ):
+        # check error during connection
+        rpc_url = api_url_for(rotkehlchen_api_server, 'rpcnodesresource', blockchain='base')
+        response = requests.post(url=rpc_url, json={'identifier': drpc_node.identifier})
+        assert response.json()['result'] == {
+            'errors': [{'name': 'dRPC', 'error': 'Custom error'}],
+        }
+        assert response.status_code == HTTPStatus.OK

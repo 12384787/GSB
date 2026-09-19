@@ -1,0 +1,191 @@
+<script setup lang="ts">
+import type { AddressData, BlockchainAccount } from '@/modules/accounts/blockchain-accounts';
+import { type Account, Blockchain } from '@rotki/common';
+import { omit } from 'es-toolkit';
+import { hasAccountAddress } from '@/modules/accounts/account-helpers';
+import { matchesAccountQuery, selectableAccounts } from '@/modules/accounts/account-selection';
+import { getAccountAddress, getAccountId } from '@/modules/accounts/account-utils';
+import { useAddressNameResolution } from '@/modules/accounts/address-book/use-address-name-resolution';
+import { useBlockchainAccountsStore } from '@/modules/accounts/use-blockchain-accounts-store';
+import { getNonRootAttrs, getRootAttrs } from '@/modules/core/common/helpers/attrs';
+import AccountDisplay from '@/modules/shell/components/display/AccountDisplay.vue';
+import TagDisplay from '@/modules/tags/TagDisplay.vue';
+
+type AccountWithAddressData = BlockchainAccount<AddressData>;
+
+type AccountWithExtra = AccountWithAddressData & { address: string; key: string };
+
+/** Which accounts the selector offers. These are consumed together by `selectableAccounts`. */
+interface AccountSelectorSource {
+  chains?: string[];
+  usableAddresses?: string[];
+  multichain?: boolean;
+  unique?: boolean;
+  hideOnEmptyUsable?: boolean;
+}
+
+/** How the wrapped field presents and validates. Passed through to RuiAutoComplete. */
+interface AccountSelectorField {
+  label?: string;
+  hint?: string;
+  errorMessages?: string[];
+  required?: boolean;
+  showDetails?: boolean;
+  noDataText?: string;
+  dense?: boolean;
+}
+
+defineOptions({
+  inheritAttrs: false,
+});
+
+const modelValue = defineModel<AccountWithAddressData[]>({ required: true });
+
+const {
+  field,
+  hideChainIcon = false,
+  loading = false,
+  source,
+} = defineProps<{
+  source?: AccountSelectorSource;
+  field?: AccountSelectorField;
+  loading?: boolean;
+  hideChainIcon?: boolean;
+}>();
+
+const { t } = useI18n({ useScope: 'global' });
+
+const { accounts: accountsPerChain } = storeToRefs(useBlockchainAccountsStore());
+const { getAddressName } = useAddressNameResolution();
+
+const chains = computed<string[]>(() => source?.chains ?? []);
+
+const usableAddresses = computed<string[]>(() => source?.usableAddresses ?? []);
+
+const hideOnEmptyUsable = computed<boolean>(() => source?.hideOnEmptyUsable ?? false);
+
+const errorMessages = computed<string[]>(() => field?.errorMessages ?? []);
+
+const required = computed<boolean>(() => field?.required ?? false);
+
+const hideDetails = computed<boolean>(() => !(field?.showDetails ?? false));
+
+const dense = computed<boolean>(() => field?.dense ?? false);
+
+const label = computed<string>(() => field?.label || t('blockchain_account_selector.default_label'));
+
+const noDataText = computed<string>(() => field?.noDataText || t('blockchain_account_selector.no_data'));
+
+const accounts = computed<AccountWithAddressData[]>(() =>
+  Object.values(get(accountsPerChain))
+    .flatMap(x => x)
+    .filter(hasAccountAddress),
+);
+
+const internalValue = computed<AccountWithExtra | undefined>(() => {
+  const [first] = get(modelValue);
+  if (!first)
+    return undefined;
+
+  return { ...first, address: getAccountAddress(first), key: getAccountId(first) };
+});
+
+const offeredAccounts = computed<AccountWithAddressData[]>(() => selectableAccounts(get(accounts), {
+  chains: get(chains),
+  multichain: source?.multichain,
+  unique: source?.unique,
+}));
+
+const displayedAccounts = computed<AccountWithExtra[]>(() => {
+  const accounts = Array.from(get(offeredAccounts), item => ({
+    ...item,
+    address: getAccountAddress(item),
+    key: getAccountId(item),
+  }));
+  const usable = get(usableAddresses);
+  if (usable.length > 0)
+    return accounts.filter(account => usable.includes(account.address));
+
+  return get(hideOnEmptyUsable) ? [] : accounts;
+});
+
+function filter(item: BlockchainAccount, queryText: string): boolean {
+  return matchesAccountQuery(item, queryText, account =>
+    getAddressName(getAccountAddress(account), account.chain === 'ALL' ? Blockchain.ETH : account.chain));
+}
+
+/**
+ * Replaces the whole selection with `nextValue`, or empties it when nothing is picked.
+ *
+ * @remarks
+ * The model stays a one-element array so callers keep their shape while the selector behaves as
+ * single-select: RuiAutoComplete infers multi-select from an array model value, and the
+ * `internalValue` bound to it is never one. The `address` and `key` fields are derived for display
+ * and are stripped back off on the way out.
+ */
+function input(nextValue?: AccountWithExtra): void {
+  set(modelValue, nextValue ? [omit(nextValue, ['address', 'key'])] : []);
+}
+
+function getAccount(account: AccountWithAddressData): Account {
+  return {
+    address: getAccountAddress(account),
+    chain: account.chain,
+  };
+}
+</script>
+
+<template>
+  <div
+    class="bg-white dark:bg-dark-elevated"
+    v-bind="getRootAttrs($attrs)"
+  >
+    <RuiAutoComplete
+      :model-value="internalValue"
+      :options="displayedAccounts"
+      :filter="filter"
+      key-attr="key"
+      text-attr="address"
+      auto-select-first
+      :loading="loading"
+      :disabled="loading"
+      :hide-details="hideDetails"
+      hide-selected
+      :hide-no-data="!hideOnEmptyUsable"
+      :item-height="40"
+      :required="required"
+      :clearable="!required"
+      :dense="dense"
+      variant="outlined"
+      outlined
+      :hint="field?.hint"
+      :label="label"
+      class="blockchain-account-selector"
+      :error-messages="errorMessages"
+      v-bind="getNonRootAttrs($attrs)"
+      :no-data-text="noDataText"
+      return-object
+      @update:model-value="input($event)"
+    >
+      <template #selection="{ item }">
+        <AccountDisplay
+          :account="getAccount(item)"
+          :hide-chain-icon="hideChainIcon"
+        />
+      </template>
+      <template #item="{ item }">
+        <div class="grow py-1">
+          <AccountDisplay
+            :account="getAccount(item)"
+            :hide-chain-icon="hideChainIcon"
+          />
+          <TagDisplay
+            :class="hideChainIcon ? 'pl-8' : 'pl-[3.75rem]'"
+            :tags="item.tags"
+            small
+          />
+        </div>
+      </template>
+    </RuiAutoComplete>
+  </div>
+</template>

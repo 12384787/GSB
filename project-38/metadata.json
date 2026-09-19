@@ -1,0 +1,10 @@
+{
+  "number": 38,
+  "repository": "rotki/rotki",
+  "url": "https://github.com/rotki/rotki",
+  "description": "A portfolio tracking, analytics, accounting and management application that protects your privacy",
+  "language": "Python",
+  "stars": 4027,
+  "default_branch": "main",
+  "source_zip_url": "https://github.com/rotki/rotki/archive/refs/heads/main.zip"
+}

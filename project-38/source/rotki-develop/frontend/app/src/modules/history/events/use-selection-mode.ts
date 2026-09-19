@@ -1,0 +1,159 @@
+import type { ComputedRef, DeepReadonly, Ref } from 'vue';
+import { get, set } from '@vueuse/shared';
+
+export interface SelectionState {
+  isActive: boolean;
+  isAllSelected: boolean;
+  isPartiallySelected: boolean;
+  selectedCount: number;
+  selectedIds: Set<number>;
+  hasAvailableEvents: boolean;
+  selectAllMatching: boolean;
+  totalMatchingCount: number;
+}
+
+interface SelectionActions {
+  clear: () => void;
+  exit: () => void;
+  toggle: () => void;
+  toggleAll: () => void;
+  toggleEvent: (eventId: number) => void;
+  toggleSwap: (eventIds: number[]) => void;
+  toggleSelectAllMatching: () => void;
+}
+
+export interface UseHistoryEventsSelectionModeReturn {
+  actions: SelectionActions;
+  getSelectedIds: () => number[];
+  setAvailableIds: (ids: number[]) => void;
+  setTotalMatchingCount: (count: number) => void;
+  state: ComputedRef<SelectionState>;
+  isEventSelected: (eventId: number) => boolean;
+  selectedEvents: DeepReadonly<Ref<Set<number>>>;
+  isSelectionMode: Readonly<Ref<boolean>>;
+  isSelectAllMatching: Readonly<Ref<boolean>>;
+}
+
+export function useHistoryEventsSelectionMode(): UseHistoryEventsSelectionModeReturn {
+  const isActive = shallowRef<boolean>(false);
+  const selectedIds = shallowRef<Set<number>>(new Set());
+  const availableIds = ref<number[]>([]);
+  const selectAllMatching = shallowRef<boolean>(false);
+  const totalMatchingCount = shallowRef<number>(0);
+
+  const state = computed<SelectionState>(() => {
+    const isSelectAll = get(selectAllMatching);
+    const availableIdsLength = get(availableIds).length;
+    const selectedIdsVal = get(selectedIds);
+    const selectedIdsLength = selectedIdsVal.size;
+
+    return {
+      hasAvailableEvents: availableIdsLength > 0,
+      isActive: get(isActive),
+      isAllSelected: availableIdsLength > 0
+        && get(availableIds).every(id => selectedIdsVal.has(id)),
+      isPartiallySelected: selectedIdsLength > 0
+        && selectedIdsLength < availableIdsLength
+        && !isSelectAll,
+      selectAllMatching: isSelectAll,
+      selectedCount: isSelectAll ? get(totalMatchingCount) : selectedIdsLength,
+      selectedIds: selectedIdsVal,
+      totalMatchingCount: get(totalMatchingCount),
+    };
+  });
+
+  /**
+   * Leaves the select-all-matching mode, because a manual pick has replaced it.
+   *
+   * @remarks
+   * The mode stands for every row the current filter matches, most of which are never loaded, so
+   * it is a claim about the query rather than a set of ids. The moment the user toggles a row the
+   * selection becomes an explicit set, and the two cannot both hold.
+   */
+  const leaveSelectAllMatching = (): void => {
+    if (get(selectAllMatching))
+      set(selectAllMatching, false);
+  };
+
+  const actions: SelectionActions = {
+    clear: () => {
+      set(selectedIds, new Set());
+      set(selectAllMatching, false);
+    },
+    exit: () => {
+      set(isActive, false);
+      actions.clear();
+    },
+    toggle: () => {
+      set(isActive, !get(isActive));
+      if (!get(isActive))
+        actions.clear();
+    },
+    toggleAll: () => {
+      if (get(selectAllMatching)) {
+        actions.clear();
+        return;
+      }
+
+      if (get(state).isAllSelected)
+        actions.clear();
+      else
+        set(selectedIds, new Set(get(availableIds)));
+    },
+    toggleEvent: (eventId: number) => {
+      leaveSelectAllMatching();
+
+      const ids = new Set(get(selectedIds));
+      if (ids.has(eventId))
+        ids.delete(eventId);
+      else
+        ids.add(eventId);
+
+      set(selectedIds, ids);
+    },
+    toggleSwap: (eventIds: number[]) => {
+      leaveSelectAllMatching();
+
+      const ids = new Set(get(selectedIds));
+      const allSelected = eventIds.every(id => ids.has(id));
+
+      if (allSelected)
+        eventIds.forEach(id => ids.delete(id));
+      else
+        eventIds.forEach(id => ids.add(id));
+
+      set(selectedIds, ids);
+    },
+    toggleSelectAllMatching: () => {
+      const newValue = !get(selectAllMatching);
+      set(selectAllMatching, newValue);
+      // When toggling off, clear the selection
+      if (!newValue)
+        set(selectedIds, new Set());
+    },
+  };
+
+  const getSelectedIds = (): number[] => Array.from(get(selectedIds));
+
+  const setAvailableIds = (ids: number[]): void => {
+    set(availableIds, ids);
+  };
+
+  const setTotalMatchingCount = (count: number): void => {
+    set(totalMatchingCount, count);
+  };
+
+  const isEventSelected = (eventId: number): boolean => get(selectAllMatching) || get(selectedIds).has(eventId);
+
+  return {
+    actions,
+    getSelectedIds,
+    isEventSelected,
+    isSelectAllMatching: readonly(selectAllMatching),
+    isSelectionMode: readonly(isActive),
+    selectedEvents: readonly(selectedIds),
+    setAvailableIds,
+    setTotalMatchingCount,
+    state,
+  };
+}

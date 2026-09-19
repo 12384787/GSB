@@ -1,0 +1,223 @@
+import { CommonQueryStatusData, NumericString } from '@rotki/common';
+import { z } from 'zod';
+import { EvmChainLikeAddress } from '@/modules/history/events/event-payloads';
+import { SocketMessageProgressUpdateSubType } from './base';
+
+export const DataMigrationStatusData = z.object({
+  currentMigration: z.object({
+    currentStep: z.number().nonnegative(),
+    description: z.string().nullable(),
+    totalSteps: z.number().nonnegative(),
+    version: z.number().nonnegative(),
+  }),
+  startVersion: z.number().nonnegative(),
+  targetVersion: z.number().nonnegative(),
+});
+
+export type DataMigrationStatusData = z.infer<typeof DataMigrationStatusData>;
+
+export const DbUpgradeStatusData = z.object({
+  currentUpgrade: z.object({
+    currentStep: z.number().nonnegative(),
+    description: z.string().nullable(),
+    totalSteps: z.number().nonnegative(),
+    toVersion: z.number().nonnegative(),
+  }),
+  startVersion: z.number().nonnegative(),
+  targetVersion: z.number().nonnegative(),
+});
+
+export type DbUpgradeStatusData = z.infer<typeof DbUpgradeStatusData>;
+
+export const MigratedAddresses = z.array(EvmChainLikeAddress);
+
+export type MigratedAddresses = z.infer<typeof MigratedAddresses>;
+
+export const HistoryEventsQueryStatus = {
+  CANCELLED: 'cancelled',
+  QUERYING_EVENTS_FINISHED: 'querying_events_finished',
+  QUERYING_EVENTS_STARTED: 'querying_events_started',
+  QUERYING_EVENTS_STATUS_UPDATE: 'querying_events_status_update',
+} as const;
+
+export type HistoryEventsQueryStatus = (typeof HistoryEventsQueryStatus)[keyof typeof HistoryEventsQueryStatus];
+
+export const HistoryEventsQueryData = z.object({
+  eventType: z.string(),
+  location: z.string(),
+  name: z.string(),
+  period: z.tuple([z.number(), z.number()]).optional(),
+  status: z.enum(HistoryEventsQueryStatus),
+});
+
+export type HistoryEventsQueryData = z.infer<typeof HistoryEventsQueryData>;
+
+/**
+ * Not purely the backend's enum. `TransactionStatusStep` (api/websockets/typedefs.py) sends the
+ * seven querying/decoding steps; `ACCOUNT_CHANGE`, `CANCELLED` and `FAILED` are frontend-assigned
+ * outcomes for states the backend has no message for.
+ */
+export const TransactionsQueryStatus = {
+  ACCOUNT_CHANGE: 'account_change',
+  CANCELLED: 'cancelled',
+  DECODING_TRANSACTIONS_FINISHED: 'decoding_transactions_finished',
+  DECODING_TRANSACTIONS_STARTED: 'decoding_transactions_started',
+  /**
+   * The query failed. Frontend-assigned: a failed query never sends
+   * `QUERYING_TRANSACTIONS_FINISHED`, since the backend only emits that on the success path.
+   */
+  FAILED: 'failed',
+  QUERYING_EVM_TOKENS_TRANSACTIONS: 'querying_evm_tokens_transactions',
+  QUERYING_INTERNAL_TRANSACTIONS: 'querying_internal_transactions',
+  QUERYING_TRANSACTIONS: 'querying_transactions',
+  QUERYING_TRANSACTIONS_FINISHED: 'querying_transactions_finished',
+  QUERYING_TRANSACTIONS_STARTED: 'querying_transactions_started',
+} as const;
+
+export type TransactionsQueryStatus = (typeof TransactionsQueryStatus)[keyof typeof TransactionsQueryStatus];
+
+const EvmTransactionStatusData = z.object({
+  address: z.string(),
+  chain: z.string(),
+  period: z.tuple([z.number(), z.number()]),
+  status: z.enum(TransactionsQueryStatus),
+  subtype: z.literal('evm').or(z.literal('evmlike')),
+});
+
+/**
+ * Batched: one message covers every address of a chain. `period` is optional only because the
+ * backend does not send it yet; downstream is wired for it either way.
+ */
+const BitcoinTransactionStatusData = z.object({
+  addresses: z.array(z.string()),
+  chain: z.string(),
+  period: z.tuple([z.number(), z.number()]).optional(),
+  status: z.enum(TransactionsQueryStatus),
+  subtype: z.literal('bitcoin'),
+});
+
+const SolanaTransactionStatusData = z.object({
+  address: z.string(),
+  chain: z.string(),
+  period: z.tuple([z.number(), z.number()]),
+  status: z.enum(TransactionsQueryStatus),
+  subtype: z.literal('solana'),
+});
+
+export const UnifiedTransactionStatusData = z.union([
+  EvmTransactionStatusData,
+  BitcoinTransactionStatusData,
+  SolanaTransactionStatusData,
+]);
+
+export type UnifiedTransactionStatusData = z.infer<typeof UnifiedTransactionStatusData>;
+
+export const EvmUnDecodedTransactionsData = CommonQueryStatusData.extend({
+  chain: z.string(),
+});
+
+export type EvmUnDecodedTransactionsData = z.infer<typeof EvmUnDecodedTransactionsData>;
+
+const EvmUndecodedTransactionBreakdown = z.object({
+  total: z.number(),
+  undecoded: z.number(),
+});
+
+export const EvmUndecodedTransactionResponse = z.record(z.string(), EvmUndecodedTransactionBreakdown);
+
+export type EvmUndecodedTransactionResponse = z.infer<typeof EvmUndecodedTransactionResponse>;
+
+const EvmUnDecodedTransactionsDataWithSubtype = EvmUnDecodedTransactionsData.extend({
+  subtype: z.literal(SocketMessageProgressUpdateSubType.UNDECODED_TRANSACTIONS),
+});
+
+export const StatsPriceQueryData = CommonQueryStatusData.extend({
+  counterparty: z.string(),
+});
+
+export type StatsPriceQueryData = z.infer<typeof StatsPriceQueryData>;
+
+const LiquityStakingQueryDataWithSubtype = CommonQueryStatusData.extend({
+  subtype: z.literal(SocketMessageProgressUpdateSubType.LIQUITY_STAKING_QUERY),
+});
+
+const StatsPriceQueryDataWithSubtype = StatsPriceQueryData.extend({
+  subtype: z.literal(SocketMessageProgressUpdateSubType.STATS_PRICE_QUERY),
+});
+
+const MultiplePricesQueryStatusWithSubtype = CommonQueryStatusData.extend({
+  subtype: z.literal(SocketMessageProgressUpdateSubType.MULTIPLE_PRICES_QUERY_STATUS),
+});
+
+export const CsvImportResult = z.object({
+  messages: z.array(z.object({
+    isError: z.boolean().default(false),
+    msg: z.string(),
+    rows: z.array(z.number()).optional(),
+  })),
+  processed: z.number(),
+  sourceName: z.string(),
+  total: z.number(),
+});
+
+export type CsvImportResult = z.infer<typeof CsvImportResult>;
+
+const CsvImportResultWithSubtype = CsvImportResult.extend({
+  subtype: z.literal(SocketMessageProgressUpdateSubType.CSV_IMPORT_RESULT),
+});
+
+const HistoricalPriceQueryStatusDataWithSubtype = CommonQueryStatusData.extend({
+  subtype: z.literal(SocketMessageProgressUpdateSubType.HISTORICAL_PRICE_QUERY_STATUS),
+});
+
+export const ProtocolCacheUpdatesData = EvmUnDecodedTransactionsData.extend({
+  protocol: z.string(),
+});
+
+export type ProtocolCacheUpdatesData = z.infer<typeof ProtocolCacheUpdatesData>;
+
+const ProtocolCacheUpdatesDataWithSubtype = ProtocolCacheUpdatesData.extend({
+  subtype: z.literal(SocketMessageProgressUpdateSubType.PROTOCOL_CACHE_UPDATES),
+});
+
+const HistoricalBalanceProcessingData = z.object({
+  processed: z.number(),
+  total: z.number(),
+});
+
+const NegativeBalanceBucket = z.object({
+  asset: z.string(),
+  location: z.string(),
+  locationLabel: z.string().nullable(),
+  protocol: z.string().nullable(),
+});
+
+type NegativeBalanceBucket = z.infer<typeof NegativeBalanceBucket>;
+
+export const NegativeBalanceDetectedData = z.object({
+  asset: z.string(),
+  balanceBefore: NumericString,
+  bucket: NegativeBalanceBucket,
+  eventIdentifier: z.number(),
+  groupIdentifier: z.string(),
+  lastRunTs: z.number().nullable(),
+});
+
+export type NegativeBalanceDetectedData = z.infer<typeof NegativeBalanceDetectedData>;
+
+const HistoricalBalanceProcessingDataWithSubtype = HistoricalBalanceProcessingData.extend({
+  subtype: z.literal(SocketMessageProgressUpdateSubType.HISTORICAL_BALANCE_PROCESSING),
+});
+
+export const ProgressUpdateResultData = z.discriminatedUnion('subtype', [
+  EvmUnDecodedTransactionsDataWithSubtype,
+  ProtocolCacheUpdatesDataWithSubtype,
+  HistoricalPriceQueryStatusDataWithSubtype,
+  HistoricalBalanceProcessingDataWithSubtype,
+  CsvImportResultWithSubtype,
+  LiquityStakingQueryDataWithSubtype,
+  StatsPriceQueryDataWithSubtype,
+  MultiplePricesQueryStatusWithSubtype,
+]);
+
+export type ProgressUpdateResultData = z.infer<typeof ProgressUpdateResultData>;

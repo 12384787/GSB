@@ -1,0 +1,2 @@
+rotki/rotki
+A portfolio tracking, analytics, accounting and management application that protects your privacy

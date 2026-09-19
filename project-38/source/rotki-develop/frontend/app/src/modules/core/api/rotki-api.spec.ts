@@ -1,0 +1,1105 @@
+import { server } from '@test/setup-files/server';
+import { http, HttpResponse } from 'msw';
+import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from 'vitest';
+import { defaultApiUrl } from '@/modules/core/api/api-urls';
+import { RequestTarget } from '@/modules/core/api/constants';
+import { RequestCancelledError } from '@/modules/core/api/request-queue/errors';
+import { RequestQueue } from '@/modules/core/api/request-queue/queue';
+import { RequestPriority } from '@/modules/core/api/request-queue/request-priority';
+import { RotkiApi } from '@/modules/core/api/rotki-api';
+import { ApiValidationError } from '@/modules/core/api/types/errors';
+import { HTTPStatus } from '@/modules/core/api/types/http';
+
+const backendUrl = process.env.VITE_BACKEND_URL;
+
+describe('modules/api/rotki-api', () => {
+  let api: RotkiApi;
+  const originalLocation = window.location;
+
+  beforeEach(() => {
+    api = new RotkiApi();
+    vi.clearAllMocks();
+
+    /* A plain object, so the redirect assertions can read back what the code assigned to `href`.
+       It has to start as a valid absolute URL: happy-dom resolves every Request against
+       `window.location.href`, and an empty base makes the URL constructor throw. */
+    Object.defineProperty(window, 'location', {
+      value: { href: 'http://localhost:3000/', origin: 'http://localhost:3000' },
+      writable: true,
+    });
+  });
+
+  afterEach(() => {
+    Object.defineProperty(window, 'location', {
+      value: originalLocation,
+      writable: true,
+    });
+  });
+
+  describe('constructor and setup', () => {
+    it('should initialize with default API URLs', () => {
+      expect(api.serverUrl).toBe(defaultApiUrl);
+      expect(api.baseURL).toBe(`${defaultApiUrl}/api/1/`);
+      expect(api.colibriBaseURL).toBe(`${defaultApiUrl}/colibri`);
+    });
+
+    it('should return true for defaultBackend when using default URL', () => {
+      expect(api.defaultBackend).toBe(true);
+    });
+
+    it('should configure custom server URL via setup', () => {
+      const customUrl = 'http://custom-server:8080';
+      api.setup(customUrl);
+
+      expect(api.serverUrl).toBe(customUrl);
+      expect(api.baseURL).toBe(`${customUrl}/api/1/`);
+      // Colibri follows the custom backend instead of staying on the previous one.
+      expect(api.colibriBaseURL).toBe(`${customUrl}/colibri`);
+      expect(api.defaultBackend).toBe(false);
+    });
+  });
+
+  describe('colibri request routing', () => {
+    it('should address colibri under the origin setup was last given, which arrives after construction, and queue it separately', async () => {
+      api.setup('http://127.0.0.1:4141');
+
+      server.use(
+        http.get('http://127.0.0.1:4141/colibri/all', () =>
+          HttpResponse.json({ result: [], message: '' })),
+      );
+
+      await api.get('/all', { target: RequestTarget.COLIBRI });
+
+      // The request landed on the colibri queue, not the core one.
+      expect(api.getColibriQueueMetrics().requestsThisSecond).toBe(1);
+      expect(api.getQueueMetrics().requestsThisSecond).toBe(0);
+    });
+  });
+
+  describe('buildUrl', () => {
+    it('should build a URL without query parameters', () => {
+      const url = api.buildUrl('assets');
+      expect(url).toBe(`${api.baseURL}assets`);
+    });
+
+    it('should build a URL with query parameters', () => {
+      const url = api.buildUrl('assets', { limit: 10, offset: 0 });
+      expect(url).toContain('limit=10');
+      expect(url).toContain('offset=0');
+    });
+
+    it('should transform query keys to snake_case', () => {
+      const url = api.buildUrl('assets', { assetType: 'crypto' });
+      expect(url).toContain('asset_type=crypto');
+    });
+
+    it('should skip null and undefined query values', () => {
+      const url = api.buildUrl('assets', { limit: 10, filter: null, search: undefined });
+      expect(url).toContain('limit=10');
+      expect(url).not.toContain('filter');
+      expect(url).not.toContain('search');
+    });
+
+    it('should handle relative base URL by using window.location.origin', () => {
+      const relativeApi = new RotkiApi();
+      // Simulate a relative base URL (e.g., when VITE_PUBLIC_PATH is set)
+      relativeApi.setup('/rotki');
+
+      const url = relativeApi.buildUrl('avatars/ens/vitalik.eth');
+      expect(url).toBe('http://localhost:3000/rotki/api/1/avatars/ens/vitalik.eth');
+    });
+  });
+
+  describe('fetch - success cases', () => {
+    it('should make a successful GET request and unwraps ActionResult', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json({
+            result: { id: 1, name: 'Test' },
+            message: '',
+          })),
+      );
+
+      const result = await api.get<{ id: number; name: string }>('test');
+
+      expect(result).toEqual({ id: 1, name: 'Test' });
+    });
+
+    it('should make a successful POST request with body transformation', async () => {
+      let capturedBody: unknown;
+
+      server.use(
+        http.post(`${backendUrl}/api/1/test`, async ({ request }) => {
+          capturedBody = await request.json();
+          return HttpResponse.json({
+            result: { success: true },
+            message: '',
+          });
+        }),
+      );
+
+      await api.post('test', { userName: 'test', userAge: 25 });
+
+      expect(capturedBody).toEqual({ user_name: 'test', user_age: 25 });
+    });
+
+    it('should make a successful PUT request', async () => {
+      server.use(
+        http.put(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json({
+            result: { updated: true },
+            message: '',
+          })),
+      );
+
+      const result = await api.put<{ updated: boolean }>('test', { id: 1 });
+
+      expect(result).toEqual({ updated: true });
+    });
+
+    it('should make a successful PATCH request', async () => {
+      server.use(
+        http.patch(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json({
+            result: { patched: true },
+            message: '',
+          })),
+      );
+
+      const result = await api.patch<{ patched: boolean }>('test', { field: 'value' });
+
+      expect(result).toEqual({ patched: true });
+    });
+
+    it('should make a successful DELETE request', async () => {
+      server.use(
+        http.delete(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json({
+            result: true,
+            message: '',
+          })),
+      );
+
+      const result = await api.delete<boolean>('test');
+
+      expect(result).toBe(true);
+    });
+
+    it('should handle falsy result value 0 correctly', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json({
+            result: 0,
+            message: '',
+          })),
+      );
+
+      const result = await api.get<number>('test');
+      expect(result).toBe(0);
+    });
+
+    it('should handle falsy result value false correctly (no message)', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json({
+            result: false,
+            message: '',
+          })),
+      );
+
+      const result = await api.get<boolean>('test');
+      expect(result).toBe(false);
+    });
+
+    it('should handle falsy result value empty string correctly (no message)', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json({
+            result: '',
+            message: '',
+          })),
+      );
+
+      const result = await api.get<string>('test');
+      expect(result).toBe('');
+    });
+  });
+
+  describe('fetch - transformation options', () => {
+    it('should skip camelCase transformation when skipCamelCase is true', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json({
+            result: { user_name: 'test', created_at: '2024-01-01' },
+            message: '',
+          })),
+      );
+
+      const result = await api.get<{ user_name: string; created_at: string }>('test', { skipCamelCase: true });
+
+      expect(result).toEqual({ user_name: 'test', created_at: '2024-01-01' });
+    });
+
+    it('should use noRootCamelCase transformer when skipRootCamelCase is true', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json({
+            result: { _custom_key_: { nested_value: 1 } },
+            message: '',
+          })),
+      );
+
+      const result = await api.get<{ _custom_key_: { nestedValue: number } }>('test', { skipRootCamelCase: true });
+
+      expect(result).toEqual({ _custom_key_: { nestedValue: 1 } });
+    });
+
+    it('should skip snake_case transformation when skipSnakeCase is true', async () => {
+      let capturedBody: unknown;
+
+      server.use(
+        http.post(`${backendUrl}/api/1/test`, async ({ request }) => {
+          capturedBody = await request.json();
+          return HttpResponse.json({
+            result: { success: true },
+            message: '',
+          });
+        }),
+      );
+
+      await api.post('test', { userName: 'test' }, { skipSnakeCase: true });
+
+      expect(capturedBody).toEqual({ userName: 'test' });
+    });
+
+    it('should not transform FormData body', async () => {
+      let capturedContentType: string | null = null;
+
+      server.use(
+        http.post(`${backendUrl}/api/1/upload`, async ({ request }) => {
+          capturedContentType = request.headers.get('content-type');
+          return HttpResponse.json({
+            result: { uploaded: true },
+            message: '',
+          });
+        }),
+      );
+
+      const formData = new FormData();
+      formData.append('file', new Blob(['content']), 'test.txt');
+
+      await api.post('upload', formData);
+
+      expect(capturedContentType).toContain('multipart/form-data');
+    });
+  });
+
+  describe('fetch - skipResultUnwrap option', () => {
+    it('should return raw response when skipResultUnwrap is true', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json({
+            result: { data: 'test' },
+            message: '',
+            customField: 'extra',
+          })),
+      );
+
+      const result = await api.get<{ result: { data: string }; message: string; customField: string }>('test', { skipResultUnwrap: true });
+
+      expect(result).toEqual({
+        result: { data: 'test' },
+        message: '',
+        customField: 'extra',
+      });
+    });
+  });
+
+  describe('fetch - defaultValue option', () => {
+    it('should return defaultValue when result is null', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json({
+            result: null,
+            message: 'No data found',
+          })),
+      );
+
+      const result = await api.get<string[]>('test', { defaultValue: [] });
+
+      expect(result).toEqual([]);
+    });
+
+    it('should return defaultValue when result is undefined', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json({
+            result: undefined,
+            message: 'Not found',
+          })),
+      );
+
+      const result = await api.get<number>('test', { defaultValue: 0 });
+
+      expect(result).toBe(0);
+    });
+
+    it('should throw error when result is null and no defaultValue provided', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json({
+            result: null,
+            message: 'Error message',
+          })),
+      );
+
+      await expect(api.get('test')).rejects.toThrow('Error message');
+    });
+  });
+
+  describe('fetch - treat409AsSuccess option', () => {
+    it('should return true when status is 409 and treat409AsSuccess is enabled', async () => {
+      server.use(
+        http.post(`${backendUrl}/api/1/logout`, () =>
+          HttpResponse.json(
+            {
+              result: null,
+              message: 'Already logged out',
+            },
+            { status: HTTPStatus.CONFLICT },
+          )),
+      );
+
+      const result = await api.post<boolean>('logout', null, { treat409AsSuccess: true });
+
+      expect(result).toBe(true);
+    });
+
+    it('should not treat 409 as success when option is not set', async () => {
+      server.use(
+        http.post(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json(
+            {
+              result: null,
+              message: 'Conflict error',
+            },
+            { status: HTTPStatus.CONFLICT },
+          )),
+      );
+
+      await expect(api.post('test', null)).rejects.toThrow('Conflict error');
+    });
+  });
+
+  describe('fetch - filterEmptyProperties option', () => {
+    it('should filter empty properties from body when filterEmptyProperties is true', async () => {
+      let capturedBody: unknown;
+
+      server.use(
+        http.post(`${backendUrl}/api/1/test`, async ({ request }) => {
+          capturedBody = await request.json();
+          return HttpResponse.json({
+            result: { success: true },
+            message: '',
+          });
+        }),
+      );
+
+      await api.post('test', {
+        name: 'test',
+        empty: null,
+        arr: [],
+        valid: 'value',
+      }, { filterEmptyProperties: true });
+
+      expect(capturedBody).toEqual({ name: 'test', valid: 'value' });
+    });
+
+    it('should filter empty properties from query when filterEmptyProperties is true', async () => {
+      let capturedUrl: string = '';
+
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, ({ request }) => {
+          capturedUrl = request.url;
+          return HttpResponse.json({
+            result: { success: true },
+            message: '',
+          });
+        }),
+      );
+
+      await api.get('test', {
+        query: { search: 'query', empty: null, list: [] },
+        filterEmptyProperties: true,
+      });
+
+      expect(capturedUrl).toContain('search=query');
+      expect(capturedUrl).not.toContain('empty');
+      expect(capturedUrl).not.toContain('list');
+    });
+
+    it('should respect alwaysPickKeys option', async () => {
+      let capturedBody: unknown;
+
+      server.use(
+        http.post(`${backendUrl}/api/1/test`, async ({ request }) => {
+          capturedBody = await request.json();
+          return HttpResponse.json({
+            result: { success: true },
+            message: '',
+          });
+        }),
+      );
+
+      await api.post('test', {
+        name: 'test',
+        forceInclude: null,
+      }, {
+        filterEmptyProperties: { alwaysPickKeys: ['forceInclude'] },
+      });
+
+      expect(capturedBody).toEqual({ name: 'test', force_include: null });
+    });
+  });
+
+  describe('fetch - error handling', () => {
+    it('should handle 401 unauthorized by calling auth failure action and redirecting', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json(
+            {
+              result: null,
+              message: 'Unauthorized',
+            },
+            { status: HTTPStatus.UNAUTHORIZED },
+          )),
+      );
+
+      const authFailureAction = vi.fn();
+      api.setOnAuthFailure(authFailureAction);
+
+      // 401 still throws an error after handling auth failure
+      await expect(api.get('test')).rejects.toThrow();
+
+      expect(authFailureAction).toHaveBeenCalled();
+      expect(window.location.href).toBe('/#/');
+    });
+
+    it('should not call the auth failure handler on 401 when skipAuthHandler is set', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json(
+            {
+              result: null,
+              message: 'Unauthorized',
+            },
+            { status: HTTPStatus.UNAUTHORIZED },
+          )),
+      );
+
+      const authFailureAction = vi.fn();
+      api.setOnAuthFailure(authFailureAction);
+
+      await expect(api.get('test', { skipAuthHandler: true })).rejects.toThrow();
+
+      expect(authFailureAction).not.toHaveBeenCalled();
+    });
+
+    it('should throw ApiValidationError for 400 status with message', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json(
+            {
+              result: null,
+              message: '{"field": ["Invalid value"]}',
+            },
+            { status: HTTPStatus.BAD_REQUEST },
+          )),
+      );
+
+      await expect(api.get('test')).rejects.toThrow(ApiValidationError);
+    });
+
+    it('should throw error for status codes not in validateStatus', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json(
+            { message: 'Internal error' },
+            { status: HTTPStatus.INTERNAL_SERVER_ERROR },
+          )),
+      );
+
+      await expect(api.get('test')).rejects.toThrow();
+    });
+
+    it('should throw Error for conflict status with message', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json(
+            {
+              result: null,
+              message: 'Resource conflict',
+            },
+            { status: HTTPStatus.CONFLICT },
+          )),
+      );
+
+      await expect(api.get('test')).rejects.toThrow('Resource conflict');
+    });
+
+    it('should use custom validStatuses array', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json(
+            {
+              result: { data: 'test' },
+              message: '',
+            },
+            { status: HTTPStatus.CREATED },
+          )),
+      );
+
+      const result = await api.get<{ data: string }>('test', {
+        validStatuses: [HTTPStatus.CREATED],
+      });
+
+      expect(result).toEqual({ data: 'test' });
+    });
+
+    it('should throw error when status is not in validStatuses', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json(
+            { message: 'Not acceptable' },
+            { status: HTTPStatus.OK },
+          )),
+      );
+
+      await expect(
+        api.get('test', { validStatuses: [HTTPStatus.CREATED] }),
+      ).rejects.toThrow();
+    });
+  });
+
+  describe('fetch - query transformation', () => {
+    it('should transform query keys to snake_case', async () => {
+      let capturedUrl: string = '';
+
+      server.use(
+        http.get(`${backendUrl}/api/1/assets`, ({ request }) => {
+          capturedUrl = request.url;
+          return HttpResponse.json({
+            result: [],
+            message: '',
+          });
+        }),
+      );
+
+      await api.get('assets', { query: { assetType: 'crypto', pageSize: 10 } });
+
+      expect(capturedUrl).toContain('asset_type=crypto');
+      expect(capturedUrl).toContain('page_size=10');
+    });
+
+    it('should join array query values with commas (not URL-encoded)', async () => {
+      let capturedUrl: string = '';
+
+      server.use(
+        http.get(`${backendUrl}/api/1/assets`, ({ request }) => {
+          capturedUrl = request.url;
+          return HttpResponse.json({
+            result: [],
+            message: '',
+          });
+        }),
+      );
+
+      await api.get('assets', { query: { tags: ['tag1', 'tag2', 'tag3'] } });
+
+      expect(capturedUrl).toContain('tags=tag1,tag2,tag3');
+    });
+  });
+
+  describe('headStatus', () => {
+    it('should return status code for HEAD request', async () => {
+      server.use(
+        http.head(`${backendUrl}/api/1/resource`, () =>
+          new HttpResponse(null, { status: HTTPStatus.OK })),
+      );
+
+      const status = await api.headStatus('resource');
+
+      expect(status).toBe(HTTPStatus.OK);
+    });
+
+    it('should transform query parameters for HEAD request', async () => {
+      let capturedUrl: string = '';
+
+      server.use(
+        http.head(`${backendUrl}/api/1/resource`, ({ request }) => {
+          capturedUrl = request.url;
+          return new HttpResponse(null, { status: HTTPStatus.OK });
+        }),
+      );
+
+      await api.headStatus('resource', { query: { resourceId: 123 } });
+
+      expect(capturedUrl).toContain('resource_id=123');
+    });
+
+    it('should handle 401 unauthorized in HEAD request by calling auth failure and throwing', async () => {
+      server.use(
+        http.head(`${backendUrl}/api/1/resource`, () =>
+          new HttpResponse(null, { status: HTTPStatus.UNAUTHORIZED })),
+      );
+
+      const authFailureAction = vi.fn();
+      api.setOnAuthFailure(authFailureAction);
+
+      // 401 triggers auth failure handling AND throws error (status not in valid list)
+      await expect(api.headStatus('resource')).rejects.toThrow();
+
+      expect(authFailureAction).toHaveBeenCalled();
+      expect(window.location.href).toBe('/#/');
+    });
+
+    it('should throw error for invalid status in HEAD request', async () => {
+      server.use(
+        http.head(`${backendUrl}/api/1/resource`, () =>
+          new HttpResponse(null, { status: HTTPStatus.INTERNAL_SERVER_ERROR })),
+      );
+
+      await expect(api.headStatus('resource')).rejects.toThrow();
+    });
+  });
+
+  describe('fetchBlob', () => {
+    it('should return blob for successful request', async () => {
+      const blobContent = 'test file content';
+
+      server.use(
+        http.get(`${backendUrl}/api/1/download`, () =>
+          new HttpResponse(blobContent, {
+            status: HTTPStatus.OK,
+            headers: {
+              'Content-Type': 'application/octet-stream',
+            },
+          })),
+      );
+
+      const result = await api.fetchBlob('download');
+
+      expect(result).toBeInstanceOf(Blob);
+      const text = await result.text();
+      expect(text).toBe(blobContent);
+    });
+
+    it('should parse JSON error from blob response', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/download`, () =>
+          HttpResponse.json(
+            { result: null, message: 'Download failed' },
+            {
+              status: HTTPStatus.OK,
+              headers: {
+                'Content-Type': 'application/json',
+              },
+            },
+          )),
+      );
+
+      await expect(api.fetchBlob('download')).rejects.toThrow('Download failed');
+    });
+
+    it('should throw TypeError for invalid JSON in error blob', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/download`, () =>
+          new HttpResponse('not json', {
+            status: HTTPStatus.OK,
+            headers: {
+              'Content-Type': 'application/json',
+            },
+          })),
+      );
+
+      await expect(api.fetchBlob('download')).rejects.toThrow(TypeError);
+    });
+
+    it('should handle 401 unauthorized in blob request by calling auth failure and throwing', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/download`, () =>
+          new HttpResponse('test', {
+            status: HTTPStatus.UNAUTHORIZED,
+            headers: {
+              'Content-Type': 'application/octet-stream',
+            },
+          })),
+      );
+
+      const authFailureAction = vi.fn();
+      api.setOnAuthFailure(authFailureAction);
+
+      // 401 triggers auth failure handling AND throws error (status not in valid list)
+      await expect(api.fetchBlob('download')).rejects.toThrow();
+
+      expect(authFailureAction).toHaveBeenCalled();
+      expect(window.location.href).toBe('/#/');
+    });
+
+    it('should throw a generic error for a non-json error response', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/download`, () =>
+          new HttpResponse('boom', {
+            status: HTTPStatus.INTERNAL_SERVER_ERROR,
+            headers: {
+              'Content-Type': 'application/octet-stream',
+            },
+          })),
+      );
+
+      await expect(api.fetchBlob('download')).rejects.toThrow('Request failed with status 500');
+    });
+
+    it('should transform body in blob request', async () => {
+      let capturedBody: unknown;
+
+      server.use(
+        http.post(`${backendUrl}/api/1/download`, async ({ request }) => {
+          capturedBody = await request.json();
+          return new HttpResponse('file content', {
+            status: HTTPStatus.OK,
+            headers: {
+              'Content-Type': 'application/octet-stream',
+            },
+          });
+        }),
+      );
+
+      await api.fetchBlob('download', {
+        method: 'POST',
+        body: { exportFormat: 'csv' },
+      });
+
+      expect(capturedBody).toEqual({ export_format: 'csv' });
+    });
+  });
+
+  describe('cancel', () => {
+    it('should allow new requests after cancel', async () => {
+      api.cancel();
+
+      server.use(
+        http.get(`${backendUrl}/api/1/new-request`, () =>
+          HttpResponse.json({
+            result: { success: true },
+            message: '',
+          })),
+      );
+
+      const result = await api.get<{ success: boolean }>('new-request');
+
+      expect(result).toEqual({ success: true });
+    });
+  });
+
+  describe('response transformation - camelCase', () => {
+    it('should transform snake_case response keys to camelCase', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/user`, () =>
+          HttpResponse.json({
+            result: {
+              user_id: 1,
+              first_name: 'John',
+              last_name: 'Doe',
+              created_at: '2024-01-01',
+              meta_data: {
+                last_login: '2024-01-15',
+                login_count: 5,
+              },
+            },
+            message: '',
+          })),
+      );
+
+      const result = await api.get<{
+        userId: number;
+        firstName: string;
+        lastName: string;
+        createdAt: string;
+        metaData: {
+          lastLogin: string;
+          loginCount: number;
+        };
+      }>('user');
+
+      expect(result).toEqual({
+        userId: 1,
+        firstName: 'John',
+        lastName: 'Doe',
+        createdAt: '2024-01-01',
+        metaData: {
+          lastLogin: '2024-01-15',
+          loginCount: 5,
+        },
+      });
+    });
+
+    it('should transform nested arrays correctly', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/items`, () =>
+          HttpResponse.json({
+            result: [
+              { item_id: 1, item_name: 'First' },
+              { item_id: 2, item_name: 'Second' },
+            ],
+            message: '',
+          })),
+      );
+
+      const result = await api.get<Array<{ itemId: number; itemName: string }>>('items');
+
+      expect(result).toEqual([
+        { itemId: 1, itemName: 'First' },
+        { itemId: 2, itemName: 'Second' },
+      ]);
+    });
+  });
+
+  describe('error response with falsy result and message', () => {
+    it('should throw error when result is false with a message', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json({
+            result: false,
+            message: 'Operation failed',
+          })),
+      );
+
+      await expect(api.get('test')).rejects.toThrow('Operation failed');
+    });
+
+    it('should throw error when result is empty string with a message', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json({
+            result: '',
+            message: 'Empty result error',
+          })),
+      );
+
+      await expect(api.get('test')).rejects.toThrow('Empty result error');
+    });
+  });
+
+  describe('fetch - retry option', () => {
+    it('should not retry by default', async () => {
+      let callCount = 0;
+
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () => {
+          callCount++;
+          return HttpResponse.json({
+            result: { success: true },
+            message: '',
+          });
+        }),
+      );
+
+      await api.get('test');
+
+      expect(callCount).toBe(1);
+    });
+
+    it('should accept retry option with boolean true', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json({
+            result: { success: true },
+            message: '',
+          })),
+      );
+
+      const result = await api.get<{ success: boolean }>('test', { retry: true });
+
+      expect(result).toEqual({ success: true });
+    });
+
+    it('should accept retry option with custom configuration', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () =>
+          HttpResponse.json({
+            result: { success: true },
+            message: '',
+          })),
+      );
+
+      const result = await api.get<{ success: boolean }>('test', {
+        retry: { maxRetries: 3, retryDelay: 1000 },
+      });
+
+      expect(result).toEqual({ success: true });
+    });
+
+    it('should throw error when request fails without retry', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () => HttpResponse.error()),
+      );
+
+      await expect(api.get('test')).rejects.toThrow();
+    });
+  });
+
+  describe('stopRequests', () => {
+    beforeEach(() => {
+      server.use(
+        http.get(`${backendUrl}/api/1/test`, () => HttpResponse.json({ result: { ok: true }, message: '' })),
+        http.head(`${backendUrl}/api/1/test`, () => new HttpResponse(null, { status: HTTPStatus.OK })),
+      );
+    });
+
+    it('should reject a queued fetch once stopped', async () => {
+      api.stopRequests();
+
+      await expect(api.get('test')).rejects.toThrow(RequestCancelledError);
+    });
+
+    it('should reject a skipQueue fetch once stopped', async () => {
+      api.stopRequests();
+
+      await expect(api.fetch('test', { skipQueue: true })).rejects.toThrow(RequestCancelledError);
+    });
+
+    it('should reject headStatus once stopped', async () => {
+      api.stopRequests();
+
+      await expect(api.headStatus('test')).rejects.toThrow(RequestCancelledError);
+    });
+
+    it('should reject fetchBlob once stopped', async () => {
+      api.stopRequests();
+
+      await expect(api.fetchBlob('test')).rejects.toThrow(RequestCancelledError);
+    });
+
+    it('should accept requests again after setup, so a backend restart recovers', async () => {
+      api.stopRequests();
+      await expect(api.get('test')).rejects.toThrow(RequestCancelledError);
+
+      api.setup(defaultApiUrl);
+
+      await expect(api.get('test')).resolves.toEqual({ ok: true });
+    });
+  });
+
+  describe('cancellation reaches the connection', () => {
+    /**
+     * The queue attached a per-request abort signal that `fetchDirect` then overwrote with the
+     * api-wide one, so cancelling rejected the caller's promise while the request carried on. The
+     * queue freed its slot at the same moment, so it could dispatch a replacement and hold more
+     * connections than the browser allows per host.
+     */
+    it('should abort the in-flight request, not just reject the caller', async () => {
+      let handlerSignal: AbortSignal | undefined;
+      let release = (): void => {};
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+
+      server.use(
+        http.get(`${backendUrl}/api/1/slow`, async ({ request }) => {
+          handlerSignal = request.signal;
+          await held;
+          return HttpResponse.json({ message: '', result: true });
+        }),
+      );
+
+      const pending = api.get('slow', { tags: ['cancel-me'] });
+      const settled = expect(pending).rejects.toThrow(RequestCancelledError);
+
+      await vi.waitFor(() => {
+        expect(handlerSignal).toBeDefined();
+      });
+
+      api.cancelByTag('cancel-me');
+
+      await settled;
+      await vi.waitFor(() => {
+        expect(handlerSignal?.aborted).toBe(true);
+      });
+
+      release();
+    });
+
+    it('should abort a request that outlives its timeout', async () => {
+      let handlerSignal: AbortSignal | undefined;
+      let release = (): void => {};
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+
+      server.use(
+        http.get(`${backendUrl}/api/1/slow`, async ({ request }) => {
+          handlerSignal = request.signal;
+          await held;
+          return HttpResponse.json({ message: '', result: true });
+        }),
+      );
+
+      await expect(api.get('slow', { timeout: 50 })).rejects.toThrow();
+
+      await vi.waitFor(() => {
+        expect(handlerSignal?.aborted).toBe(true);
+      });
+
+      release();
+    });
+  });
+
+  describe('default request priority', () => {
+    /**
+     * Derived centrally rather than tagged at ~295 call sites: a rule nobody has to remember is the
+     * only one that holds. The queue's background cap keys off priority, so a request that lands in
+     * the wrong band silently loses its protection.
+     */
+    let enqueue: MockInstance<RequestQueue['enqueue']>;
+
+    beforeEach(() => {
+      enqueue = vi.spyOn(RequestQueue.prototype, 'enqueue').mockResolvedValue(undefined);
+    });
+
+    afterEach(() => {
+      enqueue.mockRestore();
+    });
+
+    it.each([
+      ['put', RequestPriority.CRITICAL],
+      ['patch', RequestPriority.CRITICAL],
+      ['delete', RequestPriority.CRITICAL],
+    ] as const)('should treat %s as a user action', async (method, expected) => {
+      await api[method]('/test');
+
+      expect(enqueue).toHaveBeenCalledWith('/test', expect.objectContaining({ priority: expected }));
+    });
+
+    it.each([
+      ['get'],
+      ['post'],
+    ] as const)('should treat %s as a normal read', async (method) => {
+      await api[method]('/test');
+
+      expect(enqueue).toHaveBeenCalledWith(
+        '/test',
+        expect.objectContaining({ priority: RequestPriority.NORMAL }),
+      );
+    });
+
+    it('should let an explicit priority win', async () => {
+      await api.delete('/test', { priority: RequestPriority.BACKGROUND });
+
+      expect(enqueue).toHaveBeenCalledWith(
+        '/test',
+        expect.objectContaining({ priority: RequestPriority.BACKGROUND }),
+      );
+    });
+  });
+});

@@ -1,0 +1,5 @@
+任务类型：Bug 修复
+任务难度：困难
+语言/框架：TypeScript
+
+请在已有的 strapi/strapi 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：🚀 Strapi is the leading open-source headless CMS. It’s 100% JavaScript/TypeScript, fully customizable, and developer-first.。围绕真实入口（.ai,.coderabbit.yaml .commitlintrc.ts,.cursor .editorconfig,.gitattributes .github,.gitignore .husky,.npmrc .nvmrc,.nxignore .prettierignore,.prettierrc.js .syncpackrc.json,.well-known .yarn,.yarnrc.yml AGENTS.md,CLAUDE.md CODE_OF_CONDUCT.md,CONTRIBUTING.md LICENSE,README.md SECURITY.md,codecov.yml docker-compose.dev.yml,docker-compose.test.yml docs,examples fileTransformer.js,jest-preset.front.js jest-preset.unit.js,jest.config.api.js jest.config.cli.js,jsconfig.json lerna.json,lint-staged.config.mjs lint-staged.shared.mjs,nx.json package.json,packages playwright.base.config.js,public rollup.）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。

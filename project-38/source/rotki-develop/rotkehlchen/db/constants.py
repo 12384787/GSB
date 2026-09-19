@@ -1,0 +1,116 @@
+from enum import Enum
+from typing import Final, Literal
+
+from rotkehlchen.errors.serialization import DeserializationError
+from rotkehlchen.utils.mixins.enums import DBIntEnumMixIn
+
+KDF_ITER: Final = 64000
+
+BINANCE_HISTORY_START_TS_KEY: Final = 'binance_history_start_ts'
+BINANCE_MARKETS_KEY: Final = 'binance_selected_trade_pairs'
+GATE_LOCATION_KEY: Final = 'gate_location'
+KRAKEN_ACCOUNT_TYPE_KEY: Final = 'kraken_account_type'
+KRAKEN_FUTURES_API_KEY_KEY: Final = 'kraken_futures_api_key'
+KRAKEN_FUTURES_API_SECRET_KEY: Final = 'kraken_futures_api_secret'
+OKX_LOCATION_KEY: Final = 'okx_location'
+USER_CREDENTIAL_MAPPING_KEYS: Final = (BINANCE_HISTORY_START_TS_KEY, BINANCE_MARKETS_KEY, GATE_LOCATION_KEY, KRAKEN_ACCOUNT_TYPE_KEY, KRAKEN_FUTURES_API_KEY_KEY, KRAKEN_FUTURES_API_SECRET_KEY, OKX_LOCATION_KEY)  # noqa: E501
+
+
+# -- EVM transactions attributes values -- used in evm_tx_mappings
+TX_DECODED: Final = 0
+TX_SPAM: Final = 1
+# Marks that full parent-hash internal transactions were queried and persisted for this tx.
+TX_INTERNALS_QUERIED: Final = 2
+
+
+class InternalTxSource(DBIntEnumMixIn):
+    """The indexer that produced an evm_internal_transactions row.
+
+    Persisted as int in the `source` column so indexer discrepancies are traceable.
+    LEGACY (0) is used for rows that predate source tracking and for any manual/test
+    insertion path where the indexer is unknown. Member names intentionally match the
+    indexer display names returned by the node inquirer so they can be deserialized
+    from those names directly.
+    """
+    LEGACY = 0
+    ETHERSCAN = 1
+    BLOCKSCOUT = 2
+    ROUTESCAN = 3
+
+
+# -- history_events_mappings values --
+HISTORY_MAPPING_KEY_STATE: Final = 'state'
+
+
+class HistoryMappingState(DBIntEnumMixIn):
+    CUSTOMIZED = 1
+    PROFIT_ADJUSTMENT = 2  # events auto-created during historical balances processing when withdrawals exceed deposits  # noqa: E501
+    MATCHED = 3  # events matched with asset movements and adjustments created during matching.
+    IMPORTED_FROM_CSV = 4
+    SYNTHETIC = 5  # events manufactured by rotki from other events' data, e.g. exchange adjustments or the counterpart leg of a bridge whose chain can no longer be queried  # noqa: E501
+
+
+class HistoryEventLinkType(DBIntEnumMixIn):
+    ASSET_MOVEMENT_MATCH = 1
+    BRIDGE_MATCH = 2  # links the source chain bridge deposit (left) to the destination chain bridge withdrawal (right)  # noqa: E501
+
+
+EVM_ACCOUNTS_DETAILS_LAST_QUERIED_TS: Final = 'last_queried_timestamp'
+EVM_ACCOUNTS_DETAILS_TOKENS: Final = 'tokens'
+
+# sqlite treats NULLs as different values in UNIQUE checks.
+# we use "NONE" instead of NULL so that only one "no value" row can exist.
+NO_ACCOUNTING_COUNTERPARTY: Final = 'NONE'
+LINKABLE_ACCOUNTING_SETTINGS_NAME = Literal[
+    'include_gas_costs',
+    'include_crypto2crypto',
+]
+LINKABLE_ACCOUNTING_PROPERTIES = Literal[
+    'taxable',
+    'count_entire_amount_spend',
+    'count_cost_basis_pnl',
+]
+
+# Chunk size to use when specifying large numbers of sql variables in a single sql statement.
+# The absolute max would be 32766 - see https://www.sqlite.org/limits.html#max_variable_number
+SQL_VARIABLE_CHUNK_SIZE: Final = 10000
+
+
+class UpdateType(Enum):
+    SPAM_ASSETS = 'spam_assets'
+    RPC_NODES = 'rpc_nodes'
+    CONTRACTS = 'contracts'
+    GLOBAL_ADDRESSBOOK = 'global_addressbook'
+    ACCOUNTING_RULES = 'accounting_rules'
+    LOCATION_ASSET_MAPPINGS = 'location_asset_mappings'
+    COUNTERPARTY_ASSET_MAPPINGS = 'counterparty_asset_mappings'
+
+    def serialize(self) -> str:
+        """Serializes the update type for the DB and API"""
+        return f'{self.value}_version'
+
+    @classmethod
+    def deserialize(cls: type[UpdateType], value: str) -> UpdateType:
+        """Deserialize string from api/DB to UpdateType
+        May raise:
+        - Deserialization error if value is not a valid UpdateType
+        """
+        try:
+            return cls(value[:-8])  # length of the _version suffix
+        except ValueError as e:
+            raise DeserializationError(f'Failed to deserialize UpdateTypevalue {value}') from e
+
+
+# Giving a name for history_events.identifier since without it in the free version case https://github.com/rotki/rotki/issues/7362 we were hitting a no such column: history_events.identifier  # noqa: E501
+HISTORY_BASE_ENTRY_FIELDS: Final = 'entry_type, history_events.identifier AS history_events_identifier, group_identifier, sequence_index, timestamp, location, location_label, asset, amount, notes, type, subtype, extra_data, ignored '  # noqa: E501
+HISTORY_BASE_ENTRY_LENGTH: Final = 13
+
+CHAIN_EVENT_FIELDS: Final = 'tx_ref, counterparty, address'
+CHAIN_EVENT_NULL_FIELDS: Final = 'NULL as tx_ref, NULL as counterparty, NULL as address'
+CHAIN_FIELD_LENGTH: Final = 3
+
+ETH_STAKING_EVENT_FIELDS: Final = 'validator_index, is_exit_or_blocknumber'
+ETH_STAKING_EVENT_NULL_FIELDS: Final = 'NULL as validator_index, NULL as is_exit_or_blocknumber'
+ETH_STAKING_FIELD_LENGTH: Final = 2
+
+EXTRAINTERNALTXPREFIX: Final = 'extrainternaltx'

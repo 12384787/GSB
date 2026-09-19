@@ -1,0 +1,5 @@
+任务类型：Bug 修复
+任务难度：困难
+语言/框架：Rust
+
+请在已有的 nautechsystems/nautilus_trader 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：Production-grade Rust-native trading engine with deterministic event-driven architecture。围绕真实入口（.cargo,.codespellrc .config,.docker .dockerignore,.env.example .gitattributes,.github .gitignore,.gitleaks.toml .lycheeignore,.markdownlint.jsonc .nautilus-engineering.lock,.nautilus-engineering .pre-commit-config.yaml,.pre-commit-hooks .supply-chain,.taplo.toml .typos.toml,.yamlfmt .yamllint.yaml,ADAPTERS.md AGENTS.md,AI_POLICY.md BENCHMARKING.md,CLA.md CLAUDE.md,CODE_OF_CONDUCT.md CONTRIBUTING.md,Cargo.lock Cargo.toml,LICENSE MIGRATION_V2.md,Makefile README.md,RELEASES.md ROADMAP.md,SECURITY.md TRADEMARK.md,assets clippy.toml,crates deny.toml,docs examples,hawk.toml osv-scanner.toml,patches ）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。

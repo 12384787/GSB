@@ -1,0 +1,570 @@
+name: Rotki CI
+
+on:
+  pull_request:
+    branches:
+      - master
+      - develop
+      - bugfixes
+      - feature/**
+  push:
+    branches:
+      - master
+      - develop
+      - bugfixes
+      - feature/**
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions: { }
+
+jobs:
+  check-changes:
+    name: 'Required job check'
+    runs-on: ubuntu-latest
+    outputs:
+      backend_tasks: ${{ steps.checker.outputs.backend_tasks }}
+      colibri_tasks: ${{ steps.checker.outputs.colibri_tasks }}
+      starling_tasks: ${{ steps.checker.outputs.starling_tasks }}
+      frontend_tasks: ${{ steps.checker.outputs.frontend_tasks }}
+      e2e_tasks: ${{ steps.checker.outputs.e2e_tasks }}
+      documentation_tasks: ${{ steps.checker.outputs.documentation_tasks }}
+      test_environment: ${{ steps.checker.outputs.backend_environment }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run check action
+        uses: rotki/action-job-checker@c507ef41d38d78c43014d42175dc1725019f0c23  # v6.1.0
+        id: checker
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config: |
+            # yaml-language-server: $schema=https://raw.githubusercontent.com/rotki/action-job-checker/v6.1.0/schema.json
+            groups:
+              - name: frontend
+                paths: [frontend]
+                run_tag: run frontend
+                implies: [e2e]
+              - name: e2e
+                run_tag: run e2e
+              - name: backend
+                paths:
+                  - rotkehlchen
+                  - pyproject.toml
+                  - .github/workflows/task_backend_tests.yml
+                run_tag: run backend
+                skip_tag: skip py tests
+                environments:
+                  - tag: run nft py tests
+                    value: nfts
+                  - tag: run all py tests
+                    value: nightly
+              - name: colibri
+                # The colibri tests read the packaged global database, so a new asset list has to
+                # run them too. Leaving it out let a shipped asset break them for six days.
+                paths: [colibri, Cargo.toml, Cargo.lock, rotkehlchen/data/global.db]
+              - name: starling
+                paths: [crates, Cargo.toml, Cargo.lock]
+              - name: documentation
+                paths: [docs]
+
+  check-typos:
+    name: 'Check Typos'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run typos checker
+        uses: crate-ci/typos@8a48f81b6c64dcfea44b3633223084c4be58ac5f  # v1.49.0
+
+  code-analyze-frontend:
+    name: 'Code analyze frontend'
+    needs: [ 'check-changes', 'check-typos' ]
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    if: ${{ needs.check-changes.outputs.frontend_tasks }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@d1ba80a13dd99fba24a470575428917156a28b43  # v4.37.5
+        with:
+          languages: 'javascript'
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@d1ba80a13dd99fba24a470575428917156a28b43  # v4.37.5
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@d1ba80a13dd99fba24a470575428917156a28b43  # v4.37.5
+        with:
+          category: "/language:javascript"
+
+  lint-frontend:
+    name: 'Frontend checks'
+    needs: [ 'check-changes', 'check-typos' ]
+    if: ${{ needs.check-changes.outputs.frontend_tasks }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Load env
+        uses: rotki/action-env@49f59e650cfdc8796c4ac6533ec044b190d83f9a  # v4.0.0
+        with:
+          env_file: .github/.env.ci
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6.0.10
+        with:
+          package_json_file: frontend/package.json
+
+      - name: Setup node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version-file: 'frontend/.nvmrc'
+          cache: 'pnpm'
+          cache-dependency-path: 'frontend/pnpm-lock.yaml'
+
+      - name: Install dependencies
+        id: install
+        working-directory: ./frontend
+        run: pnpm install --frozen-lockfile
+
+      # Each check is its own step so the failure annotation names what actually broke: a
+      # vue-tsc error reports as "Typecheck", not as a generic lint failure. The condition
+      # keeps later checks running after an earlier one fails, so a single run reports every
+      # problem, while still skipping them all if the install itself never succeeded.
+      - name: Typecheck
+        if: ${{ steps.install.outcome == 'success' && github.event_name != 'push' }}
+        working-directory: ./frontend
+        run: pnpm run typecheck
+
+      - name: Build
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && github.event_name != 'push' }}
+        working-directory: ./frontend
+        run: pnpm run --filter rotki build:app
+
+      - name: Check bundle placement
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && github.event_name != 'push' }}
+        working-directory: ./frontend
+        run: pnpm run --filter rotki check:bundle
+
+      - name: ESLint
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        working-directory: ./frontend
+        run: pnpm run lint
+
+      - name: Stylelint
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        working-directory: ./frontend
+        run: pnpm run lint:style
+
+      - name: Linked i18n keys
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        working-directory: ./frontend
+        run: pnpm run --filter rotki check:linked-keys
+
+      # Runs from the workspace root, not from app: the catalog it resolves
+      # `catalog:` versions against lives in frontend/pnpm-workspace.yaml.
+      - name: Knip
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        working-directory: ./frontend
+        run: pnpm run knip
+
+      # The app typecheck filters to `rotki`, so the dev-proxy is only covered here.
+      - name: dev-proxy
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        working-directory: ./frontend
+        run: pnpm run test:proxy
+
+  check-backend-mapping-keys:
+    name: 'Backend mapping keys'
+    needs: [ 'check-changes' ]
+    # Runs on backend changes too, unlike the other frontend jobs. The generated key list is scraped
+    # from the Python enums, so a backend-only PR that adds or renames an event type is exactly what
+    # makes it stale, and gating this on frontend_tasks alone would never catch that case.
+    if: ${{ needs.check-changes.outputs.frontend_tasks || needs.check-changes.outputs.backend_tasks }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6.0.10
+        with:
+          package_json_file: frontend/package.json
+
+      - name: Setup node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version-file: 'frontend/.nvmrc'
+          cache: 'pnpm'
+          cache-dependency-path: 'frontend/pnpm-lock.yaml'
+
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Check the generated backend mapping keys are current
+        working-directory: ./frontend
+        run: pnpm run --filter rotki check:backend-strings
+
+  unittest-frontend:
+    name: 'Frontend unit tests'
+    needs: [ 'check-changes' ]
+    if: ${{ github.event_name != 'push' && needs.check-changes.outputs.frontend_tasks }}
+    uses: ./.github/workflows/task_fe_unit_tests.yml
+    permissions:
+      contents: read
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  docs:
+    name: 'Documentation build'
+    needs: [ 'check-changes', 'check-typos' ]
+    if: ${{ github.event_name != 'push' && needs.check-changes.outputs.documentation_tasks }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load env
+        uses: rotki/action-env@49f59e650cfdc8796c4ac6533ec044b190d83f9a  # v4.0.0
+        with:
+          env_file: .github/.env.ci
+
+      - name: Setup python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          freethreaded: true
+          cache: 'pip'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          enable-cache: true
+          version: ${{ env.UV_VERSION }}
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --locked --group docs
+
+      - name: Build html docs
+        run: cd docs && uv run make html
+
+  code-analyze-backend:
+    name: 'Code analyze backend'
+    needs: [ 'check-changes', 'check-typos' ]
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    if: ${{ needs.check-changes.outputs.backend_tasks }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@d1ba80a13dd99fba24a470575428917156a28b43  # v4.37.5
+        with:
+          languages: 'python'
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@d1ba80a13dd99fba24a470575428917156a28b43  # v4.37.5
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@d1ba80a13dd99fba24a470575428917156a28b43  # v4.37.5
+        with:
+          category: "/language:python"
+
+  lint-colibri:
+    name: 'Colibri lint and test'
+    needs: [ 'check-changes', 'check-typos' ]
+    if: ${{ github.event_name != 'push' && needs.check-changes.outputs.colibri_tasks }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@a10f8ba42083c4371848c3dd6d3cd3622a939cd1  # clippy
+        with:
+          toolchain: 1.91
+          components: clippy
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          cache-on-failure: true
+          workspaces: |
+            . -> target
+
+      - name: Fetch Rust dependencies
+        run: cargo fetch --locked
+
+      - run: cargo check -p colibri --locked && cargo clippy -p colibri --all-targets --locked
+        env:
+          RUSTFLAGS: -Dwarnings
+
+      - run: cargo test -p colibri --locked
+        env:
+          RUSTFLAGS: -Dwarnings
+
+  lint-starling:
+    name: 'Starling lint and test'
+    needs: [ 'check-changes', 'check-typos' ]
+    if: ${{ github.event_name != 'push' && needs.check-changes.outputs.starling_tasks }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@a10f8ba42083c4371848c3dd6d3cd3622a939cd1  # clippy
+        with:
+          toolchain: 1.91
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          cache-on-failure: true
+          workspaces: |
+            . -> target
+
+      - name: Fetch Rust dependencies
+        run: cargo fetch --locked
+
+      - run: cargo fmt --all --check
+
+      - run: cargo check --workspace --exclude colibri --locked && cargo clippy --workspace --exclude colibri --all-targets --locked
+        env:
+          RUSTFLAGS: -Dwarnings
+
+      - run: cargo test --workspace --exclude colibri --locked
+        env:
+          RUSTFLAGS: -Dwarnings
+
+  test-starling-windows:
+    name: 'Starling windows lifecycle tests'
+    needs: [ 'check-changes', 'check-typos' ]
+    if: ${{ github.event_name != 'push' && needs.check-changes.outputs.starling_tasks }}
+    # The only job on a windows runner: the cross-platform suite already runs on
+    # ubuntu in lint-starling, so this runs *only* the windows-specific target.
+    # Those tests cover console-ctrl delivery and CREATE_NEW_PROCESS_GROUP
+    # isolation, which cannot be exercised anywhere but windows.
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load env
+        uses: rotki/action-env@49f59e650cfdc8796c4ac6533ec044b190d83f9a  # v4.0.0
+        with:
+          env_file: .github/.env.ci
+
+      - uses: dtolnay/rust-toolchain@a10f8ba42083c4371848c3dd6d3cd3622a939cd1
+        with:
+          toolchain: 1.91
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          cache-on-failure: true
+          workspaces: |
+            . -> target
+
+      - name: Setup python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          freethreaded: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          enable-cache: true
+          version: ${{ env.UV_VERSION }}
+          cache-dependency-glob: "uv.lock"
+
+      - name: Fetch Rust dependencies
+        run: cargo fetch --locked
+
+      # A regression in the process-group isolation makes the Ctrl+C under test
+      # escape to the shared console and take the harness down with it, so a
+      # failure here can surface as a killed job rather than a failed assertion.
+      - run: cargo test -p starling-core --locked --test windows_lifecycle
+        env:
+          RUSTFLAGS: -Dwarnings
+
+      # The pyinstaller tree test is #[ignore]d because it needs this bundle, so
+      # it only ever runs where we build it. It guards the ghost-process case:
+      # pyinstaller's bootloader forks a child, and only the Job Object reaps it.
+      # `--with` keeps pyinstaller out of the project env (it is not a project dep).
+      - name: Build the pyinstaller fixture bundle
+        run: >
+          uv run --no-sync --with pyinstaller==${{ env.PYINSTALLER_VERSION }} pyinstaller
+          --onedir --noconfirm --clean
+          --name fake_bootloader_pyi
+          --distpath target/pyi/dist
+          --workpath target/pyi/build
+          --specpath target/pyi
+          crates/starling-core/tests/support/fake_bootloader.py
+
+      - run: cargo test -p starling-core --locked --test process_tree_python_bundle -- --ignored
+        env:
+          RUSTFLAGS: -Dwarnings
+
+  lint-backend:
+    name: 'Backend lint'
+    needs: [ 'check-changes', 'check-typos' ]
+    if: ${{ github.event_name != 'push' && needs.check-changes.outputs.backend_tasks }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0  # full history so the diff-scoped logging lint can reach the PR base
+
+      - name: Load env
+        uses: rotki/action-env@49f59e650cfdc8796c4ac6533ec044b190d83f9a  # v4.0.0
+        with:
+          env_file: .github/.env.ci
+
+      - name: Setup python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          freethreaded: true
+          cache: 'pip'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          enable-cache: true
+          version: ${{ env.UV_VERSION }}
+          cache-dependency-glob: "uv.lock"
+
+      - name: Cache find-duplicate-constants binary
+        id: fdc-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: tools/find-duplicate-constants/target/release/find-duplicate-constants
+          key: ${{ runner.os }}-find-duplicate-constants-${{ hashFiles('tools/find-duplicate-constants/Cargo.lock', 'tools/find-duplicate-constants/Cargo.toml', 'tools/find-duplicate-constants/src/**') }}
+
+      - name: Setup Rust
+        if: steps.fdc-cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
+        with:
+          toolchain: 1.91
+
+      - name: Cache Rust dependencies
+        if: steps.fdc-cache.outputs.cache-hit != 'true'
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+        with:
+          cache-on-failure: true
+          workspaces: tools/find-duplicate-constants
+
+      - name: Build find-duplicate-constants
+        if: steps.fdc-cache.outputs.cache-hit != 'true'
+        working-directory: ./tools/find-duplicate-constants
+        run: cargo build --release
+
+      - name: Install dependencies
+        run: uv sync --locked --group lint
+
+      - name: Lint
+        env:
+          LINT_DIFF_BASE: ${{ github.event.pull_request.base.sha }}  # diff-scoped logging lint base
+        run: uv run make lint
+
+  test-backend:
+    if: ${{ github.event_name != 'push' && needs.check-changes.outputs.backend_tasks }}
+    needs: [ 'lint-backend', 'check-changes' ]
+    uses: ./.github/workflows/task_backend_tests.yml
+    with:
+      os: ubuntu-22.04
+      test_environment: ${{needs.check-changes.outputs.test_environment}}
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    permissions:
+      contents: read
+
+  test-contract:
+    # Non-required drift detector: validates live backend responses against the
+    # frontend api composables (full fetch + transform + zod pipeline) on a
+    # golden profile. Deliberately not part of the 'done' success check.
+    name: 'API contract tests'
+    needs: [ 'check-changes' ]
+    if: ${{ github.event_name != 'push' && (needs.check-changes.outputs.backend_tasks || needs.check-changes.outputs.frontend_tasks) }}
+    uses: ./.github/workflows/task_contract_tests.yml
+    permissions:
+      contents: read
+
+  test-e2e:
+    name: 'Frontend e2e tests'
+    needs: check-changes
+    if: ${{ github.event_name != 'push' && needs.check-changes.outputs.e2e_tasks }}
+    uses: ./.github/workflows/task_e2e_tests.yml
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
+    permissions:
+      contents: read
+
+  done:
+    name: 'Success check'
+    if: ${{ always() }}
+    needs: [ 'check-changes', 'lint-frontend', 'check-backend-mapping-keys', 'unittest-frontend', 'docs', 'lint-colibri', 'lint-starling', 'test-starling-windows', 'lint-backend', 'test-backend', 'test-e2e' ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if any task failed
+        run: |
+          if echo "${RESULT}" | jq -e '.[] | select(. == "failure")' > /dev/null 2>&1; then
+              echo "::error::At least one required task failed"
+              exit 1
+          fi
+        env:
+          RESULT: ${{ toJSON(needs.*.result) }}

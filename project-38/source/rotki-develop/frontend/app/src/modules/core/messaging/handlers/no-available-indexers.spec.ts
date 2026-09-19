@@ -1,0 +1,164 @@
+import type { Router } from 'vue-router';
+import { assert, type Notification, type NotificationAction, NotificationGroup } from '@rotki/common';
+import { mockT } from '@test/i18n';
+import { createMock } from '@test/utils/create-mock';
+import { mockUseSupportedChains } from '@test/utils/mocks/supported-chains';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { useConfirmStore } from '@/modules/core/common/use-confirm-store';
+import { createNoAvailableIndexersHandler } from '@/modules/core/messaging/handlers/no-available-indexers';
+import { useSettingsRepo } from '@/modules/settings/settings-repo';
+
+const updateFrontendSetting = vi.fn();
+
+vi.mock('@/modules/settings/use-settings-operations', () => ({
+  useSettingsOperations: (): Record<string, ReturnType<typeof vi.fn>> => ({
+    applyFrontendSettingLocal: vi.fn(),
+    enableModule: vi.fn(),
+    setKrakenAccountType: vi.fn(),
+    update: vi.fn(),
+    updateFrontendSetting,
+  }),
+}));
+
+vi.mock('@/modules/core/common/use-supported-chains', () =>
+  mockUseSupportedChains({ getChainName: (chain: string): string => chain.toUpperCase() }));
+
+const push = vi.fn<Router['push']>();
+const router = createMock<Router>({ push });
+
+describe('createNoAvailableIndexersHandler', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+    updateFrontendSetting.mockReset();
+    updateFrontendSetting.mockResolvedValue({ success: true });
+  });
+
+  it('should return a notification when the chain is not suppressed', async () => {
+    const handler = createNoAvailableIndexersHandler(mockT, router);
+
+    const result = await handler.handle({ chain: 'optimism' });
+
+    expect(result).toMatchObject({
+      group: `${NotificationGroup.NO_AVAILABLE_INDEXERS}:optimism`,
+    });
+  });
+
+  it('should give each chain its own group so they do not collapse into one notification', async () => {
+    const handler = createNoAvailableIndexersHandler(mockT, router);
+
+    const optimism = await handler.handle({ chain: 'optimism' });
+    const binance = await handler.handle({ chain: 'binance_sc' });
+
+    assert(optimism);
+    assert(binance);
+    expect(optimism.group).not.toBe(binance.group);
+  });
+
+  it('should keep notifying other chains when one chain is suppressed', async () => {
+    const handler = createNoAvailableIndexersHandler(mockT, router);
+    const store = useSettingsRepo();
+    store.updateFrontend({ suppressNoIndexerChains: ['binance_sc'] });
+
+    expect(await handler.handle({ chain: 'binance_sc' })).toBeNull();
+    expect(await handler.handle({ chain: 'optimism' })).toMatchObject({
+      group: `${NotificationGroup.NO_AVAILABLE_INDEXERS}:optimism`,
+    });
+  });
+
+  it('should route to the EVM indexer settings when the user clicks the configure action', async () => {
+    const handler = createNoAvailableIndexersHandler(mockT, router);
+
+    const result = await handler.handle({ chain: 'binance_sc' });
+    assert(result);
+    const actions = Array.isArray(result.action) ? result.action : [result.action];
+    const configureAction = actions.find(a => a && a.label.includes('action') && !a.label.includes('do_not_show_again'));
+    assert(configureAction);
+
+    await configureAction.action();
+
+    expect(push).toHaveBeenCalledWith({ name: '/settings/chains/', hash: '#indexer' });
+  });
+
+  it('should explain the paid etherscan key and offer to enter it when that is the reason', async () => {
+    const handler = createNoAvailableIndexersHandler(mockT, router);
+    const result = await handler.handle({ chain: 'base', reason: 'etherscan_paid_key_required' });
+    assert(result);
+    expect(result.title).toContain('paid_key_required.title');
+    expect(result.message).toContain('paid_key_required.message');
+    const actions = Array.isArray(result.action) ? result.action : [result.action];
+    const enterKeyAction = actions.find(a => a?.label.includes('enter_key'));
+    assert(enterKeyAction);
+    await enterKeyAction.action();
+    expect(push).toHaveBeenCalledWith({ name: '/api-keys/external/', query: { service: 'etherscan' } });
+  });
+
+  it('should not offer to enter a key when no reason is given', async () => {
+    const handler = createNoAvailableIndexersHandler(mockT, router);
+    const result = await handler.handle({ chain: 'base' });
+    assert(result);
+    expect(result.title).not.toContain('paid_key_required');
+    const actions = Array.isArray(result.action) ? result.action : [result.action];
+    expect(actions.find(a => a?.label.includes('enter_key'))).toBeUndefined();
+  });
+
+  it('should return null when the chain is in the suppression list', async () => {
+    const handler = createNoAvailableIndexersHandler(mockT, router);
+    const store = useSettingsRepo();
+    store.updateFrontend({ suppressNoIndexerChains: ['binance_sc'] });
+
+    const result = await handler.handle({ chain: 'binance_sc' });
+
+    expect(result).toBeNull();
+  });
+
+  function getSuppressAction(notification: Notification | null | void): NotificationAction {
+    assert(notification);
+    const actions = Array.isArray(notification.action) ? notification.action : [notification.action];
+    const suppressAction = actions.find(a => a?.label.includes('do_not_show_again'));
+    assert(suppressAction);
+    return suppressAction;
+  }
+
+  it('should append the chain to suppressNoIndexerChains when the user confirms', async () => {
+    const handler = createNoAvailableIndexersHandler(mockT, router);
+    const confirmStore = useConfirmStore();
+
+    const result = await handler.handle({ chain: 'binance_sc' });
+    const suppressAction = getSuppressAction(result);
+
+    await suppressAction.action();
+    expect(confirmStore.visible).toBe(true);
+
+    await confirmStore.confirm();
+
+    expect(updateFrontendSetting).toHaveBeenCalledWith({ suppressNoIndexerChains: ['binance_sc'] });
+  });
+
+  it('should not update the suppression list when the user dismisses the confirmation', async () => {
+    const handler = createNoAvailableIndexersHandler(mockT, router);
+    const confirmStore = useConfirmStore();
+
+    const result = await handler.handle({ chain: 'binance_sc' });
+    const suppressAction = getSuppressAction(result);
+
+    await suppressAction.action();
+    await confirmStore.dismiss();
+
+    expect(updateFrontendSetting).not.toHaveBeenCalled();
+  });
+
+  it('should skip the update when the chain was added to the list between notification and confirmation', async () => {
+    const handler = createNoAvailableIndexersHandler(mockT, router);
+    const store = useSettingsRepo();
+    const confirmStore = useConfirmStore();
+
+    const result = await handler.handle({ chain: 'binance_sc' });
+    const suppressAction = getSuppressAction(result);
+
+    store.updateFrontend({ suppressNoIndexerChains: ['binance_sc'] });
+    await suppressAction.action();
+    await confirmStore.confirm();
+
+    expect(updateFrontendSetting).not.toHaveBeenCalled();
+  });
+});

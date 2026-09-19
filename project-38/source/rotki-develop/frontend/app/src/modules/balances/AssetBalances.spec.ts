@@ -1,0 +1,53 @@
+import { createCustomPinia } from '@test/utils/create-pinia';
+import { libraryDefaults } from '@test/utils/provide-defaults';
+import { mount, type VueWrapper } from '@vue/test-utils';
+import { setActivePinia } from 'pinia';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import AssetBalances from '@/modules/balances/AssetBalances.vue';
+
+describe('asset-balances', () => {
+  let wrapper: VueWrapper<InstanceType<typeof AssetBalances>>;
+  beforeEach(() => {
+    const pinia = createCustomPinia();
+    setActivePinia(pinia);
+    wrapper = mount(AssetBalances, {
+      global: {
+        plugins: [pinia],
+        provide: libraryDefaults,
+      },
+      props: {
+        balances: [],
+      },
+    });
+  });
+
+  afterEach(() => {
+    wrapper.unmount();
+  });
+
+  it('should enter loading state when balances load', async () => {
+    await wrapper.setProps({ loading: true });
+    await nextTick();
+
+    expect(wrapper.find('tbody td div[role=progressbar]').exists()).toBe(true);
+
+    await wrapper.setProps({ loading: false });
+    await nextTick();
+
+    expect(wrapper.find('tbody td div[role=progressbar]').exists()).toBe(false);
+    expect(wrapper.find('tbody tr td p').text()).toMatch('data_table.no_data');
+  });
+
+  it('should drop the currency from the price and value headers only when nested in another row', async () => {
+    const headers = (): string => wrapper.find('thead').text();
+
+    expect(headers()).toContain('common.price_in_symbol');
+    expect(headers()).toContain('common.value_in_symbol');
+
+    await wrapper.setProps({ nested: true });
+
+    expect(headers()).not.toContain('_in_symbol');
+    expect(headers()).toContain('common.price');
+    expect(headers()).toContain('common.value');
+  });
+});

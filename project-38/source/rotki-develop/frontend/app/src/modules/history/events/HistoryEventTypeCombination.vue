@@ -1,0 +1,95 @@
+<script setup lang="ts">
+import type { RuiIcons } from '@rotki/ui-library';
+import type { HistoryEventCategoryDetailWithId, HistoryEventCategoryDirection } from '@/modules/history/events/event-type';
+import { type MessageKey, msg } from '@/message-key';
+
+const { type, showInfo, showLabel, icon, highlight } = defineProps<{
+  type: HistoryEventCategoryDetailWithId;
+  showLabel?: boolean;
+  icon?: RuiIcons;
+  highlight?: boolean;
+  showInfo?: boolean;
+}>();
+
+/**
+ * Maps a direction onto its translated label key.
+ *
+ * @remarks Each key is spelled out rather than interpolated: an inline template literal in `t()`
+ * makes the linked-keys rule treat the whole prefix as used, which quietly exempts the subtree
+ * from unused-key reporting.
+ */
+const DIRECTION_KEYS: Record<HistoryEventCategoryDirection, MessageKey> = {
+  in: msg.$t('backend_mappings.events.type_direction.directions.in'),
+  neutral: msg.$t('backend_mappings.events.type_direction.directions.neutral'),
+  out: msg.$t('backend_mappings.events.type_direction.directions.out'),
+};
+
+const directionIcon = computed<RuiIcons>(() => {
+  switch (type.direction) {
+    case 'in':
+      return 'lu-arrow-down';
+    case 'out':
+      return 'lu-arrow-up';
+    default:
+      return 'lu-arrow-up-down';
+  }
+});
+
+const { t } = useI18n({ useScope: 'global' });
+</script>
+
+<template>
+  <div class="flex items-center gap-3">
+    <div
+      class="shrink-0 bg-rui-grey-200 dark:bg-rui-grey-900 text-rui-grey-600 dark:text-rui-grey-400 size-10 flex items-center justify-center rounded-full relative"
+      :class="{
+        '!bg-rui-primary-lighter/[0.7] dark:!bg-rui-primary-lighter !text-rui-primary': highlight,
+      }"
+    >
+      <RuiIcon
+        size="20"
+        :name="icon || type.icon"
+        :color="highlight ? undefined : type.color"
+      />
+      <RuiIcon
+        v-if="showInfo"
+        name="lu-info"
+        size="14"
+        class="absolute bottom-0 right-0 opacity-40"
+      />
+    </div>
+    <div
+      v-if="showLabel"
+      class="flex items-center gap-2"
+    >
+      <div class="font-bold uppercase text-sm">
+        {{ type.label }}
+      </div>
+      <RuiTooltip
+        :options="{ autoUpdate: { resize: false, scroll: false }, placement: 'top' }"
+        :open-delay="400"
+      >
+        <template #activator>
+          <div class="cursor-pointer rounded-full bg-rui-grey-200 dark:bg-rui-grey-800 p-1">
+            <RuiIcon
+              size="14"
+              :name="directionIcon"
+            />
+          </div>
+        </template>
+        <i18n-t
+          scope="global"
+          tag="span"
+          keypath="backend_mappings.events.type_direction.title"
+          class="whitespace-break-spaces"
+        >
+          <template #direction>
+            <span class="whitespace-nowrap font-bold">
+              {{ t(DIRECTION_KEYS[type.direction]) }}
+            </span>
+          </template>
+        </i18n-t>
+      </RuiTooltip>
+    </div>
+  </div>
+</template>

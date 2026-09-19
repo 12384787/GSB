@@ -1,0 +1,34 @@
+import type { MaybeRefOrGetter, Ref } from 'vue';
+
+interface UseCopyReturn {
+  copy: () => Promise<void>;
+  copied: Readonly<Ref<boolean>>;
+}
+
+export function useCopy(source: MaybeRefOrGetter<string>): UseCopyReturn {
+  const copied = shallowRef<boolean>(false);
+
+  const { copy: copyText } = useClipboard({
+    source,
+  });
+
+  const { isPending, start, stop } = useTimeoutFn(() => {
+    set(copied, false);
+  }, 4000, { immediate: false });
+
+  const { start: startAnimation } = useTimeoutFn(() => {
+    set(copied, true);
+    start();
+  }, 100, { immediate: false });
+
+  const copy = async (): Promise<void> => {
+    await copyText();
+    if (get(isPending)) {
+      stop();
+      set(copied, false);
+    }
+    startAnimation();
+  };
+
+  return { copied: readonly(copied), copy };
+}

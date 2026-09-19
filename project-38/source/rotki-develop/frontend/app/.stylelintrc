@@ -1,0 +1,53 @@
+{
+  "plugins": [
+    "stylelint-order"
+  ],
+  "extends": "stylelint-config-recommended-vue",
+  "rules": {
+    "no-empty-source": null,
+    "selector-pseudo-element-no-unknown": [
+      true,
+      {
+        "ignorePseudoElements": ["v-deep", "v-global", "v-slotted"]
+      }
+    ],
+    "selector-pseudo-class-no-unknown": [
+      true,
+      {
+        "ignorePseudoClasses": ["global", "deep", "slotted"]
+      }
+    ],
+    "at-rule-no-unknown": [
+      true,
+      {
+        "ignoreAtRules": ["tailwind", "apply", "layer", "config", "variants", "responsive", "screen"]
+      }
+    ],
+    "rule-empty-line-before": [
+      "always",
+      {
+        "except": ["first-nested"],
+        "ignore": ["after-comment"]
+      }
+    ],
+    "comment-no-empty": true,
+    "declaration-block-no-duplicate-properties": true,
+    "declaration-block-single-line-max-declarations": 1,
+    "function-no-unknown": [
+      true,
+      {
+        "ignoreFunctions": ["theme", "screen"]
+      }
+    ],
+    "order/order": [
+      {
+        "type": "at-rule",
+        "name": "apply"
+      },
+      "custom-properties",
+      "declarations",
+      "rules",
+      "at-rules"
+    ]
+  }
+}

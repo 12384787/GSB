@@ -1,0 +1,182 @@
+import type { LogService } from '@electron/main/log-service';
+import fs from 'node:fs/promises';
+import http, { type Server } from 'node:http';
+import net from 'node:net';
+import path from 'node:path';
+import { getMimeType } from '@electron/main/create-protocol';
+import { sanitizePath } from '@electron/main/path-sanitizer';
+
+const HttpStatus = {
+  OK: 200,
+  FORBIDDEN: 403,
+  NOT_FOUND: 404,
+  INTERNAL_SERVER_ERROR: 500,
+} as const;
+
+export class AppServer {
+  private server: Server | undefined;
+  private readonly baseDirectory: string;
+
+  constructor(private readonly logger: LogService, baseDirectory?: string) {
+    this.baseDirectory = baseDirectory ?? import.meta.dirname;
+  }
+
+  public async start(port: number, initialRoute?: string): Promise<void> {
+    const devServerUrl = import.meta.env.VITE_DEV_SERVER_URL;
+    const isDev = !!devServerUrl;
+
+    if (isDev) {
+      await this.startDevelopmentProxy(port, devServerUrl, initialRoute);
+    }
+    else {
+      await this.startProductionServer(port);
+    }
+  }
+
+  /**
+   * Serves the renderer by proxying to the vite dev server.
+   *
+   * @remarks
+   * `httpxy` is imported dynamically because it is a development-only dependency. A static import
+   * would put it in the production main bundle, where it is dead weight and its absence at install
+   * time would be a build failure rather than a path never taken.
+   */
+  private async startDevelopmentProxy(port: number, devServerUrl: string, initialRoute?: string): Promise<void> {
+    const { createProxyServer } = await import('httpxy');
+
+    return new Promise((resolve, reject) => {
+      const proxy = createProxyServer({
+        target: devServerUrl,
+        changeOrigin: true,
+      });
+
+      const server = http.createServer((req, res) => {
+        this.logger.debug(`Proxy request: ${req.method} ${req.url}`);
+
+        proxy.web(req, res).catch((error: Error) => {
+          this.logger.error('Proxy error:', error);
+          res.writeHead(HttpStatus.INTERNAL_SERVER_ERROR, { 'Content-Type': 'text/plain' });
+          res.end('Proxy error');
+        });
+      });
+
+      // Handle WebSocket upgrade requests (for HMR)
+      server.on('upgrade', (req, socket, head) => {
+        this.logger.debug(`WebSocket upgrade request: ${req.url}`);
+        // Node types it as Duplex; an HTTP/1.1 upgrade is always the net.Socket httpxy wants.
+        if (!(socket instanceof net.Socket)) {
+          socket.destroy();
+          return;
+        }
+        proxy.ws(req, socket, {}, head).catch((error: Error) => {
+          this.logger.error('WebSocket proxy error:', error);
+          socket.destroy();
+        });
+      });
+
+      server.once('error', reject);
+
+      server.listen(port, () => {
+        server.removeListener('error', reject);
+        server.on('error', (error) => {
+          this.logger.error('Development proxy server error:', error);
+        });
+
+        this.server = server;
+        this.logger.info(`Development proxy server started at http://localhost:${port}`);
+        if (initialRoute) {
+          this.logger.info(`Initial route configured: ${initialRoute}`);
+        }
+        resolve();
+      });
+    });
+  }
+
+  private async startProductionServer(port: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const server = http.createServer((req, res) => {
+        this.handleProductionRequest(req, res, this.baseDirectory).catch((error) => {
+          this.logger.error('Unhandled error in production request handler:', error);
+          res.writeHead(HttpStatus.INTERNAL_SERVER_ERROR, { 'Content-Type': 'text/plain' });
+          res.end('500 Internal Server Error');
+        });
+      });
+
+      server.once('error', reject);
+
+      server.listen(port, () => {
+        server.removeListener('error', reject);
+        server.on('error', (error) => {
+          this.logger.error('Production server error:', error);
+        });
+
+        this.server = server;
+        this.logger.info(`Production server started at http://localhost:${port}`);
+        resolve();
+      });
+    });
+  }
+
+  private async handleProductionRequest(req: http.IncomingMessage, res: http.ServerResponse, currentDir: string): Promise<void> {
+    try {
+      const url = new URL(`http://localhost:${req.url}`);
+      const pathname = decodeURIComponent(url.pathname);
+
+      let requestFile = sanitizePath(pathname);
+
+      // Serve index.html for SPA routes
+      if (!requestFile || requestFile === '/' || requestFile.startsWith('/#/')) {
+        requestFile = 'index.html';
+      }
+
+      const filePath = path.join(currentDir, requestFile);
+
+      // Security check: ensure file is within the current directory
+      const resolvedCurrentDir = path.resolve(currentDir);
+      const resolvedFilePath = path.resolve(filePath);
+      if (!resolvedFilePath.startsWith(resolvedCurrentDir)) {
+        res.writeHead(HttpStatus.FORBIDDEN, { 'Content-Type': 'text/plain' });
+        res.end('403 Forbidden: Access Denied');
+        return;
+      }
+
+      try {
+        // Check if file exists and read it
+        const data = await fs.readFile(resolvedFilePath);
+        res.writeHead(HttpStatus.OK, { 'Content-Type': getMimeType(resolvedFilePath) });
+        res.end(data);
+      }
+      catch {
+        // File doesn't exist or can't be read
+        this.logger.warn(`File not found or unreadable: ${resolvedFilePath}`);
+        res.writeHead(HttpStatus.NOT_FOUND, { 'Content-Type': 'text/plain' });
+        res.end('404 File not Found');
+      }
+    }
+    catch (error) {
+      this.logger.error('Server error:', error);
+      res.writeHead(HttpStatus.INTERNAL_SERVER_ERROR, { 'Content-Type': 'text/plain' });
+      res.end('500 Internal Server Error');
+    }
+  }
+
+  public isListening(): boolean {
+    return this.server?.listening ?? false;
+  }
+
+  public stop(): void {
+    this.logger.info('Stopping app server...');
+
+    if (this.server?.listening) {
+      this.server.close((err) => {
+        if (err) {
+          this.logger.error('Error closing app server:', err);
+        }
+        else {
+          this.logger.info('App server closed');
+        }
+      });
+      this.server = undefined;
+    }
+  }
+}

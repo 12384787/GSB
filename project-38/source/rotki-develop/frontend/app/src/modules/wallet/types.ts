@@ -1,0 +1,88 @@
+import type { BigNumber } from '@rotki/common';
+import { z } from 'zod';
+
+export interface TradableAssetWithoutValue {
+  asset: string;
+  chain: string;
+  amount: BigNumber;
+}
+
+export interface TradableAsset extends TradableAssetWithoutValue {
+  fiatValue?: BigNumber;
+  price?: BigNumber;
+}
+
+export interface TransactionParams {
+  to: string;
+  amount: string;
+  assetIdentifier?: string;
+  native: boolean;
+  chain: string;
+}
+
+export interface RecentTransaction {
+  hash: string;
+  chain: string;
+  timestamp: number;
+  context: string;
+  status: 'pending' | 'completed' | 'failed';
+  metadata: any;
+  initiatorAddress: string;
+}
+
+export interface GasFeeEstimation {
+  gasFee: string;
+  maxAmount: string;
+}
+
+interface PrepareTransferPayload {
+  fromAddress: string;
+  toAddress: string;
+  amount: string;
+}
+
+export interface PrepareERC20TransferPayload extends PrepareTransferPayload {
+  token: string;
+}
+
+export const PrepareERC20TransferResponse = z.object({
+  chainId: z.number(),
+  data: z.string(),
+  from: z.string(),
+  nonce: z.number(),
+  to: z.string(),
+  value: z.number().transform(arg => BigInt(arg)),
+});
+
+export type PrepareERC20TransferResponse = z.infer<typeof PrepareERC20TransferResponse>;
+
+export interface PrepareNativeTransferPayload extends PrepareTransferPayload {
+  chain: string;
+}
+
+export const PrepareNativeTransferResponse = z.object({
+  from: z.string(),
+  nonce: z.number(),
+  to: z.string(),
+  value: z.number().transform(arg => BigInt(arg)),
+});
+
+export type PrepareNativeTransferResponse = z.infer<typeof PrepareNativeTransferResponse>;
+
+/**
+ * A transfer the backend has prepared, ready to hand to the wallet.
+ *
+ * @remarks
+ * Both arms carry `data`: the ERC20 response brings its own, and a native transfer is given the
+ * empty `0x` by `prepareTransactionPayload`. The native response alone does not declare it, which
+ * is why this alias exists rather than the bare union.
+ */
+export type PreparedTransaction =
+  | PrepareERC20TransferResponse
+  | (PrepareNativeTransferResponse & { data: string });
+
+export interface GetAssetBalancePayload {
+  evmChain: string;
+  address: string;
+  asset: string;
+}

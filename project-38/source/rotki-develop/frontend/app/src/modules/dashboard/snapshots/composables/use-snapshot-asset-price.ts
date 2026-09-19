@@ -1,0 +1,269 @@
+import type { ComputedRef, MaybeRefOrGetter, Ref } from 'vue';
+import type { HistoricalPriceFormPayload } from '@/modules/assets/prices/price-types';
+import { Zero } from '@rotki/common';
+import { CURRENCY_USD } from '@/modules/assets/amount-display/currencies';
+import { useAssetPricesApi } from '@/modules/assets/api/use-asset-prices-api';
+import { useHistoricPriceCache } from '@/modules/assets/prices/use-historic-price-cache';
+import { usePriceTaskManager } from '@/modules/assets/prices/use-price-task-manager';
+import { bigNumberifyFromRef } from '@/modules/core/common/data/bignumbers';
+import { useHistoricFiatConversion } from '@/modules/dashboard/snapshots/composables/use-historic-fiat-conversion';
+import { PriceOracle } from '@/modules/settings/types/price-oracle';
+import { useSetting } from '@/modules/settings/use-setting';
+import { ActivityKind, ActivityPart } from '@/modules/task-center/core/types';
+import { useTaskCenter } from '@/modules/task-center/use-task-center';
+
+interface UseSnapshotAssetPriceOptions {
+  /** The asset amount (two-way; the form's v-model). */
+  amount: Ref<string>;
+  /** The stored USD value (two-way; the form's v-model). Always USD. */
+  usdValue: Ref<string>;
+  /** The asset identifier (two-way; the form's v-model). */
+  asset: Ref<string>;
+  /** The snapshot timestamp, in SECONDS. */
+  timestamp: MaybeRefOrGetter<number>;
+}
+
+interface UseSnapshotAssetPriceReturn {
+  /** Asset price in USD (bound to the USD-mode primary field). */
+  modelAssetToUsdPrice: Ref<string>;
+  /** Asset price in the user's display currency (non-USD primary field). */
+  modelAssetToFiatPrice: Ref<string>;
+  /** Asset value in the user's display currency (non-USD secondary field). */
+  modelFiatValue: Ref<string>;
+  /** Whether the user is editing the secondary (value) field. */
+  modelFiatValueFocused: Ref<boolean>;
+  /** Whether the user's main currency is USD (no conversion needed). */
+  isCurrentCurrencyUsd: ComputedRef<boolean>;
+  /** The user's main currency symbol. */
+  currencySymbol: Ref<string>;
+  /** Whether a historic-price fetch is in flight. */
+  fetching: ComputedRef<boolean>;
+  /** Persist a user-edited manual price (USD or fiat) for the timestamp. */
+  submitPrice: () => Promise<void>;
+  /** Clear all derived/fetched price state. */
+  reset: () => void;
+}
+
+/**
+ * The price-sync state machine between asset, USD and display currency, for the snapshot balance
+ * edit form.
+ *
+ * @remarks
+ * Snapshots are stored in USD, so in another main currency the user edits the fiat price while the
+ * stored `usdValue` is kept in sync through the historic rate at the snapshot's timestamp. That rate
+ * is derived from the two fetched asset prices, asset-to-fiat over asset-to-USD, which is what
+ * applied then and stays stable across the user's edits.
+ */
+export function useSnapshotAssetPrice(
+  options: UseSnapshotAssetPriceOptions,
+): UseSnapshotAssetPriceReturn {
+  const { amount, asset, timestamp, usdValue } = options;
+
+  const modelFiatValue = shallowRef<string>('');
+  const modelAssetToUsdPrice = shallowRef<string>('');
+  const modelAssetToFiatPrice = shallowRef<string>('');
+
+  const modelFiatValueFocused = shallowRef<boolean>(false);
+  const fetchedAssetToUsdPrice = shallowRef<string>('');
+  const fetchedAssetToFiatPrice = shallowRef<string>('');
+
+  const { resetHistoricalPricesData } = useHistoricPriceCache();
+  const currencySymbol = useSetting('currencySymbol');
+  const { useIsActivePrefix } = useTaskCenter();
+  const { getHistoricPrice } = usePriceTaskManager();
+  const { addHistoricalPrice } = useAssetPricesApi();
+
+  const isCurrentCurrencyUsd = computed<boolean>(() => get(currencySymbol) === CURRENCY_USD);
+  const fetching = useIsActivePrefix(ActivityKind.PRICES, ActivityPart.HISTORIC);
+
+  // The same historic USD -> display-currency rate the snapshot display converts back with.
+  const { rate: usdToFiatRate } = useHistoricFiatConversion(timestamp);
+
+  const numericAssetToUsdPrice = bigNumberifyFromRef(modelAssetToUsdPrice);
+  const numericAssetToFiatPrice = bigNumberifyFromRef(modelAssetToFiatPrice);
+  const numericFiatValue = bigNumberifyFromRef(modelFiatValue);
+  const numericAmount = bigNumberifyFromRef(amount);
+  const numericUsdValue = bigNumberifyFromRef(usdValue);
+
+  async function savePrice(payload: HistoricalPriceFormPayload): Promise<void> {
+    await addHistoricalPrice(payload);
+    resetHistoricalPricesData([payload]);
+  }
+
+  function onAssetToUsdPriceChange(forceUpdate = false): void {
+    if (get(isCurrentCurrencyUsd) && get(amount) && get(modelAssetToUsdPrice) && (!get(modelFiatValueFocused) || forceUpdate))
+      set(usdValue, get(numericAmount).multipliedBy(get(numericAssetToUsdPrice)).toFixed());
+  }
+
+  function onAssetToFiatPriceChanged(forceUpdate = false): void {
+    if (get(amount) && get(modelAssetToFiatPrice) && (!get(modelFiatValueFocused) || forceUpdate))
+      set(modelFiatValue, get(numericAmount).multipliedBy(get(numericAssetToFiatPrice)).toFixed());
+  }
+
+  function onUsdValueChange(): void {
+    if (get(amount) && get(modelFiatValueFocused))
+      set(modelAssetToUsdPrice, get(numericUsdValue).div(get(numericAmount)).toFixed());
+  }
+
+  /**
+   * Restates the edited fiat value as the USD value that actually gets stored.
+   *
+   * @remarks
+   * Divides by the historic USD to fiat rate rather than by the asset's own USD over fiat price
+   * ratio, so the stored value round-trips exactly through the display, which converts with that
+   * same rate. The two diverge for fiat-pegged assets, whose oracle USD price is not the forex
+   * rate. No-op while the display currency is USD, or before an amount is entered.
+   */
+  function syncUsdValueFromFiat(): void {
+    if (get(isCurrentCurrencyUsd) || !get(amount))
+      return;
+
+    const rate = get(usdToFiatRate);
+    if (rate.isPositive())
+      set(usdValue, get(numericFiatValue).div(rate).toFixed());
+  }
+
+  function onFiatValueChange(): void {
+    if (!get(amount))
+      return;
+
+    if (get(modelFiatValueFocused))
+      set(modelAssetToFiatPrice, get(numericFiatValue).div(get(numericAmount)).toFixed());
+
+    syncUsdValueFromFiat();
+  }
+
+  async function fetchHistoricPrices(): Promise<void> {
+    const assetVal = get(asset);
+    const ts = toValue(timestamp);
+    if (!ts || !assetVal)
+      return;
+
+    // Fallback for when the historic lookup comes back empty.
+    const currentAmount = get(numericAmount);
+    const oldUsdPrice = currentAmount.isPositive()
+      ? get(numericUsdValue).dividedBy(currentAmount)
+      : Zero;
+
+    if (assetVal === CURRENCY_USD) {
+      set(fetchedAssetToUsdPrice, '1');
+    }
+    else {
+      const price = await getHistoricPrice({ fromAsset: assetVal, timestamp: ts, toAsset: CURRENCY_USD });
+
+      if (price.gt(0))
+        set(fetchedAssetToUsdPrice, price.toFixed());
+      else
+        set(modelAssetToUsdPrice, oldUsdPrice.toFixed());
+    }
+
+    if (!get(isCurrentCurrencyUsd)) {
+      const currentCurrency = get(currencySymbol);
+
+      if (assetVal === currentCurrency) {
+        set(fetchedAssetToFiatPrice, '1');
+        return;
+      }
+
+      const price = await getHistoricPrice({ fromAsset: assetVal, timestamp: ts, toAsset: currentCurrency });
+
+      if (price.gt(0))
+        set(fetchedAssetToFiatPrice, price.toFixed());
+      else
+        set(modelAssetToFiatPrice, oldUsdPrice.toFixed());
+    }
+  }
+
+  async function submitPrice(): Promise<void> {
+    const assetVal = get(asset);
+    if (!assetVal)
+      return;
+
+    if (get(isCurrentCurrencyUsd)) {
+      if (get(modelAssetToUsdPrice) !== get(fetchedAssetToUsdPrice)) {
+        await savePrice({
+          fromAsset: assetVal,
+          price: get(modelAssetToUsdPrice),
+          sourceType: PriceOracle.MANUAL,
+          timestamp: toValue(timestamp),
+          toAsset: CURRENCY_USD,
+        });
+      }
+    }
+    else if (get(modelAssetToFiatPrice) !== get(fetchedAssetToFiatPrice)) {
+      await savePrice({
+        fromAsset: assetVal,
+        price: get(modelAssetToFiatPrice),
+        sourceType: PriceOracle.MANUAL,
+        timestamp: toValue(timestamp),
+        toAsset: get(currencySymbol),
+      });
+    }
+  }
+
+  function reset(): void {
+    set(fetchedAssetToUsdPrice, '');
+    set(fetchedAssetToFiatPrice, '');
+    set(modelAssetToUsdPrice, '');
+    set(modelAssetToFiatPrice, '');
+    set(modelFiatValue, '');
+    set(usdValue, '');
+  }
+
+  watchImmediate([(): number => toValue(timestamp), asset], async (): Promise<void> => {
+    await fetchHistoricPrices();
+  });
+
+  watchImmediate(fetchedAssetToUsdPrice, (price) => {
+    set(modelAssetToUsdPrice, price);
+    onAssetToUsdPriceChange(true);
+  });
+
+  watchImmediate(modelAssetToUsdPrice, () => {
+    onAssetToUsdPriceChange();
+  });
+
+  watchImmediate(usdValue, () => {
+    onUsdValueChange();
+  });
+
+  watchImmediate(fetchedAssetToFiatPrice, (price) => {
+    set(modelAssetToFiatPrice, price);
+    onAssetToFiatPriceChanged(true);
+  });
+
+  watchImmediate(modelAssetToFiatPrice, () => {
+    onAssetToFiatPriceChanged();
+  });
+
+  watchImmediate(modelFiatValue, () => {
+    onFiatValueChange();
+  });
+
+  watchImmediate(amount, () => {
+    if (!get(isCurrentCurrencyUsd)) {
+      onAssetToFiatPriceChanged();
+      onFiatValueChange();
+    }
+
+    onAssetToUsdPriceChange();
+    onUsdValueChange();
+  });
+
+  // The rate resolves asynchronously, after a freshly opened form has already derived its USD value.
+  watch(usdToFiatRate, () => {
+    syncUsdValueFromFiat();
+  });
+
+  return {
+    currencySymbol,
+    fetching,
+    isCurrentCurrencyUsd,
+    modelAssetToFiatPrice,
+    modelAssetToUsdPrice,
+    modelFiatValue,
+    modelFiatValueFocused,
+    reset,
+    submitPrice,
+  };
+}

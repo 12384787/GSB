@@ -1,0 +1,329 @@
+import type { Ref } from 'vue';
+import { type NotificationData, NotificationGroup } from '@rotki/common';
+import { createMock } from '@test/utils/create-mock';
+import { runSpecWith } from '@test/utils/mocks/native-task';
+import { err, ok, type Result } from 'plainfp/result';
+import { beforeEach, describe, expect, it, type Mock, vi } from 'vitest';
+import { Cancelled, type TaskError, TaskFailed } from '@/modules/core/tasks/task-result';
+import { GnosisPayError, type GnosisPayErrorContext } from './types';
+import { useGnosisPaySigning } from './use-gnosis-pay-signing';
+
+const CONNECTED_ADDRESS = '0x1234567890123456789012345678901234567890';
+
+const fetchNonce = vi.fn();
+const verifySiweSignature = vi.fn();
+const runTaskResult = vi.fn();
+const showErrorMessage = vi.fn();
+const removeMatching = vi.fn<(predicate: (n: NotificationData) => boolean) => void>();
+
+const submitTask = vi.fn(runSpecWith(runTaskResult));
+const signMessage = vi.fn();
+const injectedGetWalletClient = vi.fn();
+const wcGetWalletClient = vi.fn();
+const walletMode = ref<string>('local-bridge');
+
+vi.mock('@/modules/integrations/gnosis-pay/use-gnosis-pay-api', () => ({
+  useGnosisPaySiweApi: vi.fn().mockImplementation(() => ({
+    fetchNonce,
+    verifySiweSignature,
+  })),
+}));
+
+vi.mock('@/modules/task-center/use-native-task', () => ({
+  useNativeTask: vi.fn().mockImplementation(() => ({
+    cancelByType: vi.fn(() => vi.fn()),
+    runTaskResult,
+    statusOf: vi.fn(),
+    submitTask,
+  })),
+}));
+
+vi.mock('@/modules/core/notifications/use-notifications', () => ({
+  useNotifications: vi.fn().mockImplementation(() => ({ removeMatching, showErrorMessage })),
+}));
+
+vi.mock('@/modules/wallet/bridge/use-injected-wallet', () => ({
+  useInjectedWallet: vi.fn().mockImplementation(() => ({
+    getWalletClient: injectedGetWalletClient,
+  })),
+}));
+
+vi.mock('@/modules/wallet/use-wallet-connect', () => ({
+  useWalletConnect: vi.fn().mockImplementation(() => ({
+    getWalletClient: wcGetWalletClient,
+  })),
+}));
+
+vi.mock('@/modules/wallet/use-wallet-store', () => ({
+  useWalletStore: vi.fn().mockImplementation(() => ({ walletMode })),
+}));
+
+vi.mock('@/modules/wallet/constants', () => ({
+  WALLET_MODES: { LOCAL_BRIDGE: 'local-bridge', WALLET_CONNECT: 'walletconnect' },
+  isUserRejectedError: (error: unknown): boolean => String(error).includes('User rejected'),
+}));
+
+vi.mock('@/modules/core/common/logging/logging', () => ({
+  logger: { debug: vi.fn(), error: vi.fn(), info: vi.fn(), warn: vi.fn() },
+}));
+
+function makeSuccess<T>(result: T): Result<T, TaskError> {
+  return ok(result);
+}
+
+function makeFailure(message: string, opts: Partial<{ cancelled: boolean }> = {}): Result<never, TaskError> {
+  if (opts.cancelled)
+    return err(Cancelled({ message }));
+  return err(TaskFailed({ message }));
+}
+
+interface Harness {
+  clearError: Mock<() => void>;
+  connectedAddress: Ref<string | undefined>;
+  errorType: Ref<GnosisPayError | null>;
+  onSignInComplete?: Mock<() => void | Promise<void>>;
+  setError: Mock<(type: GnosisPayError, context?: GnosisPayErrorContext) => void>;
+  signingInProgress: Ref<boolean>;
+  signInSuccess: Ref<boolean>;
+}
+
+function makeHarness(overrides: Partial<Harness> = {}): Harness {
+  return {
+    clearError: vi.fn(),
+    connectedAddress: ref<string | undefined>(CONNECTED_ADDRESS),
+    errorType: ref<GnosisPayError | null>(null),
+    setError: vi.fn(),
+    signingInProgress: ref<boolean>(false),
+    signInSuccess: ref<boolean>(false),
+    ...overrides,
+  };
+}
+
+describe('useGnosisPaySigning', () => {
+  beforeEach(() => {
+    fetchNonce.mockReset();
+    verifySiweSignature.mockReset();
+    runTaskResult.mockReset();
+    submitTask.mockClear();
+    showErrorMessage.mockReset();
+    removeMatching.mockReset();
+    signMessage.mockReset().mockResolvedValue('0xSignature');
+    const fakeClient = { signMessage };
+    injectedGetWalletClient.mockReset().mockReturnValue(fakeClient);
+    wcGetWalletClient.mockReset().mockReturnValue(fakeClient);
+    set(walletMode, 'local-bridge');
+  });
+
+  it('should clear error when starting a fresh sign-in', async () => {
+    const harness = makeHarness();
+    runTaskResult.mockImplementation(async (fn: () => Promise<unknown>) => {
+      await fn();
+      return makeSuccess('nonce-1');
+    });
+    runTaskResult.mockImplementationOnce(async () => makeSuccess('nonce-1'));
+    runTaskResult.mockImplementationOnce(async () => makeSuccess(true));
+
+    const { signInWithEthereum } = useGnosisPaySigning({ ...harness, signInSuccess: harness.signInSuccess });
+    await signInWithEthereum();
+
+    expect(harness.clearError).toHaveBeenCalled();
+  });
+
+  it('should preserve INVALID_ADDRESS warning while signing', async () => {
+    const harness = makeHarness({ errorType: ref(GnosisPayError.INVALID_ADDRESS) });
+    runTaskResult.mockImplementationOnce(async () => makeSuccess('nonce'));
+    runTaskResult.mockImplementationOnce(async () => makeSuccess(true));
+
+    const { signInWithEthereum } = useGnosisPaySigning(harness);
+    await signInWithEthereum();
+
+    expect(harness.clearError).not.toHaveBeenCalled();
+  });
+
+  it('should set NO_WALLET_CONNECTED when no address is connected', async () => {
+    const harness = makeHarness({ connectedAddress: ref<string | undefined>(undefined) });
+
+    const { signInWithEthereum } = useGnosisPaySigning(harness);
+    await signInWithEthereum();
+
+    expect(harness.setError).toHaveBeenCalledWith(GnosisPayError.NO_WALLET_CONNECTED);
+    expect(submitTask).not.toHaveBeenCalled();
+    expect(get(harness.signingInProgress)).toBe(false);
+  });
+
+  it('should sign in successfully and invoke onSignInComplete', async () => {
+    const onSignInComplete = vi.fn();
+    const harness = makeHarness();
+    runTaskResult.mockImplementationOnce(async () => makeSuccess('nonce-123'));
+    runTaskResult.mockImplementationOnce(async () => makeSuccess(true));
+
+    const { signInWithEthereum } = useGnosisPaySigning({ ...harness, onSignInComplete });
+    await signInWithEthereum();
+
+    expect(fetchNonce).not.toHaveBeenCalled();
+    expect(submitTask).toHaveBeenCalledTimes(2);
+    expect(signMessage).toHaveBeenCalledTimes(1);
+    const signedMessage = String(signMessage.mock.calls[0][0].message);
+    expect(signedMessage).toContain(CONNECTED_ADDRESS);
+    expect(signedMessage).toContain('Nonce: nonce-123');
+    expect(get(harness.signInSuccess)).toBe(true);
+    expect(onSignInComplete).toHaveBeenCalled();
+    expect(get(harness.signingInProgress)).toBe(false);
+  });
+
+  it('should drop the session-expired warning once the signature is verified', async () => {
+    const harness = makeHarness();
+    runTaskResult.mockImplementationOnce(async () => makeSuccess('nonce'));
+    runTaskResult.mockImplementationOnce(async () => makeSuccess(true));
+
+    const { signInWithEthereum } = useGnosisPaySigning(harness);
+    await signInWithEthereum();
+
+    expect(removeMatching).toHaveBeenCalledTimes(1);
+
+    const predicate = removeMatching.mock.calls[0][0];
+    expect(predicate(createMock<NotificationData>({ group: NotificationGroup.GNOSIS_PAY_SESSION_EXPIRED }))).toBe(true);
+    expect(predicate(createMock<NotificationData>({ group: NotificationGroup.MISSING_API_KEY }))).toBe(false);
+  });
+
+  it('should keep the session-expired warning when verification returns false', async () => {
+    const harness = makeHarness();
+    runTaskResult.mockImplementationOnce(async () => makeSuccess('nonce'));
+    runTaskResult.mockImplementationOnce(async () => makeSuccess(false));
+
+    const { signInWithEthereum } = useGnosisPaySigning(harness);
+    await signInWithEthereum();
+
+    expect(removeMatching).not.toHaveBeenCalled();
+  });
+
+  it('should put a bare authority on line 1 and the full url in URI', async () => {
+    const harness = makeHarness();
+    runTaskResult.mockImplementationOnce(async () => makeSuccess('nonce-123'));
+    runTaskResult.mockImplementationOnce(async () => makeSuccess(true));
+
+    const { signInWithEthereum } = useGnosisPaySigning(harness);
+    await signInWithEthereum();
+
+    const lines = String(signMessage.mock.calls[0][0].message).split('\n');
+    expect(lines[0]).toBe('rotki.com wants you to sign in with your Ethereum account:');
+    expect(lines).toContain('URI: https://rotki.com');
+  });
+
+  it('should bail out when fetching the nonce fails actionably', async () => {
+    const harness = makeHarness();
+    runTaskResult.mockImplementationOnce(async () => makeFailure('nonce error'));
+
+    const { signInWithEthereum } = useGnosisPaySigning(harness);
+    await signInWithEthereum();
+
+    expect(showErrorMessage).toHaveBeenCalled();
+    expect(signMessage).not.toHaveBeenCalled();
+    expect(get(harness.signInSuccess)).toBe(false);
+  });
+
+  it('should not show error message when nonce fetch is cancelled', async () => {
+    const harness = makeHarness();
+    runTaskResult.mockImplementationOnce(async () => makeFailure('cancelled', { cancelled: true }));
+
+    const { signInWithEthereum } = useGnosisPaySigning(harness);
+    await signInWithEthereum();
+
+    expect(showErrorMessage).not.toHaveBeenCalled();
+    expect(signMessage).not.toHaveBeenCalled();
+  });
+
+  it('should bail out when verification fails', async () => {
+    const harness = makeHarness();
+    runTaskResult.mockImplementationOnce(async () => makeSuccess('nonce'));
+    runTaskResult.mockImplementationOnce(async () => makeFailure('verify failed'));
+
+    const { signInWithEthereum } = useGnosisPaySigning(harness);
+    await signInWithEthereum();
+
+    expect(showErrorMessage).toHaveBeenCalled();
+    expect(get(harness.signInSuccess)).toBe(false);
+  });
+
+  it('should show generic failure when verification returns false', async () => {
+    const harness = makeHarness();
+    runTaskResult.mockImplementationOnce(async () => makeSuccess('nonce'));
+    runTaskResult.mockImplementationOnce(async () => makeSuccess(false));
+
+    const { signInWithEthereum } = useGnosisPaySigning(harness);
+    await signInWithEthereum();
+
+    expect(showErrorMessage).toHaveBeenCalled();
+    expect(get(harness.signInSuccess)).toBe(false);
+  });
+
+  it('should detect a user-rejected signature error', async () => {
+    const harness = makeHarness();
+    runTaskResult.mockImplementationOnce(async () => makeSuccess('nonce'));
+    signMessage.mockRejectedValueOnce(new Error('User rejected the request'));
+
+    const { signInWithEthereum } = useGnosisPaySigning(harness);
+    await signInWithEthereum();
+
+    expect(harness.setError).toHaveBeenCalledWith(GnosisPayError.SIGNATURE_REJECTED);
+    expect(showErrorMessage).not.toHaveBeenCalled();
+  });
+
+  it('should show a generic error when signing throws an unknown error', async () => {
+    const harness = makeHarness();
+    runTaskResult.mockImplementationOnce(async () => makeSuccess('nonce'));
+    signMessage.mockRejectedValueOnce(new Error('boom'));
+
+    const { signInWithEthereum } = useGnosisPaySigning(harness);
+    await signInWithEthereum();
+
+    expect(harness.setError).not.toHaveBeenCalledWith(GnosisPayError.SIGNATURE_REJECTED);
+    expect(showErrorMessage).toHaveBeenCalled();
+  });
+
+  it('should use the wallet-connect provider when in walletconnect mode', async () => {
+    set(walletMode, 'walletconnect');
+    const harness = makeHarness();
+    runTaskResult.mockImplementationOnce(async () => makeSuccess('nonce'));
+    runTaskResult.mockImplementationOnce(async () => makeSuccess(true));
+
+    const { signInWithEthereum } = useGnosisPaySigning(harness);
+    await signInWithEthereum();
+
+    expect(wcGetWalletClient).toHaveBeenCalled();
+    expect(injectedGetWalletClient).not.toHaveBeenCalled();
+  });
+
+  it('should always reset signingInProgress when finished', async () => {
+    const harness = makeHarness();
+    runTaskResult.mockImplementationOnce(async () => {
+      throw new Error('unexpected');
+    });
+
+    const { signInWithEthereum } = useGnosisPaySigning(harness);
+    await signInWithEthereum();
+
+    expect(get(harness.signingInProgress)).toBe(false);
+  });
+
+  it('should run the task helpers with the expected task types', async () => {
+    const harness = makeHarness();
+    runTaskResult.mockImplementationOnce(async (fn: () => Promise<string>) => {
+      await fn();
+      return makeSuccess('nonce');
+    });
+    runTaskResult.mockImplementationOnce(async (fn: () => Promise<boolean>) => {
+      await fn();
+      return makeSuccess(true);
+    });
+
+    const { signInWithEthereum } = useGnosisPaySigning(harness);
+    await signInWithEthereum();
+
+    expect(fetchNonce).toHaveBeenCalled();
+    expect(verifySiweSignature).toHaveBeenCalled();
+    const verifyArgs = verifySiweSignature.mock.calls[0];
+    expect(verifyArgs[0]).toContain(CONNECTED_ADDRESS);
+    expect(verifyArgs[1]).toBe('0xSignature');
+  });
+});

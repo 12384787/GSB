@@ -1,0 +1,151 @@
+<script setup lang="ts">
+import type { PullEventPayload } from '@/modules/history/events/event-payloads';
+import { HistoryEventEntryType } from '@rotki/common';
+import { useSupportedChains } from '@/modules/core/common/use-supported-chains';
+import { initialIndexerOrder } from '@/modules/history/events/components/redecode-indexer-order';
+import SettingsItem from '@/modules/settings/controls/SettingsItem.vue';
+import { PrioritizedListData } from '@/modules/settings/types/prioritized-list-data';
+import {
+  BLOCKSCOUT_PRIO_LIST_ITEM,
+  ETHERSCAN_PRIO_LIST_ITEM,
+  type PrioritizedListId,
+  ROUTESCAN_PRIO_LIST_ITEM,
+} from '@/modules/settings/types/prioritized-list-id';
+import { useEvmIndexerSettings } from '@/modules/settings/use-evm-indexer-settings';
+import PrioritizedList from '@/modules/shell/components/PrioritizedList.vue';
+
+const show = defineModel<boolean>('show', { required: true });
+
+const { payload, hasCustomEvents, showIndexerOptions } = defineProps<{
+  payload: PullEventPayload | undefined;
+  hasCustomEvents?: boolean;
+  showIndexerOptions?: boolean;
+}>();
+
+const emit = defineEmits<{
+  confirm: [event: { payload: PullEventPayload; deleteCustom: boolean; customIndexersOrder?: string[] }];
+}>();
+
+const deleteCustom = ref<boolean>(false);
+const localIndexerOrder = ref<PrioritizedListId[]>([]);
+
+const forceDeleteCustom = computed<boolean>(() => !!hasCustomEvents);
+
+const { t } = useI18n({ useScope: 'global' });
+const { getEvmChainName } = useSupportedChains();
+const { defaultEvmIndexerOrder, evmIndexersOrder } = useEvmIndexerSettings();
+
+const availableIndexers = new PrioritizedListData<PrioritizedListId>([
+  ETHERSCAN_PRIO_LIST_ITEM,
+  BLOCKSCOUT_PRIO_LIST_ITEM,
+  ROUTESCAN_PRIO_LIST_ITEM,
+]);
+
+const isEvmEvent = computed<boolean>(() => {
+  if (!payload)
+    return false;
+
+  return payload.type === HistoryEventEntryType.EVM_EVENT
+    || payload.type === HistoryEventEntryType.EVM_SWAP_EVENT;
+});
+
+const evmChainName = computed<string | undefined>(() => {
+  if (!payload)
+    return undefined;
+
+  // Type guard: EVM events have LocationAndTxRef as data, ETH block events have number[]
+  if (payload.type === HistoryEventEntryType.EVM_EVENT || payload.type === HistoryEventEntryType.EVM_SWAP_EVENT) {
+    return getEvmChainName(payload.data.location);
+  }
+
+  return undefined;
+});
+
+function resetState(): void {
+  set(deleteCustom, get(forceDeleteCustom));
+  set(localIndexerOrder, initialIndexerOrder(
+    get(evmChainName),
+    get(evmIndexersOrder),
+    get(defaultEvmIndexerOrder),
+  ));
+}
+
+function confirmRedecode(): void {
+  if (payload) {
+    const indexerOrder = get(localIndexerOrder);
+    emit('confirm', {
+      customIndexersOrder: get(isEvmEvent) && indexerOrder.length > 0 ? indexerOrder : undefined,
+      deleteCustom: get(deleteCustom),
+      payload,
+    });
+  }
+  set(show, false);
+  resetState();
+}
+
+watchImmediate(show, (value) => {
+  if (value) {
+    resetState();
+  }
+});
+</script>
+
+<template>
+  <RuiDialog
+    v-model="show"
+    :max-width="700"
+  >
+    <RuiCard :class-names="{ content: '!pt-0' }">
+      <template #header>
+        {{ t('transactions.actions.redecode_events') }}
+      </template>
+
+      <!-- Custom events warning - only show when there are custom events -->
+      <RuiAlert
+        v-if="hasCustomEvents"
+        type="warning"
+        class="mb-4"
+      >
+        {{ t('transactions.events.confirmation.reset.custom_events_warning') }}
+      </RuiAlert>
+
+      <!-- Indexer order section for EVM events (only when showIndexerOptions is true) -->
+      <SettingsItem
+        v-if="showIndexerOptions && isEvmEvent"
+        class="!py-0 !border-0"
+      >
+        <template #title>
+          {{ t('transactions.events.confirmation.reset.indexer_order_title') }}
+        </template>
+        <template #subtitle>
+          {{ t('transactions.events.confirmation.reset.indexer_order_hint') }}
+        </template>
+        <RuiAlert
+          v-if="localIndexerOrder.length === 0"
+          type="warning"
+          class="mb-4"
+        >
+          {{ t('evm_settings.indexer.no_indexers_warning') }}
+        </RuiAlert>
+        <PrioritizedList
+          v-model="localIndexerOrder"
+          dense
+          :all-items="availableIndexers"
+          :item-data-name="t('evm_settings.indexer.data_name')"
+          :disable-delete="localIndexerOrder.length <= 1"
+          variant="flat"
+        />
+      </SettingsItem>
+
+      <template #footer>
+        <div class="grow" />
+        <RuiButton
+          color="primary"
+          @click="confirmRedecode()"
+        >
+          {{ t('common.actions.proceed') }}
+        </RuiButton>
+      </template>
+    </RuiCard>
+  </RuiDialog>
+</template>

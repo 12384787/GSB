@@ -1,0 +1,177 @@
+import type { RotkiApi } from '@/modules/core/api/rotki-api';
+import type { useInterop } from '@/modules/shell/app/use-electron-interop';
+import { createMock } from '@test/utils/create-mock';
+import flushPromises from 'flush-promises';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { useLogout } from '@/modules/auth/use-logout';
+
+const mockResetSchedulerState = vi.fn();
+const mockNavigateToUserLogin = vi.fn();
+const mockCallLogout = vi.fn();
+const mockGetLoggedUsers = vi.fn();
+const mockDisconnectWallet = vi.fn();
+const mockNotifyUserLogout = vi.fn();
+const mockResetMcpSession = vi.fn();
+const mockResetTray = vi.fn();
+const mockSetMessage = vi.fn();
+const mockLogged = ref<boolean>(true);
+const mockUsername = ref<string>('testuser');
+
+vi.mock('@/modules/session/use-scheduler-state', () => ({
+  useSchedulerState: vi.fn(() => ({
+    reset: mockResetSchedulerState,
+  })),
+}));
+
+vi.mock('@/modules/shell/layout/use-navigation', () => ({
+  useAppNavigation: vi.fn(() => ({
+    navigateToUserLogin: mockNavigateToUserLogin,
+  })),
+}));
+
+vi.mock('@/modules/auth/use-users-api', () => ({
+  useUsersApi: vi.fn(() => ({
+    logout: mockCallLogout,
+    loggedUsers: mockGetLoggedUsers,
+  })),
+}));
+
+vi.mock('@/modules/wallet/use-wallet-store', () => ({
+  disconnectWalletIfActive: async (): Promise<void> => mockDisconnectWallet(),
+}));
+
+vi.mock('@/modules/shell/app/use-electron-interop', () => ({
+  useInterop: vi.fn(() => createMock<ReturnType<typeof useInterop>>({
+    notifyUserLogout: mockNotifyUserLogout,
+    resetMcpSession: mockResetMcpSession,
+    resetTray: mockResetTray,
+  })),
+}));
+
+vi.mock('@/modules/core/common/use-message-store', () => ({
+  useMessageStore: vi.fn(() => ({
+    setMessage: mockSetMessage,
+  })),
+}));
+
+vi.mock('@/modules/auth/use-session-auth-store', () => ({
+  useSessionAuthStore: vi.fn(() => ({
+    logged: mockLogged,
+    username: mockUsername,
+  })),
+}));
+
+vi.mock('@/modules/core/api/rotki-api', () => ({
+  api: createMock<RotkiApi>({
+    cancel: vi.fn(),
+    cancelAllQueued: vi.fn(),
+  }),
+}));
+
+vi.mock('@/modules/core/common/logging/logging', () => ({
+  logger: {
+    error: vi.fn(),
+  },
+}));
+
+vi.mock('@vueuse/core', async () => {
+  const actual = await vi.importActual('@vueuse/core');
+  return {
+    ...actual,
+    promiseTimeout: vi.fn().mockResolvedValue(undefined),
+  };
+});
+
+describe('modules::account::use-logout', () => {
+  beforeEach(() => {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+
+    set(mockLogged, true);
+    set(mockUsername, 'testuser');
+
+    mockCallLogout.mockResolvedValue(undefined);
+    mockDisconnectWallet.mockResolvedValue(undefined);
+    mockNavigateToUserLogin.mockResolvedValue(undefined);
+    mockGetLoggedUsers.mockResolvedValue([]);
+    mockResetMcpSession.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe('logout', () => {
+    it('should call resetSchedulerState when logout is called', async () => {
+      const { logout } = useLogout();
+
+      await logout();
+      await flushPromises();
+
+      expect(mockResetSchedulerState).toHaveBeenCalledTimes(1);
+    });
+
+    it('should call resetSchedulerState before other logout operations', async () => {
+      const callOrder: string[] = [];
+
+      mockResetSchedulerState.mockImplementation(() => {
+        callOrder.push('resetSchedulerState');
+      });
+      mockNotifyUserLogout.mockImplementation(() => {
+        callOrder.push('notifyUserLogout');
+      });
+      mockDisconnectWallet.mockImplementation(async () => {
+        callOrder.push('disconnectWallet');
+      });
+
+      const { logout } = useLogout();
+
+      await logout();
+      await flushPromises();
+
+      expect(callOrder[0]).toBe('resetSchedulerState');
+      expect(callOrder).toContain('notifyUserLogout');
+      expect(callOrder).toContain('disconnectWallet');
+    });
+
+    it('should call resetSchedulerState even if logout fails', async () => {
+      mockCallLogout.mockRejectedValue(new Error('Logout failed'));
+
+      const { logout } = useLogout();
+
+      await logout();
+      await flushPromises();
+
+      expect(mockResetSchedulerState).toHaveBeenCalledTimes(1);
+    });
+
+    it('should reset the MCP session after backend logout', async () => {
+      const callOrder: string[] = [];
+      mockCallLogout.mockImplementation(async () => {
+        callOrder.push('backendLogout');
+      });
+      mockResetMcpSession.mockImplementation(async () => {
+        callOrder.push('resetMcpSession');
+      });
+
+      const { logout } = useLogout();
+
+      await logout();
+
+      expect(callOrder).toEqual(['backendLogout', 'resetMcpSession']);
+    });
+  });
+
+  it('should skip the backend call but still clean up locally after a restart', async () => {
+    const { logout } = useLogout();
+    await logout(true, { skipBackendCall: true });
+    await flushPromises();
+
+    expect(mockCallLogout).not.toHaveBeenCalled();
+    expect(mockDisconnectWallet).toHaveBeenCalled();
+    expect(mockResetSchedulerState).toHaveBeenCalled();
+    expect(mockResetTray).toHaveBeenCalled();
+    expect(mockNavigateToUserLogin).toHaveBeenCalled();
+    expect(get(mockLogged)).toBe(false);
+  });
+});

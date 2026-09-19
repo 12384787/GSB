@@ -1,0 +1,507 @@
+from collections import defaultdict
+from unittest.mock import patch
+
+import pytest
+
+from rotkehlchen.accounting.structures.balance import Balance, BalanceSheet
+from rotkehlchen.assets.asset import EvmToken
+from rotkehlchen.chain.aggregator import CHAIN_TO_BALANCE_PROTOCOLS, ChainsAggregator
+from rotkehlchen.chain.balances import BlockchainBalances
+from rotkehlchen.chain.ethereum.modules.liquity.constants import CPT_LIQUITY
+from rotkehlchen.chain.evm.types import string_to_evm_address
+from rotkehlchen.chain.structures import EvmTokenDetectionData
+from rotkehlchen.constants import DEFAULT_BALANCE_LABEL, ONE, ZERO
+from rotkehlchen.constants.assets import A_BCH, A_BTC, A_DAI, A_ETH, A_EUR, A_LQTY, A_POL
+from rotkehlchen.db.cache import DBCacheDynamic
+from rotkehlchen.db.settings import CachedSettings
+from rotkehlchen.fval import FVal
+from rotkehlchen.globaldb.handler import GlobalDBHandler
+from rotkehlchen.history.types import HistoricalPrice, HistoricalPriceOracle
+from rotkehlchen.inquirer import Inquirer
+from rotkehlchen.tests.utils.factories import UNIT_BTC_ADDRESS1, make_evm_address
+from rotkehlchen.tests.utils.xpubs import setup_db_for_xpub_tests_impl
+from rotkehlchen.types import (
+    ChainID,
+    ChecksumEvmAddress,
+    Price,
+    SupportedBlockchain,
+    Timestamp,
+    TokenKind,
+)
+
+OPTIMISM_OP_TOKEN = EvmToken.initialize(
+    address=string_to_evm_address('0x4200000000000000000000000000000000000042'),
+    chain_id=ChainID.OPTIMISM,
+    token_kind=TokenKind.ERC20,
+)
+OPTIMISM_USDC_TOKEN = EvmToken.initialize(
+    address=string_to_evm_address('0x7F5c764cBc14f9669B88837ca1490cCa17c31607'),
+    chain_id=ChainID.OPTIMISM,
+    token_kind=TokenKind.ERC20,
+)
+
+ETH_ADDRESS1 = string_to_evm_address('0xbB8311c7bAD518f0D8f907Cad26c5CcC85a06dC4')
+ETH_ADDRESS2 = string_to_evm_address('0xc37b40ABdB939635068d3c5f13E7faF686F03B65')
+
+
+@pytest.fixture(name='use_db')
+def fixture_use_db():
+    return False
+
+
+@pytest.fixture(name='blockchain_balances')
+def fixture_blockchain_balances(use_db, data_dir, username, sql_vm_instructions_cb):
+    if use_db is True:
+        db, _, xpub2, _, all_btc_addresses = setup_db_for_xpub_tests_impl(data_dir, username, sql_vm_instructions_cb)  # noqa: E501
+        xpub_data = xpub2
+        a = BlockchainBalances(db)
+        for btc_addy in all_btc_addresses:
+            a.btc[btc_addy] = Balance(amount=ONE, value=ONE)
+    else:
+        a = BlockchainBalances(None)
+        a.btc[UNIT_BTC_ADDRESS1] = Balance(amount=ONE, value=ONE)
+        a.bch[UNIT_BTC_ADDRESS1] = Balance(amount=ONE, value=ONE)
+        all_btc_addresses = (UNIT_BTC_ADDRESS1,)
+        xpub_data = None
+
+    address1 = make_evm_address()
+    address2 = make_evm_address()
+    a.eth[address1] = BalanceSheet()
+    a.eth[address1].assets[A_ETH][DEFAULT_BALANCE_LABEL] = Balance(amount=ONE, value=ONE)
+    a.optimism[address2].assets[OPTIMISM_OP_TOKEN][DEFAULT_BALANCE_LABEL] = Balance(amount=ONE, value=ONE)  # noqa: E501
+    a.optimism[address2].assets[A_ETH][DEFAULT_BALANCE_LABEL] = Balance(amount=ONE, value=ONE)
+
+    yield a, address1, address2, all_btc_addresses, xpub_data
+    if use_db is True:
+        db.logout()
+
+
+def test_copy():
+    a = BlockchainBalances(None)
+    address = make_evm_address()
+    a.eth[address] = BalanceSheet()
+    a.eth[address].assets[A_ETH][DEFAULT_BALANCE_LABEL] = Balance(amount=ONE, value=ONE)
+    b = a.copy()
+
+    a.eth[address].assets[A_ETH][DEFAULT_BALANCE_LABEL] += Balance(amount=ONE, value=ONE)
+
+    assert a.eth[address].assets[A_ETH][DEFAULT_BALANCE_LABEL] == Balance(amount=FVal('2'), value=FVal('2'))  # noqa: E501
+    assert b.eth[address].assets[A_ETH][DEFAULT_BALANCE_LABEL] == Balance(amount=ONE, value=ONE)
+
+
+def test_recalculate_totals(blockchain_balances):
+    a, address1, address2, _, _ = blockchain_balances
+    assert a.recalculate_totals() == BalanceSheet(
+        assets={
+            OPTIMISM_OP_TOKEN: {DEFAULT_BALANCE_LABEL: Balance(amount=ONE, value=ONE)},
+            A_ETH: {DEFAULT_BALANCE_LABEL: Balance(amount=FVal('2'), value=FVal('2'))},
+            A_BTC: {DEFAULT_BALANCE_LABEL: Balance(amount=ONE, value=ONE)},
+            A_BCH: {DEFAULT_BALANCE_LABEL: Balance(amount=ONE, value=ONE)},
+        },
+    )
+
+    # do a change and see it's taken into account at recalculate
+    a.eth[address2] = BalanceSheet()
+    a.eth[address2].assets[A_ETH][DEFAULT_BALANCE_LABEL] = Balance(amount=ONE, value=ONE)
+    a.eth[address1].assets[A_ETH][DEFAULT_BALANCE_LABEL] = Balance(amount=FVal('4'), value=FVal('4'))  # noqa: E501
+    a.bch[UNIT_BTC_ADDRESS1] = Balance(amount=FVal('5'), value=FVal('5'))
+    a.optimism[address2].assets[OPTIMISM_USDC_TOKEN][DEFAULT_BALANCE_LABEL] = Balance(amount=FVal('100'), value=FVal('100'))  # noqa: E501
+    a.optimism[address2].assets.pop('ETH')
+    assert a.recalculate_totals() == BalanceSheet(
+        assets={
+            OPTIMISM_OP_TOKEN: {DEFAULT_BALANCE_LABEL: Balance(amount=ONE, value=ONE)},
+            OPTIMISM_USDC_TOKEN:  {DEFAULT_BALANCE_LABEL: Balance(amount=FVal('100'), value=FVal('100'))},  # noqa: E501
+            A_ETH: {DEFAULT_BALANCE_LABEL: Balance(amount=FVal('5'), value=FVal('5'))},
+            A_BTC: {DEFAULT_BALANCE_LABEL: Balance(amount=ONE, value=ONE)},
+            A_BCH: {DEFAULT_BALANCE_LABEL: Balance(amount=FVal('5'), value=FVal('5'))},
+        },
+    )
+
+
+@pytest.mark.parametrize('use_db', [True])
+def test_serialize(blockchain_balances):
+    a, address1, address2, _, xpub_data = blockchain_balances
+    optimism_chain_key = SupportedBlockchain.OPTIMISM.serialize()
+    ethereum_chain_key = SupportedBlockchain.ETHEREUM.serialize()
+    expected_serialized_dict = {
+        SupportedBlockchain.BITCOIN.serialize(): {
+            'standalone': {
+                '12wxFzpjdymPk3xnHmdDLCTXUT9keY3XRd': {'amount': '1', 'value': '1'},
+                '16zNpyv8KxChtjXnE5nYcPqcXcrSQXX2JW': {'amount': '1', 'value': '1'},
+                '16zNpyv8KxChtjXnE5oYcPqcXcrSQXX2JJ': {'amount': '1', 'value': '1'},
+                '1LZypJUwJJRdfdndwvDmtAjrVYaHko136r': {'amount': '1', 'value': '1'},
+                '1MKSdDCtBSXiE49vik8xUG2pTgTGGh5pqe': {'amount': '1', 'value': '1'}},
+            'xpubs': [
+                {
+                    'addresses': {
+                        'bc1qc3qcxs025ka9l6qn0q5cyvmnpwrqw2z49qwrx5': {'amount': '1', 'value': '1'},  # noqa: E501
+                        'bc1qnus7355ecckmeyrmvv56mlm42lxvwa4wuq5aev': {'amount': '1', 'value': '1'},  # noqa: E501
+                        'bc1qr4r8vryfzexvhjrx5fh5uj0s2ead8awpqspqra': {'amount': '1', 'value': '1'},  # noqa: E501
+                        'bc1qr5r8vryfzexvhjrx5fh5uj0s2ead8awpqspalz': {'amount': '1', 'value': '1'},  # noqa: E501
+                        'bc1qup7f8g5k3h5uqzfjed03ztgn8hhe542w69wc0g': {'amount': '1', 'value': '1'},  # noqa: E501
+                    },
+                    'derivation_path': 'm/0',
+                    'xpub': xpub_data.xpub.xpub}]},
+        ethereum_chain_key: {
+            address1: {
+                'assets': {'ETH': {DEFAULT_BALANCE_LABEL: {'amount': '1', 'value': '1'}}},
+                'liabilities': {},
+            },
+        },
+        optimism_chain_key: {
+            address2: {
+                'assets': {
+                    'ETH': {DEFAULT_BALANCE_LABEL: {'amount': '1', 'value': '1'}},
+                    OPTIMISM_OP_TOKEN.serialize(): {DEFAULT_BALANCE_LABEL: {'amount': '1', 'value': '1'}},  # noqa: E501
+                },
+                'liabilities': {},
+            },
+        },
+    }
+    assert a.serialize(given_chain=None) == expected_serialized_dict
+
+    # change something and see it is also reflected in the serialized dict
+    a.optimism[address2].assets[OPTIMISM_USDC_TOKEN][DEFAULT_BALANCE_LABEL] = Balance(amount=FVal('100'), value=FVal('100'))  # noqa: E501
+    expected_serialized_dict[optimism_chain_key][address2]['assets'][OPTIMISM_USDC_TOKEN.serialize()] = {DEFAULT_BALANCE_LABEL: {'amount': '100', 'value': '100'}}  # noqa: E501
+    a.eth[address1].assets.pop(A_ETH.identifier)
+    expected_serialized_dict[ethereum_chain_key][address1] = {'assets': {}, 'liabilities': {}}
+    assert a.serialize(given_chain=None) == expected_serialized_dict
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [[ETH_ADDRESS1, ETH_ADDRESS2]])
+@pytest.mark.parametrize('ethereum_modules', [['liquity']])
+def test_protocol_balances(blockchain: ChainsAggregator) -> None:
+    """
+    Test that liquity is injected in balances properly when querying module balances.
+    ETH_ADDRESS1 has a DSProxy with deposits in liquity and ETH_ADDRESS2 doesn't have anything
+    """
+    blockchain._add_eth_protocol_balances(eth_balances=blockchain.balances.eth)
+    # the proxy balances are added to the owner's
+    assert blockchain.balances.eth[ETH_ADDRESS1].assets == {
+        A_LQTY: {CPT_LIQUITY: Balance(
+            amount=FVal('24534.358910568761255258'),
+            value=FVal('36801.5383658531418828870'),
+        )},
+    }
+    assert blockchain.balances.eth[ETH_ADDRESS2].assets == {}
+
+
+def test_partial_balance_refresh_keeps_other_accounts(blockchain: ChainsAggregator) -> None:
+    """Test that refreshing balances for a subset of addresses does not replace the
+    balance sheets of the other tracked accounts.
+
+    Protocol balance queries (query_protocols_with_balance/_add_eth_protocol_balances)
+    return entries for any tracked address with protocol activity, not only the queried
+    ones. Before the fix those entries replaced the other accounts' full balance sheets
+    with protocol-only data.
+    """
+    refreshed_address, other_address = make_evm_address(), make_evm_address()
+    other_sheet = BalanceSheet()
+    other_sheet.assets[A_ETH][DEFAULT_BALANCE_LABEL] = Balance(amount=ONE, value=ONE)
+    other_sheet.assets[A_DAI][DEFAULT_BALANCE_LABEL] = Balance(amount=FVal('100'), value=FVal('100'))  # noqa: E501
+    blockchain.balances.eth[other_address] = other_sheet
+
+    refreshed_sheet = BalanceSheet()
+    refreshed_sheet.assets[A_ETH][DEFAULT_BALANCE_LABEL] = Balance(amount=FVal('2'), value=FVal('2'))  # noqa: E501
+    protocol_only_sheet = BalanceSheet()  # what a protocol query returns for the non-queried address  # noqa: E501
+    protocol_only_sheet.assets[A_LQTY][CPT_LIQUITY] = Balance(amount=ONE, value=ONE)
+
+    with patch.object(
+        blockchain,
+        'query_eth_balances',
+        return_value={
+            refreshed_address: refreshed_sheet,
+            other_address: protocol_only_sheet,
+        },
+    ):
+        blockchain._query_chain_balances(
+            blockchain=SupportedBlockchain.ETHEREUM,
+            addresses=[refreshed_address],
+        )
+
+    assert blockchain.balances.eth[refreshed_address] == refreshed_sheet
+    assert blockchain.balances.eth[other_address] == other_sheet
+
+
+@pytest.mark.parametrize('number_of_eth_accounts', [2])
+def test_full_balance_refresh_preserves_disabled_addresses(
+        blockchain: ChainsAggregator,
+        ethereum_accounts: list[ChecksumEvmAddress],
+) -> None:
+    """A full refresh replaces active addresses but freezes disabled-address balances."""
+    active_address, disabled_address = ethereum_accounts
+    old_active_sheet = BalanceSheet()
+    old_active_sheet.assets[A_ETH][DEFAULT_BALANCE_LABEL] = Balance(amount=ONE)
+    old_disabled_sheet = BalanceSheet()
+    old_disabled_sheet.assets[A_ETH][DEFAULT_BALANCE_LABEL] = Balance(amount=FVal('2'))
+    blockchain.balances.eth[active_address] = old_active_sheet
+    blockchain.balances.eth[disabled_address] = old_disabled_sheet
+
+    new_active_sheet = BalanceSheet()
+    new_active_sheet.assets[A_ETH][DEFAULT_BALANCE_LABEL] = Balance(amount=FVal('3'))
+    new_disabled_sheet = BalanceSheet()
+    new_disabled_sheet.assets[A_ETH][DEFAULT_BALANCE_LABEL] = Balance(amount=FVal('4'))
+
+    CachedSettings().update_entry(
+        'disabled_chain_queries',
+        {SupportedBlockchain.ETHEREUM: frozenset({disabled_address})},
+    )
+    try:
+        with patch.object(
+            blockchain,
+            'query_eth_balances',
+            return_value={
+                active_address: new_active_sheet,
+                disabled_address: new_disabled_sheet,
+            },
+        ) as query_eth_balances:
+            blockchain._query_chain_balances(
+                blockchain=SupportedBlockchain.ETHEREUM,
+                ignore_cache=True,
+            )
+
+        query_eth_balances.assert_called_once_with((active_address,))
+        assert blockchain.balances.eth[active_address] == new_active_sheet
+        assert blockchain.balances.eth[disabled_address] == old_disabled_sheet
+    finally:
+        CachedSettings().update_entry('disabled_chain_queries', {})
+
+
+@pytest.mark.parametrize('number_of_eth_accounts', [1])
+def test_fully_disabled_chain_balance_refresh_is_frozen(
+        blockchain: ChainsAggregator,
+        ethereum_accounts: list[ChecksumEvmAddress],
+) -> None:
+    """A fully disabled chain keeps its balances and is not queried by a full refresh."""
+    account = ethereum_accounts[0]
+    sheet = BalanceSheet()
+    sheet.assets[A_ETH][DEFAULT_BALANCE_LABEL] = Balance(amount=ONE)
+    blockchain.balances.eth[account] = sheet
+
+    CachedSettings().update_entry(
+        'disabled_chain_queries',
+        {SupportedBlockchain.ETHEREUM: frozenset()},
+    )
+    try:
+        with patch.object(blockchain, 'query_eth_balances') as query_eth_balances:
+            blockchain.query_balances(
+                blockchain=SupportedBlockchain.ETHEREUM,
+                ignore_cache=True,
+            )
+
+        query_eth_balances.assert_not_called()
+        assert blockchain.balances.eth[account] == sheet
+    finally:
+        CachedSettings().update_entry('disabled_chain_queries', {})
+
+
+def test_protocol_balance_refresh_uses_requested_addresses(
+        blockchain: ChainsAggregator,
+) -> None:
+    requested_addresses = [make_evm_address()]
+
+    class ProtocolBalances:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def query_balances(self, addresses: list[ChecksumEvmAddress]) -> dict:
+            assert addresses == requested_addresses
+            return {}
+
+    with patch.dict(
+        CHAIN_TO_BALANCE_PROTOCOLS,
+        {ChainID.ETHEREUM: (ProtocolBalances,)},
+    ):
+        blockchain.get_chain_manager(
+            blockchain=SupportedBlockchain.ETHEREUM,
+        ).query_protocols_with_balance(
+            balances=defaultdict(BalanceSheet),
+            addresses=requested_addresses,
+        )
+
+
+def test_blockchain_balances_cache_removes_spent_token(blockchain: ChainsAggregator) -> None:
+    """Test that refreshing an address removes token balances no longer returned."""
+    address = make_evm_address()
+    asset_balances = blockchain.balances.eth[address].assets
+    asset_balances[A_ETH][DEFAULT_BALANCE_LABEL] = Balance(amount=ONE)
+    asset_balances[A_DAI][DEFAULT_BALANCE_LABEL] = Balance(amount=FVal('2'))
+    blockchain._update_blockchain_balances_cache(
+        blockchain=SupportedBlockchain.ETHEREUM,
+        addresses=[address],
+    )
+
+    del asset_balances[A_DAI]
+    blockchain._update_blockchain_balances_cache(
+        blockchain=SupportedBlockchain.ETHEREUM,
+        addresses=[address],
+    )
+
+    with blockchain.database.conn.read_ctx() as cursor:
+        cached_rows = cursor.execute(
+            'SELECT asset, amount FROM blockchain_balances_cache WHERE blockchain=? AND '
+            'address=? ORDER BY asset',
+            (SupportedBlockchain.ETHEREUM.serialize(), address),
+        ).fetchall()
+
+    assert cached_rows == [(A_ETH.identifier, '1')]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('polygon_pos_accounts', [['0x4bBa290826C253BD854121346c370a9886d1bC26']])
+def test_native_token_balance(
+        blockchain: ChainsAggregator,
+        polygon_pos_accounts: list[ChecksumEvmAddress],
+):
+    """
+    Test that for different blockchains different assets are used as native tokens.
+    We test it by requesting a Polygon POS balance and checking MATIC balance.
+    """
+    address = polygon_pos_accounts[0]
+    sorted_call_order = sorted(blockchain.polygon_pos.node_inquirer.default_call_order())  # type: ignore
+
+    def mock_default_call_order(skip_indexers: bool = False):  # pylint: disable=unused-argument
+        # return sorted_call_order to remove randomness, and thus make it vcr'able
+        return sorted_call_order
+
+    usdc = EvmToken('eip155:137/erc20:0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359')
+    weth = EvmToken('eip155:137/erc20:0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619')
+    usdt = EvmToken('eip155:137/erc20:0xc2132D05D31c914a87C6611C10748AEb04B58e8F')
+    pol = A_POL.resolve_to_evm_token()
+
+    with (
+        patch.object(blockchain.polygon_pos.node_inquirer, 'default_call_order', mock_default_call_order),  # noqa: E501
+        patch(
+            'rotkehlchen.globaldb.handler.GlobalDBHandler.get_token_detection_data',
+            new=lambda *args, **kwargs: ([EvmTokenDetectionData(
+                identifier=pol.identifier,
+                address=pol.evm_address,
+                decimals=pol.decimals,  # type: ignore
+            ), EvmTokenDetectionData(
+                identifier=usdc.identifier,
+                address=usdc.evm_address,
+                decimals=usdc.decimals,  # type: ignore
+            ), EvmTokenDetectionData(
+                identifier=weth.identifier,
+                address=weth.evm_address,
+                decimals=weth.decimals,  # type: ignore
+            ), EvmTokenDetectionData(
+                identifier=usdt.identifier,
+                address=usdt.evm_address,
+                decimals=usdt.decimals,  # type: ignore
+            )], []),
+        ),
+    ):
+        blockchain.polygon_pos.tokens.detect_tokens(
+            only_cache=False,
+            addresses=[address],
+        )
+        blockchain._query_chain_balances(blockchain=SupportedBlockchain.POLYGON_POS)
+        balances = blockchain.balances.polygon_pos[address].assets
+        assert balances == {
+            pol: {DEFAULT_BALANCE_LABEL: Balance(
+                amount=FVal('8.204435619126641457'),
+                value=FVal('12.3066534286899621855'),
+            )},
+            usdc: {DEFAULT_BALANCE_LABEL: Balance(amount=FVal('0.33078'), value=FVal(0.496170))},
+            weth: {DEFAULT_BALANCE_LABEL: Balance(
+                amount=FVal('0.007712106620416874'),
+                value=FVal(0.0115681599306253110),
+            )},
+            usdt: {DEFAULT_BALANCE_LABEL: Balance(amount=FVal('0.074222'), value=FVal(0.1113330))},
+        }
+
+
+@pytest.mark.parametrize('number_of_eth_accounts', [0])
+@pytest.mark.parametrize('gnosis_accounts', [['0x586AD5760a2fe5847c58deEc2933e11B5f595dBF']])
+def test_cached_gnosis_balance_uses_manual_current_price(
+        blockchain: ChainsAggregator,
+        gnosis_accounts: list[ChecksumEvmAddress],
+) -> None:
+    """Regression test for cached GET repricing preferring manual current prices.
+
+    Reproduces issue 1 from the aGnoEURe investigation: when blockchain balances are
+    read from the DB cache, a manual current price must take precedence over any
+    historical price found at ``last_refresh_ts``.
+    """
+    assert len(gnosis_accounts) == 1
+    address = gnosis_accounts[0]
+    manual_price = FVal('5')
+    historical_price = FVal('1')
+    amount = FVal('65.748178097718409869')
+
+    gnosis_token = EvmToken.initialize(
+        address=string_to_evm_address('0xEdBC7449a9b594CA4E053D9737EC5Dc4CbCcBfb2'),
+        chain_id=ChainID.GNOSIS,
+        token_kind=TokenKind.ERC20,
+    )
+    blockchain.balances.gnosis[address] = BalanceSheet()
+    blockchain.balances.gnosis[address].assets[gnosis_token]['aave-v3'] = Balance(
+        amount=amount,
+        value=ZERO,
+    )
+    blockchain._update_blockchain_balances_cache(
+        blockchain=SupportedBlockchain.GNOSIS,
+        addresses=None,
+    )
+
+    refresh_ts = Timestamp(1_700_000_000)
+    with blockchain.database.user_write() as write_cursor:
+        blockchain.database.set_dynamic_cache(
+            write_cursor=write_cursor,
+            name=DBCacheDynamic.LAST_BLOCKCHAIN_BALANCES_QUERY_TS,
+            value=refresh_ts,
+            blockchain=SupportedBlockchain.GNOSIS.serialize(),
+        )
+
+    GlobalDBHandler.add_historical_prices([HistoricalPrice(
+        from_asset=gnosis_token,
+        to_asset=A_EUR,
+        source=HistoricalPriceOracle.MANUAL,
+        timestamp=refresh_ts,
+        price=Price(historical_price),
+    )])
+    GlobalDBHandler.add_manual_latest_price(
+        from_asset=gnosis_token,
+        to_asset=A_EUR,
+        price=Price(manual_price),
+    )
+    blockchain.balances.gnosis.clear()
+
+    with patch.object(
+        GlobalDBHandler,
+        'get_manual_current_price',
+        side_effect=AssertionError('cached balance repricing should prefetch manual prices'),
+    ):
+        balances_update = blockchain.get_balances_update(
+            chain=SupportedBlockchain.GNOSIS,
+            from_cache=True,
+        )
+
+    assert gnosis_token in balances_update.totals.assets
+    assert balances_update.totals.assets[gnosis_token]['aave-v3'].value == amount * manual_price
+
+
+def test_only_cache_repricing_does_not_query_price_oracles() -> None:
+    """A cache-only balance read must not fetch a missing manual-price conversion online."""
+    with (
+        patch.object(Inquirer, 'get_cached_current_price_entry', return_value=None),
+        patch.object(
+            Inquirer,
+            'find_price',
+            side_effect=AssertionError(
+                'cache-only balance repricing must not query price oracles',
+            ),
+        ),
+    ):
+        price = ChainsAggregator.get_price_for_cached_balances(
+            asset=A_ETH.resolve_to_crypto_asset(),
+            timestamp=Timestamp(1_700_000_000),
+            main_currency=A_EUR,
+            price_cache={},
+            manual_current_prices={A_ETH.identifier: (A_BTC, Price(ONE))},
+            only_cache=True,
+        )
+
+    assert price == ZERO

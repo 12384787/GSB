@@ -1,0 +1,319 @@
+from typing import TYPE_CHECKING, Any, Final
+
+from eth_utils import to_checksum_address
+
+from rotkehlchen.assets.utils import asset_normalized_value, asset_raw_value
+from rotkehlchen.chain.decoding.types import CounterpartyDetails
+from rotkehlchen.chain.evm.constants import CLAIM_REWARD_TOPIC, ZERO_ADDRESS
+from rotkehlchen.chain.evm.decoding.interfaces import EvmDecoderInterface
+from rotkehlchen.chain.evm.decoding.structures import (
+    DEFAULT_EVM_DECODING_OUTPUT,
+    ActionItem,
+    DecoderContext,
+    EvmDecodingOutput,
+)
+from rotkehlchen.constants.assets import A_ETH
+from rotkehlchen.history.events.structures.evm_event import (
+    BRIDGE_EXTRA_DATA_KEY,
+    BridgeExtraData,
+)
+from rotkehlchen.history.events.structures.types import HistoryEventSubType, HistoryEventType
+from rotkehlchen.types import ChainID, SupportedBlockchain
+from rotkehlchen.utils.misc import bytes_to_address
+
+from .constants import CPT_ZKSYNC, ZKSYNC_BRIDGE, ZKSYNC_LITE_SUNSET_CLAIM
+
+if TYPE_CHECKING:
+    from rotkehlchen.chain.evm.structures import EvmTxReceiptLog
+    from rotkehlchen.types import ChecksumEvmAddress
+
+ONCHAIN_DEPOSIT: Final = b'\xb6\x86k\x02\x9f:\xa2\x9c\xd9\xe2\xbf\xf8\x15\x9a\x8c\xca\xa48\x9fz\x08|q\th\xe0\xb2\x00\xc0\xc7;\x08'  # noqa: E501
+DEPOSIT: Final = b'\x8f_QD\x83\x94i\x9a\xd6\xa3\xb8\x0c\xda\xdfN\xc6\x8c]rL\x8c?\xea\t\xbe\xa5[<-\x0e-\xd0'  # noqa: E501
+NEW_PRIORITY_REQUEST: Final = b'\xd0\x943r\xc0\x8bC\x8a\x88\xd4\xb3\x9dw!i\x01\x07\x9e\xda\x9c\xa5\x9dE4\x98A\xc0\x99\x08;h0'  # noqa: E501
+PENDING_WITHDRAWALS_COMPLETE: Final = b'\x9bTx\xc9\x9b\\\xa4\x1b\xee\xc4\xf6\xf6\x08A&\xd6\xf9\xe2c\x82\xd0\x17\xb4\xbbg\xc3|\x9e\x84S\xa3\x13'  # noqa: E501
+WITHDRAWAL: Final = b'\xef\xefa\x9a\xe4\xa5B\xa2\xb8\x81\x0bN\xfe\xcc\xd8G\x8b\xd6\x83\xe9\x855N\xe3\x1d\xd2\xd6D\xaf\xf6\xd0\xca'  # noqa: E501
+# Withdrawal(uint16 indexed tokenId, uint128 amount), the bridge's original payout event.
+# 0xf4bf32c167ee6e782944cd1db8174729b46adcd3bc732e282cc4a80793933154. Unlike the one above
+# it does not log who was paid, so its transfer is found by amount alone.
+LEGACY_WITHDRAWAL: Final = b'\xf4\xbf2\xc1g\xeenx)D\xcd\x1d\xb8\x17G)\xb4j\xdc\xd3\xbcs.(,\xc4\xa8\x07\x93\x931T'  # noqa: E501
+
+
+class ZksyncDecoder(EvmDecoderInterface):
+
+    @staticmethod
+    def _find_priority_deposit_log(context: DecoderContext) -> EvmTxReceiptLog | None:
+        """Find the NewPriorityRequest log of a deposit priority operation if any exists"""
+        for tx_log in context.all_logs:
+            if (
+                    tx_log.topics[0] == NEW_PRIORITY_REQUEST and
+                    int.from_bytes(tx_log.data[64:96]) == 1  # 1 is the deposit op type
+            ):
+                return tx_log
+
+        return None
+
+    @staticmethod
+    def _withdrawal_bridge_extra_data(to_address: str | None) -> dict[str, BridgeExtraData]:
+        """Create the bridge extra data of a withdrawal from zksync lite to ethereum"""
+        bridge_data = BridgeExtraData(
+            from_chain=SupportedBlockchain.ZKSYNC_LITE.serialize(),
+            to_chain=ChainID.ETHEREUM.serialize(),
+        )
+        if to_address is not None:
+            bridge_data['to_address'] = to_address
+        return {BRIDGE_EXTRA_DATA_KEY: bridge_data}
+
+    def _decode_event(self, context: DecoderContext) -> EvmDecodingOutput:
+        if context.tx_log.topics[0] == ONCHAIN_DEPOSIT:
+            priority_log = self._find_priority_deposit_log(context)
+            return self._decode_deposit(
+                context=context,
+                user_address=bytes_to_address(context.tx_log.topics[1]),
+                recipient=bytes_to_address(context.tx_log.topics[3]),
+                serial_id=str(int.from_bytes(priority_log.data[32:64])) if priority_log is not None else None,  # noqa: E501
+            )
+        elif context.tx_log.topics[0] == DEPOSIT:
+            if (priority_log := self._find_priority_deposit_log(context)) is not None:
+                # the deposit pubdata is opType, accountId, tokenId and amount (whose sizes
+                # differ per contract version) with the zksync lite recipient as its last 20 bytes
+                pubdata_offset = int.from_bytes(priority_log.data[96:128])
+                pubdata_end = pubdata_offset + 32 + int.from_bytes(priority_log.data[pubdata_offset:pubdata_offset + 32])  # noqa: E501
+                return self._decode_deposit(
+                    context=context,
+                    user_address=bytes_to_address(priority_log.data[0:32]),
+                    recipient=to_checksum_address(priority_log.data[pubdata_end - 20:pubdata_end]),
+                    serial_id=str(int.from_bytes(priority_log.data[32:64])),
+                )
+        elif context.tx_log.topics[0] == PENDING_WITHDRAWALS_COMPLETE:
+            return self._decode_withdrawal(context)
+        elif context.tx_log.topics[0] == WITHDRAWAL:
+            return self._decode_single_withdrawal(context)
+        elif context.tx_log.topics[0] == LEGACY_WITHDRAWAL:
+            return self._decode_legacy_withdrawal(context)
+        elif context.tx_log.topics[0] == CLAIM_REWARD_TOPIC:
+            return self._decode_sunset_claim(context)
+
+        return DEFAULT_EVM_DECODING_OUTPUT
+
+    def _decode_deposit(
+            self,
+            context: DecoderContext,
+            user_address: ChecksumEvmAddress,
+            recipient: ChecksumEvmAddress,
+            serial_id: str | None,
+    ) -> EvmDecodingOutput:
+        """Match a zksync lite deposit with the transfer to decode it
+
+        TODO: This is now quite bad. We don't use the token id of zksync as we should.
+        Example: https://etherscan.io/tx/0xdd6d1f92980faf622c09acd84dbff4fe0bd7ae466a23c2479df709f8996d250e#eventlog
+        We should include the zksync api querying module which is in this PR:
+        https://github.com/rotki/rotki/pull/3985/files
+        to get the ids of tokens and then match them to what is deposited.
+        """
+        amount_raw = int.from_bytes(context.tx_log.data)
+
+        for event in context.decoded_events:
+            if event.event_type == HistoryEventType.SPEND and event.location_label == user_address:
+                resolved_event_asset = event.asset.resolve_to_crypto_asset()
+                event_raw_amount = asset_raw_value(
+                    amount=event.amount,
+                    asset=resolved_event_asset,
+                )
+                if event_raw_amount != amount_raw:
+                    continue
+
+                # found the deposit transfer
+                event.event_type = HistoryEventType.DEPOSIT
+                event.event_subtype = HistoryEventSubType.BRIDGE
+                event.counterparty = CPT_ZKSYNC
+                crypto_asset = resolved_event_asset
+                event.notes = f'Deposit {event.amount} {crypto_asset.symbol} to zksync'
+                bridge_data = BridgeExtraData(
+                    from_chain=ChainID.ETHEREUM.serialize(),
+                    to_chain=SupportedBlockchain.ZKSYNC_LITE.serialize(),
+                    from_address=user_address,
+                    to_address=recipient,
+                )
+                if serial_id is not None:
+                    bridge_data['transfer_id'] = serial_id
+                event.extra_data = {BRIDGE_EXTRA_DATA_KEY: bridge_data}
+                break
+
+        return DEFAULT_EVM_DECODING_OUTPUT
+
+    def _decode_withdrawal(self, context: DecoderContext) -> EvmDecodingOutput:
+        """Decode zksync lite withdrawal event.
+        The log event doesn't contain information about the withdrawn
+        amount or token since there are multiple withdrawals bundled together
+        """
+        for event in context.decoded_events:
+            if event.event_type == HistoryEventType.RECEIVE and event.event_subtype == HistoryEventSubType.NONE:  # noqa: E501
+                event.event_type = HistoryEventType.WITHDRAWAL
+                event.event_subtype = HistoryEventSubType.BRIDGE
+                event.counterparty = CPT_ZKSYNC
+                event.notes = f'Withdraw {event.amount} {event.asset.symbol_or_name()} from zksync'
+                event.extra_data = self._withdrawal_bridge_extra_data(event.location_label)
+
+        return DEFAULT_EVM_DECODING_OUTPUT
+
+    def _decode_sunset_claim(self, context: DecoderContext) -> EvmDecodingOutput:
+        """Decode a ZKsync Lite sunset claim."""
+        if not self.base.is_tracked(user_address := bytes_to_address(context.tx_log.data[32:64])):
+            return DEFAULT_EVM_DECODING_OUTPUT
+
+        token_address = bytes_to_address(context.tx_log.data[64:96])
+        amount = asset_normalized_value(
+            amount=int.from_bytes(context.tx_log.data[96:128]),
+            asset=(asset := self.base.get_token_or_native(token_address)),
+        )
+        for event in context.decoded_events:
+            if (
+                    event.event_type == HistoryEventType.RECEIVE and
+                    event.event_subtype == HistoryEventSubType.NONE and
+                    event.location_label == user_address and
+                    event.address == ZKSYNC_LITE_SUNSET_CLAIM and
+                    event.asset == asset and
+                    (
+                        event.amount == amount or
+                        token_address == ZERO_ADDRESS
+                    )
+            ):
+                event.event_type = HistoryEventType.WITHDRAWAL
+                event.event_subtype = HistoryEventSubType.BRIDGE
+                event.counterparty = CPT_ZKSYNC
+                event.notes = (
+                    f'Claim {event.amount} {event.asset.symbol_or_name()} '
+                    f'from the ZKsync Lite sunset'
+                )
+                event.address = ZKSYNC_LITE_SUNSET_CLAIM
+                event.extra_data = self._withdrawal_bridge_extra_data(user_address)
+                return DEFAULT_EVM_DECODING_OUTPUT
+
+        if token_address != ZERO_ADDRESS:
+            return EvmDecodingOutput(action_items=[ActionItem(
+                action='transform',
+                from_event_type=HistoryEventType.RECEIVE,
+                from_event_subtype=HistoryEventSubType.NONE,
+                asset=asset,
+                amount=amount,
+                location_label=user_address,
+                to_event_type=HistoryEventType.WITHDRAWAL,
+                to_event_subtype=HistoryEventSubType.BRIDGE,
+                to_notes='Claim {amount} {symbol} from the ZKsync Lite sunset',
+                to_counterparty=CPT_ZKSYNC,
+                to_address=ZKSYNC_LITE_SUNSET_CLAIM,
+                extra_data=self._withdrawal_bridge_extra_data(user_address),
+            )])
+
+        return EvmDecodingOutput(events=[self.base.make_event_from_transaction(
+            transaction=context.transaction,
+            tx_log=context.tx_log,
+            event_type=HistoryEventType.WITHDRAWAL,
+            event_subtype=HistoryEventSubType.BRIDGE,
+            asset=asset,
+            amount=amount,
+            location_label=user_address,
+            notes=f'Claim {amount} {asset.symbol} from the ZKsync Lite sunset',
+            counterparty=CPT_ZKSYNC,
+            address=ZKSYNC_LITE_SUNSET_CLAIM,
+            extra_data=self._withdrawal_bridge_extra_data(user_address),
+        )])
+
+    def _decode_legacy_withdrawal(self, context: DecoderContext) -> EvmDecodingOutput:
+        """Decode a payout logged by the bridge's original Withdrawal event.
+
+        That event names the token but not who was paid, so the transfer it belongs to is
+        found by its amount among the receives from the bridge decoded so far. The token id
+        cannot narrow it down further since rotki does not map zksync token ids to assets.
+        Both the erc20 transfer log and the internal transaction an eth payout arrives in
+        are decoded before this log, so the receive is always already there.
+        """
+        amount_raw = int.from_bytes(context.tx_log.data)
+        for event in context.decoded_events:
+            if (
+                    event.event_type == HistoryEventType.RECEIVE and
+                    event.event_subtype == HistoryEventSubType.NONE and
+                    event.address == ZKSYNC_BRIDGE and
+                    event.location_label is not None and
+                    asset_raw_value(
+                        amount=event.amount,
+                        asset=event.asset.resolve_to_crypto_asset(),
+                    ) == amount_raw
+            ):
+                event.event_type = HistoryEventType.WITHDRAWAL
+                event.event_subtype = HistoryEventSubType.BRIDGE
+                event.counterparty = CPT_ZKSYNC
+                event.notes = f'Withdraw {event.amount} {event.asset.symbol_or_name()} from zksync'
+                event.extra_data = self._withdrawal_bridge_extra_data(event.location_label)
+                break
+
+        return DEFAULT_EVM_DECODING_OUTPUT
+
+    def _decode_single_withdrawal(self, context: DecoderContext) -> EvmDecodingOutput:
+        """Decode a single zksync lite withdrawal event from batched withdrawals."""
+        if not self.base.is_tracked(user_address := bytes_to_address(context.tx_log.topics[1])):
+            return DEFAULT_EVM_DECODING_OUTPUT
+
+        amount_raw = int.from_bytes(context.tx_log.data)
+        for event in context.decoded_events:
+            if (
+                    event.event_type == HistoryEventType.RECEIVE and
+                    event.event_subtype == HistoryEventSubType.NONE and
+                    event.location_label == user_address and
+                    asset_raw_value(
+                        amount=event.amount,
+                        asset=event.asset.resolve_to_crypto_asset(),
+                    ) == amount_raw
+            ):
+                event.event_type = HistoryEventType.WITHDRAWAL
+                event.event_subtype = HistoryEventSubType.BRIDGE
+                event.counterparty = CPT_ZKSYNC
+                event.notes = f'Withdraw {event.amount} {event.asset.symbol_or_name()} from zksync'
+                event.extra_data = self._withdrawal_bridge_extra_data(user_address)
+                break
+        else:  # no matching transfer found
+            if int.from_bytes(context.tx_log.topics[2]) != 0:  # non-ETH token
+                return EvmDecodingOutput(action_items=[ActionItem(
+                    action='transform',
+                    from_event_type=HistoryEventType.RECEIVE,
+                    from_event_subtype=HistoryEventSubType.NONE,
+                    location_label=user_address,
+                    to_event_type=HistoryEventType.WITHDRAWAL,
+                    to_event_subtype=HistoryEventSubType.BRIDGE,
+                    to_notes='Withdraw {amount} {symbol} from zksync',
+                    to_counterparty=CPT_ZKSYNC,
+                    to_address=ZKSYNC_BRIDGE,
+                    extra_data=self._withdrawal_bridge_extra_data(user_address),
+                )])
+
+            amount = asset_normalized_value(
+                amount=amount_raw,
+                asset=(asset := A_ETH.resolve_to_crypto_asset()),
+            )
+            return EvmDecodingOutput(events=[self.base.make_event_from_transaction(
+                transaction=context.transaction,
+                tx_log=context.tx_log,
+                event_type=HistoryEventType.WITHDRAWAL,
+                event_subtype=HistoryEventSubType.BRIDGE,
+                asset=asset,
+                amount=amount,
+                location_label=user_address,
+                notes=f'Withdraw {amount} {asset.symbol} from zksync',
+                counterparty=CPT_ZKSYNC,
+                address=ZKSYNC_BRIDGE,
+                extra_data=self._withdrawal_bridge_extra_data(user_address),
+            )])
+
+        return DEFAULT_EVM_DECODING_OUTPUT
+
+    # -- DecoderInterface methods
+
+    def addresses_to_decoders(self) -> dict[ChecksumEvmAddress, tuple[Any, ...]]:
+        return {
+            ZKSYNC_BRIDGE: (self._decode_event,),
+            ZKSYNC_LITE_SUNSET_CLAIM: (self._decode_event,),
+        }
+
+    @staticmethod
+    def counterparties() -> tuple[CounterpartyDetails, ...]:
+        return (CounterpartyDetails(identifier=CPT_ZKSYNC, label='zkSync', image='zksync.jpg'),)

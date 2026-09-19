@@ -1,0 +1,156 @@
+name: Rotki Nightly Tests
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  push:
+    branches:
+      - tests
+  workflow_dispatch:
+
+permissions: { }
+
+jobs:
+  linux:
+    uses: ./.github/workflows/task_backend_tests.yml
+    if: ${{ github.repository == 'rotki/rotki' || github.event_name != 'schedule' }}
+    with:
+      os: ubuntu-22.04
+      test_environment: nightly
+      collect_coverage: true
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    permissions:
+      contents: read
+
+  macos:
+    uses: ./.github/workflows/task_backend_tests.yml
+    if: ${{ always() && (github.repository == 'rotki/rotki' || github.event_name != 'schedule') }}
+    needs: [ 'linux' ]
+    with:
+      os: macos-latest
+      test_environment: nightly
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    permissions:
+      contents: read
+
+  windows:
+    uses: ./.github/workflows/task_backend_tests.yml
+    if: ${{ always() && (github.repository == 'rotki/rotki' || github.event_name != 'schedule') }}
+    with:
+      os: windows-latest
+      test_environment: nightly
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    permissions:
+      contents: read
+
+  e2e:
+    uses: ./.github/workflows/task_e2e_tests.yml
+    if: ${{ always() && (github.repository == 'rotki/rotki' || github.event_name != 'schedule') }}
+    needs: [ 'macos' ]
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    permissions:
+      contents: read
+
+  backend-coverage:
+    name: 'Backend coverage upload'
+    if: ${{ always() && (github.repository == 'rotki/rotki' || github.event_name != 'schedule') }}
+    needs: [ 'linux' ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Load env
+        uses: rotki/action-env@49f59e650cfdc8796c4ac6533ec044b190d83f9a  # v4.0.0
+        with:
+          env_file: .github/.env.ci
+
+      - name: Setup python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          freethreaded: true
+          cache: 'pip'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          enable-cache: true
+          version: ${{ env.UV_VERSION }}
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --locked --group dev --group lint --group ci
+
+      - name: Download coverage artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: coverage-ubuntu-22.04-*
+          merge-multiple: true
+          path: coverage_artifacts
+
+      - name: Combine coverage
+        run: |
+          uv run coverage combine coverage_artifacts/.coverage.*
+          uv run coverage xml -o coverage.xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
+        with:
+          flags: backend-nightly
+          files: coverage.xml
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  unittest-frontend:
+    uses: ./.github/workflows/task_fe_unit_tests.yml
+    if: ${{ always() && (github.repository == 'rotki/rotki' || github.event_name != 'schedule') }}
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    permissions:
+      contents: read
+
+  verify-link:
+    uses: ./.github/workflows/task_fe_external_links_verification.yml
+    if: ${{ always() && (github.repository == 'rotki/rotki' || github.event_name != 'schedule') }}
+    permissions:
+      contents: read
+
+  notify:
+    name: 'Success check'
+    if: ${{ always() && (github.repository == 'rotki/rotki' || github.event_name != 'schedule') }}
+    needs: [ 'linux', 'macos', 'windows', 'backend-coverage' ]
+    runs-on: ubuntu-latest
+    environment: nightly_notify
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check if any task failed
+        run: |
+          data=($(echo "${RESULT}" | sed 's/[][,"]//g'))
+          echo "Processing ${#data[@]} entries"
+          for idx in "${!data[@]}"
+          do
+            echo "Processing entry $idx: ${data[$idx]}"
+            if [[ ${data[$idx]} == "failure" ]]; then
+                ./.github/scripts/notifier.py --webhook "$DISCORD_WEBHOOK" --run-id "$GITHUB_RUN_ID" --test
+                exit 1;
+            fi
+          done
+        env:
+          RESULT: ${{ toJSON(needs.*.result) }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}

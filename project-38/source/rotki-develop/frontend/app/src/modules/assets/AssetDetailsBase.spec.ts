@@ -1,0 +1,211 @@
+import type { StubInstance } from '@test/utils/component-vm';
+import type { NftAsset } from '@/modules/assets/nfts';
+import type { AssetActions, AssetDisplay, AssetResolution } from '@/modules/assets/types';
+import { createCustomPinia } from '@test/utils/create-pinia';
+import { mount, type VueWrapper } from '@vue/test-utils';
+import { setActivePinia } from 'pinia';
+import { beforeEach, describe, expect, it } from 'vitest';
+import AssetDetailsBase from '@/modules/assets/AssetDetailsBase.vue';
+
+type AnyPropsWrapper = VueWrapper<StubInstance>;
+
+const ASSET: NftAsset = {
+  identifier: 'eip155:1/erc20:0x6B175474E89094C44Da98b954EedeAC495271d0F',
+  isCustomAsset: false,
+  name: 'Dai Stablecoin',
+  symbol: 'DAI',
+};
+
+const AppImage = {
+  name: 'AppImage',
+  props: ['src', 'size', 'fit'],
+  template: '<img data-testid="app-image" :src="src" />',
+};
+
+/** Declares `changeable`, which the real AssetIcon does not, so the regression test below can see it. */
+const AssetIcon = {
+  name: 'AssetIcon',
+  props: ['identifier', 'size', 'showChain', 'forceChain', 'resolutionOptions', 'optimizeForVirtualScroll', 'changeable'],
+  template: '<div data-testid="asset-icon" />',
+};
+
+const AssetDetailsMenuContent = {
+  name: 'AssetDetailsMenuContent',
+  props: ['asset', 'iconOnly', 'hideActions', 'isCollectionParent'],
+  template: '<div data-testid="menu-content" />',
+};
+
+/** Pass-through stand-in for the real menu, which needs a popper. */
+const RuiMenu = {
+  name: 'RuiMenu',
+  template: '<div data-testid="rui-menu"><slot name="activator" :attrs="{}" /><slot /></div>',
+};
+
+describe('assetDetailsBase', () => {
+  interface Props {
+    asset?: NftAsset;
+    display?: AssetDisplay;
+    actions?: AssetActions;
+    resolution?: AssetResolution;
+  }
+
+  function createWrapper(props: Props = {}): VueWrapper {
+    return mount(AssetDetailsBase, {
+      global: {
+        plugins: [createCustomPinia()],
+        stubs: { AppImage, AssetDetailsMenuContent, AssetIcon, RuiMenu },
+      },
+      props: { asset: ASSET, ...props },
+    });
+  }
+
+  function icon(wrapper: VueWrapper): AnyPropsWrapper {
+    return wrapper.findComponent<StubInstance>({ name: 'AssetIcon' });
+  }
+
+  function listItem(wrapper: VueWrapper): AnyPropsWrapper {
+    return wrapper.findComponent<StubInstance>({ name: 'ListItem' });
+  }
+
+  function menuContent(wrapper: VueWrapper): AnyPropsWrapper {
+    return wrapper.findComponent<StubInstance>({ name: 'AssetDetailsMenuContent' });
+  }
+
+  function appImage(wrapper: VueWrapper): AnyPropsWrapper {
+    return wrapper.findComponent<StubInstance>({ name: 'AppImage' });
+  }
+
+  beforeEach(() => {
+    setActivePinia(createCustomPinia());
+  });
+
+  describe('display defaults', () => {
+    it('should fall back to the default size when no display bag is given', () => {
+      expect(icon(createWrapper()).props('size')).toBe('30px');
+    });
+
+    it('should use the size from the display bag', () => {
+      expect(icon(createWrapper({ display: { size: '48px' } })).props('size')).toBe('48px');
+    });
+
+    it('should keep the default size when the display bag holds an explicit undefined, which a spread would take as the value', () => {
+      expect(icon(createWrapper({ display: { size: undefined } })).props('size')).toBe('30px');
+    });
+
+    it('should draw a roomy list item by default', () => {
+      expect(listItem(createWrapper()).props('size')).toBe('md');
+    });
+
+    it('should draw a compact list item when dense', () => {
+      expect(listItem(createWrapper({ display: { dense: true } })).props('size')).toBe('sm');
+    });
+
+    it('should forward optimizeForVirtualScroll to the icon', () => {
+      expect(icon(createWrapper({ display: { optimizeForVirtualScroll: true } })).props('optimizeForVirtualScroll')).toBe(true);
+    });
+  });
+
+  describe('resolution defaults', () => {
+    it('should associate the asset by default', () => {
+      expect(icon(createWrapper()).props('resolutionOptions')).toStrictEqual({ associate: true });
+    });
+
+    it('should not associate the asset when the resolution bag says so', () => {
+      expect(icon(createWrapper({ resolution: { enableAssociation: false } })).props('resolutionOptions')).toStrictEqual({ associate: false });
+    });
+
+    it('should not pass changeable to the icon, neither as a prop nor as a stray attribute', () => {
+      const wrapper = createWrapper();
+
+      expect(icon(wrapper).props('changeable')).toBeUndefined();
+      expect(wrapper.find('[data-testid="asset-icon"]').attributes('changeable')).toBeUndefined();
+    });
+
+    it('should show the chain by default', () => {
+      expect(icon(createWrapper()).props('showChain')).toBe(true);
+    });
+
+    it('should hide the chain for a collection parent, which stands for several chains', () => {
+      expect(icon(createWrapper({ resolution: { isCollectionParent: true } })).props('showChain')).toBe(false);
+    });
+
+    it('should forward forceChain to the icon', () => {
+      expect(icon(createWrapper({ resolution: { forceChain: 'optimism' } })).props('forceChain')).toBe('optimism');
+    });
+
+    it('should tell the menu content whether this is a collection parent', () => {
+      const wrapper = createWrapper({ resolution: { isCollectionParent: true } });
+
+      expect(menuContent(wrapper).props('isCollectionParent')).toBe(true);
+    });
+  });
+
+  describe('actions', () => {
+    it('should render the menu by default', () => {
+      const wrapper = createWrapper();
+
+      expect(wrapper.find('[data-testid="rui-menu"]').exists()).toBe(true);
+      expect(listItem(wrapper).exists()).toBe(true);
+    });
+
+    it('should skip the menu entirely when hideMenu is set', () => {
+      const wrapper = createWrapper({ actions: { hideMenu: true } });
+
+      expect(wrapper.find('[data-testid="rui-menu"]').exists()).toBe(false);
+      expect(listItem(wrapper).exists()).toBe(true);
+    });
+
+    it('should render the bare image when hideMenu and iconOnly are both set', () => {
+      const wrapper = createWrapper({ actions: { hideMenu: true }, display: { iconOnly: true } });
+
+      expect(wrapper.find('[data-testid="rui-menu"]').exists()).toBe(false);
+      expect(listItem(wrapper).exists()).toBe(false);
+      expect(icon(wrapper).exists()).toBe(true);
+    });
+
+    it('should forward hideActions to the menu content', () => {
+      const wrapper = createWrapper({ actions: { hideActions: true } });
+
+      expect(menuContent(wrapper).props('hideActions')).toBe(true);
+    });
+
+    it('should not hide the menu actions by default', () => {
+      expect(menuContent(createWrapper()).props('hideActions')).toBe(false);
+    });
+  });
+
+  describe('image source', () => {
+    it('should draw the asset icon when the asset has no image url', () => {
+      const wrapper = createWrapper();
+
+      expect(icon(wrapper).exists()).toBe(true);
+      expect(wrapper.find('[data-testid="app-image"]').exists()).toBe(false);
+    });
+
+    it('should draw the image url when the asset has one', () => {
+      const wrapper = createWrapper({ asset: { ...ASSET, imageUrl: 'https://example.com/dai.png' } });
+
+      expect(wrapper.find('[data-testid="app-image"]').attributes('src')).toBe('https://example.com/dai.png');
+      expect(icon(wrapper).exists()).toBe(false);
+    });
+
+    it('should size the image url with the same display size', () => {
+      const wrapper = createWrapper({ asset: { ...ASSET, imageUrl: 'https://example.com/dai.png' }, display: { size: '48px' } });
+
+      expect(appImage(wrapper).props('size')).toBe('48px');
+    });
+  });
+
+  describe('subtitle', () => {
+    it('should show the name under the symbol', () => {
+      expect(listItem(createWrapper()).props('subtitle')).toBe('Dai Stablecoin');
+    });
+
+    it('should leave the name out when it only repeats the symbol', () => {
+      const wrapper = createWrapper({ asset: { ...ASSET, name: 'eth', symbol: 'ETH' } });
+
+      expect(listItem(wrapper).props('title')).toBe('ETH');
+      expect(listItem(wrapper).props('subtitle')).toBe('');
+    });
+  });
+});

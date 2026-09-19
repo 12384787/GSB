@@ -1,0 +1,269 @@
+<script setup lang="ts">
+import type { DataTableColumn } from '@rotki/ui-library';
+import type { ManualBalance, ManualBalanceRequestPayload, ManualBalanceWithPrice } from '@/modules/balances/types/manual-balances';
+import { isEqual } from 'es-toolkit';
+import ManualBalanceMissingAssetWarning
+  from '@/modules/accounts/manual-balances/ManualBalanceMissingAssetWarning.vue';
+import { useManualBalanceFields } from '@/modules/accounts/manual-balances/use-manual-balance-fields';
+import { useManualBalanceTableActions } from '@/modules/accounts/manual-balances/use-manual-balance-table-actions';
+import { type Filters, manualBalanceTagsParams } from '@/modules/accounts/manual-balances/use-manual-balances-filter';
+import { AssetValueDisplay, FiatDisplay, ValueDisplay } from '@/modules/assets/amount-display';
+import AssetDetails from '@/modules/assets/AssetDetails.vue';
+import { useManualBalancesOrLiabilities } from '@/modules/balances/manual/use-manual-balances-or-liabilities';
+import { usePillBarLabels } from '@/modules/core/table/pill/composables/use-pill-bar-labels';
+import PillFilterBar from '@/modules/core/table/pill/PillFilterBar.vue';
+import { TableId, useRememberTableSorting } from '@/modules/core/table/use-remember-table-sorting';
+import { useServerTable, useTableEmptyState } from '@/modules/core/table/use-server-table';
+import LocationDisplay from '@/modules/history/LocationDisplay.vue';
+import { useSetting } from '@/modules/settings/use-setting';
+import RefreshButton from '@/modules/shell/components/RefreshButton.vue';
+import RowActions from '@/modules/shell/components/RowActions.vue';
+import RowAppend from '@/modules/shell/components/RowAppend.vue';
+import TagDisplay from '@/modules/tags/TagDisplay.vue';
+
+const { type } = defineProps<{
+  type: 'liabilities' | 'balances';
+}>();
+
+const emit = defineEmits<{
+  edit: [value: ManualBalance];
+}>();
+
+const { t } = useI18n({ useScope: 'global' });
+
+const tags = ref<string[]>([]);
+
+const { pillParams, source: tagsSource } = manualBalanceTagsParams(tags);
+
+const currencySymbol = useSetting('currencySymbol');
+const { dataSource, fetch, locations } = useManualBalancesOrLiabilities(() => type);
+const { prepareForEdit, pricesLoading, refresh, refreshing, showDeleteConfirmation } = useManualBalanceTableActions();
+
+const modelFilters = ref<Filters>({});
+const fields = useManualBalanceFields(locations, modelFilters);
+const pillLabels = usePillBarLabels();
+
+const {
+  collection: state,
+  error,
+  filter: filters,
+  isLoading: loading,
+  pagination,
+  refetch: fetchData,
+  sort,
+} = useServerTable<
+  ManualBalanceWithPrice,
+  ManualBalanceRequestPayload,
+  Filters
+>({
+  fetch,
+  fields,
+  filters: modelFilters,
+  params: [tagsSource],
+  sort: {
+    default: [
+      {
+        column: 'value',
+        direction: 'desc',
+      },
+    ],
+  },
+  urlState: { mode: 'route' },
+});
+
+const emptyState = useTableEmptyState({ error });
+
+function edit(balance: ManualBalanceWithPrice): void {
+  emit('edit', prepareForEdit(balance));
+}
+
+const cols = computed<DataTableColumn<ManualBalanceWithPrice>[]>(() => [{
+  align: 'center',
+  cellClass: 'py-2 w-[120px]',
+  class: 'w-[120px]',
+  key: 'location',
+  label: t('common.location'),
+}, {
+  key: 'label',
+  label: t('common.label'),
+  sortable: true,
+}, {
+  class: 'w-[12rem] xl:w-[16rem] 2xl:w-[20rem]',
+  key: 'asset',
+  label: t('common.asset'),
+  sortable: true,
+}, {
+  align: 'end',
+  key: 'price',
+  label: t('common.price_in_symbol', {
+    symbol: get(currencySymbol),
+  }),
+  sortable: true,
+}, {
+  align: 'end',
+  key: 'amount',
+  label: t('common.amount'),
+  sortable: true,
+}, {
+  align: 'end',
+  key: 'value',
+  label: t('common.value_in_symbol', {
+    symbol: get(currencySymbol),
+  }),
+  sortable: true,
+}, {
+  align: 'end',
+  cellClass: 'w-[120px]',
+  class: 'w-[120px]',
+  key: 'actions',
+  label: t('common.actions_text'),
+}]);
+
+useRememberTableSorting<ManualBalanceWithPrice>(TableId.MANUAL_BALANCES, sort, cols);
+
+watchImmediate(dataSource, async (newBalances, oldBalances) => {
+  if (isEqual(newBalances, oldBalances))
+    return;
+
+  await fetchData();
+});
+
+watchDebounced(
+  pricesLoading,
+  async (isLoading, wasLoading) => {
+    if (!isLoading && wasLoading)
+      await fetchData();
+  },
+  { debounce: 800, maxWait: 1000 },
+);
+</script>
+
+<template>
+  <RuiCard data-testid="manual-balances">
+    <template #custom-header>
+      <div class="px-4 pt-4">
+        <div class="flex items-center flex-wrap gap-3">
+          <RefreshButton
+            :loading="refreshing"
+            :tooltip="t('manual_balances_table.refresh.tooltip')"
+            @refresh="refresh()"
+          />
+          <!-- No spacer before the bar: pushed right it left a dead gap after the lone refresh
+               button, and the bar is what should take the width the row has left. -->
+          <PillFilterBar
+            v-model:matches="filters"
+            v-model:params="pillParams"
+            class="flex-1 min-w-[16rem]"
+            :fields="fields"
+            :labels="pillLabels"
+          />
+        </div>
+      </div>
+    </template>
+    <RuiDataTable
+      v-model:sort.external="sort"
+      v-model:pagination.external="pagination"
+      outlined
+      dense
+      :loading="loading"
+      :cols="cols"
+      :empty="emptyState"
+      row-attr="label"
+      :rows="state.data"
+      data-testid="manual-balances"
+      class="lg:[&_table]:w-full"
+    >
+      <template #item.label="{ row }">
+        <div
+          class="font-medium !pb-0 text-truncate min-w-[8rem] max-w-[16rem]"
+          :title="row.label"
+          data-testid="label"
+          :class="{
+            'pt-0': !row.tags,
+          }"
+        >
+          {{ row.label }}
+        </div>
+        <div v-if="row.tags">
+          <TagDisplay
+            :tags="row.tags"
+            small
+          />
+        </div>
+      </template>
+      <template #item.asset="{ row }">
+        <AssetDetails
+          v-if="!row.assetIsMissing"
+          class="[&>div]:max-w-[12rem] xl:[&>div]:max-w-[16rem] 2xl:[&>div]:max-w-[20rem]"
+          :asset="row.asset"
+          :actions="{ hideActions: true }"
+        />
+        <ManualBalanceMissingAssetWarning v-else />
+      </template>
+      <template #item.price="{ row }">
+        <FiatDisplay
+          v-if="!row.assetIsMissing"
+          :loading="!row.price || row.price.lt(0)"
+          :value="row.price"
+          :price-asset="row.asset"
+        />
+        <template v-else>
+          -
+        </template>
+      </template>
+      <template #item.amount="{ row }">
+        <ValueDisplay
+          data-testid="manual-balance-amount"
+          :value="row.amount"
+        />
+      </template>
+      <template #item.value="{ row }">
+        <AssetValueDisplay
+          v-if="!row.assetIsMissing"
+          :asset="row.asset"
+          :value="row.value"
+        />
+        <template v-else>
+          -
+        </template>
+      </template>
+      <template #item.location="{ row }">
+        <LocationDisplay
+          :identifier="row.location"
+          data-testid="manual-balance-location"
+        />
+      </template>
+      <template #item.actions="{ row }">
+        <RowActions
+          align="end"
+          :edit-tooltip="t('manual_balances_table.edit_tooltip')"
+          :delete-tooltip="t('manual_balances_table.delete_tooltip')"
+          @edit-click="edit(row)"
+          @delete-click="showDeleteConfirmation(row.identifier)"
+        />
+      </template>
+      <template
+        v-if="state.data.length > 0"
+        #body.append
+      >
+        <RowAppend
+          :label-colspan="5"
+          :right-patch-colspan="1"
+        >
+          <template #label>
+            <span class="p-4">
+              {{ t('common.total') }}
+            </span>
+          </template>
+
+          <FiatDisplay
+            v-if="state.totalValue"
+            class="p-4"
+            data-testid="manual-balance-total"
+            :value="state.totalValue"
+          />
+        </RowAppend>
+      </template>
+    </RuiDataTable>
+  </RuiCard>
+</template>

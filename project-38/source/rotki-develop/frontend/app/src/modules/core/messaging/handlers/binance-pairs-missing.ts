@@ -1,0 +1,22 @@
+import type { NotificationHandler } from '../interfaces';
+import type { BinancePairsMissingData } from '@/modules/core/messaging/types';
+import { NotificationCategory, Priority, Severity } from '@rotki/common';
+import { createNotificationHandler } from '@/modules/core/messaging/utils';
+
+export function createBinancePairsMissingHandler(t: ReturnType<typeof useI18n>['t'], router: ReturnType<typeof useRouter>): NotificationHandler<BinancePairsMissingData> {
+  return createNotificationHandler<BinancePairsMissingData>(({ location, name }) => ({
+    action: {
+      action: async () => router.push({
+        name: '/api-keys/exchanges/',
+        query: { location, name },
+      }),
+      label: t('notification_messages.binance_pairs_missing.action'),
+      persist: true,
+    },
+    category: NotificationCategory.DEFAULT,
+    message: t('notification_messages.binance_pairs_missing.message', { name }),
+    priority: Priority.ACTION,
+    severity: Severity.WARNING,
+    title: t('notification_messages.binance_pairs_missing.title'),
+  }));
+}

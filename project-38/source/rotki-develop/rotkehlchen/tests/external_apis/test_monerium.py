@@ -1,0 +1,553 @@
+import json
+import threading
+import time
+from dataclasses import replace
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
+
+import pytest
+import requests
+
+from rotkehlchen.api.websockets.typedefs import WSMessageType
+from rotkehlchen.chain.evm.decoding.monerium.constants import CPT_MONERIUM
+from rotkehlchen.chain.evm.structures import EvmTxReceipt
+from rotkehlchen.concurrency import spawn, wait
+from rotkehlchen.constants.assets import A_ETH_EURE
+from rotkehlchen.constants.misc import ONE
+from rotkehlchen.db.cache import DBCacheStatic
+from rotkehlchen.db.constants import HISTORY_MAPPING_KEY_STATE, HistoryMappingState
+from rotkehlchen.db.filtering import EvmEventFilterQuery, HistoryEventFilterQuery
+from rotkehlchen.db.history_events import DBHistoryEvents
+from rotkehlchen.errors.misc import RemoteError
+from rotkehlchen.externalapis.monerium import Monerium, MoneriumOAuthClient
+from rotkehlchen.fval import FVal
+from rotkehlchen.history.events.structures.evm_event import BRIDGE_EXTRA_DATA_KEY, EvmEvent
+from rotkehlchen.history.events.structures.types import HistoryEventSubType, HistoryEventType
+from rotkehlchen.tests.fixtures.messages import MockedWsMessage
+from rotkehlchen.tests.utils.api import api_url_for, assert_proper_response
+from rotkehlchen.tests.utils.ethereum import txreceipt_to_data
+from rotkehlchen.tests.utils.factories import make_ethereum_transaction
+from rotkehlchen.tests.utils.premium import MockResponse
+from rotkehlchen.types import ChainID, Location, TimestampMS, deserialize_evm_tx_hash
+from rotkehlchen.utils.misc import ts_now
+
+if TYPE_CHECKING:
+    from rotkehlchen.api.server import APIServer
+    from rotkehlchen.db.dbhandler import DBHandler
+
+
+def mock_monerium_and_run_periodic_task(database: DBHandler, contents: str) -> bool:
+    def mock_orders(*_args: Any, **_kwargs: Any) -> MockResponse:
+        return MockResponse(
+            status_code=HTTPStatus.OK,
+            text=json.dumps({'orders': json.loads(contents)}),
+        )
+
+    with (
+        patch(
+            'rotkehlchen.externalapis.monerium.MoneriumOAuthClient.request',
+            side_effect=mock_orders,
+        ),
+        patch(
+            'rotkehlchen.externalapis.monerium.MoneriumOAuthClient.is_authenticated',
+            return_value=True,
+        ),
+    ):
+        monerium = Monerium(database)
+        assert monerium.oauth_client.is_authenticated()
+        return monerium.get_and_process_orders()
+
+
+def test_send_bank_transfer(database: DBHandler, monerium_credentials: Any) -> None:  # pylint: disable=unused-argument
+    """Test that sending a bank transfer on-chain via monerium is seen via their API
+    and the periodic task identifies the event and properly annotates it"""
+    dbevents = DBHistoryEvents(database)
+    tx_hash = deserialize_evm_tx_hash(val='0x10d953610921f39d9d20722082077e03ec8db8d9c75e4b301d0d552119fd0354')  # noqa: E501
+    amount_str = '1500'
+    user_address = '0x99a0618B846D43E29C15ac468Eae06d03C9243C7'
+    timestamp = TimestampMS(1701765059000)
+    event = EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=171,
+        timestamp=timestamp,
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.NONE,
+        asset=A_ETH_EURE,
+        amount=FVal(amount_str),
+        location_label=user_address,
+        notes=f'Burn {amount_str} EURe',
+        counterparty=CPT_MONERIUM,
+    )
+    with database.user_write() as write_cursor:
+        dbevents.add_history_event(write_cursor=write_cursor, event=event)
+
+    assert mock_monerium_and_run_periodic_task(  # a bank transfer creates no bridge leg
+        database=database,
+        contents='[{"id": "xx-yy", "profile": "zz-yy", "accountId": "aa-yy", "address": "0x99a0618B846D43E29C15ac468Eae06d03C9243C7", "kind": "redeem", "amount": "1500", "currency": "eur", "totalFee": "0", "fees": [], "counterpart": {"details": {"name": "Finanzamt Charlottenburg", "country": "DE", "companyName": "Finanzamt Charlottenburg"}, "identifier": {"iban": "DE94 1005 0000 6600 0464 63", "standard": "iban"}}, "memo": "LohnsteuerQ1", "supportingDocumentId": "", "chain": "ethereum", "network": "mainnet", "meta": {"state": "processed", "txHashes": ["0x10d953610921f39d9d20722082077e03ec8db8d9c75e4b301d0d552119fd0354"], "placedBy": "qq-yy", "placedAt": "2023-10-18T12:09:42.621469Z", "processedAt": "2023-10-18T12:09:43.621469Z", "approvedAt": "2023-10-18T12:09:44.621469Z", "confirmedAt": "2023-10-18T12:09:44.921469Z", "receivedAmount": "1500", "sentAmount": "1500"}}]',  # noqa: E501
+    ) is False
+
+    # Set the expected changes in the event
+    event.notes = 'Send 1500 EURe via bank transfer to Finanzamt Charlottenburg (DE94 1005 0000 6600 0464 63) with memo "LohnsteuerQ1"'  # noqa: E501
+    event.identifier = 1
+    with database.conn.read_ctx() as cursor:
+        new_events = dbevents.get_history_events_internal(
+            cursor=cursor,
+            filter_query=EvmEventFilterQuery.make(
+                tx_hashes=[tx_hash],
+            ),
+        )
+        assert cursor.execute(
+            'SELECT COUNT(*) FROM history_events_mappings '
+            'WHERE parent_identifier = ? AND name = ? AND value = ?',
+            (
+                event.identifier,
+                HISTORY_MAPPING_KEY_STATE,
+                HistoryMappingState.CUSTOMIZED.serialize_for_db(),
+            ),
+        ).fetchone()[0] == 0
+    assert new_events == [event]
+
+
+def test_receive_bank_transfer(database: DBHandler, monerium_credentials: Any) -> None:  # pylint: disable=unused-argument
+    """Test that receiving a bank transfer on-chain via monerium is seen via their API
+    and the periodic task identifies the event and properly annotates it"""
+    dbevents = DBHistoryEvents(database)
+    tx_hash = deserialize_evm_tx_hash(val='0x4ed9db44c5ee4ba6a4cf3e8e9b386f0b857afebad8339a92666e175c747bdd74')  # noqa: E501
+    amount_str = '1500'
+    user_address = '0xbCCeE6Ff2bCAfA95300D222D316A29140c4746da'
+    timestamp = TimestampMS(1701765059000)
+    event = EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=113,
+        timestamp=timestamp,
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.RECEIVE,
+        event_subtype=HistoryEventSubType.NONE,
+        asset=A_ETH_EURE,
+        amount=FVal(amount_str),
+        location_label=user_address,
+        notes=f'Mint {amount_str} EURe',
+        counterparty=CPT_MONERIUM,
+    )
+    with database.user_write() as write_cursor:
+        dbevents.add_history_event(write_cursor=write_cursor, event=event)
+
+    assert mock_monerium_and_run_periodic_task(  # a bank transfer creates no bridge leg
+        database=database,
+        contents='[{"id": "xx-yy", "profile": "zz-yy", "accountId": "aa-yy", "address": "0xbCCeE6Ff2bCAfA95300D222D316A29140c4746da", "kind": "issue", "amount": "1500", "currency": "eur", "totalFee": "0", "fees": [], "counterpart": {"details": {"name": "Payward Ltd", "country": "GB"}, "identifier": {"iban": "GB60 CLJU 0099 7129 9001 60", "standard": "iban"}}, "memo": "Kraken Tx AAA-BBB", "supportingDocumentId": "", "chain": "ethereum", "network": "mainnet", "meta": {"state": "processed", "txHashes": ["0x4ed9db44c5ee4ba6a4cf3e8e9b386f0b857afebad8339a92666e175c747bdd74"], "placedBy": "qq-yy", "placedAt": "2023-10-18T12:09:42.621469Z", "processedAt": "2023-10-18T12:09:43.621469Z", "approvedAt": "2023-10-18T12:09:44.621469Z", "confirmedAt": "2023-10-18T12:09:44.921469Z", "receivedAmount": "1500", "sentAmount": "1500"}}]',  # noqa: E501
+    ) is False
+
+    # Set the expected changes in the event
+    event.notes = 'Receive 1500 EURe via bank transfer from Payward Ltd (GB60 CLJU 0099 7129 9001 60) with memo "Kraken Tx AAA-BBB"'  # noqa: E501
+    event.identifier = 1
+    with database.conn.read_ctx() as cursor:
+        new_events = dbevents.get_history_events_internal(
+            cursor=cursor,
+            filter_query=EvmEventFilterQuery.make(
+                tx_hashes=[tx_hash],
+            ),
+        )
+    assert new_events == [event]
+
+
+def test_bridge_via_monerium(database: DBHandler, monerium_credentials: Any) -> None:  # pylint: disable=unused-argument
+    """Test that the case where the mint is a bridging from one chain to another is handled
+    correctly and that the monerium API result is processed"""
+    dbevents = DBHistoryEvents(database)
+    ethhash = deserialize_evm_tx_hash(val='0x4ed9db44c5ee4ba6a4cf3e8e9b386f0b857afebad8339a92666e175c747bdd74')  # noqa: E501
+    amount_str = '1500'
+    gnosishash = deserialize_evm_tx_hash(val='0x10d953610921f39d9d20722082077e03ec8db8d9c75e4b301d0d552119fd0354')  # noqa: E501
+    eth_user_address = '0x99a0618B846D43E29C15ac468Eae06d03C9243C7'
+    gnosis_user_address = '0xbCCeE6Ff2bCAfA95300D222D316A29140c4746da'
+    timestamp = TimestampMS(1701765059000)
+    eth_event = EvmEvent(
+        tx_ref=ethhash,
+        sequence_index=171,
+        timestamp=timestamp,
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.NONE,
+        asset=A_ETH_EURE,
+        amount=FVal(amount_str),
+        location_label=eth_user_address,
+        notes=f'Burn {amount_str} EURe',
+        counterparty=CPT_MONERIUM,
+    )
+    gnosis_event = EvmEvent(
+        tx_ref=gnosishash,
+        sequence_index=113,
+        timestamp=timestamp,
+        location=Location.GNOSIS,
+        event_type=HistoryEventType.RECEIVE,
+        event_subtype=HistoryEventSubType.NONE,
+        asset=A_ETH_EURE,
+        amount=FVal(amount_str),
+        location_label=gnosis_user_address,
+        notes=f'Mint {amount_str} EURe',
+        counterparty=CPT_MONERIUM,
+    )
+    with database.user_write() as write_cursor:
+        dbevents.add_history_events(write_cursor=write_cursor, history=[eth_event, gnosis_event])
+
+    assert mock_monerium_and_run_periodic_task(  # the caller matches the legs this creates
+        database=database,
+        contents='[{"id": "xx-yy", "profile": "zz-yy", "accountId": "aa-yy", "address": "0xbCCeE6Ff2bCAfA95300D222D316A29140c4746da", "kind": "issue", "amount": "1500", "currency": "eur", "totalFee": "0", "fees": [], "counterpart": {"details": {}, "identifier": {"chain": "ethereum", "address": "0x99a0618B846D43E29C15ac468Eae06d03C9243C7", "network": "mainnet", "standard": "chain"}}, "memo": "Move to Gnosis Chain", "supportingDocumentId": "", "chain": "gnosis", "network": "mainnet", "meta": {"state": "processed", "txHashes": ["0x4ed9db44c5ee4ba6a4cf3e8e9b386f0b857afebad8339a92666e175c747bdd74", "0x10d953610921f39d9d20722082077e03ec8db8d9c75e4b301d0d552119fd0354"], "placedBy": "qq-yy", "placedAt": "2023-10-18T12:09:42.621469Z", "processedAt": "2023-10-18T12:09:43.621469Z", "approvedAt": "2023-10-18T12:09:44.621469Z", "confirmedAt": "2023-10-18T12:09:44.921469Z", "receivedAmount": "1500", "sentAmount": "1500"}},{"id": "pp-yy", "profile": "ll-yy", "accountId": "kk-yy", "address": "0x99a0618B846D43E29C15ac468Eae06d03C9243C7", "kind": "redeem", "amount": "1500", "currency": "eur", "totalFee": "0", "fees": [], "counterpart": {"details": {}, "identifier": {"chain": "gnosis", "address": "0xbCCeE6Ff2bCAfA95300D222D316A29140c4746da", "network": "mainnet", "standard": "chain"}}, "memo": "Move to Gnosis Chain", "supportingDocumentId": "", "chain": "ethereum", "network": "mainnet", "meta": {"state": "processed", "placedBy": "qq-yy", "txHashes": ["0x4ed9db44c5ee4ba6a4cf3e8e9b386f0b857afebad8339a92666e175c747bdd74", "0x10d953610921f39d9d20722082077e03ec8db8d9c75e4b301d0d552119fd0354"], "placedAt": "2023-10-18T12:09:42.621469Z", "processedAt": "2023-10-18T12:09:43.621469Z", "approvedAt": "2023-10-18T12:09:44.621469Z", "confirmedAt": "2023-10-18T12:09:44.921469Z", "receivedAmount": "1500", "sentAmount": "1500"}}]',  # noqa: E501
+    ) is True
+
+    # Set the expected changes in the events. Both legs get the same structured bridge
+    # data, keyed by the pair of tx hashes the two orders of the move share, so the
+    # bridge matcher can pair them exactly instead of guessing from amount and time.
+    bridge_data = {BRIDGE_EXTRA_DATA_KEY: {
+        'from_chain': ChainID.ETHEREUM.serialize(),
+        'to_chain': ChainID.GNOSIS.serialize(),
+        'from_address': eth_user_address,
+        'to_address': gnosis_user_address,
+        'transfer_id': f'{gnosishash!s}-{ethhash!s}',
+    }}
+    eth_event.identifier = 1
+    eth_event.notes = 'Bridge 1500 EURe to gnosis with memo "Move to Gnosis Chain"'
+    eth_event.event_type = HistoryEventType.DEPOSIT
+    eth_event.event_subtype = HistoryEventSubType.BRIDGE
+    eth_event.extra_data = bridge_data
+    gnosis_event.identifier = 2
+    gnosis_event.notes = 'Bridge 1500 EURe from ethereum with memo "Move to Gnosis Chain"'
+    gnosis_event.event_type = HistoryEventType.WITHDRAWAL
+    gnosis_event.event_subtype = HistoryEventSubType.BRIDGE
+    gnosis_event.extra_data = bridge_data
+    with database.conn.read_ctx() as cursor:
+        new_events = dbevents.get_history_events_internal(
+            cursor=cursor,
+            filter_query=EvmEventFilterQuery.make(
+                counterparties=[CPT_MONERIUM],
+            ),
+        )
+    assert new_events == [gnosis_event, eth_event]
+
+
+@pytest.mark.parametrize('default_mock_price_value', [ONE])
+@pytest.mark.parametrize('start_with_valid_premium', [True])
+@pytest.mark.parametrize('have_decoders', [True])
+def test_query_info_on_redecode_request(rotkehlchen_api_server: APIServer) -> None:
+    """Test that triggering a re-decode for a monerium transaction updates correctly the notes"""
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    database = rotki.data.db
+    # TODO: figure out why the fixture `start_with_valid_premium` doesn't activate the premium
+    # by calling the chain aggregator
+    rotki.chains_aggregator.activate_premium_status(rotki.premium)  # type: ignore
+    dbevents = DBHistoryEvents(database)
+    amount_str = '1500'
+    gnosishash = deserialize_evm_tx_hash(val='0x10d953610921f39d9d20722082077e03ec8db8d9c75e4b301d0d552119fd0354')  # noqa: E501
+    gnosis_user_address = '0xbCCeE6Ff2bCAfA95300D222D316A29140c4746da'
+    gnosis_event = EvmEvent(
+        tx_ref=gnosishash,
+        sequence_index=113,
+        timestamp=TimestampMS(1701765059000),
+        location=Location.GNOSIS,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.NONE,
+        asset=A_ETH_EURE,
+        amount=FVal(amount_str),
+        location_label=gnosis_user_address,
+        notes=f'Burn {amount_str} EURe',
+        counterparty=CPT_MONERIUM,
+    )
+    with database.user_write() as write_cursor:
+        database.set_static_cache(
+            write_cursor=write_cursor,
+            name=DBCacheStatic.MONERIUM_OAUTH_CREDENTIALS,
+            value=json.dumps({
+                'access_token': 'mock-access-token',
+                'refresh_token': 'mock-refresh-token',
+                'expires_at': ts_now() + 3600,
+                'client_id': 'mock-client-id',
+                'token_type': 'Bearer',
+                'user_email': 'mock@monerium.com',
+            }),
+        )
+    assert rotki.monerium is not None
+    rotki.monerium.oauth_client.reload_credentials()
+
+    def add_event(self: Any, *args: Any, **kwargs: Any) -> list[EvmEvent]:  # pylint: disable=unused-argument
+        with database.conn.read_ctx() as cursor:
+            # reload data so the monerium decoder inits the api
+            self.reload_data(cursor)
+
+        with database.user_write() as write_cursor:
+            dbevents.add_history_events(write_cursor=write_cursor, history=[gnosis_event])
+
+        # call post process to add metadata into the decoded transaction
+        self._post_process(refresh_balances=False, events=[gnosis_event])
+        return [gnosis_event]
+
+    response_txt = '[{"id":"YYYY","profile":"PP","accountId":"PP","address":"0xbCCeE6Ff2bCAfA95300D222D316A29140c4746da","kind":"redeem","amount":"2353.57","currency":"eur","totalFee":"0","fees":[],"counterpart":{"details":{"name":"Yabir Benchakhtir","country":"ES","lastName":"Benchakhtir","firstName":"Yabir"},"identifier":{"iban":"ESXX KKKK OOOO IIII KKKK LLLL","standard":"iban"}},"memo":"Venta inversion","supportingDocumentId":"","chain":"gnosis","network":"mainnet","meta":{"state":"processed","txHashes":["0x10d953610921f39d9d20722082077e03ec8db8d9c75e4b301d0d552119fd0354"],"placedBy":"ii","placedAt":"2024-04-19T13:45:00.287212Z","processedAt":"2024-04-19T13:45:00.287212Z","approvedAt":"2024-04-19T13:45:00.287212Z","confirmedAt":"2024-04-19T13:45:00.287212Z","receivedAmount":"2353.57","sentAmount":"2353.57"}}]'  # noqa: E501
+    gnosis_transaction = replace(
+        make_ethereum_transaction(tx_hash=gnosishash),
+        chain_id=ChainID.GNOSIS,
+    )
+    with (
+        patch(
+            'rotkehlchen.externalapis.monerium.Monerium._query',
+            return_value={'orders': json.loads(response_txt)},
+        ),
+        patch('rotkehlchen.chain.evm.decoding.decoder.EVMTransactionDecoder.decode_and_get_transaction_hashes', new=add_event),  # noqa: E501
+        patch.object(
+            rotki.chains_aggregator.gnosis.node_inquirer,
+            'get_transaction_by_hash',
+            return_value=(
+                gnosis_transaction,
+                txreceipt_to_data(EvmTxReceipt(
+                    tx_hash=gnosishash,
+                    chain_id=ChainID.GNOSIS,
+                    contract_address=None,
+                    status=True,
+                    tx_type=2,
+                    logs=[],
+                )),
+            ),
+        ),
+    ):
+        response = requests.put(
+            api_url_for(
+                rotkehlchen_api_server,
+                'transactionsdecodingresource',
+            ),
+            json={'chain': 'gnosis', 'tx_refs': [str(gnosishash)]},
+        )
+        assert_proper_response(response)
+
+    with database.conn.read_ctx() as cursor:
+        events = dbevents.get_history_events_internal(
+            cursor=cursor,
+            filter_query=HistoryEventFilterQuery.make(),
+        )
+
+    assert events[0].notes == 'Send 2353.57 EURe via bank transfer to Yabir Benchakhtir (ESXX KKKK OOOO IIII KKKK LLLL) with memo "Venta inversion"'  # noqa: E501
+
+
+def test_concurrent_refresh_is_serialized(database: DBHandler, monerium_credentials: Any) -> None:
+    """Ensure concurrent Monerium queries do not refresh the token twice."""
+    with database.conn.read_ctx() as cursor:
+        cached_value = database.get_static_cache(
+            cursor=cursor,
+            name=DBCacheStatic.MONERIUM_OAUTH_CREDENTIALS,
+        )
+    assert cached_value is not None
+    credentials = json.loads(cached_value)
+    credentials['expires_at'] = ts_now() - 10  # force refresh path
+    with database.user_write() as write_cursor:
+        database.set_static_cache(
+            write_cursor=write_cursor,
+            name=DBCacheStatic.MONERIUM_OAUTH_CREDENTIALS,
+            value=json.dumps(credentials),
+        )
+
+    client = MoneriumOAuthClient(database=database, session=requests.Session())
+    refresh_calls: list[int] = []
+    refresh_started = threading.Event()
+
+    def fake_refresh(self: MoneriumOAuthClient) -> None:
+        refresh_calls.append(ts_now())
+        refresh_started.set()
+        time.sleep(0.1)  # give time for the second task to reach the lock
+        assert self._credentials is not None
+        self._credentials.expires_at = ts_now() + 3600
+
+    with patch.object(
+        MoneriumOAuthClient,
+        '_refresh_access_token',
+        autospec=True,
+        side_effect=fake_refresh,
+    ):
+        first = spawn(client.ensure_access_token)
+        assert refresh_started.wait(timeout=5), 'first task never started refreshing'
+        second = spawn(client.ensure_access_token)
+        wait([first, second])
+
+    assert len(refresh_calls) == 1
+    assert client._credentials is not None
+    assert client._credentials.expires_at > ts_now()
+
+
+@pytest.mark.parametrize('function_scope_initialize_mock_rotki_notifier', [True])
+def test_concurrent_refresh_with_single_monerium_instance_keeps_credentials(
+        database: DBHandler,
+        monerium_credentials: Any,  # pylint: disable=unused-argument
+) -> None:
+    """Ensure concurrent refreshes through the shared Monerium instance don't race."""
+    with database.conn.read_ctx() as cursor:
+        cached_value = database.get_static_cache(
+            cursor=cursor,
+            name=DBCacheStatic.MONERIUM_OAUTH_CREDENTIALS,
+        )
+    assert cached_value is not None
+
+    credentials = json.loads(cached_value)
+    credentials['expires_at'] = ts_now() - 10
+    with database.user_write() as write_cursor:
+        database.set_static_cache(
+            write_cursor=write_cursor,
+            name=DBCacheStatic.MONERIUM_OAUTH_CREDENTIALS,
+            value=json.dumps(credentials),
+        )
+
+    monerium = Monerium(database)
+    post_calls = 0
+    post_started = threading.Event()
+
+    def mock_post(*args: Any, **kwargs: Any) -> MockResponse:  # pylint: disable=unused-argument
+        nonlocal post_calls
+        post_calls += 1
+        post_started.set()
+        time.sleep(0.1)  # give the second task time to wait on the instance lock
+        return MockResponse(
+            status_code=HTTPStatus.OK,
+            text=json.dumps({
+                'access_token': 'new-access-token',
+                'refresh_token': 'new-refresh-token',
+                'expires_in': 3600,
+                'token_type': 'Bearer',
+            }),
+        )
+
+    with patch.object(requests.Session, 'post', side_effect=mock_post):
+        first = spawn(monerium.oauth_client.ensure_access_token)
+        assert post_started.wait(timeout=5), 'first task never started the token refresh post'
+        second = spawn(monerium.oauth_client.ensure_access_token)
+        wait([first, second])
+
+    assert first.exception is None
+    assert second.exception is None
+    assert post_calls == 1
+    with database.conn.read_ctx() as cursor:
+        stored_value = database.get_static_cache(
+            cursor=cursor,
+            name=DBCacheStatic.MONERIUM_OAUTH_CREDENTIALS,
+        )
+    assert stored_value is not None
+    stored_credentials = json.loads(stored_value)
+    assert stored_credentials['access_token'] == 'new-access-token'
+    assert stored_credentials['refresh_token'] == 'new-refresh-token'
+    assert database.msg_aggregator.rotki_notifier.pop_message() is None  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize('function_scope_initialize_mock_rotki_notifier', [True])
+def test_non_revoked_refresh_failure_does_not_notify_reauthentication_needed(
+        database: DBHandler,
+        monerium_credentials: Any,  # pylint: disable=unused-argument
+        caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Ensure unrelated refresh failures don't tell the user to reauthenticate Monerium."""
+    with database.conn.read_ctx() as cursor:
+        cached_value = database.get_static_cache(
+            cursor=cursor,
+            name=DBCacheStatic.MONERIUM_OAUTH_CREDENTIALS,
+        )
+    assert cached_value is not None
+
+    credentials = json.loads(cached_value)
+    credentials['expires_at'] = ts_now() - 10
+    with database.user_write() as write_cursor:
+        database.set_static_cache(
+            write_cursor=write_cursor,
+            name=DBCacheStatic.MONERIUM_OAUTH_CREDENTIALS,
+            value=json.dumps(credentials),
+        )
+
+    client = MoneriumOAuthClient(database=database, session=requests.Session())
+    with (
+        patch.object(
+            client.session,
+            'post',
+            return_value=MockResponse(
+                status_code=HTTPStatus.UNAUTHORIZED,
+                text='{"error":"unauthorized"}',
+            ),
+        ),
+        pytest.raises(RemoteError),
+    ):
+        client.ensure_access_token()
+
+    assert client.is_authenticated() is True
+    assert database.msg_aggregator.rotki_notifier.pop_message() is None  # type: ignore[union-attr]
+    assert (
+        'Failed to refresh Monerium access token due to HTTP status 401: '
+        '{"error":"unauthorized"}' in caplog.text
+    )
+
+
+@pytest.mark.parametrize('function_scope_initialize_mock_rotki_notifier', [True])
+def test_refresh_connection_failure_does_not_notify_reauthentication_needed(
+        database: DBHandler,
+        monerium_credentials: Any,  # pylint: disable=unused-argument
+        caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Ensure connection failures don't tell the user to reauthenticate Monerium."""
+    with database.conn.read_ctx() as cursor:
+        cached_value = database.get_static_cache(
+            cursor=cursor,
+            name=DBCacheStatic.MONERIUM_OAUTH_CREDENTIALS,
+        )
+    assert cached_value is not None
+
+    credentials = json.loads(cached_value)
+    credentials['expires_at'] = ts_now() - 10
+    with database.user_write() as write_cursor:
+        database.set_static_cache(
+            write_cursor=write_cursor,
+            name=DBCacheStatic.MONERIUM_OAUTH_CREDENTIALS,
+            value=json.dumps(credentials),
+        )
+
+    client = MoneriumOAuthClient(database=database, session=requests.Session())
+    with (
+        patch.object(client.session, 'post', side_effect=requests.ConnectionError('offline')),
+        pytest.raises(RemoteError),
+    ):
+        client.ensure_access_token()
+
+    assert client.is_authenticated() is True
+    assert database.msg_aggregator.rotki_notifier.pop_message() is None  # type: ignore[union-attr]
+    assert 'Failed to refresh Monerium access token due to offline' in caplog.text
+
+
+@pytest.mark.parametrize('function_scope_initialize_mock_rotki_notifier', [True])
+def test_invalid_grant_refresh_clears_credentials(
+        database: DBHandler,
+        monerium_credentials: Any,  # pylint: disable=unused-argument
+) -> None:
+    """Ensure invalid_grant during refresh clears Monerium OAuth credentials."""
+    with database.conn.read_ctx() as cursor:
+        cached_value = database.get_static_cache(
+            cursor=cursor,
+            name=DBCacheStatic.MONERIUM_OAUTH_CREDENTIALS,
+        )
+    assert cached_value is not None
+
+    credentials = json.loads(cached_value)
+    credentials['expires_at'] = ts_now() - 10
+    with database.user_write() as write_cursor:
+        database.set_static_cache(
+            write_cursor=write_cursor,
+            name=DBCacheStatic.MONERIUM_OAUTH_CREDENTIALS,
+            value=json.dumps(credentials),
+        )
+
+    client = MoneriumOAuthClient(database=database, session=requests.Session())
+    with (
+        patch.object(client.session, 'post', return_value=MockResponse(status_code=HTTPStatus.BAD_REQUEST, text='{"error":"invalid_grant"}')),  # noqa: E501
+        pytest.raises(RemoteError),
+    ):
+        client.ensure_access_token()
+
+    with database.conn.read_ctx() as cursor:
+        assert database.get_static_cache(
+            cursor=cursor,
+            name=DBCacheStatic.MONERIUM_OAUTH_CREDENTIALS,
+        ) is None
+    assert client.is_authenticated() is False
+    assert database.msg_aggregator.rotki_notifier.pop_message() == MockedWsMessage(  # type: ignore[union-attr]
+        message_type=WSMessageType.MONERIUM_SESSIONKEY_EXPIRED,
+        data={'error': 'Please sign in with Monerium again to refresh your data'},
+    )

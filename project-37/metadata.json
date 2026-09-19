@@ -1,0 +1,10 @@
+{
+  "number": 37,
+  "repository": "nautechsystems/nautilus_trader",
+  "url": "https://github.com/nautechsystems/nautilus_trader",
+  "description": "Production-grade Rust-native trading engine with deterministic event-driven architecture",
+  "language": "Rust",
+  "stars": 29091,
+  "default_branch": "main",
+  "source_zip_url": "https://github.com/nautechsystems/nautilus_trader/archive/refs/heads/main.zip"
+}

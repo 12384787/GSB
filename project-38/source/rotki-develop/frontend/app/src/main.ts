@@ -1,0 +1,76 @@
+import { createRuiI8nPlugin } from '@rotki/ui-library';
+import { checkIfDevelopment } from '@shared/utils';
+import { createPinia } from 'pinia';
+import App from '@/App.vue';
+import { i18n } from '@/i18n';
+import { setupFormatter } from '@/modules/assets/amount-display/setup-formatter';
+import { setupDayjs } from '@/modules/core/common/data/date';
+import { attemptPolyfillResizeObserver } from '@/modules/core/common/helpers/e2e';
+import { useItemsPerPage } from '@/modules/session/use-items-per-page';
+import { StoreStatePersistsPlugin } from '@/modules/shell/app/store-debug-plugin';
+import { StoreResetPlugin, StoreTrackPlugin } from '@/modules/shell/app/store-plugins';
+import { registerDevtools } from '@/plugins/devtools';
+import { createRuiPlugin } from '@/plugins/rui';
+import { router } from '@/router';
+
+import './main.css';
+
+const isDevelopment = checkIfDevelopment() && !import.meta.env.VITE_TEST;
+const IS_CLIENT = typeof window !== 'undefined';
+
+attemptPolyfillResizeObserver();
+
+const pinia = createPinia();
+pinia.use(StoreResetPlugin);
+pinia.use(StoreTrackPlugin);
+
+if (isDevelopment)
+  pinia.use(StoreStatePersistsPlugin);
+
+setActivePinia(pinia);
+
+const itemsPerPage = useItemsPerPage();
+const { isMdAndDown } = useBreakpoint();
+
+const rui = createRuiPlugin({
+  table: {
+    globalItemsPerPage: true,
+    itemsPerPage,
+    limits: [10, 25, 50, 100],
+    stickyOffset: computed(() => get(isMdAndDown) ? 56 : 64),
+  },
+});
+
+const search = window.location.search;
+const hash = window.location.hash;
+const skipUpdate = search.includes('skip_update') || hash.includes('skip_update');
+if (skipUpdate)
+  sessionStorage.setItem('skip_update', '1');
+
+const app = createApp(App);
+
+app.directive('blur', {
+  mounted(el): void {
+    el.addEventListener('focus', (event: any): void => {
+      if (!event.target)
+        return;
+
+      event.target.blur();
+    });
+  },
+});
+
+app.use(rui);
+app.use(pinia);
+app.use(i18n);
+app.use(createRuiI8nPlugin(i18n));
+app.use(router);
+app.mount('#app');
+
+setupDayjs();
+setupFormatter();
+
+if (isDevelopment && IS_CLIENT)
+  registerDevtools(app);
+
+export { app };

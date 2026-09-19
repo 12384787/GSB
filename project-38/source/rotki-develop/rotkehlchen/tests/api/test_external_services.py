@@ -1,0 +1,413 @@
+from http import HTTPStatus
+from typing import TYPE_CHECKING
+from unittest.mock import patch
+
+import pytest
+import requests
+
+from rotkehlchen.chain.evm.types import EvmIndexer
+from rotkehlchen.constants.misc import ONE
+from rotkehlchen.externalapis.helius import HELIUS_RPC_URL
+from rotkehlchen.fval import FVal
+from rotkehlchen.tests.utils.api import (
+    api_url_for,
+    assert_error_response,
+    assert_proper_response,
+    assert_proper_sync_response_with_result,
+)
+from rotkehlchen.types import SupportedBlockchain
+
+if TYPE_CHECKING:
+    from rotkehlchen.api.server import APIServer
+
+
+@pytest.mark.parametrize('include_etherscan_key', [False])
+@pytest.mark.parametrize('include_cryptocompare_key', [False])
+@pytest.mark.parametrize('include_beaconchain_key', [False])
+@pytest.mark.parametrize('include_blockscout_key', [False])
+def test_add_get_external_service(rotkehlchen_api_server: APIServer) -> None:
+    """Tests that adding and retrieving external service credentials works"""
+    # With no data an empty response should be returned
+    response = requests.get(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert result == {}
+
+    # Now add some data and see that the response shows they are added
+    expected_result = {
+        'etherscan': {'api_key': 'key1'},
+        'cryptocompare': {'api_key': 'key2'},
+        'blockscout': {'api_key': 'key3'},
+    }
+    data = {'services': [
+        {'name': 'etherscan', 'api_key': 'key1'},
+        {'name': 'cryptocompare', 'api_key': 'key2'},
+        {'name': 'blockscout', 'api_key': 'key3'},
+    ]}
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+        json=data,
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert result == expected_result
+
+    # Query again and see that the newly added services are returned
+    response = requests.get(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert result == expected_result
+
+    # Test that we can replace a value of an already existing service
+    new_key = 'new_key'
+    expected_result['cryptocompare']['api_key'] = new_key
+    data = {'services': [{'name': 'cryptocompare', 'api_key': new_key}]}
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+        json=data,
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert result == expected_result
+
+    # Query again and see that the modified services are returned
+    response = requests.get(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert result == expected_result
+
+
+def test_etherscan_re_enabled(rotkehlchen_api_server: APIServer) -> None:
+    """Test that etherscan is re-enabled when a user adds a new api key."""
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    for chain_manager in (chain_managers := (
+        rotki.chains_aggregator.binance_sc,
+        rotki.chains_aggregator.base,
+        rotki.chains_aggregator.optimism,
+    )):
+        chain_manager.node_inquirer.available_indexers.pop(EvmIndexer.ETHERSCAN)
+
+    assert_proper_sync_response_with_result(requests.put(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+        json={'services': [{'name': 'etherscan', 'api_key': 'key1'}]},
+    ))
+    for chain_manager in chain_managers:
+        assert EvmIndexer.ETHERSCAN in chain_manager.node_inquirer.available_indexers
+
+
+def test_helius_key_syncs_solana_rpc_node(rotkehlchen_api_server: APIServer) -> None:
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    node_inquirer = rotki.chains_aggregator.solana.node_inquirer
+
+    def assert_helius_weights() -> None:
+        nodes = rotki.data.db.get_rpc_nodes(blockchain=SupportedBlockchain.SOLANA)
+        assert next(node.weight for node in nodes if node.node_info.name == 'Helius') == FVal('0.5')  # noqa: E501
+        assert sum(
+            node.weight
+            for node in nodes
+            if node.node_info.owned is False and node.node_info.name != 'Helius'
+        ) == FVal('0.5')
+
+    with patch.object(node_inquirer, 'connect_to_multiple_nodes') as connect_mock:
+        result = assert_proper_sync_response_with_result(requests.put(
+            api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+            json={'services': [{'name': 'helius', 'api_key': 'key1'}]},
+        ))
+    assert result['helius'] == {'api_key': 'key1'}
+    connect_mock.assert_called_once()
+    assert [
+        node.node_info.endpoint for node in rotki.data.db.get_rpc_nodes(
+            blockchain=SupportedBlockchain.SOLANA,
+        )
+        if node.node_info.name == 'Helius'
+    ] == [f'{HELIUS_RPC_URL}?api-key=key1']
+    assert_helius_weights()
+
+    with patch.object(node_inquirer, 'connect_to_multiple_nodes'):
+        assert_proper_sync_response_with_result(requests.put(
+            api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+            json={'services': [{'name': 'helius', 'api_key': 'key2'}]},
+        ))
+    assert [
+        node.node_info.endpoint for node in rotki.data.db.get_rpc_nodes(
+            blockchain=SupportedBlockchain.SOLANA,
+        )
+        if node.node_info.name == 'Helius'
+    ] == [f'{HELIUS_RPC_URL}?api-key=key2']
+    assert_helius_weights()
+
+    with patch.object(node_inquirer, 'connect_to_multiple_nodes'):
+        assert_proper_sync_response_with_result(requests.delete(
+            api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+            json={'services': ['helius']},
+        ))
+    assert all(
+        node.node_info.name != 'Helius'
+        for node in rotki.data.db.get_rpc_nodes(blockchain=SupportedBlockchain.SOLANA)
+    )
+    assert sum(
+        node.weight for node in rotki.data.db.get_rpc_nodes(
+            blockchain=SupportedBlockchain.SOLANA,
+        )
+        if node.node_info.owned is False
+    ) == ONE
+
+
+@pytest.mark.parametrize('include_etherscan_key', [False])
+@pytest.mark.parametrize('include_beaconchain_key', [False])
+@pytest.mark.parametrize('include_blockscout_key', [False])
+def test_delete_external_service(rotkehlchen_api_server: APIServer) -> None:
+    """Tests that delete external service credentials works"""
+    # Add some data and see that the response shows they are added
+    expected_result = {
+        'etherscan': {'api_key': 'key1'},
+        'cryptocompare': {'api_key': 'key2'},
+    }
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+        json={'services': [
+            {'name': 'etherscan', 'api_key': 'key1'},
+            {'name': 'cryptocompare', 'api_key': 'key2'},
+        ]},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert result == expected_result
+
+    expected_result.pop('etherscan')
+    # Now try to delete an entry and see the response shows it's deleted
+    response = requests.delete(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+        json={'services': ['etherscan']},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert result == expected_result
+
+    # Query again and see that the modified services are returned
+    response = requests.get(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert result == expected_result
+
+    # Now try to delete an existing and a non-existing service to make sure
+    # that if the service is not in the DB, deletion is silently ignored
+    response = requests.delete(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+        json={'services': ['etherscan', 'cryptocompare']},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert result == {}
+
+    # Query again and see that the modified services are returned
+    response = requests.get(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert result == {}
+
+
+def test_add_external_services_errors(rotkehlchen_api_server: APIServer) -> None:
+    """Tests that errors at adding external service credentials are handled properly"""
+    # Missing data
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='services": ["Missing data for required field.',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # invalid type for services
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+        json={'services': 'foo'},
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='"services": ["Not a valid list."',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # invalid type for services list element
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+        json={'services': ['foo']},
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='services": {"0": {"_schema": ["Invalid input type',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Missing api_key entry
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+        json={'services': [{'name': 'etherscan'}]},
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='"api_key": ["an api key is needed for etherscan"',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Missing name entry
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+        json={'services': [{'api_key': 'goookey'}]},
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='"name": ["Missing data for required field."',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Unsupported service name
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+        json={'services': [{'name': 'unknown', 'api_key': 'goookey'}]},
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='Failed to deserialize ExternalService value unknown',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Invalid type for service name
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+        json={'services': [{'name': 23.2, 'api_key': 'goookey'}]},
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='Failed to deserialize ExternalService value from non string value: 23.2',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Invalid type for api_key
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+        json={'services': [{'name': 'etherscan', 'api_key': 53.2}]},
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='"api_key": ["Not a valid string."',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+
+@pytest.mark.parametrize('start_with_valid_premium', [True])
+def test_complete_monerium_oauth_triggers_background_refresh(
+        rotkehlchen_api_server: APIServer,
+        start_with_valid_premium: bool,  # pylint: disable=unused-argument
+) -> None:
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    with (
+        patch(
+            'rotkehlchen.api.v1.resources.has_premium_capability',
+            return_value=True,
+        ),
+        patch(
+            'rotkehlchen.externalapis.monerium.MoneriumOAuthClient.complete_oauth',
+            return_value={
+                'success': True,
+                'message': 'Successfully authenticated with Monerium',
+                'user_email': 'mock@monerium.com',
+            },
+        ) as complete_oauth_mock,
+        patch.object(rotki.task_supervisor, 'spawn_and_track') as spawn_mock,
+    ):
+        response = requests.put(
+            api_url_for(rotkehlchen_api_server, 'moneriumoauthresource'),
+            json={
+                'access_token': 'mock-access-token',
+                'refresh_token': 'mock-refresh-token',
+                'expires_in': 3600,
+            },
+        )
+
+    assert_proper_response(response)
+    result = assert_proper_sync_response_with_result(response)
+    assert result['success'] is True
+    assert result['user_email'] == 'mock@monerium.com'
+    complete_oauth_mock.assert_called_once_with(
+        access_token='mock-access-token',
+        refresh_token='mock-refresh-token',
+        expires_in=3600,
+    )
+    spawn_mock.assert_called_once()
+    spawned_fn = spawn_mock.call_args.kwargs['method']
+    # queries the orders and matches any bridge legs that run creates
+    assert spawned_fn.__name__ == '_query_monerium_orders'
+
+
+@pytest.mark.parametrize('start_with_valid_premium', [True])
+def test_complete_monerium_oauth_requires_capability(
+        rotkehlchen_api_server: APIServer,
+        start_with_valid_premium: bool,  # pylint: disable=unused-argument
+) -> None:
+    with patch(
+        'rotkehlchen.api.v1.resources.has_premium_capability',
+        return_value=False,
+    ):
+        response = requests.put(
+            api_url_for(rotkehlchen_api_server, 'moneriumoauthresource'),
+            json={
+                'access_token': 'mock-access-token',
+                'refresh_token': 'mock-refresh-token',
+                'expires_in': 3600,
+            },
+        )
+
+    assert_error_response(
+        response=response,
+        contained_in_msg='Monerium is not available for your current subscription tier',
+        status_code=HTTPStatus.FORBIDDEN,
+    )
+
+
+def test_remove_external_services_errors(rotkehlchen_api_server: APIServer) -> None:
+    """Tests that errors at removing external service credentials are handled properly"""
+    # Missing data
+    response = requests.delete(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='services": ["Missing data for required field.',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Wrong type for services
+    response = requests.delete(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+        json={'services': 23.5},
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='"services": ["Not a valid list.',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Wrong type for services list element
+    response = requests.delete(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+        json={'services': [55]},
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='Failed to deserialize ExternalService value from non string value: 55',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Unsupported service name in the list
+    response = requests.delete(
+        api_url_for(rotkehlchen_api_server, 'externalservicesresource'),
+        json={'services': ['unknown', 'etherscan']},
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='Failed to deserialize ExternalService value unknown',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )

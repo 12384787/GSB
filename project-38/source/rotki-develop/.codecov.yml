@@ -1,0 +1,41 @@
+codecov:
+  require_ci_to_pass: true
+  notify:
+    wait_for_ci: true
+
+coverage:
+  status:
+    project: off
+    patch: off
+
+comment:
+  layout: "reach, diff, flags, files"
+  behavior: default
+  require_changes: false
+
+flags:
+  backend-nightly:
+    carryforward: true
+    paths:
+      - rotkehlchen
+  frontend_unit:
+    carryforward: true
+    paths:
+      - frontend/app
+  frontend_integration:
+    carryforward: true
+    paths:
+      - frontend/app
+
+ignore:
+  - "**/*.d.ts"
+  - "**/*.spec.ts"
+  - "**/*.test.ts"
+  - "frontend/app/src/App.vue"
+  - "frontend/app/src/DevApp.vue"
+  - "frontend/app/src/i18n.ts"
+  - "frontend/app/src/main.ts"
+  - "frontend/app/src/locales/**"
+  - "frontend/app/src/pages/playground/**"
+  - "frontend/app/tests/**"
+  - "rotkehlchen/tests/**"

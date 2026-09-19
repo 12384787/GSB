@@ -1,0 +1,1225 @@
+# Custom enum table for locations
+DB_CREATE_LOCATION = """
+CREATE TABLE IF NOT EXISTS location (
+  location    CHAR(1)       PRIMARY KEY NOT NULL,
+  seq     INTEGER UNIQUE
+);
+/* External */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('A', 1);
+/* Kraken */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('B', 2);
+/* Poloniex */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('C', 3);
+/* Bittrex */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('D', 4);
+/* Binance */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('E', 5);
+/* Bitmex */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('F', 6);
+/* Coinbase */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('G', 7);
+/* Total */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('H', 8);
+/* Banks */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('I', 9);
+/* Blockchain */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('J', 10);
+/* Coinbase Pro */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('K', 11);
+/* Gemini */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('L', 12);
+/* Equities */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('M', 13);
+/* Real estate */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('N', 14);
+/* Commodities */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('O', 15);
+/* Crypto.com */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('P', 16);
+/* Uniswap */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('Q', 17);
+/* Bitstamp */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('R', 18);
+/* Binance US */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('S', 19);
+/* Bitfinex */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('T', 20);
+/* Bitcoin.de */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('U', 21);
+/* ICONOMI */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('V', 22);
+/* KUCOIN */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('W', 23);
+/* BALANCER */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('X', 24);
+/* LOOPRING */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('Y', 25);
+/* FTX */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('Z', 26);
+/* NEXO */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('[', 27);
+/* BlockFI */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('\\', 28);
+/* IndependentReserve */
+INSERT OR IGNORE INTO location(location, seq) VALUES (']', 29);
+/* Gitcoin */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('^', 30);
+/* Sushiswap */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('_', 31);
+/* ShapeShift */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('`', 32);
+/* Uphold */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('a', 33);
+/* Bitpanda */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('b', 34);
+/* Bisq */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('c', 35);
+/* FTX US */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('d', 36);
+/* OKX */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('e', 37);
+/* ETHEREUM */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('f', 38);
+/* OPTIMISM */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('g', 39);
+/* POLYGON_POS */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('h', 40);
+/* ARBITRUM_ONE */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('i', 41);
+/* BASE */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('j', 42);
+/* GNOSIS */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('k', 43);
+/* WOO */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('l', 44);
+/* Bybit */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('m', 45);
+/* Scroll */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('n', 46);
+/* ZKSync Lite */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('o', 47);
+/* HTX */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('p', 48);
+/* Bitcoin */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('q', 49);
+/* Bitcoin Cash */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('r', 50);
+/* Polkadot */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('s', 51);
+/* Kusama */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('t', 52);
+/* Coinbase Prime */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('u', 53);
+/* Binance Smart Chain */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('v', 54);
+/* Solana */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('w', 55);
+/* Avalanche */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('x', 56);
+/* Hyperliquid */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('y', 57);
+/* Monad */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('z', 58);
+/* Sonic */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('~', 62);
+/* Robinhood */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('\x7f', 63);
+/* Ink */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('\x80', 64);
+/* Qonto */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('\x81', 65);
+/* FinTS */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('\x82', 66);
+/* Gate */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('{', 59);
+/* Bit2me */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('|', 60);
+/* CoinEx */
+INSERT OR IGNORE INTO location(location, seq) VALUES ('}', 61);
+"""
+
+# Custom enum table for Balance categories (asset/liability)
+DB_CREATE_BALANCE_CATEGORY = """
+CREATE TABLE IF NOT EXISTS balance_category (
+  category    CHAR(1)       PRIMARY KEY NOT NULL,
+  seq     INTEGER UNIQUE
+);
+/* Asset Category */
+INSERT OR IGNORE INTO balance_category(category, seq) VALUES ('A', 1);
+/* Liability Category */
+INSERT OR IGNORE INTO balance_category(category, seq) VALUES ('B', 2);
+"""
+
+DB_CREATE_ASSETS = """
+CREATE TABLE IF NOT EXISTS assets (
+    identifier TEXT NOT NULL PRIMARY KEY
+);
+"""
+
+DB_CREATE_IGNORED_ACTIONS = """
+CREATE TABLE IF NOT EXISTS ignored_actions (
+    identifier TEXT PRIMARY KEY
+);
+"""
+
+DB_CREATE_TIMED_BALANCES = """
+CREATE TABLE IF NOT EXISTS timed_balances (
+    category CHAR(1) NOT NULL DEFAULT('A') REFERENCES balance_category(category),
+    timestamp INTEGER,
+    currency TEXT,
+    amount TEXT,
+    usd_value TEXT,
+    FOREIGN KEY(currency) REFERENCES assets(identifier) ON UPDATE CASCADE,
+    PRIMARY KEY (timestamp, currency, category)
+);
+"""
+
+DB_CREATE_TIMED_LOCATION_DATA = """
+CREATE TABLE IF NOT EXISTS timed_location_data (
+    timestamp INTEGER,
+    location CHAR(1) NOT NULL DEFAULT('A') REFERENCES location(location),
+    usd_value TEXT,
+    PRIMARY KEY (timestamp, location)
+);
+"""
+
+DB_CREATE_USER_CREDENTIALS = """
+CREATE TABLE IF NOT EXISTS user_credentials (
+    name TEXT NOT NULL,
+    location CHAR(1) NOT NULL DEFAULT('A') REFERENCES location(location),
+    api_key TEXT,
+    api_secret TEXT,
+    passphrase TEXT,
+    PRIMARY KEY (name, location)
+);
+"""
+
+DB_CREATE_USER_CREDENTIALS_MAPPINGS = """
+CREATE TABLE IF NOT EXISTS user_credentials_mappings (
+    credential_name TEXT NOT NULL,
+    credential_location CHAR(1) NOT NULL DEFAULT('A') REFERENCES location(location),
+    setting_name TEXT NOT NULL,
+    setting_value TEXT NOT NULL,
+    FOREIGN KEY(credential_name, credential_location) REFERENCES user_credentials(name, location) ON DELETE CASCADE ON UPDATE CASCADE,
+    PRIMARY KEY (credential_name, credential_location, setting_name)
+);
+"""  # noqa: E501
+
+DB_CREATE_EXTERNAL_SERVICE_CREDENTIALS = """
+CREATE TABLE IF NOT EXISTS external_service_credentials (
+    name VARCHAR[30] NOT NULL PRIMARY KEY,
+    api_key TEXT NOT NULL,
+    api_secret TEXT
+);
+"""
+
+DB_CREATE_TAGS_TABLE = """
+CREATE TABLE IF NOT EXISTS tags (
+    name TEXT NOT NULL PRIMARY KEY COLLATE NOCASE,
+    description TEXT,
+    background_color TEXT,
+    foreground_color TEXT
+);
+/* Contract */
+INSERT OR IGNORE INTO tags(name, description, background_color, foreground_color) VALUES ('Contract', 'System tag for smart contract addresses', '9370DB', 'FFFFFF');
+"""  # noqa: E501
+
+DB_CREATE_BLOCKCHAIN_ACCOUNTS = """
+CREATE TABLE IF NOT EXISTS blockchain_accounts (
+    blockchain VARCHAR[24] NOT NULL,
+    account TEXT NOT NULL,
+    PRIMARY KEY (blockchain, account)
+);
+"""
+
+DB_CREATE_XPUBS = """
+CREATE TABLE IF NOT EXISTS xpubs (
+    xpub TEXT NOT NULL,
+    derivation_path TEXT NOT NULL,
+    label TEXT,
+    blockchain TEXT NOT NULL,
+    PRIMARY KEY (xpub, derivation_path, blockchain)
+);
+"""
+
+DB_CREATE_XPUB_MAPPINGS = """
+CREATE TABLE IF NOT EXISTS xpub_mappings (
+    address TEXT NOT NULL,
+    xpub TEXT NOT NULL,
+    derivation_path TEXT NOT NULL,
+    account_index INTEGER,
+    derived_index INTEGER,
+    blockchain TEXT NOT NULL,
+    FOREIGN KEY(blockchain, address)
+    REFERENCES blockchain_accounts(blockchain, account) ON DELETE CASCADE
+    FOREIGN KEY(xpub, derivation_path, blockchain) REFERENCES xpubs(
+        xpub,
+        derivation_path,
+        blockchain
+    ) ON DELETE CASCADE
+    PRIMARY KEY (address, xpub, derivation_path, blockchain)
+);
+"""
+
+
+# Store information about the tokens queried for each combination of account and blockchain.
+# The table is designed to have a key-value structure where we use the key `token` to
+# identify the tokens queried per address and the key `last_queried_timestamp` to
+# determine when the last query was executed
+DB_CREATE_EVM_ACCOUNTS_DETAILS = """
+CREATE TABLE IF NOT EXISTS evm_accounts_details (
+    account VARCHAR[42] NOT NULL,
+    chain_id INTEGER NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (account, chain_id, key, value)
+);
+"""
+
+DB_CREATE_EVM_ACCOUNT_PROXIES = """
+CREATE TABLE IF NOT EXISTS evm_account_proxies (
+    account VARCHAR[42] NOT NULL,
+    chain_id INTEGER NOT NULL,
+    proxy_type TEXT NOT NULL,
+    proxy_address VARCHAR[42] NOT NULL,
+    PRIMARY KEY (account, chain_id, proxy_type, proxy_address)
+);
+"""
+
+DB_CREATE_MANUALLY_TRACKED_BALANCES = """
+CREATE TABLE IF NOT EXISTS manually_tracked_balances (
+    id INTEGER PRIMARY KEY,
+    asset TEXT NOT NULL,
+    label TEXT NOT NULL UNIQUE,
+    amount TEXT,
+    location CHAR(1) NOT NULL DEFAULT('A') REFERENCES location(location),
+    category CHAR(1) NOT NULL DEFAULT('A') REFERENCES balance_category(category),
+    FOREIGN KEY(asset) REFERENCES assets(identifier) ON UPDATE CASCADE
+);
+"""
+
+# Not putting object_reference as a foreign key since multiple objects, not only
+# blockchain accounts can have tag mappings (future-proof thinking here)
+DB_CREATE_TAG_MAPPINGS = """
+CREATE TABLE IF NOT EXISTS tag_mappings (
+    object_reference TEXT,
+    tag_name TEXT,
+    FOREIGN KEY(tag_name) REFERENCES tags(name)
+    PRIMARY KEY (object_reference, tag_name)
+);
+"""
+
+DB_CREATE_MULTISETTINGS = """
+CREATE TABLE IF NOT EXISTS multisettings (
+    name VARCHAR[24] NOT NULL,
+    value TEXT,
+    UNIQUE(name, value)
+);
+"""
+
+
+DB_CREATE_MARGIN = """
+CREATE TABLE IF NOT EXISTS margin_positions (
+    id TEXT PRIMARY KEY,
+    location CHAR(1) NOT NULL DEFAULT('A') REFERENCES location(location),
+    open_time INTEGER,
+    close_time INTEGER,
+    profit_loss TEXT,
+    pl_currency TEXT NOT NULL,
+    fee TEXT,
+    fee_currency TEXT,
+    link TEXT,
+    notes TEXT,
+    FOREIGN KEY(pl_currency) REFERENCES assets(identifier) ON UPDATE CASCADE,
+    FOREIGN KEY(fee_currency) REFERENCES assets(identifier) ON UPDATE CASCADE
+);
+"""
+
+DB_CREATE_EVM_TRANSACTIONS = """
+CREATE TABLE IF NOT EXISTS evm_transactions (
+    identifier INTEGER NOT NULL PRIMARY KEY,
+    tx_hash BLOB NOT NULL,
+    chain_id INTEGER NOT NULL,
+    timestamp INTEGER NOT NULL,
+    block_number INTEGER NOT NULL,
+    from_address TEXT NOT NULL,
+    to_address TEXT,
+    value TEXT NOT NULL,
+    gas TEXT NOT NULL,
+    gas_price TEXT NOT NULL,
+    gas_used TEXT NOT NULL,
+    input_data BLOB NOT NULL,
+    nonce INTEGER NOT NULL,
+    UNIQUE(tx_hash, chain_id)
+);
+"""
+
+# The table can be used by any L2 chain that has an extra L1 fee structure
+# It should be renamed, at some point, to something like `l2_with_l1_fees_transactions`
+DB_CREATE_OPTIMISM_TRANSACTIONS = """
+CREATE TABLE IF NOT EXISTS optimism_transactions (
+    tx_id INTEGER NOT NULL PRIMARY KEY,
+    l1_fee TEXT,
+    FOREIGN KEY(tx_id) REFERENCES evm_transactions(identifier) ON DELETE CASCADE ON UPDATE CASCADE
+);
+"""
+
+DB_CREATE_EVM_TRANSACTION_AUTHORIZATIONS = """
+CREATE TABLE IF NOT EXISTS evm_transactions_authorizations (
+    tx_id INTEGER NOT NULL PRIMARY KEY,
+    nonce INTEGER NOT NULL,
+    delegated_address TEXT NOT NULL,
+    FOREIGN KEY(tx_id) REFERENCES evm_transactions(identifier) ON DELETE CASCADE
+);
+"""
+
+# from/to address/value is also in the primary key of the internal transactions since
+# trace_id, which is returned by etherscan does not guarantee uniqueness. Example:
+# https://api.etherscan.io/api?module=account&action=txlistinternal&sort=asc&startBlock=16779092&endBlock=16779092
+# Same for gas/gas_used. An example would be https://etherscan.io/tx/0x72f5e619a8f521d874652ec5c09ea22e329ed3a990012e1fe6548d5a07e1959c
+# where each consolidation internal transaction of 1 wei is the same and can only differentiate
+# from gas/gasused combination
+# NB: If you change the internal transactions schema then make sure to change the indexes
+# at DBHandler.write_tuples are correct
+DB_CREATE_EVM_INTERNAL_TRANSACTIONS = """
+CREATE TABLE IF NOT EXISTS evm_internal_transactions (
+    parent_tx INTEGER NOT NULL,
+    trace_id INTEGER NOT NULL,
+    from_address TEXT NOT NULL,
+    to_address TEXT,
+    value TEXT NOT NULL,
+    gas TEXT NOT NULL,
+    gas_used TEXT NOT NULL,
+    source INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY(parent_tx) REFERENCES evm_transactions(identifier) ON DELETE CASCADE ON UPDATE CASCADE,
+    PRIMARY KEY(parent_tx, trace_id, from_address, to_address, value, gas, gas_used)
+);
+"""  # noqa: E501
+
+DB_CREATE_EVMTX_RECEIPTS = """
+CREATE TABLE IF NOT EXISTS evmtx_receipts (
+    tx_id INTEGER NOT NULL PRIMARY KEY,
+    contract_address TEXT, /* can be null */
+    status INTEGER NOT NULL CHECK (status IN (0, 1)),
+    type INTEGER NOT NULL,
+    FOREIGN KEY(tx_id) REFERENCES evm_transactions(identifier) ON DELETE CASCADE ON UPDATE CASCADE
+);
+"""
+
+DB_CREATE_EVMTX_RECEIPT_LOGS = """
+CREATE TABLE IF NOT EXISTS evmtx_receipt_logs (
+    identifier INTEGER NOT NULL PRIMARY KEY,  /* adding identifier here instead of composite key in order to not duplicate in topics which are A LOT */
+    tx_id INTEGER NOT NULL,
+    log_index INTEGER NOT NULL,
+    data BLOB NOT NULL,
+    address TEXT NOT NULL,
+    FOREIGN KEY(tx_id) REFERENCES evmtx_receipts(tx_id) ON DELETE CASCADE ON UPDATE CASCADE,
+    UNIQUE(tx_id, log_index)
+);
+"""  # noqa: E501
+
+DB_CREATE_EVMTX_RECEIPT_LOG_TOPICS = """
+CREATE TABLE IF NOT EXISTS evmtx_receipt_log_topics (
+    log INTEGER NOT NULL,
+    topic BLOB NOT NULL,
+    topic_index INTEGER NOT NULL,
+    FOREIGN KEY(log) REFERENCES evmtx_receipt_logs(identifier) ON DELETE CASCADE ON UPDATE CASCADE,
+    PRIMARY KEY(log, topic_index)
+);
+"""
+
+DB_CREATE_EVMTX_ADDRESS_MAPPINGS = """
+CREATE TABLE IF NOT EXISTS evmtx_address_mappings (
+    tx_id INTEGER NOT NULL,
+    address TEXT NOT NULL,
+    FOREIGN KEY(tx_id) references evm_transactions(identifier) ON UPDATE CASCADE ON DELETE CASCADE,
+    PRIMARY KEY (tx_id, address)
+);
+"""
+
+
+# Custom enum table for zksyn transaction types
+DB_CREATE_ZKSYNCLITE_TX_TYPE = """
+CREATE TABLE IF NOT EXISTS zksynclite_tx_type (
+  type    CHAR(1)       PRIMARY KEY NOT NULL,
+  seq     INTEGER UNIQUE
+);
+/* Transfer Type */
+INSERT OR IGNORE INTO zksynclite_tx_type(type, seq) VALUES ('A', 1);
+/* Deposit Type */
+INSERT OR IGNORE INTO zksynclite_tx_type(type, seq) VALUES ('B', 2);
+/* Withdraw Type */
+INSERT OR IGNORE INTO zksynclite_tx_type(type, seq) VALUES ('C', 3);
+/* ChangePubKey Type */
+INSERT OR IGNORE INTO zksynclite_tx_type(type, seq) VALUES ('D', 4);
+/* ForcedExit Type */
+INSERT OR IGNORE INTO zksynclite_tx_type(type, seq) VALUES ('E', 5);
+/* FullExit Type */
+INSERT OR IGNORE INTO zksynclite_tx_type(type, seq) VALUES ('F', 6);
+/* Swap Type */
+INSERT OR IGNORE INTO zksynclite_tx_type(type, seq) VALUES ('G', 7);
+"""
+
+# Instead of using an attribute mapping like evm chains adding the is_decoded directly to the table
+# Reasoning is it's the only mapping we care for so no reason to keep a different
+# mappings table for zksync lite transactions
+DB_CREATE_ZKSYNCLITE_TRANSACTIONS = """
+CREATE TABLE IF NOT EXISTS zksynclite_transactions (
+    identifier INTEGER NOT NULL PRIMARY KEY,
+    tx_hash BLOB NOT NULL UNIQUE,
+    type CHAR(1) NOT NULL DEFAULT('A') REFERENCES zksynclite_tx_type(type),
+    is_decoded INTEGER NOT NULL DEFAULT 0 CHECK (is_decoded IN (0, 1)),
+    timestamp INTEGER NOT NULL,
+    block_number INTEGER NOT NULL,
+    from_address TEXT NOT NULL,
+    to_address TEXT,
+    asset TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    fee TEXT,
+    FOREIGN KEY(asset) REFERENCES assets(identifier) ON UPDATE CASCADE
+);
+"""
+
+DB_CREATE_ZKSYNCLITE_SWAPS = """
+CREATE TABLE IF NOT EXISTS zksynclite_swaps (
+    tx_id INTEGER NOT NULL,
+    from_asset TEXT NOT NULL,
+    from_amount TEXT NOT NULL,
+    to_asset TEXT NOT NULL,
+    to_amount TEXT NOT NULL,
+    FOREIGN KEY(tx_id) REFERENCES zksynclite_transactions(identifier) ON UPDATE CASCADE ON DELETE CASCADE,
+    FOREIGN KEY(from_asset) REFERENCES assets(identifier) ON UPDATE CASCADE,
+    FOREIGN KEY(to_asset) REFERENCES assets(identifier) ON UPDATE CASCADE
+);
+"""  # noqa: E501
+
+DB_CREATE_USED_QUERY_RANGES = """
+CREATE TABLE IF NOT EXISTS used_query_ranges (
+    name VARCHAR[24] NOT NULL PRIMARY KEY,
+    start_ts INTEGER,
+    end_ts INTEGER
+);
+"""
+
+# Stores per-transaction state flags (e.g. decoded, spam, internals queried).
+DB_CREATE_EVM_TX_MAPPINGS = """
+CREATE TABLE IF NOT EXISTS evm_tx_mappings (
+    tx_id INTEGER NOT NULL,
+    value INTEGER NOT NULL,
+    FOREIGN KEY(tx_id) references evm_transactions(identifier) ON UPDATE CASCADE ON DELETE CASCADE,
+    PRIMARY KEY (tx_id, value)
+);
+"""
+
+DB_CREATE_EVM_INTERNAL_TX_CONFLICTS = """
+CREATE TABLE IF NOT EXISTS evm_internal_tx_conflicts (
+    transaction_hash BLOB NOT NULL,
+    chain INTEGER NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('fix_redecode', 'repull')),
+    repull_reason TEXT CHECK (repull_reason IN ('all_zero_gas', 'other')),
+    redecode_reason TEXT CHECK (
+        redecode_reason IN (
+            'mixed_zero_gas',
+            'duplicate_exact_rows',
+            'mixed_zero_gas_and_duplicate'
+        )
+    ),
+    fixed INTEGER NOT NULL CHECK (fixed IN (0, 1)),
+    last_retry_ts INTEGER,
+    last_error TEXT,
+    PRIMARY KEY (transaction_hash, chain)
+);
+"""
+
+DB_CREATE_SETTINGS = """
+CREATE TABLE IF NOT EXISTS settings (
+    name VARCHAR[24] NOT NULL PRIMARY KEY,
+    value TEXT
+);
+"""
+
+DB_CREATE_ETH2_VALIDATORS = """
+CREATE TABLE IF NOT EXISTS eth2_validators (
+    identifier INTEGER NOT NULL PRIMARY KEY,
+    validator_index INTEGER UNIQUE,
+    public_key TEXT NOT NULL UNIQUE,
+    ownership_proportion TEXT NOT NULL,
+    withdrawal_address TEXT,
+    validator_type INTEGER NOT NULL CHECK (validator_type IN (0, 1, 2)),
+    activation_timestamp INTEGER,
+    withdrawable_timestamp INTEGER,
+    exited_timestamp INTEGER
+);
+"""
+
+DB_CREATE_ETH_VALIDATORS_DATA_CACHE = """
+CREATE TABLE IF NOT EXISTS eth_validators_data_cache (
+    id INTEGER NOT NULL PRIMARY KEY,
+    validator_index INTEGER NOT NULL,
+    timestamp INTEGER NOT NULL,  -- timestamp is in milliseconds
+    balance TEXT NOT NULL,
+    withdrawals_pnl TEXT NOT NULL,
+    exit_pnl TEXT NOT NULL,
+    UNIQUE(validator_index, timestamp),
+    FOREIGN KEY(validator_index) REFERENCES eth2_validators(validator_index) ON UPDATE CASCADE ON DELETE CASCADE
+);
+"""  # noqa: E501
+
+
+DB_CREATE_SKIPPED_EXTERNAL_EVENTS = """
+CREATE TABLE IF NOT EXISTS skipped_external_events (
+    identifier INTEGER NOT NULL PRIMARY KEY,
+    data TEXT NOT NULL,
+    location CHAR(1) NOT NULL DEFAULT('A') REFERENCES location(location),
+    extra_data TEXT,
+    UNIQUE(data, location)
+);
+"""
+
+DB_CREATE_HISTORY_EVENTS = """
+CREATE TABLE IF NOT EXISTS history_events (
+    identifier INTEGER NOT NULL PRIMARY KEY,
+    entry_type INTEGER NOT NULL,
+    group_identifier TEXT NOT NULL,
+    sequence_index INTEGER NOT NULL,
+    timestamp INTEGER NOT NULL,
+    location CHAR(1) NOT NULL DEFAULT('A') REFERENCES location(location),
+    location_label TEXT,
+    asset TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    notes TEXT,
+    type TEXT NOT NULL,
+    subtype TEXT NOT NULL,
+    extra_data TEXT,
+    ignored INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY(asset) REFERENCES assets(identifier) ON UPDATE CASCADE,
+    UNIQUE(group_identifier, sequence_index)
+);
+"""
+
+# Table that extends history_events table and stores chain-agnostic transaction metadata.
+DB_CREATE_CHAIN_EVENTS_INFO = """
+CREATE TABLE IF NOT EXISTS chain_events_info (
+    identifier INTEGER PRIMARY KEY,
+    tx_ref BLOB NOT NULL,
+    counterparty TEXT,
+    address TEXT,
+    FOREIGN KEY(identifier) REFERENCES history_events(identifier) ON UPDATE CASCADE ON DELETE CASCADE
+);
+"""  # noqa: E501
+
+# Table that maps bitcoin history events to zero, one, or many counterparty addresses.
+# WITHOUT ROWID keeps this mapping compact since the composite PK is the natural key.
+DB_CREATE_BITCOIN_EVENTS_ADDRESSES = """
+CREATE TABLE IF NOT EXISTS bitcoin_events_addresses (
+    event_identifier INTEGER NOT NULL,
+    address TEXT NOT NULL,
+    FOREIGN KEY(event_identifier) REFERENCES history_events(identifier) ON UPDATE CASCADE ON DELETE CASCADE,
+    PRIMARY KEY(event_identifier, address)
+) WITHOUT ROWID;
+"""  # noqa: E501
+
+# Table that extends history events table and stores data specific to ethereum staking
+DB_CREATE_ETH_STAKING_EVENTS_INFO = """
+CREATE TABLE IF NOT EXISTS eth_staking_events_info(
+    identifier INTEGER PRIMARY KEY,
+    validator_index INTEGER NOT NULL,
+    is_exit_or_blocknumber INTEGER NOT NULL,
+    FOREIGN KEY(identifier) REFERENCES history_events(identifier) ON UPDATE CASCADE ON DELETE CASCADE
+);
+"""  # noqa: E501
+
+
+# This table is used to store for specific history events:
+# - whether it is customized
+# - validator mapping
+DB_CREATE_HISTORY_EVENTS_MAPPINGS = """
+CREATE TABLE IF NOT EXISTS history_events_mappings (
+    parent_identifier INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    value INTEGER NOT NULL,
+    FOREIGN KEY(parent_identifier) references history_events(identifier) ON UPDATE CASCADE ON DELETE CASCADE,
+    PRIMARY KEY (parent_identifier, name, value)
+);
+"""  # noqa: E501
+
+# Duplicate tables for storing backup copies of history events before editing them so they can be
+# restored to their original state later. Used in asset movement matching.
+DB_CREATE_HISTORY_EVENTS_BACKUP = DB_CREATE_HISTORY_EVENTS.replace('history_events', 'history_events_backup')  # noqa: E501
+DB_CREATE_CHAIN_EVENTS_INFO_BACKUP = DB_CREATE_CHAIN_EVENTS_INFO.replace(
+    'chain_events_info', 'chain_events_info_backup',
+).replace('history_events', 'history_events_backup')
+
+# usd_price is a column of the table because we sort by price in the fiat currency and that price
+# needs to be calculated from last_price and the price of last_price_asset. If we don't sort using
+# the usd_price when the NFTs are valued in different assets the order is not correct.
+DB_CREATE_NFTS = """
+CREATE TABLE IF NOT EXISTS nfts (
+    identifier TEXT NOT NULL PRIMARY KEY,
+    name TEXT,
+    last_price TEXT NOT NULL,
+    last_price_asset TEXT NOT NULL,
+    manual_price INTEGER NOT NULL CHECK (manual_price IN (0, 1)),
+    owner_address TEXT,
+    blockchain TEXT GENERATED ALWAYS AS ('ETH') VIRTUAL,
+    is_lp INTEGER NOT NULL CHECK (is_lp IN (0, 1)),
+    image_url TEXT,
+    collection_name TEXT,
+    usd_price REAL NOT NULL DEFAULT 0,
+    FOREIGN KEY(blockchain, owner_address) REFERENCES blockchain_accounts(blockchain, account) ON DELETE CASCADE,
+    FOREIGN KEY (identifier) REFERENCES assets(identifier) ON UPDATE CASCADE,
+    FOREIGN KEY (last_price_asset) REFERENCES assets(identifier) ON UPDATE CASCADE
+);
+"""  # noqa: E501
+
+
+DB_CREATE_ENS_MAPPINGS = """
+CREATE TABLE IF NOT EXISTS ens_mappings (
+    address TEXT NOT NULL,
+    ens_name TEXT UNIQUE,
+    last_update INTEGER NOT NULL,
+    last_avatar_update INTEGER NOT NULL DEFAULT 0,
+    source TEXT NOT NULL DEFAULT 'ens',
+    PRIMARY KEY(address, source)
+);
+"""
+
+DB_CREATE_ADDRESS_BOOK = """
+CREATE TABLE IF NOT EXISTS address_book (
+    address TEXT NOT NULL,
+    blockchain TEXT NOT NULL,
+    name TEXT NOT NULL,
+    PRIMARY KEY(address, blockchain)
+);
+"""
+
+DB_CREATE_RPC_NODES = """
+CREATE TABLE IF NOT EXISTS rpc_nodes(
+    identifier INTEGER NOT NULL PRIMARY KEY,
+    name TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    owned INTEGER NOT NULL CHECK (owned IN (0, 1)),
+    active INTEGER NOT NULL CHECK (active IN (0, 1)),
+    weight TEXT NOT NULL,
+    blockchain TEXT NOT NULL,
+    is_archive INTEGER CHECK (is_archive IN (0, 1)),
+    is_pruned INTEGER CHECK (is_pruned IN (0, 1)),
+    UNIQUE(endpoint, blockchain)
+);
+"""
+
+DB_CREATE_USER_NOTES = """
+CREATE TABLE IF NOT EXISTS user_notes(
+    identifier INTEGER NOT NULL PRIMARY KEY,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    location TEXT NOT NULL,
+    last_update_timestamp INTEGER NOT NULL,
+    is_pinned INTEGER NOT NULL CHECK (is_pinned IN (0, 1))
+);
+"""
+
+DB_CREATE_ACCOUNTING_RULE = """
+CREATE TABLE IF NOT EXISTS accounting_rules(
+    identifier INTEGER NOT NULL PRIMARY KEY,
+    type TEXT NOT NULL,
+    subtype TEXT NOT NULL,
+    counterparty TEXT NOT NULL,
+    taxable INTEGER NOT NULL CHECK (taxable IN (0, 1)),
+    count_entire_amount_spend INTEGER NOT NULL CHECK (count_entire_amount_spend IN (0, 1)),
+    count_cost_basis_pnl INTEGER NOT NULL CHECK (count_cost_basis_pnl IN (0, 1)),
+    accounting_treatment TEXT,
+    is_event_specific INTEGER NOT NULL CHECK (is_event_specific IN (0, 1)) DEFAULT 0
+);
+"""
+
+DB_CREATE_ACCOUNTING_RULE_EVENTS = """
+CREATE TABLE IF NOT EXISTS accounting_rule_events(
+    identifier INTEGER NOT NULL PRIMARY KEY,
+    rule_id INTEGER NOT NULL,
+    event_id INTEGER NOT NULL,
+    FOREIGN KEY(event_id) REFERENCES history_events(identifier) ON DELETE CASCADE,
+    FOREIGN KEY(rule_id) REFERENCES accounting_rules(identifier) ON DELETE CASCADE,
+    UNIQUE(rule_id, event_id)
+);
+"""
+
+DB_CREATE_MAPPED_ACCOUNTING_RULES = """
+CREATE TABLE IF NOT EXISTS linked_rules_properties(
+    identifier INTEGER PRIMARY KEY NOT NULL,
+    accounting_rule INTEGER REFERENCES accounting_rules(identifier),
+    property_name TEXT NOT NULL,
+    setting_name TEXT NOT NULL references settings(name)
+);
+"""
+
+DB_CREATE_UNRESOLVED_REMOTE_CONFLICTS = """
+CREATE TABLE IF NOT EXISTS unresolved_remote_conflicts(
+    identifier INTEGER PRIMARY KEY NOT NULL,
+    local_id INTEGER NOT NULL,
+    remote_data TEXT NOT NULL,
+    type INTEGER NOT NULL
+);
+"""
+
+DB_CREATE_KEY_VALUE_CACHE = """CREATE TABLE IF NOT EXISTS key_value_cache (
+    name TEXT NOT NULL PRIMARY KEY,
+    value TEXT
+);"""
+
+DB_CREATE_HISTORY_EVENT_LINKS = """
+CREATE TABLE IF NOT EXISTS history_event_links (
+    left_event_id INTEGER NOT NULL,
+    right_event_id INTEGER NOT NULL,
+    link_type INTEGER NOT NULL,
+    PRIMARY KEY (left_event_id, link_type, right_event_id),
+    FOREIGN KEY(left_event_id) REFERENCES history_events(identifier) ON DELETE CASCADE,
+    FOREIGN KEY(right_event_id) REFERENCES history_events(identifier) ON DELETE CASCADE,
+    UNIQUE(right_event_id, link_type)
+);
+"""
+
+DB_CREATE_HISTORY_EVENT_LINK_IGNORES = """
+CREATE TABLE IF NOT EXISTS history_event_link_ignores (
+    event_id INTEGER NOT NULL,
+    link_type INTEGER NOT NULL,
+    PRIMARY KEY (event_id, link_type),
+    FOREIGN KEY(event_id) REFERENCES history_events(identifier) ON DELETE CASCADE
+);
+"""
+
+DB_CREATE_CALENDAR = """
+CREATE TABLE IF NOT EXISTS calendar (
+    identifier INTEGER PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    description TEXT,
+    counterparty TEXT,
+    address TEXT,
+    blockchain TEXT,
+    color TEXT,
+    auto_delete INTEGER NOT NULL CHECK (auto_delete IN (0, 1)),
+    FOREIGN KEY(blockchain, address) REFERENCES blockchain_accounts(blockchain, account) ON DELETE CASCADE,
+    UNIQUE(name, address, blockchain)
+);
+"""  # noqa: E501
+
+
+DB_CREATE_CALENDAR_REMINDERS = """
+CREATE TABLE IF NOT EXISTS calendar_reminders (
+    identifier INTEGER PRIMARY KEY NOT NULL,
+    event_id INTEGER NOT NULL,
+    secs_before INTEGER NOT NULL,
+    acknowledged INTEGER NOT NULL CHECK (acknowledged IN (0, 1)) DEFAULT 0,
+    FOREIGN KEY(event_id) REFERENCES calendar(identifier) ON DELETE CASCADE
+);
+"""
+
+DB_CREATE_COWSWAP_ORDERS = """
+CREATE TABLE IF NOT EXISTS cowswap_orders (
+    identifier TEXT NOT NULL PRIMARY KEY,
+    order_type TEXT NOT NULL,
+    raw_fee_amount TEXT NOT NULL
+);
+"""
+
+DB_CREATE_GNOSISPAY_DATA = """
+CREATE TABLE IF NOT EXISTS gnosispay_data (
+    identifier INTEGER PRIMARY KEY NOT NULL,
+    tx_hash BLOB NOT NULL UNIQUE,
+    timestamp INTEGER NOT NULL,
+    merchant_name TEXT NOT NULL,
+    merchant_city TEXT,
+    country TEXT NOT NULL,
+    mcc INTEGER NOT NULL,
+    transaction_symbol TEXT NOT NULL,
+    transaction_amount TEXT NOT NULL,
+    billing_symbol TEXT,
+    billing_amount TEXT,
+    reversal_symbol TEXT,
+    reversal_amount TEXT
+);
+"""
+
+DB_CREATE_SOLANA_TRANSACTIONS = """
+CREATE TABLE IF NOT EXISTS solana_transactions (
+    identifier INTEGER PRIMARY KEY NOT NULL,
+    slot INTEGER NOT NULL,
+    fee INTEGER NOT NULL,
+    block_time INTEGER NOT NULL,
+    success INTEGER NOT NULL CHECK(success IN (0, 1)),
+    signature BLOB NOT NULL UNIQUE
+);
+"""
+
+# stores all accounts involved in the transaction
+# account_index maintains original position in transaction
+DB_CREATE_SOLANA_TX_ACCOUNT_KEYS = """
+CREATE TABLE IF NOT EXISTS solana_tx_account_keys (
+    tx_id INTEGER NOT NULL,
+    account_index INTEGER NOT NULL,
+    address BLOB NOT NULL,
+    PRIMARY KEY(tx_id, account_index),
+    FOREIGN KEY(tx_id) REFERENCES solana_transactions(identifier) ON DELETE CASCADE ON UPDATE CASCADE
+);
+"""  # noqa: E501
+
+# stores all instructions (top-level and inner/cross-program invocation)
+# execution_index: flat execution order within transaction
+# parent_execution_index: uses TOP_LEVEL_PARENT constant for top-level instructions
+DB_CREATE_SOLANA_TX_INSTRUCTIONS = """
+CREATE TABLE IF NOT EXISTS solana_tx_instructions (
+    identifier INTEGER NOT NULL PRIMARY KEY,
+    tx_id INTEGER NOT NULL,
+    execution_index INTEGER NOT NULL,
+    parent_execution_index INTEGER NOT NULL,
+    program_id_index INTEGER NOT NULL,
+    data BLOB,
+    FOREIGN KEY(tx_id) REFERENCES solana_transactions(identifier) ON DELETE CASCADE ON UPDATE CASCADE,
+    FOREIGN KEY(tx_id, program_id_index) REFERENCES solana_tx_account_keys(tx_id, account_index) ON DELETE CASCADE ON UPDATE CASCADE
+);
+"""  # noqa: E501
+
+# maps which accounts each instruction uses and in what order
+# references instructions by instruction identifier
+DB_CREATE_SOLANA_TX_INSTRUCTION_ACCOUNTS = """
+CREATE TABLE IF NOT EXISTS solana_tx_instruction_accounts (
+    identifier INTEGER NOT NULL PRIMARY KEY,
+    instruction_id INTEGER NOT NULL,
+    account_order INTEGER NOT NULL,
+    account_index INTEGER NOT NULL,
+    tx_id INTEGER NOT NULL,
+    FOREIGN KEY(instruction_id) REFERENCES solana_tx_instructions(identifier) ON DELETE CASCADE ON UPDATE CASCADE,
+    FOREIGN KEY(tx_id, account_index) REFERENCES solana_tx_account_keys(tx_id, account_index) ON DELETE CASCADE ON UPDATE CASCADE
+);
+"""  # noqa: E501
+
+DB_CREATE_SOLANA_ADDRESS_MAPPINGS = """
+CREATE TABLE IF NOT EXISTS solanatx_address_mappings (
+    tx_id INTEGER NOT NULL,
+    address TEXT NOT NULL,
+    PRIMARY KEY(tx_id, address),
+    FOREIGN KEY(tx_id) REFERENCES solana_transactions(identifier) ON DELETE CASCADE ON UPDATE CASCADE
+);
+"""  # noqa: E501
+
+DB_CREATE_SOLANA_TX_MAPPINGS = """
+CREATE TABLE IF NOT EXISTS solana_tx_mappings (
+    tx_id INTEGER NOT NULL,
+    value INTEGER NOT NULL,
+    FOREIGN KEY(tx_id) references solana_transactions(identifier) ON UPDATE CASCADE ON DELETE CASCADE,
+    PRIMARY KEY (tx_id, value)
+);
+"""  # noqa: E501
+
+DB_CREATE_SOLANA_ATA_ADDRESS_MAPPINGS = """
+CREATE TABLE IF NOT EXISTS solana_ata_address_mappings (
+    blockchain TEXT GENERATED ALWAYS AS ('SOLANA') VIRTUAL,
+    account TEXT NOT NULL,
+    ata_address TEXT NOT NULL,
+    PRIMARY KEY(account, ata_address),
+    FOREIGN KEY(blockchain, account) REFERENCES blockchain_accounts(blockchain, account) ON DELETE CASCADE
+);
+"""  # noqa: E501
+
+# Stores the bitcoin/bitcoin cash transactions we queried, so that they can be decoded
+# again without querying the explorers a second time. Both chains share the tables since
+# a single manager serves them, with the location column telling them apart.
+# vin/vout_count are the number of TxIOs the transaction has according to the API. Some
+# APIs return only the TxIOs touching the queried addresses, so they are what tells a
+# locally saved transaction that is missing TxIOs apart from a complete one.
+DB_CREATE_BITCOIN_TRANSACTIONS = """
+CREATE TABLE IF NOT EXISTS bitcoin_transactions (
+    identifier INTEGER NOT NULL PRIMARY KEY,
+    location CHAR(1) NOT NULL REFERENCES location(location),
+    tx_id TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    block_height INTEGER NOT NULL,
+    fee INTEGER NOT NULL,
+    vin_count INTEGER,
+    vout_count INTEGER,
+    UNIQUE(location, tx_id)
+);
+"""
+
+# The inputs and outputs of a bitcoin transaction. Amounts are in satoshis, which is what
+# every API returns and keeps them exact. `io_index` is the index the chain itself gives
+# the TxIO, so that two partial views of the same transaction complete each other instead
+# of duplicating rows. Address is null for scripts that have none, such as op_return, and
+# script is null for the input TxIOs of APIs that omit it.
+DB_CREATE_BITCOIN_TX_IO = """
+CREATE TABLE IF NOT EXISTS bitcoin_tx_io (
+    tx_id INTEGER NOT NULL,
+    direction INTEGER NOT NULL CHECK(direction IN (1, 2)),
+    io_index INTEGER NOT NULL,
+    value INTEGER NOT NULL,
+    address TEXT,
+    script BLOB,
+    PRIMARY KEY(tx_id, direction, io_index),
+    FOREIGN KEY(tx_id) REFERENCES bitcoin_transactions(identifier) ON DELETE CASCADE ON UPDATE CASCADE
+) WITHOUT ROWID;
+"""  # noqa: E501
+
+# Maps each bitcoin transaction to the tracked addresses it was queried for. Used to know
+# which transactions to remove along with an address, keeping the ones another tracked
+# address still needs.
+DB_CREATE_BITCOINTX_ADDRESS_MAPPINGS = """
+CREATE TABLE IF NOT EXISTS bitcointx_address_mappings (
+    tx_id INTEGER NOT NULL,
+    address TEXT NOT NULL,
+    PRIMARY KEY(tx_id, address),
+    FOREIGN KEY(tx_id) REFERENCES bitcoin_transactions(identifier) ON DELETE CASCADE ON UPDATE CASCADE
+) WITHOUT ROWID;
+"""  # noqa: E501
+
+# Marks the state of a bitcoin transaction, currently only whether it has been decoded.
+DB_CREATE_BITCOIN_TX_MAPPINGS = """
+CREATE TABLE IF NOT EXISTS bitcoin_tx_mappings (
+    tx_id INTEGER NOT NULL,
+    value INTEGER NOT NULL,
+    PRIMARY KEY(tx_id, value),
+    FOREIGN KEY(tx_id) REFERENCES bitcoin_transactions(identifier) ON DELETE CASCADE ON UPDATE CASCADE
+) WITHOUT ROWID;
+"""  # noqa: E501
+
+# Lido CSM tracking tables. All columns are consumed by DBLidoCsm for enforcing the
+# FK to tracked Ethereum accounts and persisting cached metrics snapshots.
+DB_CREATE_LIDO_CSM_NODE_OPERATORS = """
+CREATE TABLE IF NOT EXISTS lido_csm_node_operators (
+    node_operator_id INTEGER NOT NULL PRIMARY KEY,
+    address TEXT NOT NULL,
+    blockchain TEXT GENERATED ALWAYS AS ('ETH') VIRTUAL,
+    FOREIGN KEY(blockchain, address)
+        REFERENCES blockchain_accounts(blockchain, account)
+        ON DELETE CASCADE
+);
+"""
+
+DB_CREATE_LIDO_CSM_NODE_OPERATOR_METRICS = """
+CREATE TABLE IF NOT EXISTS lido_csm_node_operator_metrics (
+    node_operator_id INTEGER NOT NULL PRIMARY KEY,
+    operator_type_id INTEGER,
+    bond_current TEXT,
+    bond_required TEXT,
+    bond_claimable TEXT,
+    total_deposited_validators INTEGER,
+    rewards_pending TEXT,
+    updated_ts INTEGER,
+    FOREIGN KEY(node_operator_id)
+        REFERENCES lido_csm_node_operators(node_operator_id)
+        ON UPDATE CASCADE ON DELETE CASCADE
+);
+"""
+
+# Cache for historical on-chain balance queries (by block).
+# timestamp is the queried timestamp in seconds.
+DB_CREATE_HISTORICAL_BALANCE_CACHE = """
+CREATE TABLE IF NOT EXISTS historical_balance_cache (
+    id INTEGER NOT NULL PRIMARY KEY,
+    blockchain TEXT NOT NULL,
+    address TEXT NOT NULL,
+    asset TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    block_number INTEGER NOT NULL,
+    FOREIGN KEY(asset) REFERENCES assets(identifier) ON UPDATE CASCADE,
+    UNIQUE(blockchain, address, asset, block_number)
+);
+"""
+
+DB_CREATE_BLOCKCHAIN_BALANCES_CACHE = """
+CREATE TABLE IF NOT EXISTS blockchain_balances_cache (
+    blockchain TEXT NOT NULL,
+    address TEXT NOT NULL,
+    asset TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    category CHAR(1) NOT NULL DEFAULT('A'),
+    amount TEXT NOT NULL,
+    FOREIGN KEY(asset) REFERENCES assets(identifier) ON UPDATE CASCADE,
+    PRIMARY KEY (blockchain, address, asset, label, category)
+) WITHOUT ROWID;
+"""
+
+# Stores metrics for history events including balance, pnl, and cost_basis data.
+# Each row represents a metric for a specific bucket after the event is applied.
+# Bucket = (location, location_label, protocol, asset) where:
+# - location_label is the address/account (can differ from history_events for transfers)
+# - protocol is NULL for wallet, or protocol name for DeFi positions (e.g., 'aave_v3', 'lido')
+# - metric_key is the type of metric ('balance', 'pnl', 'cost_basis', etc.)
+# - asset is the identifier this metric is aggregated under (may differ from event asset,
+#   e.g., token upgrades)
+DB_CREATE_DATA_ISSUES = """
+CREATE TABLE IF NOT EXISTS data_issues (
+    id INTEGER NOT NULL PRIMARY KEY,
+    kind TEXT NOT NULL,
+    location TEXT NOT NULL,
+    location_label TEXT NOT NULL DEFAULT '',
+    protocol TEXT NOT NULL DEFAULT '',
+    asset TEXT NOT NULL DEFAULT '',
+    event_identifier INTEGER,
+    ts_start INTEGER NOT NULL,
+    ts_end INTEGER NOT NULL,
+    severity TEXT NOT NULL,
+    state TEXT NOT NULL,
+    auto_remediation_attempts_json TEXT NOT NULL DEFAULT '[]',
+    payload_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    resolved_at INTEGER
+);
+"""
+
+DB_CREATE_EVENT_METRICS = """
+CREATE TABLE IF NOT EXISTS event_metrics (
+    id INTEGER NOT NULL PRIMARY KEY,
+    event_identifier INTEGER NOT NULL REFERENCES history_events(identifier) ON DELETE CASCADE,
+    location CHAR(1) NOT NULL,
+    location_label TEXT,
+    protocol TEXT,
+    metric_key TEXT NOT NULL,
+    metric_value TEXT NOT NULL,
+    asset TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    sequence_index INTEGER NOT NULL,
+    sort_key INTEGER NOT NULL,
+    UNIQUE(event_identifier, location_label, protocol, metric_key, asset)
+);
+"""
+
+# The history_events indexes significantly improve performance when filtering history events in large DBs.  # noqa: E501
+# Shown below are before/after query speeds we observed for each index:
+# idx_history_events_entry_type: Before: 12951ms, After: 0ms
+# idx_history_events_timestamp: Before: 13001ms, After: 1ms
+# idx_history_events_location: Before: 13436ms, After: 857ms
+# idx_history_events_location_label: Before: 12982ms, After: 57ms
+# idx_history_events_asset: Before: 13114ms, After: 251ms
+# idx_history_events_type: Before: 12995ms, After: 7ms
+# idx_history_events_subtype: Before: 12937ms, After: 2ms
+# idx_history_events_ignored: Before: 14723ms, After: 5184ms
+DB_CREATE_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_history_events_entry_type ON history_events(entry_type);
+CREATE INDEX IF NOT EXISTS idx_history_events_timestamp ON history_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_history_events_location ON history_events(location);
+CREATE INDEX IF NOT EXISTS idx_history_events_location_label ON history_events(location_label);
+CREATE INDEX IF NOT EXISTS idx_history_events_asset ON history_events(asset);
+CREATE INDEX IF NOT EXISTS idx_history_events_type ON history_events(type);
+CREATE INDEX IF NOT EXISTS idx_history_events_subtype ON history_events(subtype);
+CREATE INDEX IF NOT EXISTS idx_history_events_ignored ON history_events(ignored);
+CREATE INDEX IF NOT EXISTS idx_timed_balances_currency_timestamp_category_value ON timed_balances(currency, timestamp, category, usd_value);
+CREATE INDEX IF NOT EXISTS idx_bitcoin_events_addresses_address ON bitcoin_events_addresses(address);
+CREATE INDEX IF NOT EXISTS idx_bitcoin_tx_io_address ON bitcoin_tx_io(address);
+CREATE INDEX IF NOT EXISTS idx_evm_transactions_chain_timestamp ON evm_transactions(chain_id, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_evm_account_proxies_chain_account ON evm_account_proxies(chain_id, account);
+CREATE INDEX IF NOT EXISTS idx_evmtx_address_mappings_address ON evmtx_address_mappings(address, tx_id);
+CREATE INDEX IF NOT EXISTS idx_zksynclite_transactions_from_timestamp ON zksynclite_transactions(from_address, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_zksynclite_transactions_to_timestamp ON zksynclite_transactions(to_address, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_solana_transactions_block_time ON solana_transactions(block_time DESC);
+CREATE INDEX IF NOT EXISTS idx_solanatx_address_mappings_address ON solanatx_address_mappings(address, tx_id);
+CREATE INDEX IF NOT EXISTS idx_bitcoin_transactions_location_timestamp ON bitcoin_transactions(location, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_bitcointx_address_mappings_address ON bitcointx_address_mappings(address, tx_id);
+CREATE INDEX IF NOT EXISTS idx_history_event_links_right ON history_event_links(right_event_id);
+CREATE INDEX IF NOT EXISTS idx_history_event_links_composite ON history_event_links(link_type, left_event_id, right_event_id);
+CREATE INDEX IF NOT EXISTS idx_history_event_link_ignores_type ON history_event_link_ignores(link_type);
+CREATE INDEX IF NOT EXISTS idx_chain_events_info_tx_ref ON chain_events_info(tx_ref);
+CREATE UNIQUE INDEX IF NOT EXISTS unique_generic_accounting_rules ON accounting_rules(type, subtype, counterparty) WHERE is_event_specific = 0;
+CREATE INDEX IF NOT EXISTS idx_event_metrics_event ON event_metrics(event_identifier);
+CREATE INDEX IF NOT EXISTS idx_event_metrics_location_label ON event_metrics(location_label);
+CREATE INDEX IF NOT EXISTS idx_event_metrics_protocol ON event_metrics(protocol);
+CREATE INDEX IF NOT EXISTS idx_event_metrics_metric_key ON event_metrics(metric_key);
+CREATE INDEX IF NOT EXISTS idx_event_metrics_metric_key_timestamp ON event_metrics(metric_key, timestamp);
+CREATE INDEX IF NOT EXISTS idx_event_metrics_metric_key_asset_sort_key ON event_metrics(metric_key, asset, sort_key);
+CREATE INDEX IF NOT EXISTS idx_event_metrics_asset ON event_metrics(asset);
+CREATE INDEX IF NOT EXISTS idx_event_metrics_balances_latest ON event_metrics(metric_key, location, location_label, protocol, asset, timestamp, sort_key, metric_value);
+CREATE INDEX IF NOT EXISTS idx_data_issues_state ON data_issues(state);
+CREATE INDEX IF NOT EXISTS idx_data_issues_kind_state ON data_issues(kind, state);
+CREATE INDEX IF NOT EXISTS idx_data_issues_location_label_asset ON data_issues(location, location_label, asset);
+-- `event_identifier` is nullable because some issues are scoped to an event while others are
+-- scoped to a bucket. SQLite treats NULL values as distinct in normal UNIQUE constraints, so
+-- partial unique indexes are required to enforce one natural key row for both scopes.
+CREATE UNIQUE INDEX IF NOT EXISTS unique_data_issues_event_scope ON data_issues(kind, location, location_label, protocol, asset, event_identifier) WHERE event_identifier IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS unique_data_issues_bucket_scope ON data_issues(kind, location, location_label, protocol, asset) WHERE event_identifier IS NULL;
+"""  # noqa: E501
+
+DB_SCRIPT_CREATE_TABLES = f"""
+PRAGMA foreign_keys=off;
+BEGIN TRANSACTION;
+{DB_CREATE_LOCATION}
+{DB_CREATE_BALANCE_CATEGORY}
+{DB_CREATE_ASSETS}
+{DB_CREATE_TIMED_BALANCES}
+{DB_CREATE_TIMED_LOCATION_DATA}
+{DB_CREATE_USER_CREDENTIALS}
+{DB_CREATE_USER_CREDENTIALS_MAPPINGS}
+{DB_CREATE_EXTERNAL_SERVICE_CREDENTIALS}
+{DB_CREATE_BLOCKCHAIN_ACCOUNTS}
+{DB_CREATE_EVM_ACCOUNTS_DETAILS}
+{DB_CREATE_EVM_ACCOUNT_PROXIES}
+{DB_CREATE_MULTISETTINGS}
+{DB_CREATE_MANUALLY_TRACKED_BALANCES}
+{DB_CREATE_EVM_TRANSACTIONS}
+{DB_CREATE_EVM_TRANSACTION_AUTHORIZATIONS}
+{DB_CREATE_OPTIMISM_TRANSACTIONS}
+{DB_CREATE_EVM_INTERNAL_TRANSACTIONS}
+{DB_CREATE_EVMTX_RECEIPTS}
+{DB_CREATE_EVMTX_RECEIPT_LOGS}
+{DB_CREATE_EVMTX_RECEIPT_LOG_TOPICS}
+{DB_CREATE_EVMTX_ADDRESS_MAPPINGS}
+{DB_CREATE_ZKSYNCLITE_TX_TYPE}
+{DB_CREATE_ZKSYNCLITE_TRANSACTIONS}
+{DB_CREATE_ZKSYNCLITE_SWAPS}
+{DB_CREATE_MARGIN}
+{DB_CREATE_USED_QUERY_RANGES}
+{DB_CREATE_EVM_TX_MAPPINGS}
+{DB_CREATE_EVM_INTERNAL_TX_CONFLICTS}
+{DB_CREATE_SETTINGS}
+{DB_CREATE_TAGS_TABLE}
+{DB_CREATE_TAG_MAPPINGS}
+{DB_CREATE_XPUBS}
+{DB_CREATE_XPUB_MAPPINGS}
+{DB_CREATE_ETH2_VALIDATORS}
+{DB_CREATE_ETH_VALIDATORS_DATA_CACHE}
+{DB_CREATE_HISTORY_EVENTS}
+{DB_CREATE_CHAIN_EVENTS_INFO}
+{DB_CREATE_BITCOIN_EVENTS_ADDRESSES}
+{DB_CREATE_BITCOIN_TRANSACTIONS}
+{DB_CREATE_BITCOIN_TX_IO}
+{DB_CREATE_BITCOINTX_ADDRESS_MAPPINGS}
+{DB_CREATE_BITCOIN_TX_MAPPINGS}
+{DB_CREATE_ETH_STAKING_EVENTS_INFO}
+{DB_CREATE_HISTORY_EVENTS_MAPPINGS}
+{DB_CREATE_HISTORY_EVENTS_BACKUP}
+{DB_CREATE_CHAIN_EVENTS_INFO_BACKUP}
+{DB_CREATE_IGNORED_ACTIONS}
+{DB_CREATE_NFTS}
+{DB_CREATE_ENS_MAPPINGS}
+{DB_CREATE_ADDRESS_BOOK}
+{DB_CREATE_RPC_NODES}
+{DB_CREATE_USER_NOTES}
+{DB_CREATE_SKIPPED_EXTERNAL_EVENTS}
+{DB_CREATE_ACCOUNTING_RULE}
+{DB_CREATE_ACCOUNTING_RULE_EVENTS}
+{DB_CREATE_MAPPED_ACCOUNTING_RULES}
+{DB_CREATE_UNRESOLVED_REMOTE_CONFLICTS}
+{DB_CREATE_KEY_VALUE_CACHE}
+{DB_CREATE_HISTORY_EVENT_LINKS}
+{DB_CREATE_HISTORY_EVENT_LINK_IGNORES}
+{DB_CREATE_CALENDAR}
+{DB_CREATE_CALENDAR_REMINDERS}
+{DB_CREATE_COWSWAP_ORDERS}
+{DB_CREATE_GNOSISPAY_DATA}
+{DB_CREATE_SOLANA_TRANSACTIONS}
+{DB_CREATE_SOLANA_TX_ACCOUNT_KEYS}
+{DB_CREATE_SOLANA_TX_INSTRUCTIONS}
+{DB_CREATE_SOLANA_TX_INSTRUCTION_ACCOUNTS}
+{DB_CREATE_SOLANA_ADDRESS_MAPPINGS}
+{DB_CREATE_SOLANA_TX_MAPPINGS}
+{DB_CREATE_SOLANA_ATA_ADDRESS_MAPPINGS}
+{DB_CREATE_LIDO_CSM_NODE_OPERATORS}
+{DB_CREATE_LIDO_CSM_NODE_OPERATOR_METRICS}
+{DB_CREATE_HISTORICAL_BALANCE_CACHE}
+{DB_CREATE_BLOCKCHAIN_BALANCES_CACHE}
+{DB_CREATE_DATA_ISSUES}
+{DB_CREATE_EVENT_METRICS}
+{DB_CREATE_INDEXES}
+COMMIT;
+PRAGMA foreign_keys=on;
+"""

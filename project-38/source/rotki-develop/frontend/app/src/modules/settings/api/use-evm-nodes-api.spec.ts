@@ -1,0 +1,348 @@
+import type { BlockchainRpcNode } from '@/modules/settings/types/rpc';
+import { Blockchain } from '@rotki/common';
+import { server } from '@test/setup-files/server';
+import { type DefaultBodyType, http, HttpResponse } from 'msw';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { useEvmNodesApi } from '@/modules/settings/api/use-evm-nodes-api';
+
+const backendUrl = process.env.VITE_BACKEND_URL;
+
+describe('composables/api/settings/evm-nodes-api', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe('fetchEvmNodes', () => {
+    it('should fetch EVM nodes for default ETH chain', async () => {
+      const mockNodes: BlockchainRpcNode[] = [
+        {
+          identifier: 1,
+          name: 'Node 1',
+          endpoint: 'https://eth.example.com',
+          active: true,
+          owned: false,
+          weight: 50,
+          blockchain: 'ETH',
+        },
+        {
+          identifier: 2,
+          name: 'Node 2',
+          endpoint: 'https://eth2.example.com',
+          active: false,
+          owned: true,
+          weight: 30,
+          blockchain: 'ETH',
+        },
+      ];
+
+      server.use(
+        http.get(`${backendUrl}/api/1/blockchains/ETH/nodes`, () =>
+          HttpResponse.json({
+            result: mockNodes,
+            message: '',
+          })),
+      );
+
+      const { fetchEvmNodes } = useEvmNodesApi();
+      const result = await fetchEvmNodes();
+
+      expect(result).toHaveLength(2);
+      expect(result[0]).toEqual(mockNodes[0]);
+      expect(result[1]).toEqual(mockNodes[1]);
+    });
+
+    it('should fetch EVM nodes for specified chain', async () => {
+      const mockNodes: BlockchainRpcNode[] = [
+        {
+          identifier: 1,
+          name: 'Optimism Node',
+          endpoint: 'https://optimism.example.com',
+          active: true,
+          owned: true,
+          weight: 100,
+          blockchain: 'OPTIMISM',
+        },
+      ];
+
+      server.use(
+        http.get(`${backendUrl}/api/1/blockchains/OPTIMISM/nodes`, () =>
+          HttpResponse.json({
+            result: mockNodes,
+            message: '',
+          })),
+      );
+
+      const { fetchEvmNodes } = useEvmNodesApi(ref(Blockchain.OPTIMISM));
+      const result = await fetchEvmNodes();
+
+      expect(result).toHaveLength(1);
+      expect(result[0]).toEqual(mockNodes[0]);
+    });
+  });
+
+  describe('addEvmNode', () => {
+    it('should add a new EVM node with correct snake_case payload', async () => {
+      let requestBody: DefaultBodyType = null;
+
+      server.use(
+        http.put(`${backendUrl}/api/1/blockchains/ETH/nodes`, async ({ request }) => {
+          requestBody = await request.json();
+          return HttpResponse.json({
+            result: true,
+            message: '',
+          });
+        }),
+      );
+
+      const { addEvmNode } = useEvmNodesApi();
+      const newNode = {
+        name: 'New Node',
+        endpoint: 'https://new.example.com',
+        active: true,
+        owned: true,
+        weight: 75,
+        blockchain: 'ETH',
+      };
+
+      const result = await addEvmNode(newNode);
+
+      expect(result).toBe(true);
+      expect(requestBody).toEqual({
+        name: 'New Node',
+        endpoint: 'https://new.example.com',
+        active: true,
+        owned: true,
+        weight: 75,
+        blockchain: 'ETH',
+      });
+    });
+
+    it('should only send the writable fields, dropping any other server field', async () => {
+      let requestBody: DefaultBodyType = null;
+
+      server.use(
+        http.put(`${backendUrl}/api/1/blockchains/ETH/nodes`, async ({ request }) => {
+          requestBody = await request.json();
+          return HttpResponse.json({
+            result: true,
+            message: '',
+          });
+        }),
+      );
+
+      const { addEvmNode } = useEvmNodesApi();
+      const newNode = {
+        name: 'Archive Node',
+        endpoint: 'https://archive.example.com',
+        active: true,
+        owned: true,
+        weight: 100,
+        blockchain: 'ETH',
+        isArchive: true,
+        runtimeStatus: 'cooling_down' as const,
+        cooldownUntil: 1785655945,
+        // a runtime field the backend may add later, which the frontend knows nothing about
+        lastErrorKind: 'connection',
+      };
+
+      await addEvmNode(newNode);
+
+      expect(requestBody).toEqual({
+        name: 'Archive Node',
+        endpoint: 'https://archive.example.com',
+        active: true,
+        owned: true,
+        weight: 100,
+        blockchain: 'ETH',
+      });
+    });
+  });
+
+  describe('editEvmNode', () => {
+    it('should edit an existing EVM node with correct snake_case payload', async () => {
+      let requestBody: DefaultBodyType = null;
+
+      server.use(
+        http.patch(`${backendUrl}/api/1/blockchains/ETH/nodes`, async ({ request }) => {
+          requestBody = await request.json();
+          return HttpResponse.json({
+            result: true,
+            message: '',
+          });
+        }),
+      );
+
+      const { editEvmNode } = useEvmNodesApi();
+      const editedNode: BlockchainRpcNode = {
+        identifier: 1,
+        name: 'Updated Node',
+        endpoint: 'https://updated.example.com',
+        active: false,
+        owned: true,
+        weight: 25,
+        blockchain: 'ETH',
+      };
+
+      const result = await editEvmNode(editedNode);
+
+      expect(result).toBe(true);
+      expect(requestBody).toEqual({
+        identifier: 1,
+        name: 'Updated Node',
+        endpoint: 'https://updated.example.com',
+        active: false,
+        owned: true,
+        weight: 25,
+        blockchain: 'ETH',
+      });
+    });
+
+    it('should only send the writable fields, dropping any other server field', async () => {
+      let requestBody: DefaultBodyType = null;
+
+      server.use(
+        http.patch(`${backendUrl}/api/1/blockchains/ETH/nodes`, async ({ request }) => {
+          requestBody = await request.json();
+          return HttpResponse.json({
+            result: true,
+            message: '',
+          });
+        }),
+      );
+
+      const { editEvmNode } = useEvmNodesApi();
+      const editedNode = {
+        identifier: 1,
+        name: 'Archive Node',
+        endpoint: 'https://archive.example.com',
+        active: true,
+        owned: true,
+        weight: 100,
+        blockchain: 'ETH',
+        isArchive: true,
+        runtimeStatus: 'cooling_down' as const,
+        cooldownUntil: 1785655945,
+        // a runtime field the backend may add later, which the frontend knows nothing about
+        lastErrorKind: 'connection',
+      };
+
+      await editEvmNode(editedNode);
+
+      expect(requestBody).toEqual({
+        identifier: 1,
+        name: 'Archive Node',
+        endpoint: 'https://archive.example.com',
+        active: true,
+        owned: true,
+        weight: 100,
+        blockchain: 'ETH',
+      });
+    });
+  });
+
+  describe('deleteEvmNode', () => {
+    it('should delete an EVM node by identifier', async () => {
+      let requestBody: DefaultBodyType = null;
+
+      server.use(
+        http.delete(`${backendUrl}/api/1/blockchains/ETH/nodes`, async ({ request }) => {
+          requestBody = await request.json();
+          return HttpResponse.json({
+            result: true,
+            message: '',
+          });
+        }),
+      );
+
+      const { deleteEvmNode } = useEvmNodesApi();
+      const result = await deleteEvmNode(42);
+
+      expect(result).toBe(true);
+      expect(requestBody).toEqual({
+        identifier: 42,
+      });
+    });
+  });
+
+  describe('reConnectNode', () => {
+    it('should reconnect a specific node by identifier', async () => {
+      let requestBody: DefaultBodyType = null;
+
+      server.use(
+        http.post(`${backendUrl}/api/1/blockchains/ETH/nodes`, async ({ request }) => {
+          requestBody = await request.json();
+          return HttpResponse.json({
+            result: { errors: [] },
+            message: '',
+          });
+        }),
+      );
+
+      const { reConnectNode } = useEvmNodesApi();
+      const result = await reConnectNode(5);
+
+      expect(result).toEqual({ errors: [] });
+      expect(requestBody).toEqual({
+        identifier: 5,
+      });
+    });
+
+    it('should reconnect all nodes when no identifier provided', async () => {
+      let requestBody: DefaultBodyType = null;
+
+      server.use(
+        http.post(`${backendUrl}/api/1/blockchains/ETH/nodes`, async ({ request }) => {
+          requestBody = await request.json();
+          return HttpResponse.json({
+            result: { errors: [] },
+            message: '',
+          });
+        }),
+      );
+
+      const { reConnectNode } = useEvmNodesApi();
+      const result = await reConnectNode();
+
+      expect(result).toEqual({ errors: [] });
+      expect(requestBody).toEqual({});
+    });
+
+    it('should return the nodes the backend could not connect', async () => {
+      server.use(
+        http.post(`${backendUrl}/api/1/blockchains/ETH/nodes`, () =>
+          HttpResponse.json({
+            result: { errors: [{ name: 'my node', error: 'Failed to connect' }] },
+            message: '',
+          })),
+      );
+
+      const { reConnectNode } = useEvmNodesApi();
+
+      expect(await reConnectNode(5)).toEqual({ errors: [{ name: 'my node', error: 'Failed to connect' }] });
+    });
+  });
+
+  describe('dynamic chain parameter', () => {
+    it('should use correct URL when chain ref changes', async () => {
+      const chainRef = ref(Blockchain.ETH);
+      let requestedUrl = '';
+
+      server.use(
+        http.get(`${backendUrl}/api/1/blockchains/polygon_pos/nodes`, ({ request }) => {
+          requestedUrl = request.url;
+          return HttpResponse.json({
+            result: [],
+            message: '',
+          });
+        }),
+      );
+
+      const { fetchEvmNodes } = useEvmNodesApi(chainRef);
+
+      chainRef.value = Blockchain.POLYGON_POS;
+      await fetchEvmNodes();
+
+      expect(requestedUrl).toContain('/blockchains/polygon_pos/nodes');
+    });
+  });
+});

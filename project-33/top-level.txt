@@ -1,0 +1,1 @@
+.dockerignore,.github .gitignore,.nvmrc .well-known,CODE_OF_CONDUCT.md CONTRIBUTING.md,Dockerfile LICENSE.md,README.md assets,eslint.config.mjs http_server.js,manifest.json package.json,patches pnpm-lock.yaml,pnpm-workspace.yaml src,tests tsconfig.json,webpack.config.js

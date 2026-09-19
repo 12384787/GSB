@@ -1,0 +1,267 @@
+import { describe, expect, it } from 'vitest';
+import { buildTree, someInSubtree, subtreeLeaves, subtreeProgress, subtreeSteps } from './tree';
+import { type Activity, type ActivityId, ActivityKind, ActivitySourceType, ActivityStatus, makeActivityId } from './types';
+
+function activity(id: string, status: ActivityStatus, parent?: string, startedAt?: number): Activity {
+  return {
+    cancellable: false,
+    id: makeActivityId(ActivityKind.TX_SYNC, id),
+    kind: ActivityKind.TX_SYNC,
+    parent: parent === undefined ? undefined : makeActivityId(ActivityKind.TX_SYNC, parent),
+    percentage: -1,
+    rerunnable: false,
+    source: { type: ActivitySourceType.NATIVE },
+    startedAt,
+    status,
+    title: id,
+  };
+}
+
+function id(value: string): ActivityId {
+  return makeActivityId(ActivityKind.TX_SYNC, value);
+}
+
+/** Insertion order, so a tree is never accidentally correct because the input was already sorted. */
+const byId = (a: Activity, b: Activity): number => a.id.localeCompare(b.id);
+
+describe('buildTree', () => {
+  it('should nest children under their declared parent', () => {
+    const { children, roots } = buildTree([
+      activity('umbrella', ActivityStatus.RUNNING),
+      activity('eth', ActivityStatus.RUNNING, 'umbrella'),
+      activity('eth-a', ActivityStatus.RUNNING, 'eth'),
+    ], byId);
+
+    expect(roots.map(root => root.id)).toEqual([id('umbrella')]);
+    expect(children.get(id('umbrella'))?.map(child => child.id)).toEqual([id('eth')]);
+    expect(children.get(id('eth'))?.map(child => child.id)).toEqual([id('eth-a')]);
+  });
+
+  /**
+   * `clearTerminal` prunes settled records, so a parent can legitimately vanish while its children
+   * still run. Dropping those children would hide live work entirely — the panel would show
+   * nothing while the app kept querying.
+   */
+  it('should treat an activity whose parent is absent as a root', () => {
+    const { roots } = buildTree([activity('orphan', ActivityStatus.RUNNING, 'gone')], byId);
+
+    expect(roots.map(root => root.id)).toEqual([id('orphan')]);
+  });
+
+  it('should order siblings by start time, with unstarted ones last', () => {
+    const { children } = buildTree([
+      activity('parent', ActivityStatus.RUNNING),
+      activity('queued', ActivityStatus.PENDING, 'parent'),
+      activity('second', ActivityStatus.RUNNING, 'parent', 200),
+      activity('first', ActivityStatus.RUNNING, 'parent', 100),
+    ], byId);
+
+    expect(children.get(id('parent'))?.map(child => child.id)).toEqual([
+      id('first'),
+      id('second'),
+      id('queued'),
+    ]);
+  });
+
+  it('should leave a parent with no children out of the map', () => {
+    const { children, roots } = buildTree([activity('lonely', ActivityStatus.RUNNING)], byId);
+
+    expect(roots).toHaveLength(1);
+    expect(children.size).toBe(0);
+  });
+});
+
+describe('subtreeSteps', () => {
+  /**
+   * Leaves only. Counting rows instead would let every intermediate node inflate the denominator:
+   * the tree below is 2 accounts of work, not 4 activities of it.
+   */
+  it('should count leaves, not rows', () => {
+    const activities = [
+      activity('umbrella', ActivityStatus.RUNNING),
+      activity('eth', ActivityStatus.RUNNING, 'umbrella'),
+      activity('eth-a', ActivityStatus.COMPLETE, 'eth'),
+      activity('eth-b', ActivityStatus.RUNNING, 'eth'),
+    ];
+    const { children, roots } = buildTree(activities, byId);
+
+    expect(subtreeSteps(children, roots[0])).toEqual({ current: 1, total: 2 });
+  });
+
+  it('should count a childless activity as one step', () => {
+    const { children, roots } = buildTree([activity('solo', ActivityStatus.RUNNING)], byId);
+
+    expect(subtreeSteps(children, roots[0])).toEqual({ current: 0, total: 1 });
+  });
+
+  /**
+   * The rollup counts both as done on purpose (`projection.ts`): no further progress is coming, so
+   * a bar that excluded them would stall. The chip on the row is what tells the user they were not
+   * successes.
+   */
+  it('should count failed and skipped leaves as done', () => {
+    const { children, roots } = buildTree([
+      activity('parent', ActivityStatus.RUNNING),
+      activity('failed', ActivityStatus.FAILED, 'parent'),
+      activity('skipped', ActivityStatus.SKIPPED, 'parent'),
+      activity('running', ActivityStatus.RUNNING, 'parent'),
+    ], byId);
+
+    expect(subtreeSteps(children, roots[0])).toEqual({ current: 2, total: 3 });
+  });
+
+  it('should count a chain in its accounts, leaving out the decode of another kind beneath it', () => {
+    const decode: Activity = { ...activity('decode', ActivityStatus.RUNNING, 'eth'), kind: ActivityKind.TX_DECODING };
+    const { children, roots } = buildTree([
+      activity('eth', ActivityStatus.RUNNING),
+      activity('eth-a', ActivityStatus.COMPLETE, 'eth'),
+      activity('eth-b', ActivityStatus.RUNNING, 'eth'),
+      decode,
+    ], byId);
+
+    expect(subtreeSteps(children, roots[0])).toEqual({ current: 1, total: 2 });
+  });
+
+  it('should count a job with no descendant of its own kind in leaves of every kind', () => {
+    const umbrella: Activity = { ...activity('umbrella', ActivityStatus.RUNNING), kind: ActivityKind.HISTORY_SYNC };
+    const decode: Activity = { ...activity('decode', ActivityStatus.COMPLETE, 'eth'), kind: ActivityKind.TX_DECODING };
+    const { children, roots } = buildTree([
+      umbrella,
+      { ...activity('eth', ActivityStatus.RUNNING), parent: umbrella.id },
+      activity('eth-a', ActivityStatus.COMPLETE, 'eth'),
+      decode,
+    ], byId);
+
+    expect(subtreeSteps(children, roots[0])).toEqual({ current: 2, total: 2 });
+  });
+
+  it('should count a run in its same-kind parents, crediting a running one with its own percentage', () => {
+    const balances = (name: string, status: ActivityStatus, parent?: string, percentage = -1): Activity => ({
+      ...activity(name, status),
+      id: makeActivityId(ActivityKind.BLOCKCHAIN_BALANCES, name),
+      kind: ActivityKind.BLOCKCHAIN_BALANCES,
+      parent: parent === undefined ? undefined : makeActivityId(ActivityKind.BLOCKCHAIN_BALANCES, parent),
+      percentage,
+    });
+    const detection: Activity = {
+      ...activity('detect', ActivityStatus.COMPLETE),
+      kind: ActivityKind.TOKEN_DETECTION,
+      parent: makeActivityId(ActivityKind.BLOCKCHAIN_BALANCES, 'eth'),
+    };
+    const { children, roots } = buildTree([
+      balances('run', ActivityStatus.RUNNING),
+      balances('eth', ActivityStatus.RUNNING, 'run', 50),
+      balances('gnosis', ActivityStatus.COMPLETE, 'run'),
+      detection,
+    ], byId);
+
+    expect(subtreeSteps(children, roots[0])).toEqual({ current: 1, total: 2 });
+    expect(subtreeProgress(children, roots[0])).toBe(75);
+  });
+
+  it('should not hang on a parent cycle', () => {
+    const a = activity('a', ActivityStatus.RUNNING, 'b');
+    const b = activity('b', ActivityStatus.RUNNING, 'a');
+    const { children } = buildTree([a, b], byId);
+
+    expect(subtreeSteps(children, a).total).toBeLessThanOrEqual(2);
+  });
+});
+
+describe('someInSubtree', () => {
+  const isRunning = (item: Activity): boolean => item.status === ActivityStatus.RUNNING;
+
+  it('should find a running descendant under a queued root', () => {
+    const { children, roots } = buildTree([
+      activity('parent', ActivityStatus.PENDING),
+      activity('child', ActivityStatus.RUNNING, 'parent'),
+    ], byId);
+
+    expect(someInSubtree(children, roots[0], isRunning)).toBe(true);
+  });
+
+  it('should be false when the whole subtree is queued', () => {
+    const { children, roots } = buildTree([
+      activity('parent', ActivityStatus.PENDING),
+      activity('child', ActivityStatus.PENDING, 'parent'),
+    ], byId);
+
+    expect(someInSubtree(children, roots[0], isRunning)).toBe(false);
+  });
+});
+
+describe('subtreeLeaves', () => {
+  it('should return the leaves at every depth, skipping the parents above them', () => {
+    const { children, roots } = buildTree([
+      activity('umbrella', ActivityStatus.COMPLETE),
+      activity('eth', ActivityStatus.COMPLETE, 'umbrella'),
+      activity('eth-a', ActivityStatus.FAILED, 'eth'),
+      activity('eth-b', ActivityStatus.COMPLETE, 'eth'),
+      activity('btc', ActivityStatus.COMPLETE, 'umbrella'),
+    ], byId);
+
+    expect(subtreeLeaves(children, roots[0]).map(leaf => leaf.id).sort()).toEqual([id('btc'), id('eth-a'), id('eth-b')]);
+  });
+
+  it('should return a childless root as its own leaf', () => {
+    const { children, roots } = buildTree([activity('solo', ActivityStatus.FAILED)], byId);
+
+    expect(subtreeLeaves(children, roots[0]).map(leaf => leaf.id)).toEqual([id('solo')]);
+  });
+});
+
+describe('subtreeProgress', () => {
+  function withPercentage(base: Activity, percentage: number): Activity {
+    return { ...base, percentage };
+  }
+
+  it('should give a leaf fractional credit for its own progress, though its step tally stays 0 of 1', () => {
+    const root = withPercentage(activity('prices', ActivityStatus.RUNNING), 45);
+    const { children } = buildTree([root], byId);
+
+    expect(subtreeProgress(children, root)).toBe(45);
+    expect(subtreeSteps(children, root)).toEqual({ current: 0, total: 1 });
+  });
+
+  it('should count a settled leaf as whole regardless of its percentage', () => {
+    const root = withPercentage(activity('prices', ActivityStatus.COMPLETE), 20);
+    const { children } = buildTree([root], byId);
+
+    expect(subtreeProgress(children, root)).toBe(100);
+  });
+
+  /** Unknown work is unfinished work: it drags the mean down rather than leaving the denominator. */
+  it('should count an unquantifiable leaf as zero without dropping it', () => {
+    const activities = [
+      activity('umbrella', ActivityStatus.RUNNING),
+      withPercentage(activity('eth', ActivityStatus.COMPLETE, 'umbrella'), 100),
+      activity('gno', ActivityStatus.RUNNING, 'umbrella'),
+    ];
+    const { children, roots } = buildTree(activities, byId);
+
+    expect(subtreeProgress(children, roots[0])).toBe(50);
+  });
+
+  it('should say so when nothing in the subtree can be quantified', () => {
+    const activities = [
+      activity('umbrella', ActivityStatus.RUNNING),
+      activity('eth', ActivityStatus.RUNNING, 'umbrella'),
+    ];
+    const { children, roots } = buildTree(activities, byId);
+
+    expect(subtreeProgress(children, roots[0])).toBe(-1);
+  });
+
+  it('should average the leaves of a deep tree, not its rows', () => {
+    const activities = [
+      activity('umbrella', ActivityStatus.RUNNING),
+      activity('eth', ActivityStatus.RUNNING, 'umbrella'),
+      activity('eth-a', ActivityStatus.COMPLETE, 'eth'),
+      withPercentage(activity('eth-b', ActivityStatus.RUNNING, 'eth'), 50),
+    ];
+    const { children, roots } = buildTree(activities, byId);
+
+    // Two leaves: one whole, one half. The two intermediate rows count for nothing.
+    expect(subtreeProgress(children, roots[0])).toBe(75);
+  });
+});

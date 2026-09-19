@@ -1,0 +1,262 @@
+import type { LogService } from '@electron/main/log-service';
+import type { WalletBridgeWebSocketServer } from '@electron/main/ws';
+import type { EIP6963ProviderDetail } from '@/types';
+import { AppServer } from '@electron/main/app-server';
+import { selectPort } from '@shared/port-utils';
+import { ROTKI_RPC_METHODS } from '@shared/proxy/constants';
+import { wait } from '@shared/utils';
+import { shell } from 'electron';
+
+const MAX_PORT_RETRIES = 2;
+
+interface WalletBridgeIpcHandlersCallbacks {
+  sendIpcMessage: (channel: string, ...args: any[]) => void;
+}
+
+export class WalletBridgeIpcHandlers {
+  private callbacks: WalletBridgeIpcHandlersCallbacks | null = null;
+  private walletConnectBridgePort: number | undefined = undefined;
+  private readonly appServer: AppServer;
+
+  constructor(
+    private readonly logger: LogService,
+    private readonly walletBridgeWebSocketServer: WalletBridgeWebSocketServer,
+  ) {
+    this.appServer = new AppServer(logger);
+  }
+
+  initialize(callbacks: WalletBridgeIpcHandlersCallbacks): void {
+    this.callbacks = callbacks;
+    // Set the IPC callbacks on the WebSocket server
+    this.walletBridgeWebSocketServer.setIpcCallbacks({
+      sendIpcMessage: callbacks.sendIpcMessage,
+    });
+  }
+
+  /**
+   * Opens the wallet bridge page in the user's browser, starting the servers if they are down.
+   *
+   * @remarks
+   * Both servers are checked before anything is started, because the bridge is reopened as often
+   * as it is opened and restarting a live pair would drop a connected wallet. When they are up but
+   * the client has gone, reopening the url is enough to bring it back; the provider selection is
+   * only reset when a connected client is being handed a fresh page.
+   */
+  openWalletConnectBridge = async (): Promise<void> => {
+    const httpRunning = this.appServer.isListening();
+    const wsRunning = this.walletBridgeWebSocketServer.isListening();
+    const wsConnected = this.walletBridgeWebSocketServer.isConnected();
+
+    if (this.walletConnectBridgePort && httpRunning && wsRunning) {
+      if (wsConnected) {
+        this.logger.info(`Wallet Connect Bridge already running and connected at http://localhost:${this.walletConnectBridgePort}, resetting provider selection and opening page`);
+        await this.resetSelectedProvider();
+        await shell.openExternal(`http://localhost:${this.walletConnectBridgePort}/#/wallet-bridge`);
+      }
+      else {
+        this.logger.info(`Wallet Connect Bridge servers running but client disconnected, reopening URL to reconnect`);
+        await shell.openExternal(`http://localhost:${this.walletConnectBridgePort}/#/wallet-bridge`);
+      }
+      return;
+    }
+
+    // Servers not running or not configured, start them with retry
+    const portNumber = await this.startServersWithRetry();
+    this.walletConnectBridgePort = portNumber;
+
+    await shell.openExternal(`http://localhost:${portNumber}/#/wallet-bridge`);
+  };
+
+  private async startServersWithRetry(): Promise<number> {
+    const port = await selectPort(40010);
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt <= MAX_PORT_RETRIES; attempt++) {
+      const candidatePort = port + attempt;
+      try {
+        await this.appServer.start(candidatePort, '/#/wallet-bridge');
+        await this.walletBridgeWebSocketServer.start(candidatePort + 1);
+        return candidatePort;
+      }
+      catch (error) {
+        lastError = error;
+        this.performCleanup();
+        this.logger.warn(`Failed to start wallet bridge servers on port ${candidatePort}: ${String(error)}`);
+      }
+    }
+
+    throw new Error(`Failed to start wallet bridge servers after ${MAX_PORT_RETRIES + 1} attempts: ${String(lastError)}`);
+  }
+
+  handleWalletBridgeHttpListening = async (): Promise<boolean> => this.appServer.isListening();
+
+  handleWalletBridgeWsListening = async (): Promise<boolean> => this.walletBridgeWebSocketServer.isListening();
+
+  handleWalletBridgeClientReady = async (): Promise<boolean> => this.walletBridgeWebSocketServer.isClientReady();
+
+  handleUserLogout = (): void => {
+    this.logger.info('User logout event received, cleaning up wallet bridge connections');
+
+    // Try to send close signal immediately and synchronously if possible
+    this.sendCloseSignalAndCleanup();
+  };
+
+  handleStopServers = async (): Promise<void> => {
+    try {
+      this.logger.info('Stopping wallet bridge servers');
+
+      // Send close signal to clients if connected
+      const wasConnected = this.walletBridgeWebSocketServer.isConnected();
+      if (wasConnected) {
+        try {
+          this.walletBridgeWebSocketServer.sendNotification({ type: 'close_tab' });
+          // Brief delay to allow message to be sent
+          await wait(150);
+        }
+        catch (error) {
+          this.logger.warn('Failed to send close notification during server stop:', error);
+        }
+      }
+
+      // Stop both servers
+      this.performCleanup();
+    }
+    catch (error: any) {
+      this.logger.error('Failed to stop wallet bridge servers:', error);
+      throw error;
+    }
+  };
+
+  private sendCloseSignalAndCleanup(): void {
+    const wasConnected = this.walletBridgeWebSocketServer.isConnected();
+
+    if (wasConnected) {
+      this.logger.info('Sending close signal to bridge clients');
+
+      // Try to send the notification immediately
+      try {
+        this.walletBridgeWebSocketServer.sendNotification({ type: 'close_tab' });
+
+        // Wait a moment for the message to be sent before disconnecting
+        setTimeout(() => {
+          this.performCleanup();
+        }, 150);
+      }
+      catch (error) {
+        this.logger.warn('Failed to send close notification:', error);
+        // Clean up immediately if we can't send the message
+        this.performCleanup();
+      }
+    }
+    else {
+      // No connection, clean up immediately
+      this.logger.info('No active bridge connection, cleaning up immediately');
+      this.performCleanup();
+    }
+  }
+
+  private performCleanup(): void {
+    this.logger.info('Performing wallet bridge cleanup');
+
+    // Disconnect wallet bridge WebSocket
+    this.walletBridgeWebSocketServer.disconnect();
+
+    // Stop app server
+    this.appServer.stop();
+
+    // Clear the stored port so it can be restarted fresh next time
+    this.walletConnectBridgePort = undefined;
+  }
+
+  // EIP-6963 Provider Detection handlers
+  getAvailableProviders = async (): Promise<any[]> => {
+    try {
+      this.logger.debug('Getting available EIP-6963 providers from bridge');
+
+      if (!this.walletBridgeWebSocketServer.isConnected()) {
+        this.logger.warn('Wallet bridge not connected for provider detection');
+        return [];
+      }
+
+      const result = await this.walletBridgeWebSocketServer.sendToWalletBridge({
+        method: ROTKI_RPC_METHODS.GET_AVAILABLE_PROVIDERS,
+        params: [],
+      });
+
+      this.logger.debug('Received available EIP-6963 providers from bridge:', result);
+
+      return result ?? [];
+    }
+    catch (error: any) {
+      this.logger.error('Failed to get available providers:', error);
+      return [];
+    }
+  };
+
+  selectProvider = async (_event: Electron.IpcMainInvokeEvent, uuid: string): Promise<boolean> => {
+    try {
+      this.logger.debug(`Selecting EIP-6963 provider: ${uuid}`);
+
+      if (!this.walletBridgeWebSocketServer.isConnected()) {
+        this.logger.warn('Wallet bridge not connected for provider selection');
+        return false;
+      }
+
+      const result = await this.walletBridgeWebSocketServer.sendToWalletBridge({
+        method: ROTKI_RPC_METHODS.SELECT_PROVIDER,
+        params: [uuid],
+      });
+
+      return result === true;
+    }
+    catch (error: any) {
+      this.logger.error('Failed to select provider:', error);
+      return false;
+    }
+  };
+
+  getSelectedProvider = async (): Promise<EIP6963ProviderDetail | null> => {
+    try {
+      this.logger.debug('Getting selected provider from bridge');
+
+      if (!this.walletBridgeWebSocketServer.isConnected()) {
+        this.logger.warn('Wallet bridge not connected for getting selected provider');
+        return null;
+      }
+
+      const result = await this.walletBridgeWebSocketServer.sendToWalletBridge({
+        method: ROTKI_RPC_METHODS.GET_SELECTED_PROVIDER,
+        params: [],
+      });
+
+      return result ?? null;
+    }
+    catch (error: any) {
+      this.logger.error('Failed to get selected provider:', error);
+      return null;
+    }
+  };
+
+  private readonly resetSelectedProvider = async (): Promise<void> => {
+    try {
+      this.logger.debug('Resetting selected provider in bridge');
+
+      if (!this.walletBridgeWebSocketServer.isConnected()) {
+        this.logger.warn('Wallet bridge not connected for resetting selected provider');
+        return;
+      }
+
+      // Clear the selected provider by selecting an empty string or null
+      await this.walletBridgeWebSocketServer.sendToWalletBridge({
+        method: ROTKI_RPC_METHODS.SELECT_PROVIDER,
+        params: [''],
+      });
+
+      this.logger.info('Successfully reset selected provider in bridge');
+    }
+    catch (error: any) {
+      this.logger.error('Failed to reset selected provider:', error);
+      // Don't throw error as this is not critical for opening the bridge
+    }
+  };
+}

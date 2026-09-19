@@ -1,0 +1,372 @@
+import {
+  BigNumber,
+  Theme,
+  ThemeColors,
+  ThemeEnum,
+  TimeFramePeriod,
+  TimeFramePeriodEnum,
+  TimeFramePersist,
+  TimeFrameSetting,
+} from '@rotki/common';
+import { isEmpty } from 'es-toolkit/compat';
+import { z } from 'zod';
+import { CurrencyLocationEnum } from '@/modules/assets/amount-display/currency-location';
+import { Constraints, MINIMUM_DIGIT_TO_BE_ABBREVIATED } from '@/modules/core/common/constraints';
+import { DateFormatEnum } from '@/modules/core/common/date-format';
+import { Defaults } from '@/modules/core/common/defaults';
+import { logger } from '@/modules/core/common/logging/logging';
+import { SavedFilterLocations } from '@/modules/core/table/filtering';
+import { LegacySavedFilters } from '@/modules/core/table/pill/core/legacy-saved-filter';
+import { SavedView } from '@/modules/core/table/pill/core/saved-view';
+import { TableColumnEnum } from '@/modules/core/table/table-column';
+import { generateRandomScrambleMultiplier } from '@/modules/session/session-utils';
+import { PrivacyMode } from '@/modules/session/types';
+import {
+  FRONTEND_SETTINGS_SCHEMA_VERSION,
+  normalizeLegacyShapes,
+} from '@/modules/settings/types/frontend-settings-migrations';
+import { DARK_COLORS, LIGHT_COLORS } from '@/plugins/theme';
+
+export enum Quarter {
+  Q1 = 'Q1',
+  Q2 = 'Q2',
+  Q3 = 'Q3',
+  Q4 = 'Q4',
+  ALL = 'ALL',
+}
+
+const QuarterEnum = z.enum(Quarter);
+
+const ProfitLossTimeframe = z.object({
+  quarter: QuarterEnum,
+  year: z.string(),
+});
+
+const ExplorerEndpoints = z.object({
+  address: z.string().optional(),
+  block: z.string().optional(),
+  token: z.string().optional(),
+  transaction: z.string().optional(),
+});
+
+const ExplorersSettings = z.record(z.string(), ExplorerEndpoints.optional());
+
+/**
+ * Spelled out as literals so that the inferred type is `BigNumber.RoundingMode` itself, rather than
+ * a number that every consumer has to assert into it.
+ */
+const RoundingMode = z.literal([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+
+export type RoundingMode = z.infer<typeof RoundingMode>;
+
+const RefreshPeriod = z.number().min(-1).max(Constraints.MAX_MINUTES_DELAY).int();
+
+/**
+ * How often a notification group has interrupted the user, so the nag schedule can back off
+ * instead of re-toasting the same unresolved condition on every login.
+ */
+export const NotificationScheduleEntry = z.object({
+  lastShown: z.number().int().nonnegative(),
+  shownCount: z.number().int().nonnegative(),
+});
+
+export type NotificationScheduleEntry = z.infer<typeof NotificationScheduleEntry>;
+
+const QueryPeriod = z.number().int().max(Constraints.MAX_SECONDS_DELAY).nonnegative();
+
+export enum DashboardTableType {
+  ASSETS = 'ASSETS',
+  LIABILITIES = 'LIABILITIES',
+  NFT = 'NFT',
+  LIQUIDITY_POSITION = 'LIQUIDITY_POSITION',
+  BLOCKCHAIN_ASSET_BALANCES = 'BLOCKCHAIN_ASSET_BALANCES',
+}
+
+const DashboardTablesVisibleColumns = z.object({
+  [DashboardTableType.ASSETS]: TableColumnEnum.default(
+    Defaults.DEFAULT_DASHBOARD_TABLE_VISIBLE_COLUMNS,
+  ),
+  [DashboardTableType.BLOCKCHAIN_ASSET_BALANCES]: TableColumnEnum.default(
+    Defaults.DEFAULT_DASHBOARD_TABLE_VISIBLE_COLUMNS,
+  ),
+  [DashboardTableType.LIABILITIES]: TableColumnEnum.default(
+    Defaults.DEFAULT_DASHBOARD_TABLE_VISIBLE_COLUMNS,
+  ),
+  [DashboardTableType.LIQUIDITY_POSITION]: TableColumnEnum.default(
+    Defaults.DEFAULT_DASHBOARD_TABLE_VISIBLE_COLUMNS,
+  ),
+  [DashboardTableType.NFT]: TableColumnEnum.default(
+    Defaults.DEFAULT_DASHBOARD_TABLE_VISIBLE_COLUMNS,
+  ),
+});
+
+const VersionUpdateCheckFrequency = z.number().min(-1).max(Constraints.MAX_HOURS_DELAY).int();
+
+export enum SupportedLanguage {
+  EN = 'en',
+  ES = 'es',
+  GR = 'gr',
+  DE = 'de',
+  CN = 'cn',
+  FR = 'fr',
+  RU = 'ru',
+}
+
+const SupportedLanguageEnum = z.enum(SupportedLanguage);
+
+export enum BlockchainRefreshButtonBehaviour {
+  ONLY_REFRESH_BALANCES = 'ONLY_REFRESH_BALANCES',
+  REDETECT_TOKENS = 'REDETECT_TOKENS',
+}
+
+const BlockchainRefreshButtonBehaviourEnum = z.enum(BlockchainRefreshButtonBehaviour);
+
+const SavedFilterLocationEnum = z.enum(SavedFilterLocations);
+
+const PrivacyModeEnum = z.nativeEnum(PrivacyMode);
+
+export enum BalanceSource {
+  BLOCKCHAIN = 'BLOCKCHAIN',
+  EXCHANGES = 'EXCHANGES',
+  MANUAL = 'MANUAL',
+}
+
+export const BalanceValueThreshold = z.partialRecord(z.enum(BalanceSource), z.string().optional());
+
+export type BalanceValueThreshold = z.infer<typeof BalanceValueThreshold>;
+
+const EvmQueryIndicatorMinOutOfSyncPeriod = z
+  .number()
+  .min(1)
+  .max(Constraints.MAX_HOURS_DELAY)
+  .int();
+const EvmQueryIndicatorDismissalThreshold = z
+  .number()
+  .min(1)
+  .max(Constraints.MAX_HOURS_DELAY)
+  .int();
+
+const AutoDetectTokensCooldownHours = z
+  .number()
+  .min(Constraints.AUTO_DETECT_TOKENS_COOLDOWN_MIN_HOURS)
+  .max(Constraints.AUTO_DETECT_TOKENS_COOLDOWN_MAX_HOURS)
+  .int();
+
+const LastAutoDetectAt = z.number().int().nonnegative();
+
+const NewlyDetectedTokensMaxCount = z
+  .number()
+  .min(Constraints.NEWLY_DETECTED_TOKENS_MIN_COUNT)
+  .max(Constraints.NEWLY_DETECTED_TOKENS_MAX_COUNT)
+  .int();
+const NewlyDetectedTokensTtlDays = z
+  .number()
+  .min(Constraints.NEWLY_DETECTED_TOKENS_MIN_TTL_DAYS)
+  .max(Constraints.NEWLY_DETECTED_TOKENS_MAX_TTL_DAYS)
+  .int();
+
+const PasswordConfirmationInterval = z
+  .number()
+  .min(Constraints.PASSWORD_CONFIRMATION_MIN_SECONDS)
+  .max(Constraints.PASSWORD_CONFIRMATION_MAX_SECONDS)
+  .int();
+const LastPasswordConfirmed = z.number().int().nonnegative();
+const EnablePasswordConfirmation = z.boolean();
+
+/**
+ * One remembered free-text filter value. Array order carries recency (newest first) and `count`
+ * carries how often it was used, so the ranking can move from one to the other, or to a blend,
+ * without migrating what is already stored.
+ */
+const RecentFilterValue = z.object({
+  count: z.number().default(1),
+  value: z.string(),
+});
+
+export const FrontendSettings = z.object({
+  abbreviateNumber: z.boolean().default(false),
+  amountRoundingMode: RoundingMode.default(BigNumber.ROUND_UP),
+  /**
+   * Ids of the one-off questions the user has already answered. Kept apart from
+   * `lastAppliedSettingsVersion` because a decision is retired by being answered, not by the version
+   * cursor moving past the release that asked it.
+   *
+   * Append-only, and deliberately never pruned. An id whose provider has been deleted is inert, so
+   * the only thing pruning would buy is a few bytes, against the risk of a user on an older build
+   * dropping ids it does not recognise and being re-asked on the way back up. A question that gets
+   * superseded takes a *new* id, which leaves the old answer harmlessly behind rather than trying to
+   * migrate it. Ids must therefore never be reused or renamed;
+   * `select-providers.spec.ts` enforces that they are at least unique.
+   *
+   * `.catch` because a corrupt value here should cost the user one repeated question, not a reset of
+   * every frontend setting they have.
+   */
+  answeredSuggestions: z.array(z.string()).default([]).catch([]),
+  autoDetectTokensCooldownHours: AutoDetectTokensCooldownHours.default(24),
+  autoDetectTokensOnLogin: z.boolean().default(false),
+  autoRerunOnEdit: z.boolean().default(false),
+  balanceValueThreshold: BalanceValueThreshold.default({}),
+  blockchainRefreshButtonBehaviour: BlockchainRefreshButtonBehaviourEnum.default(
+    BlockchainRefreshButtonBehaviour.ONLY_REFRESH_BALANCES,
+  ),
+  /** Empty until first set. `.catch` so a corrupt value costs one reset, not the whole blob. */
+  clientId: z.string().default('').catch(''),
+  currencyLocation: CurrencyLocationEnum.default(Defaults.DEFAULT_CURRENCY_LOCATION),
+  darkTheme: ThemeColors.default(DARK_COLORS),
+  dashboardTablesVisibleColumns: DashboardTablesVisibleColumns.default(() => ({
+    [DashboardTableType.ASSETS]: Defaults.DEFAULT_DASHBOARD_TABLE_VISIBLE_COLUMNS,
+    [DashboardTableType.BLOCKCHAIN_ASSET_BALANCES]:
+      Defaults.DEFAULT_DASHBOARD_TABLE_VISIBLE_COLUMNS,
+    [DashboardTableType.LIABILITIES]: Defaults.DEFAULT_DASHBOARD_TABLE_VISIBLE_COLUMNS,
+    [DashboardTableType.LIQUIDITY_POSITION]: Defaults.DEFAULT_DASHBOARD_TABLE_VISIBLE_COLUMNS,
+    [DashboardTableType.NFT]: Defaults.DEFAULT_DASHBOARD_TABLE_VISIBLE_COLUMNS,
+  })),
+  dateInputFormat: DateFormatEnum.default(Defaults.DEFAULT_DATE_INPUT_FORMAT),
+  decimalSeparator: z.string().default(Defaults.DEFAULT_DECIMAL_SEPARATOR),
+  defaultThemeVersion: z.number().default(1),
+  defiSetupDone: z.boolean().default(false),
+  /**
+   * The external services whose optional-API-key prompt the user has dismissed. Deliberately without
+   * a `.catch`, so that an unreadable value surfaces rather than silently re-showing every prompt.
+   */
+  dismissedApiKeyNotices: z.array(z.string()).default([]),
+  enableAliasNames: z.boolean().default(true),
+  enablePasswordConfirmation: EnablePasswordConfirmation.default(true),
+  evmQueryIndicatorDismissalThreshold: EvmQueryIndicatorDismissalThreshold.default(
+    Defaults.DEFAULT_EVM_QUERY_INDICATOR_DISMISSAL_THRESHOLD,
+  ),
+  evmQueryIndicatorMinOutOfSyncPeriod: EvmQueryIndicatorMinOutOfSyncPeriod.default(
+    Defaults.DEFAULT_EVM_QUERY_INDICATOR_MIN_OUT_OF_SYNC_PERIOD,
+  ),
+  explorers: ExplorersSettings.default({}),
+  gnosisPaySafeMigrationLastNotified: z.number().int().nonnegative().default(0),
+  gnosisPaySafeMigrationNeverNotify: z.boolean().default(false),
+  graphZeroBased: z.boolean().default(false),
+  ignoreSnapshotError: z.boolean().default(false),
+  itemsPerPage: z.number().positive().int().default(10),
+  language: SupportedLanguageEnum.default(SupportedLanguage.EN),
+  lastAppliedSettingsVersion: z.string().default('0.0.0'),
+  lastAutoDetectAt: LastAutoDetectAt.default(0),
+  lastKnownTimeframe: TimeFramePeriodEnum.default(TimeFramePeriod.ALL),
+  lastPasswordConfirmed: LastPasswordConfirmed.default(0),
+  lightTheme: ThemeColors.default(LIGHT_COLORS),
+  minimumDigitToBeAbbreviated: z.number().default(MINIMUM_DIGIT_TO_BE_ABBREVIATED),
+  newlyDetectedTokensMaxCount: NewlyDetectedTokensMaxCount.default(
+    Defaults.DEFAULT_NEWLY_DETECTED_TOKENS_MAX_COUNT,
+  ),
+  newlyDetectedTokensTtlDays: NewlyDetectedTokensTtlDays.default(
+    Defaults.DEFAULT_NEWLY_DETECTED_TOKENS_TTL_DAYS,
+  ),
+  nftsInNetValue: z.boolean().default(true),
+  notificationSchedule: z.record(z.string(), NotificationScheduleEntry).default({}).catch({}),
+  notifyNewNfts: z.boolean().optional().default(false),
+  passwordConfirmationInterval: PasswordConfirmationInterval.default(
+    Defaults.DEFAULT_PASSWORD_CONFIRMATION_INTERVAL,
+  ),
+  persistPrivacySettings: z.boolean().default(false),
+  persistTableSorting: z.boolean().default(false),
+  privacyMode: PrivacyModeEnum.default(PrivacyMode.NORMAL),
+  profitLossReportPeriod: ProfitLossTimeframe.default({
+    quarter: Quarter.ALL,
+    year: new Date().getFullYear().toString(),
+  }),
+  queryPeriod: z.preprocess(
+    queryPeriod =>
+      Math.min(
+        Number.parseInt(String(queryPeriod)) || Defaults.DEFAULT_QUERY_PERIOD,
+        Constraints.MAX_SECONDS_DELAY,
+      ),
+    QueryPeriod.default(Defaults.DEFAULT_QUERY_PERIOD),
+  ),
+  refreshPeriod: z.preprocess(
+    refreshPeriod =>
+      Math.min(Number.parseInt(String(refreshPeriod)) || -1, Constraints.MAX_MINUTES_DELAY),
+    RefreshPeriod.default(-1),
+  ),
+  recentFilterValues: z
+    .record(z.string(), z.array(RecentFilterValue))
+    .default({})
+    .catch({}),
+  renderAllNftImages: z.boolean().default(true),
+  savedFilters: z
+    .partialRecord(SavedFilterLocationEnum, LegacySavedFilters)
+    .default({})
+
+    .catch({}),
+  savedViews: z
+    .partialRecord(SavedFilterLocationEnum, z.array(SavedView))
+    .default({})
+    .catch({}),
+  schemaVersion: z.number().default(FRONTEND_SETTINGS_SCHEMA_VERSION),
+  scrambleData: z.boolean().default(false),
+  scrambleMultiplier: z.number().optional().default(generateRandomScrambleMultiplier()),
+  selectedTheme: ThemeEnum.default(Theme.AUTO),
+  showGraphRangeSelector: z.boolean().default(true),
+  silentNotifications: z.boolean().default(false),
+  subscriptDecimals: z.boolean().default(false),
+  suppressNoIndexerChains: z.array(z.string()).default([]),
+  thousandSeparator: z.string().default(Defaults.DEFAULT_THOUSAND_SEPARATOR),
+  timeframeSetting: TimeFrameSetting.default(TimeFramePersist.REMEMBER),
+  useHistoricalAssetBalances: z.boolean().default(false),
+  valueRoundingMode: RoundingMode.default(BigNumber.ROUND_DOWN),
+  versionUpdateCheckFrequency: z.preprocess(
+    versionUpdateCheckFrequency =>
+      Math.min(
+        Number.parseInt(String(versionUpdateCheckFrequency)) ||
+        Defaults.DEFAULT_VERSION_UPDATE_CHECK_FREQUENCY,
+        Constraints.MAX_HOURS_DELAY,
+      ),
+    VersionUpdateCheckFrequency.default(Defaults.DEFAULT_VERSION_UPDATE_CHECK_FREQUENCY),
+  ),
+  visibleTimeframes: z.array(TimeFrameSetting).default(Defaults.DEFAULT_VISIBLE_TIMEFRAMES),
+  whitelistedDomainsForNftImages: z.array(z.string()).default([]),
+});
+
+export type FrontendSettings = z.infer<typeof FrontendSettings>;
+
+export type FrontendSettingsPayload = Partial<FrontendSettings>;
+
+/** Reads the stored blob, migrating legacy shapes in memory. */
+export function parseFrontendSettings(blob: Record<string, unknown>): FrontendSettings {
+  const data = normalizeLegacyShapes(blob);
+  if (isEmpty(data)) {
+    return getDefaultFrontendSettings();
+  }
+  const result = FrontendSettings.safeParse(data);
+  if (result.success) {
+    return result.data;
+  }
+
+  // Strip invalid fields and force schemaVersion so defaults can fill them in
+  const cleanData: Record<string, unknown> = { ...data };
+  const invalidKeys: string[] = [];
+  for (const issue of result.error.issues) {
+    const key = issue.path[0];
+    if (key !== undefined && typeof key === 'string') {
+      invalidKeys.push(key);
+      delete cleanData[key];
+    }
+  }
+
+  logger.error(
+    `Failed to parse frontend settings, invalid keys: [${invalidKeys.join(', ')}]. Attempting recovery`,
+  );
+  cleanData.schemaVersion = FRONTEND_SETTINGS_SCHEMA_VERSION;
+
+  const retryResult = FrontendSettings.safeParse(cleanData);
+  if (retryResult.success) {
+    return retryResult.data;
+  }
+
+  logger.error('Frontend settings recovery failed, falling back to defaults', retryResult.error);
+  return getDefaultFrontendSettings();
+}
+
+export function getDefaultFrontendSettings(
+  props: Partial<FrontendSettings> = {},
+): FrontendSettings {
+  return FrontendSettings.parse({
+    schemaVersion: FRONTEND_SETTINGS_SCHEMA_VERSION,
+    ...props,
+  });
+}

@@ -1,0 +1,137 @@
+import type { ComputedRef, MaybeRef, Ref } from 'vue';
+import type { AssetBalanceWithPrice } from '../balances';
+import type { AssetInfoWithId } from '../data';
+import type { BigNumber } from '../numbers';
+import type { FrontendSettingsPayload, TimeUnit } from '../settings/frontend';
+import type { Theme, Themes } from '../settings/themes';
+import type {
+  CommonQueryStatusData,
+  FailedHistoricalAssetPriceResponse,
+  HistoricalAssetPricePayload,
+  HistoricalAssetPriceResponse,
+  LocationData,
+  NetValue,
+  OwnedAssets,
+  TimedAssetBalances,
+  TimedAssetHistoricalBalances,
+  TimedBalances,
+} from '../statistics';
+
+export type ExclusionSource = 'exchange' | 'manual' | 'blockchain';
+
+export interface StatisticsApi {
+  assetValueDistribution: () => Promise<TimedAssetBalances>;
+  locationValueDistribution: () => Promise<LocationData>;
+  ownedAssets: () => Promise<OwnedAssets>;
+  timedBalances: (asset: string, start: number, end: number, collectionId?: number) => Promise<TimedBalances>;
+  timedHistoricalBalances: (asset: string, start: number, end: number, collectionId?: number) => Promise<TimedAssetHistoricalBalances>;
+  fetchNetValue: () => Promise<void>;
+  netValue: (startingData: number) => Ref<NetValue>;
+  isQueryingDailyPrices: ComputedRef<boolean>;
+  failedDailyPrices: Ref<Record<string, FailedHistoricalAssetPriceResponse>>;
+  queryHistoricalAssetPrices: (payload: HistoricalAssetPricePayload) => Promise<HistoricalAssetPriceResponse>;
+  historicalDailyPriceStatus: Ref<CommonQueryStatusData | undefined>;
+  cancelHistoricPriceTask: () => Promise<void>;
+  cancelDailyHistoricPriceTask: () => Promise<void>;
+}
+
+export interface DateUtilities {
+  epoch: () => number;
+  epochToFormat: (epoch: number, format: string) => string;
+  epochStartSubtract: (amount: number, unit: TimeUnit) => number;
+  convertToTimestamp: (date: string, dateFormat?: string) => number;
+}
+
+export interface BalancesApi {
+  byLocation: Ref<Record<string, BigNumber>>;
+  balances: (groupMultiChain?: boolean, exclude?: ExclusionSource[]) => ComputedRef<AssetBalanceWithPrice[]>;
+  exchangeRate: (currency: string) => Ref<BigNumber>;
+  queryOnlyCacheHistoricalRates: (asset: string, timestamp: number[]) => Promise<Record<number, BigNumber>>;
+  assetPrice: (asset: string) => ComputedRef<BigNumber>;
+}
+
+export interface AssetsApi {
+  assetInfo: (identifier: MaybeRef<string>) => ComputedRef<AssetInfoWithId | null>;
+  assetSymbol: (identifier: MaybeRef<string>) => ComputedRef<string>;
+  tokenAddress: (identifier: MaybeRef<string>) => ComputedRef<string>;
+}
+
+export interface DataUtilities {
+  readonly assets: AssetsApi;
+  readonly statistics: StatisticsApi;
+  readonly balances: BalancesApi;
+}
+
+export interface UserSettingsApi {
+  currencySymbol: Ref<string>;
+  floatingPrecision: Ref<number>;
+  decimalSeparator: Ref<string>;
+  thousandSeparator: Ref<string>;
+  subscriptDecimals: Ref<boolean>;
+  shouldShowAmount: Ref<boolean>;
+  shouldShowPercentage: Ref<boolean>;
+  scrambleData: Ref<boolean>;
+  scrambleMultiplier: Ref<number>;
+  selectedTheme: Ref<Theme>;
+  dateInputFormat: Ref<string>;
+  privacyMode: Ref<number>;
+  graphZeroBased: Ref<boolean>;
+  showGraphRangeSelector: Ref<boolean>;
+  useHistoricalAssetBalances: Ref<boolean>;
+}
+
+export interface SettingsApi {
+  update: (settings: FrontendSettingsPayload) => Promise<void>;
+  defaultThemes: () => Themes;
+  themes: () => Themes;
+  isDark: ComputedRef<boolean>;
+  user: UserSettingsApi;
+  i18n: {
+    t: (key: string, values?: Record<string, unknown>, choice?: number) => string;
+    te: (key: string) => boolean;
+  };
+}
+
+interface ColorStop {
+  color: string;
+  offset: number;
+}
+
+interface GradientColor {
+  colorStops: ColorStop[];
+  type: 'linear';
+  x: number;
+  x2: number;
+  y: number;
+  y2: number;
+}
+
+export interface GradientArea {
+  color: GradientColor;
+}
+
+export interface NewGraphApi {
+  baseColor: ComputedRef<string>;
+  gradient: ComputedRef<GradientArea>;
+  secondaryColor: ComputedRef<string>;
+}
+
+type GetGraphApi = () => NewGraphApi;
+
+export interface LoggerApi {
+  error: (...args: any[]) => void;
+  warn: (...args: any[]) => void;
+  info: (...args: any[]) => void;
+  debug: (...args: any[]) => void;
+  trace: (...args: any[]) => void;
+  success: (...args: any[]) => void;
+  log: (...args: any[]) => void;
+}
+
+export interface PremiumApi {
+  readonly date: DateUtilities;
+  readonly data: DataUtilities;
+  readonly settings: SettingsApi;
+  readonly graphs: GetGraphApi;
+  readonly logger: LoggerApi;
+}

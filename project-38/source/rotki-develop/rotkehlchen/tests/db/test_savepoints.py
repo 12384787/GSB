@@ -1,0 +1,226 @@
+import time
+from contextlib import suppress
+
+import pytest
+import rsqlite
+
+from rotkehlchen.concurrency import spawn, wait
+from rotkehlchen.db.drivers.sqlite import (
+    ContextError,
+    DBConnection,
+    DBConnectionType,
+)
+from rotkehlchen.errors.asset import UnknownAsset
+
+
+@pytest.fixture(name='conn')
+def fixture_conn():
+    conn = DBConnection(
+        path=':memory:',
+        connection_type=DBConnectionType.GLOBAL,
+        sql_vm_instructions_cb=0,
+    )
+    yield conn
+    conn.close()
+
+
+def test_unnamed_savepoints(conn: DBConnection):
+    with conn.write_ctx() as write_cursor:
+        write_cursor.execute('CREATE TABLE a(b INTEGER PRIMARY KEY)')
+
+    with conn.savepoint_ctx() as cursor1:
+        assert len(conn.savepoints) == 1
+        savepoint1 = next(iter(conn.savepoints))
+        cursor1.execute('INSERT INTO a VALUES (1)')
+        cursor2, savepoint2 = conn._enter_savepoint()  # also check manual savepoints
+        assert list(conn.savepoints) == [savepoint1, savepoint2]
+        cursor2.execute('INSERT INTO a VALUES (2)')
+        # make sure that 2 was added
+        assert cursor1.execute('SELECT b FROM a').fetchall() == [(1,), (2,)]
+        conn.rollback_savepoint()
+        # check that the second savepoint was NOT released since it was only rolled back
+        assert list(conn.savepoints) == [savepoint1, savepoint2]
+        assert cursor1.execute('SELECT b FROM a').fetchall() == [(1,)]  # 2 should not be there
+        cursor1.execute('INSERT INTO a VALUES (3)')  # add one more value after the rollback
+    assert len(conn.savepoints) == 0  # check that we released successfully
+
+    with conn.read_ctx() as cursor:  # And make sure that the data is saved
+        assert cursor.execute('SELECT b FROM a').fetchall() == [(1,), (3,)]
+
+
+def test_savepoint_errors(conn: DBConnection):
+    with pytest.raises(ContextError):
+        conn.release_savepoint()
+
+    conn._enter_savepoint('point')
+    with pytest.raises(ContextError):
+        conn._enter_savepoint('point')
+
+    with pytest.raises(ContextError):
+        conn.rollback_savepoint('abc')
+
+
+def test_write_transaction_with_savepoint(conn: DBConnection):
+    """Test that opening a savepoint within a write transaction in the
+    same greenlet is okay"""
+    with conn.write_ctx() as write_cursor:
+        write_cursor.execute('CREATE TABLE a(b INTEGER PRIMARY KEY)')
+        write_cursor.execute('INSERT INTO a VALUES (1)')
+        with conn.savepoint_ctx() as savepoint_cursor:
+            savepoint_cursor.execute('INSERT INTO a VALUES (2)')
+
+    with conn.read_ctx() as cursor:
+        assert cursor.execute('SELECT b from a').fetchall() == [(1,), (2,)]
+
+
+def test_write_transaction_with_savepoint_other_context(conn: DBConnection):
+    """Test that opening a savepoint from a different task while a write
+    transaction is already open from another task waits for the original to finish"""
+    def other_context(conn: DBConnection, first_run: bool) -> None:
+        with conn.savepoint_ctx() as savepoint1_cursor:
+            values = (2,) if first_run else (4,)
+            savepoint1_cursor.execute('INSERT INTO a VALUES (?)', values)
+            if first_run:
+                return
+            with suppress(ValueError), conn.savepoint_ctx() as savepoint2_cursor:
+                savepoint2_cursor.execute('INSERT INTO a VALUES (5)')
+                raise ValueError('Test rollback')
+
+    with conn.write_ctx() as write_cursor:
+        write_cursor.execute('CREATE TABLE a(b INTEGER PRIMARY KEY)')
+        write_cursor.execute('INSERT INTO a VALUES (1)')
+        task1 = spawn(other_context, conn, True)
+        time.sleep(.3)  # give the other task time to run into the write lock
+        assert task1.exception is None
+        assert task1.dead is False, 'the other task should still run'
+        # check while the write transaction is still open: once it commits the
+        # blocked task may be scheduled at any moment and write its row
+        assert write_cursor.execute('SELECT b from a').fetchall() == [(1,)], 'other task should not have written to the DB'  # noqa: E501
+
+    wait([task1])  # wait till the other task finishes
+    with conn.read_ctx() as cursor:  # make sure it wrote in the DB
+        assert cursor.execute('SELECT b from a').fetchall() == [(1,), (2,)], 'other task should write to the DB'  # noqa: E501
+
+    # now let's try with the other task also rolling back part of the savepoint
+    with conn.write_ctx() as write_cursor:
+        write_cursor.execute('INSERT INTO a VALUES (3)')
+        task1 = spawn(other_context, conn, False)
+        time.sleep(.3)  # give the other task time to run into the write lock
+        assert task1.exception is None
+        assert task1.dead is False, 'the other task should still run'
+        assert write_cursor.execute('SELECT b from a').fetchall() == [(1,), (2,), (3,)], 'other task should not have written to the DB'  # noqa: E501
+
+    wait([task1])  # wait till the other task finishes
+    with conn.read_ctx() as cursor:  # make sure it wrote in the DB but not the last one
+        assert cursor.execute('SELECT b from a').fetchall() == [(1,), (2,), (3,), (4,)], 'other task should write to the DB'  # noqa: E501
+
+
+def test_savepoint_with_write_transaction(conn: DBConnection):
+    """Test that a write transaction under a savepoint can still happen by
+    switching to a savepoint instead"""
+    with conn.write_ctx() as write_cursor:
+        write_cursor.execute('CREATE TABLE a(b INTEGER PRIMARY KEY)')
+
+    with conn.savepoint_ctx() as savepoint_cursor:
+        savepoint_cursor.execute('INSERT INTO a VALUES (1)')
+        with conn.write_ctx() as write_cursor:
+            write_cursor.execute('INSERT INTO a VALUES (2)')
+
+    with conn.read_ctx() as cursor:
+        assert cursor.execute('SELECT b from a').fetchall() == [(1,), (2,)]
+
+    with suppress(ValueError), conn.savepoint_ctx() as savepoint_cursor:
+        savepoint_cursor.execute('INSERT INTO a VALUES (3)')
+        with conn.write_ctx() as write_cursor:
+            write_cursor.execute('INSERT INTO a VALUES (4)')
+            raise ValueError('Test rollback')
+
+    with conn.read_ctx() as cursor:
+        assert cursor.execute('SELECT b from a').fetchall() == [(1,), (2,)]
+
+
+def test_savepoint_with_write_transaction_other_context(conn: DBConnection):
+    """Test that a write transaction after a savepoint but in a different task
+    does not continue the savepoint but instead waits"""
+    def other_context(conn) -> None:
+        with conn.write_ctx() as write_cursor:
+            write_cursor.execute('INSERT INTO a VALUES (4)')
+
+    with conn.write_ctx() as write_cursor:
+        write_cursor.execute('CREATE TABLE a(b INTEGER PRIMARY KEY)')
+
+    with conn.savepoint_ctx() as savepoint_cursor:
+        savepoint_cursor.execute('INSERT INTO a VALUES (1)')
+        task1 = spawn(other_context, conn)
+        time.sleep(.3)  # give the other task time to run into the write lock
+        assert task1.exception is None
+        assert task1.dead is False, 'the other task should still run'
+        # check while the savepoint is still open: once it releases the blocked
+        # task may be scheduled at any moment and write its row
+        assert savepoint_cursor.execute('SELECT b from a').fetchall() == [(1,)], 'other task should not have written to the DB'  # noqa: E501
+
+    wait([task1])  # wait till the other task finishes
+    with conn.read_ctx() as cursor:  # make sure it wrote in the DB
+        assert cursor.execute('SELECT b from a').fetchall() == [(1,), (4,)], 'other task should write to the DB'  # noqa: E501
+
+
+def test_open_savepoint_with_savepoint_other_context(conn: DBConnection):
+    """Test that opening a savepoint while a savepoint queue is already open in
+    another task waits until the first one is completely done"""
+    def other_context(conn, first_run) -> None:
+        with conn.savepoint_ctx() as savepoint1_cursor:
+            values = (2,) if first_run else (4,)
+            savepoint1_cursor.execute('INSERT INTO a VALUES (?)', values)
+            if first_run:
+                return
+            with suppress(ValueError), conn.savepoint_ctx() as savepoint2_cursor:
+                savepoint2_cursor.execute('INSERT INTO a VALUES (5)')
+                raise ValueError('Test rollback')
+
+    with conn.write_ctx() as write_cursor:
+        write_cursor.execute('CREATE TABLE a(b INTEGER PRIMARY KEY)')
+
+    with conn.savepoint_ctx() as savepoint_cursor:
+        savepoint_cursor.execute('INSERT INTO a VALUES (1)')
+        task1 = spawn(other_context, conn, True)
+        time.sleep(.3)  # give the other task time to run into the savepoint lock
+        assert task1.exception is None
+        assert task1.dead is False, 'the other task should still run'
+        assert savepoint_cursor.execute('SELECT b from a').fetchall() == [(1,)], 'other task should not have written to the DB'  # noqa: E501
+
+    wait([task1])  # wait till the other task finishes
+    with conn.read_ctx() as cursor:  # make sure it wrote in the DB
+        assert cursor.execute('SELECT b from a').fetchall() == [(1,), (2,)], 'other task should write to the DB'  # noqa: E501
+
+    # now let's try with the other task also rolling back part of the savepoint
+    with conn.savepoint_ctx() as savepoint_cursor:
+        savepoint_cursor.execute('INSERT INTO a VALUES (3)')
+        task1 = spawn(other_context, conn, False)
+        time.sleep(.3)  # give the other task time to run into the savepoint lock
+        assert task1.exception is None
+        assert task1.dead is False, 'the other task should still run'
+        assert savepoint_cursor.execute('SELECT b from a').fetchall() == [(1,), (2,), (3,)], 'other task should not have written to the DB'  # noqa: E501
+
+    wait([task1])  # wait till the other task finishes
+    with conn.read_ctx() as cursor:  # make sure it wrote in the DB but not the last one
+        assert cursor.execute('SELECT b from a').fetchall() == [(1,), (2,), (3,), (4,)], 'other task should write to the DB'  # noqa: E501
+
+
+def test_rollback_in_savepoints(conn: DBConnection):
+    """
+    Test that savepoints are released when an error is raised. This verifies
+    that a rollback is always followed up by a release since that is required.
+    """
+
+    with (
+        suppress(UnknownAsset),
+        conn.savepoint_ctx(savepoint_name='mysave') as savepoint_cursor,
+    ):
+        savepoint_cursor.execute('CREATE TABLE mytable(age INTEGER PRIMARY KEY)')
+        # raise the error to trigger the except clause in savepoint_ctx
+        raise UnknownAsset('ETH')
+
+    # leaving the with statement should have released the savepoint and trying to release
+    # again the savepoint should raise an error because we have already released it.
+    with pytest.raises(rsqlite.OperationalError), conn.write_ctx() as write_cursor:
+        write_cursor.execute("RELEASE SAVEPOINT 'mysave'")

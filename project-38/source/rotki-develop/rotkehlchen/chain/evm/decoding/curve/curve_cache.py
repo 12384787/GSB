@@ -1,0 +1,502 @@
+import logging
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal
+
+from rotkehlchen.chain.evm.constants import ZERO_ADDRESS
+from rotkehlchen.chain.evm.contracts import EvmContract
+from rotkehlchen.chain.evm.decoding.curve.constants import (
+    CPT_CURVE,
+    CURVE_ADDRESS_PROVIDER,
+    CURVE_ADDRESS_PROVIDER_BY_CHAIN,
+    CURVE_API_URL,
+    CURVE_CHAIN_ID,
+    CURVE_METAREGISTRY_METHODS,
+    IGNORED_CURVE_POOLS,
+    MAX_ONCHAIN_POOLS_QUERY,
+)
+from rotkehlchen.chain.evm.types import string_to_evm_address
+from rotkehlchen.chain.evm.utils import maybe_notify_cache_query_status
+from rotkehlchen.db.addressbook import DBAddressbook
+from rotkehlchen.errors.misc import (
+    RemoteError,
+    UnableToDecryptRemoteData,
+)
+from rotkehlchen.errors.serialization import DeserializationError
+from rotkehlchen.globaldb.cache import (
+    compute_cache_key,
+    globaldb_get_general_cache_values,
+    globaldb_get_unique_cache_value,
+    globaldb_set_general_cache_values,
+    globaldb_set_unique_cache_value,
+    globaldb_update_cache_last_ts,
+)
+from rotkehlchen.globaldb.handler import GlobalDBHandler
+from rotkehlchen.logging import RotkehlchenLogsAdapter
+from rotkehlchen.serialization.deserialize import deserialize_evm_address
+from rotkehlchen.types import (
+    AddressbookEntry,
+    CacheType,
+    ChainID,
+    ChecksumEvmAddress,
+    Timestamp,
+)
+from rotkehlchen.utils.network import request_get_dict
+
+if TYPE_CHECKING:
+
+    from rotkehlchen.chain.evm.node_inquirer import EvmNodeInquirer
+    from rotkehlchen.db.drivers.sqlite import DBCursor
+    from rotkehlchen.user_messages import MessagesAggregator
+
+logger = logging.getLogger(__name__)
+log = RotkehlchenLogsAdapter(logger)
+
+
+@dataclass
+class CurvePoolData:
+    pool_address: ChecksumEvmAddress
+    pool_name: str | None
+    lp_token_address: ChecksumEvmAddress
+    gauge_address: ChecksumEvmAddress | None
+    # Coins in the pool. Has the LP token of the base pool for metapools.
+    coins: list[ChecksumEvmAddress]
+    # All underlying coins in a meta-pool, including the coins from the base pool. None for non-metapools.  # noqa: E501
+    underlying_coins: list[ChecksumEvmAddress] | None
+
+
+def read_curve_pools_and_gauges(chain_id: ChainID) -> tuple[dict[ChecksumEvmAddress, list[ChecksumEvmAddress]], set[ChecksumEvmAddress]]:  # noqa: E501
+    """Reads globaldb cache and returns:
+    - A dict mapping known curve pool addresses to their coin list for the given chain.
+    - A set of all known curve gauges addresses for the given chain.
+
+    Returned functions doesn't raise anything unless cache entries were inserted incorrectly.
+    """
+    chain_id_str = str(chain_id.serialize_for_db())
+    # Appending '0x' to each prefix disambiguates chain_ids that are prefixes of other chain_ids
+    # (e.g. chain 1 vs 10 vs 100) since all EVM addresses start with '0x'.
+    pool_addr_prefix = compute_cache_key((CacheType.CURVE_POOL_ADDRESS, chain_id_str))
+    gauge_prefix = compute_cache_key((CacheType.CURVE_GAUGE_ADDRESS, chain_id_str))
+    tokens_prefix = compute_cache_key((CacheType.CURVE_POOL_TOKENS, chain_id_str))
+    tokens_prefix_len = len(tokens_prefix)
+    known_pools: set[ChecksumEvmAddress] = set()
+    curve_gauges: set[ChecksumEvmAddress] = set()
+    pool_to_indexed_coins: dict[ChecksumEvmAddress, list[tuple[int, ChecksumEvmAddress]]] = {}
+    with GlobalDBHandler().conn.read_ctx() as cursor:
+        # Probe via the helper so tests that patch it to return [] can short-circuit the reader
+        # (see patch_decoder_reload_data in tests/utils/decoders.py).
+        if len(globaldb_get_general_cache_values(
+            cursor=cursor,
+            key_parts=(CacheType.CURVE_LP_TOKENS, chain_id_str),
+        )) == 0:
+            return {}, set()
+
+        known_pools.update(string_to_evm_address(pool_addr) for _, pool_addr in cursor.execute(
+            'SELECT key, value FROM unique_cache WHERE key LIKE ?',
+            (f'{pool_addr_prefix}0x%',),
+        ))
+
+        curve_gauges.update(string_to_evm_address(gauge_addr) for _, gauge_addr in cursor.execute(
+            'SELECT key, value FROM unique_cache WHERE key LIKE ?',
+            (f'{gauge_prefix}0x%',),
+        ))
+
+        for key, token_addr in cursor.execute(
+            'SELECT key, value FROM general_cache WHERE key LIKE ?',
+            (f'{tokens_prefix}0x%',),
+        ):
+            pool_address = string_to_evm_address(key[tokens_prefix_len:tokens_prefix_len + 42])
+            idx = int(key[tokens_prefix_len + 42:])
+            pool_to_indexed_coins.setdefault(pool_address, []).append(
+                (idx, string_to_evm_address(token_addr)),
+            )
+
+    curve_pools: dict[ChecksumEvmAddress, list[ChecksumEvmAddress]] = {}
+    for pool_address in known_pools:
+        indexed_coins = sorted(pool_to_indexed_coins.get(pool_address, []))
+        curve_pools[pool_address] = [coin for _, coin in indexed_coins]
+    return curve_pools, curve_gauges
+
+
+def _save_curve_data_to_cache(
+        evm_inquirer: EvmNodeInquirer,
+        new_data: list[CurvePoolData],
+) -> None:
+    """Stores data received about curve pools and gauges in the cache"""
+    db_addressbook = DBAddressbook(db_handler=evm_inquirer.database)
+    chain_id_str = str(evm_inquirer.chain_id.serialize_for_db())
+    for pool in new_data:
+        addressbook_entries = []
+        if pool.pool_name is not None:
+            addressbook_entries = [AddressbookEntry(
+                address=pool.pool_address,
+                name=pool.pool_name,
+                blockchain=evm_inquirer.blockchain,
+            )]
+            if pool.gauge_address is not None:
+                addressbook_entries.append(AddressbookEntry(
+                    address=pool.gauge_address,
+                    name=f'Curve gauge for {pool.pool_name}',
+                    blockchain=evm_inquirer.blockchain,
+                ))
+        with GlobalDBHandler().conn.write_ctx() as write_cursor:
+            db_addressbook.add_or_update_addressbook_entries(
+                write_cursor=write_cursor,
+                entries=addressbook_entries,
+            )
+            globaldb_set_general_cache_values(
+                write_cursor=write_cursor,
+                key_parts=(CacheType.CURVE_LP_TOKENS, chain_id_str),
+                values=[pool.lp_token_address],  # keys of pools_mapping are lp tokens
+            )
+            globaldb_set_unique_cache_value(
+                write_cursor=write_cursor,
+                key_parts=(CacheType.CURVE_POOL_ADDRESS, chain_id_str, pool.lp_token_address),
+                value=pool.pool_address,
+            )
+            for idx, coin in enumerate(pool.coins):
+                globaldb_set_general_cache_values(
+                    write_cursor=write_cursor,
+                    key_parts=(
+                        CacheType.CURVE_POOL_TOKENS,
+                        chain_id_str,
+                        pool.pool_address,
+                        str(idx),
+                    ),
+                    values=[coin],
+                )
+            if pool.gauge_address is not None:
+                globaldb_set_unique_cache_value(
+                    write_cursor=write_cursor,
+                    key_parts=(CacheType.CURVE_GAUGE_ADDRESS, chain_id_str, pool.pool_address),
+                    value=pool.gauge_address,
+                )
+
+
+def _query_curve_data_from_api(
+        evm_inquirer: EvmNodeInquirer,
+        existing_pools: set[ChecksumEvmAddress],
+) -> list[CurvePoolData]:
+    """
+    Query all curve information(lp tokens, pools, gauges, pool coins) from curve api.
+
+    May raise:
+    - RemoteError if failed to query curve api
+    """
+    all_api_pools, api_url = [], CURVE_API_URL.format(curve_blockchain_id=CURVE_CHAIN_ID[evm_inquirer.chain_id])  # noqa: E501
+    log.debug(f'Querying curve api {api_url}')
+    response_json = request_get_dict(api_url)
+    if response_json['success'] is False:
+        raise RemoteError(f'Curve api endpoint {api_url} returned failure. Response: {response_json}')  # noqa: E501
+
+    try:
+        all_api_pools.extend(response_json['data']['poolData'])
+    except KeyError as e:
+        raise RemoteError(f'Curve api endpoint {api_url} response is missing {e} key') from e
+
+    processed_new_pools = []
+    for api_pool_data in all_api_pools:
+        try:
+            pool_address = deserialize_evm_address(api_pool_data['address'])
+            if pool_address in IGNORED_CURVE_POOLS or pool_address in existing_pools:
+                continue
+
+            coins = [deserialize_evm_address(x['address']) for x in api_pool_data['coins']]
+            underlying_coins = None
+            if (
+                'underlyingCoins' in api_pool_data and
+                (u_coins := [
+                    deserialize_evm_address(x['address'])
+                    for x in api_pool_data['underlyingCoins']
+                ]) != coins
+            ):
+                underlying_coins = u_coins
+
+            processed_new_pools.append(CurvePoolData(
+                pool_address=pool_address,
+                pool_name=api_pool_data['name'],
+                lp_token_address=deserialize_evm_address(api_pool_data['lpTokenAddress']),
+                gauge_address=deserialize_evm_address(api_pool_data['gaugeAddress']) if 'gaugeAddress' in api_pool_data else None,  # noqa: E501
+                coins=coins,
+                underlying_coins=underlying_coins,
+            ))
+        except KeyError as e:
+            raise RemoteError(f'Curve pool data {api_pool_data} are missing key {e}') from e
+        except DeserializationError as e:
+            log.error(
+                f'Could not deserialize evm address while decoding curve pool '
+                f'{api_pool_data["address"]} information from curve api: {e}',
+            )
+
+    if len(processed_new_pools) > 0:
+        _save_curve_data_to_cache(evm_inquirer=evm_inquirer, new_data=processed_new_pools)
+
+    return processed_new_pools
+
+
+def _query_curve_pool(
+        evm_inquirer: EvmNodeInquirer,
+        metaregistry: EvmContract,
+        metaregistry_address: ChecksumEvmAddress,
+        pool_index: int,
+        pools_to_skip: set[str | ChecksumEvmAddress],
+        processed: int,
+        total: int,
+) -> CurvePoolData | None:
+    """Query and deserialize a single Curve pool from the metaregistry."""
+    try:
+        if (pool_address := metaregistry.call(
+            node_inquirer=evm_inquirer,
+            method_name='pool_list',
+            arguments=[pool_index],
+        )) in pools_to_skip:
+            return None
+
+        log.debug(
+            'Processing Curve pool %s/%s %s on %s.',
+            processed, total, pool_address, evm_inquirer.chain_name,
+        )
+        raw_pool_properties = evm_inquirer.multicall_2(
+            calls=[(
+                metaregistry_address,
+                metaregistry.encode(method_name=method_name, arguments=[pool_address]),
+            ) for method_name in CURVE_METAREGISTRY_METHODS],
+            require_success=False,
+        )
+    except RemoteError as e:
+        log.error(
+            'Failed to retrieve Curve pool address for index %s from the metaregistry on %s '
+            'due to %s',
+            pool_index, evm_inquirer.chain_name, e,
+        )
+        return None
+
+    decoded_pool_properties: list[Any] = []
+    for (success, result), method_name in zip(raw_pool_properties, CURVE_METAREGISTRY_METHODS, strict=True):  # length should be same due to the call  # noqa: E501
+        if success is False:
+            if method_name == 'get_pool_name':  # There are a number of pools (especially later ones) where the pool name query fails  # noqa: E501
+                decoded_pool_properties.append(None)  # Pool name will be constructed from the underlying tokens later instead  # noqa: E501
+                continue
+            break
+
+        try:
+            decoded_pool_properties.append(metaregistry.decode(
+                result=result,
+                method_name=method_name,
+                arguments=[pool_address],
+            )[0])
+        except DeserializationError as e:
+            log.error(
+                'Failed to decode the %s property of curve pool %s on %s due to %s',
+                method_name, pool_address, evm_inquirer.chain_name, e,
+            )
+            break
+
+    if len(decoded_pool_properties) != len(CURVE_METAREGISTRY_METHODS):
+        log.error(
+            'Failed to query properties of curve pool %s on %s. Skipping.',
+            pool_address, evm_inquirer.chain_name,
+        )
+        return None
+
+    # the decoded addresses are already checksummed by the contract decoding
+    pool_name, gauge_address, lp_token_address, coins_raw, underlying_coins_raw = decoded_pool_properties  # noqa: E501
+    coins = [x for x in coins_raw if x != ZERO_ADDRESS]
+    u_coins = [x for x in underlying_coins_raw if x != ZERO_ADDRESS]
+    return CurvePoolData(
+        pool_address=pool_address,
+        pool_name=pool_name,
+        lp_token_address=lp_token_address,
+        gauge_address=gauge_address if gauge_address != ZERO_ADDRESS else None,
+        coins=coins,
+        underlying_coins=None if u_coins == coins or len(u_coins) == 0 else u_coins,
+    )
+
+
+def _query_curve_data_from_chain(
+        evm_inquirer: EvmNodeInquirer,
+        existing_pools: set[ChecksumEvmAddress],
+        msg_aggregator: MessagesAggregator,
+        reload_all: bool,
+) -> list[CurvePoolData]:
+    """Query all curve information(lp tokens, pools, gauges, pool coins) from the metaregistry.
+    `reload_all` controls whether to refresh all pools or only query new pools.
+    """
+    address_provider_address = CURVE_ADDRESS_PROVIDER_BY_CHAIN.get(
+        evm_inquirer.chain_id,
+        CURVE_ADDRESS_PROVIDER,
+    )
+
+    if (address_provider := evm_inquirer.contracts.contract_by_address(
+        address=address_provider_address,
+    )) is None:
+        log.error(
+            f'Failed to retrieve Curve address provider contract {address_provider_address} '
+            f'on {evm_inquirer.chain_name}. Skipping Curve cache update.',
+        )
+        return []
+
+    try:
+        metaregistry_address = address_provider.call(
+            node_inquirer=evm_inquirer,
+            method_name='get_address',
+            arguments=[7],
+        )
+    except RemoteError as e:
+        log.error(
+            f'Failed to retrieve metaregistry address from the Curve '
+            f'address provider on {evm_inquirer.chain_name} due to {e!s}',
+        )
+        return []
+
+    metaregistry = EvmContract(
+        address=metaregistry_address,
+        abi=evm_inquirer.contracts.abi('CURVE_METAREGISTRY'),  # type: ignore[call-overload]  # for some reason mypy doesn't properly see argument type
+        deployed_block=0,  # deployment_block is not used and the contract is dynamic
+    )
+    try:
+        pool_count = metaregistry.call(node_inquirer=evm_inquirer, method_name='pool_count')
+    except RemoteError as e:
+        log.error(
+            'Failed to retrieve Curve pool count from the metaregistry '
+            f'on {evm_inquirer.chain_name} due to {e!s}',
+        )
+        return []
+
+    if (existing_pool_count := len(existing_pools)) >= pool_count:
+        return []
+    if reload_all:
+        pools_to_query_count = pool_count
+    elif (pools_to_query_count := pool_count - existing_pool_count) > MAX_ONCHAIN_POOLS_QUERY:
+        pool_count = existing_pool_count + MAX_ONCHAIN_POOLS_QUERY
+        pools_to_query_count = MAX_ONCHAIN_POOLS_QUERY
+        log.info(
+            f'Tried to query {pools_to_query_count} {evm_inquirer.chain_name} Curve pools. '
+            f'Too many pools to query onchain. Only querying {pools_to_query_count}.',
+        )
+
+    new_pools, last_notified_ts = [], Timestamp(0)
+    pools_to_skip = IGNORED_CURVE_POOLS | existing_pools
+    for pool_index in range((start_idx := pool_count - pools_to_query_count), pool_count):
+        processed = pool_index - start_idx + 1
+        if (pool := _query_curve_pool(
+            evm_inquirer=evm_inquirer,
+            metaregistry=metaregistry,
+            metaregistry_address=metaregistry_address,
+            pool_index=pool_index,
+            pools_to_skip=pools_to_skip,
+            processed=processed,
+            total=pools_to_query_count,
+        )) is not None:
+            new_pools.append(pool)
+
+        if processed != pools_to_query_count:
+            last_notified_ts = maybe_notify_cache_query_status(
+                msg_aggregator=msg_aggregator,
+                last_notified_ts=last_notified_ts,
+                protocol=CPT_CURVE,
+                chain=evm_inquirer.chain_id,
+                processed=processed,
+                total=pools_to_query_count,
+            )
+
+    if len(new_pools) > 0:
+        _save_curve_data_to_cache(evm_inquirer=evm_inquirer, new_data=new_pools)
+
+    maybe_notify_cache_query_status(
+        msg_aggregator=msg_aggregator,
+        last_notified_ts=Timestamp(0),
+        protocol=CPT_CURVE,
+        chain=evm_inquirer.chain_id,
+        processed=pools_to_query_count,
+        total=pools_to_query_count,
+    )
+    return new_pools
+
+
+def query_curve_data(
+        inquirer: EvmNodeInquirer,
+        cache_type: Literal[CacheType.CURVE_LP_TOKENS],
+        msg_aggregator: MessagesAggregator,
+        reload_all: bool,
+) -> list[CurvePoolData] | None:
+    """Query curve lp tokens, curve pools and curve gauges and save them in the database.
+    First tries to find data via curve api.
+
+    Returns list of pools if api query was successful, otherwise None.
+    """
+    with GlobalDBHandler().conn.read_ctx() as cursor:
+        existing_pools = {  # query the pools that we already have in the db
+            string_to_evm_address(address[0])
+            for address in cursor.execute(
+                'SELECT value FROM unique_cache WHERE key LIKE ?',
+                (compute_cache_key((
+                    CacheType.CURVE_POOL_ADDRESS,
+                    str(inquirer.chain_id.serialize_for_db()),
+                    '0x%',  # Include the beginning `0x` of the address to avoid matching chain id 10 when using chain id 1  # noqa: E501
+                )),),
+            )
+        }
+
+    try:
+        pools_data = _query_curve_data_from_api(
+            evm_inquirer=inquirer,
+            existing_pools=existing_pools,
+        )
+    except (RemoteError, UnableToDecryptRemoteData) as e:
+        log.error(f'Could not query curve api due to: {e}. Will query the metaregistry on chain')
+        pools_data = _query_curve_data_from_chain(
+            evm_inquirer=inquirer,
+            existing_pools=existing_pools,
+            msg_aggregator=msg_aggregator,
+            reload_all=reload_all,
+        )
+
+    if len(pools_data) == 0:  # if no new pools, update the last_queried_ts of db entries
+        with GlobalDBHandler().conn.write_ctx() as write_cursor:
+            globaldb_update_cache_last_ts(
+                write_cursor=write_cursor,
+                cache_type=cache_type,
+                key_parts=(str(inquirer.chain_id.serialize_for_db()),),
+            )
+        return None
+
+    return pools_data
+
+
+def get_lp_and_gauge_token_addresses(
+        pool_address: ChecksumEvmAddress,
+        chain_id: ChainID,
+) -> set[ChecksumEvmAddress]:
+    """Reads the db to get the lp and gauge token addresses for the given pool address"""
+    addresses, chain_id_str = set(), str(chain_id.serialize_for_db())
+    with GlobalDBHandler().conn.read_ctx() as cursor:
+        if (key := cursor.execute(
+            'SELECT key FROM unique_cache WHERE value = ?',
+            (pool_address,),
+        ).fetchone()) is not None:
+            addresses.add(key[0][-42:])  # 42 is the length of the EVM address
+
+            if (gauge_address := globaldb_get_unique_cache_value(
+                cursor=cursor,
+                key_parts=(CacheType.CURVE_GAUGE_ADDRESS, chain_id_str, pool_address),
+            )) is not None:
+                addresses.add(gauge_address)
+
+    return addresses
+
+
+def get_curve_address_from_cache(
+        cursor: DBCursor,
+        cache_type: CacheType,
+        chain_id: ChainID,
+        cache_value: ChecksumEvmAddress,
+) -> ChecksumEvmAddress | None:
+    """Return the address encoded in a unique cache key for Curve lookups."""
+    cache_prefix = compute_cache_key((cache_type, str(chain_id.serialize_for_db())))
+    if (key := cursor.execute(
+        'SELECT key FROM unique_cache WHERE value = ? AND key LIKE ?',
+        (cache_value, f'{cache_prefix}%'),
+    ).fetchone()) is None:
+        return None
+
+    return string_to_evm_address(key[0][-42:])

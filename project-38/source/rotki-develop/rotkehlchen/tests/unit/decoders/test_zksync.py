@@ -1,0 +1,342 @@
+import pytest
+
+from rotkehlchen.chain.decoding.constants import CPT_GAS
+from rotkehlchen.chain.ethereum.modules.zksync.constants import (
+    CPT_ZKSYNC,
+    ZKSYNC_BRIDGE,
+    ZKSYNC_LITE_SUNSET_CLAIM,
+)
+from rotkehlchen.constants.assets import A_DAI, A_ETH, A_USDC, A_USDT, Asset
+from rotkehlchen.fval import FVal
+from rotkehlchen.history.events.structures.evm_event import EvmEvent
+from rotkehlchen.history.events.structures.types import HistoryEventSubType, HistoryEventType
+from rotkehlchen.tests.utils.ethereum import get_decoded_events_of_transaction
+from rotkehlchen.types import Location, TimestampMS, deserialize_evm_tx_hash
+
+
+@pytest.mark.vcr
+@pytest.mark.parametrize('ethereum_accounts', [['0x7277F7849966426d345D8F6B9AFD1d3d89183083']])
+def test_zksync_lite_legacy_deposit(ethereum_inquirer, ethereum_accounts):
+    """
+    Test a transaction with the OnChainDeposit event which is missing
+    from the newest implementation of the proxy address
+    """
+    tx_hash = deserialize_evm_tx_hash('0x6740ba7d674c285ce315b97dffdbf2cf91f74a2b75fba6fd82b3e0e5c8057218')  # noqa: E501
+    user_address = ethereum_accounts[0]
+    events, _ = get_decoded_events_of_transaction(evm_inquirer=ethereum_inquirer, tx_hash=tx_hash)
+    assert events == [
+        EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1607624823000)),
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.003633546'),
+            location_label=user_address,
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=270,
+            timestamp=timestamp,
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.BRIDGE,
+            asset=A_DAI,
+            amount=FVal(dai_str := '9.4361'),
+            location_label=user_address,
+            notes=f'Deposit {dai_str} DAI to zksync',
+            counterparty=CPT_ZKSYNC,
+            address=ZKSYNC_BRIDGE,
+            extra_data={'bridge': {
+                'from_chain': 1,
+                'to_chain': 'zksync_lite',
+                'from_address': user_address,
+                'to_address': user_address,
+                'transfer_id': '2310',
+            }},
+        ),
+    ]
+
+
+@pytest.mark.vcr
+@pytest.mark.parametrize('ethereum_accounts', [['0x7277F7849966426d345D8F6B9AFD1d3d89183083']])
+def test_zksync_lite_deposit(ethereum_inquirer, ethereum_accounts):
+    """Test a transaction with the Deposit event"""
+    tx_hash = deserialize_evm_tx_hash('0x041514c879ae6f4f36c44000270ce482798502be230865911d1013978f4bcb87')  # noqa: E501
+    user_address = ethereum_accounts[0]
+    events, _ = get_decoded_events_of_transaction(evm_inquirer=ethereum_inquirer, tx_hash=tx_hash)
+    assert events == [
+        EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1639578202000)),
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.007252433740671543'),
+            location_label=user_address,
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=139,
+            timestamp=timestamp,
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.BRIDGE,
+            asset=A_DAI,
+            amount=FVal(dai_str := '18.4614'),
+            location_label=user_address,
+            notes=f'Deposit {dai_str} DAI to zksync',
+            counterparty=CPT_ZKSYNC,
+            address=ZKSYNC_BRIDGE,
+            extra_data={'bridge': {
+                'from_chain': 1,
+                'to_chain': 'zksync_lite',
+                'from_address': user_address,
+                'to_address': user_address,
+                'transfer_id': '243318',
+            }},
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0x9531C059098e3d194fF87FebB587aB07B30B1306']])
+def test_zksync_lite_withdrawal(ethereum_inquirer, ethereum_accounts):
+    """Test a transaction with the Withdrawal event"""
+    tx_hash = deserialize_evm_tx_hash('0x234407968b9a688be3fb37cf7ff8ef3b4168d6cd85ec45b8344bb2a88832f982')  # noqa: E501
+    user_address = ethereum_accounts[0]
+    events, _ = get_decoded_events_of_transaction(evm_inquirer=ethereum_inquirer, tx_hash=tx_hash)
+    assert events == [
+        EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1604326368000)),
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.WITHDRAWAL,
+            event_subtype=HistoryEventSubType.BRIDGE,
+            asset=A_ETH,
+            amount=FVal(eth_str := '1.4437093'),
+            location_label=user_address,
+            notes=f'Withdraw {eth_str} ETH from zksync',
+            counterparty=CPT_ZKSYNC,
+            address=ZKSYNC_BRIDGE,
+            extra_data=(withdrawal_extra_data := {'bridge': {
+                'from_chain': 'zksync_lite',
+                'to_chain': 1,
+                'to_address': user_address,
+            }}),
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=176,
+            timestamp=timestamp,
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.WITHDRAWAL,
+            event_subtype=HistoryEventSubType.BRIDGE,
+            asset=A_DAI,
+            amount=FVal(dai_str := '1691.92749999'),
+            location_label=user_address,
+            notes=f'Withdraw {dai_str} DAI from zksync',
+            counterparty=CPT_ZKSYNC,
+            address=ZKSYNC_BRIDGE,
+            extra_data=withdrawal_extra_data,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=177,
+            timestamp=timestamp,
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.WITHDRAWAL,
+            event_subtype=HistoryEventSubType.BRIDGE,
+            asset=Asset('eip155:1/erc20:0xD56daC73A4d6766464b38ec6D91eB45Ce7457c44'),
+            amount=FVal(pan_str := '1586.6'),
+            location_label=user_address,
+            notes=f'Withdraw {pan_str} PAN from zksync',
+            counterparty=CPT_ZKSYNC,
+            address=ZKSYNC_BRIDGE,
+            extra_data=withdrawal_extra_data,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=178,
+            timestamp=timestamp,
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.WITHDRAWAL,
+            event_subtype=HistoryEventSubType.BRIDGE,
+            asset=A_USDC,
+            amount=FVal(usdc_str := '57.25'),
+            location_label=user_address,
+            notes=f'Withdraw {usdc_str} USDC from zksync',
+            counterparty=CPT_ZKSYNC,
+            address=ZKSYNC_BRIDGE,
+            extra_data=withdrawal_extra_data,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=179,
+            timestamp=timestamp,
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.WITHDRAWAL,
+            event_subtype=HistoryEventSubType.BRIDGE,
+            asset=A_USDT,
+            amount=FVal(usdt_str := '15.2'),
+            location_label=user_address,
+            notes=f'Withdraw {usdt_str} USDT from zksync',
+            counterparty=CPT_ZKSYNC,
+            address=ZKSYNC_BRIDGE,
+            extra_data=withdrawal_extra_data,
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0x2B888954421b424C5D3D9Ce9bB67c9bD47537d12']])
+def test_zksync_lite_batched_withdrawal(ethereum_inquirer, ethereum_accounts):
+    """Test decoding of a single withdrawal from a batched zksync lite transaction."""
+    tx_hash = deserialize_evm_tx_hash('0x4fe316860f922fe8a9cdc61dc1f786ec663ebedfd4eaf101d7719f3989c2522e')  # noqa: E501
+    events, _ = get_decoded_events_of_transaction(evm_inquirer=ethereum_inquirer, tx_hash=tx_hash)
+    expected_events = [EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=0,
+        timestamp=TimestampMS(1708436735000),
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.WITHDRAWAL,
+        event_subtype=HistoryEventSubType.BRIDGE,
+        asset=A_ETH,
+        amount=FVal('6.626770825'),
+        location_label=ethereum_accounts[0],
+        notes='Withdraw 6.626770825 ETH from zksync',
+        counterparty=CPT_ZKSYNC,
+        address=ZKSYNC_BRIDGE,
+        extra_data={'bridge': {
+            'from_chain': 'zksync_lite',
+            'to_chain': 1,
+            'to_address': ethereum_accounts[0],
+        }},
+    )]
+    assert expected_events == events
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0xfC27723b63464f195b8492814A2791555DA7c8B8']])
+def test_zksync_lite_batched_withdrawal_token(ethereum_inquirer, ethereum_accounts):
+    """Test decoding of a token withdrawal from a batched zksync lite transaction."""
+    tx_hash = deserialize_evm_tx_hash('0x4fe316860f922fe8a9cdc61dc1f786ec663ebedfd4eaf101d7719f3989c2522e')  # noqa: E501
+    events, _ = get_decoded_events_of_transaction(evm_inquirer=ethereum_inquirer, tx_hash=tx_hash)
+    expected_events = [EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=55,
+        timestamp=TimestampMS(1708436735000),
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.WITHDRAWAL,
+        event_subtype=HistoryEventSubType.BRIDGE,
+        asset=A_USDC,
+        amount=FVal('2'),
+        location_label=ethereum_accounts[0],
+        notes='Withdraw 2 USDC from zksync',
+        counterparty=CPT_ZKSYNC,
+        address=ZKSYNC_BRIDGE,
+        extra_data={'bridge': {
+            'from_chain': 'zksync_lite',
+            'to_chain': 1,
+            'to_address': ethereum_accounts[0],
+        }},
+    )]
+    assert expected_events == events
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0xFB3A939Cb06eeF36E1ceD48bdba1fcEe177Ac7f4']])
+def test_zksync_lite_sunset_claim(ethereum_inquirer, ethereum_accounts):
+    """Test decoding ZKsync Lite sunset claims."""
+    tx_hash = deserialize_evm_tx_hash('0x8c1cf41de91b0e5fd09db4d15eaf4e95dfa65fd4c385b0b0092a80140b353b7e')  # noqa: E501
+    events, _ = get_decoded_events_of_transaction(evm_inquirer=ethereum_inquirer, tx_hash=tx_hash)
+    expected_events = [EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=0,
+        timestamp=(timestamp := TimestampMS(1781512307000)),
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.WITHDRAWAL,
+        event_subtype=HistoryEventSubType.BRIDGE,
+        asset=A_ETH,
+        amount=FVal(eth_str := '0.00100170986'),
+        location_label=(user_address := ethereum_accounts[0]),
+        notes=f'Claim {eth_str} ETH from the ZKsync Lite sunset',
+        counterparty=CPT_ZKSYNC,
+        address=ZKSYNC_LITE_SUNSET_CLAIM,
+        extra_data=(claim_extra_data := {'bridge': {
+            'from_chain': 'zksync_lite',
+            'to_chain': 1,
+            'to_address': user_address,
+        }}),
+    ), EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=2119,
+        timestamp=timestamp,
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.WITHDRAWAL,
+        event_subtype=HistoryEventSubType.BRIDGE,
+        asset=A_USDC,
+        amount=FVal(usdc_str := '0.008282'),
+        location_label=user_address,
+        notes=f'Claim {usdc_str} USDC from the ZKsync Lite sunset',
+        counterparty=CPT_ZKSYNC,
+        address=ZKSYNC_LITE_SUNSET_CLAIM,
+        extra_data=claim_extra_data,
+    ), EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=2121,
+        timestamp=timestamp,
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.WITHDRAWAL,
+        event_subtype=HistoryEventSubType.BRIDGE,
+        asset=Asset('eip155:1/erc20:0xC91a71A1fFA3d8B22ba615BA1B9c01b2BBBf55ad'),
+        amount=FVal(zz_str := '10'),
+        location_label=user_address,
+        notes=f'Claim {zz_str} ZZ from the ZKsync Lite sunset',
+        counterparty=CPT_ZKSYNC,
+        address=ZKSYNC_LITE_SUNSET_CLAIM,
+        extra_data=claim_extra_data,
+    )]
+    assert expected_events == events
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0x9531C059098e3d194fF87FebB587aB07B30B1306']])
+def test_zksync_lite_legacy_batched_withdrawal(ethereum_inquirer, ethereum_accounts):
+    """Test that payouts logged by the bridge's original Withdrawal event are decoded.
+
+    That event names only the token and the amount, not who was paid, so each payout is
+    found by amount among the receives from the bridge. The eth one arrives in an internal
+    transaction rather than a transfer log, and is decoded the same way.
+    """
+    tx_hash = deserialize_evm_tx_hash('0xe765a634eaa1645324b585e96d7893bf30f1aa8eaf630840124ddbd7a2bff4c7')  # noqa: E501
+    events, _ = get_decoded_events_of_transaction(evm_inquirer=ethereum_inquirer, tx_hash=tx_hash)
+    user_address, timestamp = ethereum_accounts[0], TimestampMS(1617977903000)
+    extra_data = {'bridge': {
+        'from_chain': 'zksync_lite',
+        'to_chain': 1,
+        'to_address': user_address,
+    }}
+    assert events == [EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=sequence_index,
+        timestamp=timestamp,
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.WITHDRAWAL,
+        event_subtype=HistoryEventSubType.BRIDGE,
+        asset=asset,
+        amount=FVal(amount),
+        location_label=user_address,
+        notes=f'Withdraw {amount} {symbol} from zksync',
+        counterparty=CPT_ZKSYNC,
+        address=ZKSYNC_BRIDGE,
+        extra_data=extra_data,
+    ) for sequence_index, asset, amount, symbol in (
+        (0, A_ETH, '2.048641517695', 'ETH'),
+        (74, A_DAI, '2932.171400001', 'DAI'),
+        (77, Asset('eip155:1/erc20:0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2'), '0.0247', 'MKR'),
+        (79, Asset('eip155:1/erc20:0xD56daC73A4d6766464b38ec6D91eB45Ce7457c44'), '3913.9305', 'PAN'),  # noqa: E501
+        (81, A_USDC, '279.854', 'USDC'),
+        (83, A_USDT, '199.182', 'USDT'),
+    )]

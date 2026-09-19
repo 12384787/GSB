@@ -1,0 +1,917 @@
+{
+  "about": {
+    "app_version": "Version de la App:",
+    "components": {
+      "title": "Componenes Premium",
+      "version": "Versión Premium:"
+    }
+  },
+  "account_balances": {
+    "confirm_delete": {
+      "description_xpub": "¿Estás seguro de que quieres eliminar {address}?",
+      "title": "Eliminar cuenta"
+    },
+    "data_table": {
+      "loading": "Por favor, espera mientras rotki consulta la blockchain..."
+    },
+    "detect_tokens": {
+      "tooltip": {
+        "last_detected": "Última detección: : {time}",
+        "redetect": "Re-detectar tokens"
+      }
+    },
+    "edit_tooltip": "Editar cuenta",
+    "refresh_tooltip": "Actualizar los saldos de {blockchain} ignorando cualquier entrada en caché"
+  },
+  "account_form": {
+    "advanced_tooltip": "Mostrar las opciones avanzadas de xpub | Ocultar las opciones avanzadas de xpub",
+    "error": {
+      "description": "Error anãdiendo cuenta: {error}",
+      "title": "Añadir una cuenta"
+    },
+    "labels": {
+      "addresses": "Direcciones",
+      "addresses_entries": "sin entradas | {count} entrada única | {count} entradas únicas",
+      "addresses_hint": "Inserte múltiples direcciones separadas por comas o saltos de línea",
+      "blockchain": "Elija cadena de bloques | Elija cadenas de bloques",
+      "btc": {
+        "derivation_path": "Ruta de Derivación"
+      },
+      "multiple": "Añadir múltiples direcciones"
+    },
+    "validation": {
+      "address_non_empty": "La dirección no puede estar vacía",
+      "xpub_non_empty": "El campo XPUB no puede estar vacío"
+    }
+  },
+  "account_management": {
+    "about_tooltip": "Mostrar la ventana de información de la aplicación",
+    "creation": {
+      "error": "Error en la creación de la cuenta"
+    }
+  },
+  "account_settings": {
+    "cost_basis_method_settings": {
+      "labels": {
+        "acb": "Costo Promedio"
+      }
+    },
+    "csv_export_settings": {
+      "labels": {
+        "export_csv_formulas": "¿Deben exportarse las fórmulas como parte del CSV PnL?",
+        "have_csv_summary": "¿Debería incluirse un resumen de todos los eventos en la exportación CSV de todos los eventos?"
+      },
+      "title": "Configuración de la exportación CSV"
+    },
+    "messages": {
+      "cost_basis": {
+        "disabled": "Cálculo de la base de costo anterior desactivado con éxito",
+        "enabled": "Cálculo de la base de costo anterior habilitado con éxito",
+        "error": "Error al cambiar el cálculo de la base de costo: {message}"
+      },
+      "cost_basis_method": {
+        "error": "Error al cambiar el método de base de costo a {method}: {message}",
+        "success": "Método de base de costo cambiado con éxito a {method}"
+      },
+      "crypto_to_crypto": "Error al configurar cripto a cripto: {message}",
+      "eth_staking_taxable_after_withdrawal": {
+        "disabled": "Configuración de tributación de staking de ETH tras activarse los retiros deshabilitada correctamente",
+        "enabled": "Configuración de tributación de staking de ETH tras activarse los retiros habilitada correctamente",
+        "error": "Error al cambiar la configuración de tributación de staking de ETH después del activarese los retiros: {message}"
+      },
+      "export_csv_formulas": "Error al configurar la opción para incluir fórmulas en la exportación CSV: {message}",
+      "gas_costs": "Error al configurar los costos de gas de Ethereum: {message}",
+      "have_csv_summary": "Error al configurar la opción para incluir un resumen en la exportación CSV: {message}",
+      "tax_free": "Período extenso de tasas {enabled}",
+      "tax_free_period": "Período extenso de impuestos definido para {period} dias"
+    },
+    "validation": {
+      "tax_free_days": "Por favor, ingrese el número de días",
+      "tax_free_days_gt_zero": "El número de días no puede ser negativo ni cero"
+    }
+  },
+  "account_settings_display": {
+    "cost_basis_fees": "Las tarifas de la base de costos fueron tomadas en cuenta:",
+    "cost_basis_method": "Método para calcular el coste base:",
+    "crypto2crypto": "Se tuvieron en cuenta los intercambios de cripto a cripto:",
+    "days": "{days} días",
+    "eth_staking_taxable_after_withdrawal_enabled": "Los eventos de staking de ETH se omiten hasta que los retiros estén habilitados:",
+    "gas_costs": "Se tuvieron en cuenta los costes en gas:",
+    "past_cost_basis": "La base de costos pasada fue calculada durante la creación del informe:",
+    "profit_currency": "Moneda de beneficio:",
+    "subtitle": "Estas configuraciones contables fueron utilizadas durante la creación del informe",
+    "tax_free_period": "Período extenso de impuestos:",
+    "title": "Configuraciones Contables"
+  },
+  "accounting_settings": {
+    "trade": {
+      "labels": {
+        "calculate_past_cost_basis": "Calcular el coste base pasado al crear el informe",
+        "cost_basis_method": "Método para calcular el coste base",
+        "eth_staking_taxable_after_withdrawal_enabled": "Debemos omitir los eventos de staking de ETH en la contabilidad hasta que los retiros estén habilitados",
+        "include_crypto2crypto": "Tener en cuenta los intercambios de cripto a cripto.",
+        "include_fees_in_cost_basis": "Tener en cuenta las tarifas en el coste base.",
+        "include_gas_costs": "Tener en cuenta los costos de gas de Ethereum",
+        "tax_free": "¿Hay un periodo libre de impuestos?",
+        "taxfree_after_period": "Libre de impuestos después de cuántos días"
+      },
+      "title": "Configuraciones de intercambios"
+    }
+  },
+  "actions": {
+    "assets": {
+      "erc20": {
+        "error": {
+          "description": "Hubo un error al consultar los detalles del token: {message}",
+          "title": "Consultando detalles del token {address} ({evmChain})"
+        }
+      },
+      "update": {
+        "error": {
+          "description": "La actualización de la base de datos de activos falló: {message}"
+        },
+        "task": {
+          "title": "Actualizando la base de datos de activos"
+        }
+      },
+      "versions": {
+        "error": {
+          "description": "La verificación de actualización de la base de datos de activos falló: {message}"
+        },
+        "task": {
+          "title": "Verificando actualizaciones en la base de datos de activos."
+        }
+      }
+    },
+    "balances": {
+      "all_balances": {
+        "error": {
+          "message": "No se pudieron consultar los balances ni guardar la instantánea: {message}",
+          "title": "Error al guardar la instantánea de balances"
+        },
+        "task": {
+          "description": "Consultando todos los balances y guardando una instantánea para las estadísticas.",
+          "ignore_errors_note": "Se ignorarán los errores durante la consulta."
+        }
+      },
+      "blockchain": {
+        "error": {
+          "description": "Error al consultar los balances en blockchain.: {error}",
+          "title": "Consultando balances en blockchains"
+        }
+      },
+      "blockchain_account_removal": {
+        "error": {
+          "description": "Error al eliminar la cuenta: {error}",
+          "title": "Eliminando {count} cuentas(s) en {blockchain} "
+        }
+      },
+      "blockchain_accounts_add": {
+        "no_new": {
+          "description": "Las direcciones seleccionadas ya están siendo rastreadas por rotki"
+        },
+        "task": {
+          "title": "Agregando cuenta de {blockchain}"
+        }
+      },
+      "create_oracle_cache": {
+        "already_running": "La tarea ya está en curso",
+        "failed": "Error al crear una entrada de caché de {fromAsset} a {toAsset} en la fuente: {error}",
+        "task": "Creando entrada de caché dee {fromAsset} a {toAsset} en {source}"
+      },
+      "detect_tokens": {
+        "task": {
+          "title": "Recuperando tokens detectados"
+        }
+      },
+      "exchange_balances": {
+        "error": {
+          "message": "Error al consultar los balances de {location}: {error}",
+          "title": "Consulta de balances de {location}"
+        }
+      },
+      "exchange_rates": {
+        "error": {
+          "message": "Error al consultar los tipos de cambio: {message}",
+          "title": "Tipos de cambio"
+        }
+      },
+      "exchange_removal": {
+        "description": "No se pudo eliminar {exchange} debido a: {error}",
+        "title": "Elimination de plataforma de intercambio"
+      },
+      "exchange_setup": {
+        "description": "La configuración de {exchange} falló debido a: {error}",
+        "title": "Configuración de Exchange"
+      },
+      "historic_fetch_price": {
+        "task": {
+          "description": "Recuperando tipos de {fromAsset} a {toAsset} en {date} | Recuperando tasas para {count} pares a {toAsset}",
+          "title": "Recuperando el tipo de intercambio"
+        }
+      },
+      "manual_balances": {
+        "error": {
+          "message": "Falló: {message}",
+          "title": "Recuperando balances manuales"
+        }
+      },
+      "manual_delete": {
+        "error": {
+          "title": "Eliminando balance manual"
+        }
+      },
+      "xpub_removal": {
+        "error": {
+          "description": "Falló al eliminar {xpub}: {error}",
+          "title": "Eliminación de Xpub"
+        }
+      }
+    },
+    "defi": {
+      "liquity_staking": {
+        "error": {
+          "description": "Failed to retreive Liquity staking: {message}"
+        }
+      }
+    },
+    "history_events": {
+      "missing_rule": {
+        "add_rule": "Agregar regla contable faltante",
+        "edit": "Editar evento",
+        "message": "Este evento no será procesado en el reporte de ganancias y perdidas. Para corregirlo, debes elegir una de estas opciones:",
+        "re_decode": "Recodificar evento",
+        "title": "Evento al que le falta una regla contable"
+      }
+    },
+    "history_events_export": {
+      "message": {
+        "failure": "Fallo en la exportación de eventos de historial: {description}",
+        "success": "Eventos de historial exportados a CSV exitosamente"
+      },
+      "title": "Exportación de Eventos de Historial"
+    },
+    "online_events": {
+      "error": {
+        "description": "Error al consultar eventos en línea con tipo de consulta {queryType}: {error}",
+        "title": "Consulta de Eventos en Línea"
+      },
+      "skipped": {
+        "csv_export": {
+          "message": {
+            "failure": "Error al exportar eventos omitidos",
+            "success": "Eventos omitidos exportados a CSV exitosamente"
+          },
+          "title": "Exportación CSV"
+        }
+      }
+    },
+    "session": {
+      "refresh_general_cache": {
+        "error": {
+          "message": "Error al actualizar los datos del protocolo {name}: {message}"
+        },
+        "task": {
+          "title": "Actualizar datos del protocolo ({name})"
+        }
+      }
+    },
+    "transactions_redecode": {
+      "error": {
+        "description": "Fallo al decodificar eventos de transacciones: {error}",
+        "title": "Descodificando eventos de transacciones"
+      }
+    },
+    "transactions_redecode_by_chain": {
+      "error": {
+        "description": "Falló la decodificación de eventos de {cadena}: {error}",
+        "title": "Descodificando eventos de transacciones"
+      }
+    }
+  },
+  "airdrops": {
+    "unknown_info": "Hay airdrops disponibles para estas direcciones, pero aún no podemos analizar si han sido reclamadas o no.",
+    "unknown_tooltip": "La dirección es elegible para este lanzamiento aéreo, pero aún no podemos analizar si ha sido reclamada o no."
+  },
+  "asset_balances": {
+    "loading": "Espere mientras rotki consulta los saldos..."
+  },
+  "asset_form": {
+    "optional": "Campos opcionales",
+    "replaced": "Este icono se aplicará después de hacer clic en \"(Guardar)\"."
+  },
+  "asset_management": {
+    "cex_mapping": {
+      "add_error": "No se ha podido añadir la asignación: {message}",
+      "add_mapping": "Añadir cartografía",
+      "add_title": "Añadir una nueva asignación",
+      "all_exchanges": "Todos los intercambios",
+      "asset_symbol": "Símbolo del activo",
+      "confirm_delete": {
+        "message": "¿Está seguro de que desea eliminar la asignación de activos para el símbolo {asset} en {location}?",
+        "title": "Eliminar asignación de activos de bolsa"
+      },
+      "delete_error": "No se ha podido eliminar la asignación: {message}",
+      "edit_error": "No se ha podido editar la asignación: {message}",
+      "edit_title": "Editar la asignación",
+      "form": {
+        "asset_non_empty": "El campo activo reconocido no puede estar vacío",
+        "location_non_empty": "El campo ubicación no puede estar vacío",
+        "location_symbol_non_empty": "El campo de símbolo de activo no puede estar vacío"
+      },
+      "location_symbol": "Símbolo del activo en la bolsa",
+      "recognized_as": "Reconocido como",
+      "save_for_all": "Guardar esta asignación para todas las bolsas",
+      "subtitle": "Puede vincular símbolos de activos en una bolsa centralizada con activos reconocidos por rotki. Esto es necesario para que rotki pueda procesar activos en las bolsas."
+    }
+  },
+  "asset_update": {
+    "advanced": "Opciones avanzadas"
+  },
+  "assets": {
+    "action": {
+      "ignore": "Ignorar activo"
+    },
+    "amount": "Total en propiedad",
+    "custom_price": {
+      "delete": {
+        "error": {
+          "message": "No se ha podido borrar el último precio de {activo}",
+          "title": "Eliminando el último precio personalizado"
+        },
+        "message": "¿Está seguro de que desea eliminar el precio personalizado para {asset}?",
+        "tooltip": "Eliminar el precio personalizado"
+      },
+      "edit": {
+        "tooltip": "Editar o establecer el precio personalizado"
+      }
+    },
+    "value": "Valor"
+  },
+  "back_button": {
+    "tooltip": "Navegar a la página anterior."
+  },
+  "backend_settings": {
+    "title": "Ajustes del servicio"
+  },
+  "blockchain_balances": {
+    "form_dialog": {
+      "add_title": "Añade una cuenta en la blockchain"
+    }
+  },
+  "collapsed_pending_tasks": {
+    "cancel_task": "Cancelar tarea",
+    "cancel_task_info": "Esta acción dejará el proceso en ejecución ({title}) en un estado inacabado, ¿está seguro de que desea cancelarlo?"
+  },
+  "common": {
+    "actions": {
+      "back": "Atras",
+      "cancel": "Cancelar",
+      "create": "Crear",
+      "delete": "Borrar",
+      "dismiss": "Desestimar",
+      "download": "Descargar",
+      "download_csv": "Descargar CSV",
+      "edit": "Editar",
+      "export_csv": "Exportar CSV",
+      "filter": "Filtrar",
+      "finish": "Terminar",
+      "install": "Instalar",
+      "next": "Siguiente",
+      "pull": "Descargar",
+      "push": "Subir",
+      "save": "Guardar",
+      "search": "Buscar",
+      "skip": "Saltar",
+      "yes": "Sí"
+    },
+    "actions_text": "Comportamiento",
+    "address": "Dirección",
+    "amount": "Cantidad",
+    "asset": "Activo",
+    "assets": "Activos",
+    "category": "Categoría",
+    "claimed": "Reclamada",
+    "description": "Descripción",
+    "details": "Detalles",
+    "entry_type": "Tipo de entrada",
+    "events": "Eventos",
+    "exchange": "Intercambio",
+    "location": "Ubicación",
+    "never": "Nunca",
+    "notes": "Notas",
+    "of": "de",
+    "optional": "Opcional",
+    "price": "Precio",
+    "price_in_symbol": "Precio en {symbol}",
+    "refresh": "Actualizar",
+    "select_directory": "Seleccionar un directorio",
+    "status": "Estado",
+    "unclaimed": "No reclamado",
+    "unknown": "Desconocido",
+    "validator_index": "Índice de validador"
+  },
+  "conflict_dialog": {
+    "action_hint": {
+      "bottom": "También tiene otra opción extra, puede gestionar los conflictos individualmente.\n",
+      "top": "Se han detectado cambios locales. Tiene dos opciones:"
+    },
+    "keep_local": "Mantener todo local",
+    "keep_local_tooltip": "No se actualizará ningún activo afectado. Pueden ser necesarias actualizaciones manuales.",
+    "keep_remote": "Mantener todo lo remoto",
+    "keep_remote_tooltip": "Actualice todos los activos. No es necesaria ninguna otra acción.",
+    "manage": "Gestionar conflictos",
+    "resolve_all_hint": "Todos los conflictos se resolverán utilizando datos de {source}.",
+    "subtitle": "{conflicts} las entradas de activos no pueden actualizarse automáticamente. {remaining} entradas restantes requieren la intervención del usuario.",
+    "title": "Conflictos detectados"
+  },
+  "create_account": {
+    "credentials": {
+      "description": "Recuerda que el usuario que creas aquí está {highlight}, independientemente de la cuenta creada en la web.",
+      "highlight": "solo habilitado en la aplicación",
+      "label_password": "Contraseña",
+      "label_password_backup_reminder": "rotki guarda todos los datos del usuario localmente. Entiendo que si pierdo mi contraseña, perderé acceso a mis datos. He creado una copia de seguridad de la contraseña.",
+      "label_password_repeat": "Repetir contraseña",
+      "label_username": "Nombre de perfil",
+      "password_sync_requirement": "Asegúrate de que la cuenta utilice la misma contraseña que la base de datos respaldada originalmente. No podrás acceder a la base de datos si ingresas una contraseña diferente.",
+      "validation": {
+        "check_prompt": "Confirma que has leído y creado una copia de seguridad",
+        "non_empty_password": "Por favor, proporciona una contraseña",
+        "non_empty_password_confirmation": "Por favor, proporciona una confirmación de contraseña",
+        "non_empty_username": "Por favor proporcione un nombre de perfil",
+        "password_confirmation_mismatch": "La confirmación de contraseña no coincide con la contraseña proporcionada",
+        "valid_username": "Un nombre de perfil debe contener solo caracteres alfanuméricos y no tener espacios"
+      }
+    },
+    "have_account": {
+      "description": "¿Ya tienes una cuenta?",
+      "log_in": "Desbloquea tu cuenta"
+    },
+    "introduction": {
+      "description": "rotki es una aplicación local que respeta tu privacidad.\n\nLas cuentas de rotki están encriptadas usando tu contraseña y {highlight}.\n\nLa cuenta que creas aquí solo es útil para la aplicación; en la web utilizamos una base de datos diferente.",
+      "highlight": "guardada en tu sistema de archivos local"
+    },
+    "premium": {
+      "button_premium_approve": "Sí, habilitar premium",
+      "premium_question": "¿Ya eres un usuario premium de rotki y quieres habilitar funciones premium?\nEsto es necesario si deseas sincronizar tu base de datos de rotki desde otro dispositivo al crear la cuenta. Puedes comprar premium {premiumLink}"
+    },
+    "steps": {
+      "step_1": {
+        "description": "Primer paso",
+        "title": "Introducción"
+      },
+      "step_2": {
+        "description": "¿Tienes una cuenta premium en nuestro sitio web?",
+        "title": "Habilitar Premium"
+      },
+      "step_3": {
+        "description": "Configura tus credenciales",
+        "title": "Crear cuenta"
+      },
+      "step_4": {
+        "title": "Análisis de uso"
+      }
+    },
+    "title": "Crear Cuenta",
+    "usage_analytics": {
+      "description": "rotki es una aplicación local y el análisis de uso anónimo es la única forma que tenemos de tener una idea de cuántas personas utilizan nuestro software, de dónde son, etc. Estos datos son muy importantes para nosotros, son completamente anónimos y nos ayudan a crear un mejor producto para ti.",
+      "label_confirm": "Enviar análisis de uso anónimo"
+    }
+  },
+  "currency_drop_down": {
+    "hint": "Seleccionar como la divisa principal",
+    "profit_currency": "Divisa de ganancias ({currency})"
+  },
+  "dashboard": {
+    "blockchain_balances": {
+
+    },
+    "exchange_balances": {
+
+    },
+    "snapshot": {
+      "edit": {
+        "dialog": {
+          "balances": {
+            "preview": {
+              "from": "De",
+              "to": "Para"
+            },
+            "rules": {
+              "amount": "El campo de cantidad no puede estar vacío",
+              "asset": "Este campo no puede estar vacío"
+            }
+          }
+        }
+      }
+    }
+  },
+  "dashboard_asset_table": {
+    "headers": {
+      "percentage_of_total_net_value": "% del valor neto",
+      "percentage_total": "% del total"
+    }
+  },
+  "data_management": {
+    "purge_data": {
+      "confirm": {
+        "message": "¿Está seguro de que desea purgar los datos almacenados en caché para {source} ({value})?",
+        "message_all": "¿Está seguro de que desea purgar los datos almacenados en caché para todos los {source}?",
+        "title": "Confirmar purga de datos en caché"
+      },
+      "transaction_purge_confirm": {
+        "message": "¿Está seguro de que desea purgar estos datos de transacciones? Esta acción eliminará las transacciones y los recibos, y llevará mucho tiempo volver a consultar todo."
+      }
+    },
+    "refresh_cache": {
+      "confirm": {
+        "message": "¿Está seguro de que desea actualizar los datos del protocolo para {source}?",
+        "title": "Confirmar actualización de datos del protocolo"
+      },
+      "error": "Error al borrar los datos del protocolo para {source}: {message}",
+      "select_cache": "Seleccionar datos del protocolo para actualizar",
+      "subtitle": "Permite actualizar datos del protocolo en rotki",
+      "success": "Los datos del protocolo se borraron correctamente",
+      "title": "Actualizar datos del protocolo",
+      "tooltip": "Actualizar datos del protocolo para la fuente seleccionada"
+    }
+  },
+  "data_table": {
+    "no_data": "No hay datos disponibles",
+    "rows_per_page": "Filas por página"
+  },
+  "error": {
+    "generic": {
+      "message": "Encontramos un error interno al procesar su solicitud. Si este problema persiste, comuníquese con nuestro equipo de soporte con los detalles a continuación: \nCódigo de error: {code} \nMensaje de error: {message} \nRuta: {path}",
+      "title": "Algo salió mal"
+    }
+  },
+  "evm_rpc_node_manager": {
+    "connected": {
+      "failure": "Fallido",
+      "false": "Listo"
+    }
+  },
+  "exchange_balances": {
+    "add_exchange": "Añadir exchange",
+    "select_exchange": "Elegir exchange"
+  },
+  "external_services": {
+    "api_key": "Clave de la API",
+    "blockscout": {
+      "description": "rotki usa Blockscout para obtener información sobre consultas de retiro de ETH y más. Solo es necesaria una clave API si las peticiones están siendo limitadas por el servidor de Blockscout.",
+      "hint": "Ingrese su clave para la API de Blockscout"
+    }
+  },
+  "general_settings": {
+    "amount": {
+      "label": {
+        "currency_location": "Ubicación del símbolo de moneda",
+        "decimal_separator": "Separador decimal",
+        "location_after": "Después",
+        "location_before": "Antes",
+        "resulting_format": "Formato final:",
+        "thousand_separator": "Separador de miles"
+      },
+      "title": "Ajustes de cantidades"
+    },
+    "external_service_setting": {
+      "label": {
+        "connect_timeout": "Tiempo de conexión agotado",
+        "connect_timeout_hint": "El número de segundos que se esperarán antes de renunciar a establecer una conexión con un servicio externo.",
+        "query_retry_limit": "Límite de reintento de consulta",
+        "query_retry_limit_hint": "El número de veces que se intentará nuevamente una consulta a servicios externos antes de renunciar.",
+        "read_timeout": "Tiempo de lectura agotado",
+        "read_timeout_hint": "El número de segundos que se esperarán para el primer byte después de haber establecido una conexión con un servicio externo."
+      },
+      "title": "Configuración de servicio externo",
+      "validation": {
+        "connect_timeout": {
+          "invalid_range": "El tiempo de conexión agotado debe ser mayor que {min}",
+          "non_empty": "Por favor, ingrese el tiempo de conexión agotado"
+        },
+        "query_retry_limit": {
+          "invalid_range": "El límite de reintento de consulta debe ser mayor que {min}",
+          "non_empty": "Por favor, ingrese el límite de reintento de consulta"
+        },
+        "read_timeout": {
+          "invalid_range": "El tiempo de lectura agotado debe ser mayor que {min}",
+          "non_empty": "Por favor, ingrese el tiempo de lectura agotado"
+        }
+      }
+    },
+    "nft_setting": {
+      "label": {
+        "include_nfts_hint": "Por defecto, los gráficos y el cuadro de mandos incluyen el valor de todas las NFT.",
+        "render_setting": {
+          "allow_all": "Permitir todas las imágenes",
+          "only_allow_whitelisted": "Permitir sólo imágenes de dominios de la lista blanca"
+        },
+        "whitelist_domains": "Lista blanca de dominios",
+        "whitelisted_domain_entries": "ninguna entrada | {count} entrada única | {count} entradas únicas",
+        "whitelisted_domains": "Dominios de la lista blanca",
+        "whitelisted_domains_hint": "Introduzca uno o varios dominios separados por comas. Pulse el botón de la derecha para guardar los cambios."
+      },
+      "messages": {
+        "error": "Error al configurar los dominios permitidos para el renderizado de imágenes de NFTs",
+        "success": "Dominios permitidos para la representación de imágenes de NFT guardados correctamente"
+      }
+    },
+    "title": "Ajustes generales",
+    "validation": {
+      "chains_to_skip_detection": {
+        "error": "Error al configurar las cadenas EVM para omitir la detección de actividad de cuentas entre cadenas",
+        "success": "Cadenas EVM para omitir la detección de actividad de cuentas entre cadenas guardadas correctamente"
+      }
+    }
+  },
+  "generate": {
+    "labels": {
+      "end_date": "Fecha de Finalización",
+      "start_date": "Fecha de Inicio"
+    },
+    "period": "Periodo"
+  },
+  "help_sidebar": {
+    "faq": {
+      "subtitle": "Preguntas sobre la aplicación"
+    },
+    "github": {
+      "subtitle": "Revisa nuestro código y los tickets abiertos"
+    },
+    "title": "Ayuda y soporte",
+    "tooltip": "Ayuda",
+    "twitter": {
+      "subtitle": "Síguenos"
+    },
+    "user_guide": {
+      "subtitle": "Empieza aquí",
+      "title": "Guía de uso"
+    }
+  },
+  "import_data": {
+    "binance": {
+      "line_one": "Las columnas que procesamos incluyen: User_ID, UTC_Time, Account, Operation, Coin, Change y Remark.",
+      "line_three": "Debido al formato CSV de Binance, existe la posibilidad de que no se importen todos los datos. Si esto ocurre, recibirás una advertencia.",
+      "line_two": "Puede obtener el archivo CSV en {link}."
+    },
+    "kucoin": {
+      "import": "Importar {0} de Kucoin",
+      "import_types": "comercios",
+      "line_one": "Admitimos la importación de ficheros de tipo csv."
+    }
+  },
+  "input_mode_select": {
+    "import_from_wallet": {
+      "label": "Importar direcciones desde la cartera del navegador",
+      "missing": "No podemos detectar ningún monedero en este navegador",
+      "missing_tooltip": {
+        "title": "Estas son las causas más comunes:",
+        "wallet_is_not_enabled": "La extensión para el monedero está deshabilitada. Puedes habilitarla en el menú Extensions/Add-Ons, dependiendo de tu navegador.",
+        "wallet_is_not_installed": "Este navegador no tiene ningún monedero instalado. Puedes ir a la tienda de extensiones de tu navegador e instalar uno"
+      }
+    }
+  },
+  "kraken_page": {
+    "loading": "Tu información de staking en Kraken se esta actualizando..."
+  },
+  "loan_stake": {
+    "unclaimed_rewards": "Recompensas pendientes"
+  },
+  "login": {
+    "button_create_account": "Crear una cuenta",
+    "button_no_account": "¿No tienes una cuenta?",
+    "credential_error": {
+      "description": "Si aún no ha creado una cuenta de aplicación, deberá hacerlo para poder iniciar sesión.",
+      "support": "Si necesita ayuda, contáctenos en nuestro canal de soporte en discord.",
+      "title": "Tenga en cuenta que la cuenta de su sitio web y su cuenta de aplicación están separadas y no se pueden usar indistintamente."
+    },
+    "label_password": "Contraseña",
+    "label_username": "Nombre de perfil",
+    "logout": "Cerrar sesión",
+    "remember_password": "Recordar contraseña",
+    "remember_username": "Recordar nombre de perfil",
+    "title": "Desbloquear cuenta",
+    "upgrading_db": {
+      "current": "Se está aplicando el paso {currentStep} de {totalSteps} de la actualización de la base de datos v{currentVersion}.",
+      "title": "Actualización de base de datos",
+      "warning": "La base de datos se está actualizando de la versión {fromVersion} a {toVersion}. No cierres la aplicación hasta que esté terminada."
+    },
+    "validation": {
+      "non_empty_password": "Por favor introduzca una contraseña",
+      "non_empty_username": "Por favor proporcione un nombre de perfil",
+      "valid_username": "Un nombre de perfil debe contener solo caracteres alfanuméricos y no tener espacios"
+    },
+    "welcome_description": "Bienvenido al administrador de cartera de código abierto que protege su privacidad.",
+    "welcome_title": "Bienvenido a rotki"
+  },
+  "manage_user_assets": {
+    "export": {
+      "button": "Exportar",
+      "title": "Exportar"
+    }
+  },
+  "managed_asset_content": {
+    "add_asset": "Añadir activo"
+  },
+  "manual_balances": {
+    "dialog": {
+      "add": {
+        "title": "Añadir un balance manual"
+      },
+      "edit": {
+        "title": "Editar balance manual"
+      }
+    }
+  },
+  "manual_balances_form": {
+    "fields": {
+      "label": "Etiqueta",
+      "tags": "Etiqueta"
+    }
+  },
+  "merge_dialog": {
+    "done": "La fusión de activos se ha completado. El activo antiguo seguirá apareciendo en el frontend. Para asegurarse de que el nuevo se muestra en todas partes, reinicie la aplicación o actualice manualmente los saldos en cada lugar en el que aparezca el activo antiguo",
+    "error": "La fusión no se ha realizado correctamente",
+    "hint": "El activo de origen se fusionará con el activo de destino y se actualizarán todos sus usos",
+    "merge": "Fusionar",
+    "source": {
+      "label": "Fuente",
+      "non_empty": "El identificador de la fuente no puede no estar vacío"
+    },
+    "source_hint": "El identificador de activo que se desea fusionar en el destino",
+    "subtitle": "Fusionar dos activos",
+    "target": {
+      "non_empty": "El activo de destino no puede estar vacío"
+    },
+    "target_hint": "Identificador: {identifier}",
+    "title": "Fusionar activos"
+  },
+  "message": {
+    "success": {
+      "title": "Éxito"
+    }
+  },
+  "module_selector": {
+    "actions": {
+      "disable_all": "Desactivar todo",
+      "enable_all": "Activar todo"
+    },
+    "filter": "Módulos de búsqueda",
+    "table": {
+      "enabled": "Activado"
+    }
+  },
+  "navigation_menu": {
+    "balances_sub": {
+      "blockchain_balances": "Balances en blockchains",
+      "exchange_balances": "Balances en exchanges",
+      "manual_balances": "Balances manuales",
+      "non_fungible_balances": "Balances en NFT"
+    },
+    "history": "Historial",
+    "manage_prices": "Administrar Precios",
+    "settings": "Ajustes",
+    "settings_sub": {
+      "accounting": "Contabilidad",
+      "database": "Base de datos",
+      "modules": "Módulos"
+    },
+    "statistics": "Estadísticas"
+  },
+  "notes_menu": {
+    "search": "Buscar"
+  },
+  "notification_indicator": {
+    "tooltip": "Notificaciones"
+  },
+  "notification_messages": {
+    "missing_api_key": {
+      "action": "Introducir clave",
+      "change_indexer_order": "Cambiar orden del indexador",
+      "etherscan": {
+        "message": "rotki está usando {service} sin una clave API configurada, lo que puede ralentizar las consultas. Puedes añadir una clave API para un mejor rendimiento, o ajustar el orden del indexador para priorizar un servicio diferente.",
+        "title": "{service} clave API"
+      },
+      "get_key": "Obtener clave API"
+    }
+  },
+  "notification_sidebar": {
+    "clear_tooltip": "Limpiar todas las notificaciones",
+    "no_messages": "Sin mensajes",
+    "title": "Notificaciones"
+  },
+  "overall_balances": {
+    "loading": "Cargando"
+  },
+  "price_oracle_selection": {
+    "hint": "* Al desactivar todos los oráculos será imposible consultar los precios de los activos. Es posible que tengas que hacer clic en 'Actualizar precios' para aplicar los cambios."
+  },
+  "price_oracle_settings": {
+    "data_name": "oráculo de precios",
+    "latest_prices_update": "Últimos precios de pedidos actualizados. Es posible que tengas que hacer clic en el botón 'Actualizar precios' para aplicar los cambios."
+  },
+  "price_refresh": {
+    "button": "Refrescar precios"
+  },
+  "profit_loss_reports": {
+    "notification": {
+      "action": "Ver el informe",
+      "message": "Se ha generado el informe de PnL desde {start} hasta {end}.",
+      "title": "Se ha generado el informe de PnL"
+    }
+  },
+  "purge_selector": {
+    "centralized_exchange": "Intercambio centralizado",
+    "centralized_exchange_to_clear": {
+      "hint": "Vacíe este campo para eliminar los datos de todos los intercambios centralizados",
+      "label": "Intercambio centralizado para compensar"
+    },
+    "chain_to_clear": {
+      "hint": "Vacíe este campo para eliminar los datos de transacción de todas las cadenas",
+      "label": "Cadena para borrar"
+    },
+    "decentralized_exchange": "Intercambio descentralizado",
+    "decentralized_exchange_to_clear": {
+      "hint": "Vacía este campo para eliminar los datos de todos los intercambios descentralizados",
+      "label": "Intercambio descentralizado para compensar"
+    },
+    "defi_module": "Módulo DeFi",
+    "defi_module_to_clear": {
+      "hint": "Vacía este campo para eliminar los datos de todos los módulos defi",
+      "label": "Módulo DeFi a borrar"
+    },
+    "label": "Seleccione una fuente de datos",
+    "transactions": "Transacciones"
+  },
+  "snapshot_action_button": {
+    "force_save": "Forzar guardado",
+    "ignore_errors_label": "Ignorar errores",
+    "snapshot_title": "Última instantanea de balances"
+  },
+  "sync_indicator": {
+    "last_data_upload": "Última sincronización premium de la base de datos",
+    "upload_confirmation": {
+      "action": "Subir | Descargar",
+      "confirm_check": "Comprendo",
+      "title": "Forzar subida | Forzar bajada"
+    }
+  },
+  "tag_creator": {
+    "labels": {
+      "background": "Fondo",
+      "foreground": "Frente"
+    }
+  },
+  "transactions": {
+    "actions": {
+      "add_event": "Añadir un nuevo evento",
+      "delete_transaction": "Borrar transacciones y eventos",
+      "redecode_events": "Releer eventos"
+    },
+    "dialog": {
+      "add_tx": "Añadir transacción por hash tx",
+      "delete": {
+        "error": {
+          "message": "Falló: {message}",
+          "title": "Borrar transacción EVM"
+        },
+        "message": "¿Está seguro de que desea eliminar esta transacción y sus eventos? Tendrá que purgar todas las transacciones o añadir por el hash de la transacción para restaurarlas.",
+        "title": "Borrar transacción y eventos"
+      }
+    },
+    "events": {
+      "export": {
+        "confirmation_message": "¿Estás seguro de que deseas exportar la lista de eventos con los filtros seleccionados aplicados?"
+      },
+      "skipped": {
+        "csv_export_error": "Hubo un error al exportar a CSV",
+        "download_failed": "No es posible descargar el CSV",
+        "headers": {
+          "number": "Número de eventos omitidos"
+        },
+        "no_skipped_events": "No se encontraron eventos omitidos",
+        "reprocess": {
+          "action": "Reprocesar eventos",
+          "failed": {
+            "no_processed_events": "No se han procesado eventos externos omitidos",
+            "title": "Error al reprocesar eventos omitidos"
+          },
+          "success": {
+            "all": "Todos los eventos externos omitidos se han procesado",
+            "some": "{successful} de {total} eventos externos omitidos se han procesado",
+            "title": "Eventos omitidos procesados"
+          }
+        }
+      }
+    },
+    "filter": {
+      "account": "Filtrar por cuenta"
+    }
+  },
+  "user_dropdown": {
+    "logout": "Cerrar sesión",
+    "settings": "Ajustes",
+    "switch_theme": "Cambiar tema"
+  }
+}

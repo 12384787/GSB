@@ -1,0 +1,53 @@
+<script setup lang="ts">
+import ExportReportCsv from '@/modules/reports/ExportReportCsv.vue';
+
+defineProps<{
+  reportId: number;
+}>();
+
+const emit = defineEmits<{
+  delete: [];
+}>();
+
+const { t } = useI18n({ useScope: 'global' });
+</script>
+
+<template>
+  <RuiMenu
+    :class-names="{ menu: 'max-w-[15rem]' }"
+    :options="{ placement: 'bottom-end' }"
+    close-on-content-click
+  >
+    <template #activator="{ attrs }">
+      <RuiButton
+        class="!p-2"
+        icon
+        variant="text"
+        v-bind="attrs"
+      >
+        <RuiIcon
+          name="lu-ellipsis-vertical"
+          size="20"
+        />
+      </RuiButton>
+    </template>
+    <ExportReportCsv
+      :report-id="reportId"
+      list
+    />
+    <RuiButton
+      variant="list"
+      color="error"
+      @click="emit('delete')"
+    >
+      <template #prepend>
+        <RuiIcon
+          size="20"
+          name="lu-trash-2"
+        />
+      </template>
+
+      {{ t('reports_table.delete') }}
+    </RuiButton>
+  </RuiMenu>
+</template>

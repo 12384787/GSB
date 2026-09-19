@@ -1,0 +1,372 @@
+<script setup lang="ts">
+import type { DataTableColumn } from '@rotki/ui-library';
+import { startPromise } from '@shared/utils';
+import { usePillBarLabels } from '@/modules/core/table/pill/composables/use-pill-bar-labels';
+import PillFilterBar from '@/modules/core/table/pill/PillFilterBar.vue';
+import ScrollableDialogContent from '@/modules/core/table/ScrollableDialogContent.vue';
+import { useTableEmptyState } from '@/modules/core/table/use-table-empty-state';
+import InternalTxConflictRowActions from '@/modules/history/internal-tx-conflicts/InternalTxConflictRowActions.vue';
+import { useInternalTxConflictFields } from '@/modules/history/internal-tx-conflicts/use-internal-tx-conflict-fields';
+import CopyButton from '@/modules/shell/components/CopyButton.vue';
+import DateDisplay from '@/modules/shell/components/display/DateDisplay.vue';
+import LocationIcon from '@/modules/shell/components/display/LocationIcon.vue';
+import HashLink from '@/modules/shell/components/HashLink.vue';
+import {
+  type InternalTxConflict,
+  type InternalTxConflictAction,
+  InternalTxConflictActions,
+  InternalTxConflictStatuses,
+  type RedecodeReason,
+  RedecodeReasons,
+  type RepullReason,
+  RepullReasons,
+} from './types';
+import { useInternalTxConflictResolution } from './use-internal-tx-conflict-resolution';
+import { useInternalTxConflictSelection } from './use-internal-tx-conflict-selection';
+import { useInternalTxConflicts } from './use-internal-tx-conflicts';
+
+const { compact = false, highlightedTxHash } = defineProps<{
+  compact?: boolean;
+  highlightedTxHash?: string;
+}>();
+
+const emit = defineEmits<{
+  'show-in-events': [conflict: InternalTxConflict];
+}>();
+
+const { t } = useI18n({ useScope: 'global' });
+
+const {
+  conflicts,
+  error,
+  failedCount,
+  fetchConflicts,
+  fetchCounts,
+  filters,
+  loading,
+  pagination,
+  pendingCount,
+  setFilter,
+  sort,
+} = useInternalTxConflicts();
+
+const emptyState = useTableEmptyState({ error });
+
+const fields = useInternalTxConflictFields();
+const pillLabels = usePillBarLabels();
+
+const {
+  areAllSelected,
+  clearSelection,
+  isSelected,
+  selectedConflicts,
+  selectedCount,
+  toggleAllOnPage,
+  toggleSelection,
+} = useInternalTxConflictSelection();
+
+const {
+  cancelResolution,
+  isResolving,
+  progress,
+  resolveMany,
+  resolveOne,
+} = useInternalTxConflictResolution();
+
+const isRunning = computed<boolean>(() => get(progress).isRunning);
+
+const TAB_STATUSES = [
+  InternalTxConflictStatuses.PENDING,
+  InternalTxConflictStatuses.FAILED,
+  InternalTxConflictStatuses.FIXED,
+] as const;
+
+const activeTab = ref<number>(0);
+
+const headers = computed<DataTableColumn<InternalTxConflict>[]>(() => {
+  if (compact) {
+    return [
+      { key: 'selection', label: '', sortable: false },
+      { key: 'chain', label: '', sortable: true, cellClass: '!p-1', class: '!p-1' },
+      { key: 'txHash', label: t('internal_tx_conflicts.columns.tx_hash'), sortable: true },
+      { key: 'timestamp', label: t('internal_tx_conflicts.columns.timestamp'), sortable: true },
+      { key: 'actions', label: '' },
+    ];
+  }
+
+  return [
+    { key: 'selection', label: '', sortable: false },
+    { key: 'chain', label: '', sortable: true, cellClass: '!p-1', class: '!p-1' },
+    { key: 'txHash', label: t('internal_tx_conflicts.columns.tx_hash'), sortable: true },
+    { key: 'timestamp', label: t('internal_tx_conflicts.columns.timestamp'), sortable: true },
+    { key: 'reason', label: t('internal_tx_conflicts.columns.reason') },
+    { key: 'lastRetryTs', label: t('internal_tx_conflicts.columns.last_retry'), sortable: true },
+    { key: 'lastError', label: t('internal_tx_conflicts.columns.last_error'), cellClass: 'max-w-56' },
+    { key: 'actions', label: '' },
+  ];
+});
+
+const actionLabels = computed<Record<InternalTxConflictAction, string>>(() => ({
+  [InternalTxConflictActions.FIX_REDECODE]: t('internal_tx_conflicts.actions.fix_redecode'),
+  [InternalTxConflictActions.REPULL]: t('internal_tx_conflicts.actions.repull'),
+}));
+
+const reasonLabels = computed<Record<RepullReason | RedecodeReason, string>>(() => ({
+  [RepullReasons.ALL_ZERO_GAS]: t('internal_tx_conflicts.reasons.all_zero_gas'),
+  [RepullReasons.OTHER]: t('internal_tx_conflicts.reasons.other'),
+  [RedecodeReasons.DUPLICATE_EXACT_ROWS]: t('internal_tx_conflicts.reasons.duplicate_exact_rows'),
+  [RedecodeReasons.MIXED_ZERO_GAS]: t('internal_tx_conflicts.reasons.mixed_zero_gas'),
+  [RedecodeReasons.MIXED_ZERO_GAS_AND_DUPLICATE]: t('internal_tx_conflicts.reasons.mixed_zero_gas_and_duplicate'),
+}));
+
+const allPageSelected = computed<boolean>(() => areAllSelected(get(conflicts)));
+
+function getActionLabel(action: InternalTxConflictAction): string {
+  return get(actionLabels)[action];
+}
+
+function getReasonLabel(row: InternalTxConflict): string {
+  if (row.repullReason)
+    return get(reasonLabels)[row.repullReason];
+
+  if (row.redecodeReason)
+    return get(reasonLabels)[row.redecodeReason];
+
+  return '—';
+}
+
+async function refreshData(): Promise<void> {
+  await Promise.all([fetchConflicts(), fetchCounts()]);
+}
+
+function onResolveOne(conflict: InternalTxConflict): void {
+  startPromise(resolveOne(conflict, { onComplete: refreshData }));
+}
+
+function onResolveSelected(): void {
+  startPromise(resolveMany(get(selectedConflicts), { onComplete: refreshData }));
+}
+
+watch(activeTab, (tab) => {
+  clearSelection();
+  setFilter(TAB_STATUSES[tab]);
+});
+
+onBeforeMount(() => {
+  startPromise(Promise.all([fetchCounts(), fetchConflicts()]));
+});
+
+defineExpose({
+  refreshData,
+});
+</script>
+
+<template>
+  <div class="flex flex-col flex-1 overflow-hidden">
+    <RuiTabs
+      v-model="activeTab"
+      class="border-b border-default"
+      color="primary"
+    >
+      <RuiTab>
+        {{ t('internal_tx_conflicts.tabs.pending') }}
+        <RuiChip
+          v-if="pendingCount > 0"
+          color="warning"
+          size="sm"
+          class="ml-2 !px-0.5 !py-0"
+        >
+          {{ pendingCount }}
+        </RuiChip>
+      </RuiTab>
+      <RuiTab>
+        {{ t('internal_tx_conflicts.tabs.failed') }}
+        <RuiChip
+          v-if="failedCount > 0"
+          color="error"
+          size="sm"
+          class="ml-2 !px-0.5 !py-0"
+        >
+          {{ failedCount }}
+        </RuiChip>
+      </RuiTab>
+      <RuiTab>
+        {{ t('internal_tx_conflicts.tabs.fixed') }}
+      </RuiTab>
+    </RuiTabs>
+
+    <!-- Compact never puts the bar beside the selection actions: the pinned rail is narrow while
+         the viewport is not, so a `md:` row read the screen and squeezed the bar into a column of
+         its own, one control per line. -->
+    <div
+      class="flex flex-col gap-2 pt-4 pb-2 shrink-0"
+      :class="compact ? 'px-3' : 'px-4 md:flex-row md:items-center'"
+    >
+      <div class="flex items-center gap-3">
+        <template v-if="isRunning">
+          <RuiProgress
+            variant="indeterminate"
+            color="primary"
+            class="flex-1"
+          />
+          <span class="text-body-2 whitespace-nowrap">
+            {{ t('internal_tx_conflicts.resolution.progress', { completed: progress.completed, total: progress.total }) }}
+          </span>
+          <RuiButton
+            variant="outlined"
+            color="error"
+            size="sm"
+            @click="cancelResolution()"
+          >
+            {{ t('internal_tx_conflicts.resolution.cancel') }}
+          </RuiButton>
+        </template>
+        <template v-else>
+          <span class="text-body-2 whitespace-nowrap">
+            {{ t('internal_tx_conflicts.selection.selected', { count: selectedCount }) }}
+          </span>
+          <RuiButton
+            color="primary"
+            size="sm"
+            :disabled="selectedCount === 0"
+            data-testid="resolve-selected"
+            @click="onResolveSelected()"
+          >
+            {{ t('internal_tx_conflicts.resolution.resolve_selected', { count: selectedCount }) }}
+          </RuiButton>
+          <RuiButton
+            variant="outlined"
+            size="sm"
+            :disabled="selectedCount === 0"
+            @click="clearSelection()"
+          >
+            {{ t('internal_tx_conflicts.selection.clear') }}
+          </RuiButton>
+        </template>
+      </div>
+
+      <PillFilterBar
+        v-model:matches="filters"
+        :fields="fields"
+        :labels="pillLabels"
+        :disabled="loading"
+        class="flex-1"
+      />
+    </div>
+
+    <ScrollableDialogContent
+      fill
+      :class="{ 'px-3': compact }"
+    >
+      <RuiDataTable
+        v-model:sort.external="sort"
+        v-model:pagination.external="pagination"
+        :cols="headers"
+        :empty="emptyState"
+        :rows="conflicts"
+        :loading="loading"
+        row-attr="txHash"
+        outlined
+        dense
+      >
+        <template #header.selection>
+          <RuiCheckbox
+            :model-value="allPageSelected"
+            :disabled="isRunning || conflicts.length === 0"
+            color="primary"
+            hide-details
+            class="!mt-0"
+            @update:model-value="toggleAllOnPage(conflicts)"
+          />
+        </template>
+        <template #item.selection="{ row }">
+          <RuiCheckbox
+            :model-value="isSelected(row)"
+            :disabled="isRunning"
+            color="primary"
+            hide-details
+            class="!mt-0"
+            @update:model-value="toggleSelection(row)"
+          />
+        </template>
+        <template #item.chain="{ row }">
+          <LocationIcon
+            :item="row.chain"
+            icon
+            size="24px"
+          />
+        </template>
+        <template #item.txHash="{ row }">
+          <HashLink
+            :text="row.txHash"
+            :location="row.chain"
+            type="transaction"
+          />
+        </template>
+        <template #item.timestamp="{ row }">
+          <div :class="compact && 'text-xs'">
+            <DateDisplay
+              v-if="row.timestamp"
+              :timestamp="row.timestamp"
+            />
+            <!-- eslint-disable-next-line @intlify/vue-i18n/no-raw-text -->
+            <span v-else>—</span>
+            <div
+              v-if="compact"
+              class="text-rui-text-secondary"
+            >
+              {{ getReasonLabel(row) }}
+            </div>
+          </div>
+        </template>
+        <template #item.reason="{ row }">
+          {{ getReasonLabel(row) }}
+        </template>
+        <template #item.lastRetryTs="{ row }">
+          <DateDisplay
+            v-if="row.lastRetryTs"
+            :timestamp="row.lastRetryTs"
+          />
+          <span v-else>{{ t('internal_tx_conflicts.status.never') }}</span>
+        </template>
+        <template #item.lastError="{ row }">
+          <div
+            v-if="row.lastError"
+            class="flex items-center gap-1"
+          >
+            <RuiTooltip
+              :options="{ placement: 'top' }"
+              :open-delay="400"
+              :class-names="{ tooltip: 'max-w-80' }"
+            >
+              <template #activator>
+                <span class="truncate max-w-48 inline-block align-bottom">
+                  {{ row.lastError }}
+                </span>
+              </template>
+              {{ row.lastError }}
+            </RuiTooltip>
+            <CopyButton
+              size="sm"
+              :value="row.lastError"
+              :tooltip="t('internal_tx_conflicts.actions.copy_error')"
+            />
+          </div>
+          <!-- eslint-disable-next-line @intlify/vue-i18n/no-raw-text -->
+          <span v-else>—</span>
+        </template>
+        <template #item.actions="{ row }">
+          <InternalTxConflictRowActions
+            :row="row"
+            :resolving="isResolving(row)"
+            :disabled="isRunning"
+            :action-label="getActionLabel(row.action)"
+            :highlighted="highlightedTxHash === row.txHash"
+            @resolve="onResolveOne(row)"
+            @show-in-events="emit('show-in-events', row)"
+          />
+        </template>
+      </RuiDataTable>
+    </ScrollableDialogContent>
+  </div>
+</template>

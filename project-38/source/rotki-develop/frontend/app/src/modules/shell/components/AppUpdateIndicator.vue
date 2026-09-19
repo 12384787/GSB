@@ -1,0 +1,71 @@
+<script setup lang="ts">
+import { startPromise } from '@shared/utils';
+import { useMainStore } from '@/modules/core/common/use-main-store';
+import { useUpdateChecker } from '@/modules/session/use-update-checker';
+import { useSetting } from '@/modules/settings/use-setting';
+import { useBackendConnection } from '@/modules/shell/app/use-backend-connection';
+import { useInterop } from '@/modules/shell/app/use-electron-interop';
+
+const mainStore = useMainStore();
+const { updateNeeded, version } = storeToRefs(mainStore);
+const { getVersion } = useBackendConnection();
+const { isPackaged, openUrl } = useInterop();
+const versionUpdateCheckFrequency = useSetting('versionUpdateCheckFrequency');
+const { showUpdatePopup } = useUpdateChecker();
+
+const appVersion = computed(() => get(version).latestVersion);
+
+const openLink = () => openUrl(get(version).downloadUrl);
+
+function openUpdatePopup() {
+  set(showUpdatePopup, true);
+}
+
+function update() {
+  if (isPackaged)
+    openUpdatePopup();
+  else openLink();
+}
+
+/** The configured hours as milliseconds; zero means the user turned the check off. */
+const period = computed<number>(() => get(versionUpdateCheckFrequency) * 60 * 60 * 1000);
+
+const { isActive, pause, resume } = useIntervalFn(() => {
+  startPromise(getVersion());
+}, period, { immediate: false });
+
+function setVersionUpdateCheckInterval(): void {
+  if (get(isActive))
+    pause();
+
+  if (get(period) > 0)
+    resume();
+}
+
+onMounted(() => {
+  setVersionUpdateCheckInterval();
+});
+
+watch(versionUpdateCheckFrequency, () => setVersionUpdateCheckInterval());
+
+const { t } = useI18n({ useScope: 'global' });
+</script>
+
+<template>
+  <RuiTooltip
+    v-if="updateNeeded"
+    :open-delay="400"
+  >
+    <template #activator>
+      <RuiButton
+        color="info"
+        icon
+        data-testid="app-update-indicator"
+        @click="update()"
+      >
+        <RuiIcon name="lu-circle-arrow-up" />
+      </RuiButton>
+    </template>
+    {{ t('update_indicator.version', { appVersion }) }}
+  </RuiTooltip>
+</template>

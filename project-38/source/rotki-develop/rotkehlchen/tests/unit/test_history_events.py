@@ -1,0 +1,441 @@
+from typing import TYPE_CHECKING
+from unittest.mock import patch
+
+import pytest
+
+from rotkehlchen.accounting.constants import EVENT_CATEGORY_MAPPINGS
+from rotkehlchen.accounting.types import EventAccountingRuleStatus
+from rotkehlchen.chain.evm.decoding.eas.constants import CPT_EAS
+from rotkehlchen.chain.evm.types import string_to_evm_address
+from rotkehlchen.constants.assets import A_BTC, A_ETH
+from rotkehlchen.constants.misc import ONE
+from rotkehlchen.db.cache import DBCacheDynamic
+from rotkehlchen.db.constants import HistoryMappingState
+from rotkehlchen.db.evmtx import DBEvmTx
+from rotkehlchen.db.filtering import HistoryEventFilterQuery
+from rotkehlchen.db.history_events import DBHistoryEvents
+from rotkehlchen.db.utils import get_query_chunks
+from rotkehlchen.history.events.structures.base import (
+    HistoryEvent,
+    HistoryEventSubType,
+    HistoryEventType,
+)
+from rotkehlchen.history.events.structures.bitcoin_event import BitcoinEvent
+from rotkehlchen.history.events.structures.evm_event import EvmEvent
+from rotkehlchen.tests.utils.factories import (
+    make_ethereum_transaction,
+    make_evm_address,
+    make_evm_tx_hash,
+)
+from rotkehlchen.types import BTCAddress, BTCTxId, ChecksumEvmAddress, Location, TimestampMS
+
+if TYPE_CHECKING:
+    from rotkehlchen.assets.asset import Asset
+    from rotkehlchen.db.dbhandler import DBHandler
+
+
+def test_serialize_with_invalid_type_subtype():
+    """Test that serialize an event with invalid type/subtype does not raise exception"""
+    event_type = HistoryEventType.TRANSFER
+    event_subtype = HistoryEventSubType.SPEND
+    assert event_subtype not in EVENT_CATEGORY_MAPPINGS[event_type]
+    event = HistoryEvent(
+        group_identifier='1',
+        sequence_index=1,
+        timestamp=TimestampMS(1),
+        location=Location.KRAKEN,
+        event_type=event_type,
+        event_subtype=HistoryEventSubType.NONE,
+        asset=A_ETH,
+        amount=ONE,
+    )
+    event.event_subtype = event_subtype  # do here cause ctor will raise for invalid subtype
+    assert event.serialize_for_api(
+        mapping_states={},
+        ignored_ids=set(),
+        hidden_event_ids=set(),
+        event_accounting_rule_status=EventAccountingRuleStatus.NOT_PROCESSED,  # needed to recreate the error this tests for  # noqa: E501
+        grouped_events_num=None,
+    ) == {
+        'entry': {
+            'asset': 'ETH',
+            'amount': '1',
+            'entry_type': 'history event',
+            'group_identifier': '1',
+            'event_subtype': 'spend',
+            'event_type': 'transfer',
+            'extra_data': None,
+            'identifier': None,
+            'location': 'kraken',
+            'location_label': None,
+            'sequence_index': 1,
+            'timestamp': 1,
+        },
+        'event_accounting_rule_status': 'not processed',
+    }
+
+
+def test_hash_does_not_collide_on_digit_boundary():
+    """Regression: __hash__ must not collide for pairs like (gid='0xabc', seq=12)
+    and (gid='0xabc1', seq=2) which would share the same hash under naive
+    str(group_identifier) + str(sequence_index) concatenation."""
+    def make(gid: str, seq: int) -> HistoryEvent:
+        return HistoryEvent(
+            group_identifier=gid,
+            sequence_index=seq,
+            timestamp=TimestampMS(1),
+            location=Location.KRAKEN,
+            event_type=HistoryEventType.TRANSFER,
+            event_subtype=HistoryEventSubType.NONE,
+            asset=A_ETH,
+            amount=ONE,
+        )
+
+    assert hash(make('0xabc', 12)) != hash(make('0xabc1', 2))
+
+
+@pytest.mark.parametrize('base_accounts', [[make_evm_address()]])
+def test_informational_events(database: DBHandler, base_accounts: list[ChecksumEvmAddress]):
+    """Test that informational events don't trigger price queries"""
+    dbevents = DBHistoryEvents(database)
+    tx = make_ethereum_transaction()
+    dbevmtx = DBEvmTx(database)
+    with dbevmtx.db.user_write() as cursor:
+        dbevmtx.add_transactions(cursor, [tx], relevant_address=base_accounts[0])
+
+    with database.user_write() as write_cursor:
+        dbevents.add_history_events(write_cursor, [
+            EvmEvent(
+                tx_ref=tx.tx_hash,
+                sequence_index=174,
+                timestamp=TimestampMS(0),
+                location=Location.BASE,
+                event_type=HistoryEventType.INFORMATIONAL,
+                event_subtype=HistoryEventSubType.APPROVE,
+                asset=A_ETH,
+                amount=ONE,
+                location_label=base_accounts[0],
+                notes='HOP-LP-ETH spending approval of by 0x0ce6c85cF43553DE10FC56cecA0aef6Ff0DD444d',  # noqa: E501
+                address=string_to_evm_address('0x0ce6c85cF43553DE10FC56cecA0aef6Ff0DD444d'),
+            ), EvmEvent(
+                tx_ref=tx.tx_hash,
+                sequence_index=10,
+                timestamp=TimestampMS(0),
+                location=Location.BASE,
+                event_type=HistoryEventType.INFORMATIONAL,
+                event_subtype=HistoryEventSubType.ATTEST,
+                asset=A_ETH,
+                amount=ONE,
+                location_label=base_accounts[0],
+                notes='Attest to https://optimism.easscan.org/attestation/view/0x3045bf8797f8e528219d48b23d28b661be5be17d13c28f61f4f6cced1b349c65',
+                counterparty=CPT_EAS,
+                address=string_to_evm_address('0x4200000000000000000000000000000000000021'),
+            ),
+        ])
+
+
+def test_edited_event_caches_original_position(database: DBHandler) -> None:
+    """Test that editing an onchain event caches its original position.
+
+    Verifies:
+    - first edit caches (group_id, seq_idx) with event id as value
+    - subsequent edits don't cache intermediate positions
+    - user can still add events at cached positions (cache only blocks redecoding)
+    - deleting the event clears the cache entry
+    """
+    events_db = DBHistoryEvents(database)
+    tx_hash = make_evm_tx_hash()
+
+    with database.user_write() as write_cursor:
+        assert (event_id := events_db.add_history_event(
+            write_cursor=write_cursor,
+            event=(event := EvmEvent(
+                tx_ref=tx_hash,
+                sequence_index=0,
+                timestamp=TimestampMS(1710000000000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.SPEND,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=ONE,
+            )),
+        )) is not None
+        event.identifier = event_id
+        cache_key = DBCacheDynamic.CUSTOMIZED_EVENT_ORIGINAL_SEQ_IDX.get_db_key(
+            group_identifier=event.group_identifier,
+            sequence_index=0,
+        )
+
+        # first edit stores original position with event identifier as value
+        event.sequence_index = 5
+        events_db.edit_history_event(
+            write_cursor=write_cursor,
+            event=event,
+            mapping_state=HistoryMappingState.CUSTOMIZED,
+        )
+        cache_entry = write_cursor.execute(
+            'SELECT value FROM key_value_cache WHERE name = ?', (cache_key,),
+        ).fetchone()
+        assert cache_entry is not None
+        cached_identifier = int(cache_entry[0])
+
+        # second edit does not create new cache entry for intermediate position
+        event.sequence_index = 10
+        events_db.edit_history_event(
+            write_cursor=write_cursor,
+            event=event,
+            mapping_state=HistoryMappingState.CUSTOMIZED,
+        )
+        assert write_cursor.execute(
+            'SELECT 1 FROM key_value_cache WHERE name = ?',
+            (DBCacheDynamic.CUSTOMIZED_EVENT_ORIGINAL_SEQ_IDX.get_db_key(
+                group_identifier=event.group_identifier,
+                sequence_index=5,
+            ),),
+        ).fetchone() is None
+
+        # user-added event at cached position succeeds (cache only blocks redecoding)
+        assert events_db.add_history_event(
+            write_cursor=write_cursor,
+            event=EvmEvent(
+                tx_ref=tx_hash,
+                sequence_index=0,
+                timestamp=TimestampMS(1710000000000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=ONE,
+            ),
+        ) is not None
+
+    # deleting the event removes the cache entry
+    assert events_db.delete_history_events_by_identifier(
+        identifiers=[cached_identifier],
+        force_delete=True,
+    ) is None
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT 1 FROM key_value_cache WHERE name = ?', (cache_key,),
+        ).fetchone() is None
+
+
+def test_non_onchain_edits_skip_cache(database: DBHandler) -> None:
+    """Test that editing non-onchain events (HistoryEvent) does not create cache entries."""
+    events_db = DBHistoryEvents(database)
+
+    with database.user_write() as write_cursor:
+        group_id = 'test_group_123'
+        assert (event_id := events_db.add_history_event(
+            write_cursor=write_cursor,
+            event=(event := HistoryEvent(
+                group_identifier=group_id,
+                sequence_index=0,
+                timestamp=TimestampMS(1710000000000),
+                location=Location.KRAKEN,
+                event_type=HistoryEventType.TRADE,
+                event_subtype=HistoryEventSubType.SPEND,
+                asset=A_ETH,
+                amount=ONE,
+            )),
+        )) is not None
+        event.identifier = event_id
+        event.sequence_index = 5
+        events_db.edit_history_event(
+            write_cursor=write_cursor,
+            event=event,
+            mapping_state=HistoryMappingState.CUSTOMIZED,
+        )
+
+        assert write_cursor.execute(
+            'SELECT 1 FROM key_value_cache WHERE name = ?',
+            (DBCacheDynamic.CUSTOMIZED_EVENT_ORIGINAL_SEQ_IDX.get_db_key(
+                group_identifier=group_id,
+                sequence_index=0,
+            ),),
+        ).fetchone() is None
+
+
+def test_edit_bitcoin_event_updates_counterparty_mappings(database: DBHandler) -> None:
+    events_db = DBHistoryEvents(database)
+    first_counterparty = BTCAddress('1G3MiaKdccQmiTr4gYSKmrCVDaLQ5nvBRp')
+    second_counterparty = BTCAddress('1BoatSLRHtKNngkdXEeobR76b53LETtpyT')
+
+    with database.user_write() as write_cursor:
+        event = BitcoinEvent(
+            tx_ref=BTCTxId('a' * 64),
+            sequence_index=0,
+            timestamp=TimestampMS(1710000000000),
+            location=Location.BITCOIN,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.NONE,
+            asset=A_BTC,
+            amount=ONE,
+            notes='Send 1 BTC to test address',
+            counterparty_addresses=[first_counterparty],
+        )
+        assert (event_id := events_db.add_history_event(
+            write_cursor=write_cursor,
+            event=event,
+        )) is not None
+        event.identifier = event_id
+        assert write_cursor.execute(
+            'SELECT address FROM bitcoin_events_addresses WHERE event_identifier=?',
+            (event_id,),
+        ).fetchall() == [(first_counterparty,)]
+
+        event.counterparty_addresses = [second_counterparty]
+        events_db.edit_history_event(write_cursor=write_cursor, event=event, mapping_state=None)
+        assert write_cursor.execute(
+            'SELECT address FROM bitcoin_events_addresses WHERE event_identifier=?',
+            (event_id,),
+        ).fetchall() == [(second_counterparty,)]
+
+        event.location = Location.KRAKEN
+        event.event_type = HistoryEventType.TRADE
+        event.event_subtype = HistoryEventSubType.SPEND
+        events_db.edit_history_event(write_cursor=write_cursor, event=event, mapping_state=None)
+        assert write_cursor.execute(
+            'SELECT COUNT(*) FROM bitcoin_events_addresses WHERE event_identifier=?',
+            (event_id,),
+        ).fetchone()[0] == 0
+
+
+def test_add_history_events_returns_only_inserted_count(database: DBHandler) -> None:
+    events_db = DBHistoryEvents(database)
+    event = HistoryEvent(
+        group_identifier='duplicate_batch_insert_test',
+        sequence_index=0,
+        timestamp=TimestampMS(1710000000000),
+        location=Location.KRAKEN,
+        event_type=HistoryEventType.RECEIVE,
+        event_subtype=HistoryEventSubType.NONE,
+        asset=A_ETH,
+        amount=ONE,
+    )
+
+    with database.user_write() as write_cursor:
+        assert events_db.add_history_events(write_cursor=write_cursor, history=[event]) == 1
+        assert events_db.add_history_events(write_cursor=write_cursor, history=[event]) == 0
+        assert write_cursor.execute(
+            'SELECT COUNT(*) FROM history_events WHERE group_identifier=?',
+            ('duplicate_batch_insert_test',),
+        ).fetchone()[0] == 1
+
+
+def test_add_history_events_sets_ignored_flag(database: DBHandler) -> None:
+    """Batch insert must set the `ignored` flag from the precomputed ignored-asset set: 1 for
+    events whose asset is ignored, 0 (the column default) otherwise. Regression test for the
+    optimization that replaced the per-event correlated subquery with a once-per-batch lookup.
+    """
+    events_db = DBHistoryEvents(database)
+    with database.user_write() as write_cursor:
+        database.add_to_ignored_assets(write_cursor=write_cursor, asset=A_BTC)
+
+    def make_event(group_identifier: str, asset: Asset) -> HistoryEvent:
+        return HistoryEvent(
+            group_identifier=group_identifier,
+            sequence_index=0,
+            timestamp=TimestampMS(1710000000000),
+            location=Location.KRAKEN,
+            event_type=HistoryEventType.RECEIVE,
+            event_subtype=HistoryEventSubType.NONE,
+            asset=asset,
+            amount=ONE,
+        )
+
+    with database.user_write() as write_cursor:
+        events_db.add_history_events(write_cursor=write_cursor, history=[
+            make_event('ignored_flag_test_btc', A_BTC),  # ignored asset -> ignored=1
+            make_event('ignored_flag_test_eth', A_ETH),  # not ignored -> stays 0
+        ])
+        ignored_by_asset = dict(write_cursor.execute(
+            'SELECT asset, ignored FROM history_events WHERE group_identifier IN (?, ?)',
+            ('ignored_flag_test_btc', 'ignored_flag_test_eth'),
+        ).fetchall())
+
+    assert ignored_by_asset[A_BTC.identifier] == 1
+    assert ignored_by_asset[A_ETH.identifier] == 0
+
+
+def test_get_history_events_internal_skips_ignored_group_lookup(database: DBHandler) -> None:
+    """get_history_events_internal discards ignored_group_identifiers, so it must not run the
+    per-group `... IN (...) AND ignored=1` lookup.
+
+    On an unpaginated full-history fetch (the accounting pot) that lookup would otherwise
+    build a single IN(...) over every group the user has, exceeding SQLite's 32766 variable
+    limit - and its result is thrown away anyway.
+    """
+    events_db = DBHistoryEvents(database)
+    with database.user_write() as write_cursor:
+        events_db.add_history_events(write_cursor=write_cursor, history=[HistoryEvent(
+            group_identifier=(gid := 'internal_skip_test'),
+            sequence_index=0,
+            timestamp=TimestampMS(1710000000000),
+            location=Location.KRAKEN,
+            event_type=HistoryEventType.RECEIVE,
+            event_subtype=HistoryEventSubType.NONE,
+            asset=A_ETH,
+            amount=ONE,
+        )])
+
+    with database.conn.read_ctx() as cursor:
+        executed: list[str] = []
+        real_execute = cursor.execute
+
+        def _spy(statement, *args, **kwargs):
+            executed.append(statement)
+            return real_execute(statement, *args, **kwargs)
+
+        with patch.object(cursor, 'execute', side_effect=_spy):
+            events = events_db.get_history_events_internal(
+                cursor=cursor,
+                filter_query=HistoryEventFilterQuery.make(),
+                aggregate_by_group_ids=False,
+            )
+
+    assert {event.group_identifier for event in events} == {gid}
+    assert not any('ignored=1' in statement for statement in executed), \
+        'internal full-history fetch must not run the per-group ignored lookup'
+
+
+def test_ignored_group_lookup_detects_across_chunks(database: DBHandler) -> None:
+    """The path that consumes ignored_group_identifiers must still flag ignored groups, and
+    must do so across the chunk boundaries of the (now chunked) IN(...) lookup."""
+    events_db = DBHistoryEvents(database)
+    with database.user_write() as write_cursor:
+        database.add_to_ignored_assets(write_cursor=write_cursor, asset=A_BTC)
+
+    def make_event(group_identifier: str, asset: Asset) -> HistoryEvent:
+        return HistoryEvent(
+            group_identifier=group_identifier,
+            sequence_index=0,
+            timestamp=TimestampMS(1710000000000),
+            location=Location.KRAKEN,
+            event_type=HistoryEventType.RECEIVE,
+            event_subtype=HistoryEventSubType.NONE,
+            asset=asset,
+            amount=ONE,
+        )
+
+    with database.user_write() as write_cursor:
+        events_db.add_history_events(write_cursor=write_cursor, history=[
+            make_event('ignored_grp_btc', A_BTC),  # ignored asset -> ignored=1
+            make_event('normal_grp_eth', A_ETH),
+        ])
+
+    # force a chunk size of 1 so the two groups span multiple chunks
+    with (
+        patch(
+            'rotkehlchen.db.history_events.get_query_chunks',
+            side_effect=lambda data, chunk_size=1: get_query_chunks(data, chunk_size=1),
+        ),
+        database.conn.read_ctx() as cursor,
+    ):
+        result = events_db._get_history_events_with_ignored_groups(
+            cursor=cursor,
+            filter_query=HistoryEventFilterQuery.make(),
+            entries_limit=None,
+        )
+
+    assert result.ignored_group_identifiers == {'ignored_grp_btc'}

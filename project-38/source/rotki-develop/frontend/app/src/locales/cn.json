@@ -1,0 +1,2905 @@
+{
+  "about": {
+    "app_version": "应用版本:",
+    "components": {
+      "build": "构造:",
+      "title": "高级构建",
+      "version": "高级版本:"
+    },
+    "copy_data_directory_tooltip": "复制数据目录",
+    "copy_information_tooltip": "复制申请信息",
+    "data_directory": "数据目录:",
+    "electron": "电子:",
+    "frontend_version": "前端版本:",
+    "open_data_dir_tooltip": "打开数据目录",
+    "platform": "平台:",
+    "release_notes": "最新消息",
+    "user_agent": "用户代理:"
+  },
+  "account_balance_table": {
+    "liabilities": "负债"
+  },
+  "account_balances": {
+    "confirm_delete": {
+      "description_address": "您确定要从 {chain} 链中删除 {address} 地址吗？",
+      "description_xpub": "你确定要删除{address}",
+      "title": "账号删除"
+    },
+    "data_table": {
+      "loading": "rotki 正在查询区块链，请稍候..."
+    },
+    "detect_tokens": {
+      "tooltip": {
+        "last_detected": "上次检测到: {time}",
+        "redetect": "重新检测标记",
+        "redetect_all": "重新检测所有地址的token"
+      }
+    },
+    "edit_tooltip": "编辑账户",
+    "refresh_tooltip": "刷新 {blockchain} 余额忽略任何缓存条目"
+  },
+  "account_form": {
+    "advanced_tooltip": "显示高级 xpub 选项 | 隐藏高级 xpub 选项",
+    "error": {
+      "description": "添加账户时出错：{error}",
+      "title": "添加账号"
+    },
+    "labels": {
+      "addresses": "地址",
+      "addresses_entries": "无条目 | {count} 个唯一条目 | {count} 个唯一条目",
+      "addresses_hint": "插入多个地址，用逗号或换行符分隔",
+      "blockchain": "选择区块链 | 选择区块链",
+      "btc": {
+        "derivation_path": "推导路径"
+      },
+      "multiple": "添加多个地址"
+    },
+    "validation": {
+      "address_non_empty": "地址不能为空",
+      "xpub_non_empty": "XPUB 字段不能为空"
+    }
+  },
+  "account_management": {
+    "about_tooltip": "显示应用程序的关于模式",
+    "creation": {
+      "error": "帐户创建失败"
+    }
+  },
+  "account_settings": {
+    "cost_basis_method_settings": {
+      "labels": {
+        "acb": "平均成本基础",
+        "fifo": "先进先出",
+        "hifo": "高进先出",
+        "lifo": "后进先出"
+      }
+    },
+    "csv_export_settings": {
+      "labels": {
+        "export_csv_formulas": "公式应该作为 PnL CSV 的一部分导出吗？",
+        "have_csv_summary": "所有事件的摘要都应该包含在所有事件的 CSV 导出中吗？"
+      },
+      "title": "CSV 导出设置"
+    },
+    "messages": {
+      "cost_basis": {
+        "disabled": "已成功禁用过去的成本基础计算",
+        "enabled": "成功启用过去成本基础计算",
+        "error": "无法更改成本基础计算：{message}"
+      },
+      "cost_basis_method": {
+        "error": "无法将成本基础方法更改为{method}: {message}",
+        "success": "成功将成本基础方法更改为 {method}"
+      },
+      "crypto_to_crypto": "将加密设置为加密时出错：{message}",
+      "eth_staking_taxable_after_withdrawal": {
+        "disabled": "成功禁用提现设置后应纳税的eth staking",
+        "enabled": "成功启用 eth staking taxable after withdrawal 设置",
+        "error": "提款后无法更改应纳税的 eth 质押设置： {message}"
+      },
+      "export_csv_formulas": "设置在 CSV 导出中包含公式的选项时出错: {message}",
+      "gas_costs": "设置以太坊 gas 成本时出错: {message}",
+      "have_csv_summary": "设置在 CSV 导出中包含摘要的选项时出错: {message}",
+      "tax_free": "免税期 {enabled}",
+      "tax_free_period": "免税期设置为 {period} 天"
+    },
+    "validation": {
+      "tax_free_days": "请输入天数",
+      "tax_free_days_gt_zero": "天数不能为负数或零"
+    }
+  },
+  "account_settings_display": {
+    "cost_basis_fees": "考虑了成本基础费用:",
+    "cost_basis_method": "成本基础方法:",
+    "crypto2crypto": "加密到加密交易被考虑在内:",
+    "days": "{days} 天",
+    "eth_staking_taxable_after_withdrawal_enabled": "在启用提款之前,ETH 质押事件将被忽略:",
+    "gas_costs": "考虑了 Gas 成本:",
+    "past_cost_basis": "过去的成本基础是在报告创建期间计算的:",
+    "profit_currency": "盈利货币:",
+    "subtitle": "这些会计设置是在创建报告时使用的",
+    "tax_free_period": "有一个免税期:",
+    "title": "会计设置"
+  },
+  "accounting_settings": {
+    "trade": {
+      "labels": {
+        "calculate_past_cost_basis": "创建报告时计算过去的成本基础",
+        "cost_basis_method": "成本基础法",
+        "eth_staking_taxable_after_withdrawal_enabled": "在启用提款之前，应该从会计中忽略 ETH 质押事件",
+        "include_crypto2crypto": "考虑加密到加密交易",
+        "include_fees_in_cost_basis": "考虑成本基础费用",
+        "include_gas_costs": "考虑以太坊 gas 成本",
+        "tax_free": "有免税期吗？",
+        "taxfree_after_period": "多少天后免税"
+      },
+      "title": "交易设置"
+    }
+  },
+  "actions": {
+    "assets": {
+      "erc20": {
+        "error": {
+          "description": "检索token详细信息时出错: {message}",
+          "title": "正在检索 {address} ({evmChain}) 的token详细信息"
+        }
+      },
+      "update": {
+        "error": {
+          "description": "资产数据库更新失败：{message}"
+        },
+        "task": {
+          "title": "更新资产数据库"
+        }
+      },
+      "versions": {
+        "error": {
+          "description": "资产数据库更新检查失败：{message}"
+        },
+        "task": {
+          "title": "检查资产数据库更新"
+        }
+      }
+    },
+    "balances": {
+      "all_balances": {
+        "error": {
+          "message": "查询余额并保存快照失败：{message}",
+          "title": "余额快照保存失败"
+        },
+        "task": {
+          "description": "正在查询所有余额并保存统计快照。",
+          "ignore_errors_note": "查询过程中的错误将被忽略。"
+        }
+      },
+      "blockchain": {
+        "error": {
+          "description": "查询区块链余额时出错：{error}",
+          "title": "查询区块链余额"
+        }
+      },
+      "blockchain_account_removal": {
+        "error": {
+          "description": "删除账户失败：{error}",
+          "title": "删除 {count} {blockchain} 个帐户"
+        }
+      },
+      "blockchain_accounts_add": {
+        "error": {
+          "failed_list_description": "无法添加 {addresses} 个新的 {blockchain} 账户。请再次检查这些账户是否有效：\n {list}"
+        },
+        "no_new": {
+          "description": "所选地址已被 rotki 跟踪"
+        },
+        "task": {
+          "title": "添加 {blockchain} 账户"
+        }
+      },
+      "create_oracle_cache": {
+        "already_running": "任务已经在运行",
+        "failed": "在源上创建从 {fromAsset} 到 {toAsset} 的缓存条目时失败：{error}",
+        "task": "在 {source} 上创建从 {fromAsset} 到 {toAsset} 的缓存条目"
+      },
+      "detect_tokens": {
+        "task": {
+          "title": "获取检测到的token"
+        }
+      },
+      "exchange_balances": {
+        "error": {
+          "message": "无法查询 {location} 余额：{error}",
+          "title": "{location}余额查询"
+        }
+      },
+      "exchange_rates": {
+        "error": {
+          "message": "获取汇率失败： {message}",
+          "title": "汇率"
+        }
+      },
+      "exchange_removal": {
+        "description": "删除 {exchange} 失败，原因是：{error}",
+        "title": "交易所移除"
+      },
+      "exchange_setup": {
+        "description": "{exchange} 设置失败，原因是：{error}",
+        "title": "交易所设置"
+      },
+      "historic_fetch_price": {
+        "task": {
+          "description": "在 {date} 从 {fromAsset} 获取利率到 {toAsset} | 获取 {count} 对到 {toAsset} 的速率",
+          "title": "获取转化率"
+        }
+      },
+      "manual_balances": {
+        "error": {
+          "message": "失败： {message}",
+          "title": "检索手动余额"
+        }
+      },
+      "manual_delete": {
+        "error": {
+          "title": "删除手动余额"
+        }
+      },
+      "xpub_removal": {
+        "error": {
+          "description": "无法删除 {xpub}: {error}",
+          "title": "Xpub 移除"
+        }
+      }
+    },
+    "defi": {
+      "airdrops": {
+        "error": {
+          "description": "获取空投失败： {error}",
+          "title": "空投"
+        }
+      },
+      "liquity_balances": {
+        "error": {
+          "description": "无法检索流动性余额： {message}",
+          "title": "流动性余额"
+        }
+      },
+      "liquity_pools": {
+        "error": {
+          "description": "查询流动性池失败： {message}",
+          "title": "流动资金池"
+        }
+      },
+      "liquity_staking": {
+        "error": {
+          "description": "无法检索流动性质押： {message}",
+          "title": "流动性质押"
+        }
+      }
+    },
+    "delete_eth2_validator": {
+      "error": {
+        "description": "刪除 ETH 質押驗證器失敗：{message}",
+        "title": "刪除 ETH 抵押驗證器"
+      }
+    },
+    "get_accounts": {
+      "error": {
+        "description": "查询{blockchain}账户失败：{message}",
+        "title": "账户查询"
+      }
+    },
+    "history": {
+      "fetch_associated_locations": {
+        "error": {
+          "message": "无法检索相关位置：{message}",
+          "title": "获取相关位置"
+        }
+      }
+    },
+    "history_events": {
+      "error": {
+        "description": "无法查询历史事件：{error}",
+        "title": "历史事件查询"
+      },
+      "missing_rule": {
+        "add_rule": "添加缺失的会计规则",
+        "edit": "编辑事件",
+        "message": "该事件不会在会计中处理。要处理它，您必须选择以下选项之一：",
+        "re_decode": "重新编码事件",
+        "title": "事件缺少会计规则"
+      }
+    },
+    "history_events_export": {
+      "message": {
+        "failure": "历史事件导出失败: {description}",
+        "success": "历史事件成功导出为CSV文件"
+      },
+      "title": "历史事件导出"
+    },
+    "ignore": {
+      "error": {
+        "description": "无法忽略所选操作：{error}",
+        "title": "忽略操作失败"
+      }
+    },
+    "kraken_staking": {
+      "error": {
+        "message": "查询 kraken 质押事件时出错：{message}",
+        "title": "查询Kraken质押事件"
+      }
+    },
+    "manual_balances": {
+      "add": {
+        "error": {
+          "description": "手动添加余额失败：{message}"
+        },
+        "task": {
+          "title": "添加手动余额"
+        }
+      },
+      "edit": {
+        "error": {
+          "description": "无法编辑手动余额：{message}"
+        },
+        "task": {
+          "title": "编辑手动余额"
+        }
+      }
+    },
+    "nft_balances": {
+      "error": {
+        "message": "查询 NFT 余额时出错：{message}",
+        "title": "NFT余额查询"
+      }
+    },
+    "notifications": {
+      "consume": {
+        "message_title": "后端消息"
+      }
+    },
+    "online_events": {
+      "error": {
+        "description": "使用查询类型 {queryType} 查询在线事件失败：{error}",
+        "title": "在线事件查询"
+      },
+      "skipped": {
+        "csv_export": {
+          "message": {
+            "failure": "跳过事件导出失败",
+            "success": "成功导出跳过的事件到CSV"
+          },
+          "title": "CSV导出"
+        }
+      }
+    },
+    "reports": {
+      "csv_export": {
+        "message": {
+          "failure": "历史导出失败",
+          "success": "历史导出到 CSV 成功"
+        },
+        "title": "CSV 导出"
+      },
+      "delete": {
+        "error": {
+          "description": "删除报告历史记录时收到意外响应。这可能表明报告机制存在问题。请检查日志中是否有任何错误消息（您可能必须先启用调试日志记录）并创建问题。",
+          "title": "删除报告时出错。"
+        }
+      },
+      "fetch": {
+        "error": {
+          "description": "获取报告历史记录时收到意外响应。这可能表示报告机制存在问题。请检查日志中是否有任何错误消息（您可能必须先启用调试日志记录）并创建问题。",
+          "title": "检索已处理报告时发生错误。"
+        }
+      },
+      "generate": {
+        "error": {
+          "description": "生成损益报告时收到意外响应。这可能表示生成机制存在问题。请检查日志中是否有任何错误消息（您可能必须先启用调试日志记录）并创建问题"
+        }
+      }
+    },
+    "session": {
+      "add_queriable_address": {
+        "error": {
+          "message": "添加可查询地址失败：{message}"
+        }
+      },
+      "delete_queriable_address": {
+        "error": {
+          "message": "删除查询地址失败：{message}"
+        }
+      },
+      "fetch_prices": {
+        "error": {
+          "message": "获取价格失败：{error}",
+          "title": "获取价格"
+        }
+      },
+      "fetch_queriable_address": {
+        "error": {
+          "message": "获取可查询地址失败：{message}"
+        }
+      },
+      "force_sync": {
+        "error": {
+          "message": "执行同步时出错：{error}",
+          "title": "强制同步"
+        },
+        "success": {
+          "message": "数据同步操作成功完成。",
+          "title": "强制同步"
+        }
+      },
+      "ignored_assets": {
+        "error": {
+          "message": "无法检索被忽略的资产：{error}",
+          "title": "查询被忽略的资产"
+        }
+      },
+      "kraken_account": {
+        "error": {
+          "title": "错误设置 kraken 帐户类型"
+        },
+        "success": {
+          "message": "成功设置kraken账户类型",
+          "title": "成功"
+        }
+      },
+      "password_change": {
+        "error": "更改用户密码时出错：{message}",
+        "success": "修改用户密码成功"
+      },
+      "periodic_query": {
+        "error": {
+          "message": "周期性客户端查询错误：{message}",
+          "title": "定期客户端查询"
+        }
+      },
+      "refresh_general_cache": {
+        "error": {
+          "message": "刷新协议数据失败 {name}: {message}"
+        },
+        "task": {
+          "title": "刷新协议数据 ({name})"
+        }
+      },
+      "tag_add": {
+        "error": {
+          "title": "添加标签"
+        }
+      },
+      "tag_delete": {
+        "error": {
+          "title": "删除标签"
+        }
+      },
+      "tag_edit": {
+        "error": {
+          "title": "编辑标签"
+        }
+      }
+    },
+    "staking": {
+      "eth2": {
+        "error": {
+          "description": "查詢 ETH 質押詳情失敗：{error}",
+          "title": "查詢 ETH 質押詳情"
+        }
+      }
+    },
+    "statistics": {
+      "net_value": {
+        "error": {
+          "message": "失败：{message}",
+          "title": "获取净值数据"
+        }
+      }
+    },
+    "transactions": {
+      "error": {
+        "description": "{address} ({chain}) 查询失败：{error}",
+        "title": "Blockchain交易查询"
+      }
+    },
+    "transactions_redecode": {
+      "error": {
+        "description": "解码事务事件失败： {error}",
+        "title": "解码来自事务的事件"
+      }
+    },
+    "transactions_redecode_by_chain": {
+      "error": {
+        "description": "解码 {chain} 事件失败： {error}",
+        "title": "从事务中解码事件"
+      }
+    },
+    "unignore": {
+      "error": {
+        "description": "无法取消忽略所选操作：{error}",
+        "title": "取消忽略操作失败"
+      }
+    }
+  },
+  "active_modules": {
+    "activate": "激活 {name} 模块",
+    "enable": {
+      "description": "你想启用 {name} 模块吗？",
+      "title": "启用模块"
+    },
+    "view_addresses": "查看 {name} 的查询地址"
+  },
+  "address_book": {
+    "actions": {
+      "add": {
+        "error": {
+          "description": "添加到地址簿不成功：{message}",
+          "title": "添加地址簿失败"
+        }
+      },
+      "delete": {
+        "dialog": {
+          "message": "您确定要删除 {address} ({chain}) 的地址簿条目吗？",
+          "title": "删除地址簿条目"
+        },
+        "error": {
+          "description": "删除 {address} ({chain}) 的地址簿不成功：{message}",
+          "title": "地址簿删除失败"
+        },
+        "tooltip": "删除地址簿"
+      },
+      "edit": {
+        "error": {
+          "description": "编辑地址簿失败：{message}",
+          "title": "地址簿编辑失败"
+        },
+        "tooltip": "编辑地址簿"
+      },
+      "fetch": {
+        "error": {
+          "message": "无法获取地址簿：{message}",
+          "title": "查询地址簿"
+        }
+      }
+    },
+    "dialog": {
+      "add_title": "添加地址簿条目",
+      "edit_title": "编辑地址簿条目"
+    },
+    "form": {
+      "labels": {
+        "address": "地址"
+      },
+      "no_suggestions_available": "没有可用的建议",
+      "validation": {
+        "address": "地址栏不能为空",
+        "name": "name字段不能为空"
+      }
+    },
+    "hint": {
+      "global": "全球",
+      "global_description": "地址簿保存在全局数据库中（在此设备中的所有帐户之间共享）",
+      "priority": {
+        "list": {
+          "blockchain_account_labels": "区块链账户标签",
+          "ens_names": "ENS 名称",
+          "ethereum_tokens": "以太坊代币",
+          "global_address_book": "全球地址簿",
+          "hardcoded_mappings": "硬编码映射",
+          "private_address_book": "私人地址簿"
+        }
+      },
+      "private": "私人",
+      "private_description": "地址簿仅为该账户保存。"
+    }
+  },
+  "airdrops": {
+    "headers": {
+      "source": "来源"
+    },
+    "title": "空投",
+    "unknown_info": "这些地址可以进行空投，但我们还无法分析其是否已被认领。",
+    "unknown_tooltip": "地址符合空投条件，但我们还无法分析它是否已被认领。"
+  },
+  "amount_display": {
+    "click_to_copy": "点击复制",
+    "copied": "已复制！",
+    "manual_tooltip": "手动定义价格"
+  },
+  "app": {
+    "moto": "保护您隐私的开源投资组合管理器"
+  },
+  "asset_balances": {
+    "loading": "rotki 正在查询余额，请稍候..."
+  },
+  "asset_form": {
+    "fetch_latest_icon": {
+      "description": "无法获取 {identifier} 的最新图标：{message}",
+      "title": "获取最新图标"
+    },
+    "help_coingecko": "点击获取有关如何定位 CoinGecko 标识符的帮助",
+    "help_cryptocompare": "点击获取有关如何定位 CryptoCompare 标识符的帮助",
+    "icon_upload": {
+      "description": "图标上传失败：{message}",
+      "title": "图标上传"
+    },
+    "identifier": "标识符",
+    "identifier_copy": "复制标识符",
+    "labels": {
+      "asset_type": "资产类型",
+      "chain": "链",
+      "coingecko_hint": "CoinGecko 上资产的标识符。如果未设置,rotki 将无法从 CoinGecko 检索资产价格。",
+      "cryptocompare": "加密比较",
+      "cryptocompare_hint": "CryptoCompare 上资产的标识符。如果没有给出，符号将被假定为默认符号。如果这不起作用并且没有设置 rotki 将无法从 CryptoCompare 检索资产的价格",
+      "decimals": "小数",
+      "forked": "分叉",
+      "started": "开始",
+      "swapped_for": "交换为",
+      "symbol": "符号",
+      "token_kind": "代币种类"
+    },
+    "name_non_empty": "资产名称不能为空",
+    "optional": "可选字段",
+    "replaced": "点击\"保存\"后，该图标将被应用。",
+    "type_non_empty": "资产类型不能为空",
+    "types": {
+      "error": "我们无法加载资产类型：{message}"
+    },
+    "underlying_tokens": "底层代币",
+    "validation": {
+      "valid_address": "请输入有效的地址"
+    }
+  },
+  "asset_locations": {
+    "header": {
+      "percentage": "百分比",
+      "validator": "验证器索引|公钥"
+    },
+    "title": "资产位置"
+  },
+  "asset_management": {
+    "add_error": "无法添加资产：{message}",
+    "add_title": "添加新资产",
+    "cex_mapping": {
+      "add_error": "无法添加映射： {message}",
+      "add_mapping": "添加映射",
+      "add_title": "添加新映射",
+      "all_exchanges": "所有交易所",
+      "asset_symbol": "资产符号",
+      "confirm_delete": {
+        "message": "您确定要删除 {location} 中符号 {asset} 的资产映射吗？",
+        "title": "删除交易所资产映射"
+      },
+      "delete_error": "无法删除映射： {message}",
+      "edit_error": "无法编辑映射： {message}",
+      "edit_title": "编辑映射",
+      "form": {
+        "asset_non_empty": "确认的资产字段不能为空",
+        "location_non_empty": "位置字段不能为空",
+        "location_symbol_non_empty": "资产符号字段不能为空"
+      },
+      "location_symbol": "交易所中的资产符号",
+      "recognized_as": "确认为",
+      "save_for_all": "为所有交易所保存此映射",
+      "subtitle": "您可以将中央交易所的资产符号与 rotki 识别的资产联系起来。这是 rotki 处理交易所资产所必需的。"
+    },
+    "confirm_delete": {
+      "message": "您确定要从资产数据库中删除{asset}吗？",
+      "title": "删除资产"
+    },
+    "delete_error": "无法删除 {address}: {message}",
+    "edit_error": "无法编辑资产：{message}",
+    "edit_title": "编辑资产",
+    "merge_assets": "合并资产",
+    "merge_assets_tooltip": "将两个资产合并为一个（可用于将自定义资产迁移到官方支持的资产）"
+  },
+  "asset_select": {
+    "no_results": "没有资产匹配您的搜索"
+  },
+  "asset_table": {
+    "copy_identifier": {
+      "tooltip": "将资产标识符复制到剪贴板"
+    },
+    "custom": {
+      "subtitle": "添加、编辑、删除自定义资产。资产的更改将反映在您的所有帐户中"
+    },
+    "delete_tooltip": "删除资产",
+    "edit_tooltip": "编辑资产",
+    "filter_by_ignored_status": "按忽略状态过滤",
+    "headers": {
+      "started": "开始"
+    },
+    "newly_detected": {
+      "accept_selected": "接受选择的代币",
+      "seen_during": "看到期间",
+      "select_deselect_all_tokens": "选择/取消选择所有的代币",
+      "subtitle": "检查新检测到的令牌列表并将任何垃圾邮件资产添加到忽略的代币列表"
+    },
+    "only_show_ignored": "只显示忽略的资产 ({length}) | 只显示忽略的资产",
+    "only_show_unignored": "只显示未忽略的资产",
+    "selected": "{count} 个资产被选中",
+    "show_all": "显示全部",
+    "underlying_tokens": "底层代币"
+  },
+  "asset_update": {
+    "advanced": "高级选项",
+    "description": "资产数据库的 {remote} 版本可用。您想从 {local} 版本更新吗？",
+    "manual": {
+      "check": "检查更新",
+      "skipped": "版本 {skipped} 禁用更新通知",
+      "subtitle": "检查资产数据库的更新版本",
+      "title": "检查资产数据库更新"
+    },
+    "partially_update": "部分更新",
+    "restore": {
+      "delete_confirmation": {
+        "hard_reset_message": "你真的想重置你的本地资产副本吗？你将丢失你可能手动添加的任何自定义资产。",
+        "soft_reset_message": "你真的想恢复你的本地资产数据库吗？这将保留你手动添加的资产，并且之前 rotki 不知道并将所有其他资产重置为原始状态。",
+        "title": "重置资产数据库"
+      },
+      "hard_reset": "硬重置",
+      "hard_restore_confirmation": {
+        "message": "有些资产将被删除，可能会导致本账户或系统中其他账户的状态不一致。只有在你知道自己在做什么的情况下才能确认此操作。",
+        "title": "危险操作"
+      },
+      "soft_reset": "软复位",
+      "subtitle": "删除自定义资产并将资产数据库重置为初始状态。注意：此操作可能会影响同一系统中使用资产数据库的其他用户。",
+      "success": {
+        "description": "资产数据库已成功恢复。您现在需要重新登录才能应用更改。",
+        "title": "资产数据库恢复"
+      },
+      "title": "重置资产数据库"
+    },
+    "skip_notification": "下次更新前不要通知我",
+    "success": {
+      "description": "资产数据库已成功更新到版本 {remoteVersion}。您现在需要重新登录才能应用更改",
+      "title": "资产数据库更新"
+    },
+    "title": "支持的资产更新可用",
+    "total_changes": "此更新包含 {changes} 个资产变化。",
+    "up_to_date": "您的资产数据库是最新的。",
+    "up_to_version": "只更新到版本"
+  },
+  "asset_update_status": {
+    "applying": {
+      "message": "请稍候，您的资产数据正在更新到版本 {remoteVersion}",
+      "title": "应用资产更新"
+    },
+    "checking": {
+      "message": "正在执行资产更新检查，请稍候",
+      "title": "正在检查更新的资产"
+    }
+  },
+  "assets": {
+    "action": {
+      "ignore": "忽略资产"
+    },
+    "amount": "总拥有量",
+    "backup": {
+      "missing_directory": "请选择目录"
+    },
+    "custom_price": {
+      "delete": {
+        "error": {
+          "message": "无法删除 {asset} 的最新价格",
+          "title": "删除自定义最新价格"
+        },
+        "message": "您确定要删除 {asset} 的自定义价格吗？",
+        "tooltip": "删除自定义价格"
+      },
+      "edit": {
+        "tooltip": "编辑或设置自定义价格"
+      }
+    },
+    "filter": {
+      "name_hint": "使用资产名称搜索",
+      "symbol_hint": "使用资产符号搜索"
+    },
+    "multi_chain_assets": "多链资产",
+    "value": "价值"
+  },
+  "back_button": {
+    "tooltip": "导航回上一页。"
+  },
+  "backend_mappings": {
+    "events": {
+      "group": {
+        "bridge": "桥"
+      },
+      "history_event_subtype": {
+        "airdrop": "空投",
+        "approve": "批准",
+        "bridge": "桥",
+        "deposit_asset": "存入资产",
+        "fee": "费用",
+        "generate_debt": "生成债务",
+        "governance": "治理",
+        "none": "无",
+        "payback_debt": "偿还债务",
+        "receive": "接收",
+        "receive_wrapped": "接收包装",
+        "remove_asset": "移除资产",
+        "return_wrapped": "返回包裹",
+        "reward": "奖励",
+        "spend": "花费"
+      },
+      "history_event_type": {
+        "adjustment": "调整",
+        "deposit": "存款",
+        "informational": "信息",
+        "migrate": "迁移",
+        "receive": "接收",
+        "renew": "更新",
+        "spend": "花费",
+        "staking": "质押",
+        "trade": "贸易",
+        "transfer": "转移",
+        "withdrawal": "取款"
+      },
+      "type": {
+        "airdrop": "空投",
+        "approval": "批准",
+        "borrow": "借",
+        "cancel_order": "取消订单",
+        "claim_reward": "领取奖励",
+        "deploy": "部署",
+        "deposit": "存款",
+        "donate": "捐赠",
+        "fee": "费用",
+        "governance": "治理",
+        "informational": "信息",
+        "place_order": "下订单",
+        "receive": "接收",
+        "receive_donation": "接收捐赠",
+        "refund": "退款",
+        "renew": "更新",
+        "repay": "还款",
+        "send": "发送",
+        "transfer": "转移",
+        "unknown": "未知",
+        "withdraw": "撤回"
+      }
+    },
+    "profit_loss_event_type": {
+      "asset_movement": "资产移动",
+      "loan": "贷款",
+      "margin_position": "保证金位置",
+      "prefork_acquisition": "预叉收购",
+      "staking": "质押",
+      "trade": "贸易",
+      "transaction_event": "交易事件"
+    },
+    "trade_location": {
+      "banks": "银行",
+      "commodities": "商品",
+      "equities": "股票",
+      "external": "外部"
+    }
+  },
+  "backend_settings": {
+    "actions": {
+      "reset": "重置为默认值"
+    },
+    "advanced": "高级",
+    "config_file_disabled": "此参数已在 rotki_config.json 中设置",
+    "confirm": {
+      "message": "您确定要将后端设置恢复为默认设置吗？",
+      "title": "休息后端设置"
+    },
+    "data_directory": {
+      "select": "选择 rotki 存储数据的位置"
+    },
+    "errors": {
+      "min": "此设置的最小值为 {min}",
+      "non_empty": "这个设置不能为空"
+    },
+    "log_directory": {
+      "select": "选择 rotki 存储日志的位置"
+    },
+    "log_from_other_modules": {
+      "hint": "启用来自第三方库的日志记录（对调试有用）",
+      "label": "从其他模块登录"
+    },
+    "max_log_files": {
+      "hint": "这是要保留的最大日志文件数",
+      "label": "最大日志文件数"
+    },
+    "max_log_size": {
+      "hint": "这是将用于所有 rotki 日志的最大大小（以兆字节为单位）",
+      "label": "最大日志大小"
+    },
+    "settings": {
+      "data_directory": {
+        "hint": "通过更改数据目录，旧目录中的数据将不得不手动移动到新目录中。",
+        "label": "数据目录"
+      },
+      "log_directory": {
+        "label": "日志目录"
+      },
+      "log_level": {
+        "label": "日志级别"
+      }
+    },
+    "sqlite_instructions": {
+      "hint": "指定在协作线程之间进行上下文切换的 sqlite VM 指令之后。设置为 0 以禁用异步数据库访问",
+      "label": "每个 SQLite 上下文切换的说明"
+    },
+    "subtitle": "修改后台设置",
+    "title": "后台设置"
+  },
+  "backend_settings_button": {
+    "tooltip": "更改后端设置。更改设置将重启 rotki 后端"
+  },
+  "binance_market_selector": {
+    "default_label": "过滤市场对",
+    "query_all": {
+      "error": "无法获取 binance 的市场列表。",
+      "title": "查询币安市场"
+    },
+    "query_user": {
+      "error": "无法获取选择要查询币安的市场列表。",
+      "title": "查询所选币安市场"
+    }
+  },
+  "blockchain_account_selector": {
+    "default_label": "过滤账户",
+    "no_data": "没有可用地址"
+  },
+  "blockchain_balances": {
+    "add_account": "添加账户",
+    "form_dialog": {
+      "add_title": "添加区块链账户",
+      "edit_subtitle": "修改账户信息",
+      "edit_title": "编辑区块链账户"
+    }
+  },
+  "change_password": {
+    "button": "更改密码",
+    "labels": {
+      "confirm_password": "确认新密码",
+      "new_password": "新密码",
+      "password": "当前密码"
+    },
+    "sync_warning": "在启用高级同步的情况下更改密码会影响应用程序的其他同步实例。在使用其他同步实例登录时，系统会要求您使用服务器上的同步版本覆盖本地数据库。之后，您必须 使用新设置的密码登录。",
+    "title": "用户账户和安全",
+    "validation": {
+      "empty_confirmation": "请提供密码确认",
+      "empty_password": "请提供密码",
+      "password_mismatch": "密码确认与提供的密码不匹配"
+    }
+  },
+  "collapsed_pending_tasks": {
+    "cancel_task": "取消任务",
+    "cancel_task_info": "此操作将使正在运行的进程 ({title}) 处于未完成状态，您确定要取消吗？"
+  },
+  "common": {
+    "account": "账户",
+    "actions": {
+      "back": "返回",
+      "cancel": "取消",
+      "clear_selection": "清除选择",
+      "close": "关闭",
+      "confirm": "确认",
+      "continue": "继续",
+      "copy": "复制",
+      "copy_to_clipboard": "复制到剪贴板",
+      "create": "创建",
+      "delete": "删除",
+      "dismiss": "驳回",
+      "download": "下载",
+      "download_csv": "下载 CSV",
+      "edit": "编辑",
+      "export_csv": "导出 CSV",
+      "filter": "过滤器",
+      "finish": "完成",
+      "generate": "生成",
+      "import": "导入",
+      "install": "安装",
+      "next": "下一个",
+      "no": "没有",
+      "ok": "好的",
+      "pull": "拉",
+      "push": "推",
+      "save": "保存",
+      "search": "搜索",
+      "skip": "跳过",
+      "terminate": "终止",
+      "update": "更新",
+      "yes": "是"
+    },
+    "actions_text": "动作",
+    "address": "地址",
+    "amount": "金额",
+    "asset": "资产",
+    "assets": "资产",
+    "balance": "余额",
+    "category": "类别",
+    "claimed": "声称",
+    "counterparty": "交易对手",
+    "datetime": "日期/时间",
+    "description": "描述",
+    "details": "细节",
+    "entry_type": "输入类型",
+    "events": "事件",
+    "exchange": "交易所",
+    "fee": "费用",
+    "here": "这儿",
+    "ignored_in_accounting": "已从会计中排除 (PnL)",
+    "important_notice": "重要通知:",
+    "location": "位置",
+    "multi_chain": "多链",
+    "name": "姓名",
+    "never": "从不",
+    "notes": "备注",
+    "optional": "可选",
+    "price": "价格",
+    "price_in_symbol": "{symbol} 价格",
+    "priority": "优先级",
+    "protocol": "协议",
+    "refresh": "刷新",
+    "rewards": "奖励",
+    "select_directory": "选择目录",
+    "status": "地位",
+    "total": "总计",
+    "tx_hash": "交易哈希",
+    "type": "类型",
+    "unclaimed": "无人认领",
+    "unknown": "未知",
+    "validator_index": "验证器索引",
+    "value_in_symbol": "{symbol} 值"
+  },
+  "conflict_dialog": {
+    "action": {
+      "local": "本地",
+      "remote": "远程"
+    },
+    "action_hint": {
+      "bottom": "您还可以选择单独管理冲突。",
+      "top": "已检测到本地更改。您有两个选项："
+    },
+    "hint": "{conflicts} 个资产条目无法自动更新。{remaining} 个剩余条目需要用户输入。",
+    "keep_local": "保留所有本地内容",
+    "keep_local_tooltip": "不会更新任何受影响的资产。可能需要手动更新。",
+    "keep_remote": "保留所有远程",
+    "keep_remote_tooltip": "更新所有资产。无需采取进一步行动。",
+    "manage": "管理冲突",
+    "resolve_all_hint": "所有冲突都将通过使用 {source} 数据来解决。",
+    "subtitle": "{conflicts} 个资产条目无法自动更新。{remaining} 个剩余条目需要用户输入。",
+    "table": {
+      "headers": {
+        "keep": "保持",
+        "local": "本地",
+        "remote": "远程"
+      }
+    },
+    "title": "检测到冲突"
+  },
+  "connection_failure": {
+    "default": "连接到默认",
+    "message": "无法连接到 rotki 后端，你想再试一次吗？",
+    "retry": "重试",
+    "title": "连接失败"
+  },
+  "connection_loading": {
+    "message": "正在连接到 rotki 后端"
+  },
+  "cost_basis_table": {
+    "complete": "完成",
+    "cost_basis": "成本基础",
+    "headers": {
+      "amount": "销售量",
+      "full_amount": "事件获得总量",
+      "rate": "{currency} 汇率",
+      "remaining_amount": "卖出后剩余",
+      "taxable": "应税"
+    },
+    "incomplete": "不完整"
+  },
+  "create_account": {
+    "credentials": {
+      "description": "请记住，您在此处创建的用户是 {highlight}，与在网页上创建的帐户无关。",
+      "highlight": "仅在应用程序中启用",
+      "label_password": "密码",
+      "label_password_backup_reminder": "rotki 会将所有用户数据保存在本地。我明白如果我丢失密码，我将无法访问我的数据。我已经创建了密码的备份。",
+      "label_password_repeat": "重复密码",
+      "label_username": "个人资料名称",
+      "password_sync_requirement": "请确保该帐户使用与最初备份的数据库相同的密码。如果输入不同的密码，您将无法访问数据库。",
+      "validation": {
+        "check_prompt": "确认您已阅读并创建了备份",
+        "non_empty_password": "请提供密码",
+        "non_empty_password_confirmation": "请提供密码确认",
+        "non_empty_username": "請提供個人資料名稱",
+        "password_confirmation_mismatch": "密码确认与提供的密码不匹配",
+        "valid_username": "設定檔名稱必須僅包含字母數字字元且不能包含空格"
+      }
+    },
+    "have_account": {
+      "description": "已经有账户了？",
+      "log_in": "解锁您的帐户"
+    },
+    "introduction": {
+      "description": "rotki 是一个尊重您隐私的本地应用程序。\n\nrotki 账户使用您的密码和 {highlight} 进行加密。\n\n您在此处创建的帐户仅适用于应用程序，在网页上我们使用不同的数据库。",
+      "highlight": "保存在您的本地文件系统中"
+    },
+    "premium": {
+      "button_premium_approve": "是的，启用高级版",
+      "premium_question": "您已经是 rotki 高级用户并想要启用高级功能吗？\n如果您想在创建帐户时从另一台设备同步您的 rotki 数据库，则需要进行此操作。您可以在 {premiumLink} 购买高级版"
+    },
+    "steps": {
+      "step_1": {
+        "description": "第一步",
+        "title": "介绍"
+      },
+      "step_2": {
+        "description": "您在我们的网站上是否有高级帐户？",
+        "title": "启用高级版"
+      },
+      "step_3": {
+        "description": "设置您的凭据",
+        "title": "创建帐户"
+      },
+      "step_4": {
+        "title": "使用分析"
+      }
+    },
+    "title": "创建帐户",
+    "usage_analytics": {
+      "description": "rotki 是一个本地应用程序，匿名使用分析是我们了解有多少人使用我们的软件，他们来自哪里等信息的唯一方式。这些数据对我们非常重要，它们完全匿名，并帮助我们为您创建更好的产品。",
+      "label_confirm": "提交匿名使用分析"
+    }
+  },
+  "currencies": {
+    "aud": "澳元",
+    "brl": "巴西雷亚尔",
+    "cad": "加元",
+    "chf": "瑞士法郎",
+    "cny": "人民币",
+    "dkk": "丹麦克朗",
+    "eur": "欧元",
+    "gbp": "英镑",
+    "inr": "印度卢比",
+    "jpy": "日元",
+    "krw": "韩元",
+    "ngn": "奈及利亞奈拉",
+    "nok": "挪威克朗",
+    "nzd": "新西兰元",
+    "pln": "波兰兹罗提",
+    "rub": "俄罗斯卢布",
+    "sek": "瑞典克朗",
+    "sgd": "新加坡元",
+    "try": "土耳其里拉",
+    "twd": "新台币",
+    "usd": "美元",
+    "zar": "南非兰特"
+  },
+  "currency_drop_down": {
+    "hint": "选择作为主要货币",
+    "profit_currency": "利润货币 ({currency})"
+  },
+  "dashboard": {
+    "blockchain_balances": {
+      "behaviour": {
+        "only_refresh_balances": "只刷新余额",
+        "redetect_tokens": "重新检测代币并刷新余额",
+        "title": "区块链刷新按钮行为"
+      }
+    },
+    "exchange_balances": {
+
+    },
+    "liabilities": {
+      "title": "负债"
+    },
+    "manual_balances": {
+
+    },
+    "snapshot": {
+      "delete": {
+        "dialog": {
+          "message": "你确定要删除这个快照吗？",
+          "title": "删除快照"
+        },
+        "message": {
+          "failure": "删除快照失败",
+          "success": "快照删除成功",
+          "title": "删除快照"
+        }
+      },
+      "download": {
+        "message": {
+          "failure": "快照 CSV 导出失败",
+          "success": "快照导出为CSV成功",
+          "title": "快照 CSV 导出"
+        }
+      },
+      "edit": {
+        "dialog": {
+          "actions": {
+            "delete_item": "删除项目",
+            "edit_item": "编辑项目"
+          },
+          "balances": {
+            "add_title": "添加余额快照数据",
+            "delete_confirmation": "你确定要删除这个余额快照项目吗？",
+            "delete_title": "删除余额快照项",
+            "edit_title": "更新余额快照数据",
+            "hints": {
+              "location": "这是可选的。如果指定，位置余额数据将自动调整。如果没有，您必须手动更新位置余额数据。"
+            },
+            "preview": {
+              "from": "从",
+              "title": "此位置值将被更新",
+              "to": "到"
+            },
+            "rules": {
+              "amount": "金额字段不能为空",
+              "asset": "资产字段不能为空",
+              "category": "类别字段不能为空",
+              "value": "值字段不能为空"
+            }
+          },
+          "location_data": {
+            "add_title": "添加位置数据快照数据",
+            "delete_confirmation": "您确定要删除此位置数据快照项吗？",
+            "delete_title": "删除位置数据快照项",
+            "edit_title": "更新位置数据快照数据",
+            "rules": {
+              "location": "位置字段不能为空",
+              "value": "值字段不能为空"
+            }
+          }
+        }
+      },
+      "export_database_snapshot": "导出数据库快照",
+      "subtitle": "点击下方按钮下载快照"
+    }
+  },
+  "dashboard_asset_table": {
+    "headers": {
+      "percentage_of_total_current_group": "占 {group} 总数的百分比",
+      "percentage_of_total_net_value": "净值百分比",
+      "percentage_total": "占总数的百分比"
+    },
+    "no_search_result": "您对 \"{search}\" 的搜索没有结果。",
+    "select_visible_columns": "选择可见列"
+  },
+  "data_management": {
+    "purge_data": {
+      "confirm": {
+        "message": "您确定要清除 {source} ({value}) 的缓存数据吗？({value}) 的缓存数据？",
+        "message_all": "您确定要清除所有 {source} 的缓存数据吗？",
+        "title": "确认缓存数据清除"
+      },
+      "error": "清除 {source} 的缓存数据失败：{message}",
+      "subtitle": "允许您清除 rotki 缓存的数据",
+      "success": "数据删除成功",
+      "title": "清除數据",
+      "transaction_purge_confirm": {
+        "message": "您确定要清除这些交易数据吗？此操作会删除交易和收据，而且重新查询所有内容需要很长时间。"
+      }
+    },
+    "purge_images_cache": {
+      "confirm": {
+        "message": "您确定要清除为 {source} 缓存的图像吗？",
+        "title": "确认缓存的清晰图像"
+      },
+      "error": "清除 {source} 的缓存图像失败：{message}",
+      "hint": "清空此字段以删除所有缓存",
+      "label": {
+        "asset_icons": "资产图标",
+        "asset_to_clear": "搜索资产图标以清除",
+        "ens_avatars": "ENS头像",
+        "ens_to_clear": "ENS头像清零"
+      },
+      "select_image_source": "选择要清除的图像缓存源",
+      "subtitle": "允许您清除 rotki 缓存的图像",
+      "success": "缓存已成功清除",
+      "title": "清除图像缓存"
+    },
+    "refresh_cache": {
+      "confirm": {
+        "message": "确定要刷新 {source} 的协议数据吗？",
+        "title": "确认刷新协议数据"
+      },
+      "error": "清除 {source} 的协议数据失败：{message}",
+      "select_cache": "选择要刷新的协议数据",
+      "subtitle": "允许您在 rotki 中刷新协议数据",
+      "success": "协议数据已成功清除",
+      "title": "刷新协议数据",
+      "tooltip": "刷新所选来源的协议数据"
+    },
+    "title": "管理数据"
+  },
+  "data_table": {
+    "no_data": "无数据",
+    "rows_per_page": "每页行数"
+  },
+  "database_backups": {
+    "action": {
+      "delete": "删除备份",
+      "download": "下载备份"
+    },
+    "backup": {
+      "message": "数据库备份已成功创建 {filepath}",
+      "title": "数据库备份"
+    },
+    "backup_error": {
+      "message": "创建数据库备份时出现问题：{message}",
+      "title": "数据库备份失败"
+    },
+    "column": {
+      "size": "尺寸",
+      "version": "版本"
+    },
+    "confirm": {
+      "mass_message": "您确定要删除这些 {length} 个数据库备份吗？",
+      "message": "您确定要从 {date} 删除 {size} 数据库备份吗？",
+      "title": "删除数据库备份"
+    },
+    "delete_error": {
+      "mass_message": "删除数据库备份时出现问题：{message}",
+      "message": "删除 {file} 时出现问题：{message}",
+      "title": "备份删除失败"
+    },
+    "load_error": {
+      "message": "加载可用备份列表时出现问题：{message}",
+      "title": "数据库备份负载"
+    }
+  },
+  "date_format_help": {
+    "directive": {
+      "ampm": "上午或下午标记",
+      "day_numeric": "日（数字）",
+      "day_of_the_week": "星期几",
+      "day_of_year": "一年中的第几天",
+      "day_of_year_padded": "一年中的三位数日期（带前导零）",
+      "day_two_digit": "两位数的日期",
+      "hour": "24小时",
+      "hour_padded": "两位数小时(带前导零)24h",
+      "hour_twelve": "两位数小时(带前导零)12h",
+      "hour_twelve_padded": "12 点钟",
+      "locale_date": "语言环境格式的日期",
+      "locale_datetime": "区域设置格式的日期和时间",
+      "locale_time": "语言环境格式的时间",
+      "milliseconds": "毫秒",
+      "minutes": "分钟",
+      "minutes_padded": "两位数分钟（带前导零）",
+      "month": "完整的月份名称",
+      "month_numeric": "月份（数字）",
+      "month_short": "缩写月份名称",
+      "month_two_digit": "两位数的月份",
+      "seconds": "秒",
+      "seconds_padded": "两位数秒（带前导零）",
+      "timezone": "时区",
+      "timezone_offset": "RFC 822 与 GMT 的数字偏移",
+      "week_day": "完整的工作日名称",
+      "week_day_short": "缩写工作日名称",
+      "year": "四位数年份",
+      "year_two_digit": "年份的最后两位数字"
+    },
+    "example": "结果日期 ({example})",
+    "subtitle": "这些是支持的日期格式选项",
+    "title": "日期格式"
+  },
+  "ens_names": {
+    "task": {
+      "title": "查询ENS名称"
+    }
+  },
+  "error": {
+    "generic": {
+      "message": "我们在处理您的请求时遇到内部错误。如果此问题仍然存在，请联系我们的支持团队并提供以下详细信息：\\n错误代码：{code}\\n错误消息：{message}\\n路径：{path}",
+      "title": "出了些问题"
+    }
+  },
+  "error_screen": {
+    "backend_error": "后端有问题。",
+    "copy_tooltip": "将错误文本复制到剪贴板",
+    "message": "在 Github 中打开一个问题，包括 rotki_electron.log 和 rotkehlchen.log。后端的输出如下:",
+    "start_failure": "rotki 启动失败"
+  },
+  "eth2_input": {
+    "ownership": {
+      "hint": "*可选：默认为 100%",
+      "validation": "该值应> 0%且<= 100%"
+    },
+    "ownership_percentage": "所有权百分比",
+    "public_key": "公钥"
+  },
+  "eth2_validator_limit_row": {
+    "label": "信标链验证者"
+  },
+  "evm_rpc_node_manager": {
+    "activate_error": {
+      "title": "激活/停用节点 {node} 失败"
+    },
+    "add_button": "添加节点",
+    "add_dialog": {
+      "title": "添加一个 {chain} RPC 节点"
+    },
+    "add_error": {
+      "title": "添加 {chain} RPC 节点"
+    },
+    "confirm": {
+      "message": "您确定要删除 {chain} 的 RPC 节点 '{node}' ({endpoint}) 吗？",
+      "title": "删除 {chain} RPC 节点"
+    },
+    "connected": {
+      "failure": "失败",
+      "false": "准备就绪",
+      "true": "已连接"
+    },
+    "delete_error": {
+      "title": "删除 {chain} RPC 节点"
+    },
+    "delete_tooltip": "删除选中的 RPC 节点",
+    "edit_dialog": {
+      "title": "编辑 {chain} RPC 节点"
+    },
+    "edit_error": {
+      "title": "编辑 {chain} RPC 节点"
+    },
+    "edit_tooltip": "编辑选定的 RPC 节点",
+    "etherscan": "rotki 使用的 Etherscan API",
+    "loading_error": {
+      "title": "加载 {chain} RPC 节点"
+    },
+    "public_node": "这是一个公共节点"
+  },
+  "exchange_balances": {
+    "add_exchange": "添加交易所",
+    "click_here": "点击这里",
+    "no_connected_exchanges": "你没有任何连接的交易所。{0} 建立一个交易所连接。",
+    "select_exchange": "选择交易所",
+    "select_hint": "选择交易所查看资产详情。"
+  },
+  "exchange_keys_form": {
+    "edit": {
+      "activate_tooltip": "编辑交易所的 api 密钥。",
+      "deactivate_tooltip": "取消对交易所 api 密钥的编辑。"
+    },
+    "name": {
+      "non_empty": "名称字段不能为空。"
+    }
+  },
+  "exchange_settings": {
+    "confirmation": {
+      "message": "您确定要从 rotki 中删除名为 {name} 的 {location} 条目的 API 密钥和机密吗？此操作无法撤消，您需要从交易所再次获取密钥和机密",
+      "title": "需要确认"
+    },
+    "delete": {
+      "tooltip": "删除兑换账户"
+    },
+    "dialog": {
+      "add": {
+        "title": "添加交易所"
+      },
+      "edit": {
+        "title": "编辑交易所"
+      }
+    },
+    "edit": {
+      "tooltip": "编辑兑换账户"
+    },
+    "header": {
+      "sync_enabled": "同步启用"
+    },
+    "inputs": {
+      "kraken_account": "选择您的 Kraken 账户类型"
+    },
+    "subtitle": "rotki 可以连接到支持的交易所并自动从中提取您的交易和余额。有关详细信息，请参阅 {0}。",
+    "sync": {
+      "messages": {
+        "description": "无法 {action} 同步交换 {location} 与名称 {name}: {message}",
+        "disable": "禁用",
+        "enable": "启用",
+        "title": "无法更新非同步交易所"
+      }
+    },
+    "usage_guide": "使用指南"
+  },
+  "explorers": {
+    "address": "地址",
+    "address_url": "地址将在 {addressUrl} 打开",
+    "block": "积木",
+    "block_url": "块将在 {blockUrl} 打开",
+    "chain_selector": "区块链",
+    "subtitle": "设置地址和交易的外部资源管理器 url",
+    "title": "区块链探索者",
+    "tx": "交易",
+    "tx_url": "交易将在 {txUrl} 打开"
+  },
+  "external_services": {
+    "beaconchain": {
+      "description": "rotki 使用 Beaconcha.in 獲取區塊生產歷史記錄和更詳細的質押分析。如果您需要這些數據，則需要 API 密鑰。",
+      "hint": "输入您的 Beaconcha.in API 密钥"
+    },
+    "blockscout": {
+      "description": "rotki 使用 Blockscout 获取有关 ETH 提现查询等信息。仅当您受到速率限制时才需要 API 密钥。",
+      "hint": "输入您的 Blockscout API 密钥"
+    },
+    "confirmation": {
+      "message": "您确定要删除此 API 密钥吗？",
+      "title": "删除 API Key"
+    },
+    "cryptocompare": {
+      "description": "rotki 使用 cryptocompare 来获取您投资组合中资产的价格信息。只有当您拥有大量资产并且受到速率限制时才需要 API 密钥。",
+      "hint": "输入您的 CryptoCompare API 密钥",
+      "title": "加密比较"
+    },
+    "delete_error": {
+      "description": "删除外部服务 api 密钥时出错： {message}"
+    },
+    "etherscan": {
+      "description": "如果您不使用自己的节点，建议用于任何 EVM 区块链余额或交易。",
+      "hint": "输入您的 Etherscan API 密钥"
+    },
+    "get_api_key": "您可以申请 an API key {link}",
+    "opensea": {
+      "description": "用于查询OpenSea的NFT信息和余额。",
+      "hint": "输入您的 OpenSea API key"
+    },
+    "set": {
+      "error": {
+        "message": "设置外部服务 api 密钥时出错： {error}"
+      },
+      "success": {
+        "message": "已成功更新 {serviceName} 的密钥"
+      }
+    },
+    "subtitle": "rotki 连接到各种服务提供商,以获取历史价格或区块链数据等信息。在某些情况下,rotki 依赖这些 API 获取基本信息，在这种情况下，您需要提供 API 密钥。"
+  },
+  "file_upload": {
+    "date_input_format": {
+      "hint": "如果文件中的日期格式为：{format}，请使用此选项",
+      "placeholder": "输入自定义日期格式",
+      "switch_label": "使用自定义日期格式来解析你的文件"
+    },
+    "import_complete": "导入成功完成。",
+    "loading": "加载中",
+    "many_files_selected": "必须选择一个文件",
+    "only_files": "只允许 {fileFilter} 个文件"
+  },
+  "frontend_settings": {
+    "subtitle": {
+      "alias_names": "地址的别名"
+    },
+    "title": "仅前端设置",
+    "validation": {
+      "timeframe": {
+        "error": "无法为用户设置默认时间范围",
+        "success": "默认时间范围设置为{timeframe}"
+      }
+    }
+  },
+  "general_settings": {
+    "amount": {
+      "label": {
+        "currency_location": "货币位置",
+        "decimal_separator": "小数分隔符",
+        "location_after": "之后",
+        "location_before": "之前",
+        "resulting_format": "结果格式：",
+        "thousand_separator": "千位分隔符"
+      },
+      "labels": {
+        "floating_precision": "浮动精度",
+        "main_currency": "主要货币",
+        "main_currency_subtitle": "选择为主货币"
+      },
+      "title": "金额设置"
+    },
+    "date_display": {
+      "validation": {
+        "empty": "日期显示格式不能为空",
+        "invalid": "在日期显示格式中未检测到有效模式"
+      }
+    },
+    "date_display_format_hint": "结果日期：{format}",
+    "date_display_tooltip": "恢复默认日期显示格式",
+    "date_input_format_hint": "输入示例：{format}",
+    "decimal_separator": {
+      "validation": {
+        "cannot_be_numeric_character": "小数分隔符不能为数字字符",
+        "cannot_be_the_same": "小数分隔符不能与千位分隔符相同",
+        "empty": "小数分隔符不能为空"
+      }
+    },
+    "external_service_setting": {
+      "label": {
+        "connect_timeout": "连接超时",
+        "connect_timeout_hint": "在放弃建立与外部服务的连接之前等待的秒数。",
+        "query_retry_limit": "查询重试限制",
+        "query_retry_limit_hint": "在放弃之前重试对外部服务的查询次数。",
+        "read_timeout": "读取超时",
+        "read_timeout_hint": "在与外部服务的连接建立后，等待第一个字节的秒数。"
+      },
+      "title": "外部服务设置",
+      "validation": {
+        "connect_timeout": {
+          "invalid_range": "连接超时必须大于{min}",
+          "non_empty": "请输入连接超时"
+        },
+        "query_retry_limit": {
+          "invalid_range": "查询重试限制必须大于{min}",
+          "non_empty": "请输入查询重试限制"
+        },
+        "read_timeout": {
+          "invalid_range": "读取超时必须大于{min}",
+          "non_empty": "请输入读取超时"
+        }
+      }
+    },
+    "labels": {
+      "btc_derivation_gap": "BTC衍生差距限制",
+      "date_display_format": "日期显示格式",
+      "date_input_format": "日期输入格式",
+      "treat_eth2_as_eth": "应将 ETH2 (Staked ETH) 视为 ETH"
+    },
+    "nft_setting": {
+      "label": {
+        "include_nfts_hint": "默认情况下，图表和仪表盘包括所有 NFT 的值",
+        "render_setting": {
+          "allow_all": "允许所有图像",
+          "only_allow_whitelisted": "只允许来自白名单域名的图片"
+        },
+        "whitelist_domains": "白名单域名",
+        "whitelisted_domain_entries": "无条目 | {count} 唯一条目 | {count} 唯一条目",
+        "whitelisted_domains": "白名单域",
+        "whitelisted_domains_hint": "输入单个或多个逗号分隔的域。按右侧的保存按钮保存更改"
+      },
+      "messages": {
+        "error": "设置 NFT 图像渲染允许域时出错",
+        "success": "成功保存 NFT 图像渲染的允许域"
+      }
+    },
+    "rpc_node_setting": {
+      "title": "RPC节点设置"
+    },
+    "thousand_separator": {
+      "validation": {
+        "cannot_be_numeric_character": "千位分隔符不能为数字字符",
+        "cannot_be_the_same": "千位分隔符不能与小数分隔符相同",
+        "empty": "千位分隔符不能为空"
+      }
+    },
+    "title": "通用设置",
+    "validation": {
+      "btc_derivation_gap": {
+        "error": "设置BTC差额限额错误",
+        "success": "BTC衍生差额限制已成功更改为{limit}"
+      },
+      "chains_to_skip_detection": {
+        "error": "设置跳过跨链账户活动检测的 EVM 链时出错",
+        "success": "已成功保存要跳过跨链账户活动检测的 EVM 链"
+      },
+      "currency": {
+        "error": "主要货币设置错误",
+        "success": "主要货币设置为{symbol}"
+      },
+      "currency_location": {
+        "error": "设置货币位置错误",
+        "success": "货币位置设置为{currencyLocation}"
+      },
+      "date_display_format": {
+        "error": "设置日期显示格式错误",
+        "success": "日期显示设置为{dateFormat}"
+      },
+      "date_input_format": {
+        "error": "设置日期输入格式错误",
+        "success": "日期输入设置为{dateFormat}"
+      },
+      "decimal_separator": {
+        "error": "设置小数点分隔符错误",
+        "success": "十进制分隔符设置为 \"{decimalSeparator}\""
+      },
+      "floating_precision": {
+        "error": "将浮动精度设置为 {precision} 时出错",
+        "non_empty": "请输入浮动精度",
+        "success": "浮动精度设置为{precision}"
+      },
+      "thousand_separator": {
+        "error": "千位分隔符设置错误",
+        "success": "千位分隔符设置为 \"{thousandSeparator}\""
+      },
+      "treat_eth2_as_eth": {
+        "error": "将 ETH2 视为 ETH 的错误更改设置"
+      }
+    }
+  },
+  "generate": {
+    "custom_selection": "自定义",
+    "labels": {
+      "end_date": "结束日期",
+      "start_date": "开始日期"
+    },
+    "period": "时期",
+    "sub_period": {
+      "all": "全部"
+    },
+    "sub_period_label": "期间详情",
+    "validation": {
+      "empty_end_date": "结束日期不能为空",
+      "empty_start_date": "开始日期不能为空",
+      "end_after_start": "结束时间应该在开始时间之后。"
+    }
+  },
+  "global_search": {
+    "no_actions": "没有找到动作",
+    "search_placeholder": "搜索任何内容..."
+  },
+  "hash_link": {
+    "open_link": "在外部区块浏览器中打开"
+  },
+  "help_sidebar": {
+    "about": {
+      "subtitle": "关于申请",
+      "title": "关于"
+    },
+    "browser_log": {
+      "error": {
+        "empty": {
+          "message": "糟糕，没有日志条目",
+          "title": "清空日志条目"
+        }
+      },
+      "subtitle": "下载浏览器日志文件",
+      "title": "浏览器日志"
+    },
+    "faq": {
+      "subtitle": "关于申请的问题",
+      "title": "常见问题解答"
+    },
+    "github": {
+      "subtitle": "查看我们的代码并打开问题"
+    },
+    "support": {
+      "subtitle": "加入我们活跃的社区并获得支持"
+    },
+    "title": "帮助与支持",
+    "twitter": {
+      "subtitle": "关注我们"
+    },
+    "user_guide": {
+      "subtitle": "从这里开始",
+      "title": "使用指南"
+    }
+  },
+  "helpers": {
+    "refresh_header": {
+      "tooltip": "刷新 {title} 数据"
+    }
+  },
+  "ignore": {
+    "failed": {
+      "ignore_message": "{length} 资产无法添加到忽略的资产：{message}",
+      "ignore_title": "忽略资产失败",
+      "unignore_message": "无法从忽略的资产中删除 {length} 个资产：{message}",
+      "unignore_title": "无法取消忽略资产"
+    },
+    "no_items": {
+      "description": "所有选定的条目都已被忽略 | 所有选定的条目都已包含",
+      "title": "没有要忽略的条目 | 没有要取消忽略的条目"
+    }
+  },
+  "ignore_buttons": {
+    "ignore": "忽略",
+    "ignore_tooltip": "忽略选定的资产",
+    "unignore": "取消忽略",
+    "unignore_tooltip": "取消忽略选定的资产"
+  },
+  "import_data": {
+    "binance": {
+      "line_one": "我们处理的列包括 User_ID, UTC_Time, Account, Operation, Coin, Change 和 Remark。",
+      "line_three": "由于 Binance 的 CSV 格式，有可能无法导入所有数据。如果出现这种情况，您将收到警告。",
+      "line_two": "您可以从 {link} 获取 CSV 文件。",
+      "name": "币安"
+    },
+    "bisq": {
+      "import": "从 Bisq 导入 {0}",
+      "import_trade": "交易",
+      "line_one": "[Experimental] 如果您发现导入的数据有问题，请告诉我们，以便我们相应地调整代码。"
+    },
+    "bitcoin_tax": {
+      "import": "从 bitcoin.tax 导入 {0}",
+      "import_types": "交易、收入和支出",
+      "line_one": "我们支持导入交易、收入和支出 csv 文件类型。",
+      "line_three": "代表硬币重命名或分叉的交易文件类型的“交换”操作由 rotki 在别处处理，因此不需要为其创建历史事件。",
+      "line_two": "所有导入的事件都映射到 rotki 的历史事件。"
+    },
+    "bitmex": {
+      "import": "从 BitMEX 导入 {0}",
+      "import_types": "钱包历史",
+      "line_one": "[Experimental]如果您发现导入的数据有问题，请告诉我们，以便我们相应地调整代码。",
+      "line_two": "钱包历史文件中的金额假定为比特币。如果您希望其他货币支持此功能，请联系。"
+    },
+    "bitstamp": {
+      "import": "从 Bitstamp 导入 {0}",
+      "import_types": "交易、存款和取款"
+    },
+    "bittrex": {
+      "import": "从 Bittrex 导入 {0}",
+      "import_types": "交易、存款和取款"
+    },
+    "blockfi": {
+      "import": "从 BlockFi 导入 {0}",
+      "import_trade": "交易",
+      "import_transactions": "交易",
+      "line_one": "[Experimental]如果您发现导入的数据有问题，请告诉我们，以便我们相应地调整代码。",
+      "line_two": "BlockFi 允许您导出两个不同的文件。交易将从仅包含交易的文件中导入。"
+    },
+    "cointracking": {
+      "line_one": "CoinTracking 的交易/存款/取款不包括费用。",
+      "line_three": "ETH/BTC 交易被视为存款/取款，因此它们不会导入到 rotki 中。要导入 ETH 交易，只需在 {0} 中输入您的账户，它们就会自动为您导入。",
+      "line_two": "由于数据的表示方式，从 CoinTracking 导入的所有交易将始终被视为买入。",
+      "preferred": "出于上述原因，最好直接连接你的交易所以便从那里导入数据。如果你不这样做，就会失去很多准确性。"
+    },
+    "cryptocom": {
+      "line_four": "此处仅导入交易（用于税务报告），如果您希望资产显示在您的 rotki 余额中，您必须手动添加它们作为手动余额：{0}",
+      "line_one": "[Early stage] 这个导入脚本可能会遗漏一些交易类型，比如取款。由于我们无法拥有所有类型的详尽列表，我们会使用我们当时所知道的来开发它。如果你认为导入 可以改进脚本，您可以帮助提供更多数据类型，{0}。",
+      "line_one_link": "请告诉我们",
+      "line_three": "来自 crypto.com 的交易/存款/取款不包括费用明细。它们目前(2020 年 8 月)被免除或按交易金额处理。",
+      "line_two": "{0} 如果您想连接您的 Crypto.com Exchange 帐户，请等待我们支持它，然后连接到它作为交易所。",
+      "line_two_warning": "它只涉及 Crypto.com 移动应用程序。",
+      "source_name": "crypto.com 移动应用程序"
+    },
+    "custom": {
+      "import_events": "导入事件",
+      "import_trades": "导入交易",
+      "name": "自定义导入"
+    },
+    "description": "您可以通过将文件拖到相应区域或单击选择按钮，从以下服务手动导入数据。",
+    "kucoin": {
+      "import": "从 Kucoin 导入 {0}",
+      "import_types": "行业",
+      "line_one": "我们支持导入各行业的 csv 文件类型。"
+    },
+    "nexo": {
+      "import": "从 Nexo 导入 {0}",
+      "import_transactions": "交易",
+      "line_one": "[Experimental] 如果您发现导入的数据有问题，请告诉我们，以便我们相应地调整代码。"
+    },
+    "note": "从 {0} 的 CSV 导出中导入数据的重要注意事项。",
+    "notice": "这些平台可能会经常以向后不兼容的方式更改其格式。 因此，此导入可能会停止工作。 如果发生这种情况{link}，我们将看看我们能做些什么。",
+    "notice_link": "用 rotki 打开一个问题",
+    "select_source": {
+      "title": "选择来源"
+    },
+    "shapeshift": {
+      "import": "从 ShapeShift 导入 {0}",
+      "import_trade": "交易",
+      "line_one": "[Experimental] 如果您发现导入的数据有问题，请告诉我们，以便我们相应地调整代码。",
+      "line_two": "ShapeShift 允许您导出交易文件。交易将从仅包含交易的文件中导入。"
+    },
+    "title": "导入数据",
+    "uphold": {
+      "import": "从 Uphold 导入 {0}",
+      "import_trade": "交易",
+      "line_one": "[Experimental] 如果您发现导入的数据有问题，请告诉我们，以便我们相应地调整代码。",
+      "line_two": "Uphold 让您导出一个交易文件。它可以在活动列表右上角的活动下找到。"
+    }
+  },
+  "input_mode_select": {
+    "import_from_wallet": {
+      "label": "从浏览器钱包导入地址",
+      "missing": "我们无法在该浏览器中检测到任何钱包。",
+      "missing_tooltip": {
+        "title": "以下是常见的原因:",
+        "wallet_is_not_enabled": "钱包的扩展已禁用。您可以根据自己的浏览器，在 “扩展/附加组件 ”菜单中启用它。",
+        "wallet_is_not_installed": "该浏览器没有安装任何钱包。您可以到浏览器的扩展商店安装一个。"
+      }
+    }
+  },
+  "kraken_page": {
+    "loading": "您的 Kraken 质押信息正在加载中...",
+    "page": {
+      "description": "要查看您的质押信息，您需要添加一个 Kraken {link}"
+    }
+  },
+  "kraken_staking_events": {
+    "refresh_tooltip": "刷新您的 Kraken 质押事件"
+  },
+  "kraken_staking_overview": {
+    "current": "当前",
+    "earned": "总收入",
+    "hint": {
+      "current": "基于当前资产价格",
+      "historical": "基于资产的历史价格"
+    },
+    "historical": "历史",
+    "title": "概述"
+  },
+  "kraken_staking_received": {
+    "switch": {
+      "current": "当前",
+      "historical": "历史"
+    },
+    "title": "每项资产赚取"
+  },
+  "liquity_pools": {
+    "liquidation_gains": "无人认领的清算收益",
+    "no_lusd_deposited": "没有存入 LUSD",
+    "rewards": "无人认领 @:common.rewards",
+    "title": "稳定池存款"
+  },
+  "liquity_staking_details": {
+    "refresh_tooltip": "刷新质押金额和价格",
+    "select_account": "选择账户"
+  },
+  "liquity_staking_events": {
+    "title": "股权活动"
+  },
+  "loan_stake": {
+    "no_lqty_staked": "没有质押的 LQTY",
+    "unclaimed_rewards": "无人认领的奖励"
+  },
+  "locations": {
+    "total_asset_price": "总资产价格"
+  },
+  "login": {
+    "button_create_account": "创建账户",
+    "button_no_account": "没有帐户？",
+    "credential_error": {
+      "description": "如果您尚未创建应用帐户，则需要创建应用帐户才能登录。",
+      "support": "如果您需要帮助，请通过我们的 Discord 支持渠道联系我们。",
+      "title": "请注意，您的网站帐户和应用程序帐户是分开的，不能互换使用。"
+    },
+    "custom_backend": {
+      "hint": "你想要连接的后端的 url(默认留空)",
+      "label": "后台网址",
+      "session_only": "仅为本次会话保存",
+      "tooltip": "连接到不同的 rotki 后端",
+      "validation": {
+        "non_empty": "自定义后台url不能为空",
+        "url": "插入的条目不是有效的 url 格式"
+      }
+    },
+    "description": {
+      "more_details": "{documentation} 向您显示有关本地应用程序和用户的更多详细信息。",
+      "our_docs": "我们的文档",
+      "welcome": "欢迎！ 请输入您的详细信息。"
+    },
+    "label_password": "密码",
+    "label_username": "个人资料名称",
+    "logout": "注销",
+    "migrating_data": {
+      "current": "正在应用数据迁移 {currentVersion} 的 {totalSteps} 中的步骤 {currentStep}。",
+      "title": "数据迁移",
+      "warning": "数据迁移 {currentVersion} 正在运行。在完成之前请不要关闭应用程序。"
+    },
+    "remember_password": "记住密码d",
+    "remember_password_tooltip": "密码将保存在本地计算机上的密码管理工具中（例如 MacOS 中的钥匙串）",
+    "remember_username": "記住個人資料名稱",
+    "sync_error": {
+      "local_modified": "本地最后修改时间：{0}",
+      "question": "你想更换你的本地数据库吗？",
+      "remote_modified": "远程最后修改：{0}",
+      "title": "数据库同步所需的用户操作"
+    },
+    "title": "解锁账户",
+    "upgrading_db": {
+      "current": "正在应用数据库升级 v{currentVersion} 的 {totalSteps} 中的步骤 {currentStep}。",
+      "title": "数据库升级",
+      "warning": "数据库正在从版本 {fromVersion} 升级到 {toVersion}。在完成之前请不要关闭应用程序。"
+    },
+    "validation": {
+      "non_empty_password": "请提供密码",
+      "non_empty_username": "請提供個人資料名稱",
+      "valid_username": "設定檔名稱必須僅包含字母數字字元且不能包含空格"
+    },
+    "welcome_description": "欢迎使用保护您隐私的开源投资组合管理器。",
+    "welcome_title": "欢迎来到 rotki"
+  },
+  "macos_unsupported": {
+    "header": "不支持的 macOS 版本",
+    "message": "rotki 支持的最低 macOs 版本是 High Sierra(10.13)"
+  },
+  "manage_user_assets": {
+    "export": {
+      "button": "导出",
+      "subtitle": "为您的资产创建一个 zip 存档",
+      "success": "存档创建成功",
+      "title": "导出"
+    },
+    "import": {
+      "subtitle": "从 zip 存档中恢复用户资产"
+    },
+    "warning": "此功能旨在让您轻松地将资产从一个 rotki 实例移动到另一个实例。它要求两个实例具有相同的版本。在不同版本之间使用此功能可能会导致错误。"
+  },
+  "managed_asset_content": {
+    "add_asset": "增加资产"
+  },
+  "manual_balances": {
+    "add_manual_balance": "添加手动余额",
+    "dialog": {
+      "add": {
+        "title": "添加手动余额"
+      },
+      "edit": {
+        "subtitle": "修改余额、位置、标签",
+        "title": "编辑手动余额"
+      }
+    }
+  },
+  "manual_balances_form": {
+    "fields": {
+      "balance_type": "余额类型",
+      "create_a_custom_asset": "创建自定义资产",
+      "input_manual_price": "添加和使用手动价格",
+      "label": "标签",
+      "tags": "标签"
+    },
+    "type": {
+      "liability": "责任"
+    },
+    "validation": {
+      "amount": "金额不能为空",
+      "asset": "资产不能为空",
+      "label_empty": "标签不能为空",
+      "label_exists": "标签 {label} 已经存在"
+    }
+  },
+  "manual_balances_table": {
+    "delete_dialog": {
+      "message": "您确定要删除此条目吗？",
+      "title": "删除手动跟踪余额"
+    },
+    "delete_tooltip": "删除余额",
+    "edit_tooltip": "编辑余额",
+    "refresh": {
+      "tooltip": "刷新手动余额"
+    }
+  },
+  "merge_dialog": {
+    "done": "资产合并完成。旧资产仍将出现在前端。为确保新资产在各处显示，请重新启动应用程序或在旧资产出现的每个地方手动刷新余额。",
+    "error": "合并不成功",
+    "hint": "源资产将合并到目标资产中，其所有用法都将更新。",
+    "merge": "合并",
+    "source": {
+      "label": "来源",
+      "non_empty": "源标识符不能为空"
+    },
+    "source_hint": "要合并到目标中的资产标识符",
+    "subtitle": "合并两个资产",
+    "target": {
+      "label": "目标",
+      "non_empty": "目标资产不能为空"
+    },
+    "target_hint": "标识符：{identifier}",
+    "title": "合并资产"
+  },
+  "message": {
+    "error": {
+      "title": "错误"
+    },
+    "success": {
+      "title": "成功"
+    }
+  },
+  "missing_exchange_rate": {
+    "message": "如果您使用此货币，本次 rotki 会话可能会出错。",
+    "title": "缺少汇率"
+  },
+  "module_activator": {
+    "hint": "* 为所有地址激活的模块不会出现在这里",
+    "subtitle": "选择应该为这个账户查询哪些模块",
+    "title": "启用模块"
+  },
+  "module_not_active": {
+    "at_least_one": "你需要至少激活其中一个。",
+    "not_active": "{module} 模块未激活。请访问{link}。{text}",
+    "settings_link": "模块设置"
+  },
+  "module_selector": {
+    "actions": {
+      "disable_all": "禁用所有",
+      "enable_all": "启用全部"
+    },
+    "filter": "搜索模块",
+    "select_accounts_hint": "选择将为每个子模块检索数据的帐户。如果没有选择地址，将为所有可用地址检索数据",
+    "table": {
+      "enabled": "已启用",
+      "select_accounts": "选择账户"
+    }
+  },
+  "module_settings": {
+    "title": "模块设置"
+  },
+  "modules": {
+    "dashboard": {
+      "liquidity_pools": {
+        "pool_details": {
+          "premium_only": "升级到溢价以查看资产信息"
+        },
+        "pool_table": {
+          "title": "LP代币"
+        },
+        "task": {
+          "error_message": "检索 {protocol} 余额时出错：{message}",
+          "title": "获取 {protocol} 余额"
+        }
+      }
+    }
+  },
+  "navigation_menu": {
+    "api_keys_sub": {
+      "exchanges": "交换",
+      "external_services": "外部服务",
+      "premium": "rotki 高级"
+    },
+    "balances": "余额",
+    "balances_sub": {
+      "blockchain_balances": "区块链余额",
+      "exchange_balances": "外汇余额",
+      "manual_balances": "手动余额",
+      "non_fungible_balances": "NFT 余额"
+    },
+    "dashboard": "仪表板",
+    "defi_sub": {
+      "airdrops": "空投"
+    },
+    "history": "历史",
+    "import_data": "导入数据",
+    "locations": "地点",
+    "manage_address_book": "管理地址簿",
+    "manage_assets": "管理资产",
+    "manage_assets_sub": {
+      "assets": "资产",
+      "custom_assets": "自定义资产",
+      "newly_detected": "新检测到的令牌"
+    },
+    "manage_prices": "管理价格",
+    "manage_prices_sub": {
+      "historic_prices": "历史价格",
+      "latest_prices": "最新价格"
+    },
+    "profit_loss_report": "盈亏报告",
+    "settings": "设置",
+    "settings_sub": {
+      "accounting": "会计",
+      "database": "数据库",
+      "general": "一般",
+      "modules": "模块"
+    },
+    "staking": "质押",
+    "statistics": "统计"
+  },
+  "nft_balance_table": {
+    "column": {
+      "percentage": "净值%",
+      "price_in_asset": "资产价格"
+    },
+    "title": "NFT 余额",
+    "token_id": "代币 ID"
+  },
+  "nft_gallery": {
+    "empty_filter": "没有匹配过滤器参数的 NFT",
+    "empty_subtitle": "没有检测到 NFT",
+    "empty_title": "未检测到 NFT",
+    "error_title": "加载 NFT 时出错",
+    "loading": "加载 NFT",
+    "refresh_tooltip": "重新加载 NFT",
+    "select_account": "选择账户",
+    "select_collection": "选择收藏",
+    "sort": {
+      "collection": "收藏"
+    },
+    "upgrade": "显示 {limit} 个 NFT。要查看更多,请升级到 {link}"
+  },
+  "non_fungible_balances": {
+    "column": {
+      "custom_price": "自定义价格",
+      "price_in_asset": "资产价格"
+    },
+    "ignore": "忽略 NFT",
+    "refresh": "刷新余额"
+  },
+  "notes_menu": {
+    "delete_confirmation": "你确定要删除这条笔记吗？",
+    "dialog": {
+      "add_title": "添加备注",
+      "edit_title": "编辑笔记"
+    },
+    "empty_notes": "没有找到/保存笔记",
+    "labels": {
+      "content": "记笔记...",
+      "title": "标题"
+    },
+    "last_updated": "最后更新时间：{datetime}",
+    "limit_warning": "免费计划中已达到 {limit} 个用户笔记的限制。要获得更多笔记，您可以升级到 {link}",
+    "rules": {
+      "content": {
+        "non_empty": "请填写备注"
+      }
+    },
+    "search": "搜索",
+    "tabs": {
+      "general": "一般",
+      "in_this_page_tooltip": "专用于 \"{page}\" 部分的注释"
+    },
+    "tooltip": "注释"
+  },
+  "notification_indicator": {
+    "tooltip": "通知"
+  },
+  "notification_messages": {
+    "address_migration": {
+      "message": "以下地址已添加到{chain}:{addresses}|以下地址已添加到{chain}:{addresses}",
+      "title": "地址已添加到{chain}|地址已添加到{chain}"
+    },
+    "backend": {
+      "title": "后端"
+    },
+    "missing_api_key": {
+      "action": "回车键",
+      "change_indexer_order": "更改索引器顺序",
+      "etherscan": {
+        "message": "rotki 正在使用 {service}，但未配置 API 密钥，这可能会减慢查询速度。您可以添加 API 密钥以获得更好的性能，或调整索引器顺序以优先使用其他服务。",
+        "title": "{service} API 密钥"
+      },
+      "get_key": "获取 API 密钥"
+    },
+    "new_detected_token": {
+      "action": "查看更多",
+      "message": "从事件处理和查询中检测到标识符为 {identifier} 的新令牌。|从事件处理和查询中检测到 {count} 个新令牌。",
+      "title": "检测到新令牌|检测到新令牌"
+    },
+    "premium": {
+      "active": {
+        "message": "检测到您的高级订阅。",
+        "title": "高级功能已激活"
+      },
+      "inactive": {
+        "expired_message": "您的高级订阅已过期。前往 rotki 网站续订您的订阅。",
+        "network_problem_message": "由于网络问题，我们无法验证您的高级订阅。",
+        "title": "高级功能已停用"
+      }
+    },
+    "snapshot_failed": {
+      "message": "无法在{location} 保存余额快照。{error}",
+      "title": "余额快照失败"
+    }
+  },
+  "notification_popup": {
+    "dismiss_all": "关闭所有待处理的通知",
+    "tooltip": "待处理通知数"
+  },
+  "notification_sidebar": {
+    "clear_tooltip": "清除所有通知",
+    "confirmation": {
+      "message": "此操作将清除所有活动通知。你想继续吗？",
+      "title": "清除活动通知"
+    },
+    "no_messages": "没有消息！",
+    "title": "通知"
+  },
+  "overall_balances": {
+    "loading": "加载中",
+    "premium_hint": "通过升级到 rotki premium 获得完整体验"
+  },
+  "pinned": {
+    "tooltip": "固定部分"
+  },
+  "poap_delivery_airdrops": {
+    "title": "可领取的 POAP 交付 NFT"
+  },
+  "premium_components": {
+    "eth2_staking": {
+      "based_of_performance": "基于性能",
+      "overview": "概述",
+      "staking_per_beacon_chain": "每个信标链验证器的 Staking"
+    },
+    "staking": {
+      "no_accounts": "没有检测到有 {protocol} 质押的账户。",
+      "refresh": "刷新质押详情"
+    },
+    "statistics": {
+      "asset_amount_and_value_over_time": "资产数量和价值随时间的变化",
+      "max_visible": "要显示的最大资产",
+      "netvalue_over_time": "一段时间内的净值",
+      "no_balance_snapshot_data_available": "没有可用的余额快照数据。",
+      "range_selector": {
+        "data_available": "数据可用",
+        "ending_date_must_before_starting_date": "结束日期不能早于开始日期。",
+        "no_entries_available_before": "之前没有条目可用"
+      },
+      "refresh_the_net_value_data": "刷新净值数据",
+      "select_asset": "搜索资产",
+      "value_distribution_by_asset": "按资产分配价值",
+      "value_distribution_by_location": "按位置分配价值",
+      "visible_percentage": "仅显示项目的百分比："
+    },
+    "theme_manager": {
+      "dark_theme": "深色主题",
+      "light_theme": "浅色主题",
+      "reset": {
+        "default": "重置为默认的应用程序颜色",
+        "short": "重置为默认值"
+      },
+      "select_color": "选择颜色"
+    },
+    "unsupported_app_version": {
+      "minimum_supported": "最低支持版本为 v{v}",
+      "subtitle": "高级组件不再支持此版本的 rotki。",
+      "title": "不支持的应用版本",
+      "update_to_latest": "为了更好的支持，请更新到最新版本。"
+    }
+  },
+  "premium_credentials": {
+    "validation": {
+      "non_empty_key": "API key 不能为空",
+      "non_empty_secret": "API secret 不能为空"
+    }
+  },
+  "premium_loading_failed": {
+    "description": "这可能表示高级组件服务存在问题。",
+    "open_issue": "如果问题仍然存在，请在我们的问题跟踪器中打开一个问题。",
+    "title": "加载组件时出错。",
+    "try_again": "请稍后再试。"
+  },
+  "premium_lock": {
+    "tooltip": "只有高级订阅才支持该功能"
+  },
+  "premium_settings": {
+    "actions": {
+      "delete": "删除 Key",
+      "replace": "替换 Key",
+      "setup": "设置",
+      "sync": "允许与 rotki 服务器同步数据"
+    },
+    "delete_confirmation": {
+      "message": "您确定要删除您帐户的 rotki 高级密钥吗？如果您想重新启用高级密钥，您将不得不再次输入您的密钥。",
+      "title": "删除 rotki 高级密钥？"
+    },
+    "error": {
+      "removing_failed": "删除密钥不成功",
+      "setting_failed": "设置密钥不成功"
+    },
+    "get": "获得溢价",
+    "premium_active": "@:premium_settings.title 已激活",
+    "subtitle": "@:premium_settings.title 是一项可选的订阅服务，可以访问分析、图表并解锁许多其他功能。有关可用内容的更多信息，请访问 {0} 网站。"
+  },
+  "price_accuracy_hint": {
+    "tooltip": "这些价格是基于美元历史价值的当前汇率"
+  },
+  "price_form": {
+    "date_non_empty": "价格日期不能为空",
+    "from_asset": "来自资产",
+    "from_non_empty": "from 资产不能为空",
+    "historic": {
+      "hint": "1 {fromAsset} 价值 {price} {toAsset}"
+    },
+    "latest": {
+      "hint": "1 {fromAsset} 值 {price} {toAsset}"
+    },
+    "price_non_empty": "价格不能为空",
+    "to_non_empty": "to 资产不能为空"
+  },
+  "price_management": {
+    "add": {
+      "error": {
+        "description": "添加价格不成功：{message}",
+        "title": "加价失败"
+      }
+    },
+    "dialog": {
+      "add_title": "添加手动价格",
+      "edit_title": "编辑手动价格"
+    },
+    "edit": {
+      "error": {
+        "description": "编辑价格不成功：{message}",
+        "title": "价格修改失败"
+      }
+    },
+    "from_asset": "来自资产",
+    "historic": {
+      "add_title": "添加手动历史价格"
+    },
+    "latest": {
+      "add_title": "添加手动最新价格"
+    }
+  },
+  "price_oracle_selection": {
+    "hint": "* 禁用所有预言机将导致无法查询资产价格。您可能需要单击“刷新价格”来应用更改。"
+  },
+  "price_oracle_settings": {
+    "data_name": "价格预言机",
+    "historic_prices": "历史价格",
+    "latest_prices": "最新价格",
+    "latest_prices_update": "最新订单价格已更新。您可能需要单击“刷新价格”按钮来应用更改。",
+    "subtitle": "管理以何种顺序使用哪些价格预言机。",
+    "title": "价格预言机设置"
+  },
+  "price_refresh": {
+    "button": "刷新价格"
+  },
+  "price_table": {
+    "actions": {
+      "delete": {
+        "tooltip": "删除价格条目"
+      },
+      "edit": {
+        "tooltip": "编辑价格条目"
+      }
+    },
+    "delete": {
+      "dialog": {
+        "message": "您确定要删除此价格条目吗？",
+        "title": "删除价格"
+      },
+      "failure": {
+        "message": "删除价格条目时出错：{message}",
+        "title": "价格删除失败"
+      }
+    },
+    "fetch": {
+      "failure": {
+        "message": "无法获取价格 {message}",
+        "title": "价格获取失败"
+      }
+    },
+    "headers": {
+      "from_asset": "来自资产"
+    },
+    "is_worth": "值得",
+    "on": "上",
+    "refresh_tooltip": "刷新价格",
+    "was_worth": "值得"
+  },
+  "prioritized_list": {
+    "all_added": "没有禁用 {namePluralized}",
+    "disabled_items": "{num} 个禁用的 {namePluralized}",
+    "item": {
+      "delete": "禁用 {name} 条目",
+      "empty": "找不到价格 {namePluralized}！"
+    }
+  },
+  "profit_loss_events": {
+    "cost_basis": {
+      "hide": "隐藏成本基础",
+      "show": "显示成本基础"
+    },
+    "same_action": "这个事件发生在同一个动作上"
+  },
+  "profit_loss_overview": {
+    "title": "概述"
+  },
+  "profit_loss_report": {
+    "actionable": {
+      "actions": {
+        "pin_section": "引脚部分",
+        "regenerate_report": "重新生成报告"
+      },
+      "issues_found": "在生成的报告中发现了 {total} 个问题",
+      "missing_acquisitions": {
+        "asset_is_ignored": "该资产被忽略",
+        "headers": {
+          "found_amount": "发现数量",
+          "missing_acquisitions": "缺少收购",
+          "missing_amount": "缺失金额",
+          "quick_action": "快速行动"
+        },
+        "hint": "一些资产获取丢失了。你需要弄清楚你在哪里购买的，然后导入或手动创建相关的获取事件",
+        "title": "缺失收购({total})"
+      },
+      "missing_prices": {
+        "all_prices_filled": "所有价格均已填写",
+        "hint": "一些事件被跳过，因为我们找不到相关资产的价格。您可以通过手动输入价格来帮助 rotki。您不填写的条目将继续被跳过。",
+        "if_sure": "如果你确定，",
+        "input_price": "输入价格",
+        "no_filled_prices": "没有填写价格",
+        "price_is_saved": "价格已保存",
+        "price_not_found": "未找到价格",
+        "refresh_price_hint": "当 rokti 尝试获取历史价格时检测到速率限制。您可以手动再次获取历史价格，或输入手动价格。",
+        "regenerate_report_nudge": "点击下方按钮重新生成报告。",
+        "skipped_all_events_confirmation": "你确定要跳过所有资产价格缺失的事件吗？",
+        "title": "缺失价格({total})",
+        "total_skipped_prices": "{total} 个价格被跳过"
+      },
+      "show_issues": "显示问题"
+    },
+    "csv_export_error": "导出错误",
+    "download_failed": "无法下载报告",
+    "error": {
+      "subtitle": "由于错误无法生成报告",
+      "title": "损益表生成"
+    },
+    "loading": "正在加载您的 PnL 报告，请稍候",
+    "loading_hint": "您的报告生成可能需要一段时间，具体取决于您在选定时间段内执行的交易量和操作。",
+    "loading_message": "正在生成您的报告，请稍候...",
+    "report_period": "报告从{start}到{end}",
+    "settings_tooltip": "打开会计设置"
+  },
+  "profit_loss_reports": {
+    "columns": {
+      "created": "创建日期",
+      "end": "期末",
+      "start": "周期开始"
+    },
+    "debug": {
+      "export_data": "导出调试数据",
+      "export_message": {
+        "failure": "导出PnL报告调试数据失败",
+        "success": "PnL报告调试数据导出成功",
+        "title": "导出PnL报告调试数据"
+      },
+      "import_data": "导入调试数据",
+      "import_data_dialog": {
+        "title": "导入PnL报告调试数据"
+      },
+      "import_message": {
+        "failure": "导入 PnL 报告调试数据失败：{message}",
+        "success": "PnL报告调试数据导入成功",
+        "title": "导入PnL报告调试数据"
+      },
+      "title": "调试"
+    },
+    "notification": {
+      "action": "查看报告",
+      "message": "从 {start} 到 {end} 生成了盈亏报告。",
+      "title": "已生成盈亏报告"
+    },
+    "title": "生成的报告"
+  },
+  "purge_selector": {
+    "centralized_exchange": "中心化交易所",
+    "centralized_exchange_to_clear": {
+      "hint": "清空该字段以删除所有中心化交易所的数据",
+      "label": "集中交易所清零"
+    },
+    "chain_to_clear": {
+      "hint": "清空该字段以删除所有链的交易数据",
+      "label": "链要清除"
+    },
+    "decentralized_exchange": "去中心化交易所",
+    "decentralized_exchange_to_clear": {
+      "hint": "清空此字段以删除所有去中心化交易所的数据",
+      "label": "去中心化交易所去清算"
+    },
+    "defi_module": "DeFi 模块",
+    "defi_module_to_clear": {
+      "hint": "清空此字段以删除所有 defi 模块的数据",
+      "label": "待清除的 DeFi 模块"
+    },
+    "label": "选择数据源",
+    "transactions": "交易"
+  },
+  "queried_address_dialog": {
+    "add": "添加地址",
+    "all_address_queried": "你所有的以太坊地址都被查询了 {module}",
+    "remove_tooltip": "从查询地址中移除地址",
+    "subtitle": "管理为{module}查询的地址",
+    "title": "查询地址"
+  },
+  "reports_table": {
+    "delete": "删除报告",
+    "load": "加载报告"
+  },
+  "rounding_settings": {
+    "amount_rounding": "金额舍入",
+    "amount_rounding_hint": "指定金额（例如拥有资产的金额）如何四舍五入。",
+    "round": {
+      "down": "向下取整",
+      "down_description": "向零舍入",
+      "half_even": "对半",
+      "half_even_description": "向最近的邻居舍入。如果等距，则向偶数邻居舍入",
+      "up": "向上舍入",
+      "up_description": "从零开始四舍五入"
+    },
+    "subtitle": "设置显示的金额在前端如何四舍五入",
+    "title": "金额取整",
+    "value_rounding": "值四舍五入",
+    "value_rounding_hint": "指定价值（例如拥有资产的法币价值）如何四舍五入。"
+  },
+  "rpc_node_form": {
+    "active": "活跃",
+    "active_hint": "只有活动节点会被查询",
+    "endpoint": "端点",
+    "owned": "拥有",
+    "owned_hint": "如果此节点是用户拥有的私有节点则启用",
+    "weight": "重量",
+    "weight_hint": "节点权重{weight}/100(调整公共节点权重时其他节点也会相应调整)"
+  },
+  "settings": {
+    "not_saved": "设置未保存",
+    "saved": "设置已保存"
+  },
+  "snapshot_action_button": {
+    "force_save": "强制保存",
+    "ignore_errors_label": "忽略错误",
+    "ignore_errors_tooltip": "保存余额快照，忽略外部 API 上的任何错误。这可能导致快照不完整。",
+    "messages": {
+      "failed_description": "导入快照失败: {message}",
+      "success_description": "快照导入成功。您现在将退出。",
+      "title": "快照导入"
+    },
+    "snapshot_title": "最后余额快照",
+    "snapshot_tooltip": "这将强制拍摄所有余额的快照，忽略任何缓存。请谨慎使用，因为它可能会导致您受到速率限制。"
+  },
+  "snapshot_import_dialog": {
+    "balance_snapshot_file": "余额快照文件",
+    "balance_snapshot_file_suggested": "建议的文件名:balances_snapshot_import.csv",
+    "location_data_snapshot_file": "位置数据快照文件",
+    "location_data_snapshot_suggested": "建议文件名:location_data_snapshot_import.csv",
+    "title": "手动导入快照"
+  },
+  "sorting_selector": {
+    "desc": {
+      "sort_asc_tooltip": "将排序改为升序",
+      "sort_desc_tooltip": "将排序改为降序"
+    }
+  },
+  "staking_page": {
+    "dropdown_hint": "选择一个位置以查看更多详细信息",
+    "dropdown_label": "选择位置",
+    "page": {
+      "description": "选择一个受支持的位置以查看有关您的质押资产的更多信息。",
+      "title": "质押地点"
+    }
+  },
+  "statistics_graph_settings": {
+    "infer_zero_timed_balances": {
+      "label": "为在特定时间没有余额的资产推断零时间余额。这对于在图表中显示零余额期间很有用。",
+      "title": "推断零时间余额"
+    },
+    "multiplier": {
+      "label": "乘数",
+      "off": "没有错过的快照将被视为零。",
+      "on": "如果两个现有余额快照之间有 {period} 小时或更长时间的时间段，则图表将考虑该时间段的零余额。",
+      "subtitle": "设置在两个现有余额快照之间的多少小时后图表将考虑该期间的零余额。",
+      "title": "缺少快照乘数",
+      "validations": {
+        "positive_number": "必须是正数"
+      }
+    },
+    "tooltip": "资产图表设置"
+  },
+  "summary_card": {
+
+  },
+  "sync_buttons": {
+    "download_tooltip": "从服务器拉取保存的数据并替换你的本地数据库",
+    "upload_tooltip": "将您的本地数据库推送到服务器并替换那里的所有数据"
+  },
+  "sync_indicator": {
+    "db_upload_result": {
+      "message": "我们无法完成上传，因为{reason}",
+      "title": "数据库同步尝试不成功"
+    },
+    "last_data_upload": "上次高级数据库同步",
+    "menu_tooltip": "查看上次高级数据库同步的时间，并执行手动同步。",
+    "upload_confirmation": {
+      "action": "推|拉",
+      "confirm_check": "我明白了",
+      "message_download": "通过强制拉取，您的本地数据库将被替换为从 rotki 服务器拉取的数据。没有办法恢复任何被覆盖的数据，或恢复此操作。执行此操作时请小心，因为它可能会导致意外 数据丢失。通过继续，您承认您了解使用此操作的危险。",
+      "message_download_relogin": "执行拉取后，需要手动重新登录。",
+      "message_upload": "通过强制推送，任何先前驻留在 rotki 服务器中的同步数据都将被覆盖。没有办法恢复任何被覆盖的数据，或恢复此操作。执行此操作时请小心，因为它可能会导致意外数据 损失。通过继续，您承认您了解使用此操作的危险。",
+      "title": "强制推 | 强制拉"
+    }
+  },
+  "tag_creator": {
+    "labels": {
+      "background": "背景",
+      "foreground": "前景"
+    },
+    "validation": {
+      "empty_name": "请提供标签名称"
+    }
+  },
+  "tag_manager": {
+    "confirmation": {
+      "message": "您确定要删除 {tagToDelete} 吗？这也会删除该标签的所有映射。",
+      "title": "确认标签删除"
+    },
+    "title": "标签管理器"
+  },
+  "task_manager": {
+    "error": "处理任务 [{taskId}] '{title}' 时出错：{error}"
+  },
+  "theme_switch": {
+    "auto": "自动（检测设备主题）",
+    "dark": "暗",
+    "light": "亮",
+    "tooltip": "切换到 {mode} 模式"
+  },
+  "timeframe_settings": {
+    "default_timeframe": "仪表板图形默认时间范围",
+    "default_timeframe_description": "设置仪表板图表的默认时间范围。此时间范围将在登录时预先选择。默认情况下，它将记住上一个会话的选择。",
+    "inactive_timeframes": "非活动时间帧",
+    "visible_timeframes": "可见时间框架"
+  },
+  "transactions": {
+    "actions": {
+      "add_event": "添加新事件",
+      "delete_transaction": "删除交易和事件",
+      "redecode_events": "重新解码事件"
+    },
+    "dialog": {
+      "add_tx": "按 tx 哈希值添加交易",
+      "delete": {
+        "error": {
+          "message": "失败：{message}",
+          "title": "删除 EVM 交易"
+        },
+        "message": "您确定要删除该事务及其事件吗？您必须清除所有事务或按事务哈希值添加才能恢复它们。",
+        "title": "删除事务和事件"
+      }
+    },
+    "events": {
+      "actions": {
+        "delete": "删除事件",
+        "edit": "编辑事件"
+      },
+      "confirmation": {
+        "delete": {
+          "message": "您确定要删除该事件吗？",
+          "title": "删除事件"
+        },
+        "ignore": {
+          "action": "是的，忽略交易",
+          "message": "一个交易至少需要一个事件。你想在会计中忽略这个交易吗？",
+          "title": "无法删除事件"
+        }
+      },
+      "dialog": {
+        "add": {
+          "title": "添加事件"
+        },
+        "edit": {
+          "title": "编辑活动"
+        }
+      },
+      "export": {
+        "confirmation_message": "您确定要导出已应用所选筛选器的事件列表吗？"
+      },
+      "form": {
+        "amount": {
+          "validation": {
+            "non_empty": "金额字段不能为空。"
+          }
+        },
+        "asset": {
+          "validation": {
+            "non_empty": "资产字段不能为空"
+          }
+        },
+        "datetime": {
+          "hint": "事件发生的日期和时间"
+        },
+        "event_subtype": {
+          "validation": {
+            "non_empty": "事件子类型字段不能为空。"
+          }
+        },
+        "event_type": {
+          "label": "事件类型",
+          "validation": {
+            "non_empty": "事件类型字段不能为空。"
+          }
+        },
+        "location": {
+          "validation": {
+            "non_empty": "位置字段不能为空。"
+          }
+        },
+        "location_label": {
+          "label": "位置标签"
+        },
+        "notes": {
+          "hint": "[Optional] 为操作存储的附加注释"
+        },
+        "sequence_index": {
+          "label": "序列索引",
+          "validation": {
+            "non_empty": "序列索引字段不能为空。"
+          }
+        }
+      },
+      "headers": {
+        "event_identifier": "事件组 ID"
+      },
+      "skipped": {
+        "csv_export_error": "导出为CSV时出错",
+        "download_failed": "无法下载CSV",
+        "headers": {
+          "number": "被跳过的事件数量"
+        },
+        "no_skipped_events": "未发现跳过的事件",
+        "reprocess": {
+          "action": "重新处理事件",
+          "failed": {
+            "no_processed_events": "未处理任何被跳过的外部事件",
+            "title": "重新处理被跳过事件时出错"
+          },
+          "success": {
+            "all": "所有被跳过的外部事件已被处理",
+            "some": "已处理 {successful} 个（共 {total} 个）被跳过的外部事件",
+            "title": "已处理的被跳过事件"
+          }
+        }
+      }
+    },
+    "filter": {
+      "account": "按账户筛选"
+    },
+    "ignore": "从会计中排除",
+    "refresh_tooltip": "获取最新事件",
+    "title": "历史事件",
+    "unignore": "在会计中包含"
+  },
+  "underlying_token_manager": {
+    "delete_tooltip": "删除底层代币",
+    "edit_tooltip": "编辑底层代币",
+    "hint": "代币中标的资产的百分比。例如，一个 uniswap lp 代币由两个标的代币组成，每个代币具有 50% 的权重。",
+    "labels": {
+      "tokens": "底层代币",
+      "weight": "重量"
+    },
+    "tokens": {
+      "token_kind": "代币种类",
+      "weight": "重量"
+    },
+    "validation": {
+      "address_non_empty": "地址不能为空",
+      "non_empty": "请设置权重值",
+      "not_valid": "指定的重量似乎不是有效值",
+      "out_of_range": "权重可以从 1-100%"
+    }
+  },
+  "update_indicator": {
+    "version": "rotki 的更新版本 ({appVersion}) 可用"
+  },
+  "update_popup": {
+    "download_failed": {
+      "message": "下载应用程序更新时出错。有关更多信息，请查看应用程序日志文件 (rotki_electron.log)。"
+    },
+    "download_nudge": "你要下载吗？",
+    "download_progress": "正在下载应用程序更新，请稍候",
+    "downloaded": "更新版本将在下次重启时安装。您要立即重启应用程序以应用更新吗？",
+    "install_failed": {
+      "message": "安装应用程序更新时出错：{message}"
+    },
+    "messages": "新版本的 rotki 可用。请参阅 {releaseNotes}。",
+    "release_notes": "发行说明",
+    "restart": "rotki 将立即重启以应用更新。"
+  },
+  "upgrade_row": {
+    "events": "@:upgrade_row.first_line 要查看更多请升级到 {link}",
+    "events_premium": "@:upgrade_row.first_line 要查看更多请 {link}",
+    "first_line": "从 {from} 到 {to} 处理了 {limit} out of {total} {label}。",
+    "rotki_premium": "rotki 高级版",
+    "upgrade": "显示 {limit} out of {total} {label}。要查看更多，请升级到 {link}",
+    "upgrade_premium": "显示 {limit} out of {total} {label}。要查看更多请 {link}",
+    "upgrade_your_plan": "升级您的计划"
+  },
+  "user_dropdown": {
+    "change_privacy_mode": {
+      "label": "更改隐私模式",
+      "normal_mode": {
+        "description": "同时显示金额和百分比",
+        "label": "正常"
+      },
+      "private_mode": {
+        "description": "隐藏金额和百分比",
+        "label": "私人"
+      },
+      "semi_private_mode": {
+        "description": "隐藏金额显示百分比",
+        "label": "半私人"
+      }
+    },
+    "confirmation": {
+      "message": "您确定要退出当前的 rotki 会话吗？",
+      "title": "需要确认"
+    },
+    "logout": "注销",
+    "settings": "设置",
+    "switch_theme": "切换主题"
+  },
+  "validator_filter_input": {
+    "label": "选择验证器"
+  },
+  "win_unsupported": {
+    "header": "不支持的 Windows 版本",
+    "message": "rotki 支持的最低 Windows 版本是 Windows 8(6.2)"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "bundler"
+  },
+  "references": [
+    {
+      "path": "tsconfig.lib.json"
+    }
+  ],
+  "files": []
+}

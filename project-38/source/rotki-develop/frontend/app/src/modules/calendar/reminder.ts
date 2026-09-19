@@ -1,0 +1,32 @@
+import { z } from 'zod';
+
+export const CalenderReminderPayload = z.object({
+  eventId: z.number(),
+  secsBefore: z.number(),
+});
+
+export type CalenderReminderPayload = z.infer<typeof CalenderReminderPayload>;
+
+export const CalendarReminderEntry = CalenderReminderPayload.extend({
+  acknowledged: z.boolean(),
+  identifier: z.number(),
+});
+
+export type CalendarReminderEntry = z.infer<typeof CalendarReminderEntry>;
+
+export const CalendarReminderEntries = z.object({
+  entries: z.array(CalendarReminderEntry),
+});
+
+export type CalendarReminderEntries = z.infer<typeof CalendarReminderEntries>;
+
+export interface CalendarReminderRequestPayload {
+  identifier: number;
+}
+
+export const CalendarReminderAddResponseSchema = z.object({
+  success: z.array(z.number()).optional(),
+  failed: z.array(z.number()).optional(),
+});
+
+export type CalendarReminderAddResponse = z.infer<typeof CalendarReminderAddResponseSchema>;

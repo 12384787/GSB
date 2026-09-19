@@ -1,0 +1,2376 @@
+import datetime
+import operator
+from collections import defaultdict
+from contextlib import ExitStack
+from pathlib import Path
+from typing import TYPE_CHECKING
+from unittest.mock import MagicMock, Mock, patch
+
+import pytest
+
+from rotkehlchen.accounting.structures.balance import Balance, BalanceSheet
+from rotkehlchen.assets.asset import Asset, EvmToken, UnderlyingToken
+from rotkehlchen.assets.utils import get_or_create_evm_token
+from rotkehlchen.chain.aggregator import CHAIN_TO_BALANCE_PROTOCOLS
+from rotkehlchen.chain.arbitrum_one.modules.gearbox.balances import (
+    GearboxBalances as GearboxBalancesArbitrumOne,
+)
+from rotkehlchen.chain.arbitrum_one.modules.gearbox.constants import GEAR_TOKEN_ARB
+from rotkehlchen.chain.arbitrum_one.modules.gmx.balances import GmxBalances
+from rotkehlchen.chain.arbitrum_one.modules.gmx.constants import CPT_GMX
+from rotkehlchen.chain.arbitrum_one.modules.thegraph.balances import ThegraphBalances
+from rotkehlchen.chain.arbitrum_one.modules.umami.balances import UmamiBalances
+from rotkehlchen.chain.arbitrum_one.modules.umami.constants import CPT_UMAMI
+from rotkehlchen.chain.base.modules.aerodrome.balances import AerodromeBalances
+from rotkehlchen.chain.base.modules.extrafi.balances import ExtrafiBalances as ExtrafiBalancesBase
+from rotkehlchen.chain.base.modules.morpho_blue.balances import MorphoBlueBalances
+from rotkehlchen.chain.base.modules.runmoney.balances import RunmoneyBalances
+from rotkehlchen.chain.base.modules.runmoney.constants import CPT_RUNMONEY
+from rotkehlchen.chain.ethereum.interfaces.balances import (
+    BalancesSheetType,
+    ProtocolWithBalance,
+    ProtocolWithGauges,
+)
+from rotkehlchen.chain.ethereum.modules.aave.balances import AaveBalances
+from rotkehlchen.chain.ethereum.modules.across.balances import AcrossBalances
+from rotkehlchen.chain.ethereum.modules.blur.balances import BlurBalances
+from rotkehlchen.chain.ethereum.modules.blur.constants import BLUR_IDENTIFIER, CPT_BLUR
+from rotkehlchen.chain.ethereum.modules.convex.balances import CPT_CONVEX, ConvexBalances
+from rotkehlchen.chain.ethereum.modules.curve.balances import CurveBalances
+from rotkehlchen.chain.ethereum.modules.curve.constants import VOTING_ESCROW
+from rotkehlchen.chain.ethereum.modules.curve.crvusd.balances import CurveCrvusdBalances
+from rotkehlchen.chain.ethereum.modules.eigenlayer.balances import EigenlayerBalances
+from rotkehlchen.chain.ethereum.modules.eigenlayer.constants import CPT_EIGENLAYER
+from rotkehlchen.chain.ethereum.modules.gearbox.balances import GearboxBalances
+from rotkehlchen.chain.ethereum.modules.gearbox.constants import GEAR_TOKEN
+from rotkehlchen.chain.ethereum.modules.hedgey.balances import HedgeyBalances
+from rotkehlchen.chain.ethereum.modules.hedgey.constants import CPT_HEDGEY
+from rotkehlchen.chain.ethereum.modules.octant.balances import OctantBalances
+from rotkehlchen.chain.ethereum.modules.octant.constants import CPT_OCTANT
+from rotkehlchen.chain.ethereum.modules.pendle.balances import PendleBalances
+from rotkehlchen.chain.ethereum.modules.pendle.constants import PENDLE_TOKEN
+from rotkehlchen.chain.ethereum.modules.pickle_finance.main import PickleFinance
+from rotkehlchen.chain.ethereum.modules.safe.balances import SafeBalances
+from rotkehlchen.chain.ethereum.modules.safe.constants import CPT_SAFE, SAFE_TOKEN_ID
+from rotkehlchen.chain.ethereum.modules.yearn.vesting.balances import (
+    YearnVestingBalances,
+    vested_amount_at,
+)
+from rotkehlchen.chain.ethereum.modules.yearn.vesting.constants import CPT_YEARN_VESTING
+from rotkehlchen.chain.ethereum.utils import should_update_protocol_cache
+from rotkehlchen.chain.evm.contracts import WEB3
+from rotkehlchen.chain.evm.decoding.aave.constants import CPT_AAVE, CPT_AAVE_V3
+from rotkehlchen.chain.evm.decoding.across.constants import CPT_ACROSS
+from rotkehlchen.chain.evm.decoding.balancer.constants import CPT_BEETS_V2, CPT_BEETS_V3
+from rotkehlchen.chain.evm.decoding.compound.v3.balances import Compoundv3Balances
+from rotkehlchen.chain.evm.decoding.compound.v3.constants import CPT_COMPOUND_V3
+from rotkehlchen.chain.evm.decoding.curve.constants import CPT_CURVE
+from rotkehlchen.chain.evm.decoding.curve.lend.balances import CurveLendBalances
+from rotkehlchen.chain.evm.decoding.extrafi.cache import (
+    get_existing_reward_pools,
+    query_extrafi_data,
+)
+from rotkehlchen.chain.evm.decoding.extrafi.constants import CPT_EXTRAFI
+from rotkehlchen.chain.evm.decoding.flying_tulip.constants import CPT_FLYING_TULIP
+from rotkehlchen.chain.evm.decoding.flying_tulip.ftusd.balances import FlyingTulipStakingBalances
+from rotkehlchen.chain.evm.decoding.flying_tulip.lend.balances import FlyingTulipLendBalances
+from rotkehlchen.chain.evm.decoding.flying_tulip.lend.constants import (
+    LAST_DEPOSIT_FOR_QUERY,
+)
+from rotkehlchen.chain.evm.decoding.flying_tulip.lend.discovery import (
+    query_deposit_for_transactions,
+)
+from rotkehlchen.chain.evm.decoding.gearbox.constants import CPT_GEARBOX
+from rotkehlchen.chain.evm.decoding.giveth.constants import CPT_GIVETH
+from rotkehlchen.chain.evm.decoding.hop.balances import HopBalances
+from rotkehlchen.chain.evm.decoding.hop.constants import CPT_HOP
+from rotkehlchen.chain.evm.decoding.morpho_blue.constants import CPT_MORPHO_BLUE, MORPHO_BLUE
+from rotkehlchen.chain.evm.decoding.pendle.constants import CPT_PENDLE
+from rotkehlchen.chain.evm.decoding.thegraph.constants import CPT_THEGRAPH
+from rotkehlchen.chain.evm.decoding.velodrome.constants import CPT_AERODROME, CPT_VELODROME
+from rotkehlchen.chain.evm.decoding.velodrome.utils import get_slipstream_position_price
+from rotkehlchen.chain.evm.decoding.woo_fi.balances import WoofiBalances
+from rotkehlchen.chain.evm.decoding.woo_fi.constants import CPT_WOO_FI
+from rotkehlchen.chain.evm.types import (
+    EvmIndexer,
+    NodeName,
+    SerializableChainIndexerOrder,
+    WeightedNode,
+    string_to_evm_address,
+)
+from rotkehlchen.chain.gnosis.modules.giveth.balances import GivethBalances as GivethGnosisBalances
+from rotkehlchen.chain.hyperliquid.modules.kinetiq.balances import KinetiqBalances
+from rotkehlchen.chain.hyperliquid.modules.kinetiq.constants import CPT_KINETIQ
+from rotkehlchen.chain.optimism.modules.extrafi.balances import ExtrafiBalances
+from rotkehlchen.chain.optimism.modules.giveth.balances import (
+    GivethBalances as GivethOptimismBalances,
+)
+from rotkehlchen.chain.optimism.modules.velodrome.balances import VelodromeBalances
+from rotkehlchen.chain.optimism.modules.walletconnect.balances import WalletconnectBalances
+from rotkehlchen.chain.optimism.modules.walletconnect.constants import (
+    CPT_WALLETCONNECT,
+    WCT_TOKEN_ID,
+)
+from rotkehlchen.chain.sonic.modules.beets.balances import BeetsV2Balances, BeetsV3Balances
+from rotkehlchen.constants.assets import (
+    A_AAVE,
+    A_ARB,
+    A_CRV,
+    A_CVX,
+    A_ENS,
+    A_ETH,
+    A_GLM,
+    A_GMX,
+    A_GRT_ARB,
+    A_HYPE,
+    A_STETH,
+    A_USDC,
+    A_WBTC,
+    A_WETH,
+    A_WETH_ARB,
+)
+from rotkehlchen.constants.misc import ONE, ZERO
+from rotkehlchen.constants.resolver import evm_address_to_identifier
+from rotkehlchen.db.cache import DBCacheDynamic
+from rotkehlchen.db.filtering import EvmEventFilterQuery
+from rotkehlchen.db.history_events import DBHistoryEvents
+from rotkehlchen.fval import FVal
+from rotkehlchen.globaldb.cache import (
+    globaldb_get_unique_cache_last_queried_ts_by_key,
+    globaldb_set_general_cache_values,
+)
+from rotkehlchen.globaldb.handler import GlobalDBHandler
+from rotkehlchen.history.events.structures.evm_event import EvmEvent
+from rotkehlchen.history.events.structures.types import HistoryEventSubType, HistoryEventType
+from rotkehlchen.tests.unit.decoders.test_curve_crvusd import (
+    fixture_crvusd_controller,  # noqa: F401
+)
+from rotkehlchen.tests.unit.decoders.test_curve_lend import (
+    fixture_arbitrum_vault_token,  # noqa: F401
+    fixture_arbitrum_vault_underlying_token,  # noqa: F401
+)
+from rotkehlchen.tests.unit.test_types import LEGACY_TESTS_INDEXER_ORDER
+from rotkehlchen.tests.utils.arbitrum_one import get_arbitrum_allthatnode
+from rotkehlchen.tests.utils.balances import find_inheriting_classes
+from rotkehlchen.tests.utils.constants import CURRENT_PRICE_MOCK
+from rotkehlchen.tests.utils.decoders import patch_decoder_should_update_protocol_caches
+from rotkehlchen.tests.utils.ethereum import (
+    PRUNED_AND_NOT_ARCHIVED_NODE,
+    get_decoded_events_of_transaction,
+    wait_until_all_nodes_connected,
+)
+from rotkehlchen.tests.utils.factories import (
+    make_ethereum_event,
+    make_evm_address,
+    make_evm_tx_hash,
+)
+from rotkehlchen.tests.utils.sonic import SONIC_MAINNET_NODE
+from rotkehlchen.types import (
+    CacheType,
+    ChainID,
+    ChecksumEvmAddress,
+    Location,
+    Price,
+    SupportedBlockchain,
+    TimestampMS,
+    TokenKind,
+    deserialize_evm_tx_hash,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from rotkehlchen.chain.aggregator import ChainsAggregator
+    from rotkehlchen.chain.arbitrum_one.decoding.decoder import ArbitrumOneTransactionDecoder
+    from rotkehlchen.chain.arbitrum_one.node_inquirer import ArbitrumOneInquirer
+    from rotkehlchen.chain.base.decoding.decoder import BaseTransactionDecoder
+    from rotkehlchen.chain.base.node_inquirer import BaseInquirer
+    from rotkehlchen.chain.ethereum.decoding.decoder import EthereumTransactionDecoder
+    from rotkehlchen.chain.ethereum.node_inquirer import EthereumInquirer
+    from rotkehlchen.chain.evm.decoding.decoder import EVMTransactionDecoder
+    from rotkehlchen.chain.evm.node_inquirer import EvmNodeInquirer
+    from rotkehlchen.chain.evm.tokens import TokenBalancesType
+    from rotkehlchen.chain.gnosis.node_inquirer import GnosisInquirer
+    from rotkehlchen.chain.hyperliquid.node_inquirer import HyperliquidInquirer
+    from rotkehlchen.chain.optimism.decoding.decoder import OptimismTransactionDecoder
+    from rotkehlchen.chain.optimism.node_inquirer import OptimismInquirer
+    from rotkehlchen.db.dbhandler import DBHandler
+    from rotkehlchen.inquirer import Inquirer
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('load_global_caches', [[CPT_CURVE]])
+@pytest.mark.parametrize('ethereum_accounts', [['0xb24cE065a3A9bbCCED4B74b6F4435b852286396d']])
+def test_curve_balances(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        load_global_caches: list[str],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    tx_hash = deserialize_evm_tx_hash('0x09b67a0846ce2f6bea50221cfb5ac67f5b2f55b89300e45f58bf2f69dc589d43')  # noqa: E501
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=tx_hash,
+        load_global_caches=load_global_caches,
+    )
+    curve_balances_inquirer = CurveBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    curve_balances = curve_balances_inquirer.query_balances(addresses=ethereum_accounts)
+    user_balance = curve_balances[ethereum_accounts[0]]
+    asset = EvmToken('eip155:1/erc20:0xC25a3A3b969415c80451098fa907EC722572917F')
+    assert user_balance.assets[asset][CPT_CURVE] == Balance(
+        amount=FVal('2402.233522210805651105'),
+        value=FVal('3603.3502833162084766575'),
+    )
+
+
+def test_gauge_queries_are_scoped_per_address(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_transaction_decoder: EthereumTransactionDecoder,
+) -> None:
+    curve_balances = CurveBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=ethereum_transaction_decoder,
+    )
+    user1, user2, gauge1, gauge2 = (make_evm_address() for _ in range(4))
+    token1, token2 = A_CRV.resolve_to_evm_token(), A_CVX.resolve_to_evm_token()
+    with (
+        patch.object(curve_balances, 'addresses_with_gauge_deposits', return_value={
+            user1: [MagicMock(address=gauge1, asset=token1)],
+            user2: [MagicMock(address=gauge2, asset=token2)],
+        }),
+        patch.object(curve_balances, '_query_gauges_balances', return_value={}) as query_mock,
+        patch(
+            'rotkehlchen.chain.ethereum.interfaces.balances.get_rpc_first_chunk_size_call_order',
+            return_value=(100, []),
+        ),
+    ):
+        ProtocolWithGauges.query_balances(curve_balances, addresses=[user1, user2])
+
+    assert [
+        call_args.kwargs['gauges_to_token'] for call_args in query_mock.call_args_list
+    ] == [{gauge1: token1}, {gauge2: token2}]
+
+
+@pytest.mark.vcr
+@pytest.mark.parametrize('ethereum_accounts', [['0x21Ab0875611da0235BC5b6405b8A08268D859700']])
+def test_curve_locked_crv_balances(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_transaction_decoder: EthereumTransactionDecoder,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Ensure locked CRV balances stored in the veCRV escrow are detected."""
+    lock_event = EvmEvent(
+        tx_ref=make_evm_tx_hash(),
+        sequence_index=0,
+        timestamp=TimestampMS(0),
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.DEPOSIT,
+        event_subtype=HistoryEventSubType.DEPOSIT_TO_PROTOCOL,
+        asset=A_CRV,
+        amount=(locked_crv_amount := FVal('311.05616434049212239')),
+        location_label=(address := ethereum_accounts[0]),
+        counterparty=CPT_CURVE,
+        address=VOTING_ESCROW,
+    )
+    events_db = DBHistoryEvents(ethereum_inquirer.database)
+    with ethereum_inquirer.database.conn.write_ctx() as write_cursor:
+        events_db.add_history_event(write_cursor=write_cursor, event=lock_event)
+
+        curve_balances = CurveBalances(
+            evm_inquirer=ethereum_inquirer,
+            tx_decoder=ethereum_transaction_decoder,
+        ).query_balances(addresses=ethereum_accounts)
+        user_balance = curve_balances[address]
+        assert user_balance.assets[A_CRV][CPT_CURVE] == Balance(
+            amount=locked_crv_amount,
+            value=locked_crv_amount * CURRENT_PRICE_MOCK,
+        )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0xe5e2Baf96198c56380dDD5E992D7d1ADa0e989c0']])
+def test_yearn_vesting_balances(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_transaction_decoder: EthereumTransactionDecoder,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Ensure tokens still vesting in a yearn vesting escrow are detected as balances
+    of the escrow's recipient. The escrow is discovered from a decoded claim event.
+    """
+    token = get_or_create_evm_token(
+        userdb=ethereum_inquirer.database,
+        evm_address=string_to_evm_address('0xBe53A109B494E5c9f97b9Cd39Fe969BE68BF6204'),
+        chain_id=ChainID.ETHEREUM,
+        token_kind=TokenKind.ERC20,
+        symbol='yvUSDC-1',
+        decimals=6,
+    )
+    events_db = DBHistoryEvents(ethereum_inquirer.database)
+    with ethereum_inquirer.database.conn.write_ctx() as write_cursor:
+        events_db.add_history_event(write_cursor=write_cursor, event=EvmEvent(
+            tx_ref=make_evm_tx_hash(),
+            sequence_index=0,
+            timestamp=TimestampMS(0),
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.WITHDRAWAL,
+            event_subtype=HistoryEventSubType.WITHDRAW_FROM_PROTOCOL,
+            asset=token,
+            amount=ONE,
+            location_label=(user_address := ethereum_accounts[0]),
+            counterparty=CPT_YEARN_VESTING,
+            address=string_to_evm_address('0x0d2b3AE5432c53580b462f04e6365a1955C8bbD4'),
+        ))
+
+    vesting_balances = YearnVestingBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=ethereum_transaction_decoder,
+    ).query_balances(addresses=ethereum_accounts)
+    vesting_amount = FVal('22623.100898')  # locked + unclaimed at recording time
+    assert vesting_balances[user_address].assets[token][CPT_YEARN_VESTING] == Balance(
+        amount=vesting_amount,
+        value=vesting_amount * CURRENT_PRICE_MOCK,
+    )
+
+
+@pytest.mark.parametrize(('timestamp', 'expected'), [
+    (999, 0),  # before the vesting start
+    (1249, 0),  # after the start but before the cliff
+    (1250, 250),  # cliff reached, vests linearly from the start
+    (1500, 500),
+    (2000, 1000),  # fully vested
+    (2500, 1000),  # capped after the vesting end
+])
+def test_yearn_vesting_vested_amount(timestamp: int, expected: int) -> None:
+    """Test the linear vesting schedule computation of the yearn vesting escrows"""
+    assert vested_amount_at(
+        timestamp=timestamp,
+        start_time=1000,
+        end_time=2000,
+        cliff_length=250,
+        total_locked=1000,
+    ) == expected
+
+
+@pytest.mark.parametrize('ethereum_accounts', [['0xfBe970e455a52acCa2A86265202da711Ac7A99dd']])
+def test_across_staked_lp_balances(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_transaction_decoder: EthereumTransactionDecoder,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    token = get_or_create_evm_token(
+        userdb=ethereum_inquirer.database,
+        evm_address=string_to_evm_address('0xC9b09405959f63F72725828b5d449488b02be1cA'),
+        chain_id=ChainID.ETHEREUM,
+        token_kind=TokenKind.ERC20,
+        symbol='Av2-USDC-LP',
+        decimals=9,
+    )
+    events_db = DBHistoryEvents(ethereum_inquirer.database)
+    with ethereum_inquirer.database.conn.write_ctx() as write_cursor:
+        events_db.add_history_event(write_cursor=write_cursor, event=EvmEvent(
+            tx_ref=deserialize_evm_tx_hash('0xba03ae3521fb051d2f2c11355401f13f004978cc2b6af3d936a7333d8c5ce01f'),
+            sequence_index=178,
+            timestamp=TimestampMS(1782476591000),
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.DEPOSIT_TO_PROTOCOL,
+            asset=token,
+            amount=FVal('0.941791733'),
+            location_label=(user_address := ethereum_accounts[0]),
+            counterparty=CPT_ACROSS,
+            address=string_to_evm_address('0x9040e41eF5E8b281535a96D9a48aCb8cfaBD9a48'),
+        ))
+
+    with (
+        patch.object(ethereum_inquirer, 'call_contract', return_value=1100000000000000000),
+        patch.object(ethereum_inquirer, 'multicall', return_value=[WEB3.codec.encode(
+            ['(uint256,uint256,uint256,uint256)'],
+            [(941791733, 1782476591, 2208435768107840498940736998091, 0)],
+        )]),
+        patch.object(
+            type(inquirer),
+            'find_main_currency_prices',
+            side_effect=lambda assets: {
+                asset: inquirer.find_across_lp_price(asset.resolve_to_evm_token())
+                for asset in assets
+            },
+        ),
+        patch.object(
+            type(inquirer),
+            'get_evm_manager',
+            return_value=Mock(node_inquirer=ethereum_inquirer),
+        ),
+    ):
+        across_balances = AcrossBalances(
+            evm_inquirer=ethereum_inquirer,
+            tx_decoder=ethereum_transaction_decoder,
+        ).query_balances(addresses=ethereum_accounts)
+
+    staked_amount = FVal('0.941791733')
+    updated_token = EvmToken(token.identifier)
+    assert updated_token.protocol == CPT_ACROSS
+    assert updated_token.underlying_tokens == [UnderlyingToken(
+        address=A_USDC.resolve_to_evm_token().evm_address,
+        token_kind=TokenKind.ERC20,
+        weight=ONE,
+    )]
+    assert across_balances[user_address].assets[updated_token][CPT_ACROSS] == Balance(
+        amount=staked_amount,
+        value=staked_amount * CURRENT_PRICE_MOCK * FVal('1.1'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('load_global_caches', [[CPT_CONVEX]])
+@pytest.mark.parametrize('ethereum_accounts', [['0x53913A03a065f685097f8E8f40284D58016bB0F9']])
+def test_convex_gauges_balances(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    tx_hash = deserialize_evm_tx_hash('0xf9d35b99cd67a506d216dbfeaaeb89adcfb3b8d104f2d863c97278eacee1bc41')  # noqa: E501
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=tx_hash,
+    )
+    convex_balances_inquirer = ConvexBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    convex_balances = convex_balances_inquirer.query_balances(addresses=ethereum_accounts)
+    user_balance = convex_balances[ethereum_accounts[0]]
+    asset = EvmToken('eip155:1/erc20:0xF9835375f6b268743Ea0a54d742Aa156947f8C06')
+    assert user_balance.assets[asset][CPT_CONVEX] == Balance(
+        amount=FVal('34.011048723934089999'),
+        value=FVal('51.0165730859011349985'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('load_global_caches', [[CPT_CONVEX]])
+@pytest.mark.parametrize('ethereum_accounts', [['0x36928dCA92EA4eDA2292d0090e60532eB6A32475']])
+def test_convex_staking_balances(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check Convex balance query for CVX locked and staked"""
+    tx_hash = deserialize_evm_tx_hash('0x49f4dabfee05cc78e2b19a574373ad5afb1de52e03d7b355fe8611be7137e411')  # noqa: E501
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=tx_hash,
+    )
+    convex_balances_inquirer = ConvexBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    convex_balances = convex_balances_inquirer.query_balances(addresses=ethereum_accounts)
+    user_balance = convex_balances[ethereum_accounts[0]]
+    # the amount here is the sum of the locked ~44 and the staked tokens ~333
+    assert user_balance.assets[A_CVX.resolve_to_evm_token()][CPT_CONVEX] == Balance(
+        amount=FVal('18229.934390350508148387'),
+        value=FVal('27344.9015855257622225805'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0x36928dCA92EA4eDA2292d0090e60532eB6A32475']])
+def test_convex_staking_balances_without_gauges(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_transaction_decoder: EthereumTransactionDecoder,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """
+    Check that convex balances are correctly propagated if one account doesn't have gauges
+    deposits but has staked CVX. The reason for this test is that staked/locked CVX is added to the
+    balances returned from the gauges and those balances before this test were
+    not a defaultdict and could lead to a failure.
+    """
+    tx_hash = deserialize_evm_tx_hash('0x49f4dabfee05cc78e2b19a574373ad5afb1de52e03d7b355fe8611be7137e411')  # noqa: E501
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=tx_hash,
+    )
+    convex_balances_inquirer = ConvexBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    convex_balances = convex_balances_inquirer.query_balances(addresses=ethereum_accounts)
+    user_balance = convex_balances[ethereum_accounts[0]]
+    assert user_balance.assets[A_CVX.resolve_to_evm_token()][CPT_CONVEX] == Balance(
+        amount=FVal('18229.934390350508148387'),
+        value=FVal('27344.9015855257622225805'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('load_global_caches', [[CPT_VELODROME]])
+@pytest.mark.parametrize('optimism_accounts', [['0x78C13393Aee675DD7ED07ce992210750D1F5dB88']])
+def test_velodrome_v2_staking_balances(
+        optimism_inquirer: OptimismInquirer,
+        optimism_transaction_decoder: OptimismTransactionDecoder,
+        optimism_accounts: list[ChecksumEvmAddress],
+        load_global_caches: list[str],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check that balances of velodrome v2 gauges are properly queried."""
+    tx_hash = deserialize_evm_tx_hash('0xed7e13e4941bba33edbbd70c4f48c734629fd67fe4eac43ce1bed3ef8f3da7df')  # transaction that interacts with the gauge address  # noqa: E501
+    _, tx_decoder = get_decoded_events_of_transaction(  # decode events that interact with the gauge address  # noqa: E501
+        evm_inquirer=optimism_inquirer,
+        tx_hash=tx_hash,
+        load_global_caches=load_global_caches,
+    )
+    balances_inquirer = VelodromeBalances(
+        evm_inquirer=optimism_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    balances = balances_inquirer.query_balances(addresses=optimism_accounts)  # queries the gauge balance of the address if the address has interacted with a known gauge  # noqa: E501
+    user_balance = balances[optimism_accounts[0]]
+    weth_op_lp_token = evm_address_to_identifier(
+        address=string_to_evm_address('0xd25711EdfBf747efCE181442Cc1D8F5F8fc8a0D3'),
+        chain_id=ChainID.OPTIMISM,
+        token_type=TokenKind.ERC20,
+    )
+    assert user_balance.assets[Asset(weth_op_lp_token).resolve_to_evm_token()][CPT_VELODROME] == Balance(  # noqa: E501
+        amount=FVal('0.043087772070655563'),  # staked in gauge
+        value=FVal('0.0646316581059833445'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('arbitrum_one_accounts', [['0xA9728D95567410555557a54EcA320e5E8bEa36a5']])
+def test_thegraph_balances_arbitrum_one(
+        arbitrum_one_inquirer: ArbitrumOneInquirer,
+        arbitrum_one_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check that balances of GRT currently delegated to indexers are properly detected."""
+    amount = FVal('32.04878202377411')
+    tx_hash = deserialize_evm_tx_hash('0x3c846f305330969fb0ddb87c5ae411b4e9692f451a7ff3237b6f71020030c7d1')  # noqa: E501
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_hash=tx_hash,
+    )
+    thegraph_balances_inquirer = ThegraphBalances(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    thegraph_balances = thegraph_balances_inquirer.query_balances(addresses=arbitrum_one_accounts)
+    user_balance = thegraph_balances[arbitrum_one_accounts[0]]
+    assert user_balance.assets[A_GRT_ARB][CPT_THEGRAPH] == Balance(
+        amount=amount,
+        value=amount * FVal(1.5),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0x9531C059098e3d194fF87FebB587aB07B30B1306']])
+@pytest.mark.parametrize('arbitrum_one_accounts', [['0x9531C059098e3d194fF87FebB587aB07B30B1306']])
+def test_thegraph_balances_vested_arbitrum_one(
+        arbitrum_one_inquirer: ArbitrumOneInquirer,
+        arbitrum_one_transaction_decoder: ArbitrumOneTransactionDecoder,
+        ethereum_inquirer: EthereumInquirer,
+        arbitrum_one_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check that balances of GRT currently vested are properly detected."""
+    expected_grt_balance = FVal('300243.11331623966')
+    # decode the delegation transfer event which has the vested contract address as delegator_l2
+    for tx_hash in (
+        '0x48321bb00e5c5b67f080991864606dbc493051d20712735a579d7ae31eca3d78',
+        '0xed80711e4cb9c428790f0d9b51f79473bf5253d5d03c04d958d411e7fa34a92e',
+    ):
+        get_decoded_events_of_transaction(
+            evm_inquirer=ethereum_inquirer,
+            tx_hash=deserialize_evm_tx_hash(
+                tx_hash,
+            ),
+        )
+
+    original_get_delegations = ThegraphBalances._get_delegations
+
+    def mock_get_delegations(self, addresses):
+        """Mock _get_delegations to ensure deterministic ordering for VCR"""
+        delegations = original_get_delegations(self, addresses=addresses)
+        return sorted(delegations, key=operator.itemgetter(0, 1, 2, 3))
+
+    with patch.object(ThegraphBalances, '_get_delegations', mock_get_delegations):
+        thegraph_balances = ThegraphBalances(
+            evm_inquirer=arbitrum_one_inquirer,
+            tx_decoder=arbitrum_one_transaction_decoder,
+        ).query_balances(addresses=arbitrum_one_accounts)
+    assert thegraph_balances[arbitrum_one_accounts[0]].assets[A_GRT_ARB][CPT_THEGRAPH] == Balance(
+        amount=expected_grt_balance,
+        value=expected_grt_balance * FVal(1.5),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0x936d69AbCD9acdC89455EEFAf744044fFC1CA660']])
+def test_octant_balances(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_transaction_decoder: EthereumTransactionDecoder,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check that balances of locked GLM in Octant are properly detected"""
+    tx_hash = deserialize_evm_tx_hash('0x24b721fc7aa34bd42297e3c799faebf931a5dcadec8f1b448b2609a0bc4ec08c')  # noqa: E501
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=tx_hash,
+    )
+    octant_balances_inquirer = OctantBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    octant_balances = octant_balances_inquirer.query_balances(addresses=ethereum_accounts)
+    user_balance = octant_balances[ethereum_accounts[0]]
+    assert user_balance.assets[A_GLM.resolve_to_evm_token()][CPT_OCTANT] == Balance(amount=FVal('9849.361552045676790003'), value=FVal('14774.0423280685151850045'))  # noqa: E501
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0x2B888954421b424C5D3D9Ce9bB67c9bD47537d12']])
+def test_octant_balances_v2(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_transaction_decoder: EthereumTransactionDecoder,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check that balances of locked GLM in Octant v2 are properly detected"""
+    tx_hash = deserialize_evm_tx_hash('0x117d78603f8a20f3c8ce29145d2f485d27688c922e09f532132fe33ecddcfe71')  # noqa: E501
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=tx_hash,
+    )
+    octant_balances_inquirer = OctantBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    octant_balances = octant_balances_inquirer.query_balances(addresses=ethereum_accounts)
+    user_balance = octant_balances[ethereum_accounts[0]]
+    assert user_balance.assets[A_GLM.resolve_to_evm_token()][CPT_OCTANT] == Balance(
+        amount=FVal('3767.190200498257727034'),
+        value=FVal('5650.785300747386590551'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0x15AcAA0E27b70AfE3D7631cDAf5516BCAbE3bc0F']])
+def test_eigenlayer_balances(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_transaction_decoder: EthereumTransactionDecoder,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    tx_hash = deserialize_evm_tx_hash('0x89981857ab9f31369f954ae332ffd910e1f3c8efe531efde5f26666316855591')  # noqa: E501
+    events, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=tx_hash,
+    )
+    assert len(events) == 2
+    balances_inquirer = EigenlayerBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    balances = balances_inquirer.query_balances(addresses=ethereum_accounts)
+    assert balances[ethereum_accounts[0]].assets[A_STETH.resolve_to_evm_token()][CPT_EIGENLAYER] == Balance(  # noqa: E501
+        amount=FVal('0.114063122816914142'),
+        value=FVal('0.1710946842253712130'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0x789E8DD02FfCCd7A753B048559d4FBeA1e1a1b7c']])
+def test_eigenpod_balances(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_transaction_decoder: EthereumTransactionDecoder,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    tx_hash = deserialize_evm_tx_hash('0xb6fa282227916f9b16df953f79a5859ba80b8bc3b9c6adc01f262070d3c9e3d5')  # noqa: E501
+    events, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=tx_hash,
+    )
+    assert len(events) == 2
+    balances_inquirer = EigenlayerBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    eigenpod_balance = FVal('0.054506232')
+    balances = balances_inquirer.query_balances(addresses=ethereum_accounts)
+    assert balances[ethereum_accounts[0]].assets[A_ETH][CPT_EIGENLAYER] == Balance(
+        amount=eigenpod_balance,
+        value=FVal('1.5') * eigenpod_balance,
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('arbitrum_one_accounts', [[
+    '0x328fE286b2bE1895959E2601364AfE9DAA22aba3',
+    '0x4ebE485C1DF060f6Fc6E3C3b200EBc21Fe11a94D',
+]])
+@pytest.mark.parametrize('arbitrum_one_manager_connect_at_start', [(get_arbitrum_allthatnode(weight=ONE, owned=True),)])  # noqa: E501
+@pytest.mark.parametrize('mocked_current_prices', [{
+    ('eip155:42161/erc20:0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f', 'EUR'): FVal(69928),  # wBTC
+    ('eip155:42161/erc20:0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1', 'EUR'): FVal(1.001),  # dai
+    ('eip155:42161/erc20:0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', 'EUR'): FVal(3583.17),  # weth  # noqa: E501
+    ('USD', 'EUR'): FVal(0.86),
+}])
+@pytest.mark.parametrize('should_mock_current_price_queries', [True])
+def test_gmx_balances(
+        arbitrum_one_inquirer: ArbitrumOneInquirer,
+        arbitrum_one_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """
+    Test querying balances for GMX. We use an address with 2 different positions and the other
+    one has a single position. There are both shorts and longs in the data.
+    """
+    for tx_hex in (
+        '0x195cdb1bde8da223c7e6216166f7e8b5b79fee6409dde145a8f3e95223ebcc51',  # short btc
+        '0x59d136f8d1b366a895ddf4136fb45d62b862e79f4a937f5a9b33ceec47eaf32f',  # long btc
+        '0xf14d5a3f3fa4a4c324f95b70db81502f3d7c1910782381ed82f3580da64b093f',  # long eth
+    ):
+        tx_hash = deserialize_evm_tx_hash(tx_hex)
+        _, tx_decoder = get_decoded_events_of_transaction(
+            evm_inquirer=arbitrum_one_inquirer,
+            tx_hash=tx_hash,
+        )
+
+    balances_inquirer = GmxBalances(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_decoder=tx_decoder,
+    )
+
+    # we mock the function call for the user positions since the function returns a set and
+    # the inconsistency in the order can affect the output of the mocked responses. We do
+    # check that the expected output and the actual output match.
+    expected_positions = {
+        arbitrum_one_accounts[0]: [
+            ('0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', True),  # noqa: E501
+            ('0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f', '0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f', True),  # noqa: E501
+        ],
+        arbitrum_one_accounts[1]: [
+            ('0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1', '0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f', False),  # noqa: E501
+        ],
+    }
+    actual_positions = balances_inquirer._extract_unique_deposits(
+        addresses=arbitrum_one_accounts,
+    )
+    for addr, positions in expected_positions.items():
+        assert set(actual_positions[addr]) == set(positions)
+
+    with patch(
+        'rotkehlchen.chain.arbitrum_one.modules.gmx.balances.GmxBalances._extract_unique_deposits',
+        return_value=expected_positions,
+    ):
+        balances = balances_inquirer.query_balances(addresses=arbitrum_one_accounts)
+
+    weth_arb = Asset('eip155:42161/erc20:0x82aF49447D8a07e3bd95BD0d56f35241523fBab1')
+    assert balances[arbitrum_one_accounts[0]].assets[weth_arb][CPT_GMX] == Balance(
+        amount=FVal('0.017737950443268023'),
+        value=FVal('63.55809188980468301082167440312664'),
+    )
+    wbtc_arb = Asset('eip155:42161/erc20:0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f')
+    assert balances[arbitrum_one_accounts[0]].assets[wbtc_arb][CPT_GMX] == Balance(
+        amount=FVal('0.00079318'),
+        value=FVal('55.46580837229843679981755944819408'),
+    )
+    dai_arb = Asset('eip155:42161/erc20:0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1')
+    assert balances[arbitrum_one_accounts[1]].assets[dai_arb][CPT_GMX] == Balance(
+        amount=FVal('36.891213952953196043'),
+        value=FVal('36.92810516690614923950566317966002'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('arbitrum_one_accounts', [['0x3D3db31AdbCCB6a4e5aE94ec0701d361E147FA6A']])
+@pytest.mark.parametrize('arbitrum_one_manager_connect_at_start', [(get_arbitrum_allthatnode(weight=ONE, owned=True),)])  # noqa: E501
+@pytest.mark.parametrize('should_mock_current_price_queries', [False])
+def test_gmx_balances_staking(
+        arbitrum_one_inquirer: ArbitrumOneInquirer,
+        arbitrum_one_accounts: list[ChecksumEvmAddress],
+        arbitrum_one_manager_connect_at_start,
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Test the balance query for staked GMX. It adds a staking event and then queries the
+    balances for that address.
+    """
+    wait_until_all_nodes_connected(
+        connect_at_start=arbitrum_one_manager_connect_at_start,
+        evm_inquirer=arbitrum_one_inquirer,
+    )
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0x25160bf17e5a77935c7661933c045739dba44606859a20f00f187ef291e56a8f'),
+    )
+    balances_inquirer = GmxBalances(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    balances = balances_inquirer.query_balances(addresses=arbitrum_one_accounts)
+    assert balances[arbitrum_one_accounts[0]].assets[A_GMX][CPT_GMX] == Balance(
+        amount=FVal('4.201981641893733976'),
+        value=FVal('32.64939735751431299352'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0x6A61Ea7832f84C3096c70f042aB88D9a56732D7B']])
+def test_aave_balances_staking(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Test the balance query for staked AAVE balances. It adds a staking event
+    and then queries the balances for that address."""
+    amount = FVal('0.134274348203440352')
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0xfaf96358784483a96a61db6aa4ecf4ac87294b841671ca208de6b5d8f83edf17'),
+    )
+    balances_inquirer = AaveBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    balances = balances_inquirer.query_balances(addresses=ethereum_accounts)
+    assert balances[ethereum_accounts[0]].assets[A_AAVE][CPT_AAVE] == Balance(
+        amount=amount,
+        value=amount * FVal(1.5),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [[
+    '0xecdED8b1c603cF21299835f1DFBE37f10F2a29Af', '0x8Cbac427B6967d5d84Ec4230081e2763AB3A8C92',
+]])
+def test_aave_v3_balances(blockchain: ChainsAggregator) -> None:
+    """Check that ethereum mainnet Aave v3 positions/liabilities are properly returned in the balances query"""  # noqa: E501
+    ethereum_manager = blockchain.get_evm_manager(chain_id=ChainID.ETHEREUM)
+    a_eth_usdc = get_or_create_evm_token(
+        userdb=blockchain.database,
+        evm_address=string_to_evm_address('0x98C23E9d8f34FEFb1B7BD6a91B7FF122F4e16F5c'),
+        chain_id=ChainID.ETHEREUM,
+        token_kind=TokenKind.ERC20,
+        symbol='aEthUSDC',
+        protocol=CPT_AAVE_V3,
+    )
+    stable_debt_eth_usdc = get_or_create_evm_token(
+        userdb=blockchain.database,
+        evm_address=string_to_evm_address('0xB0fe3D292f4bd50De902Ba5bDF120Ad66E9d7a39'),
+        chain_id=ChainID.ETHEREUM,
+        token_kind=TokenKind.ERC20,
+        symbol='stableDebtEthUSDC',
+        protocol=CPT_AAVE_V3,
+    )
+    variable_debt_eth_usdc = get_or_create_evm_token(
+        userdb=blockchain.database,
+        evm_address=string_to_evm_address('0x72E95b8931767C79bA4EeE721354d6E99a61D004'),
+        chain_id=ChainID.ETHEREUM,
+        token_kind=TokenKind.ERC20,
+        symbol='variableDebtEthUSDC',
+        protocol=CPT_AAVE_V3,
+    )
+
+    aave_prices = {
+        a_eth_usdc: Price(FVal(0.1)),
+        stable_debt_eth_usdc: Price(FVal(10)),
+        variable_debt_eth_usdc: Price(FVal(100)),
+    }
+
+    def mock_new_balances(addresses: Sequence[ChecksumEvmAddress]) -> TokenBalancesType:
+        return {
+            addresses[0]: {a_eth_usdc: FVal(123), stable_debt_eth_usdc: FVal(456)},
+            addresses[1]: {stable_debt_eth_usdc: FVal(456), variable_debt_eth_usdc: FVal(789)},
+        }, aave_prices
+
+    balances: defaultdict[ChecksumEvmAddress, BalanceSheet] = defaultdict(BalanceSheet)
+    with patch.object(
+        target=ethereum_manager.tokens,
+        attribute='query_tokens_for_addresses',
+        new=mock_new_balances,
+    ):
+        balances = ethereum_manager.query_evm_tokens(
+            accounts=blockchain.accounts.eth,
+            balances=balances,
+        )
+
+    # Check individual balances instead of full BalanceSheet comparison
+    assert balances[blockchain.accounts.eth[0]].assets[a_eth_usdc][CPT_AAVE_V3] == Balance(
+        amount=FVal(123),
+        value=FVal(123) * aave_prices[a_eth_usdc],
+    )
+    assert balances[blockchain.accounts.eth[0]].liabilities[stable_debt_eth_usdc][CPT_AAVE_V3] == Balance(  # noqa: E501
+        amount=FVal(456),
+        value=FVal(456) * aave_prices[stable_debt_eth_usdc],
+    )
+    assert balances[blockchain.accounts.eth[1]].liabilities[stable_debt_eth_usdc][CPT_AAVE_V3] == Balance(  # noqa: E501
+        amount=FVal(456),
+        value=FVal(456) * aave_prices[stable_debt_eth_usdc],
+    )
+    assert balances[blockchain.accounts.eth[1]].liabilities[variable_debt_eth_usdc][CPT_AAVE_V3] == Balance(  # noqa: E501
+        amount=FVal(789),
+        value=FVal(789) * aave_prices[variable_debt_eth_usdc],
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [[
+    '0x1107F797c1af4982b038Eb91260b3f9A90eecee9',
+    '0x887380Bb5F5fF5C87BEcc46F0867Fec460F7c5a6',
+    '0xD413dCf1b80E10a8Ba7Cab329DA7545cCc827319',
+]])
+def test_compound_v3_token_balances_liabilities(
+        blockchain: ChainsAggregator, ethereum_accounts: list[ChecksumEvmAddress],
+) -> None:
+    """Test that the balances of compound v3 supplied/borrowed tokens are correct."""
+    c_usdc_v3 = EvmToken('eip155:1/erc20:0xc3d688B66703497DAA19211EEdff47f25384cdc3')
+
+    with ExitStack() as stack:
+        patch_decoder_should_update_protocol_caches(stack)
+        blockchain.ethereum.transactions_decoder.decode_transaction_hashes(
+            ignore_cache=True,
+            tx_hashes=[
+                deserialize_evm_tx_hash('0x0c9276ed2a202b039d5fa6e9749fd19f631c62e8e4beccc2f4dc0358a4882bb1'),  # Borrow 3,500 USDC from cUSDCv3  # noqa: E501
+                deserialize_evm_tx_hash('0x13965c2a1ba75dafa060d0bdadd332c9330b9c5819a8fee7d557a937728fa22f'),  # Borrow 42.5043 USDC from USDCv3  # noqa: E501
+                deserialize_evm_tx_hash('0xd53dbca004a5f4a178d881e0194c4464ac5fd52db017329be01413514cb4796e'),  # Borrow 594,629.451218 USDC from USDCv3  # noqa: E501
+                deserialize_evm_tx_hash('0x542abb3dd8c187158b612de5409642a0e0624d13ab4146a0b62f4d8d28b9149b'),  # Deposit 0.01 ETH  # noqa: E501
+            ],
+        )
+    compound_v3_balances = Compoundv3Balances(
+        evm_inquirer=blockchain.ethereum.node_inquirer,
+        tx_decoder=blockchain.ethereum.transactions_decoder,
+    )
+    unique_borrows, underlying_tokens = compound_v3_balances._extract_unique_borrowed_tokens(
+        addresses=ethereum_accounts,
+    )
+
+    def mock_extract_unique_borrowed_tokens(
+            self: Compoundv3Balances,  # pylint: disable=unused-argument
+            addresses: list[ChecksumEvmAddress],  # pylint: disable=unused-argument
+    ) -> tuple[dict[EvmToken, list[ChecksumEvmAddress]], dict[ChecksumEvmAddress, EvmToken]]:
+        return {
+            token: sorted(borrowers)  # cast set to list to avoid randomness in VCR
+            for token, borrowers in unique_borrows.items()
+        }, underlying_tokens
+
+    def mock_query_tokens(addresses):
+        return ({
+            ethereum_accounts[1]: {c_usdc_v3: FVal('0.32795')},
+        }, {c_usdc_v3: Price(CURRENT_PRICE_MOCK)}) if len(addresses) != 0 else ({}, {})
+
+    with patch(
+        target='rotkehlchen.chain.evm.decoding.compound.v3.balances.Compoundv3Balances._extract_unique_borrowed_tokens',
+        new=mock_extract_unique_borrowed_tokens,
+    ), patch(
+        target='rotkehlchen.chain.evm.tokens.EvmTokens.query_tokens_for_addresses',
+        side_effect=mock_query_tokens,
+    ):
+        blockchain._query_chain_balances(blockchain=SupportedBlockchain.ETHEREUM)
+
+    def get_balance(amount: str):
+        return Balance(
+            amount=FVal(amount), value=FVal(amount) * CURRENT_PRICE_MOCK,
+        )
+    assert blockchain.balances.eth[ethereum_accounts[0]].liabilities[A_USDC][CPT_COMPOUND_V3] == get_balance('15042.136803')  # noqa: E501
+    assert blockchain.balances.eth[ethereum_accounts[1]].assets[c_usdc_v3][CPT_COMPOUND_V3] == get_balance('0.32795')  # noqa: E501
+    assert blockchain.balances.eth[ethereum_accounts[2]].assets[A_WETH][CPT_COMPOUND_V3] == get_balance('0.075')  # noqa: E501
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0x0e414c1c4780df6c09c2f1070990768D44B70b1D']])
+def test_blur_balances(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check that staked balances of Blur are properly detected."""
+    tx_hash = deserialize_evm_tx_hash('0x09b9d311c62dadc69a06f39daa5206760f38ef48d9e8473f27a9cf2d599133c9')  # noqa: E501
+    amount = FVal('6350.3577325406')
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=tx_hash,
+    )
+    blur_balances_inquirer = BlurBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    blur_balances = blur_balances_inquirer.query_balances(addresses=ethereum_accounts)
+    user_balance = blur_balances[ethereum_accounts[0]]
+    assert user_balance.assets[Asset(BLUR_IDENTIFIER)][CPT_BLUR] == Balance(
+        amount=amount,
+        value=amount * FVal(1.5),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('arbitrum_one_accounts', [['0x0e414c1c4780df6c09c2f1070990768D44B70b1D']])
+def test_hop_balances_staking(
+        arbitrum_one_inquirer: ArbitrumOneInquirer,
+        arbitrum_one_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Test the balance query for staked hop lp balances. It adds a staking event
+    and then queries the balances for that address."""
+    lp_amount, reward_amount = FVal('0.005676129314105837'), FVal('0.06248913329652552')
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0x6329984b82cb85903fee9fef61fb77cdf848ff6344056156da2e66676ad91473'),
+    )
+    balances_inquirer = HopBalances(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    balances = balances_inquirer.query_balances(addresses=arbitrum_one_accounts)
+    hop_lp_token = Asset('eip155:42161/erc20:0x59745774Ed5EfF903e615F5A2282Cae03484985a')
+    hop_reward_token = Asset('eip155:42161/erc20:0xc5102fE9359FD9a28f877a67E36B0F050d81a3CC')
+    assert balances[arbitrum_one_accounts[0]].assets[hop_lp_token][CPT_HOP] == Balance(
+        amount=lp_amount,
+        value=lp_amount * FVal(1.5),
+    )
+    assert balances[arbitrum_one_accounts[0]].assets[hop_reward_token][CPT_HOP] == Balance(
+        amount=reward_amount,
+        value=reward_amount * FVal(1.5),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('arbitrum_one_accounts', [['0x0e414c1c4780df6c09c2f1070990768D44B70b1D']])
+def test_hop_balances_staking_2(
+        arbitrum_one_inquirer: ArbitrumOneInquirer,
+        arbitrum_one_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Test the balance query for staked hop lp balances. It adds a staking event
+    and then queries the balances for that address."""
+    lp_amount, reward_amount = FVal('0.005676129314105837'), FVal('0.008945843949587174')
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0xe0c1f6f152422784a4e4346d84af7d32fda95eab17da257f3fdc5121f4a6fbc8'),
+    )
+    balances_inquirer = HopBalances(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    balances = balances_inquirer.query_balances(addresses=arbitrum_one_accounts)
+    hop_lp_token = Asset('eip155:42161/erc20:0x59745774Ed5EfF903e615F5A2282Cae03484985a')
+    assert balances[arbitrum_one_accounts[0]].assets[hop_lp_token][CPT_HOP] == Balance(
+        amount=lp_amount,
+        value=lp_amount * FVal(1.5),
+    )
+    assert balances[arbitrum_one_accounts[0]].assets[A_ARB][CPT_HOP] == Balance(
+        amount=reward_amount,
+        value=reward_amount * FVal(1.5),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0x0e414c1c4780df6c09c2f1070990768D44B70b1D']])
+def test_gearbox_balances(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check that staked balances of Gearbox are properly detected."""
+    tx_hash = deserialize_evm_tx_hash('0x5de7647a4c8f8ca1e5434725dd09b27ce05e41954d72c3f1f4d639c8b7019f4a')  # noqa: E501
+    amount = FVal('260.869836197270890866')
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=tx_hash,
+    )
+    protocol_balances_inquirer = GearboxBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    protocol_balances = protocol_balances_inquirer.query_balances(addresses=ethereum_accounts)
+    user_balance = protocol_balances[ethereum_accounts[0]]
+    assert user_balance.assets[GEAR_TOKEN][CPT_GEARBOX] == Balance(
+        amount=amount,
+        value=amount * FVal(1.5),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('arbitrum_one_accounts', [['0xc8474089b8A428a32d938f5C28FB7eC8534D6FD1']])
+def test_gearbox_balances_arb(
+        arbitrum_one_inquirer: ArbitrumOneInquirer,
+        arbitrum_one_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check that staked balances of Gearbox are properly detected."""
+    tx_hash = deserialize_evm_tx_hash('0xd6abdbf2e57c37e191c5e93b9b99d1c70acdca000b2fd9e8236093a0b359221e')  # noqa: E501
+    amount = FVal('139896.73226582730792446')
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_hash=tx_hash,
+    )
+    protocol_balances_inquirer = GearboxBalancesArbitrumOne(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    protocol_balances = protocol_balances_inquirer.query_balances(addresses=arbitrum_one_accounts)
+    user_balance = protocol_balances[arbitrum_one_accounts[0]]
+    assert user_balance.assets[GEAR_TOKEN_ARB][CPT_GEARBOX] == Balance(
+        amount=amount,
+        value=amount * FVal(1.5),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0xA76C44d0adD77F9403715D8B6F47AD4e6515EC8c']])
+def test_safe_locked(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check that locked SAFE balances are properly detected."""
+    tx_hash = deserialize_evm_tx_hash('0xad3d976ae02cf82f109cc2d2f3e8f2f10df6a00a4825e3f04cf0e1b7e68a06b8')  # noqa: E501
+    amount = FVal('11515.763372')
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=tx_hash,
+    )
+    protocol_balances_inquirer = SafeBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    protocol_balances = protocol_balances_inquirer.query_balances(addresses=ethereum_accounts)
+    user_balance = protocol_balances[ethereum_accounts[0]]
+    assert user_balance.assets[Asset(SAFE_TOKEN_ID)][CPT_SAFE] == Balance(
+        amount=amount,
+        value=amount * FVal(1.5),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0xdD3B1AA220A65428AB96Db2C8C02890CC513aa07']])
+def test_safenet_staked(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check that SAFE staked in SafeNet is properly detected."""
+    tx_hash = deserialize_evm_tx_hash('0xe2d848c50e978d10c9079c6468d81c5e427d81e729b91647a596e5aa27420a66')  # noqa: E501
+    amount = FVal('106361.771209977152494242')
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=tx_hash,
+    )
+    protocol_balances_inquirer = SafeBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    protocol_balances = protocol_balances_inquirer.query_balances(addresses=ethereum_accounts)
+    user_balance = protocol_balances[ethereum_accounts[0]]
+    assert user_balance.assets[Asset(SAFE_TOKEN_ID)][CPT_SAFE] == Balance(
+        amount=amount,
+        value=amount * FVal(1.5),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('db_settings', LEGACY_TESTS_INDEXER_ORDER)
+@pytest.mark.parametrize('network_mocking', [False])
+@pytest.mark.parametrize('optimism_accounts', [[
+    '0x4ba257EC214BA1e6a3b4E46Bd7C4654b9E81CED3',
+    '0xf34743D4F4C2f9276ED6dda070CB695ebB24aA62',
+]])
+def test_extrafi_lending_balances(
+        optimism_inquirer: OptimismInquirer,
+        optimism_accounts: list[ChecksumEvmAddress],
+        globaldb: GlobalDBHandler,
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check that balances for extrafi both for lending and locking extra are queried correctly"""
+    for tx_hex in (
+        '0x1886c8169b096df75061e2fec93df029c42325f2f7066535ecc07a504efc5e92',  # lock extra
+        '0x81a87d2f8a9752ac4889ec92d6ec553417e3b4cc709a240718cf423f362e89b1',  # deposit velo for lending  # noqa: E501
+    ):
+        tx_hash = deserialize_evm_tx_hash(tx_hex)
+        _, tx_decoder = get_decoded_events_of_transaction(
+            evm_inquirer=optimism_inquirer,
+            tx_hash=tx_hash,
+        )
+    protocol_balances_inquirer = ExtrafiBalances(
+        evm_inquirer=optimism_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    protocol_balances, velo_amount, extra_amount = protocol_balances_inquirer.query_balances(addresses=optimism_accounts), FVal('366399.179130825123704582'), FVal('6405.478041239509217895')  # noqa: E501
+    assert protocol_balances[optimism_accounts[0]].assets[Asset('eip155:10/erc20:0x9560e827aF36c94D2Ac33a39bCE1Fe78631088Db')][CPT_EXTRAFI] == Balance(  # noqa: E501
+        amount=velo_amount,
+        value=velo_amount * FVal(1.5),
+    )
+    assert protocol_balances[optimism_accounts[1]].assets[Asset('eip155:10/erc20:0x2dAD3a13ef0C6366220f989157009e501e7938F8')][CPT_EXTRAFI] == Balance(  # noqa: E501
+        amount=extra_amount,
+        value=extra_amount * FVal(1.5),
+    )
+
+    with globaldb.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            "SELECT key, value FROM unique_cache WHERE key LIKE 'EXTRAFI_LENDING_RESERVES%'",
+        ).fetchall() == [(
+            'EXTRAFI_LENDING_RESERVES1035',
+            '0x9560e827aF36c94D2Ac33a39bCE1Fe78631088Db',
+        )]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('db_settings', LEGACY_TESTS_INDEXER_ORDER)
+@pytest.mark.parametrize('network_mocking', [False])
+@pytest.mark.parametrize('base_accounts', [['0x007183900fBbe3e7815b278074a49B8C7319EDba']])
+@pytest.mark.parametrize('should_mock_current_price_queries', [False])
+def test_extrafi_farm_balances(
+        base_inquirer: BaseInquirer,
+        base_accounts: list[ChecksumEvmAddress],
+        globaldb: GlobalDBHandler,
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check that balances for extrafi farms are queried correctly"""
+    tx_hash = deserialize_evm_tx_hash('0xf0458b2c208fa7362669b6430277808a2bda527fcbe5dd3514a5879c445311cc')  # noqa: E501
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=base_inquirer,
+        tx_hash=tx_hash,
+    )
+    protocol_balances_inquirer = ExtrafiBalancesBase(
+        evm_inquirer=base_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    protocol_balances = protocol_balances_inquirer.query_balances(addresses=base_accounts)
+    assert protocol_balances[base_accounts[0]].assets[Asset('eip155:8453/erc20:0x61366A4e6b1DB1b85DD701f2f4BFa275EF271197')][CPT_EXTRAFI] == Balance(  # noqa: E501
+        amount=FVal('0.001146519712970269'),
+        value=FVal('13715.96845367077767909372680774996'),
+    )
+    assert protocol_balances[base_accounts[0]].liabilities[Asset('eip155:8453/erc20:0xB79DD08EA68A908A97220C76d19A6aA9cBDE4376')][CPT_EXTRAFI] == Balance(  # noqa: E501
+        amount=FVal('10015.072706'),
+        value=FVal('9111.555052506628515415610170'),
+    )
+
+    with globaldb.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            "SELECT key, value FROM unique_cache WHERE key LIKE 'EXTRAFI_FARM_METADADATA%'",
+        ).fetchall() == [(
+            'EXTRAFI_FARM_METADADATA845320',
+            '["0x61366A4e6b1DB1b85DD701f2f4BFa275EF271197", "0xA3d1a8DEB97B111454B294E2324EfAD13a9d8396", "0xB79DD08EA68A908A97220C76d19A6aA9cBDE4376"]',  # noqa: E501
+        )]
+
+    # query again to verify that it works as expected
+    assert (protocol_balances := protocol_balances_inquirer.query_balances(addresses=base_accounts))[base_accounts[0]].assets[Asset('eip155:8453/erc20:0x61366A4e6b1DB1b85DD701f2f4BFa275EF271197')][CPT_EXTRAFI] == Balance(  # noqa: E501
+        amount=FVal('0.001146519712970269'),
+        value=FVal('13715.96845367077767909372680774996'),
+    )
+    assert protocol_balances[base_accounts[0]].liabilities[Asset('eip155:8453/erc20:0xB79DD08EA68A908A97220C76d19A6aA9cBDE4376')][CPT_EXTRAFI] == Balance(  # noqa: E501
+        amount=FVal('10015.072706'),
+        value=FVal('9111.555052506628515415610170'),
+    )
+
+
+@pytest.mark.freeze_time
+@pytest.mark.vcr(filter_query_parameters=['apikey'], match_on=['uri', 'method', 'body'])
+def test_extrafi_cache(optimism_inquirer: OptimismInquirer, freezer):
+    """Check that the cache gets populated and timestamp updated if
+    we requery again"""
+    with GlobalDBHandler().conn.write_ctx() as write_cursor:
+        write_cursor.execute(
+            "DELETE FROM general_cache WHERE key LIKE 'EXTRAFI%'",
+        )
+        write_cursor.execute(
+            "DELETE FROM unique_cache WHERE key LIKE 'EXTRAFI%'",
+        )
+
+    start_ts = 1727436933
+    freezer.move_to(datetime.datetime.fromtimestamp(start_ts, tz=datetime.UTC))
+    query_extrafi_data(
+        inquirer=optimism_inquirer,
+        cache_type=CacheType.EXTRAFI_NEXT_RESERVE_ID,
+        msg_aggregator=optimism_inquirer.database.msg_aggregator,
+        reload_all=False,
+    )
+    chain = str(optimism_inquirer.chain_id.serialize_for_db())
+    with GlobalDBHandler().conn.read_ctx() as cursor:
+        existing_pools = get_existing_reward_pools(chain_id=ChainID.OPTIMISM)
+        assert '0x1A6cB72ba9aD6Cf0855D5B497e8E1485A3B3FE39' in existing_pools[0]
+        last_queried_ts = globaldb_get_unique_cache_last_queried_ts_by_key(
+            cursor=cursor,
+            key_parts=(CacheType.EXTRAFI_NEXT_RESERVE_ID, chain),
+        )
+        assert should_update_protocol_cache(
+            userdb=optimism_inquirer.database,
+            cache_key=CacheType.EXTRAFI_NEXT_RESERVE_ID,
+            args=(chain,),
+        ) is False
+
+    freezer.move_to(datetime.datetime.fromtimestamp(start_ts + 300, tz=datetime.UTC))
+    query_extrafi_data(  # check that the timestamp gets updated
+        inquirer=optimism_inquirer,
+        cache_type=CacheType.EXTRAFI_NEXT_RESERVE_ID,
+        msg_aggregator=optimism_inquirer.database.msg_aggregator,
+        reload_all=False,
+    )
+    with GlobalDBHandler().conn.read_ctx() as cursor:
+        assert globaldb_get_unique_cache_last_queried_ts_by_key(
+            cursor=cursor,
+            key_parts=(CacheType.EXTRAFI_NEXT_RESERVE_ID, chain),
+        ) > last_queried_ts
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('arbitrum_one_accounts', [['0x706A70067BE19BdadBea3600Db0626859Ff25D74']])
+def test_umami_balances(
+        arbitrum_one_inquirer: ArbitrumOneInquirer,
+        arbitrum_one_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check that staked balances of Umami are properly detected."""
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0x4688c10bc6fadf06c2348fffe1e13c6d7a0b0c586438944aa9557b447a5f319a'),
+    )
+
+    protocol_balances_inquirer = UmamiBalances(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    protocol_balances = protocol_balances_inquirer.query_balances(addresses=arbitrum_one_accounts)
+    user_balance = protocol_balances[arbitrum_one_accounts[0]]
+    assert user_balance.assets[Asset('eip155:42161/erc20:0x5f851F67D24419982EcD7b7765deFD64fBb50a97')][CPT_UMAMI] == Balance(  # noqa: E501
+        amount=FVal('46.422107'),
+        value=FVal('112.4829703110825'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('db_settings', LEGACY_TESTS_INDEXER_ORDER)
+@pytest.mark.parametrize('optimism_accounts', [['0xc0d5dBe750bb5c001Ba8C499385143f566611679']])
+def test_walletconnect_staked_balances(
+        optimism_inquirer: OptimismInquirer,
+        optimism_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check that staked balances of walletconnect are properly detected."""
+    tx_hash = deserialize_evm_tx_hash('0xcc691ea8eeb56fd5f5ceb98879e3571ee167a2ac4c5bad4c9463127262d096af')  # noqa: E501
+    amount = FVal('184.286559270201')
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=optimism_inquirer,
+        tx_hash=tx_hash,
+    )
+    protocol_balances_inquirer = WalletconnectBalances(
+        evm_inquirer=optimism_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    protocol_balances = protocol_balances_inquirer.query_balances(addresses=optimism_accounts)
+    user_balance = protocol_balances[optimism_accounts[0]]
+    assert user_balance.assets[Asset(WCT_TOKEN_ID)][CPT_WALLETCONNECT] == Balance(
+        amount=amount,
+        value=amount * FVal(1.5),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('should_mock_current_price_queries', [False])
+@pytest.mark.parametrize('arbitrum_one_accounts', [['0x706A70067BE19BdadBea3600Db0626859Ff25D74']])
+def test_curve_lend_balances(
+        arbitrum_one_inquirer: ArbitrumOneInquirer,
+        arbitrum_one_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+        arbitrum_vault_token: EvmToken,
+) -> None:
+    """Check that Curve lending collateral and debt balances are properly detected."""
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0x58e9068edee8897c5c2e2181cc897ba026efd936f74e14329b64355e82240ea5'),
+    )
+    protocol_balances_inquirer = CurveLendBalances(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    protocol_balances = protocol_balances_inquirer.query_balances(addresses=arbitrum_one_accounts)
+    user_balance = protocol_balances[arbitrum_one_accounts[0]]
+
+    assert user_balance.assets[A_WETH_ARB][CPT_CURVE] == Balance(
+        amount=FVal('0.013968407653526627'),
+        value=FVal('39.90019772599266896042'),
+    )
+    assert user_balance.liabilities[Asset('eip155:42161/erc20:0x498Bf2B1e120FeD3ad3D42EA2165E9b73f99C1e5')][CPT_CURVE] == Balance(  # noqa: E501
+        amount=FVal('30.100455885544052449'),
+        value=FVal('25.839194546739352031899968'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('should_mock_current_price_queries', [False])
+@pytest.mark.parametrize('ethereum_accounts', [['0x494FBCf6AB69609732B4c97462FAc7f7cb717015']])
+@pytest.mark.parametrize('crvusd_controller', ['0x4e59541306910aD6dC1daC0AC9dFB29bD9F15c67'], indirect=True)  # noqa: E501
+def test_curve_crvusd_balances(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+        crvusd_controller: ChecksumEvmAddress,
+) -> None:
+    """Check that Curve lending collateral and debt balances are properly detected."""
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0x7acdf5d10091405762dc3f2658e6da0fdd9cb42a74c55b944c2e88b089eb15cc'),
+    )
+    protocol_balances_inquirer = CurveCrvusdBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    protocol_balances = protocol_balances_inquirer.query_balances(addresses=ethereum_accounts)
+    user_balance = protocol_balances[ethereum_accounts[0]]
+
+    assert user_balance.assets[A_WBTC][CPT_CURVE] == Balance(
+        amount=FVal('0.04999999'),
+        value=FVal('3947.84921043'),
+    )
+    assert user_balance.liabilities[Asset('eip155:1/erc20:0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E')][CPT_CURVE] == Balance(  # noqa: E501
+        amount=FVal('3591.07534296748961703'),
+        value=FVal('3081.63462158809263748927311'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('should_mock_current_price_queries', [False])
+@pytest.mark.parametrize('gnosis_accounts', [['0x839395e20bbB182fa440d08F850E6c7A8f6F0780']])
+def test_gnosis_giveth_staked_balances(
+        gnosis_inquirer: GnosisInquirer,
+        gnosis_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+        allow_gnosis_etherscan: None,
+) -> None:
+    """Check that staked balances in Giveth Gnosis are properly detected"""
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=gnosis_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0x9cd449bab5d207bb5c72d681efb94f7c1643addfc41003ed7fc5a58cb7f0f265'),
+    )
+    protocol_balances_inquirer = GivethGnosisBalances(
+        evm_inquirer=gnosis_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    protocol_balances = protocol_balances_inquirer.query_balances(addresses=gnosis_accounts)
+    user_balance = protocol_balances[gnosis_accounts[0]]
+    giv_asset = Asset(protocol_balances_inquirer.giv_token_id)
+
+    assert user_balance.assets[giv_asset][CPT_GIVETH] == Balance(
+        amount=FVal('21266652.068337565927179618'),
+        value=FVal('9666.11869810079046522167997336'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('db_settings', LEGACY_TESTS_INDEXER_ORDER)
+@pytest.mark.parametrize('should_mock_current_price_queries', [False])
+@pytest.mark.parametrize('optimism_accounts', [['0x9924285ff2207D6e36642B6832A515A6a3aedCAB']])
+def test_optimism_giveth_staked_balances(
+        optimism_inquirer: OptimismInquirer,
+        optimism_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check that staked balances in Giveth Optimism are properly detected"""
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=optimism_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0x06a3f05d3441d4eb36c3497ddffbfaef059a47c735f6efa317ae0ba5962ed46c'),
+    )
+    protocol_balances_inquirer = GivethOptimismBalances(
+        evm_inquirer=optimism_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    protocol_balances = protocol_balances_inquirer.query_balances(addresses=optimism_accounts)
+    user_balance = protocol_balances[optimism_accounts[0]]
+    giv_asset = Asset(protocol_balances_inquirer.giv_token_id)
+
+    assert user_balance.assets[giv_asset][CPT_GIVETH] == Balance(
+        amount=FVal('31641.865744797163817899'),
+        value=FVal('14.38818919147416633127503328'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('should_mock_current_price_queries', [False])
+@pytest.mark.parametrize('ethereum_accounts', [['0x54BeCc7560a7Be76d72ED76a1f5fee6C5a2A7Ab6']])
+def test_hedgey_locked_balances(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        inquirer_defi: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check that hedgey locked voting token positions are detected"""
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0xb85eb3fb6496fa51ac3d43d230ea729b52593bd2781b2b9dfab638aab7011719'),
+    )
+    protocol_balances_inquirer = HedgeyBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    protocol_balances = protocol_balances_inquirer.query_balances(addresses=ethereum_accounts)
+    user_balance = protocol_balances[ethereum_accounts[0]]
+
+    assert user_balance.assets[A_ENS][CPT_HEDGEY] == Balance(
+        amount=FVal('2943.901116977446327568'),
+        value=FVal('29026.86501339762078982048'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('db_settings', LEGACY_TESTS_INDEXER_ORDER)
+@pytest.mark.parametrize('should_mock_current_price_queries', [False])
+@pytest.mark.parametrize('optimism_accounts', [['0xD4dd9a1FAc6D7bBe327c2b4A5Dc3197D0B10874b']])
+def test_velodrome_locked_balances(
+        optimism_inquirer: OptimismInquirer,
+        optimism_accounts: list[ChecksumEvmAddress],
+        inquirer_defi: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=optimism_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0x8747ae5f08613802c76f3c6d4517c87c2133b0231990dd30df32b8c9bb9fa7a1'),
+    )
+    protocol_balances_inquirer = VelodromeBalances(
+        evm_inquirer=optimism_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    protocol_balances = protocol_balances_inquirer.query_balances(addresses=optimism_accounts)
+    user_balance = protocol_balances[optimism_accounts[0]]
+    assert user_balance.assets[Asset('eip155:10/erc20:0x9560e827aF36c94D2Ac33a39bCE1Fe78631088Db')][CPT_VELODROME] == Balance(  # noqa: E501
+        amount=FVal('215.817657296359655794'),
+        value=FVal('5.29471501539563441629782432'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('db_settings', LEGACY_TESTS_INDEXER_ORDER)
+@pytest.mark.parametrize('should_mock_current_price_queries', [False])
+@pytest.mark.parametrize('base_accounts', [['0xD10c1617e7afF13759Ad45AA373E89d5251B37cC']])
+def test_aerodrome_locked_balances(
+        base_inquirer: BaseInquirer,
+        base_accounts: list[ChecksumEvmAddress],
+        inquirer_defi: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=base_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0x637a00989340052bbb5a6b63c012c70a3b695223a0da5da95e9b233a524908e2'),
+    )
+    protocol_balances_inquirer = AerodromeBalances(
+        evm_inquirer=base_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    protocol_balances = protocol_balances_inquirer.query_balances(addresses=base_accounts)
+    user_balance = protocol_balances[base_accounts[0]]
+    assert user_balance.assets[Asset('eip155:8453/erc20:0x940181a94A35A4569E4529A3CDfB74e38FD98631')][CPT_AERODROME] == Balance(  # noqa: E501
+        amount=FVal('927'),
+        value=FVal('520.361253'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('should_mock_current_price_queries', [False])
+@pytest.mark.parametrize('load_global_caches', [[CPT_AERODROME]])
+@pytest.mark.parametrize('base_accounts', [['0x14821442B7581632Ee23FF31aBa8e461A7a81022']])
+def test_aerodrome_slipstream_staked_balances(
+        base_inquirer: BaseInquirer,
+        base_accounts: list[ChecksumEvmAddress],
+        load_global_caches: list[str],
+        inquirer_defi: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Positions staked in concentrated liquidity gauges are found via the gauge's staked
+    values and valued from their underlying assets."""
+    with GlobalDBHandler().conn.write_ctx() as write_cursor:
+        globaldb_set_general_cache_values(
+            write_cursor=write_cursor,
+            key_parts=(CacheType.AERODROME_GAUGE_ADDRESS,),
+            values=(string_to_evm_address('0x491300eC768Cf28B13A8d3BbFd87713dD728b0AD'),),
+        )
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=base_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0x983751a5102c5fcb228e855fbc21c7058240611b3cb89c6077ff8596072b242a'),
+        load_global_caches=load_global_caches,
+    )
+    protocol_balances = AerodromeBalances(
+        evm_inquirer=base_inquirer,
+        tx_decoder=tx_decoder,
+    ).query_balances(addresses=base_accounts)
+    position_balance = protocol_balances[base_accounts[0]].assets[Asset(
+        'eip155:8453/erc721:0x827922686190790b37229fd06084350E74485b72/72523094',
+    )][CPT_AERODROME]
+    assert position_balance.amount == ONE
+    assert position_balance.value > ZERO  # valued from the USDC and AERO it holds
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+def test_slipstream_position_price(base_inquirer: BaseInquirer) -> None:
+    """A Slipstream position is priced from the liquidity it holds in its pool"""
+    price = get_slipstream_position_price(
+        token=get_or_create_evm_token(
+            userdb=base_inquirer.database,
+            evm_address=string_to_evm_address('0x827922686190790b37229fd06084350E74485b72'),
+            chain_id=ChainID.BASE,
+            token_kind=TokenKind.ERC721,
+            collectible_id='72523094',
+            protocol=CPT_AERODROME,
+        ),
+        evm_inquirer=base_inquirer,
+        price_func=lambda asset: Price(ONE),  # so the price is the sum of the underlying amounts
+    )
+    assert price > ZERO
+
+
+def test_all_balance_classes_used():
+    """
+    Test that all protocol balance classes are used properly in the
+    CHAIN_TO_BALANCE_PROTOCOLS mapping
+    """
+    classes = find_inheriting_classes(
+        root_directory=(root_directory := Path(__file__).resolve().parent.parent.parent),
+        search_directory=root_directory / 'chain',
+        base_class=ProtocolWithBalance,
+        exclude_class_names={
+            'GearboxCommonBalances',
+            'ExtrafiCommonBalances',
+            'VelodromeLikeBalances',
+            'GivethCommonBalances',
+            'BeetsBalances',
+        },
+    )
+    unused_classes = set()
+
+    for class_entry in classes:
+        for balances in CHAIN_TO_BALANCE_PROTOCOLS.values():
+            if class_entry in balances:
+                break
+        else:  # not found
+            unused_classes.add(class_entry)
+
+    assert unused_classes == set(), f'Found unused classes {unused_classes}'
+
+
+def test_protocol_activity_is_filtered_by_location_labels(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_transaction_decoder: EthereumTransactionDecoder,
+) -> None:
+    protocol_balances = Compoundv3Balances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=ethereum_transaction_decoder,
+    )
+    addresses = [address := make_evm_address()]
+
+    with patch.object(EvmEventFilterQuery, 'make', wraps=EvmEventFilterQuery.make) as make_filter:
+        protocol_balances.addresses_with_activity(
+            event_types={(HistoryEventType.DEPOSIT, HistoryEventSubType.DEPOSIT_TO_PROTOCOL)},
+            location_labels=addresses,
+        )
+
+    assert make_filter.call_args.kwargs['location_labels'] == [address]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('should_mock_current_price_queries', [False])
+@pytest.mark.parametrize('ethereum_accounts', [['0x94F567bf71A4A7a88114aB679336522120EE3788']])
+def test_pendle_locked_balances(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        inquirer_defi: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0x2f133fe4ecabcfb1279198d70e4a1fbaf593a9e72ee5c6a03179147eb97311d5'),
+    )
+    protocol_balances_inquirer = PendleBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=tx_decoder,
+    )
+    protocol_balances = protocol_balances_inquirer.query_balances(addresses=ethereum_accounts)
+    user_balance = protocol_balances[ethereum_accounts[0]]
+    assert user_balance.assets[PENDLE_TOKEN][CPT_PENDLE] == Balance(
+        amount=FVal('367.772672118320474345'),
+        value=FVal('750.25625112137376766380'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('db_settings', LEGACY_TESTS_INDEXER_ORDER)
+@pytest.mark.parametrize('should_mock_current_price_queries', [False])
+@pytest.mark.parametrize('base_accounts', [['0x2B888954421b424C5D3D9Ce9bB67c9bD47537d12']])
+def test_runmoney_balances(
+        base_inquirer: BaseInquirer,
+        base_accounts: list[ChecksumEvmAddress],
+        inquirer_defi: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=base_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0x406c3d965008732dbbdadea2062cd3dd8c908f512ac27f7a3cbcc109d49a89c3'),
+    )
+    protocol_balances = RunmoneyBalances(
+        evm_inquirer=base_inquirer,
+        tx_decoder=tx_decoder,
+    ).query_balances(addresses=base_accounts)
+    user_balance = protocol_balances[base_accounts[0]]
+    assert user_balance.assets[Asset('eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913')][CPT_RUNMONEY] == Balance(  # noqa: E501
+        amount=FVal('102.973178'),
+        value=FVal('94.6941344888'),
+    )
+
+
+@pytest.mark.parametrize('base_accounts', [['0x2B888954421b424C5D3D9Ce9bB67c9bD47537d12']])
+def test_morpho_blue_balances(
+        base_inquirer: BaseInquirer,
+        base_transaction_decoder: BaseTransactionDecoder,
+        base_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    user_address = base_accounts[0]
+    usdc = Asset('eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913')
+    events = [
+        EvmEvent(
+            tx_ref=make_evm_tx_hash(),
+            sequence_index=0,
+            timestamp=TimestampMS(0),
+            location=Location.BASE,
+            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.DEPOSIT_TO_PROTOCOL,
+            asset=usdc,
+            amount=FVal('10'),
+            location_label=user_address,
+            counterparty=CPT_MORPHO_BLUE,
+            address=MORPHO_BLUE,
+            extra_data={'market_id': '0xmarket-1'},
+        ),
+        EvmEvent(
+            tx_ref=make_evm_tx_hash(),
+            sequence_index=1,
+            timestamp=TimestampMS(1),
+            location=Location.BASE,
+            event_type=HistoryEventType.WITHDRAWAL,
+            event_subtype=HistoryEventSubType.WITHDRAW_FROM_PROTOCOL,
+            asset=usdc,
+            amount=FVal('3'),
+            location_label=user_address,
+            counterparty=CPT_MORPHO_BLUE,
+            address=MORPHO_BLUE,
+            extra_data={'market_id': '0xmarket-1'},
+        ),
+        EvmEvent(
+            tx_ref=make_evm_tx_hash(),
+            sequence_index=2,
+            timestamp=TimestampMS(2),
+            location=Location.BASE,
+            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.DEPOSIT_TO_PROTOCOL,
+            asset=usdc,
+            amount=FVal('2'),
+            location_label=user_address,
+            counterparty=CPT_MORPHO_BLUE,
+            address=MORPHO_BLUE,
+            extra_data={'market_id': '0xmarket-2'},
+        ),
+        EvmEvent(
+            tx_ref=make_evm_tx_hash(),
+            sequence_index=3,
+            timestamp=TimestampMS(3),
+            location=Location.BASE,
+            event_type=HistoryEventType.RECEIVE,
+            event_subtype=HistoryEventSubType.GENERATE_DEBT,
+            asset=usdc,
+            amount=FVal('4'),
+            location_label=user_address,
+            counterparty=CPT_MORPHO_BLUE,
+            address=MORPHO_BLUE,
+            extra_data={'market_id': '0xmarket-2'},
+        ),
+        EvmEvent(
+            tx_ref=make_evm_tx_hash(),
+            sequence_index=4,
+            timestamp=TimestampMS(4),
+            location=Location.BASE,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.PAYBACK_DEBT,
+            asset=usdc,
+            amount=FVal('1.5'),
+            location_label=user_address,
+            counterparty=CPT_MORPHO_BLUE,
+            address=MORPHO_BLUE,
+            extra_data={'market_id': '0xmarket-2'},
+        ),
+    ]
+    events_db = DBHistoryEvents(base_inquirer.database)
+    with base_inquirer.database.conn.write_ctx() as write_cursor:
+        for event in events:
+            events_db.add_history_event(write_cursor=write_cursor, event=event)
+
+    protocol_balances = MorphoBlueBalances(
+        evm_inquirer=base_inquirer,
+        tx_decoder=base_transaction_decoder,
+    ).query_balances(addresses=base_accounts)
+    user_balance = protocol_balances[user_address]
+    assert user_balance.assets[usdc][CPT_MORPHO_BLUE] == Balance(
+        amount=FVal('9'),
+        value=FVal('9') * CURRENT_PRICE_MOCK,
+    )
+    assert user_balance.liabilities[usdc][CPT_MORPHO_BLUE] == Balance(
+        amount=FVal('2.5'),
+        value=FVal('2.5') * CURRENT_PRICE_MOCK,
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('should_mock_current_price_queries', [False])
+@pytest.mark.parametrize('optimism_accounts', [['0xE0de8649F1902a8d2394fA79cA38Aa20b716bA0f']])
+def test_woofi_stake_v2_balances(
+        optimism_inquirer: OptimismInquirer,
+        optimism_accounts: list[ChecksumEvmAddress],
+        inquirer_defi: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Test that WOO staked in the WOOFi v2 staking contract is properly detected."""
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=optimism_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0xa8f93c81d857cf6e0b52a60263473f8bec210a6fca9c46b49d5cb90736307e95'),
+    )
+    protocol_balances = WoofiBalances(
+        evm_inquirer=optimism_inquirer,
+        tx_decoder=tx_decoder,
+    ).query_balances(addresses=optimism_accounts)
+    woo_token = Asset('eip155:10/erc20:0x871f2F2ff935FD1eD867842FF2a7bfD051A5E527')
+    assert protocol_balances[optimism_accounts[0]].assets[woo_token][CPT_WOO_FI] == Balance(
+        amount=FVal('1571.295767977009'),
+        value=FVal('23.67735311299979597812'),
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('should_mock_current_price_queries', [False])
+@pytest.mark.parametrize('optimism_accounts', [['0x2B888954421b424C5D3D9Ce9bB67c9bD47537d12']])
+def test_woofi_stake_vault_token_balances(
+        optimism_inquirer: OptimismInquirer,
+        optimism_accounts: list[ChecksumEvmAddress],
+        inquirer_defi: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Test that WOO staked in the WOOFi v2 staking contract is properly detected.
+    Decodes two txs first:
+    * the initial vault deposit (creates the vault token with the proper protocol etc)
+    * the vault token staking deposit (triggers the balances logic).
+    """
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=optimism_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0x7eb649317491dcf8a8ec1bec56e71d8e2eaac500d14f2611aebf637671a90cd9'),
+    )
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=optimism_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0x67f5e50fc2b5ba66de57ac954c5a6b9028232ec362318dd68f92cfe5bedd2d4b'),
+    )
+    protocol_balances = WoofiBalances(
+        evm_inquirer=optimism_inquirer,
+        tx_decoder=tx_decoder,
+    ).query_balances(addresses=optimism_accounts)
+    vault_token = Asset('eip155:10/erc20:0xcA7184eA1cb4cF04d49Bf219c49a39231299dA26')
+    assert protocol_balances[optimism_accounts[0]].assets[vault_token][CPT_WOO_FI] == Balance(
+        amount=FVal('15923.160753145667983352'),
+        value=FVal('1792.506669755680434705721434148408290595113020776336'),
+    )
+
+
+def test_pickle_dill_zero_positions_skip_price_query(
+        ethereum_inquirer,
+        database,
+        function_scope_messages_aggregator,
+):
+    """Zero dill positions must not trigger a PICKLE price lookup, since that
+    can cascade into remote oracle queries for every user that simply has the
+    module enabled (the default) without ever having used pickle"""
+    from rotkehlchen.inquirer import Inquirer  # same import style as above
+    pickle_module = PickleFinance(
+        ethereum_inquirer=ethereum_inquirer,
+        database=database,
+        premium=None,
+        msg_aggregator=function_scope_messages_aggregator,
+    )
+    user_address = make_evm_address()
+    zero_claim = (True, (0).to_bytes(32, 'big'))  # claim() -> uint256
+    zero_locked = (True, (0).to_bytes(64, 'big'))  # locked() -> (int128, uint256)
+    with (
+        patch.object(pickle_module.ethereum, 'multicall_2', return_value=[zero_claim, zero_locked]),  # noqa: E501
+        patch.object(Inquirer, 'find_main_currency_price', return_value=FVal(2)) as price_mock,
+    ):
+        result = pickle_module.get_dill_balances(addresses=[user_address])
+
+    assert price_mock.call_count == 0
+    assert result[user_address].dill_amount.balance.amount == ZERO
+
+    nonzero_claim = (True, (5 * 10**18).to_bytes(32, 'big'))
+    with (
+        patch.object(pickle_module.ethereum, 'multicall_2', return_value=[nonzero_claim, zero_locked]),  # noqa: E501
+        patch.object(Inquirer, 'find_main_currency_price', return_value=FVal(2)) as price_mock,
+    ):
+        result = pickle_module.get_dill_balances(addresses=[user_address])
+
+    assert price_mock.call_count == 1
+    assert result[user_address].pending_rewards.balance.amount == FVal(5)
+    assert result[user_address].pending_rewards.balance.value == FVal(10)
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('hyperliquid_accounts', [['0x9d731b5be6236C3De8EB7eECC9706bE2ffF3A105']])
+def test_kinetiq_pending_withdrawal_balances(
+        hyperliquid_inquirer: HyperliquidInquirer,
+        hyperliquid_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check that the HYPE value of queued but unconfirmed Kinetiq withdrawals is detected"""
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=hyperliquid_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0xb2717aa3c23fc0b385cc794e880e4be2ba8f95c77dd6993ff2847dd4eacb2677'),
+    )
+    protocol_balances = KinetiqBalances(
+        evm_inquirer=hyperliquid_inquirer,
+        tx_decoder=tx_decoder,
+    ).query_balances(addresses=hyperliquid_accounts)
+    expected_balance = Balance(  # a walrus inside the assert hits an UnboundLocalError under pytest's assertion rewriting  # noqa: E501
+        amount=(amount := FVal('0.620167133105137613')),
+        value=amount * FVal(1.5),
+    )
+    assert protocol_balances[hyperliquid_accounts[0]].assets[A_HYPE][CPT_KINETIQ] == expected_balance  # noqa: E501
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('hyperliquid_accounts', [['0xD161D9C1871372c150ED68Fcc90Be73a9062a1b1']])
+def test_kinetiq_earn_pending_withdrawal_balances(
+        hyperliquid_inquirer: HyperliquidInquirer,
+        hyperliquid_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+) -> None:
+    """Check that the value of Kinetiq Earn withdrawal requests still pending in the
+    on-chain withdraw queue is detected"""
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=hyperliquid_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0x5fa977bc915e9bd14622a1c1556aab103eea31f8e9ebc60bcab84525cf01796b'),
+    )
+    protocol_balances = KinetiqBalances(
+        evm_inquirer=hyperliquid_inquirer,
+        tx_decoder=tx_decoder,
+    ).query_balances(addresses=hyperliquid_accounts)
+    expected_balance = Balance(  # a walrus inside the assert hits an UnboundLocalError under pytest's assertion rewriting  # noqa: E501
+        amount=(amount := FVal('10.650464908520496564')),
+        value=amount * FVal(1.5),
+    )
+    khype = Asset('eip155:999/erc20:0xfD739d4e423301CE9385c1fb8850539D657C296D')
+    assert protocol_balances[hyperliquid_accounts[0]].assets[khype][CPT_KINETIQ] == expected_balance  # noqa: E501
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('load_global_caches', [[CPT_BEETS_V2, CPT_BEETS_V3]])
+@pytest.mark.parametrize('sonic_manager_connect_at_start', [(SONIC_MAINNET_NODE,)])
+@pytest.mark.parametrize('sonic_accounts', [['0x6B808e314d7f758076922297bcD2eCd56aFe7B19']])
+def test_beets_gauge_balances(
+        sonic_inquirer,
+        sonic_accounts: list[ChecksumEvmAddress],
+        inquirer: Inquirer,  # pylint: disable=unused-argument
+        globaldb: GlobalDBHandler,
+        load_global_caches: list[str],
+) -> None:
+    """Gauge balances for Beets v2 and v3 pools on Sonic are detected.
+
+    The address has 5.99 BPT-stS-fMULTI-MCLB staked in a v2 gauge and
+    0.667 25USDC-50FLY-25stS staked in a v3 gauge. The gauges are seeded
+    directly into the globaldb cache as the beetswaps API has no sonic
+    pool listings to refresh them from."""
+    with globaldb.conn.write_ctx() as write_cursor:
+        globaldb_set_general_cache_values(
+            write_cursor=write_cursor,
+            key_parts=(CacheType.BALANCER_V2_GAUGES, str(ChainID.SONIC.value)),
+            values=['0xB6F5702b0dA321A38a2a43A31ebe4b05183A85d5'],
+        )
+        globaldb_set_general_cache_values(
+            write_cursor=write_cursor,
+            key_parts=(CacheType.BALANCER_V2_POOLS, str(ChainID.SONIC.value)),
+            values=['0x15761307e86BAF700f29052e357a88f49B33B1B4'],
+        )
+        globaldb_set_general_cache_values(
+            write_cursor=write_cursor,
+            key_parts=(CacheType.BALANCER_V3_GAUGES, str(ChainID.SONIC.value)),
+            values=['0x52c518A5a8644bd5225ffAea38f9512Af5B8dcAe'],
+        )
+        globaldb_set_general_cache_values(
+            write_cursor=write_cursor,
+            key_parts=(CacheType.BALANCER_V3_POOLS, str(ChainID.SONIC.value)),
+            values=['0xa476B33460E792Bac5CC294ba19F0543aB00DC01'],
+        )
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=sonic_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0xa60628b20aebe7e039238738cdbe949f83de103b7d9d2ca7730970226d69d49d'),
+        load_global_caches=load_global_caches,
+    )
+    balances = BeetsV2Balances(
+        evm_inquirer=sonic_inquirer,
+        tx_decoder=tx_decoder,
+    ).query_balances(addresses=sonic_accounts)
+    v2_lp_token = Asset('eip155:146/erc20:0x15761307e86BAF700f29052e357a88f49B33B1B4')
+    assert balances[sonic_accounts[0]].assets[v2_lp_token][CPT_BEETS_V2].amount == FVal('5.991441225005343457')  # noqa: E501
+
+    _, tx_decoder = get_decoded_events_of_transaction(
+        evm_inquirer=sonic_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0xd60f4413acbd1776206ce248c2d0a8f3f95a364dc981afdb19f11825dcf040e4'),
+        load_global_caches=load_global_caches,
+    )
+    balances = BeetsV3Balances(
+        evm_inquirer=sonic_inquirer,
+        tx_decoder=tx_decoder,
+    ).query_balances(addresses=sonic_accounts)
+    v3_lp_token = Asset('eip155:146/erc20:0xa476B33460E792Bac5CC294ba19F0543aB00DC01')
+    assert balances[sonic_accounts[0]].assets[v3_lp_token][CPT_BEETS_V3].amount == FVal('0.667921828364012456')  # noqa: E501
+
+
+class _GateProbeBalances(ProtocolWithBalance):
+    """Minimal concrete protocol used to exercise the counterparty gate on its own."""
+
+    def query_balances(self, addresses: list[ChecksumEvmAddress]) -> BalancesSheetType:
+        raise NotImplementedError  # the gate lives in addresses_with_activity
+
+
+def _make_gate_probe(database: DBHandler, counterparty: str) -> _GateProbeBalances:
+    return _GateProbeBalances(
+        evm_inquirer=Mock(database=database, chain_id=ChainID.ETHEREUM),
+        tx_decoder=Mock(),
+        counterparty=counterparty,  # type: ignore[arg-type]  # any string works at runtime
+        deposit_event_types={(HistoryEventType.DEPOSIT, HistoryEventSubType.DEPOSIT_ASSET)},
+    )
+
+
+def test_activity_query_is_gated_by_the_chain_counterparties(database: DBHandler) -> None:
+    """Test the seam that lets a balance refresh cost one events query per chain.
+
+    Every protocol opens its balance query with addresses_with_activity, so what is asserted
+    here is that a counterparty absent from the chain's set skips the DB entirely, that a
+    present one is unaffected, and that not supplying a set at all (the default for anything
+    constructing these classes on its own) leaves every query running.
+    """
+    user_address = make_evm_address()
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[make_ethereum_event(
+                index=1,
+                location_label=user_address,
+                counterparty=CPT_OCTANT,
+                event_type=HistoryEventType.DEPOSIT,
+                event_subtype=HistoryEventSubType.DEPOSIT_ASSET,
+            )],
+        )
+
+    def activity_of(counterparty: str, gate: set[str] | None) -> tuple[dict, int]:
+        probe = _make_gate_probe(database=database, counterparty=counterparty)
+        probe.chain_counterparties = gate
+        with patch.object(
+            DBHistoryEvents,
+            'get_history_events_internal',
+            side_effect=DBHistoryEvents.get_history_events_internal,
+            autospec=True,
+        ) as query_mock:
+            result = probe.addresses_with_deposits(location_labels=[user_address])
+        return result, query_mock.call_count
+
+    gate = {CPT_OCTANT}
+    # present in the gate: queried, and the events come back
+    result, calls = activity_of(CPT_OCTANT, gate)
+    assert list(result) == [user_address]
+    assert calls == 1
+
+    # absent from the gate: no query at all
+    result, calls = activity_of(CPT_BLUR, gate)
+    assert result == {}
+    assert calls == 0
+
+    # no gate supplied: the query runs even though it comes back empty
+    result, calls = activity_of(CPT_BLUR, None)
+    assert result == {}
+    assert calls == 1
+
+
+def test_query_protocols_with_balance_hands_down_the_chain_counterparties(
+        blockchain: ChainsAggregator,
+) -> None:
+    """Test that the manager reads the chain's counterparties once and passes them on.
+
+    Without this the gate in addresses_with_activity is never armed in production, and every
+    protocol keeps paying for its own query - which the per-protocol tests would not notice,
+    since they construct the balance classes directly.
+    """
+    with blockchain.database.user_write() as write_cursor:
+        DBHistoryEvents(blockchain.database).add_history_events(
+            write_cursor=write_cursor,
+            history=[make_ethereum_event(
+                index=1,
+                location_label=make_evm_address(),
+                counterparty=CPT_OCTANT,
+                event_type=HistoryEventType.DEPOSIT,
+                event_subtype=HistoryEventSubType.DEPOSIT_ASSET,
+            )],
+        )
+
+    received: list[set[str] | None] = []
+
+    class _RecordingBalances(ProtocolWithBalance):
+        def __init__(
+                self,
+                evm_inquirer: EvmNodeInquirer,
+                tx_decoder: EVMTransactionDecoder,
+        ) -> None:
+            super().__init__(
+                evm_inquirer=evm_inquirer,
+                tx_decoder=tx_decoder,
+                counterparty=CPT_OCTANT,
+                deposit_event_types=set(),
+            )
+
+        def query_balances(self, addresses: list[ChecksumEvmAddress]) -> BalancesSheetType:
+            received.append(self.chain_counterparties)
+            return {}
+
+    with patch.dict(
+        'rotkehlchen.chain.evm.manager.CHAIN_TO_BALANCE_PROTOCOLS',
+        {ChainID.ETHEREUM: (_RecordingBalances,)},
+    ):
+        blockchain.get_evm_manager(chain_id=ChainID.ETHEREUM).query_protocols_with_balance(
+            balances=defaultdict(BalanceSheet),
+            addresses=[],
+        )
+
+    assert received == [{CPT_OCTANT}]
+
+
+def test_protocol_balances_skip_the_events_query_for_absent_counterparties(
+        blockchain: ChainsAggregator,
+) -> None:
+    """Test that a refresh only queries the events table for protocols the user has.
+
+    This is the whole point of the gate, and it is asserted over the real ethereum protocol
+    list rather than a stub so that a protocol added later without routing its event lookup
+    through the gate shows up here. The second half is the control: with one protocol's events
+    present that protocol must still query, or the gate would be switching everything off.
+    """
+    manager = blockchain.get_evm_manager(chain_id=ChainID.ETHEREUM)
+
+    def refresh_query_count() -> int:
+        with patch.object(
+            DBHistoryEvents,
+            'get_history_events_internal',
+            side_effect=DBHistoryEvents.get_history_events_internal,
+            autospec=True,
+        ) as spy:
+            manager.query_protocols_with_balance(
+                balances=defaultdict(BalanceSheet),
+                addresses=[],
+            )
+        return spy.call_count
+
+    assert refresh_query_count() == 0
+
+    with blockchain.database.user_write() as write_cursor:
+        DBHistoryEvents(blockchain.database).add_history_events(
+            write_cursor=write_cursor,
+            history=[make_ethereum_event(
+                index=1,
+                location_label=make_evm_address(),
+                counterparty=CPT_OCTANT,
+                event_type=HistoryEventType.DEPOSIT,
+                event_subtype=HistoryEventSubType.DEPOSIT_ASSET,
+            )],
+        )
+
+    assert refresh_query_count() == 1
+
+
+@pytest.mark.vcr(
+    filter_query_parameters=['apikey', 'api_key'], match_on=['match_rpc_calls'],
+    before_record_response=None,
+)
+@pytest.mark.parametrize('ethereum_manager_connect_at_start', [(PRUNED_AND_NOT_ARCHIVED_NODE,)])
+@pytest.mark.parametrize('db_settings', [{'evm_indexers_order': SerializableChainIndexerOrder(
+    order={ChainID.ETHEREUM: [EvmIndexer.BLOCKSCOUT]},
+)}])
+@pytest.mark.parametrize('should_mock_current_price_queries', [False])
+@pytest.mark.parametrize('ethereum_accounts', [['0x125DBE70459b36A4C71664DcC97224EafEb4AeE0']])
+def test_flying_tulip_lend_balances(
+        ethereum_inquirer, ethereum_accounts, inquirer,
+):
+    """Discover collateral and debt from a real borrowing transaction and contract responses."""
+    _, decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0x84dfebb43989ad185ba61d493762501e421e862b2ed15c86c81359d9b6e7f490'),
+    )
+    balances = FlyingTulipLendBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=decoder,
+    ).query_balances(addresses=ethereum_accounts)
+    assert set(balances) == set(ethereum_accounts)
+    position = balances[ethereum_accounts[0]]
+    assert {
+        asset.identifier: str(values[CPT_FLYING_TULIP].amount)
+        for asset, values in position.assets.items()
+    } == {
+        A_WETH.identifier: '0.499802046555352326',
+        'eip155:1/erc20:0x5DD1A7A369e8273371d2DBf9d83356057088082c': '380.339290563347645575',
+    }
+    assert {
+        asset.identifier: str(values[CPT_FLYING_TULIP].amount)
+        for asset, values in position.liabilities.items()
+    } == {'eip155:1/erc20:0xF7D85EC4E7710f71992752eac2111312e73E9C9C': '0.558442'}
+
+
+@pytest.mark.vcr(
+    filter_query_parameters=['apikey', 'api_key'], match_on=['match_rpc_calls'],
+    before_record_response=None,
+)
+@pytest.mark.parametrize('ethereum_manager_connect_at_start', [(PRUNED_AND_NOT_ARCHIVED_NODE,)])
+@pytest.mark.parametrize('db_settings', [{'evm_indexers_order': SerializableChainIndexerOrder(
+    order={ChainID.ETHEREUM: [EvmIndexer.BLOCKSCOUT]},
+)}])
+@pytest.mark.parametrize('ethereum_accounts', [[
+    '0x3c9094Fc254371998fE115a6AA38be9955b2f694', '0x072ab8B22c7C7b4DD2b3367C6E7445d6c9e3cB2F',
+]])
+def test_flying_tulip_lend_balances_ignore_other_products(
+        ethereum_inquirer, ethereum_accounts, vcr_cassette,
+):
+    """Actual staking, put and queued redemption activity must not seed lending queries."""
+    for tx_hash in (
+        '0xda81303cc65040a0fbd75b97cae82f61d068d32d61e52f0e836f664d9858cfcd',
+        '0x2b1ce9db1e985429e3d0103113f64e1aa21145650fcc5944edd03ca0e2430d59',
+        '0xa58bad57aeec3377b47fc47b474386d3afc17d73be7b8ef232d3c26aa06b9296',
+    ):
+        events, decoder = get_decoded_events_of_transaction(
+            evm_inquirer=ethereum_inquirer,
+            tx_hash=deserialize_evm_tx_hash(tx_hash),
+        )
+        assert any(event.counterparty == CPT_FLYING_TULIP for event in events)
+    previous_requests = vcr_cassette.play_count + len(vcr_cassette.requests)
+    assert FlyingTulipLendBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=decoder,
+    ).query_balances(addresses=ethereum_accounts) == {}
+    assert vcr_cassette.play_count + len(vcr_cassette.requests) == previous_requests
+
+
+@pytest.mark.vcr(
+    filter_query_parameters=['apikey', 'api_key'], match_on=['match_rpc_calls'],
+    before_record_response=None,
+)
+@pytest.mark.parametrize('ethereum_manager_connect_at_start', [(PRUNED_AND_NOT_ARCHIVED_NODE,)])
+@pytest.mark.parametrize('db_settings', [{'evm_indexers_order': SerializableChainIndexerOrder(
+    order={ChainID.ETHEREUM: [EvmIndexer.BLOCKSCOUT]},
+)}])
+@pytest.mark.parametrize('should_mock_current_price_queries', [False])
+@pytest.mark.parametrize('ethereum_accounts', [['0x3c9094Fc254371998fE115a6AA38be9955b2f694']])
+def test_flying_tulip_staking_balances(ethereum_inquirer, ethereum_accounts, inquirer):
+    """Query claimable FT rewards after decoding the account's actual vault deposit."""
+    _, decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0xda81303cc65040a0fbd75b97cae82f61d068d32d61e52f0e836f664d9858cfcd'),
+    )
+    balances = FlyingTulipStakingBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=decoder,
+    ).query_balances(addresses=ethereum_accounts)
+    assert set(balances) == set(ethereum_accounts)
+    assert {
+        asset.identifier: str(values[CPT_FLYING_TULIP].amount)
+        for asset, values in balances[ethereum_accounts[0]].assets.items()
+    } == {'eip155:1/erc20:0x5DD1A7A369e8273371d2DBf9d83356057088082c': '1.848573219340315019'}
+    assert balances[ethereum_accounts[0]].liabilities == {}
+
+
+@pytest.mark.vcr(
+    filter_query_parameters=['apikey', 'api_key'], match_on=['match_rpc_calls'],
+    before_record_response=None,
+)
+@pytest.mark.parametrize('ethereum_manager_connect_at_start', [(PRUNED_AND_NOT_ARCHIVED_NODE,)])
+@pytest.mark.parametrize('db_settings', [{'evm_indexers_order': SerializableChainIndexerOrder(
+    order={ChainID.ETHEREUM: [EvmIndexer.BLOCKSCOUT]},
+)}])
+@pytest.mark.parametrize('ethereum_accounts', [['0x3c9094Fc254371998fE115a6AA38be9955b2f694']])
+def test_flying_tulip_staking_balances_ignore_other_products(
+        ethereum_inquirer, ethereum_accounts, vcr_cassette,
+):
+    """An actual ftPUT investment must not cause a staking reward query."""
+    events, decoder = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=deserialize_evm_tx_hash('0x2b1ce9db1e985429e3d0103113f64e1aa21145650fcc5944edd03ca0e2430d59'),
+    )
+    assert any(
+        event.counterparty == CPT_FLYING_TULIP and
+        event.event_subtype == HistoryEventSubType.DEPOSIT_FOR_WRAPPED
+        for event in events
+    )
+    previous_requests = vcr_cassette.play_count + len(vcr_cassette.requests)
+    assert FlyingTulipStakingBalances(
+        evm_inquirer=ethereum_inquirer,
+        tx_decoder=decoder,
+    ).query_balances(addresses=ethereum_accounts) == {}
+    assert vcr_cassette.play_count + len(vcr_cassette.requests) == previous_requests
+
+
+@pytest.mark.vcr(
+    filter_query_parameters=['apikey'], match_on=['match_rpc_calls'], before_record_response=None,
+)
+@pytest.mark.parametrize('binance_sc_manager_connect_at_start', [(WeightedNode(
+    node_info=NodeName(
+        name='Public Node', endpoint='https://bsc-rpc.publicnode.com',
+        owned=True, blockchain=SupportedBlockchain.BINANCE_SC,
+    ),
+    active=True,
+    weight=FVal(1),
+),)])
+@pytest.mark.parametrize('binance_sc_accounts', [['0x125DBE70459b36A4C71664DcC97224EafEb4AeE0']])
+def test_flying_tulip_lend_empty_balances_binance_sc(
+        binance_sc_transactions, binance_sc_transaction_decoder, binance_sc_accounts,
+):
+    """An account without BSC lending positions returns no balances."""
+    query_deposit_for_transactions(binance_sc_transactions, binance_sc_accounts)
+    assert FlyingTulipLendBalances(
+        evm_inquirer=binance_sc_transactions.evm_inquirer,
+        tx_decoder=binance_sc_transaction_decoder,
+    ).query_balances(addresses=binance_sc_accounts) == {}
+    with binance_sc_transactions.database.conn.read_ctx() as cursor:
+        assert binance_sc_transactions.database.get_dynamic_cache(
+            cursor=cursor,
+            name=DBCacheDynamic.LAST_QUERY_TS,
+            location='binance_sc',
+            location_name=LAST_DEPOSIT_FOR_QUERY,
+            account_id='positions',
+        ) is not None
+
+
+@pytest.mark.parametrize(('contract_filter', 'expected_indices'), [
+    (None, [0, 1]),
+    ([0], [0]),
+    ([1], [1]),
+    ([0, 1], [0, 1]),
+    ([], []),
+])
+def test_protocol_balance_activity_contract_filter(
+        ethereum_inquirer, database, contract_filter, expected_indices,
+):
+    """Filter contracts independently of wallet labels, retaining the unfiltered default."""
+    wallet, other_wallet = make_evm_address(), make_evm_address()
+    contracts = [make_evm_address(), make_evm_address()]
+    events = [make_ethereum_event(
+        index=index, location_label=owner, address=contract,
+        counterparty=CPT_FLYING_TULIP, event_type=HistoryEventType.DEPOSIT,
+        event_subtype=HistoryEventSubType.DEPOSIT_TO_PROTOCOL,
+    ) for index, (owner, contract) in enumerate((
+        (wallet, contracts[0]), (wallet, contracts[1]), (other_wallet, contracts[0]),
+    ))]
+    with database.user_write() as cursor:
+        DBHistoryEvents(database).add_history_events(write_cursor=cursor, history=events)
+
+    balances = FlyingTulipLendBalances(evm_inquirer=ethereum_inquirer, tx_decoder=Mock())
+    result = balances.addresses_with_deposits(
+        location_labels=[wallet],
+        addresses=None if contract_filter is None else [contracts[idx] for idx in contract_filter],
+    )
+    assert set(result) == ({wallet} if expected_indices else set())
+    assert {event.address for event in result.get(wallet, [])} == {
+        contracts[idx] for idx in expected_indices
+    }

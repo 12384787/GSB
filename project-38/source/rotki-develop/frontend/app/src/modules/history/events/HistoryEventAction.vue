@@ -1,0 +1,84 @@
+<script lang="ts" setup>
+import type { HistoryEventEntry } from '@/modules/history/events/schemas';
+
+const { event, canUnlink } = defineProps<{
+  event: HistoryEventEntry;
+  canUnlink?: boolean;
+}>();
+
+const emit = defineEmits<{
+  unlink: [];
+}>();
+
+const vueRouter = useRouter();
+
+const { t } = useI18n({ useScope: 'global' });
+
+function onEditRule(): void {
+  const entry = event;
+
+  const data = {
+    counterparty: '',
+    eventId: entry.identifier.toString(),
+    eventSubtype: entry.eventSubtype,
+    eventType: entry.eventType,
+  };
+
+  if ('counterparty' in entry)
+    data.counterparty = entry.counterparty ?? '';
+
+  vueRouter.push({
+    path: '/settings/accounting',
+    query: { 'edit-rule': 'true', ...data },
+  });
+}
+</script>
+
+<template>
+  <div class="flex items-center">
+    <RuiMenu
+      :class-names="{ menu: 'max-w-[15rem] z-[100]' }"
+      :options="{ autoUpdate: { resize: false, scroll: false }, placement: 'bottom-end' }"
+      close-on-content-click
+    >
+      <template #activator="{ attrs }">
+        <RuiButton
+          icon
+          variant="text"
+          class="!p-2.5"
+          v-bind="attrs"
+        >
+          <RuiIcon
+            name="lu-ellipsis-vertical"
+            size="20"
+          />
+        </RuiButton>
+      </template>
+      <RuiButton
+        variant="list"
+        @click="onEditRule()"
+      >
+        <template #prepend>
+          <RuiIcon
+            class="text-rui-text-secondary"
+            name="lu-pencil"
+          />
+        </template>
+        {{ t('accounting_settings.rule.edit') }}
+      </RuiButton>
+      <RuiButton
+        v-if="canUnlink"
+        variant="list"
+        @click="emit('unlink')"
+      >
+        <template #prepend>
+          <RuiIcon
+            class="text-rui-text-secondary"
+            name="lu-unlink"
+          />
+        </template>
+        {{ t('transactions.events.actions.unlink') }}
+      </RuiButton>
+    </RuiMenu>
+  </div>
+</template>

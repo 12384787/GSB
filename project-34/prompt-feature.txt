@@ -1,0 +1,5 @@
+任务类型：Feature 迭代
+任务难度：地狱
+语言/框架：JavaScript
+
+请在已有的 koajs/koa 项目上迭代一个生产级能力，不要重写项目。项目定位：Expressive middleware for node.js using ES2017 async functions。请基于真实入口（.codecov.yml, .editorconfig, .github, .gitignore, .mailmap, AUTHORS, CODE_OF_CONDUCT.md, History.md, LICENSE, Readme.md, __tests__, docs, lib, package-lock.json, package.json, test-helpers）梳理现有调用链，增加一个需要跨模块协同的能力，同时处理公共 API 兼容、配置默认值、异常与取消、资源释放、并发/重试幂等、可观测性和文档测试。实现必须沿现有架构落点，补齐旧行为、新行为、失败回滚、重复执行和边界输入的测试，不得用硬编码或改测试来伪造通过。

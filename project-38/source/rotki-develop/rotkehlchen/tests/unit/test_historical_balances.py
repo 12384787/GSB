@@ -1,0 +1,2730 @@
+import json
+import time
+from typing import TYPE_CHECKING
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from rotkehlchen.api.websockets.typedefs import WSMessageType
+from rotkehlchen.assets.asset import Asset
+from rotkehlchen.assets.types import AssetFlag
+from rotkehlchen.assets.utils import get_or_create_evm_token
+from rotkehlchen.balances.historical import HistoricalBalancesManager
+from rotkehlchen.chain.ethereum.constants import CPT_KRAKEN
+from rotkehlchen.chain.ethereum.modules.eigenlayer.constants import CPT_EIGENLAYER
+from rotkehlchen.chain.ethereum.modules.liquity.constants import CPT_LIQUITY
+from rotkehlchen.chain.evm.decoding.aave.constants import CPT_AAVE_V3
+from rotkehlchen.chain.evm.decoding.aura_finance.constants import CPT_AURA_FINANCE
+from rotkehlchen.chain.evm.decoding.balancer.constants import CPT_BALANCER_V2
+from rotkehlchen.chain.evm.decoding.cowswap.constants import CPT_COWSWAP
+from rotkehlchen.chain.evm.decoding.hop.constants import CPT_HOP
+from rotkehlchen.chain.evm.decoding.weth.constants import CPT_WETH
+from rotkehlchen.chain.evm.structures import EvmTxReceipt
+from rotkehlchen.chain.evm.types import string_to_evm_address
+from rotkehlchen.constants.assets import A_BTC, A_DAI, A_ETH, A_ETH2, A_USDC, A_WETH
+from rotkehlchen.constants.misc import ONE, ZERO
+from rotkehlchen.db.cache import DBCacheStatic
+from rotkehlchen.db.constants import HistoryMappingState
+from rotkehlchen.db.evmtx import DBEvmTx
+from rotkehlchen.db.filtering import HistoricalBalancesFilterQuery
+from rotkehlchen.db.history_events import DBHistoryEvents
+from rotkehlchen.db.settings import ModifiableDBSettings
+from rotkehlchen.fval import FVal
+from rotkehlchen.globaldb.handler import GlobalDBHandler
+from rotkehlchen.history.data_issues.constants import IssueKind, IssueState
+from rotkehlchen.history.data_issues.manager import DataIssuesManager
+from rotkehlchen.history.events.structures.asset_movement import AssetMovement
+from rotkehlchen.history.events.structures.base import HistoryEvent
+from rotkehlchen.history.events.structures.evm_event import EvmEvent
+from rotkehlchen.history.events.structures.types import (
+    EventDirection,
+    HistoryEventSubType,
+    HistoryEventType,
+)
+from rotkehlchen.tasks.events import match_asset_movements
+from rotkehlchen.tasks.historical_balances import (
+    Bucket,
+    _get_rebasing_reconciliation_points,
+    process_historical_balances,
+    retry_rebasing_token_issue,
+)
+from rotkehlchen.tests.utils.ethereum import TEST_ADDR1, TEST_ADDR2
+from rotkehlchen.tests.utils.factories import make_evm_tx_hash
+from rotkehlchen.types import (
+    ApiKey,
+    ChainID,
+    EventMetricKey,
+    EvmTransaction,
+    EVMTxHash,
+    Location,
+    Timestamp,
+    TimestampMS,
+)
+from rotkehlchen.utils.misc import ts_now
+
+pytestmark = pytest.mark.accounting_update
+
+if TYPE_CHECKING:
+    from rotkehlchen.chain.ethereum.decoding.decoder import EthereumTransactionDecoder
+    from rotkehlchen.db.dbhandler import DBHandler
+    from rotkehlchen.db.drivers.sqlite import DBCursor
+    from rotkehlchen.user_messages import MessagesAggregator
+
+
+def _make_balance_event(timestamp: int, amount: str = '10') -> EvmEvent:
+    return EvmEvent(
+        tx_ref=make_evm_tx_hash(),
+        sequence_index=0,
+        timestamp=TimestampMS(timestamp),
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.RECEIVE,
+        event_subtype=HistoryEventSubType.NONE,
+        asset=A_ETH,
+        amount=FVal(amount),
+        location_label=TEST_ADDR1,
+    )
+
+
+@pytest.mark.parametrize('rebasing_assets', [frozenset(), frozenset({A_DAI.identifier})])
+def test_rebasing_reconciliation_skips_unrelated_events(
+        database: DBHandler,
+        rebasing_assets: frozenset[str],
+) -> None:
+    event = _make_balance_event(timestamp=1000)
+    event.identifier = 1
+    with patch.object(Bucket, 'from_event', wraps=Bucket.from_event) as from_event_mock:
+        assert _get_rebasing_reconciliation_points(
+            database=database,
+            events=[event],
+            rebasing_assets=rebasing_assets,
+            treat_eth2_as_eth=False,
+        ) == {}
+
+    from_event_mock.assert_not_called()
+
+
+def _add_test_evm_transactions(
+        database: DBHandler,
+        write_cursor: DBCursor,
+        transactions: list[tuple[EVMTxHash, Timestamp, int]],
+) -> None:
+    DBEvmTx(database).add_transactions(
+        write_cursor=write_cursor,
+        evm_transactions=[EvmTransaction(
+            tx_hash=tx_hash,
+            chain_id=ChainID.ETHEREUM,
+            timestamp=timestamp,
+            block_number=block_number,
+            from_address=TEST_ADDR1,
+            to_address=TEST_ADDR2,
+            value=0,
+            gas=21000,
+            gas_price=1,
+            gas_used=21000,
+            input_data=b'',
+            nonce=idx,
+        ) for idx, (tx_hash, timestamp, block_number) in enumerate(transactions)],
+        relevant_address=TEST_ADDR1,
+    )
+
+
+def test_rebasing_reconciliation_queries_more_than_sqlite_expression_limit(
+        database: DBHandler,
+) -> None:
+    """Transaction lookup uses chunked IN queries, not an expression-depth-limited OR chain."""
+    transaction_count = 1001
+    tx_hashes = [make_evm_tx_hash() for _ in range(transaction_count)]
+    with database.user_write() as write_cursor:
+        _add_test_evm_transactions(
+            database=database,
+            write_cursor=write_cursor,
+            transactions=[
+                (tx_hash, Timestamp(idx + 1), idx + 1)
+                for idx, tx_hash in enumerate(tx_hashes)
+            ],
+        )
+
+    events = [EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=0,
+        timestamp=TimestampMS((idx + 1) * 1000),
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.RECEIVE,
+        event_subtype=HistoryEventSubType.NONE,
+        asset=A_DAI,
+        amount=ONE,
+        location_label=TEST_ADDR1,
+        identifier=idx + 1,
+    ) for idx, tx_hash in enumerate(tx_hashes)]
+
+    points = _get_rebasing_reconciliation_points(
+        database=database,
+        events=events,
+        rebasing_assets=frozenset({A_DAI.identifier}),
+        treat_eth2_as_eth=False,
+    )
+
+    assert len(points) == transaction_count
+
+
+def test_rebasing_reconciliation_uses_highest_block_for_same_timestamp(
+        database: DBHandler,
+) -> None:
+    """Sub-second chains can sort a higher block before a lower block at one timestamp."""
+    higher_block_tx, lower_block_tx = make_evm_tx_hash(), make_evm_tx_hash()
+    with database.user_write() as write_cursor:
+        _add_test_evm_transactions(
+            database=database,
+            write_cursor=write_cursor,
+            transactions=[
+                (higher_block_tx, Timestamp(1), 101),
+                (lower_block_tx, Timestamp(1), 100),
+            ],
+        )
+
+    events = [EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=sequence_index,
+        timestamp=TimestampMS(1000),
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.RECEIVE,
+        event_subtype=HistoryEventSubType.NONE,
+        asset=A_DAI,
+        amount=ONE,
+        location_label=TEST_ADDR1,
+        identifier=sequence_index + 1,
+    ) for sequence_index, tx_hash in enumerate((higher_block_tx, lower_block_tx))]
+    bucket = Bucket.from_event(events[-1])[0][0]
+
+    assert _get_rebasing_reconciliation_points(
+        database=database,
+        events=events,
+        rebasing_assets=frozenset({A_DAI.identifier}),
+        treat_eth2_as_eth=False,
+    ) == {(2, bucket): 101}
+
+
+def _get_stale_cache_values(database: DBHandler) -> tuple[int | None, int | None]:
+    """Return the stale historical balances cache markers.
+
+    The returned tuple contains:
+    - the timestamp from which historical balances need to be recalculated, or None if no
+      stale marker exists.
+    - the timestamp when that stale marker was last modified, or None if no modification
+      marker exists.
+    """
+    with database.conn.read_ctx() as cursor:
+        rows = dict(cursor.execute(
+            'SELECT name, value FROM key_value_cache WHERE name IN (?, ?)',
+            (DBCacheStatic.STALE_BALANCES_FROM_TS.value,
+             DBCacheStatic.STALE_BALANCES_MODIFICATION_TS.value),
+        ).fetchall())
+    return (
+        int(value) if (value := rows.get(DBCacheStatic.STALE_BALANCES_FROM_TS.value)) else None,
+        int(value) if (
+            value := rows.get(DBCacheStatic.STALE_BALANCES_MODIFICATION_TS.value)
+        ) else None,
+    )
+
+
+def _assert_resume_from_stale_timestamp(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+        expected_from_ts: int,
+) -> None:
+    """Assert stale balances resume from the stored timestamp and clear both cache markers.
+
+    The helper reads the tuple returned by _get_stale_cache_values(), where the first item is
+    expected_from_ts: the expected recalculation start timestamp stored in the stale marker.
+    The second item is the marker modification timestamp. After processing, both tuple items
+    are expected to be None.
+    """
+    assert _get_stale_cache_values(database)[0] == expected_from_ts
+    process_historical_balances(
+        database=database,
+        msg_aggregator=messages_aggregator,
+        from_ts=TimestampMS(expected_from_ts),
+    )
+    assert _get_stale_cache_values(database) == (None, None)
+
+
+def test_process_historical_balances_clears_stale_marker(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    cache_key = DBCacheStatic.STALE_BALANCES_FROM_TS.value
+
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_event(
+            write_cursor=write_cursor,
+            event=EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                group_identifier='grp1',
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('10'),
+                location_label=TEST_ADDR1,
+            ),
+        )
+
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT value FROM key_value_cache WHERE name = ?',
+            (cache_key,),
+        ).fetchone() is not None
+
+    time.sleep(0.01)
+    process_historical_balances(database, messages_aggregator)
+
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT value FROM key_value_cache WHERE name = ?',
+            (cache_key,),
+        ).fetchone() is None
+
+
+def test_add_history_event_marks_balances_stale(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    with database.user_write() as write_cursor:
+        assert DBHistoryEvents(database).add_history_event(
+            write_cursor=write_cursor,
+            event=_make_balance_event(timestamp=2000),
+        ) is not None
+
+    assert _get_stale_cache_values(database)[1] is not None
+    _assert_resume_from_stale_timestamp(database, messages_aggregator, expected_from_ts=2000)
+
+
+def test_add_history_events_marks_balances_stale_from_min_timestamp(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[_make_balance_event(timestamp=3000), _make_balance_event(timestamp=1000)],
+        )
+
+    assert _get_stale_cache_values(database)[1] is not None
+    _assert_resume_from_stale_timestamp(database, messages_aggregator, expected_from_ts=1000)
+
+
+def test_delete_events_and_track_marks_balances_stale_from_deleted_timestamp(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    events_db = DBHistoryEvents(database)
+    with database.user_write() as write_cursor:
+        events_db.add_history_events(
+            write_cursor=write_cursor,
+            history=[_make_balance_event(timestamp=1000), _make_balance_event(timestamp=2000)],
+        )
+    process_historical_balances(database, messages_aggregator)
+
+    with database.user_write() as write_cursor:
+        assert events_db.delete_events_and_track(
+            write_cursor=write_cursor,
+            where_clause='WHERE timestamp=?',
+            where_bindings=(TimestampMS(2000),),
+        ) == 1
+
+    assert _get_stale_cache_values(database)[1] is not None
+    _assert_resume_from_stale_timestamp(database, messages_aggregator, expected_from_ts=2000)
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT timestamp, metric_value FROM event_metrics ORDER BY timestamp',
+        ).fetchall() == [(1000, '10')]
+
+
+def test_update_events_and_track_marks_balances_stale_from_updated_timestamp(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    events_db = DBHistoryEvents(database)
+    with database.user_write() as write_cursor:
+        events_db.add_history_events(
+            write_cursor=write_cursor,
+            history=[_make_balance_event(timestamp=1000), _make_balance_event(timestamp=2000)],
+        )
+    process_historical_balances(database, messages_aggregator)
+
+    with database.user_write() as write_cursor:
+        assert events_db.update_events_and_track(
+            write_cursor=write_cursor,
+            where_clause='WHERE timestamp=?',
+            where_bindings=(TimestampMS(2000),),
+            set_clause='SET amount=?',
+            set_bindings=('7',),
+        ) == 1
+
+    assert _get_stale_cache_values(database)[1] is not None
+    _assert_resume_from_stale_timestamp(database, messages_aggregator, expected_from_ts=2000)
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT timestamp, metric_value FROM event_metrics ORDER BY timestamp',
+        ).fetchall() == [(1000, '10'), (2000, '17')]
+
+
+def test_edit_history_event_marks_balances_stale_from_earliest_timestamp(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    events_db = DBHistoryEvents(database)
+    with database.user_write() as write_cursor:
+        assert (event_id := events_db.add_history_event(
+            write_cursor=write_cursor,
+            event=(event := _make_balance_event(timestamp=3000)),
+        )) is not None
+    process_historical_balances(database, messages_aggregator)
+
+    event.identifier = event_id
+    event.timestamp = TimestampMS(2000)
+    event.amount = FVal('15')
+    with database.user_write() as write_cursor:
+        events_db.edit_history_event(
+            write_cursor=write_cursor,
+            event=event,
+            mapping_state=HistoryMappingState.CUSTOMIZED,
+        )
+
+    assert _get_stale_cache_values(database)[1] is not None
+    _assert_resume_from_stale_timestamp(database, messages_aggregator, expected_from_ts=2000)
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT timestamp, metric_value FROM event_metrics ORDER BY timestamp',
+        ).fetchall() == [(2000, '15')]
+
+
+def test_edit_history_event_notes_only_does_not_mark_balances_stale(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    events_db = DBHistoryEvents(database)
+    with database.user_write() as write_cursor:
+        assert (event_id := events_db.add_history_event(
+            write_cursor=write_cursor,
+            event=(event := _make_balance_event(timestamp=1000)),
+        )) is not None
+    process_historical_balances(database, messages_aggregator)
+
+    event.identifier = event_id
+    event.notes = 'Only notes changed'
+    with database.user_write() as write_cursor:
+        events_db.edit_history_event(
+            write_cursor=write_cursor,
+            event=event,
+            mapping_state=HistoryMappingState.CUSTOMIZED,
+        )
+
+    assert _get_stale_cache_values(database) == (None, None)
+
+
+def test_has_unprocessed_events(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Test _has_unprocessed_events correctly uses stale marker to determine processing state.
+
+    Conditions tested:
+    - stale_value=None: False (all events evaluated, including negative balance skips)
+    - stale_value exists + last_processing=None: query result (never processed)
+    - stale_value exists + last_processing exists: filtered query (>= stale_event_ts)
+    """
+    manager = HistoricalBalancesManager(database)
+    stale_cache_key = DBCacheStatic.STALE_BALANCES_FROM_TS.value
+    modification_cache_key = DBCacheStatic.STALE_BALANCES_MODIFICATION_TS.value
+
+    def add_event(ts: int, asset: Asset = A_ETH) -> None:
+        with database.user_write() as write_cursor:
+            DBHistoryEvents(database).add_history_event(
+                write_cursor=write_cursor,
+                event=EvmEvent(
+                    tx_ref=make_evm_tx_hash(),
+                    group_identifier=f'grp_{ts}',
+                    sequence_index=0,
+                    timestamp=TimestampMS(ts),
+                    location=Location.ETHEREUM,
+                    event_type=HistoryEventType.RECEIVE,
+                    event_subtype=HistoryEventSubType.NONE,
+                    asset=asset,
+                    amount=FVal('10'),
+                    location_label=TEST_ADDR1,
+                ),
+            )
+
+    def clear_stale_marker() -> None:
+        with database.user_write() as write_cursor:
+            write_cursor.execute(
+                'DELETE FROM key_value_cache WHERE name IN (?, ?)',
+                (stale_cache_key, modification_cache_key),
+            )
+
+    def set_stale_marker(event_ts: int, modification_ts: int) -> None:
+        with database.user_write() as write_cursor:
+            database.set_static_cache(
+                write_cursor=write_cursor,
+                name=DBCacheStatic.STALE_BALANCES_FROM_TS,
+                value=str(event_ts),
+            )
+            database.set_static_cache(
+                write_cursor=write_cursor,
+                name=DBCacheStatic.STALE_BALANCES_MODIFICATION_TS,
+                value=str(modification_ts),
+            )
+
+    def set_last_processing(ts: int) -> None:
+        with database.user_write() as write_cursor:
+            database.set_static_cache(
+                write_cursor=write_cursor,
+                name=DBCacheStatic.LAST_HISTORICAL_BALANCE_PROCESSING_TS,
+                value=Timestamp(ts),
+            )
+
+    # 1. No events, no stale marker -> False
+    clear_stale_marker()
+    assert manager._has_unprocessed_events('timestamp <= ?', [TimestampMS(9999)]) is False
+
+    # 2. All processed, no modifications (stale=None) -> False
+    add_event(1000)
+    time.sleep(0.01)
+    process_historical_balances(database, messages_aggregator)
+    assert manager._has_unprocessed_events('timestamp <= ?', [TimestampMS(9999)]) is False
+
+    # 3. All processed including negative balance skip (stale=None) -> False (the fix!)
+    clear_stale_marker()
+    set_last_processing(ts_now())
+    assert manager._has_unprocessed_events('timestamp <= ?', [TimestampMS(9999)]) is False
+
+    # 4. Events added, never processed (stale exists, last_processing=None) -> True
+    with database.user_write() as write_cursor:
+        write_cursor.execute('DELETE FROM key_value_cache')
+        write_cursor.execute('DELETE FROM event_metrics')
+    add_event(2000)
+    assert manager._has_unprocessed_events('timestamp <= ?', [TimestampMS(9999)]) is True
+
+    # 5. Events added, never processed, no match (wrong asset) -> False
+    assert manager._has_unprocessed_events('asset = ?', ['BTC']) is False
+
+    # 6. New events after processing, matches new events -> True
+    time.sleep(0.01)
+    process_historical_balances(database, messages_aggregator)
+    add_event(5000)
+    assert manager._has_unprocessed_events('timestamp <= ?', [TimestampMS(9999)]) is True
+
+    # 7. New events after processing, query only old events -> False
+    assert manager._has_unprocessed_events('timestamp <= ?', [TimestampMS(3000)]) is False
+
+    # 8. New ETH events, query BTC -> False
+    assert manager._has_unprocessed_events('asset = ?', ['BTC']) is False
+
+    # 9. New events at ts=5000, query ts <= 3000 (before stale_event_ts) -> False
+    set_stale_marker(5000, ts_now() * 1000)
+    set_last_processing(ts_now() - 1)
+    assert manager._has_unprocessed_events('timestamp <= ?', [TimestampMS(3000)]) is False
+
+    # 10. Events modified during processing -> True
+    with database.user_write() as write_cursor:
+        write_cursor.execute('DELETE FROM event_metrics WHERE event_identifier IN (SELECT identifier FROM history_events WHERE timestamp >= 5000)')  # noqa: E501
+    assert manager._has_unprocessed_events('timestamp <= ?', [TimestampMS(9999)]) is True
+
+    # 11. A non-balance metric must not make an event look processed
+    with database.user_write() as write_cursor:
+        event_identifier = write_cursor.execute(
+            'SELECT identifier FROM history_events WHERE timestamp = ?',
+            (TimestampMS(5000),),
+        ).fetchone()[0]
+        write_cursor.execute(
+            'INSERT INTO event_metrics(event_identifier, location, location_label, protocol, '
+            'metric_key, metric_value, asset, timestamp, sequence_index, sort_key) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                event_identifier,
+                Location.ETHEREUM.serialize_for_db(),
+                TEST_ADDR1,
+                None,
+                EventMetricKey.REBASE_YIELD.serialize(),
+                '1',
+                A_ETH.identifier,
+                TimestampMS(5000),
+                0,
+                5000,
+            ),
+        )
+    assert manager._has_unprocessed_events('timestamp <= ?', [TimestampMS(9999)]) is True
+
+
+def test_process_historical_balances_resumes_at_exact_millisecond(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[
+                _make_balance_event(timestamp=1000, amount='1'),
+                _make_balance_event(timestamp=1500, amount='1'),
+            ],
+        )
+
+    process_historical_balances(database, messages_aggregator)
+    process_historical_balances(
+        database=database,
+        msg_aggregator=messages_aggregator,
+        from_ts=TimestampMS(1500),
+    )
+
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT timestamp, metric_value FROM event_metrics ORDER BY timestamp',
+        ).fetchall() == [(1000, '1'), (1500, '2')]
+
+
+def test_get_balances_with_unprocessed_events_and_timestamp_filter(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Regression test ensuring FVal timestamp scaling results are int-converted for SQL binding.
+
+    When querying historical balances with a timestamp filter, the timestamp is multiplied by
+    scaling_factor, producing an FVal that must be explicitly converted to int before passing
+    to SQL to avoid type binding errors.
+    """
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_event(
+            write_cursor=write_cursor,
+            event=EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                group_identifier='grp_test',
+                sequence_index=0,
+                timestamp=TimestampMS(1729787659000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=ONE,
+                location_label=TEST_ADDR1,
+            ),
+        )
+
+    filter_query = HistoricalBalancesFilterQuery.make(
+        timestamp=Timestamp(1729787659),
+        location=Location.ETHEREUM,
+    )
+    manager = HistoricalBalancesManager(database)
+    processing_required, balances = manager.get_balances(filter_query=filter_query)
+
+    assert processing_required is True
+    assert balances is None
+
+
+def test_get_balances_skips_zero_amounts(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Test that get_balances excludes assets with zero balance from results."""
+    manager = HistoricalBalancesManager(database)
+
+    with database.user_write() as write_cursor:
+        # ETH: +10 -10 = 0 (should be excluded), BTC: +5 (should be included)
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                group_identifier='grp1',
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('10'),
+                location_label=TEST_ADDR1,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                group_identifier='grp2',
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.SPEND,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('10'),
+                location_label=TEST_ADDR1,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                group_identifier='grp3',
+                sequence_index=0,
+                timestamp=TimestampMS(3000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_BTC,
+                amount=FVal('5'),
+                location_label=TEST_ADDR1,
+            )],
+        )
+
+    process_historical_balances(database, messages_aggregator)
+    _, balances = manager.get_balances(HistoricalBalancesFilterQuery.make(timestamp=Timestamp(4)))
+    assert balances == {A_BTC: FVal('5')}
+
+
+def test_transfer_updates_sender_and_receiver_buckets(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Test TRANSFER/NONE events create metrics for sender and receiver buckets.
+
+    Regular token transfer uses wallet buckets:
+    1. Receive 10 ETH -> wallet1 = 10
+    2. Transfer 3 ETH to wallet2 -> wallet1 = 7, wallet2 = 3
+
+    Protocol token transfer uses wallet buckets:
+    3. Receive 10 Balancer LP -> wallet1 = 10
+    4. Transfer 3 LP to wallet2 -> wallet1 = 7, wallet2 = 3
+
+    Protocol tokens from untracked address use wallet bucket:
+    5. Receive 5 LP via RECEIVE/NONE -> wallet1 = 12
+    """
+    balancer_lp_token = get_or_create_evm_token(
+        userdb=database,
+        evm_address=string_to_evm_address('0x5c6Ee304399DBdB9C8Ef030aB642B10820DB8F56'),
+        chain_id=ChainID.ETHEREUM,
+        protocol=CPT_BALANCER_V2,
+    )
+
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('10'),
+                location_label=TEST_ADDR1,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.TRANSFER,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('3'),
+                location_label=TEST_ADDR1,
+                address=TEST_ADDR2,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(3000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.RECEIVE_WRAPPED,
+                asset=balancer_lp_token,
+                amount=FVal('10'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_BALANCER_V2,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(4000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.TRANSFER,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=balancer_lp_token,
+                amount=FVal('3'),
+                location_label=TEST_ADDR1,
+                address=TEST_ADDR2,
+            ), EvmEvent(  # protocol token from untracked address uses wallet bucket
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(5000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=balancer_lp_token,
+                amount=FVal('5'),
+                location_label=TEST_ADDR1,
+            )],
+        )
+
+    process_historical_balances(database, messages_aggregator)
+
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT timestamp, asset, location_label, protocol, metric_value FROM event_metrics '
+            'ORDER BY timestamp, metric_value',
+        ).fetchall() == [
+            (1000, A_ETH.identifier, TEST_ADDR1, None, '10'),  # wallet1: 0 + 10 = 10
+            (2000, A_ETH.identifier, TEST_ADDR2, None, '3'),  # wallet2: 0 + 3 = 3
+            (2000, A_ETH.identifier, TEST_ADDR1, None, '7'),  # wallet1: 10 - 3 = 7
+            (3000, balancer_lp_token.identifier, TEST_ADDR1, None, '10'),  # 0 + 10 = 10
+            (4000, balancer_lp_token.identifier, TEST_ADDR2, None, '3'),  # 0 + 3 = 3
+            (4000, balancer_lp_token.identifier, TEST_ADDR1, None, '7'),  # 10 - 3 = 7
+            (5000, balancer_lp_token.identifier, TEST_ADDR1, None, '12'),  # 7 + 5 = 12
+        ]
+
+
+def test_exchange_transfer_does_not_update_bucket(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Test TRANSFER/NONE events in exchange locations don't affect balance buckets."""
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[HistoryEvent(
+                group_identifier='kraken-receive',
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.KRAKEN,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_BTC,
+                amount=FVal('10'),
+                location_label='kraken',
+            ), HistoryEvent(
+                group_identifier='kraken-transfer',
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.KRAKEN,
+                event_type=HistoryEventType.TRANSFER,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_BTC,
+                amount=FVal('3'),
+                location_label='kraken',
+            )],
+        )
+
+    process_historical_balances(database, messages_aggregator)
+
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT timestamp, asset, location_label, metric_value FROM event_metrics '
+            'ORDER BY timestamp',
+        ).fetchall() == [(1000, A_BTC.identifier, 'kraken', '10')]
+
+
+def test_deposit_to_protocol_updates_wallet_and_protocol_buckets(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Test DEPOSIT/DEPOSIT_TO_PROTOCOL and WITHDRAWAL/WITHDRAW_FROM_PROTOCOL events.
+
+    1. Receive 10 ETH -> wallet = 10
+    2. Deposit 5 ETH to Aave -> wallet = 5, Aave = 5
+    3. Withdraw 2 ETH from Aave -> wallet = 7, Aave = 3
+    """
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('10'),
+                location_label=TEST_ADDR1,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.DEPOSIT,
+                event_subtype=HistoryEventSubType.DEPOSIT_TO_PROTOCOL,
+                asset=A_ETH,
+                amount=FVal('5'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_AAVE_V3,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(3000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.WITHDRAWAL,
+                event_subtype=HistoryEventSubType.WITHDRAW_FROM_PROTOCOL,
+                asset=A_ETH,
+                amount=FVal('2'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_AAVE_V3,
+            )],
+        )
+
+    process_historical_balances(database, messages_aggregator)
+
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT timestamp, location_label, protocol, metric_value FROM event_metrics '
+            'ORDER BY timestamp, protocol NULLS FIRST',
+        ).fetchall() == [
+            (1000, TEST_ADDR1, None, '10'),  # wallet: 0 + 10 = 10
+            (2000, TEST_ADDR1, None, '5'),  # wallet: 10 - 5 = 5
+            (2000, TEST_ADDR1, CPT_AAVE_V3, '5'),  # protocol: 0 + 5 = 5
+            (3000, TEST_ADDR1, None, '7'),  # wallet: 5 + 2 = 7
+            (3000, TEST_ADDR1, CPT_AAVE_V3, '3'),  # protocol: 5 - 2 = 3
+        ]
+
+
+def test_empty_counterparty_does_not_create_protocol_bucket(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Test that dual and single protocol events use the wallet without a counterparty."""
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('10'),
+                location_label=TEST_ADDR1,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.DEPOSIT,
+                event_subtype=HistoryEventSubType.DEPOSIT_TO_PROTOCOL,
+                asset=A_ETH,
+                amount=FVal('3'),
+                location_label=TEST_ADDR1,
+                counterparty='',
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(3000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.GENERATE_DEBT,
+                asset=A_ETH,
+                amount=FVal('1'),
+                location_label=TEST_ADDR1,
+                counterparty='',
+            )],
+        )
+
+    process_historical_balances(database, messages_aggregator)
+
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT timestamp, location_label, protocol, metric_value FROM event_metrics '
+            'ORDER BY timestamp',
+        ).fetchall() == [
+            (1000, TEST_ADDR1, None, '10'),
+            (2000, TEST_ADDR1, None, '7'),
+            (3000, TEST_ADDR1, None, '8'),
+        ]
+
+
+def test_staking_deposit_and_withdraw_updates_wallet_and_protocol_buckets(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Test STAKING DEPOSIT_ASSET and REMOVE_ASSET events.
+
+    1. Receive 10 ETH -> wallet = 10
+    2. Stake 4 ETH to Eigenlayer -> wallet = 6, Eigenlayer = 4
+    3. Unstake 2 ETH from Eigenlayer -> wallet = 8, Eigenlayer = 2
+    """
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('10'),
+                location_label=TEST_ADDR1,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.STAKING,
+                event_subtype=HistoryEventSubType.DEPOSIT_ASSET,
+                asset=A_ETH,
+                amount=FVal('4'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_EIGENLAYER,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(3000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.STAKING,
+                event_subtype=HistoryEventSubType.REMOVE_ASSET,
+                asset=A_ETH,
+                amount=FVal('2'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_EIGENLAYER,
+            )],
+        )
+
+    process_historical_balances(database, messages_aggregator)
+
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT timestamp, location_label, protocol, metric_value FROM event_metrics '
+            'ORDER BY timestamp, protocol NULLS FIRST',
+        ).fetchall() == [
+            (1000, TEST_ADDR1, None, '10'),  # wallet: 0 + 10 = 10
+            (2000, TEST_ADDR1, None, '6'),  # wallet: 10 - 4 = 6
+            (2000, TEST_ADDR1, CPT_EIGENLAYER, '4'),  # protocol: 0 + 4 = 4
+            (3000, TEST_ADDR1, None, '8'),  # wallet: 6 + 2 = 8
+            (3000, TEST_ADDR1, CPT_EIGENLAYER, '2'),  # protocol: 4 - 2 = 2
+        ]
+
+
+def test_treat_eth2_as_eth_setting_combines_balance_buckets(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Test the treat_eth2_as_eth setting maps ETH2 events to the ETH balance bucket."""
+    with database.user_write() as write_cursor:
+        database.set_settings(write_cursor, ModifiableDBSettings(treat_eth2_as_eth=True))
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[HistoryEvent(
+                group_identifier='eth_receive',
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.KRAKEN,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('10'),
+                location_label='Kraken',
+            ), HistoryEvent(
+                group_identifier='eth2_spend',
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.KRAKEN,
+                event_type=HistoryEventType.SPEND,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH2,
+                amount=FVal('4'),
+                location_label='Kraken',
+            )],
+        )
+
+    process_historical_balances(database, messages_aggregator)
+
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT timestamp, location_label, asset, metric_value FROM event_metrics '
+            'ORDER BY timestamp',
+        ).fetchall() == [
+            (1000, 'Kraken', A_ETH.identifier, '10'),
+            (2000, 'Kraken', A_ETH.identifier, '6'),
+        ]
+
+
+def test_kraken_staking_lock_does_not_change_balance(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Test Kraken staking lock/unlock events don't affect the exchange account balance."""
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[HistoryEvent(
+                group_identifier='kraken_receive',
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.KRAKEN,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('10'),
+                location_label='Kraken',
+            ), HistoryEvent(
+                group_identifier='kraken_stake',
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.KRAKEN,
+                event_type=HistoryEventType.STAKING,
+                event_subtype=HistoryEventSubType.DEPOSIT_ASSET,
+                asset=A_ETH,
+                amount=FVal('4'),
+                location_label='Kraken',
+            ), HistoryEvent(
+                group_identifier='kraken_unstake',
+                sequence_index=0,
+                timestamp=TimestampMS(3000),
+                location=Location.KRAKEN,
+                event_type=HistoryEventType.STAKING,
+                event_subtype=HistoryEventSubType.REMOVE_ASSET,
+                asset=A_ETH,
+                amount=FVal('2'),
+                location_label='Kraken',
+            ), HistoryEvent(
+                group_identifier='kraken_staking_reward',
+                sequence_index=0,
+                timestamp=TimestampMS(4000),
+                location=Location.KRAKEN,
+                event_type=HistoryEventType.STAKING,
+                event_subtype=HistoryEventSubType.REWARD,
+                asset=A_ETH,
+                amount=FVal('0.5'),
+                location_label='Kraken',
+            )],
+        )
+
+    process_historical_balances(database, messages_aggregator)
+
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT timestamp, location_label, protocol, metric_value FROM event_metrics '
+            'ORDER BY timestamp',
+        ).fetchall() == [
+            (1000, 'Kraken', None, '10'),
+            (4000, 'Kraken', None, '10.5'),
+        ]
+
+
+def test_wrapped_deposit_and_redeem_updates_wallet_bucket(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Test DEPOSIT_FOR_WRAPPED and REDEEM_WRAPPED with protocol assets.
+
+    Simulates Balancer LP token flow through Aura Finance gauge:
+    1. Receive 10 LP from Balancer -> wallet bucket = 10
+    2. Deposit 6 LP into Aura -> wallet bucket = 4
+    3. Redeem 3 LP from Aura -> wallet bucket = 7
+    """
+    balancer_lp_token = get_or_create_evm_token(
+        userdb=database,
+        evm_address=string_to_evm_address('0x5c6Ee304399DBdB9C8Ef030aB642B10820DB8F56'),
+        chain_id=ChainID.ETHEREUM,
+        protocol=CPT_BALANCER_V2,
+    )
+
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.RECEIVE_WRAPPED,
+                asset=balancer_lp_token,
+                amount=FVal('10'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_BALANCER_V2,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.DEPOSIT,
+                event_subtype=HistoryEventSubType.DEPOSIT_FOR_WRAPPED,
+                asset=balancer_lp_token,
+                amount=FVal('6'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_AURA_FINANCE,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(3000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.WITHDRAWAL,
+                event_subtype=HistoryEventSubType.REDEEM_WRAPPED,
+                asset=balancer_lp_token,
+                amount=FVal('3'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_AURA_FINANCE,
+            )],
+        )
+
+    process_historical_balances(database, messages_aggregator)
+
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT timestamp, location_label, protocol, metric_value FROM event_metrics '
+            'ORDER BY timestamp, protocol',
+        ).fetchall() == [
+            (1000, TEST_ADDR1, None, '10'),  # 0 + 10 = 10
+            (2000, TEST_ADDR1, None, '4'),  # 10 - 6 = 4
+            (3000, TEST_ADDR1, None, '7'),  # 4 + 3 = 7
+        ]
+
+
+@pytest.mark.parametrize('db_settings', [
+    {'auto_create_profit_events': True},
+    {'auto_create_profit_events': False},
+])
+def test_synthetic_profit_event_when_protocol_withdrawal_exceeds_deposit(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+        db_settings: dict,
+) -> None:
+    """Test synthetic profit event creation when withdrawing more than deposited.
+
+    When WITHDRAWAL/WITHDRAW_FROM_PROTOCOL or STAKING/REMOVE_ASSET events withdraw more
+    than the protocol bucket balance (due to yield earned), a synthetic RECEIVE/REWARD
+    event is created for the difference (only if auto_create_profit_events is enabled).
+
+    1. Receive 10 ETH -> wallet = 10
+    2. Deposit 5 ETH to Liquity -> wallet = 5, Liquity = 5
+    3. Withdraw 5.1 ETH from Liquity (earned 0.1 ETH yield):
+       - If enabled: Profit event created, withdrawal amount adjusted
+       - If disabled: No profit event, withdrawal unchanged
+    """
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('10'),
+                location_label=TEST_ADDR1,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.DEPOSIT,
+                event_subtype=HistoryEventSubType.DEPOSIT_TO_PROTOCOL,
+                asset=A_ETH,
+                amount=FVal('5'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_LIQUITY,
+            ), EvmEvent(
+                tx_ref=(tx_hash := make_evm_tx_hash()),
+                sequence_index=0,
+                timestamp=TimestampMS(3000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.WITHDRAWAL,
+                event_subtype=HistoryEventSubType.WITHDRAW_FROM_PROTOCOL,
+                asset=A_ETH,
+                amount=FVal('5.1'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_LIQUITY,
+                notes='Withdraw 5.1 ETH from Liquity',
+            ), EvmEvent(
+                tx_ref=tx_hash,
+                sequence_index=1,  # event with sequence index immediately after the withdrawal
+                # to ensure indexes are incremented for multiple sequential events without error.
+                timestamp=TimestampMS(3000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.INFORMATIONAL,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=ZERO,
+                location_label=TEST_ADDR1,
+            )],
+        )
+
+    for _ in range(2):  # Ensure a second run gets the same result.
+        process_historical_balances(database, messages_aggregator)
+
+        with database.conn.read_ctx() as cursor:
+            if db_settings['auto_create_profit_events'] is True:
+                assert cursor.execute(
+                    'SELECT he.amount, he.sequence_index, he.notes, hem.value '
+                    'FROM history_events he '
+                    'LEFT JOIN history_events_mappings hem ON he.identifier = hem.parent_identifier '  # noqa: E501
+                    'ORDER BY he.timestamp, he.sequence_index',
+                ).fetchall() == [
+                    ('10', 0, None, None),  # receive 10 ETH
+                    ('5', 0, None, None),  # deposit 5 ETH
+                    ('0.1', 0, 'Profit earned from ETH in liquity', 2),  # synthetic profit event (state=2 virtual)  # noqa: E501
+                    ('5', 1, 'Withdraw 5 ETH from Liquity', None),  # withdrawal adjusted
+                    ('0', 2, None, None),  # informational event
+                ]
+            else:
+                assert cursor.execute(
+                    'SELECT amount, sequence_index, notes FROM history_events '
+                    'ORDER BY timestamp, sequence_index',
+                ).fetchall() == [
+                    ('10', 0, None),  # receive 10 ETH
+                    ('5', 0, None),  # deposit 5 ETH
+                    ('5.1', 0, 'Withdraw 5.1 ETH from Liquity'),  # withdrawal unchanged
+                    ('0', 1, None),  # informational event unchanged
+                ]
+
+
+@pytest.mark.parametrize('db_settings', [
+    {'auto_create_profit_events': True},
+    {'auto_create_profit_events': False},
+])
+def test_profit_event_when_protocol_withdrawal_amount_is_all_profit(
+        database: DBHandler,
+        db_settings: dict,
+) -> None:
+    """Test the profit event when withdrawing from a protocol when the full withdrawal amount
+    is all profit. This can happen when the deposit event is missing, or if all the deposited
+    funds have been withdrawn earlier but now the profit earned is being withdrawn.
+
+    In these cases, the entire withdrawal amount is treated as profit/yield by converting the
+    withdrawal event into a profit event (only if auto_create_profit_events is enabled).
+
+    1. Withdraw 5 ETH from Liquity (no prior deposit tracked):
+       - Interest event created: Liquity = 0 + 5 = 5
+       - Withdrawal processed: wallet = 0 + 5 = 5, Liquity = 5 - 5 = 0
+    """
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_event(
+            write_cursor=write_cursor,
+            event=EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.WITHDRAWAL,
+                event_subtype=HistoryEventSubType.WITHDRAW_FROM_PROTOCOL,
+                asset=A_ETH,
+                amount=FVal('5'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_LIQUITY,
+            ),
+        )
+
+    with patch.object(database.msg_aggregator, 'add_message') as msg_mock:
+        process_historical_balances(database, database.msg_aggregator)
+
+    with database.conn.read_ctx() as cursor:
+        if db_settings['auto_create_profit_events'] is True:
+            assert WSMessageType.NEGATIVE_BALANCE_DETECTED not in [
+                x.kwargs['message_type'] for x in msg_mock.call_args_list
+            ]
+            assert cursor.execute(
+                'SELECT he.amount, he.sequence_index, he.notes, hem.value '
+                'FROM history_events he '
+                'LEFT JOIN history_events_mappings hem ON he.identifier = hem.parent_identifier '
+                'ORDER BY he.timestamp, he.sequence_index',
+            ).fetchall() == [
+                ('5', 0, 'Profit earned from ETH in liquity', 2),  # converted to profit event
+            ]
+        else:
+            assert WSMessageType.NEGATIVE_BALANCE_DETECTED in [
+                x.kwargs['message_type'] for x in msg_mock.call_args_list
+            ]  # negative balance detected since no profit event created
+            assert cursor.execute(
+                'SELECT amount, sequence_index, type, subtype FROM history_events',
+            ).fetchall() == [
+                ('5', 0, 'withdrawal', 'withdraw from protocol'),  # unchanged withdrawal
+            ]
+
+
+def test_weth_wrap_then_swap_updates_wallet_buckets(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Test ETH wrapping followed by WETH swap updates the wallet WETH bucket.
+
+    1. Receive 1 ETH -> ETH wallet = 1
+    2. Wrap 1 ETH -> ETH wallet = 0, WETH wallet bucket = 1
+    3. Swap 1 WETH for 3000 DAI -> WETH wallet bucket = 0, DAI wallet = 3000
+
+    This guards against wrapped assets being routed to the event protocol bucket instead of
+    the wallet bucket.
+    """
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=ONE,
+                location_label=TEST_ADDR1,
+            ), EvmEvent(
+                tx_ref=(wrap_hash := make_evm_tx_hash()),
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.DEPOSIT,
+                event_subtype=HistoryEventSubType.DEPOSIT_FOR_WRAPPED,
+                asset=A_ETH,
+                amount=ONE,
+                location_label=TEST_ADDR1,
+                counterparty=CPT_WETH,
+            ), EvmEvent(
+                tx_ref=wrap_hash,
+                sequence_index=1,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.RECEIVE_WRAPPED,
+                asset=A_WETH,
+                amount=ONE,
+                location_label=TEST_ADDR1,
+                counterparty=CPT_WETH,
+            ), EvmEvent(
+                tx_ref=(swap_hash := make_evm_tx_hash()),
+                sequence_index=0,
+                timestamp=TimestampMS(3000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.TRADE,
+                event_subtype=HistoryEventSubType.SPEND,
+                asset=A_WETH,
+                amount=ONE,
+                location_label=TEST_ADDR1,
+            ), EvmEvent(
+                tx_ref=swap_hash,
+                sequence_index=1,
+                timestamp=TimestampMS(3000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.TRADE,
+                event_subtype=HistoryEventSubType.RECEIVE,
+                asset=A_DAI,
+                amount=FVal('3000'),
+                location_label=TEST_ADDR1,
+            )],
+        )
+
+    process_historical_balances(database, messages_aggregator)
+
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT timestamp, asset, location_label, protocol, metric_value FROM event_metrics '
+            'ORDER BY timestamp, asset, protocol NULLS FIRST, metric_value',
+        ).fetchall() == [
+            (1000, A_ETH.identifier, TEST_ADDR1, None, '1'),
+            (2000, A_ETH.identifier, TEST_ADDR1, None, '0'),
+            (2000, A_WETH.identifier, TEST_ADDR1, None, '1'),
+            (3000, A_DAI.identifier, TEST_ADDR1, None, '3000'),
+            (3000, A_WETH.identifier, TEST_ADDR1, None, '0'),
+        ]
+
+
+def test_cowswap_native_deposit_then_swap_updates_wallet_bucket_once(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Test that a CowSwap native asset order deposit does not affect its wallet bucket.
+
+    CowSwap decodes the native asset flow as two separate transactions: first a PLACE_ORDER
+    deposit, then the actual trade. The trade accounts for the full deposited amount, so applying
+    the deposit too would deduct the native asset twice.
+    """
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('25'),
+                location_label=TEST_ADDR1,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.DEPOSIT,
+                event_subtype=HistoryEventSubType.PLACE_ORDER,
+                asset=A_ETH,
+                amount=FVal('24.311042505395616962'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_COWSWAP,
+            ), EvmEvent(
+                tx_ref=(swap_hash := make_evm_tx_hash()),
+                sequence_index=0,
+                timestamp=TimestampMS(3000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.TRADE,
+                event_subtype=HistoryEventSubType.SPEND,
+                asset=A_ETH,
+                amount=FVal('24.304521595868826446'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_COWSWAP,
+            ), EvmEvent(
+                tx_ref=swap_hash,
+                sequence_index=1,
+                timestamp=TimestampMS(3000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.TRADE,
+                event_subtype=HistoryEventSubType.RECEIVE,
+                asset=A_USDC,
+                amount=FVal('40690.637506'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_COWSWAP,
+            ), EvmEvent(
+                tx_ref=swap_hash,
+                sequence_index=2,
+                timestamp=TimestampMS(3000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.TRADE,
+                event_subtype=HistoryEventSubType.FEE,
+                asset=A_ETH,
+                amount=FVal('0.006520909526790516'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_COWSWAP,
+            )],
+        )
+
+    process_historical_balances(database, messages_aggregator)
+
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT timestamp, asset, location_label, protocol, metric_value FROM event_metrics '
+            'ORDER BY timestamp, sequence_index',
+        ).fetchall() == [
+            (1000, A_ETH.identifier, TEST_ADDR1, None, '25'),
+            (3000, A_ETH.identifier, TEST_ADDR1, None, '0.695478404131173554'),
+            (3000, A_USDC.identifier, TEST_ADDR1, None, '40690.637506'),
+            (3000, A_ETH.identifier, TEST_ADDR1, None, '0.688957494604383038'),
+        ]
+
+
+@pytest.mark.parametrize('return_subtype', [
+    HistoryEventSubType.REFUND,
+    HistoryEventSubType.CANCEL_ORDER,
+])
+def test_cowswap_native_deposit_then_return_does_not_update_wallet_bucket(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+        return_subtype: HistoryEventSubType,
+) -> None:
+    """Test that refunded or cancelled CowSwap orders leave the wallet bucket unchanged."""
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('25'),
+                location_label=TEST_ADDR1,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.DEPOSIT,
+                event_subtype=HistoryEventSubType.PLACE_ORDER,
+                asset=A_ETH,
+                amount=FVal('11'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_COWSWAP,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(3000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.WITHDRAWAL,
+                event_subtype=return_subtype,
+                asset=A_ETH,
+                amount=FVal('11'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_COWSWAP,
+            )],
+        )
+
+    process_historical_balances(database, messages_aggregator)
+
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT timestamp, asset, location_label, protocol, metric_value FROM event_metrics',
+        ).fetchall() == [(1000, A_ETH.identifier, TEST_ADDR1, None, '25')]
+
+
+def test_protocol_token_spend_from_wallet_bucket(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Test non-trade OUT event deducts from the wallet bucket for protocol tokens.
+
+    1. Receive 10 Balancer LP via RECEIVE_WRAPPED -> wallet bucket = 10
+    2. Spend 3 LP via SPEND/NONE -> wallet bucket = 7
+    """
+    balancer_lp_token = get_or_create_evm_token(
+        userdb=database,
+        evm_address=string_to_evm_address('0x5c6Ee304399DBdB9C8Ef030aB642B10820DB8F56'),
+        chain_id=ChainID.ETHEREUM,
+        protocol=CPT_BALANCER_V2,
+    )
+
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.RECEIVE_WRAPPED,
+                asset=balancer_lp_token,
+                amount=FVal('10'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_BALANCER_V2,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.SPEND,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=balancer_lp_token,
+                amount=FVal('3'),
+                location_label=TEST_ADDR1,
+            )],
+        )
+
+    process_historical_balances(database, messages_aggregator)
+
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT timestamp, asset, location_label, protocol, metric_value FROM event_metrics '
+            'ORDER BY timestamp, metric_value',
+        ).fetchall() == [
+            (1000, balancer_lp_token.identifier, TEST_ADDR1, None, '10'),
+            (2000, balancer_lp_token.identifier, TEST_ADDR1, None, '7'),
+        ]
+
+
+def test_staking_protocol_lp_token_received_from_untracked_address(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Test staking a protocol LP token that was received via RECEIVE/NONE from untracked address.
+
+    When a protocol LP token (e.g., HOP LP) is received from an untracked address, it goes into
+    the wallet bucket. When later staking that token, the withdrawal comes from the wallet bucket
+    and the protocol bucket gets the explicit custody increase.
+
+    1. Receive 10 HOP LP via RECEIVE/NONE -> wallet bucket = 10
+    2. Stake 5 HOP LP to HOP -> wallet bucket = 5, hop bucket = 5
+    """
+    hop_lp_token = get_or_create_evm_token(
+        userdb=database,
+        evm_address=string_to_evm_address('0x5C2048094bAaDe483D0b1DA85c3Da6200A88a849'),
+        chain_id=ChainID.ETHEREUM,
+        protocol=CPT_HOP,
+    )
+
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=hop_lp_token,
+                amount=FVal('10'),
+                location_label=TEST_ADDR1,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.STAKING,
+                event_subtype=HistoryEventSubType.DEPOSIT_ASSET,
+                asset=hop_lp_token,
+                amount=FVal('5'),
+                location_label=TEST_ADDR1,
+                counterparty=CPT_HOP,
+            )],
+        )
+
+    process_historical_balances(database, messages_aggregator)
+
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT timestamp, location_label, protocol, metric_value FROM event_metrics '
+            'ORDER BY timestamp, protocol',
+        ).fetchall() == [
+            (1000, TEST_ADDR1, None, '10'),  # wallet bucket: 0 + 10 = 10
+            (2000, TEST_ADDR1, None, '5'),  # wallet bucket: 10 - 5 = 5
+            (2000, TEST_ADDR1, CPT_HOP, '5'),  # hop bucket: 0 + 5 = 5
+        ]
+
+
+def test_swapped_for_asset_tracked_under_new_identifier(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+        globaldb,  # pylint: disable=unused-argument
+) -> None:
+    """Test that events with v1 tokens (that have swapped_for set) are tracked under v2 identifier.
+
+    When a token upgrades (v1 -> v2) and has swapped_for set, historical balance processing should:
+    1. Store the v2 identifier in em.asset (not v1)
+    2. Allow querying by v2 identifier to find balances from v1 events
+
+    Example used: GNT (v1) -> GLM (v2)
+    """
+    gnt = Asset('eip155:1/erc20:0xa74476443119A942dE498590Fe1f2454d7D4aC0d')
+    glm = Asset('eip155:1/erc20:0x7DD9c5Cba05E151C895FDe1CF355C9A1D5DA6429')
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=gnt,
+                amount=FVal('100'),
+                location_label=TEST_ADDR1,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.SPEND,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=gnt,
+                amount=FVal('30'),
+                location_label=TEST_ADDR1,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(2500),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.SPEND,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=glm,
+                amount=FVal('10'),
+                location_label=TEST_ADDR1,
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(3000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=glm,
+                amount=FVal('50'),
+                location_label=TEST_ADDR1,
+            )],
+        )
+
+    process_historical_balances(database, messages_aggregator)
+
+    with database.conn.read_ctx() as cursor:
+        results = cursor.execute(
+            'SELECT he.asset, em.asset, em.metric_value '
+            'FROM event_metrics em '
+            'JOIN history_events he ON em.event_identifier = he.identifier '
+            'ORDER BY he.timestamp',
+        ).fetchall()
+        assert results == [
+            (gnt.identifier, glm.identifier, '100'),  # receive 100 GNT -> 0 + 100 = 100
+            (gnt.identifier, glm.identifier, '70'),  # spend 30 GNT -> 100 - 30 = 70
+            (glm.identifier, glm.identifier, '60'),  # spend 10 GLM -> 70 - 10 = 60
+            (glm.identifier, glm.identifier, '110'),  # receive 50 GLM -> 60 + 50 = 110
+        ]
+
+
+def test_rebasing_token_deficit_uses_archive_balance_and_resolves_issue(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Archive balanceOf replaces a negative event-derived balance at the block boundary."""
+    events_db = DBHistoryEvents(database)
+    receive_tx, spend_tx, final_receive_tx = (
+        make_evm_tx_hash(),
+        make_evm_tx_hash(),
+        make_evm_tx_hash(),
+    )
+    with database.user_write() as write_cursor:
+        _add_test_evm_transactions(
+            database=database,
+            write_cursor=write_cursor,
+            transactions=[
+                (receive_tx, Timestamp(1), 100),
+                (spend_tx, Timestamp(2), 200),
+                (final_receive_tx, Timestamp(2), 200),
+            ],
+        )
+        events_db.add_history_event(
+            write_cursor=write_cursor,
+            event=EvmEvent(
+                tx_ref=receive_tx,
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_DAI,
+                amount=FVal('10'),
+                location_label=TEST_ADDR1,
+            ),
+        )
+        spend_id = events_db.add_history_event(
+            write_cursor=write_cursor,
+            event=EvmEvent(
+                tx_ref=spend_tx,
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.SPEND,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_DAI,
+                amount=FVal('11'),
+                location_label=TEST_ADDR1,
+            ),
+        )
+        final_id = events_db.add_history_event(
+            write_cursor=write_cursor,
+            event=EvmEvent(
+                tx_ref=final_receive_tx,
+                sequence_index=1,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_DAI,
+                amount=FVal('2'),
+                location_label=TEST_ADDR1,
+            ),
+        )
+
+    process_historical_balances(database, messages_aggregator)
+    issue = DataIssuesManager(database).list_issues()[0]
+    assert issue.payload['event_identifier'] == spend_id
+    assert issue.state == 'open'
+
+    GlobalDBHandler.set_asset_flag(A_DAI.identifier, AssetFlag.REBASING, enabled=True)
+    try:
+        node_inquirer = MagicMock()
+        node_inquirer.get_historical_token_balance.return_value = FVal('3')
+        chains_aggregator = MagicMock()
+        chains_aggregator.get_evm_manager.return_value.node_inquirer = node_inquirer
+        get_rebasing_assets = GlobalDBHandler.get_asset_ids_with_flag
+        with (
+            patch.object(
+                GlobalDBHandler,
+                'get_asset_ids_with_flag',
+                wraps=get_rebasing_assets,
+            ) as get_flags_mock,
+            patch.object(database.msg_aggregator, 'add_message') as msg_mock,
+        ):
+            process_historical_balances(
+                database=database,
+                msg_aggregator=messages_aggregator,
+                chains_aggregator=chains_aggregator,
+            )
+
+        get_flags_mock.assert_called_once_with(AssetFlag.REBASING)
+        assert [call.kwargs['block_number'] for call in (
+            node_inquirer.get_historical_token_balance.call_args_list
+        )] == [200]
+        chains_aggregator.get_evm_manager.assert_called_once_with(ChainID.ETHEREUM)
+        assert WSMessageType.NEGATIVE_BALANCE_DETECTED not in [
+            call.kwargs['message_type'] for call in msg_mock.call_args_list
+        ]
+        with database.conn.read_ctx() as cursor:
+            assert cursor.execute(
+                'SELECT metric_key, metric_value, sort_key FROM event_metrics '
+                'WHERE event_identifier = ?',
+                (final_id,),
+            ).fetchall() == [
+                (EventMetricKey.REBASE_YIELD.serialize(), '2', 2001),
+                (EventMetricKey.BALANCE.serialize(), '3', 2001),
+            ]
+        assert DataIssuesManager(database).list_issues()[0].state == 'resolved'
+    finally:
+        GlobalDBHandler.set_asset_flag(A_DAI.identifier, AssetFlag.REBASING, enabled=False)
+
+
+def test_rebasing_protocol_deficit_writes_unsupported_bucket_issue(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """A token balanceOf cannot verify a rebasing balance held in a protocol bucket."""
+    GlobalDBHandler.set_asset_flag(A_DAI.identifier, AssetFlag.REBASING, enabled=True)
+    try:
+        tx_hashes = [make_evm_tx_hash() for _ in range(3)]
+        with database.user_write() as write_cursor:
+            _add_test_evm_transactions(
+                database=database,
+                write_cursor=write_cursor,
+                transactions=[
+                    (tx_hash, Timestamp(idx), idx * 100)
+                    for idx, tx_hash in enumerate(tx_hashes, start=1)
+                ],
+            )
+            DBHistoryEvents(database).add_history_events(
+                write_cursor=write_cursor,
+                history=[EvmEvent(
+                    tx_ref=tx_hashes[0],
+                    sequence_index=0,
+                    timestamp=TimestampMS(1000),
+                    location=Location.ETHEREUM,
+                    event_type=HistoryEventType.RECEIVE,
+                    event_subtype=HistoryEventSubType.NONE,
+                    asset=A_DAI,
+                    amount=FVal('10'),
+                    location_label=TEST_ADDR1,
+                ), EvmEvent(
+                    tx_ref=tx_hashes[1],
+                    sequence_index=0,
+                    timestamp=TimestampMS(2000),
+                    location=Location.ETHEREUM,
+                    event_type=HistoryEventType.DEPOSIT,
+                    event_subtype=HistoryEventSubType.DEPOSIT_TO_PROTOCOL,
+                    asset=A_DAI,
+                    amount=FVal('10'),
+                    location_label=TEST_ADDR1,
+                    counterparty=CPT_LIQUITY,
+                ), EvmEvent(
+                    tx_ref=tx_hashes[2],
+                    sequence_index=0,
+                    timestamp=TimestampMS(3000),
+                    location=Location.ETHEREUM,
+                    event_type=HistoryEventType.WITHDRAWAL,
+                    event_subtype=HistoryEventSubType.WITHDRAW_FROM_PROTOCOL,
+                    asset=A_DAI,
+                    amount=FVal('12'),
+                    location_label=TEST_ADDR1,
+                    counterparty=CPT_LIQUITY,
+                )],
+            )
+
+        node_inquirer = MagicMock()
+        chains_aggregator = MagicMock()
+        chains_aggregator.get_evm_manager.return_value.node_inquirer = node_inquirer
+        process_historical_balances(
+            database=database,
+            msg_aggregator=messages_aggregator,
+            chains_aggregator=chains_aggregator,
+        )
+
+        with database.conn.read_ctx() as cursor:
+            assert cursor.execute('SELECT COUNT(*) FROM history_events').fetchone()[0] == 3
+            assert cursor.execute(
+                'SELECT protocol, metric_key, metric_value FROM event_metrics '
+                'WHERE timestamp = ? ORDER BY protocol NULLS FIRST, metric_key',
+                (TimestampMS(3000),),
+            ).fetchall() == [
+                (None, EventMetricKey.BALANCE.serialize(), '12'),
+            ]
+        issues = DataIssuesManager(database).list_issues()
+        assert len(issues) == 1
+        assert issues[0].kind == IssueKind.REBASING_TOKEN.value
+        assert issues[0].payload['reason'] == 'unsupported_bucket'
+        node_inquirer.get_historical_token_balance.assert_not_called()
+    finally:
+        GlobalDBHandler.set_asset_flag(A_DAI.identifier, AssetFlag.REBASING, enabled=False)
+
+
+def test_healthy_rebasing_token_does_not_query_archive_node(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Archive reconciliation is unnecessary while event-derived balances remain valid."""
+    tx_hash = make_evm_tx_hash()
+    with database.user_write() as write_cursor:
+        _add_test_evm_transactions(
+            database=database,
+            write_cursor=write_cursor,
+            transactions=[(tx_hash, Timestamp(1), 100)],
+        )
+        event_id = DBHistoryEvents(database).add_history_event(
+            write_cursor=write_cursor,
+            event=EvmEvent(
+                tx_ref=tx_hash,
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_DAI,
+                amount=FVal('10'),
+                location_label=TEST_ADDR1,
+            ),
+        )
+
+    GlobalDBHandler.set_asset_flag(A_DAI.identifier, AssetFlag.REBASING, enabled=True)
+    try:
+        node_inquirer = MagicMock()
+        node_inquirer.get_historical_token_balance.return_value = None
+        chains_aggregator = MagicMock()
+        chains_aggregator.get_evm_manager.return_value.node_inquirer = node_inquirer
+        process_historical_balances(
+            database=database,
+            msg_aggregator=messages_aggregator,
+            chains_aggregator=chains_aggregator,
+        )
+
+        with database.conn.read_ctx() as cursor:
+            assert cursor.execute(
+                'SELECT COUNT(*) FROM event_metrics WHERE event_identifier=?',
+                (event_id,),
+            ).fetchone()[0] == 1
+        assert DataIssuesManager(database).list_issues() == []
+        node_inquirer.get_historical_token_balance.assert_not_called()
+    finally:
+        GlobalDBHandler.set_asset_flag(A_DAI.identifier, AssetFlag.REBASING, enabled=False)
+
+
+def test_negative_rebasing_token_without_archive_node_writes_specific_issue(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Missing archive access is a rebasing-token issue, not a negative-balance issue."""
+    receive_tx, spend_tx = make_evm_tx_hash(), make_evm_tx_hash()
+    with database.user_write() as write_cursor:
+        _add_test_evm_transactions(
+            database=database,
+            write_cursor=write_cursor,
+            transactions=[
+                (receive_tx, Timestamp(1), 100),
+                (spend_tx, Timestamp(2), 200),
+            ],
+        )
+        DBHistoryEvents(database).add_history_event(
+            write_cursor=write_cursor,
+            event=EvmEvent(
+                tx_ref=receive_tx,
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_DAI,
+                amount=FVal('10'),
+                location_label=TEST_ADDR1,
+            ),
+        )
+        spend_id = DBHistoryEvents(database).add_history_event(
+            write_cursor=write_cursor,
+            event=EvmEvent(
+                tx_ref=spend_tx,
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.SPEND,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_DAI,
+                amount=FVal('11'),
+                location_label=TEST_ADDR1,
+            ),
+        )
+
+    GlobalDBHandler.set_asset_flag(A_DAI.identifier, AssetFlag.REBASING, enabled=True)
+    try:
+        node_inquirer = MagicMock()
+        node_inquirer.get_historical_token_balance.return_value = None
+        node_inquirer.has_archive_node.return_value = False
+        chains_aggregator = MagicMock()
+        chains_aggregator.get_evm_manager.return_value.node_inquirer = node_inquirer
+        process_historical_balances(
+            database=database,
+            msg_aggregator=messages_aggregator,
+            chains_aggregator=chains_aggregator,
+        )
+
+        issues = DataIssuesManager(database).list_issues()
+        assert len(issues) == 1
+        issue = issues[0]
+        assert issue.kind == IssueKind.REBASING_TOKEN.value
+        assert issue.payload == {
+            'event_identifier': spend_id,
+            'block_number': 200,
+            'reason': 'archive_node_unavailable',
+        }
+        node_inquirer.get_historical_token_balance.assert_called_once()
+
+        DataIssuesManager(database).retry_auto_remediation(issue.id)
+        process_historical_balances(
+            database=database,
+            msg_aggregator=messages_aggregator,
+            chains_aggregator=chains_aggregator,
+        )
+        issue = DataIssuesManager(database).get_issue(issue.id)
+        assert issue.state == IssueState.UNRESOLVED
+        assert issue.auto_remediation_attempts[0]['reason'] == 'archive_node_unavailable'
+        assert issue.auto_remediation_attempts[0]['success'] is False
+
+        node_inquirer.get_historical_token_balance.return_value = ZERO
+        node_inquirer.has_archive_node.return_value = True
+        DataIssuesManager(database).retry_auto_remediation(issue.id)
+        retry_rebasing_token_issue(
+            database=database,
+            msg_aggregator=messages_aggregator,
+            chains_aggregator=chains_aggregator,
+            issue_id=issue.id,
+            from_ts=TimestampMS(issue.ts_start),
+        )
+
+        issue = DataIssuesManager(database).get_issue(issue.id)
+        assert issue.state == IssueState.RESOLVED
+        assert issue.payload['resolution'] == {'reason': 'no_longer_reproduces'}
+        assert len(issue.auto_remediation_attempts) == 2
+        assert issue.auto_remediation_attempts[1]['success'] is True
+        with database.conn.read_ctx() as cursor:
+            assert cursor.execute(
+                'SELECT metric_value FROM event_metrics '
+                'WHERE event_identifier=? AND metric_key=?',
+                (spend_id, EventMetricKey.BALANCE.serialize()),
+            ).fetchone()[0] == '0'
+    finally:
+        GlobalDBHandler.set_asset_flag(A_DAI.identifier, AssetFlag.REBASING, enabled=False)
+
+
+def test_rebasing_reconciliation_resumes_after_transient_query_failure(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """A later timestamp can restore metrics after an earlier archive query fails."""
+    tx_hashes = [make_evm_tx_hash() for _ in range(3)]
+    with database.user_write() as write_cursor:
+        _add_test_evm_transactions(
+            database=database,
+            write_cursor=write_cursor,
+            transactions=[
+                (tx_hash, Timestamp(idx), idx * 100)
+                for idx, tx_hash in enumerate(tx_hashes, start=1)
+            ],
+        )
+        events_db = DBHistoryEvents(database)
+        event_ids = [events_db.add_history_event(
+            write_cursor=write_cursor,
+            event=EvmEvent(
+                tx_ref=tx_hash,
+                sequence_index=0,
+                timestamp=TimestampMS(idx * 1000),
+                location=Location.ETHEREUM,
+                event_type=event_type,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_DAI,
+                amount=FVal(amount),
+                location_label=TEST_ADDR1,
+            ),
+        ) for idx, (tx_hash, event_type, amount) in enumerate(zip(
+                tx_hashes,
+                (HistoryEventType.RECEIVE, HistoryEventType.SPEND, HistoryEventType.RECEIVE),
+                ('10', '11', '2'),
+                strict=True,
+            ), start=1)]
+
+    GlobalDBHandler.set_asset_flag(A_DAI.identifier, AssetFlag.REBASING, enabled=True)
+    try:
+        node_inquirer = MagicMock()
+        node_inquirer.get_historical_token_balance.side_effect = [None, FVal('2')]
+        node_inquirer.has_archive_node.return_value = True
+        chains_aggregator = MagicMock()
+        chains_aggregator.get_evm_manager.return_value.node_inquirer = node_inquirer
+
+        process_historical_balances(
+            database=database,
+            msg_aggregator=messages_aggregator,
+            chains_aggregator=chains_aggregator,
+        )
+
+        issue = DataIssuesManager(database).list_issues()[0]
+        assert issue.state == IssueState.RESOLVED
+        assert issue.payload['event_identifier'] == event_ids[1]
+        assert node_inquirer.get_historical_token_balance.call_count == 2
+        with database.conn.read_ctx() as cursor:
+            assert cursor.execute(
+                'SELECT metric_key, metric_value FROM event_metrics '
+                'WHERE event_identifier=? ORDER BY rowid',
+                (event_ids[2],),
+            ).fetchall() == [
+                (EventMetricKey.REBASE_YIELD.serialize(), '1'),
+                (EventMetricKey.BALANCE.serialize(), '2'),
+            ]
+    finally:
+        GlobalDBHandler.set_asset_flag(A_DAI.identifier, AssetFlag.REBASING, enabled=False)
+
+
+def test_rebasing_reconciliation_reports_only_first_failure(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Later failed checkpoints must not rewrite the issue's original event and block."""
+    tx_hashes = [make_evm_tx_hash() for _ in range(3)]
+    with database.user_write() as write_cursor:
+        _add_test_evm_transactions(
+            database=database,
+            write_cursor=write_cursor,
+            transactions=[
+                (tx_hash, Timestamp(idx), idx * 100)
+                for idx, tx_hash in enumerate(tx_hashes, start=1)
+            ],
+        )
+        events_db = DBHistoryEvents(database)
+        event_ids = [events_db.add_history_event(
+            write_cursor=write_cursor,
+            event=EvmEvent(
+                tx_ref=tx_hash,
+                sequence_index=0,
+                timestamp=TimestampMS(idx * 1000),
+                location=Location.ETHEREUM,
+                event_type=event_type,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_DAI,
+                amount=FVal(amount),
+                location_label=TEST_ADDR1,
+            ),
+        ) for idx, (tx_hash, event_type, amount) in enumerate(zip(
+            tx_hashes,
+            (HistoryEventType.RECEIVE, HistoryEventType.SPEND, HistoryEventType.RECEIVE),
+            ('10', '11', '1'),
+            strict=True,
+        ), start=1)]
+
+    GlobalDBHandler.set_asset_flag(A_DAI.identifier, AssetFlag.REBASING, enabled=True)
+    try:
+        node_inquirer = MagicMock()
+        node_inquirer.get_historical_token_balance.return_value = None
+        node_inquirer.has_archive_node.return_value = False
+        chains_aggregator = MagicMock()
+        chains_aggregator.get_evm_manager.return_value.node_inquirer = node_inquirer
+
+        process_historical_balances(
+            database=database,
+            msg_aggregator=messages_aggregator,
+            chains_aggregator=chains_aggregator,
+        )
+
+        issues = DataIssuesManager(database).list_issues()
+        assert len(issues) == 1
+        assert issues[0].payload == {
+            'event_identifier': event_ids[1],
+            'block_number': 200,
+            'reason': 'archive_node_unavailable',
+        }
+        assert node_inquirer.get_historical_token_balance.call_count == 2
+    finally:
+        GlobalDBHandler.set_asset_flag(A_DAI.identifier, AssetFlag.REBASING, enabled=False)
+
+
+@pytest.mark.parametrize(('event_asset', 'bucket_asset'), [(A_ETH, A_DAI), (A_DAI, A_ETH)])
+def test_rebasing_asset_identity_mismatch_uses_negative_balance_path(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+        event_asset: Asset,
+        bucket_asset: Asset,
+) -> None:
+    """Swapped asset identity mismatches must never leave a bucket pending without a checkpoint."""
+    event = EvmEvent(
+        tx_ref=make_evm_tx_hash(),
+        sequence_index=0,
+        timestamp=TimestampMS(1000),
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.NONE,
+        asset=event_asset,
+        amount=ONE,
+        location_label=TEST_ADDR1,
+    )
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_event(write_cursor=write_cursor, event=event)
+
+    bucket = Bucket(
+        location=Location.ETHEREUM.serialize_for_db(),
+        location_label=TEST_ADDR1,
+        protocol=None,
+        asset=bucket_asset.identifier,
+    )
+    GlobalDBHandler.set_asset_flag(A_DAI.identifier, AssetFlag.REBASING, enabled=True)
+    try:
+        with patch.object(Bucket, 'from_event', return_value=[(bucket, EventDirection.OUT)]):
+            process_historical_balances(database, messages_aggregator)
+
+        issues = DataIssuesManager(database).list_issues()
+        assert len(issues) == 1
+        assert issues[0].kind == IssueKind.NEGATIVE_BALANCE
+        assert issues[0].asset == bucket_asset.identifier
+    finally:
+        GlobalDBHandler.set_asset_flag(A_DAI.identifier, AssetFlag.REBASING, enabled=False)
+
+
+def test_retry_rebasing_issue_finishes_remediation_state(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    issues_manager = DataIssuesManager(database)
+    issue_id = issues_manager.write_issue(
+        kind=IssueKind.REBASING_TOKEN,
+        location=Location.ETHEREUM.serialize_for_db(),
+        location_label=TEST_ADDR1,
+        protocol=None,
+        asset=A_DAI.identifier,
+        payload={
+            'event_identifier': 1,
+            'block_number': 100,
+            'reason': 'archive_node_unavailable',
+        },
+        ts_start=1000,
+        ts_end=1000,
+    )
+    issues_manager.retry_auto_remediation(issue_id)
+
+    with database.user_write() as write_cursor:
+        database.set_static_cache(
+            write_cursor=write_cursor,
+            name=DBCacheStatic.STALE_BALANCES_FROM_TS,
+            value='500',
+        )
+
+    with patch(
+        'rotkehlchen.tasks.historical_balances.process_historical_balances',
+        return_value=True,
+    ) as process_mock:
+        retry_rebasing_token_issue(
+            database=database,
+            msg_aggregator=messages_aggregator,
+            chains_aggregator=MagicMock(),
+            issue_id=issue_id,
+            from_ts=TimestampMS(1000),
+        )
+    assert process_mock.call_args.kwargs['from_ts'] == TimestampMS(500)
+
+    issue = issues_manager.get_issue(issue_id)
+    assert issue.state == IssueState.RESOLVED
+    assert issue.payload['resolution'] == {'reason': 'no_longer_reproduces'}
+    assert issue.auto_remediation_attempts[0] == {
+        'attribution': 'system',
+        'strategy': 'historical_balance_reprocessing',
+        'success': True,
+        'timestamp': issue.auto_remediation_attempts[0]['timestamp'],
+    }
+
+    second_issue_id = issues_manager.write_issue(
+        kind=IssueKind.REBASING_TOKEN,
+        location=Location.ETHEREUM.serialize_for_db(),
+        location_label=TEST_ADDR1,
+        protocol=None,
+        asset=A_DAI.identifier,
+        payload={
+            'event_identifier': 2,
+            'block_number': 200,
+            'reason': 'archive_node_unavailable',
+        },
+        ts_start=2000,
+        ts_end=2000,
+    )
+    issues_manager.retry_auto_remediation(second_issue_id)
+    with patch(
+        'rotkehlchen.tasks.historical_balances.process_historical_balances',
+        return_value=None,
+    ):
+        retry_rebasing_token_issue(
+            database=database,
+            msg_aggregator=messages_aggregator,
+            chains_aggregator=MagicMock(),
+            issue_id=second_issue_id,
+            from_ts=TimestampMS(2000),
+        )
+
+    second_issue = issues_manager.get_issue(second_issue_id)
+    assert second_issue.state == IssueState.UNRESOLVED
+    assert second_issue.auto_remediation_attempts[0]['reason'] == 'processing_already_running'
+    assert second_issue.auto_remediation_attempts[0]['success'] is False
+
+
+@pytest.mark.parametrize('ethereum_accounts', [[TEST_ADDR1]])
+@pytest.mark.parametrize('remedy', ['track_exchange', 'receive_payment'])
+def test_untracked_kraken_withdrawal_negative_balance(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+        ethereum_transaction_decoder: EthereumTransactionDecoder,
+        remedy: str,
+) -> None:
+    """A decoded Kraken withdrawal needs exchange history or a received-payment classification."""
+    transaction = EvmTransaction(
+        tx_hash=make_evm_tx_hash(),
+        chain_id=ChainID.ETHEREUM,
+        timestamp=Timestamp(1700000000),
+        block_number=18000000,
+        from_address=string_to_evm_address('0xAe2D4617c862309A3d75A0fFB358c7a5009c673F'),
+        to_address=TEST_ADDR1,
+        value=10**18,
+        gas=21000,
+        gas_price=10**9,
+        gas_used=21000,
+        input_data=b'',
+        nonce=0,
+    )
+    with database.user_write() as write_cursor:
+        DBEvmTx(database).add_transactions(
+            write_cursor, [transaction], relevant_address=TEST_ADDR1,
+        )
+    events, _, _ = ethereum_transaction_decoder._decode_transaction(
+        transaction=transaction,
+        tx_receipt=EvmTxReceipt(
+            tx_hash=transaction.tx_hash,
+            chain_id=ChainID.ETHEREUM,
+            contract_address=None,
+            status=True,
+            tx_type=0,
+            logs=[],
+        ),
+    )
+    assert len(events) == 1
+    withdrawal = events[0]
+    assert withdrawal.event_type == HistoryEventType.WITHDRAWAL
+    assert withdrawal.event_subtype == HistoryEventSubType.REMOVE_ASSET
+    assert withdrawal.counterparty == CPT_KRAKEN
+    assert withdrawal.location_label == TEST_ADDR1
+    assert withdrawal.amount == ONE
+    with database.conn.read_ctx() as cursor:
+        withdrawal.identifier = cursor.execute(
+            'SELECT identifier FROM history_events WHERE group_identifier=?',
+            (withdrawal.group_identifier,),
+        ).fetchone()[0]
+
+    process_historical_balances(database, messages_aggregator)
+    issues_manager = DataIssuesManager(database)
+    issues = issues_manager.list_issues()
+    assert len(issues) == 1
+    assert issues[0].kind == IssueKind.NEGATIVE_BALANCE
+    assert issues[0].payload == {
+        'event_identifier': withdrawal.identifier,
+        'in_memory_negative_amount': '-1',
+        'derived_balance_before_event': '0',
+        'reason': 'untracked_exchange',
+    }
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute('SELECT COUNT(*) FROM event_metrics').fetchone()[0] == 0
+
+    events_db = DBHistoryEvents(database)
+    if remedy == 'track_exchange':
+        database.add_exchange(
+            name='Kraken', location=Location.KRAKEN, api_key=ApiKey('test'), api_secret=None,
+        )
+        process_historical_balances(database, messages_aggregator)
+        assert 'reason' not in issues_manager.get_issue(issues[0].id).payload
+        with database.user_write() as write_cursor:
+            events_db.add_history_events(write_cursor, [HistoryEvent(
+                group_identifier='kraken-funding',
+                sequence_index=0,
+                timestamp=TimestampMS(withdrawal.timestamp - 2000),
+                location=Location.KRAKEN,
+                location_label='Kraken',
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=ONE,
+            ), AssetMovement(
+                unique_id='kraken-withdrawal',
+                timestamp=TimestampMS(withdrawal.timestamp - 1000),
+                location=Location.KRAKEN,
+                location_label='Kraken',
+                event_subtype=HistoryEventSubType.SPEND,
+                asset=A_ETH,
+                amount=ONE,
+                extra_data={'transaction_id': transaction.tx_hash.hex(), 'address': TEST_ADDR1},
+            )])
+        match_asset_movements(database)
+        with database.conn.read_ctx() as cursor:
+            assert cursor.execute(
+                'SELECT type, subtype FROM history_events WHERE identifier=?',
+                (withdrawal.identifier,),
+            ).fetchone() == ('exchange transfer', 'receive')
+    else:
+        withdrawal.event_type = HistoryEventType.RECEIVE
+        withdrawal.event_subtype = HistoryEventSubType.PAYMENT
+        with database.user_write() as write_cursor:
+            events_db.edit_history_event(
+                write_cursor, withdrawal, mapping_state=HistoryMappingState.CUSTOMIZED,
+            )
+
+    issues_manager.resolve_manually(issues[0].id)
+    with patch.object(database.msg_aggregator, 'add_message') as msg_mock:
+        process_historical_balances(database, messages_aggregator)
+    assert WSMessageType.NEGATIVE_BALANCE_DETECTED not in [
+        call.kwargs['message_type'] for call in msg_mock.call_args_list
+    ]
+    assert issues_manager.get_issue(issues[0].id).state == IssueState.RESOLVED
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT metric_value FROM event_metrics WHERE event_identifier=? AND metric_key=?',
+            (withdrawal.identifier, EventMetricKey.BALANCE.serialize()),
+        ).fetchall() == [('1',)]
+        if remedy == 'track_exchange':
+            assert cursor.execute(
+                'SELECT metric_value FROM event_metrics WHERE location=? ORDER BY timestamp',
+                (Location.KRAKEN.serialize_for_db(),),
+            ).fetchall() == [('1',), ('0',)]
+
+
+def test_negative_balance_writes_data_issue(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Negative balance detection should write a data issue without changing WS/halt behavior."""
+    events_db = DBHistoryEvents(database)
+    with database.user_write() as write_cursor:
+        receive_id = events_db.add_history_event(
+            write_cursor=write_cursor,
+            event=EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('1'),
+                location_label=TEST_ADDR1,
+            ),
+        )
+        spend_id = events_db.add_history_event(
+            write_cursor=write_cursor,
+            event=EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.SPEND,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('2'),
+                location_label=TEST_ADDR1,
+            ),
+        )
+
+    with patch.object(database.msg_aggregator, 'add_message') as msg_mock:
+        process_historical_balances(database, messages_aggregator)
+        assert WSMessageType.NEGATIVE_BALANCE_DETECTED in [
+            x.kwargs['message_type'] for x in msg_mock.call_args_list
+        ]
+
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute('SELECT COUNT(*) FROM data_issues').fetchone()[0] == 1
+        issue_row = cursor.execute(
+            'SELECT kind, state, severity, payload_json FROM data_issues',
+        ).fetchone()
+        assert issue_row[0] == 'negative_balance'
+        assert issue_row[1] == 'open'
+        assert issue_row[2] == 'warning'
+        payload = json.loads(issue_row[3])
+        assert payload == {
+            'event_identifier': spend_id,
+            'in_memory_negative_amount': '-1',
+            'derived_balance_before_event': '1',
+        }
+        assert cursor.execute(
+            'SELECT COUNT(*) FROM event_metrics WHERE event_identifier = ?',
+            (receive_id,),
+        ).fetchone()[0] == 1
+        assert cursor.execute(
+            'SELECT COUNT(*) FROM event_metrics WHERE event_identifier = ?',
+            (spend_id,),
+        ).fetchone()[0] == 0
+
+    process_historical_balances(database, messages_aggregator)
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute('SELECT COUNT(*) FROM data_issues').fetchone()[0] == 1
+
+    issue_id = DataIssuesManager(database).list_issues()[0].id
+    DataIssuesManager(database).dismiss(issue_id)
+    process_historical_balances(database, messages_aggregator)
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT state FROM data_issues WHERE id = ?',
+            (issue_id,),
+        ).fetchone()[0] == 'dismissed'
+
+
+def test_negative_balance_reopens_resolved_data_issue(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_event(
+            write_cursor=write_cursor,
+            event=EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('1'),
+                location_label=TEST_ADDR1,
+            ),
+        )
+        DBHistoryEvents(database).add_history_event(
+            write_cursor=write_cursor,
+            event=EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.SPEND,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_ETH,
+                amount=FVal('2'),
+                location_label=TEST_ADDR1,
+            ),
+        )
+
+    process_historical_balances(database, messages_aggregator)
+
+    issue_id = DataIssuesManager(database).list_issues()[0].id
+    DataIssuesManager(database).resolve_manually(issue_id)
+    process_historical_balances(database, messages_aggregator)
+    assert DataIssuesManager(database).get_issue(issue_id).state == 'open'
+
+
+def test_unmatched_bridge_data_issues(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Unmatched bridge legs past their settlement window become data issues in the
+    inbox, and get system-resolved once the legs are matched."""
+    from rotkehlchen.chain.evm.decoding.across.constants import CPT_ACROSS
+    from rotkehlchen.db.constants import HistoryEventLinkType
+    from rotkehlchen.history.data_issues.types import DataIssueFilters
+
+    events_db = DBHistoryEvents(database)
+    old_ts = TimestampMS((ts_now() - 30 * 24 * 3600) * 1000)  # far beyond any match window
+    with database.conn.write_ctx() as write_cursor:
+        events_db.add_history_events(
+            write_cursor=write_cursor,
+            history=[EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=old_ts,
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.DEPOSIT,
+                event_subtype=HistoryEventSubType.BRIDGE,
+                asset=A_ETH,
+                amount=ONE,
+                location_label=TEST_ADDR1,
+                counterparty=CPT_ACROSS,
+                extra_data={'bridge': {'from_chain': 1, 'to_chain': 42161}},
+            ), EvmEvent(
+                tx_ref=make_evm_tx_hash(),
+                sequence_index=0,
+                timestamp=TimestampMS(old_ts + 300000),
+                location=Location.ARBITRUM_ONE,
+                event_type=HistoryEventType.WITHDRAWAL,
+                event_subtype=HistoryEventSubType.BRIDGE,
+                asset=A_ETH,
+                amount=ONE,
+                location_label=TEST_ADDR1,
+                counterparty=CPT_ACROSS,
+            )],
+        )
+
+    process_historical_balances(database, messages_aggregator)
+    issues_manager = DataIssuesManager(database=database)
+    issues = issues_manager.list_issues(
+        filters=DataIssueFilters(kind=IssueKind.UNMATCHED_BRIDGE.value),
+    )
+    assert {
+        (issue.payload['direction'], Location.deserialize_from_db(issue.location), issue.state)
+        for issue in issues
+    } == {
+        ('deposit', Location.ETHEREUM, IssueState.OPEN.value),
+        ('withdrawal', Location.ARBITRUM_ONE, IssueState.OPEN.value),
+    }
+
+    # linking the pair resolves both issues on the next run
+    deposit_id, withdrawal_id = sorted(
+        issue.payload['event_identifier'] for issue in issues
+    )
+    with database.conn.write_ctx() as write_cursor:
+        write_cursor.execute(
+            'INSERT INTO history_event_links(left_event_id, right_event_id, link_type) '
+            'VALUES(?, ?, ?)',
+            (deposit_id, withdrawal_id, HistoryEventLinkType.BRIDGE_MATCH.serialize_for_db()),
+        )
+    process_historical_balances(database, messages_aggregator)
+    issues = issues_manager.list_issues(
+        filters=DataIssueFilters(kind=IssueKind.UNMATCHED_BRIDGE.value),
+    )
+    assert {issue.state for issue in issues} == {IssueState.RESOLVED.value}
+
+
+def test_bitcoin_transfer_updates_sender_and_receiver_buckets(
+        database: DBHandler,
+        messages_aggregator: MessagesAggregator,
+) -> None:
+    """Test bitcoin TRANSFER/NONE events credit the receiving address too.
+
+    Bitcoin events are plain HistoryEvents with no address column, so the counterparty has to
+    come from the notes. Without it a change output would only be debited from the sending
+    address and never credited to the receiving one, understating the wallet by the full
+    change amount on every send.
+    """
+    sender = 'bc1qdlt2jrplkf0v7ucvhhjhs0qf7cqr0j27k7j7p0'
+    change = 'bc1qm4lpczdpkcs6j4twpzd2lgguy0sd8zzsm6puhl'
+    with database.user_write() as write_cursor:
+        DBHistoryEvents(database).add_history_events(
+            write_cursor=write_cursor,
+            history=[HistoryEvent(
+                group_identifier='btc_receive',
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.BITCOIN,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_BTC,
+                amount=FVal('10'),
+                location_label=sender,
+                notes='Receive 10 BTC from bc1q5242kk7ut5nkyv74g765amvwqnglrya6xgj6mz',
+            ), HistoryEvent(
+                group_identifier='btc_change',
+                sequence_index=0,
+                timestamp=TimestampMS(2000),
+                location=Location.BITCOIN,
+                event_type=HistoryEventType.TRANSFER,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_BTC,
+                amount=FVal('3'),
+                location_label=sender,
+                notes=f'Transfer 3 BTC to {change}',
+            )],
+        )
+
+    process_historical_balances(database, messages_aggregator)
+
+    with database.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT timestamp, asset, location_label, metric_value FROM event_metrics '
+            'ORDER BY timestamp, metric_value',
+        ).fetchall() == [
+            (1000, A_BTC.identifier, sender, '10'),
+            (2000, A_BTC.identifier, change, '3'),  # credited, not lost
+            (2000, A_BTC.identifier, sender, '7'),
+        ]

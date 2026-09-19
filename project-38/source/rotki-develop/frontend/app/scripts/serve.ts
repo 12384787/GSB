@@ -1,0 +1,226 @@
+#!/usr/bin/env node
+
+import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
+import process from 'node:process';
+import { cac } from 'cac';
+import consola from 'consola';
+import electron from 'electron';
+import { build, createLogger, createServer, type Plugin, type ViteDevServer } from 'vite';
+import { type BuildOutput, LOG_LEVEL, sharedConfig } from './setup';
+
+/** Messages on stderr that match any of the contained patterns will be stripped from output */
+const stderrFilterPatterns = [
+  // Devtools extension warning: cawa-93/vite-electron-builder#492.
+  /ExtensionLoadWarning/,
+];
+
+interface WatcherConfig {
+  name: string;
+  configFile: string;
+  writeBundle: Plugin['writeBundle'];
+}
+
+interface ServeOptions {
+  web: boolean;
+  remoteDebuggingPort?: number;
+  mode: string;
+  port: number;
+  open: boolean;
+}
+
+async function getWatcher({ name, configFile, writeBundle }: WatcherConfig, mode: string): Promise<BuildOutput> {
+  return build({
+    ...sharedConfig,
+    mode,
+    configFile,
+    plugins: [{ name, writeBundle }],
+  });
+}
+
+let childProcesses: ChildProcessWithoutNullStreams[] = [];
+
+/**
+ * Start or restart App when source files are changed
+ *
+ * @remarks
+ * The dev server's url is assembled here and exported as `VITE_DEV_SERVER_URL`, which is how the
+ * spawned main process learns where to load the renderer from.
+ */
+async function setupMainPackageWatcher({ config: { server } }: ViteDevServer, mode: string, remoteDebuggingPort?: number): Promise<BuildOutput> {
+  const protocol = server.https ? 'https:' : 'http:';
+  const host = server.host ?? 'localhost';
+  const port = server.port; // Vite searches for and occupies the first free port: 3000, 3001, 3002, and so on
+  const urlPath = '/';
+  process.env.VITE_DEV_SERVER_URL = `${protocol}//${host}:${port}${urlPath}`;
+
+  const logger = createLogger(LOG_LEVEL);
+
+  let spawnProcess: ChildProcessWithoutNullStreams | null = null;
+
+  return getWatcher({
+    name: 'reload-app-on-main-package-change',
+    configFile: 'vite.config.main.ts',
+    writeBundle() {
+      if (spawnProcess) {
+        childProcesses = childProcesses.filter(p => p !== spawnProcess);
+        spawnProcess.off('exit', () => process.exit());
+        spawnProcess.kill('SIGINT');
+        spawnProcess = null;
+      }
+
+      const args = ['.'];
+      if (remoteDebuggingPort)
+        args.push(`--remote-debugging-port=${remoteDebuggingPort}`);
+
+      if (process.env.XDG_SESSION_TYPE === 'wayland')
+        args.push('--enable-features=WaylandWindowDecorations', '--ozone-platform-hint=auto');
+
+      spawnProcess = spawn(String(electron), args);
+      childProcesses.push(spawnProcess);
+
+      spawnProcess.stdout.on('data', (d) => {
+        const data = d.toString().trim();
+        if (data)
+          logger.warn(data);
+      });
+      spawnProcess.stderr.on('data', (d) => {
+        const data = d.toString().trim();
+        if (!data)
+          return;
+
+        const mayIgnore = stderrFilterPatterns.some(r => r.test(data));
+        if (mayIgnore)
+          return;
+
+        logger.error(data);
+      });
+
+      // Stops the watch script when the application has been quit
+      spawnProcess.on('exit', () => process.exit());
+    },
+  }, mode);
+}
+
+/**
+ * Start or restart App when source files are changed
+ */
+async function setupPreloadPackageWatcher({ ws }: ViteDevServer, mode: string): Promise<BuildOutput> {
+  return getWatcher({
+    name: 'reload-page-on-preload-package-change',
+    configFile: 'vite.config.preload.ts',
+    writeBundle() {
+      ws.send({
+        type: 'full-reload',
+      });
+    },
+  }, mode);
+}
+
+/**
+ * Environment variables set by coding agents that run `pnpm dev:web` on the
+ * developer's behalf. A browser tab popping up belongs to an interactive run,
+ * not to an agent's background dev server, so these suppress the auto-open the
+ * same way CI does. Set `ROTKI_OPEN_BROWSER=1` to force it back on.
+ */
+const agentEnvVars = [
+  'AI_AGENT', // claude code
+  'CLAUDECODE', // claude code
+  'CLAUDE_CODE_ENTRYPOINT', // claude code
+  'CODEX_SANDBOX', // openai codex cli
+  'CURSOR_AGENT', // cursor
+  'GEMINI_CLI', // gemini cli
+];
+
+function isAgentRun(): boolean {
+  return agentEnvVars.some(name => !!process.env[name]);
+}
+
+/**
+ * Only auto-open a browser tab in web mode: in electron mode the renderer is loaded
+ * inside the electron window, so a browser tab would be spurious. Neither CI nor a
+ * coding agent opens one either, since nobody is watching that screen.
+ */
+function shouldOpenBrowser(web: boolean, open: boolean): boolean {
+  if (!web || !open) {
+    return false;
+  }
+  if (process.env.ROTKI_OPEN_BROWSER) {
+    return true;
+  }
+  if (process.env.CI) {
+    return false;
+  }
+  if (isAgentRun()) {
+    consola.info('not opening a browser tab (agent environment detected); set ROTKI_OPEN_BROWSER=1 to override');
+    return false;
+  }
+  return true;
+}
+
+async function serve(options: ServeOptions): Promise<void> {
+  const { web, remoteDebuggingPort, mode, port, open } = options;
+
+  try {
+    // A plain boolean, so Vite opens the resolved URL and honours the instance's port.
+    const openBrowser = shouldOpenBrowser(web, open);
+    const viteDevServer = await createServer({
+      ...sharedConfig,
+      mode: process.env.CI && process.env.VITE_TEST ? 'production' : mode,
+      configFile: 'vite.config.ts',
+      server: {
+        port,
+        open: openBrowser,
+      },
+    });
+
+    await viteDevServer.listen();
+    viteDevServer.printUrls();
+
+    if (!web) {
+      await setupPreloadPackageWatcher(viteDevServer, mode);
+      await setupMainPackageWatcher(viteDevServer, mode, remoteDebuggingPort);
+    }
+
+    const cleanup = (signal: string): void => {
+      consola.info(`Received ${signal}, cleaning up...`);
+      viteDevServer.close().then(() => {
+        consola.info('Vite server stopped');
+      }).catch(error => consola.error(error)).finally(() => {
+        childProcesses.forEach((p) => {
+          console.info(`terminating child process ${p.pid}`);
+          p.kill();
+        });
+        process.exit();
+      });
+    };
+
+    process.on('SIGINT', () => cleanup('SIGINT'));
+    process.on('SIGTERM', () => cleanup('SIGTERM'));
+    process.on('SIGHUP', () => cleanup('SIGHUP'));
+  }
+  catch (error) {
+    consola.error(error);
+    process.exit(1);
+  }
+}
+
+const cli = cac();
+
+cli.command('', 'Rotki frontend development server')
+  .option('--web', 'Run as web-only (no Electron)')
+  .option('--remote-debugging-port <port>', 'Chrome remote debugging port')
+  .option('--mode <mode>', 'Development mode', { default: 'development' })
+  .option('--port <port>', 'Listening port', { default: 8080 })
+  .option('--open', 'Open the web app in the browser on start (web mode only, default: on, off under CI and coding agents; use --no-open to disable)', { default: true })
+  .action(async (options) => {
+    await serve({
+      web: options.web ?? false,
+      remoteDebuggingPort: options.remoteDebuggingPort ? Number(options.remoteDebuggingPort) : undefined,
+      mode: options.mode,
+      port: Number(options.port),
+      open: options.open ?? true,
+    });
+  });
+
+cli.help();
+cli.parse();

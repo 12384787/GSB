@@ -1,0 +1,345 @@
+import { execSync, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import process from 'node:process';
+import { defineConfig, devices, type PlaywrightTestConfig } from '@playwright/test';
+
+/**
+ * A shard is one complete stack of its own, started by `scripts/e2e-shards.ts`.
+ * `E2E_SHARD` is its 1-based number and is set only by that runner; everything
+ * below falls back to the single-stack behaviour when it is absent, so a plain
+ * `pnpm test:e2e` and CI are untouched.
+ */
+const shard = Number(process.env.E2E_SHARD ?? 0);
+
+const BASE_FRONTEND_PORT = 30301;
+const BASE_BACKEND_PORT = 30302;
+const BASE_COLIBRI_PORT = 30303;
+const BASE_MOCK_RPC_PORT = 30304;
+/** starling's reverse proxy, the single origin the tests address. Nothing dials the upstreams. */
+const BASE_PROXY_PORT = 30305;
+/** Unused by the suite, but starling wants one and it must not collide with another block. */
+const BASE_MCP_PORT = 30306;
+
+const BASE_PORTS = [
+  BASE_FRONTEND_PORT,
+  BASE_BACKEND_PORT,
+  BASE_COLIBRI_PORT,
+  BASE_MOCK_RPC_PORT,
+  BASE_PROXY_PORT,
+  BASE_MCP_PORT,
+];
+const PORT_BLOCK_STRIDE = 10;
+const MAX_PORT_BLOCKS = 10;
+
+/**
+ * Synchronously check whether a port can be bound. Playwright config files are loaded
+ * synchronously, so this shells out to a short-lived node instead of using an async
+ * `net.createServer` probe.
+ */
+function isPortFree(port: number): boolean {
+  const probe = 'const net = require("node:net");'
+    + 'const server = net.createServer();'
+    + 'server.once("error", () => process.exit(1));'
+    + 'server.once("listening", () => server.close(() => process.exit(0)));'
+    + `server.listen(${port}, "127.0.0.1");`;
+  return spawnSync(process.execPath, ['-e', probe], { stdio: 'ignore' }).status === 0;
+}
+
+/**
+ * The services use fixed ports, so a second checkout running e2e at the same time
+ * would collide (or worse, silently reuse the other checkout's servers via
+ * `reuseExistingServer`). Move the whole block up in steps of 10 until every port in it
+ * is free. CI is pinned to the base block: the build job bakes the backend/colibri URLs
+ * into the frontend bundle from its own env, so the ports cannot be chosen here.
+ *
+ * The offset must be resolved exactly once per run. Playwright loads this config in the
+ * main process and again in every worker, and by the time a worker loads it the servers
+ * the main process started are occupying the block it picked. A second probe would see
+ * them as busy and shift, leaving the helpers that import `backendUrl` pointing at a port
+ * nothing is listening on. Publishing the result to the env makes the workers - which are
+ * children of the main process - inherit the decision instead of re-deciding.
+ */
+function resolvePortOffset(): number {
+  if (process.env.CI)
+    return 0;
+
+  // Inherited from the main process or set in the shell to pin a block; `'0'` is truthy.
+  const inherited = process.env.E2E_PORT_OFFSET;
+  if (inherited && Number.isInteger(Number(inherited)))
+    return Number(inherited);
+
+  for (let block = 0; block < MAX_PORT_BLOCKS; block++) {
+    const offset = block * PORT_BLOCK_STRIDE;
+    if (BASE_PORTS.every(port => isPortFree(port + offset))) {
+      if (offset > 0)
+        console.log(`[e2e] ports ${BASE_FRONTEND_PORT}-${BASE_MOCK_RPC_PORT} are busy, using +${offset}`);
+
+      process.env.E2E_PORT_OFFSET = String(offset);
+      return offset;
+    }
+  }
+
+  throw new Error(
+    `Could not find a free block of e2e ports after ${MAX_PORT_BLOCKS} attempts starting at ${BASE_FRONTEND_PORT}`,
+  );
+}
+
+const portOffset = resolvePortOffset();
+
+const FRONTEND_PORT = BASE_FRONTEND_PORT + portOffset;
+const BACKEND_PORT = BASE_BACKEND_PORT + portOffset;
+const COLIBRI_PORT = BASE_COLIBRI_PORT + portOffset;
+const MOCK_RPC_PORT = BASE_MOCK_RPC_PORT + portOffset;
+const PROXY_PORT = BASE_PROXY_PORT + portOffset;
+const MCP_PORT = BASE_MCP_PORT + portOffset;
+
+const frontendUrl = `http://localhost:${FRONTEND_PORT}`;
+/**
+ * One origin for both backends, matching every shipping mode: `/api/1/*` and `/ws/` reach core,
+ * `/colibri/*` reaches colibri with the prefix stripped.
+ */
+const backendUrl = `http://127.0.0.1:${PROXY_PORT}`;
+const colibriUrl = `${backendUrl}/colibri`;
+const mockRpcUrl = `http://127.0.0.1:${MOCK_RPC_PORT}`;
+
+/**
+ * `.e2e` resolves from the cwd, so parallel runs in different worktrees already get their own
+ * data and log directories. Shards run inside one worktree and share a cwd, so each needs a
+ * subdirectory of its own or several backends are handed the same user database.
+ */
+const testDir = path.join(process.cwd(), '.e2e');
+const shardDir = shard > 0 ? path.join(testDir, `shard-${shard}`) : testDir;
+const dataDir = path.join(shardDir, 'data');
+const logDir = path.join(shardDir, 'logs');
+/** Shards report here under distinct names; the runner merges the blobs into one html report. */
+const blobDir = path.join(testDir, 'blob-report');
+
+function ensureDirectories(): void {
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+  if (!fs.existsSync(logDir)) {
+    fs.mkdirSync(logDir, { recursive: true });
+  }
+}
+
+ensureDirectories();
+
+/**
+ * Detect system Chromium installation for Arch Linux and other systems.
+ * Returns the path to chromium if found, undefined otherwise (uses bundled Chromium).
+ *
+ * @remarks
+ * `which chromium` is tried first, since it finds the binary on most Linux distributions without
+ * assuming where the package put it, and the known paths below are only the fallback.
+ */
+function detectSystemChromium(): string | undefined {
+  try {
+    const chromiumPath = execSync('which chromium', { encoding: 'utf-8' }).trim();
+    if (chromiumPath && fs.existsSync(chromiumPath)) {
+      return chromiumPath;
+    }
+  }
+  catch {
+    // Command failed, try fallback paths
+  }
+
+  // Fallback: common Linux paths
+  const fallbackPaths = [
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/snap/bin/chromium',
+  ];
+
+  for (const browserPath of fallbackPaths) {
+    if (fs.existsSync(browserPath)) {
+      return browserPath;
+    }
+  }
+
+  // No system Chromium found, Playwright will use bundled version
+  return undefined;
+}
+
+/**
+ * CI runs against the browser the runner image already ships. runner-images symlinks its
+ * Chromium to /usr/bin/chromium, so detectSystemChromium() finds it and no `playwright install`
+ * step is needed. That binary tracks the runner image rather than the Playwright
+ * release, so the browser version is deliberately not pinned. If a future image drops the
+ * symlink, fail here with a named error instead of silently falling back to a bundled
+ * browser that CI never downloads.
+ */
+function resolveChromium(): string | undefined {
+  const detected = detectSystemChromium();
+  if (!detected && process.env.CI) {
+    throw new Error(
+      'No system Chromium found. CI runs against the runner-provided browser at '
+      + '/usr/bin/chromium and does not run `playwright install`.',
+    );
+  }
+  return detected;
+}
+
+const systemChromium = resolveChromium();
+
+/**
+ * Interactive runs (`--ui`, `--headed`, `--debug`) keep the Vite dev server so HMR and
+ * un-minified sources are available while poking at a failing spec. Every other local
+ * run builds once and serves the output with `vite preview`: the dev server holds the
+ * whole module graph plus its transform cache in memory (multiple GB on this codebase),
+ * while preview only serves static files. CI already builds in a separate workflow step,
+ * so there the command is a bare `vite preview`.
+ */
+function isInteractiveRun(): boolean {
+  if (process.env.PWDEBUG)
+    return true;
+
+  return process.argv.some(arg => arg === '--headed' || arg === '--debug' || arg === '--ui' || arg.startsWith('--ui-'));
+}
+
+const interactive = isInteractiveRun();
+
+/**
+ * How the frontend is served for a run.
+ *
+ * @remarks
+ * `--no-open` because this is a test harness and Playwright drives its own browser, while
+ * `serve.ts` auto-opens a tab in web mode. `--strictPort` so a taken port fails loudly instead of
+ * serving elsewhere and leaving the tests pointed at nothing.
+ *
+ * The build is skipped when something else already produced the bundle: CI builds it in its own
+ * workflow job and downloads the artifact, and the shard runner builds the single bundle every
+ * shard shares before starting any of them.
+ */
+function buildFrontendCommand(): string {
+  if (interactive)
+    return `tsx scripts/serve.ts --web --no-open --port ${FRONTEND_PORT}`;
+
+  const preview = `vite preview --port ${FRONTEND_PORT} --strictPort`;
+  return process.env.CI || shard > 0 ? preview : `pnpm run build:app --mode e2e && ${preview}`;
+}
+
+const frontendCommand = buildFrontendCommand();
+
+/**
+ * A plain local run reuses whatever stack is still up from the previous run, which
+ * makes iterating on a single spec fast. A shard must not: the runner resets each
+ * shard's data directory before starting it, so a stack left over from an earlier run
+ * would be holding a database that no longer exists.
+ */
+const reuseExistingServer = !process.env.CI && shard === 0;
+
+function getReporter(): PlaywrightTestConfig['reporter'] {
+  if (process.env.CI)
+    return [['github'], ['html', { open: 'never' }]];
+
+  if (shard > 0)
+    return [['blob', { fileName: `shard-${shard}.zip`, outputDir: blobDir }], ['list']];
+
+  return 'list';
+}
+
+// Get the test group from environment (app or balances)
+const testGroup = process.env.GROUP;
+const testDirPath = testGroup ? `./tests/e2e/specs/${testGroup}` : './tests/e2e/specs';
+
+export default defineConfig({
+  testDir: testDirPath,
+  timeout: 60_000,
+  expect: {
+    timeout: 60_000,
+  },
+  fullyParallel: false,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 1 : 0,
+  // Backend is single-user, must use 1 worker
+  workers: 1,
+  reporter: getReporter(),
+  outputDir: path.join('tests', 'e2e', shard > 0 ? `test-results-${shard}` : 'test-results'),
+
+  use: {
+    baseURL: frontendUrl,
+    timezoneId: 'UTC',
+    trace: 'retain-on-failure',
+    video: process.env.CI ? 'retain-on-failure' : 'off',
+    screenshot: 'only-on-failure',
+    actionTimeout: 60_000,
+    navigationTimeout: 300_000,
+  },
+
+  projects: [
+    {
+      name: 'chromium',
+      use: {
+        ...devices['Desktop Chrome'],
+        viewport: { width: 1280, height: 720 },
+        launchOptions: {
+          executablePath: systemChromium,
+          args: [
+            '--disable-gpu',
+            '--disable-dev-shm-usage',
+            '--disable-extensions',
+            '--disable-background-networking',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
+            '--disable-component-update',
+            '--disable-sync',
+          ],
+        },
+      },
+    },
+  ],
+
+  webServer: [
+    {
+      command: `tsx tests/e2e/rpc-mock/server.ts`,
+      url: `${mockRpcUrl}/health`,
+      reuseExistingServer,
+      timeout: 10_000,
+      env: {
+        MOCK_RPC_PORT: String(MOCK_RPC_PORT),
+        MOCK_RPC_MODE: process.env.MOCK_RPC_MODE ?? 'replay',
+        ...(process.env.MOCK_RPC_TARGET && { MOCK_RPC_TARGET: process.env.MOCK_RPC_TARGET }),
+      },
+    },
+    /*
+     * One supervisor brings up core and colibri and fronts both behind its proxy. The gate is the
+     * supervisor's own `/health`, which answers 200 only once every service has passed its
+     * readiness probe: core `/api/1/ping`, colibri `/health`. Probing core through the proxy
+     * instead let the suite start with colibri still coming up, since the proxy binds and serves
+     * before the tree is brought up.
+     *
+     * `gracefulShutdown` is not politeness either. Playwright otherwise SIGKILLs the server's
+     * process tree, and starling puts core and colibri in their own process groups so it can reap
+     * them, so that kill never reaches them and both survive the run. SIGTERM plus a wait lets the
+     * supervisor drive the ordered shutdown; the window covers its own 10s grace with room spare.
+     */
+    {
+      command: `tsx scripts/start-starling.ts --port ${PROXY_PORT} --core-port ${BACKEND_PORT} --colibri-port ${COLIBRI_PORT} --mcp-port ${MCP_PORT} --data ${dataDir} --logs ${logDir}`,
+      url: `${backendUrl}/health`,
+      reuseExistingServer,
+      // Covers a cold `cargo run` for both Rust services on a fresh checkout.
+      timeout: 180_000,
+      gracefulShutdown: { signal: 'SIGTERM', timeout: 20_000 },
+      env: {
+        ROTKEHLCHEN_ENVIRONMENT: 'test',
+      },
+    },
+    {
+      command: frontendCommand,
+      url: frontendUrl,
+      reuseExistingServer,
+      // The local non-interactive path builds first, so it gets more headroom than serving does.
+      timeout: interactive || process.env.CI ? 180_000 : 300_000,
+      env: {
+        VITE_BACKEND_URL: backendUrl,
+        // Pass coverage flag to enable source maps in build
+        ...(process.env.VITE_COVERAGE && { VITE_COVERAGE: process.env.VITE_COVERAGE }),
+      },
+    },
+  ],
+});
+
+export { backendUrl, colibriUrl, dataDir, frontendUrl, logDir, mockRpcUrl };

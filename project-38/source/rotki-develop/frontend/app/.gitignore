@@ -1,0 +1,43 @@
+.DS_Store
+node_modules
+/dist
+/build
+/coverage
+/reports
+
+/tests/spectron/reports/
+selenium-debug.log
+
+# local env files
+.env.local
+.env.*.local
+
+# Log files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor directories and files
+.idea
+.vscode
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw*
+
+#Electron-builder output
+/dist_electron
+tests/e2e/test-results*
+playwright-report
+tests/**/coverage
+tests/**/.v8-coverage
+.eslintcache
+
+rotki_config.json
+package-lock.json
+components.d.ts
+.e2e
+.contract
+traces
+planning

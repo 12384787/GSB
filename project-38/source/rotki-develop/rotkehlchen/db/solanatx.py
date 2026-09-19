@@ -1,0 +1,314 @@
+from collections import defaultdict
+from typing import TYPE_CHECKING, Final
+
+from rotkehlchen.chain.solana.rpc import Pubkey, Signature
+from rotkehlchen.chain.solana.types import SolanaInstruction, SolanaTransaction
+from rotkehlchen.db.cache import DBCacheDynamic
+from rotkehlchen.db.constants import HISTORY_MAPPING_KEY_STATE, TX_DECODED, HistoryMappingState
+from rotkehlchen.db.dbtx import DBCommonTx
+from rotkehlchen.db.filtering import (
+    SolanaTransactionsFilterQuery,
+    SolanaTransactionsNotDecodedFilterQuery,
+)
+from rotkehlchen.db.history_events import DBHistoryEvents
+from rotkehlchen.db.utils import get_query_chunks
+from rotkehlchen.types import Location, SolanaAddress, SupportedBlockchain, Timestamp
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from rotkehlchen.db.drivers.sqlite import DBCursor
+
+
+# Top-level instructions use -1 as parent_execution_index (instead of NULL)
+# to avoid primary key issues with NULL values
+TOP_LEVEL_PARENT: Final = -1
+
+
+class DBSolanaTx(DBCommonTx[SolanaAddress, SolanaTransaction, Signature, SolanaTransactionsFilterQuery, SolanaTransactionsNotDecodedFilterQuery]):  # noqa: E501
+    """Database handler for Solana transactions"""
+
+    @staticmethod
+    def get_existing_signatures(
+            cursor: DBCursor,
+            signatures: Sequence[Signature],
+    ) -> set[Signature]:
+        """Filter the provided signatures returning only those that already exist in the DB.
+
+        This is used to find existing signatures before querying transaction data so we can avoid
+        requerying transactions that already exist in the DB. Also ensures that when returning
+        newly queried tx signatures, only those that are actually new are returned.
+        """
+        existing_signatures: set[Signature] = set()
+        if len(signatures) == 0:
+            return existing_signatures
+
+        for signature_chunk, placeholders in get_query_chunks(signatures):
+            cursor.execute(
+                f'SELECT signature FROM solana_transactions '
+                f'WHERE signature IN ({placeholders})',
+                [x.to_bytes() for x in signature_chunk],
+            )
+            existing_signatures.update(Signature.from_bytes(entry[0]) for entry in cursor)
+
+        return existing_signatures
+
+    def add_transactions(
+            self,
+            write_cursor: DBCursor,
+            solana_transactions: list[SolanaTransaction],
+            relevant_address: SolanaAddress | None,
+    ) -> list[Signature]:
+        """Add solana transactions to the database. Returns list of newly-inserted signatures."""
+        query = """INSERT OR IGNORE INTO solana_transactions(slot, fee, block_time, success, signature) VALUES (?, ?, ?, ?, ?)"""  # noqa: E501
+        newly_inserted: list[Signature] = []
+        for tx in solana_transactions:
+            tx_id, is_new, should_redecode = self.db.write_single_tuple(
+                write_cursor=write_cursor,
+                tuple_type='solana_transaction',
+                query=query,
+                entry=(tx.slot, tx.fee, tx.block_time, int(tx.success), tx.signature.to_bytes()),
+                relevant_address=relevant_address,
+            )
+            if is_new:
+                newly_inserted.append(tx.signature)
+            if tx_id is None:
+                continue
+            # should_redecode is only set for a new mapping on an existing transaction.
+            if should_redecode:
+                self.flag_transaction_for_redecoding(
+                    write_cursor=write_cursor,
+                    tx_id=tx_id,
+                    signature=tx.signature,
+                )
+
+            self.db.write_tuples(
+                write_cursor=write_cursor,
+                tuple_type='solana_account_key',
+                query='INSERT OR IGNORE INTO solana_tx_account_keys(tx_id, account_index, address) VALUES (?, ?, ?)',  # noqa: E501
+                tuples=[  # insert account keys
+                    (tx_id, account_index, bytes(Pubkey.from_string(address)))
+                    for account_index, address in enumerate(tx.account_keys)
+                ],
+            )
+            for instruction in tx.instructions:  # insert instructions
+                instruction_id, _, _ = self.db.write_single_tuple(
+                    write_cursor=write_cursor,
+                    tuple_type='solana_instruction',
+                    query='INSERT OR IGNORE INTO solana_tx_instructions(tx_id, execution_index, parent_execution_index, program_id_index, data) VALUES (?, ?, ?, ?, ?)',  # noqa: E501
+                    entry=(
+                        tx_id,
+                        instruction.execution_index,
+                        TOP_LEVEL_PARENT if instruction.parent_execution_index is None else instruction.parent_execution_index,  # noqa: E501
+                        tx.account_keys.index(instruction.program_id),
+                        instruction.data,
+                    ),
+                    relevant_address=None,
+                )
+                if instruction_id is not None:
+                    self.db.write_tuples(
+                        write_cursor=write_cursor,
+                        tuple_type='solana_instruction_account',
+                        query='INSERT OR IGNORE INTO solana_tx_instruction_accounts(instruction_id, account_order, account_index, tx_id) VALUES (?, ?, ?, ?)',  # noqa: E501
+                        tuples=[  # insert instruction accounts
+                            (instruction_id, order, tx.account_keys.index(account_address), tx_id)
+                            for order, account_address in enumerate(instruction.accounts)
+                        ],
+                    )
+
+        if len(newly_inserted) != 0:  # new solana txs are not decoded yet -> pending decoding
+            self.db.pending_txs_tracker.mark_decoding_dirty(SupportedBlockchain.SOLANA)
+        return newly_inserted
+
+    def flag_transaction_for_redecoding(
+            self,
+            write_cursor: DBCursor,
+            tx_id: int,
+            signature: Signature,
+    ) -> None:
+        """Clear a decoded Solana transaction unless it has customized events."""
+        if write_cursor.execute(
+            'SELECT 1 FROM solana_tx_mappings WHERE tx_id=? AND value=?',
+            (tx_id, TX_DECODED),
+        ).fetchone() is None or write_cursor.execute(
+            'SELECT 1 FROM history_events h '
+            'INNER JOIN chain_events_info c ON h.identifier=c.identifier '
+            'INNER JOIN history_events_mappings m ON h.identifier=m.parent_identifier '
+            'WHERE c.tx_ref=? AND h.location=? AND m.name=? AND m.value=?',
+            (
+                signature.to_bytes(),
+                Location.SOLANA.serialize_for_db(),
+                HISTORY_MAPPING_KEY_STATE,
+                HistoryMappingState.CUSTOMIZED.serialize_for_db(),
+            ),
+        ).fetchone() is not None:
+            return
+
+        DBHistoryEvents(self.db).delete_events_by_tx_ref(
+            write_cursor=write_cursor,
+            tx_refs=[signature],
+            location=Location.SOLANA,
+            customized_handling='delete',
+        )
+        write_cursor.execute(
+            'DELETE FROM solana_tx_mappings WHERE tx_id=? AND value=?',
+            (tx_id, TX_DECODED),
+        )
+        self.db.pending_txs_tracker.mark_decoding_dirty(SupportedBlockchain.SOLANA)
+
+    @staticmethod
+    def add_token_account_mappings(
+            write_cursor: DBCursor,
+            token_accounts_mappings: dict[SolanaAddress, tuple[SolanaAddress, SolanaAddress]],
+    ) -> None:
+        """Save Solana token account to (owner, mint) mappings in the database cache."""
+        token_cache_data = []
+        for token_account, owner_mint_data in token_accounts_mappings.items():
+            token_cache_data.append((
+                DBCacheDynamic.SOLANA_TOKEN_ACCOUNT.get_db_key(address=token_account),
+                ','.join(owner_mint_data),
+            ))
+
+        write_cursor.executemany(
+            'INSERT OR REPLACE INTO key_value_cache(name, value) VALUES(?, ?)',
+            token_cache_data,
+        )
+
+    @staticmethod
+    def get_transactions(
+            cursor: DBCursor,
+            filter_: SolanaTransactionsFilterQuery,
+    ) -> list[SolanaTransaction]:
+        """Get solana transactions from the database with filtering"""
+        query, bindings = filter_.prepare()
+        # account keys by tx for fast lookups when building instructions
+        ak_by_tx: defaultdict[int, list[SolanaAddress]] = defaultdict(list)
+        for tx_id, address_bytes in cursor.execute(
+                'SELECT tx_id, address FROM solana_tx_account_keys '
+                f'WHERE tx_id IN (SELECT identifier FROM solana_transactions {query}) ORDER BY tx_id, account_index',  # noqa: E501
+                bindings,
+        ):
+            ak_by_tx[tx_id].append(SolanaAddress(str(Pubkey.from_bytes(address_bytes))))
+
+        # split instruction data for easier processing:
+        # inst_meta holds core fields, inst_order_by_tx preserves execution order,
+        # inst_acc_indices maps instructions to their account references
+        inst_meta: dict[int, tuple[int, int | None, int, bytes]] = {}
+        inst_order_by_tx: defaultdict[int, list[int]] = defaultdict(list)
+        inst_acc_indices: defaultdict[int, list[int]] = defaultdict(list)
+
+        # ordering handles nested instructions: top-level first, then inner by parent
+        for (inst_id, tx_id, execution_index, parent_execution_index, program_id_index, inst_data, acc_index) in cursor.execute(  # noqa: E501
+                'SELECT i.identifier, i.tx_id, i.execution_index, i.parent_execution_index, i.program_id_index, i.data, ia.account_index '  # noqa: E501
+                'FROM solana_tx_instructions i LEFT JOIN solana_tx_instruction_accounts ia ON ia.instruction_id = i.identifier '  # noqa: E501
+                f'WHERE i.tx_id IN (SELECT identifier FROM solana_transactions {query}) ORDER BY i.tx_id, '  # noqa: E501
+                'CASE WHEN i.parent_execution_index = ? THEN i.execution_index ELSE i.parent_execution_index END, '  # noqa: E501
+                '(i.parent_execution_index = ?) DESC, i.execution_index, ia.account_order',
+                (*bindings, TOP_LEVEL_PARENT, TOP_LEVEL_PARENT),
+        ):  # save instruction data once per instruction
+            if inst_id not in inst_meta:
+                parent_value = None if parent_execution_index == TOP_LEVEL_PARENT else parent_execution_index  # noqa: E501
+                inst_meta[inst_id] = (execution_index, parent_value, program_id_index, inst_data)
+                inst_order_by_tx[tx_id].append(inst_id)
+            if acc_index is not None:  # each row in the join adds one account reference to this instruction  # noqa: E501
+                inst_acc_indices[inst_id].append(acc_index)
+
+        # build final transactions in original order
+        transactions: list[SolanaTransaction] = []
+        for tx_id, signature, slot, block_time, fee, success_int in cursor.execute(
+                f'SELECT identifier, signature, slot, block_time, fee, success FROM solana_transactions {query}',  # noqa: E501
+                bindings,
+        ):
+            account_keys = ak_by_tx[tx_id]
+            built_instructions: list[SolanaInstruction] = []
+            for inst_id in inst_order_by_tx[tx_id]:
+                exec_idx, parent_exec_idx, prog_idx, data = inst_meta[inst_id]
+                built_instructions.append(SolanaInstruction(
+                    execution_index=exec_idx,
+                    parent_execution_index=parent_exec_idx,
+                    program_id=account_keys[prog_idx],
+                    data=data,
+                    accounts=[account_keys[i] for i in inst_acc_indices[inst_id]],  # convert indices to actual addresses  # noqa: E501
+                ))
+
+            transactions.append(SolanaTransaction(
+                signature=Signature(signature),
+                slot=slot,
+                block_time=Timestamp(block_time),
+                fee=fee,
+                success=bool(success_int),
+                account_keys=account_keys,
+                instructions=built_instructions,
+                db_id=tx_id,
+            ))
+
+        return transactions
+
+    def deserialize_tx_hash_from_db(self, raw_tx_hash: bytes) -> Signature:
+        return Signature(raw_tx_hash)
+
+    def _get_txs_not_decoded_column_and_query(self) -> tuple[str, str]:
+        return (
+            'signature',
+            'solana_transactions AS A LEFT JOIN solana_tx_mappings AS B ON A.identifier = B.tx_id ',  # noqa: E501
+        )
+
+    def delete_transaction_data(
+            self,
+            write_cursor: DBCursor,
+            signature: Signature | None = None,
+    ) -> None:
+        """Deletes solana transactions from the DB. If signature is given, only deletes the
+        transaction with that signature.
+        """
+        query = 'DELETE FROM solana_transactions'
+        bindings = []
+        if signature is not None:
+            query += ' WHERE signature = ?'
+            bindings.append(signature.to_bytes())
+
+        write_cursor.execute(query, bindings)
+
+    def count_transactions_in_range(
+            self,
+            from_ts: Timestamp,
+            to_ts: Timestamp,
+    ) -> int:
+        """Return the number of transactions between from_ts and to_ts"""
+        with self.db.conn.read_ctx() as cursor:
+            return cursor.execute(
+                'SELECT COUNT(*) FROM solana_transactions WHERE block_time BETWEEN ? AND ?',
+                (from_ts, to_ts),
+            ).fetchone()[0]
+
+    def delete_data_for_address(
+            self,
+            write_cursor: DBCursor,
+            address: SolanaAddress,
+    ) -> None:
+        """Deletes all solana transactions and their related data for a given address
+        and all its ATAs.
+        """
+        where_str = """
+        WHERE (M.address = ? OR
+        M.address IN (SELECT ata_address FROM solana_ata_address_mappings WHERE account = ?))
+        AND M.tx_id NOT IN (SELECT tx_id FROM solanatx_address_mappings WHERE address != ? AND
+        address NOT IN (SELECT ata_address FROM solana_ata_address_mappings WHERE account = ?))
+        """
+        if len(results := write_cursor.execute(
+            'SELECT DISTINCT S.signature FROM solanatx_address_mappings AS M '
+            f'INNER JOIN solana_transactions AS S ON S.identifier = M.tx_id {where_str}',
+            (address, address, address, address),
+        ).fetchall()) == 0:
+            return  # No transactions that are only for this address or its ATAs
+
+        DBHistoryEvents(self.db).delete_events_by_tx_ref(
+            write_cursor=write_cursor,
+            tx_refs=[Signature(row[0]) for row in results],
+            location=Location.SOLANA,
+        )
+        write_cursor.execute(
+            'DELETE FROM solana_transactions WHERE identifier IN ('
+            f'SELECT DISTINCT tx_id FROM solanatx_address_mappings AS M {where_str})',
+            (address, address, address, address),
+        )

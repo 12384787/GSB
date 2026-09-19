@@ -1,0 +1,107 @@
+import type { Ref } from 'vue';
+import type { RecentTransaction, TransactionParams } from '@/modules/wallet/types';
+import type { Hash, ViemWalletClient } from '@/modules/wallet/viem-client';
+import { bigNumberify } from '@rotki/common';
+import { startPromise } from '@shared/utils';
+import { useAssetInfoCache } from '@/modules/assets/use-asset-info-cache';
+import { useWalletHelper } from '@/modules/wallet/use-wallet-helper';
+
+/**
+ * Composable for managing transaction state and history
+ */
+export function useTransactionManager(): {
+  addRecentTransaction: (hash: string, chain: string, params: TransactionParams, initiatorAddress: string | undefined) => Promise<void>;
+  getRecentTransactionByTxHash: (hash: string) => RecentTransaction | undefined;
+  handleTransactionSuccess: (client: ViemWalletClient, hash: Hash, params: TransactionParams, initiatorAddress: string | undefined) => Promise<void>;
+  recentTransactions: Readonly<Ref<RecentTransaction[]>>;
+  reset: () => void;
+  updateTransactionStatus: (hash: string, status: 'completed' | 'failed') => void;
+} {
+  const recentTransactions = ref<RecentTransaction[]>([]);
+  const { getAssetMappingHandler } = useAssetInfoCache();
+  const { updateStatePostTransaction } = useWalletHelper();
+
+  const generateTransactionContext = async (
+    params: TransactionParams,
+    fromAddress: string | undefined,
+  ): Promise<string> => {
+    const from = fromAddress ?? 'unknown';
+    const amount = params.amount;
+    const id = params.assetIdentifier;
+    const asset = params.native || !id
+      ? id
+      : await (async (): Promise<string | undefined> => {
+          const mapping = await getAssetMappingHandler([id]);
+          const assetMapping = mapping?.assets;
+          if (!assetMapping) {
+            return id;
+          }
+          return assetMapping[id]?.symbol ?? id;
+        })();
+
+    return `Send ${amount} ${asset ?? params.assetIdentifier} from ${from} to ${params.to}`;
+  };
+
+  const addRecentTransaction = async (
+    hash: string,
+    chain: string,
+    params: TransactionParams,
+    initiatorAddress: string | undefined,
+  ): Promise<void> => {
+    const context = await generateTransactionContext(params, initiatorAddress);
+    set(recentTransactions, [
+      {
+        chain,
+        context,
+        hash,
+        initiatorAddress,
+        metadata: {
+          amount: bigNumberify(params.amount),
+          asset: params.assetIdentifier,
+        },
+        status: 'pending',
+        timestamp: Date.now(),
+      },
+      ...get(recentTransactions),
+    ]);
+  };
+
+  const updateTransactionStatus = (hash: string, status: 'completed' | 'failed'): void => {
+    set(
+      recentTransactions,
+      get(recentTransactions).map(tx =>
+        tx.hash === hash
+          ? { ...tx, status }
+          : tx,
+      ),
+    );
+  };
+
+  const getRecentTransactionByTxHash = (hash: string): RecentTransaction | undefined =>
+    get(recentTransactions).find(item => item.hash === hash);
+
+  const handleTransactionSuccess = async (
+    client: ViemWalletClient,
+    hash: Hash,
+    params: TransactionParams,
+    initiatorAddress: string | undefined,
+  ): Promise<void> => {
+    startPromise(addRecentTransaction(hash, params.chain, params, initiatorAddress));
+    await client.waitForTransactionReceipt({ hash });
+    updateTransactionStatus(hash, 'completed');
+    startPromise(updateStatePostTransaction(getRecentTransactionByTxHash(hash)));
+  };
+
+  const reset = (): void => {
+    set(recentTransactions, []);
+  };
+
+  return {
+    addRecentTransaction,
+    getRecentTransactionByTxHash,
+    handleTransactionSuccess,
+    recentTransactions: shallowReadonly(recentTransactions),
+    reset,
+    updateTransactionStatus,
+  };
+}

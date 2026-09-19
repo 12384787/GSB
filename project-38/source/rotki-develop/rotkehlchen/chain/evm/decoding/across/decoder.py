@@ -1,0 +1,370 @@
+import logging
+from typing import TYPE_CHECKING, Any
+
+from rotkehlchen.assets.utils import asset_normalized_value
+from rotkehlchen.chain.decoding.utils import maybe_reshuffle_events
+from rotkehlchen.chain.evm.constants import ZERO_ADDRESS
+from rotkehlchen.chain.evm.decoding.across.constants import (
+    ACROSS_CHAIN_MAPPING,
+    ACROSS_CPT_DETAILS,
+    ACROSS_SOLANA_CHAIN_ID,
+    CPT_ACROSS,
+    DEPOSIT_TOPICS,
+    FILL_TOPICS,
+    FILLED_RELAY_WITH_RELAY_EXECUTION_INFO,
+    LIQUIDITY_ADDED,
+    LIQUIDITY_REMOVED,
+    LP_TOKEN_STAKED,
+    LP_TOKEN_UNSTAKED,
+)
+from rotkehlchen.chain.evm.decoding.interfaces import EvmDecoderInterface
+from rotkehlchen.chain.evm.decoding.structures import (
+    DEFAULT_EVM_DECODING_OUTPUT,
+    ActionItem,
+    DecoderContext,
+    EvmDecodingOutput,
+)
+from rotkehlchen.chain.evm.decoding.utils import make_bridge_extra_data, set_bridge_extra_data
+from rotkehlchen.chain.evm.decoding.weth.constants import CHAIN_ID_TO_WETH_MAPPING
+from rotkehlchen.history.events.structures.types import HistoryEventSubType, HistoryEventType
+from rotkehlchen.logging import RotkehlchenLogsAdapter
+from rotkehlchen.types import SupportedBlockchain
+from rotkehlchen.utils.misc import bytes_to_address, bytes_to_solana_address
+
+if TYPE_CHECKING:
+    from rotkehlchen.assets.asset import Asset
+    from rotkehlchen.chain.decoding.types import CounterpartyDetails
+    from rotkehlchen.chain.evm.decoding.base import BaseEvmDecoderTools
+    from rotkehlchen.chain.evm.node_inquirer import EvmNodeInquirer
+    from rotkehlchen.types import ChecksumEvmAddress
+    from rotkehlchen.user_messages import MessagesAggregator
+
+logger = logging.getLogger(__name__)
+log = RotkehlchenLogsAdapter(logger)
+
+
+def _across_chain_label(chain_id: int) -> str | None:
+    """Return a display label for an Across chain supported by rotki."""
+    if chain_id == ACROSS_SOLANA_CHAIN_ID:
+        return 'Solana'
+    if (chain := ACROSS_CHAIN_MAPPING.get(chain_id)) is not None:
+        return chain.label()
+    return None
+
+
+def _serialize_across_chain(chain_id: int) -> int | str:
+    """Use rotki's serialized name for non-EVM chains in bridge metadata."""
+    if chain_id == ACROSS_SOLANA_CHAIN_ID:
+        return SupportedBlockchain.SOLANA.serialize()
+    return chain_id
+
+
+def _decode_across_address(value: bytes, chain_id: int) -> str:
+    """Decode an Across bytes32 address according to the chain it belongs to."""
+    if chain_id == ACROSS_SOLANA_CHAIN_ID:
+        return bytes_to_solana_address(value)
+    return bytes_to_address(value)
+
+
+class AcrossCommonDecoder(EvmDecoderInterface):
+    """Decoder for Across protocol bridge transactions on SpokePool contracts.
+
+    Across uses a SpokePool contract on each supported chain. Users deposit
+    tokens into the source SpokePool (FundsDeposited event) and relayers fill
+    the deposits on the destination SpokePool (FilledRelay event), sending
+    tokens to the recipient.
+    """
+
+    def __init__(
+            self,
+            evm_inquirer: EvmNodeInquirer,
+            base_tools: BaseEvmDecoderTools,
+            msg_aggregator: MessagesAggregator,
+            spoke_pool: ChecksumEvmAddress,
+            hub_pools: tuple[ChecksumEvmAddress, ...] = (),
+            staking_contracts: tuple[ChecksumEvmAddress, ...] = (),
+    ) -> None:
+        super().__init__(
+            evm_inquirer=evm_inquirer,
+            base_tools=base_tools,
+            msg_aggregator=msg_aggregator,
+        )
+        self.spoke_pool = spoke_pool
+        self.hub_pools = hub_pools
+        self.staking_contracts = staking_contracts
+
+    def _decode_deposit(self, context: DecoderContext) -> EvmDecodingOutput:
+        """Handle FundsDeposited — user sends tokens to SpokePool on the source chain."""
+        if not self.base.is_tracked(depositor := bytes_to_address(context.tx_log.topics[3])):
+            return DEFAULT_EVM_DECODING_OUTPUT
+
+        destination_chain_id = int.from_bytes(context.tx_log.topics[1])
+        if (to_chain_label := _across_chain_label(destination_chain_id)) is not None:
+            chain_info = f' from {self.node_inquirer.chain_id.label()} to {to_chain_label}'
+        else:
+            chain_info = ''
+
+        for event in context.decoded_events:
+            if (
+                event.event_type == HistoryEventType.SPEND and
+                event.event_subtype == HistoryEventSubType.NONE and
+                event.location_label == depositor and
+                event.counterparty is None
+            ):
+                event.event_type = HistoryEventType.DEPOSIT
+                event.event_subtype = HistoryEventSubType.BRIDGE
+                event.counterparty = CPT_ACROSS
+                event.notes = (
+                    f'Bridge {event.amount} {event.asset.symbol_or_name()}'
+                    f'{chain_info} via Across'
+                )
+                set_bridge_extra_data(
+                    event=event,
+                    from_chain=self.node_inquirer.chain_id,
+                    to_chain=_serialize_across_chain(destination_chain_id),
+                    from_address=depositor,
+                    to_address=_decode_across_address(
+                        value=context.tx_log.data[224:256],
+                        chain_id=destination_chain_id,
+                    ),
+                    transfer_id=str(int.from_bytes(context.tx_log.topics[2])),
+                )
+                break
+        else:
+            log.error(
+                'Could not find matching spend event for %s Across bridge deposit %s',
+                self.node_inquirer.chain_name,
+                context.transaction.tx_hash,
+            )
+
+        return DEFAULT_EVM_DECODING_OUTPUT
+
+    def _decode_fill(self, context: DecoderContext) -> EvmDecodingOutput:
+        """Handle FilledRelay — user receives tokens from SpokePool on the destination chain."""
+        expected_assets: tuple[Asset, ...] = ()
+        expected_amount = None
+        # In the relayExecutionInfo variant the actual receiver is the updatedRecipient.
+        if context.tx_log.topics[0] == FILLED_RELAY_WITH_RELAY_EXECUTION_INFO:
+            recipient = bytes_to_address(context.tx_log.data[352:384])
+            if recipient == ZERO_ADDRESS:
+                recipient = bytes_to_address(context.tx_log.data[288:320])
+            output_token = self.base.get_or_create_evm_token(
+                address=bytes_to_address(context.tx_log.data[32:64]),
+            )
+            expected_assets = (output_token,)
+            if output_token == CHAIN_ID_TO_WETH_MAPPING.get(self.node_inquirer.chain_id):
+                expected_assets = (self.node_inquirer.native_token, output_token)
+            expected_amount = asset_normalized_value(
+                amount=int.from_bytes(context.tx_log.data[416:448]) or int.from_bytes(context.tx_log.data[96:128]),  # noqa: E501
+                asset=output_token,
+            )
+        else:
+            recipient = bytes_to_address(context.tx_log.data[288:320])
+
+        origin_chain_id = int.from_bytes(context.tx_log.topics[1])
+
+        if not self.base.is_tracked(recipient):
+            return DEFAULT_EVM_DECODING_OUTPUT
+        if (from_chain_label := _across_chain_label(origin_chain_id)) is not None:
+            chain_info = f' from {from_chain_label} to {self.node_inquirer.chain_id.label()}'
+        else:
+            chain_info = ''
+
+        bridge_extra_data = make_bridge_extra_data(
+            from_chain=_serialize_across_chain(origin_chain_id),
+            to_chain=self.node_inquirer.chain_id,
+            from_address=_decode_across_address(
+                value=context.tx_log.data[256:288],
+                chain_id=origin_chain_id,
+            ),
+            to_address=recipient,
+            transfer_id=str(int.from_bytes(context.tx_log.topics[2])),
+        )
+        for event in context.decoded_events:
+            if (
+                event.event_type == HistoryEventType.RECEIVE and
+                event.event_subtype == HistoryEventSubType.NONE and
+                event.location_label == recipient and
+                event.counterparty is None and
+                (len(expected_assets) == 0 or event.asset in expected_assets) and
+                (expected_amount is None or event.amount == expected_amount)
+            ):
+                event.event_type = HistoryEventType.WITHDRAWAL
+                event.event_subtype = HistoryEventSubType.BRIDGE
+                event.counterparty = CPT_ACROSS
+                event.notes = (
+                    f'Bridge {event.amount} {event.asset.symbol_or_name()}'
+                    f'{chain_info} via Across'
+                )
+                event.extra_data = (event.extra_data or {}) | bridge_extra_data
+                break
+        else:
+            return EvmDecodingOutput(action_items=[ActionItem(
+                action='transform',
+                from_event_type=HistoryEventType.RECEIVE,
+                from_event_subtype=HistoryEventSubType.NONE,
+                asset=expected_asset,
+                amount=expected_amount,
+                location_label=recipient,
+                to_event_type=HistoryEventType.WITHDRAWAL,
+                to_event_subtype=HistoryEventSubType.BRIDGE,
+                to_counterparty=CPT_ACROSS,
+                to_notes=(
+                    f'Bridge {{amount}} {{symbol}}'
+                    f'{chain_info} via Across'
+                ),
+                extra_data=bridge_extra_data,
+            ) for expected_asset in expected_assets or (None,)])
+
+        return DEFAULT_EVM_DECODING_OUTPUT
+
+    def _decode_add_liquidity(self, context: DecoderContext) -> EvmDecodingOutput:
+        """Handle liquidity additions to Across pools."""
+        if (
+            context.tx_log.topics[0] != LIQUIDITY_ADDED or
+            not self.base.is_tracked(user_address := bytes_to_address(context.tx_log.topics[2]))
+        ):
+            return DEFAULT_EVM_DECODING_OUTPUT
+
+        deposit_event, receive_event = None, None
+        for event in context.decoded_events:
+            if (
+                event.event_type == HistoryEventType.SPEND and
+                event.event_subtype == HistoryEventSubType.NONE and
+                event.location_label == user_address and
+                event.address == context.tx_log.address and
+                event.counterparty is None
+            ):
+                event.event_type = HistoryEventType.DEPOSIT
+                event.event_subtype = HistoryEventSubType.DEPOSIT_FOR_WRAPPED
+                event.counterparty = CPT_ACROSS
+                event.notes = f'Deposit {event.amount} {event.asset.symbol_or_name()} to Across'
+                deposit_event = event
+            elif (
+                event.event_type == HistoryEventType.RECEIVE and
+                event.event_subtype == HistoryEventSubType.NONE and
+                event.location_label == user_address and
+                event.address == ZERO_ADDRESS and
+                event.counterparty is None
+            ):
+                event.event_subtype = HistoryEventSubType.RECEIVE_WRAPPED
+                event.counterparty = CPT_ACROSS
+                event.notes = f'Receive {event.amount} {event.asset.symbol_or_name()} from Across'
+                receive_event = event
+
+        if deposit_event is not None and receive_event is not None:
+            maybe_reshuffle_events(
+                ordered_events=[deposit_event, receive_event],
+                events_list=context.decoded_events,
+            )
+
+        return DEFAULT_EVM_DECODING_OUTPUT
+
+    def _decode_remove_liquidity(self, context: DecoderContext) -> EvmDecodingOutput:
+        """Handle liquidity removals from Across pools."""
+        if (
+            context.tx_log.topics[0] != LIQUIDITY_REMOVED or
+            not self.base.is_tracked(user_address := bytes_to_address(context.tx_log.topics[2]))
+        ):
+            return DEFAULT_EVM_DECODING_OUTPUT
+
+        return_event, receive_event = None, None
+        for event in context.decoded_events:
+            if (
+                event.event_type == HistoryEventType.SPEND and
+                event.event_subtype == HistoryEventSubType.NONE and
+                event.location_label == user_address and
+                event.address == ZERO_ADDRESS and
+                event.counterparty is None
+            ):
+                event.event_subtype = HistoryEventSubType.RETURN_WRAPPED
+                event.counterparty = CPT_ACROSS
+                event.notes = f'Return {event.amount} {event.asset.symbol_or_name()} to Across'
+                return_event = event
+            elif (
+                event.event_type == HistoryEventType.RECEIVE and
+                event.event_subtype == HistoryEventSubType.NONE and
+                event.location_label == user_address and
+                event.address == context.tx_log.address and
+                event.counterparty is None
+            ):
+                event.event_type = HistoryEventType.WITHDRAWAL
+                event.event_subtype = HistoryEventSubType.REDEEM_WRAPPED
+                event.counterparty = CPT_ACROSS
+                event.notes = f'Receive {event.amount} {event.asset.symbol_or_name()} after removing liquidity from Across'  # noqa: E501
+                receive_event = event
+
+        if return_event is not None and receive_event is not None:
+            maybe_reshuffle_events(
+                ordered_events=[return_event, receive_event],
+                events_list=context.decoded_events,
+            )
+
+        return DEFAULT_EVM_DECODING_OUTPUT
+
+    def _decode_lp_staking(self, context: DecoderContext) -> EvmDecodingOutput:
+        if (
+            context.tx_log.topics[0] not in (LP_TOKEN_STAKED, LP_TOKEN_UNSTAKED) or
+            not self.base.is_tracked(user_address := bytes_to_address(context.tx_log.topics[2]))
+        ):
+            return DEFAULT_EVM_DECODING_OUTPUT
+
+        for event in context.decoded_events:
+            if (
+                context.tx_log.topics[0] == LP_TOKEN_STAKED and
+                event.event_type == HistoryEventType.SPEND and
+                event.event_subtype == HistoryEventSubType.NONE and
+                event.location_label == user_address and
+                event.address == context.tx_log.address and
+                event.counterparty is None
+            ):
+                event.event_type = HistoryEventType.DEPOSIT
+                event.event_subtype = HistoryEventSubType.DEPOSIT_TO_PROTOCOL
+                event.counterparty = CPT_ACROSS
+                event.notes = f'Deposit {event.amount} {event.asset.symbol_or_name()} into Across'
+                break
+
+            if (
+                context.tx_log.topics[0] == LP_TOKEN_UNSTAKED and
+                event.event_type == HistoryEventType.RECEIVE and
+                event.event_subtype == HistoryEventSubType.NONE and
+                event.location_label == user_address and
+                event.address == context.tx_log.address and
+                event.counterparty is None
+            ):
+                event.event_type = HistoryEventType.WITHDRAWAL
+                event.event_subtype = HistoryEventSubType.WITHDRAW_FROM_PROTOCOL
+                event.counterparty = CPT_ACROSS
+                event.notes = f'Withdraw {event.amount} {event.asset.symbol_or_name()} from Across'
+                break
+
+        return DEFAULT_EVM_DECODING_OUTPUT
+
+    def _decode_hub_pool(self, context: DecoderContext) -> EvmDecodingOutput:
+        if context.tx_log.topics[0] == LIQUIDITY_ADDED:
+            return self._decode_add_liquidity(context)
+
+        if context.tx_log.topics[0] == LIQUIDITY_REMOVED:
+            return self._decode_remove_liquidity(context)
+
+        return DEFAULT_EVM_DECODING_OUTPUT
+
+    def _decode_bridge(self, context: DecoderContext) -> EvmDecodingOutput:
+        if context.tx_log.topics[0] in DEPOSIT_TOPICS:
+            return self._decode_deposit(context)
+
+        if context.tx_log.topics[0] in FILL_TOPICS:
+            return self._decode_fill(context)
+
+        return DEFAULT_EVM_DECODING_OUTPUT
+
+    @staticmethod
+    def counterparties() -> tuple[CounterpartyDetails, ...]:
+        return (ACROSS_CPT_DETAILS,)
+
+    def addresses_to_decoders(self) -> dict[ChecksumEvmAddress, tuple[Any, ...]]:
+        return {
+            self.spoke_pool: (self._decode_bridge,),
+            **dict.fromkeys(self.hub_pools, (self._decode_hub_pool,)),
+            **dict.fromkeys(self.staking_contracts, (self._decode_lp_staking,)),
+        }

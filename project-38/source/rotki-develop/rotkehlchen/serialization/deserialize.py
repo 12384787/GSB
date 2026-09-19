@@ -1,0 +1,822 @@
+import logging
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Literal, overload
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from eth_utils import to_checksum_address
+
+from rotkehlchen.chain.evm.constants import ARBITRUM_NITRO_CHAIN_IDS
+from rotkehlchen.chain.evm.l2_with_l1_fees.types import (
+    L2_CHAINIDS_WITH_L1_FEES,
+    L2ChainIdsWithL1FeesType,
+    L2WithL1FeesTransaction,
+)
+from rotkehlchen.chain.optimism.constants import OP_BEDROCK_UPGRADE
+from rotkehlchen.chain.solana.rpc import Pubkey, Signature
+from rotkehlchen.constants import ZERO
+from rotkehlchen.errors.asset import UnprocessableTradePair
+from rotkehlchen.errors.misc import RemoteError
+from rotkehlchen.errors.serialization import ConversionError, DeserializationError
+from rotkehlchen.externalapis.utils import read_hash, read_integer
+from rotkehlchen.fval import AcceptableFValInitInput, FVal
+from rotkehlchen.history.events.structures.types import HistoryEventSubType
+from rotkehlchen.logging import RotkehlchenLogsAdapter
+from rotkehlchen.types import (
+    DEFAULT_TIMEZONE,
+    BTCTxId,
+    ChainID,
+    ChecksumEvmAddress,
+    EvmInternalTransaction,
+    EvmTransaction,
+    EvmTransactionAuthorization,
+    EVMTxHash,
+    HexColorCode,
+    SolanaAddress,
+    Timestamp,
+    TimestampMS,
+    Timezone,
+    TradePair,
+    deserialize_evm_tx_hash,
+)
+from rotkehlchen.utils.misc import convert_to_int, iso8601ts_to_timestamp
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from rotkehlchen.chain.evm.node_inquirer import EvmNodeInquirer
+    from rotkehlchen.externalapis.etherscan_like import EtherscanLikeApi
+
+
+logger = logging.getLogger(__name__)
+log = RotkehlchenLogsAdapter(logger)
+
+
+def deserialize_timestamp(timestamp: float | str | FVal | None) -> Timestamp:
+    """Deserializes a timestamp from a json entry. Given entry can either be a
+    string or an int.
+
+    Can throw DeserializationError if the data is not a valid timestamp
+    """
+    if timestamp is None:
+        raise DeserializationError('Failed to deserialize a timestamp entry from a null entry')
+
+    if isinstance(timestamp, int):
+        processed_timestamp = Timestamp(timestamp)
+    elif isinstance(timestamp, FVal):
+        try:
+            processed_timestamp = Timestamp(timestamp.to_int(exact=True))
+        except ConversionError as e:
+            # An fval was not representing an exact int
+            raise DeserializationError(
+                'Tried to deserialize a timestamp from a non-exact int FVal entry',
+            ) from e
+    elif isinstance(timestamp, (str | float)):
+        try:
+            processed_timestamp = Timestamp(FVal(timestamp).to_int(exact=True))
+        except (ValueError, ConversionError) as e:
+            # String could not be turned to an int
+            raise DeserializationError(
+                f'Failed to deserialize a timestamp entry from string {timestamp} due to {e}',
+            ) from e
+    else:
+        raise DeserializationError(
+            f'Failed to deserialize a timestamp entry. Unexpected type {type(timestamp)} given',
+        )
+
+    if processed_timestamp < 0:
+        raise DeserializationError(
+            f'Failed to deserialize a timestamp entry. Timestamps can not have'
+            f' negative values. Given value was {processed_timestamp}',
+        )
+
+    return processed_timestamp
+
+
+def deserialize_timestamp_from_date(
+        date: str | None,
+        formatstr: str,
+        location: str,
+        timezone_name: Timezone = DEFAULT_TIMEZONE,
+        skip_milliseconds: bool = False,
+) -> Timestamp:
+    """Deserializes a timestamp from a date entry depending on the format str
+
+    formatstr can also have a special value of 'iso8601' in which case the iso8601
+    function will be used.
+
+    Can throw DeserializationError if the data is not as expected
+    """
+    return deserialize_timestamp_from_date_with_timezone(
+        date=date,
+        formatstr=formatstr,
+        location=location,
+        timezone_name=timezone_name,
+        skip_milliseconds=skip_milliseconds,
+    )
+
+
+def deserialize_timestamp_from_date_with_timezone(
+        date: str | None,
+        formatstr: str,
+        location: str,
+        timezone_name: Timezone = DEFAULT_TIMEZONE,
+        skip_milliseconds: bool = False,
+) -> Timestamp:
+    """Deserializes a timestamp from a date entry using timezone_name for naive dates.
+
+    If the parsed datetime already contains timezone information it is respected.
+    Otherwise timezone_name must be a valid IANA timezone and is used to interpret
+    the naive datetime before converting it to UTC.
+    """
+    if not date:
+        raise DeserializationError(
+            f'Failed to deserialize a timestamp from a null entry in {location}',
+        )
+
+    if not isinstance(date, str):
+        raise DeserializationError(
+            f'Failed to deserialize a timestamp from a {type(date)} entry in {location}',
+        )
+
+    if skip_milliseconds:
+        # Seems that poloniex added milliseconds in their timestamps.
+        # https://github.com/rotki/rotki/issues/1631
+        # We don't deal with milliseconds in rotki times so we can safely remove it
+        splits = date.split('.', 1)
+        if len(splits) == 2:
+            date = splits[0]
+
+    if formatstr == 'iso8601':
+        return iso8601ts_to_timestamp(date)
+
+    date = date.rstrip('Z')
+    try:
+        parsed_date = datetime.strptime(date, formatstr)  # noqa: DTZ007
+    except ValueError as e:
+        raise DeserializationError(
+            f'Failed to deserialize {date} {location} timestamp entry with timezone {timezone_name}',  # noqa: E501
+        ) from e
+
+    if parsed_date.tzinfo is None:
+        try:
+            parsed_date = parsed_date.replace(tzinfo=ZoneInfo(timezone_name))
+        except ZoneInfoNotFoundError as e:
+            raise DeserializationError(
+                f'Invalid timezone "{timezone_name}". Please use an IANA timezone such as "Europe/Madrid".',  # noqa: E501
+            ) from e
+
+    return Timestamp(int(parsed_date.astimezone(UTC).timestamp()))
+
+
+def deserialize_timestamp_from_bitstamp_date(date: str) -> Timestamp:
+    """Deserializes a timestamp from a bitstamp api query result date entry
+
+    The bitstamp dates follow the %Y-%m-%d %H:%M:%S format but are in UTC time
+    and not local time so can't use iso8601ts_to_timestamp() directly since that
+    would interpret them as local time.
+
+    Can throw DeserializationError if the data is not as expected
+    """
+    return deserialize_timestamp_from_date(
+        date,
+        '%Y-%m-%d %H:%M:%S',
+        'bitstamp',
+        skip_milliseconds=True,
+    )
+
+
+def deserialize_timestamp_from_floatstr(time: str | (FVal | float)) -> Timestamp:
+    """Deserializes a timestamp from a kraken api query result entry
+    Kraken has timestamps in floating point strings. Example: '1561161486.3056'.
+
+    If the dictionary has passed through rlk_jsonloads the entry can also be an Fval
+
+    Can throw DeserializationError if the data is not as expected
+    """
+    if not time:
+        raise DeserializationError(
+            'Failed to deserialize a timestamp entry from a null entry in kraken',
+        )
+
+    if isinstance(time, int):
+        return Timestamp(time)
+    if isinstance(time, float | str):
+        try:
+            return Timestamp(convert_to_int(time, accept_only_exact=False))
+        except ConversionError as e:
+            raise DeserializationError(
+                f'Failed to deserialize {time} kraken timestamp entry from {type(time)}',
+            ) from e
+    if isinstance(time, FVal):
+        try:
+            return Timestamp(time.to_int(exact=False))
+        except ConversionError as e:
+            raise DeserializationError(
+                f'Failed to deserialize {time} kraken timestamp entry from an FVal',
+            ) from e
+
+    # else
+    raise DeserializationError(
+        f'Failed to deserialize a timestamp entry from a {type(time)} entry in kraken',
+    )
+
+
+def deserialize_timestamp_ms_from_intms(value: Any) -> TimestampMS:
+    """Deserializes a TimestampMS from an integer timestamp in milliseconds.
+    May raise DeserializationError if the data is not as expected.
+    """
+    if not isinstance(value, int):
+        raise DeserializationError(
+            f'Failed to deserialize a timestamp entry from a {type(value)} entry',
+        )
+
+    return TimestampMS(value)
+
+
+def deserialize_timestamp_from_intms(value: Any) -> Timestamp:
+    """Deserializes a Timestamp from an integer timestamp in milliseconds.
+    May raise DeserializationError if the data is not as expected.
+    """
+    return Timestamp(int(deserialize_timestamp_ms_from_intms(value) // 1000))
+
+
+def deserialize_fval(
+        value: AcceptableFValInitInput,
+        name: str | None = None,
+        location: str | None = None,
+) -> FVal:
+    try:
+        result = FVal(value)
+    except ValueError as e:
+        msg = f'Failed to deserialize value entry: {e!s}'
+        if name is not None:
+            msg += f' for {name}'
+        if location is not None:
+            msg += f' during {location}'
+        raise DeserializationError(msg) from e
+
+    return result
+
+
+def deserialize_optional_to_optional_fval(
+        value: AcceptableFValInitInput | None,
+        name: str | None = None,
+        location: str | None = None,
+) -> FVal | None:
+    """
+    Deserializes an FVal from a field that was optional and if None returns None
+    """
+    if value is None:
+        return None
+
+    return deserialize_fval(value=value, name=name, location=location)
+
+
+def deserialize_fval_or_zero(
+        value: AcceptableFValInitInput | None,
+        name: str | None = None,
+        location: str | None = None,
+) -> FVal:
+    """
+    Deserializes an FVal from a field that was optional and if None returns ZERO
+    """
+    if value is None:
+        return ZERO
+
+    return deserialize_fval(value=value, name=name, location=location)
+
+
+def deserialize_fval_force_positive(
+        value: AcceptableFValInitInput,
+        name: str | None = None,
+        location: str | None = None,
+) -> FVal:
+    """Acts exactly like deserialize_fval but also forces the number to be positive
+
+    Is needed for some places like some exchanges that list the withdrawal amounts as
+    negative numbers because it's a withdrawal.
+
+    May raise:
+    - DeserializationError
+    """
+    if (result := deserialize_fval(value=value, name=name, location=location)) < ZERO:
+        result = FVal(abs(result))
+    return result
+
+
+def _split_pair(pair: TradePair) -> tuple[str, str]:
+    assets = pair.split('_')
+    if len(assets) != 2:
+        # Could not split the pair
+        raise UnprocessableTradePair(pair)
+
+    if len(assets[0]) == 0 or len(assets[1]) == 0:
+        # no base or no quote asset
+        raise UnprocessableTradePair(pair)
+
+    return assets[0], assets[1]
+
+
+def get_pair_position_str(pair: TradePair, position: str) -> str:
+    """Get the string representation of an asset of a trade pair"""
+    assert position in {'first', 'second'}
+    base_str, quote_str = _split_pair(pair)
+    return base_str if position == 'first' else quote_str
+
+
+def deserialize_asset_movement_event_type(value: str) -> Literal[
+        HistoryEventSubType.RECEIVE,
+        HistoryEventSubType.SPEND,
+]:
+    """Takes a string and determines the asset movement direction subtype.
+
+    Can throw DeserializationError if value is not as expected
+    """
+    if not isinstance(value, str):
+        raise DeserializationError(
+            f'Failed to deserialize asset movement category from {type(value)} entry',
+        )
+
+    if (lowered_value := value.lower()) == 'deposit':
+        return HistoryEventSubType.RECEIVE
+    if lowered_value in {'withdraw', 'withdrawal'}:
+        return HistoryEventSubType.SPEND
+    raise DeserializationError(
+        f'Failed to deserialize asset movement category symbol. Unknown {value}',
+    )
+
+
+def deserialize_hex_color_code(symbol: str) -> HexColorCode:
+    """Takes a string either from the API or the DB and deserializes it into
+    a hexadecimal color code.
+
+    Can throw DeserializationError if the symbol is not as expected
+    """
+    if not isinstance(symbol, str):
+        raise DeserializationError(
+            f'Failed to deserialize color code from {type(symbol).__name__} entry',
+        )
+
+    try:
+        color_value = int(symbol, 16)
+    except ValueError as e:
+        raise DeserializationError(
+            f'The given color code value "{symbol}" could not be processed as a hex color value',
+        ) from e
+
+    if color_value < 0 or color_value > 16777215:
+        raise DeserializationError(
+            f'The given color code value "{symbol}" is out of range for a normal color field',
+        )
+
+    if len(symbol) != 6:
+        raise DeserializationError(
+            f'The given color code value "{symbol}" does not have 6 hexadecimal digits',
+        )
+
+    return HexColorCode(symbol)
+
+
+def deserialize_evm_address(symbol: str) -> ChecksumEvmAddress:
+    """Deserialize a symbol, check that it's a valid ethereum address
+    and return it checksummed.
+
+    This function can raise DeserializationError if the address is not
+    valid
+    """
+    try:
+        return to_checksum_address(symbol)
+    except (ValueError, TypeError) as e:  # eth_utils raises TypeError for a non address type
+        raise DeserializationError(f'Invalid evm address: {symbol}') from e
+
+
+def deserialize_solana_pubkey(value: str) -> Pubkey:
+    """Deserializes a Solana public key from the given data.
+    May raise DeserializationError if the value is not a valid Solana public key.
+    """
+    try:
+        return Pubkey.from_string(value)
+    except ValueError as e:
+        raise DeserializationError(f'Invalid solana pubkey: {value}') from e
+
+
+def deserialize_solana_address(value: str) -> SolanaAddress:
+    """Deserializes a Solana address from the given data.
+    Wrapper for deserialize_solana_pubkey converting the pubkey to a SolanaAddress.
+    May raise DeserializationError if the value is not a valid Solana address.
+    """
+    return SolanaAddress(str(deserialize_solana_pubkey(value)))
+
+
+def deserialize_tx_signature(value: str | bytes) -> Signature:
+    """Deserialize a solana transaction signature from a string or bytes.
+    May raise DeserializationError if the data is invalid.
+    """
+    try:
+        if isinstance(value, bytes):
+            return Signature.from_bytes(value)
+
+        return Signature.from_string(value)
+    except ValueError as e:
+        raise DeserializationError(f'Failed to deserialize solana tx signature due to {e!s}') from e  # noqa: E501
+
+
+def deserialize_btc_tx_id(value: str) -> BTCTxId:
+    """Deserialize a bitcoin transaction id from a string.
+    May raise DeserializationError if the data is not a valid bitcoin transaction id.
+    """
+    try:
+        tx_id_bytes = bytes.fromhex(value)
+    except ValueError as e:
+        raise DeserializationError(f'Failed to deserialize bitcoin tx id due to {e!s}') from e
+
+    if (id_len := len(tx_id_bytes)) != 32:
+        raise DeserializationError(f'Failed to deserialize bitcoin tx id due to invalid length {id_len}. Expected 32 bytes.')  # noqa: E501
+
+    return BTCTxId(tx_id_bytes.hex())
+
+
+def deserialize_int_from_str(symbol: str, location: str) -> int:
+    if not isinstance(symbol, str):
+        raise DeserializationError(f'Expected a string but got {type(symbol)} at {location}')
+
+    try:
+        result = int(symbol)
+    except ValueError as e:
+        raise DeserializationError(
+            f'Could not turn string "{symbol}" into an integer at {location}',
+        ) from e
+
+    return result
+
+
+def deserialize_int_from_hex(symbol: str, location: str) -> int:
+    """Takes a hex string and turns it into an integer. Some apis returns 0x as
+    a hex int and this may be an error. So we handle this as return 0 here.
+
+    May Raise:
+    - DeserializationError if the given data are in an unexpected format.
+    """
+    if not isinstance(symbol, str):
+        raise DeserializationError(f'Expected hex string but got {type(symbol)} at {location}')
+
+    if symbol == '0x':
+        return 0
+
+    try:
+        result = int(symbol, 16)
+    except ValueError as e:
+        raise DeserializationError(
+            f'Could not turn string "{symbol}" into an integer at {location}',
+        ) from e
+
+    return result
+
+
+def deserialize_int_from_hex_or_int(symbol: str | int, location: str) -> int:
+    """Takes a symbol which can either be an int or a hex string and
+    turns it into an integer
+
+    May Raise:
+    - DeserializationError if the given data are in an unexpected format.
+    """
+    if isinstance(symbol, int):
+        result = symbol
+    elif isinstance(symbol, str):
+        if symbol == '0x':
+            return 0
+
+        try:
+            result = int(symbol, 16)
+        except ValueError as e:
+            raise DeserializationError(
+                f'Could not turn string "{symbol}" into an integer {location}',
+            ) from e
+    else:
+        raise DeserializationError(
+            f'Unexpected type {type(symbol)} given to '
+            f'deserialize_int_from_hex_or_int() for {location}',
+        )
+
+    return result
+
+
+def deserialize_int(value: Any, location: str) -> int:
+    """
+    Deserialize int from an entry
+    May raise:
+    - DeserializationError if value is not a value that can be converted to integer
+    """
+    try:
+        result = int(value)
+    except (ValueError, TypeError) as e:
+        raise DeserializationError(f'Could not transform {value=} into an integer at {location}') from e  # noqa: E501
+
+    return result
+
+
+def deserialize_str(value: Any) -> str:
+    """
+    Deserialize str from an entry
+    May raise:
+    - DeserializationError if value is not a string
+    """
+    if not isinstance(value, str):
+        raise DeserializationError(f'Could not deserialize {value} as string')
+
+    return value
+
+
+def deserialize_optional[X, Y](input_val: X | None, fn: Callable[[X], Y]) -> Y | None:
+    """An optional deserialization wrapper for any deserialize function"""
+    if input_val is None:
+        return None
+
+    return fn(input_val)
+
+
+def _get_transaction_receipt(
+        tx_hash: EVMTxHash,
+        chain_id: ChainID,
+        timestamp: Timestamp,
+        evm_inquirer: EvmNodeInquirer,
+) -> dict[str, Any]:
+    """Get the transaction receipt for a tx during deserialization.
+    Handles a special case for Optimism transactions before the bedrock upgrade where some nodes
+    return null L1 fee values so we need to try the official mainnet node first regardless of the
+    default call order.
+    """
+    call_order = evm_inquirer.default_call_order()
+    if chain_id == ChainID.OPTIMISM and timestamp < OP_BEDROCK_UPGRADE:
+        call_order.sort(
+            key=lambda x: not x.node_info.endpoint.startswith('https://mainnet.optimism.io'),
+        )
+
+    return evm_inquirer.get_transaction_receipt(
+        tx_hash=tx_hash,
+        call_order=call_order,
+    )
+
+
+@overload
+def deserialize_evm_transaction(
+        data: dict[str, Any],
+        internal: Literal[True],
+        chain_id: ChainID,
+        evm_inquirer: EvmNodeInquirer | None = None,
+        parent_tx_hash: EVMTxHash | None = None,
+        indexer: EtherscanLikeApi | None = None,
+) -> tuple[EvmInternalTransaction, None]:
+    ...
+
+
+@overload
+def deserialize_evm_transaction(
+        data: dict[str, Any],
+        internal: Literal[False],
+        chain_id: ChainID,
+        evm_inquirer: None,
+        parent_tx_hash: EVMTxHash | None = None,
+        indexer: EtherscanLikeApi | None = None,
+) -> tuple[EvmTransaction, None]:
+    ...
+
+
+@overload
+def deserialize_evm_transaction(
+        data: dict[str, Any],
+        internal: Literal[False],
+        chain_id: L2ChainIdsWithL1FeesType,
+        evm_inquirer: EvmNodeInquirer,
+        parent_tx_hash: EVMTxHash | None = None,
+        indexer: EtherscanLikeApi | None = None,
+) -> tuple[L2WithL1FeesTransaction, dict[str, Any]]:
+    ...
+
+
+@overload
+def deserialize_evm_transaction(
+        data: dict[str, Any],
+        internal: Literal[False],
+        chain_id: ChainID,
+        evm_inquirer: EvmNodeInquirer,
+        parent_tx_hash: EVMTxHash | None = None,
+        indexer: EtherscanLikeApi | None = None,
+) -> tuple[EvmTransaction, dict[str, Any]]:
+    ...
+
+
+def deserialize_evm_transaction(
+        data: dict[str, Any],
+        internal: bool,
+        chain_id: ChainID,
+        evm_inquirer: EvmNodeInquirer | None = None,
+        parent_tx_hash: EVMTxHash | None = None,
+        indexer: EtherscanLikeApi | None = None,
+) -> tuple[EvmTransaction | EvmInternalTransaction, dict[str, Any] | None]:
+    """Reads dict data of a transaction and deserializes it.
+    If the transaction is not from etherscan then it's missing some data
+    so evm inquirer is used to fetch it.
+
+    If it's an internal transaction it's possible, depending on the data source (for example
+    https://docs.etherscan.io/api-endpoints/accounts#get-internal-transactions-by-transaction-hash)
+    , that the hash is missing from the data string, so it is provided in that case
+    as an argument.
+
+    For L2 chains with L1 fees, the indexer parameter is used to fetch L1 fees when called
+    from indexers, since they don't have access to evm_inquirer.
+
+    Can raise DeserializationError if something is wrong
+
+    Returns the deserialized transaction and optionally raw receipt data if it was queried
+    and if this is not for an internal transaction.
+    """
+    source = 'etherscan' if evm_inquirer is None else 'web3'
+    raw_receipt_data = None
+    try:
+        if parent_tx_hash is not None:
+            tx_hash = parent_tx_hash
+        elif (raw_tx_hash := data.get('hash')) is not None:
+            tx_hash = deserialize_evm_tx_hash(raw_tx_hash)
+        else:  # for internal transactions blockscout has a `transactionHash` key instead.
+            tx_hash = deserialize_evm_tx_hash(data['transactionHash'])
+
+        block_number = read_integer(data, 'blockNumber', source)
+        if 'timeStamp' not in data:
+            if evm_inquirer is None:
+                raise DeserializationError('Got in deserialize evm transaction without timestamp and without evm inquirer')  # noqa: E501
+
+            timestamp = evm_inquirer.get_block_timestamp(block_number=block_number)
+        else:
+            timestamp = deserialize_timestamp(data['timeStamp'])
+
+        from_address = deserialize_evm_address(data['from'])
+        is_empty_to_address = data['to'] != '' and data['to'] is not None
+        to_address = deserialize_evm_address(data['to']) if is_empty_to_address else None
+        value = read_integer(data, 'value', source)
+
+        authorization_list: list[EvmTransactionAuthorization] | None
+        if (raw_authorization_list := data.get('authorizationList')) is not None:
+            authorization_list = []
+            for entry in raw_authorization_list:
+                try:
+                    authorization_list.append(EvmTransactionAuthorization(
+                        nonce=read_integer(entry, 'nonce', source),
+                        delegated_address=deserialize_evm_address(entry['address']),
+                    ))
+                except DeserializationError as e:
+                    log.error(f'Unable to deserialize authorization entry {entry} due to {e}')
+        else:
+            authorization_list = None
+
+        if internal:
+            if data.get('callType') == 'delegatecall':
+                # Should never reach here — all callers must filter delegatecall entries
+                # before calling this function. If it does, log and skip silently.
+                log.error(f'delegatecall internal tx reached deserialization. Caller should have filtered it. Data: {data}')  # noqa: E501
+                raise DeserializationError('Unexpected delegatecall internal transaction reached deserialization')  # noqa: E501
+
+            return EvmInternalTransaction(
+                parent_tx_hash=tx_hash,
+                chain_id=chain_id,
+                # traceId is missing when querying by parent hash
+                trace_id=int(data.get('traceId', '0') or 0),  # use `or 0` since the key can also be present but have an empty string value.  # noqa: E501
+                from_address=from_address,
+                to_address=to_address,
+                value=value,
+                gas=int(data.get('gas', '0') or 0),
+                gas_used=int(data.get('gasUsed', '0') or 0),
+            ), None
+
+        # else normal transaction
+        try:
+            gas_price = read_integer(data=data, key='gasPrice', api=source)
+        except (DeserializationError, KeyError):
+            gas_price = None
+
+        input_data = read_hash(data, 'input', source)
+        if 'gasUsed' not in data or gas_price is None:  # some etherscan APIs may have this
+            if raw_receipt_data is None:
+                if evm_inquirer is not None:
+                    raw_receipt_data = _get_transaction_receipt(
+                        tx_hash=tx_hash,
+                        chain_id=chain_id,
+                        timestamp=timestamp,
+                        evm_inquirer=evm_inquirer,
+                    )
+                elif indexer is not None:
+                    raw_receipt_data = indexer.get_transaction_receipt(
+                        chain_id=chain_id,  # type: ignore[arg-type]  # chain is supported
+                        tx_hash=tx_hash,
+                    )
+                else:
+                    raise DeserializationError(
+                        f'Transaction {data.get("hash", "unknown")} missing gasUsed/gasPrice '
+                        f'and no evm_inquirer or indexer available',
+                    )
+
+            # In Arbitrum Nitro chains the gas price included in the data is the "Gas Price
+            # Bid" and not the "Gas Price Paid". The latter is the actual gas price paid for the
+            # transaction and is included in the transaction receipt as the effectiveGasPrice.
+            # Also, we've seen cases where gasPrice has no valid value.
+            if gas_price is None or chain_id in ARBITRUM_NITRO_CHAIN_IDS:
+                gas_price = read_integer(raw_receipt_data, 'effectiveGasPrice', source)  # type: ignore[arg-type]  # receipt will be present.
+
+        if 'gasUsed' not in data:
+            gas_used = read_integer(raw_receipt_data, 'gasUsed', source)  # type: ignore[arg-type]  # receipt will be present.
+        else:
+            gas_used = read_integer(data, 'gasUsed', source)
+        nonce = read_integer(data, 'nonce', source)
+
+        if chain_id in L2_CHAINIDS_WITH_L1_FEES:
+            l1_fee: int | None = None
+            try:  # if data is from etherscan's txlist it will already include the L1 fee
+                l1_fee = int(data['L1FeesPaid'])
+            except (KeyError, ValueError):  # data is not from txlist or malformed data from txlist
+                if evm_inquirer is not None:
+                    if raw_receipt_data is None:
+                        raw_receipt_data = _get_transaction_receipt(
+                            tx_hash=tx_hash,
+                            chain_id=chain_id,
+                            timestamp=timestamp,
+                            evm_inquirer=evm_inquirer,
+                        )
+                    try:
+                        l1_fee = read_integer(raw_receipt_data, 'l1Fee', source)
+                    except (DeserializationError, KeyError) as e:  # Fall back to indexers
+                        msg = f'missing key {e!s}' if isinstance(e, KeyError) else str(e)
+                        log.warning(f'Failed to get L1 fee from receipt due to {msg}. Falling back to indexers.')  # noqa: E501
+                        l1_fee = evm_inquirer.maybe_get_l1_fees(
+                            account=from_address,
+                            tx_hash=tx_hash,
+                            block_number=block_number,
+                        )
+                elif indexer is not None:  # fallback to indexers for non-Etherscan sources
+                    try:
+                        l1_fee = indexer.get_l1_fee(
+                            chain_id=chain_id,
+                            account=from_address,
+                            tx_hash=tx_hash,
+                            block_number=block_number,
+                        )
+                    except (KeyError, RemoteError, DeserializationError) as e:
+                        log.warning(f'Failed to get L1 fee from {indexer.name} due to {e!s}')
+                else:  # should never happen
+                    log.error(
+                        f'Cannot retrieve L1 fee for {chain_id.to_name()} transaction {tx_hash!s}. '  # noqa: E501
+                        f'Both evm_inquirer and indexer are None.',
+                    )
+
+            if l1_fee is None:
+                log.error(
+                    f'Failed to retrieve L1 fee while deserializing {chain_id.to_name()} '
+                    f'transaction {tx_hash!s}. Using 0 L1 fee.',
+                )
+                l1_fee = 0
+
+            return L2WithL1FeesTransaction(
+                timestamp=timestamp,
+                chain_id=chain_id,
+                block_number=block_number,
+                tx_hash=tx_hash,
+                from_address=from_address,
+                to_address=to_address,
+                value=value,
+                gas=read_integer(data, 'gas', source),
+                gas_price=gas_price,
+                gas_used=gas_used,
+                input_data=input_data,
+                nonce=nonce,
+                l1_fee=l1_fee,
+                tx_type=deserialize_int_from_hex_or_int(data.get('type', '0x0'), location='l2 transaction deserialization'),  # noqa: E501
+                authorization_list=authorization_list,
+            ), raw_receipt_data
+    except KeyError as e:
+        raise DeserializationError(
+            f'evm {"internal" if internal else ""}transaction from {source} missing expected key {e!s}',  # noqa: E501
+        ) from e
+    else:
+        return EvmTransaction(
+            timestamp=timestamp,
+            chain_id=chain_id,
+            block_number=block_number,
+            tx_hash=tx_hash,
+            from_address=from_address,
+            to_address=to_address,
+            value=value,
+            gas=read_integer(data, 'gas', source),
+            gas_price=gas_price,
+            gas_used=gas_used,
+            input_data=input_data,
+            nonce=nonce,
+            authorization_list=authorization_list,
+        ), raw_receipt_data
+
+
+def ensure_type[R](symbol: Any, expected_type: type[R], location: str) -> R:
+    if isinstance(symbol, expected_type) is True:
+        return symbol
+    raise DeserializationError(
+        f'Value "{symbol}" has type {type(symbol)} '
+        f'but expected {expected_type} at location "{location}"',
+    )

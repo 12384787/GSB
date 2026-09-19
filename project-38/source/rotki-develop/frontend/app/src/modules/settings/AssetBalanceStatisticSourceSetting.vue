@@ -1,0 +1,99 @@
+<script setup lang="ts">
+import { useAssetStatisticState } from '@/modules/settings/use-asset-statistic-state';
+import { useSettingModel } from '@/modules/settings/use-setting-model';
+import MenuTooltipButton from '@/modules/shell/components/MenuTooltipButton.vue';
+
+const { asset } = defineProps<{
+  asset?: string;
+}>();
+
+const emit = defineEmits<{
+  preference: [preference?: 'events' | 'snapshot'];
+}>();
+
+const {
+  getPreference,
+  name,
+  rememberStateForAsset,
+  suppressIfPerAsset,
+  modelUseHistoricalAssetBalances,
+} = useAssetStatisticState(() => asset);
+
+const { t } = useI18n({ useScope: 'global' });
+
+const { model } = useSettingModel('useHistoricalAssetBalances');
+
+async function persistSource(value: boolean | undefined): Promise<void> {
+  await suppressIfPerAsset(async () => {
+    set(model, value ?? false);
+  });
+}
+
+watch(modelUseHistoricalAssetBalances, () => {
+  if (!asset || !get(rememberStateForAsset)) {
+    return;
+  }
+
+  emit('preference', getPreference(asset));
+});
+
+watchImmediate(() => asset, (asset) => {
+  if (!asset || !get(rememberStateForAsset)) {
+    return;
+  }
+
+  emit('preference', getPreference(asset));
+});
+</script>
+
+<template>
+  <RuiMenu
+    :class-names="{ menu: 'min-w-[18rem] max-w-[20rem]' }"
+    :options="{ placement: 'top' }"
+  >
+    <template #activator="{ attrs }">
+      <MenuTooltipButton
+        :tooltip="t('statistics_graph_settings.source.title')"
+        class-name="graph-period"
+        custom-color
+        v-bind="attrs"
+      >
+        <RuiIcon name="lu-file-cog" />
+      </MenuTooltipButton>
+    </template>
+
+    <div class="p-4">
+      <RuiCardHeader class="p-0 mb-2">
+        <template #header>
+          {{ t('statistics_graph_settings.source.title') }}
+        </template>
+      </RuiCardHeader>
+      <RuiRadioGroup
+        v-model="modelUseHistoricalAssetBalances"
+        color="primary"
+        :hint="t('statistics_graph_settings.source.warning')"
+        size="sm"
+        @update:model-value="persistSource($event)"
+      >
+        <RuiRadio
+          :label="t('statistics_graph_settings.source.snapshot')"
+          :value="false"
+        />
+        <!-- eslint-disable vue/prefer-true-attribute-shorthand -- `value` is the radio payload, not a boolean prop, so the shorthand would pass an empty string -->
+        <RuiRadio
+          :label="t('statistics_graph_settings.source.historical_events_processing')"
+          :value="true"
+        />
+        <!-- eslint-enable vue/prefer-true-attribute-shorthand -->
+      </RuiRadioGroup>
+      <RuiCheckbox
+        v-if="asset"
+        v-model="rememberStateForAsset"
+        hide-details
+        class="mt-3"
+        color="primary"
+        :label="t('statistics_graph_settings.source.remember_state_for_asset', { asset: name })"
+      />
+    </div>
+  </RuiMenu>
+</template>

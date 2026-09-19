@@ -1,0 +1,366 @@
+import { createConsola } from 'consola';
+import { type AbiParameter, decodeAbiParameters, type DecodeAbiParametersReturnType, encodeAbiParameters, type Hex, isHex, parseAbiParameters } from 'viem';
+
+const logger = createConsola({ defaults: { tag: 'balance-scanner' } });
+
+/**
+ * Pre-parsed ABI parameter sets. Declared as constants so viem can infer the
+ * precise decoded tuple types (addresses, bigints, nested tuples) at each call
+ * site instead of widening to `unknown[]`.
+ */
+const ARGS_TOKENS_BALANCE = parseAbiParameters('address, address[]');
+const ARGS_ETHER_BALANCES = parseAbiParameters('address[]');
+const ARGS_AGGREGATE = parseAbiParameters('(address, bytes)[]');
+const RESULT_UINT256_ARRAY = parseAbiParameters('uint256[]');
+const RESULT_AGGREGATE = parseAbiParameters('uint256, bytes[]');
+
+/**
+ * Known contract addresses (checksummed).
+ */
+const BALANCE_SCANNER = '0x54eCF3f6f61F63fdFE7c27Ee8A86e54899600C92';
+const MULTICALL = '0x5BA1e12693Dc8F9c48aAD8770482f4739bEeD696';
+
+/**
+ * Function selectors (first 4 bytes of keccak256 of the signature).
+ */
+const SEL_TOKENS_BALANCE = '0xb0d861b8'; // tokens_balance(address,address[])
+const SEL_ETHER_BALANCES = '0xee1806d2'; // ether_balances(address[])
+const SEL_AGGREGATE = '0x252dba42'; // aggregate((address,bytes)[])
+
+/**
+ * token balances: account (lowercase) → token (lowercase) → balance bigint
+ */
+type TokenBalanceMap = Map<string, Map<string, bigint>>;
+
+/**
+ * ether balances: address (lowercase) → balance bigint
+ */
+type EtherBalanceMap = Map<string, bigint>;
+
+/**
+ * Stored results for non-balance-scanner sub-calls within aggregates.
+ * Key: `${target.toLowerCase()}:${calldata}` → encoded result bytes
+ */
+type SubCallResultMap = Map<string, Hex>;
+
+export interface BalanceMaps {
+  tokenBalances: TokenBalanceMap;
+  etherBalances: EtherBalanceMap;
+  subCallResults: SubCallResultMap;
+  /** Block number from eth_blockNumber for general use */
+  blockNumber: bigint;
+  /** Block number extracted from aggregate responses containing balance scanner calls */
+  aggregateBlockNumber: bigint;
+}
+
+/**
+ * Checks whether an eth_call targets a given contract address.
+ */
+function isCallTo(params: unknown[] | undefined, address: string): boolean {
+  const call = params?.[0];
+  if (typeof call !== 'object' || call === null || !('to' in call) || typeof call.to !== 'string')
+    return false;
+  return call.to.toLowerCase() === address.toLowerCase();
+}
+
+/**
+ * Gets the calldata hex string from eth_call params.
+ */
+function getCalldata(params: unknown[]): string {
+  const call = params[0];
+  if (typeof call === 'object' && call !== null && 'data' in call && typeof call.data === 'string')
+    return call.data;
+  return '0x';
+}
+
+/**
+ * Gets the function selector (first 4 bytes) from calldata.
+ */
+function getSelector(calldata: string): string {
+  return calldata.slice(0, 10).toLowerCase();
+}
+
+/**
+ * Decodes the ABI-encoded arguments (everything after the 4-byte selector).
+ */
+function decodeArgs<const T extends readonly AbiParameter[]>(calldata: string, params: T): DecodeAbiParametersReturnType<T> {
+  const argsHex: Hex = `0x${calldata.slice(10)}`;
+  return decodeAbiParameters(params, argsHex);
+}
+
+/**
+ * Decodes an ABI-encoded result.
+ */
+function decodeResult<const T extends readonly AbiParameter[]>(data: Hex, params: T): DecodeAbiParametersReturnType<T> {
+  return decodeAbiParameters(params, data);
+}
+
+/**
+ * Checks whether an aggregate call contains any balance scanner sub-calls.
+ */
+function hasBalanceScannerSubCalls(calldata: string): boolean {
+  const [calls] = decodeArgs(calldata, ARGS_AGGREGATE);
+  return calls.some(([target]) => target.toLowerCase() === BALANCE_SCANNER.toLowerCase());
+}
+
+/**
+ * Builds balance lookup maps by parsing all cassette entries.
+ *
+ * Balance scanner calls with errors (e.g. "out of gas") are skipped during
+ * parsing. At resolve time we always return success with the correct
+ * balances — this is more deterministic than replaying transient errors.
+ */
+interface CassetteEntry {
+  method: string;
+  params?: unknown[];
+  result?: unknown;
+  error?: unknown;
+}
+
+interface ParseTargets {
+  tokenBalances: TokenBalanceMap;
+  etherBalances: EtherBalanceMap;
+  subCallResults: SubCallResultMap;
+}
+
+/**
+ * Parses a single cassette entry into the balance maps. Returns the aggregate
+ * block number when the entry is a multicall with balance-scanner sub-calls,
+ * otherwise `undefined`.
+ */
+function parseCassetteEntry(entry: CassetteEntry, targets: ParseTargets): bigint | undefined {
+  if (entry.method !== 'eth_call' || !entry.params || !isHex(entry.result))
+    return undefined;
+
+  const result = entry.result;
+  const calldata = getCalldata(entry.params);
+  const selector = getSelector(calldata);
+
+  if (isCallTo(entry.params, BALANCE_SCANNER)) {
+    if (selector === SEL_TOKENS_BALANCE)
+      parseTokensBalance(calldata, result, targets.tokenBalances);
+    else if (selector === SEL_ETHER_BALANCES)
+      parseEtherBalances(calldata, result, targets.etherBalances);
+    return undefined;
+  }
+
+  if (isCallTo(entry.params, MULTICALL) && selector === SEL_AGGREGATE) {
+    const aggBlockNumber = parseAggregate(calldata, result, targets.tokenBalances, targets.etherBalances, targets.subCallResults);
+    if (hasBalanceScannerSubCalls(calldata))
+      return aggBlockNumber;
+  }
+
+  return undefined;
+}
+
+function findBlockNumber(cassette: Record<string, CassetteEntry>): bigint {
+  for (const entry of Object.values(cassette)) {
+    if (entry.method === 'eth_blockNumber' && typeof entry.result === 'string')
+      return BigInt(entry.result);
+  }
+  return 0n;
+}
+
+export function buildBalanceMaps(cassette: Record<string, CassetteEntry>): BalanceMaps {
+  const targets: ParseTargets = {
+    tokenBalances: new Map(),
+    etherBalances: new Map(),
+    subCallResults: new Map(),
+  };
+  let aggregateBlockNumber = 0n;
+
+  for (const entry of Object.values(cassette)) {
+    const aggBlockNumber = parseCassetteEntry(entry, targets);
+    if (aggBlockNumber !== undefined)
+      aggregateBlockNumber = aggBlockNumber;
+  }
+
+  const { tokenBalances, etherBalances, subCallResults } = targets;
+  const blockNumber = findBlockNumber(cassette);
+
+  logger.info(`Built balance maps: ${countTokenEntries(tokenBalances)} token balances, ${etherBalances.size} ether balances, ${subCallResults.size} sub-call results`);
+  return { tokenBalances, etherBalances, subCallResults, blockNumber, aggregateBlockNumber };
+}
+
+function countTokenEntries(map: TokenBalanceMap): number {
+  let count = 0;
+  for (const inner of map.values())
+    count += inner.size;
+  return count;
+}
+
+/**
+ * Parses a tokens_balance(address, address[]) call and its result,
+ * storing non-zero balances into the map.
+ */
+function parseTokensBalance(calldata: string, result: Hex, map: TokenBalanceMap): void {
+  const [account, tokens] = decodeArgs(calldata, ARGS_TOKENS_BALANCE);
+  const [balances] = decodeResult(result, RESULT_UINT256_ARRAY);
+
+  const accountKey = account.toLowerCase();
+  let accountMap = map.get(accountKey);
+  if (!accountMap) {
+    accountMap = new Map();
+    map.set(accountKey, accountMap);
+  }
+
+  for (const [i, token] of tokens.entries()) {
+    const balance = balances[i];
+    if (balance !== 0n) {
+      accountMap.set(token.toLowerCase(), balance);
+    }
+  }
+}
+
+/**
+ * Parses an ether_balances(address[]) call and its result.
+ */
+function parseEtherBalances(calldata: string, result: Hex, map: EtherBalanceMap): void {
+  const [addresses] = decodeArgs(calldata, ARGS_ETHER_BALANCES);
+  const [balances] = decodeResult(result, RESULT_UINT256_ARRAY);
+
+  for (const [i, address] of addresses.entries()) {
+    const balance = balances[i];
+    if (balance !== 0n) {
+      map.set(address.toLowerCase(), balance);
+    }
+  }
+}
+
+/**
+ * Parses a multicall aggregate((address,bytes)[]) call, extracting balance
+ * scanner sub-calls and parsing their results.
+ */
+function parseAggregate(
+  calldata: string,
+  result: Hex,
+  tokenMap: TokenBalanceMap,
+  etherMap: EtherBalanceMap,
+  subCallMap: SubCallResultMap,
+): bigint {
+  const [calls] = decodeArgs(calldata, ARGS_AGGREGATE);
+  const [aggBlockNumber, returnData] = decodeResult(result, RESULT_AGGREGATE);
+
+  for (const [i, [target, subCalldata]] of calls.entries()) {
+    const subResult = returnData[i];
+
+    if (target.toLowerCase() === BALANCE_SCANNER.toLowerCase()) {
+      const subSelector = getSelector(subCalldata);
+
+      if (subSelector === SEL_TOKENS_BALANCE) {
+        parseTokensBalance(subCalldata, subResult, tokenMap);
+        continue;
+      }
+      if (subSelector === SEL_ETHER_BALANCES) {
+        parseEtherBalances(subCalldata, subResult, etherMap);
+        continue;
+      }
+    }
+
+    // Store non-balance-scanner sub-call results for replay
+    const key = `${target.toLowerCase()}:${subCalldata}`;
+    subCallMap.set(key, subResult);
+  }
+
+  return aggBlockNumber;
+}
+
+/**
+ * Checks if a request is a balance scanner eth_call that we can handle semantically.
+ * Returns a constructed result hex string, or null if not applicable.
+ *
+ * Always returns success with correct balances (unknown tokens default to 0).
+ * This is more deterministic than replaying transient "out of gas" errors
+ * that depend on batch composition.
+ */
+export function tryResolveBalanceCall(
+  method: string,
+  params: unknown[] | undefined,
+  maps: BalanceMaps,
+): string | null {
+  if (method !== 'eth_call' || !params)
+    return null;
+
+  // Direct balance scanner calls
+  if (isCallTo(params, BALANCE_SCANNER)) {
+    const calldata = getCalldata(params);
+    const selector = getSelector(calldata);
+
+    if (selector === SEL_TOKENS_BALANCE) {
+      return resolveTokensBalance(calldata, maps.tokenBalances);
+    }
+    if (selector === SEL_ETHER_BALANCES) {
+      return resolveEtherBalances(calldata, maps.etherBalances);
+    }
+  }
+
+  // Multicall aggregate — only intercept if it contains balance scanner sub-calls
+  if (isCallTo(params, MULTICALL)) {
+    const calldata = getCalldata(params);
+    const selector = getSelector(calldata);
+
+    if (selector === SEL_AGGREGATE && hasBalanceScannerSubCalls(calldata)) {
+      return resolveAggregate(calldata, maps);
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Constructs a tokens_balance response for the given calldata using the balance map.
+ */
+function resolveTokensBalance(calldata: string, map: TokenBalanceMap): Hex {
+  const [account, tokens] = decodeArgs(calldata, ARGS_TOKENS_BALANCE);
+  const accountKey = account.toLowerCase();
+  const accountMap = map.get(accountKey);
+
+  const balances: bigint[] = tokens.map(token => accountMap?.get(token.toLowerCase()) ?? 0n);
+
+  return encodeAbiParameters(RESULT_UINT256_ARRAY, [balances]);
+}
+
+/**
+ * Constructs an ether_balances response for the given calldata using the balance map.
+ */
+function resolveEtherBalances(calldata: string, map: EtherBalanceMap): Hex {
+  const [addresses] = decodeArgs(calldata, ARGS_ETHER_BALANCES);
+
+  const balances: bigint[] = addresses.map(addr => map.get(addr.toLowerCase()) ?? 0n);
+
+  return encodeAbiParameters(RESULT_UINT256_ARRAY, [balances]);
+}
+
+/**
+ * Constructs a multicall aggregate response by resolving each sub-call.
+ * Sub-calls targeting the balance scanner are resolved semantically.
+ * Other sub-calls are looked up from stored results.
+ */
+function resolveAggregate(calldata: string, maps: BalanceMaps): Hex {
+  const [calls] = decodeArgs(calldata, ARGS_AGGREGATE);
+
+  const returnData: Hex[] = calls.map(([target, subCalldata]) => {
+    if (target.toLowerCase() === BALANCE_SCANNER.toLowerCase()) {
+      const subSelector = getSelector(subCalldata);
+
+      if (subSelector === SEL_TOKENS_BALANCE) {
+        return resolveTokensBalance(subCalldata, maps.tokenBalances);
+      }
+      if (subSelector === SEL_ETHER_BALANCES) {
+        return resolveEtherBalances(subCalldata, maps.etherBalances);
+      }
+    }
+
+    // Look up stored result for non-balance-scanner sub-calls
+    const key = `${target.toLowerCase()}:${subCalldata}`;
+    const stored = maps.subCallResults.get(key);
+    if (stored) {
+      return stored;
+    }
+
+    logger.warn(`Aggregate sub-call to unknown target ${target} with selector ${getSelector(subCalldata)}`);
+    return '0x';
+  });
+
+  return encodeAbiParameters(RESULT_AGGREGATE, [maps.aggregateBlockNumber, returnData]);
+}

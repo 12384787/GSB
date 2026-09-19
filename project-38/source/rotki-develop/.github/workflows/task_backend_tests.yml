@@ -1,0 +1,179 @@
+name: Backend Tests
+
+on:
+  workflow_call:
+    secrets:
+      CODECOV_TOKEN:
+        required: false
+    inputs:
+      os:
+        required: true
+        type: string
+      test_environment:
+        required: true
+        type: string
+      collect_coverage:
+        required: false
+        default: false
+        type: boolean
+
+permissions: { }
+
+jobs:
+  test-backend:
+    env:
+      CI: true
+      TEST_ENVIRONMENT: ${{ inputs.test_environment }}
+      TARGET_BRANCH: ${{ github.base_ref }}
+      SOURCE_BRANCH: ${{ github.head_ref }}
+      COLLECT_COVERAGE: ${{ inputs.collect_coverage }}
+    runs-on: ${{ inputs.os }}
+    name: 'Backend tests'
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        test-group: [ api, decoders, others, accounting ]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Checkout test caching
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: rotki/test-caching
+          path: test-caching
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Ensure VCR branch is fully rebased
+        if: github.event_name == 'pull_request' || github.event_name == 'push'
+        env:
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          cd "test-caching" || exit
+          git fetch origin
+          if [[ $(git branch --all | grep "remotes/origin/$SOURCE_BRANCH") ]]; then
+            echo "Branch $SOURCE_BRANCH exists on origin. Checking it out..."
+            git checkout "$SOURCE_BRANCH" 2>/dev/null || git checkout -b "$SOURCE_BRANCH" "origin/$SOURCE_BRANCH"
+          else
+            echo "Branch $SOURCE_BRANCH does not exist on origin. Checking the $AUTHOR's fork..."
+            git remote add author https://github.com/"$AUTHOR"/test-caching.git
+            git fetch author "$SOURCE_BRANCH" && git checkout -b "$SOURCE_BRANCH" author/"$SOURCE_BRANCH"
+            if [[ $? -ne 0 ]]; then
+                echo "No cassettes branch for this PR. Defaulting to $TARGET_BRANCH"
+                git checkout "$TARGET_BRANCH"
+                exit 0
+            fi
+
+            encoded_author=$(jq -nr --arg v "$AUTHOR" '$v|@uri')
+            encoded_source=$(jq -nr --arg v "$SOURCE_BRANCH" '$v|@uri')
+            encoded_target=$(jq -nr --arg v "$TARGET_BRANCH" '$v|@uri')
+            if [ "$(curl --silent "https://api.github.com/repos/rotki/test-caching/pulls?state=open&head=${encoded_author}:${encoded_source}&base=${encoded_target}" | jq "length")" == "0" ]; then
+                echo "Found the $SOURCE_BRANCH branch on $AUTHOR's test-caching fork. But no PR found. Aborting."
+                exit 1
+            fi
+          fi
+
+          echo "Current HEAD is $(git rev-parse HEAD)"
+          [ "$(git rev-parse "remotes/origin/$TARGET_BRANCH")" = "$(git merge-base "remotes/origin/$TARGET_BRANCH" "$SOURCE_BRANCH")" ] &&
+          echo "VCR setup: $SOURCE_BRANCH fully rebased on $TARGET_BRANCH" && exit ||
+          echo "VCR setup: $SOURCE_BRANCH not fully rebased on $TARGET_BRANCH" && exit 1
+
+      - name: Load env
+        uses: rotki/action-env@49f59e650cfdc8796c4ac6533ec044b190d83f9a  # v4.0.0
+        with:
+          env_file: .github/.env.ci
+
+      - name: Setup python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          freethreaded: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        with:
+          enable-cache: true
+          version: ${{ env.UV_VERSION }}
+          cache-dependency-glob: "uv.lock"
+
+      - name: Cache rotkehlchen test directory
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/.rotkehlchen-test-dir
+          key: ${{ runner.os }}-testdir
+
+      - name: Setup minupnpc
+        if: runner.os == 'Windows'
+        run: |
+          $MINIUPNPC_ZIP = "miniupnpc_64bit_py39-2.2.24.zip"
+          echo "`nFetching miniupnpc for windows`n"
+          $PYTHON_LOCATION = ((python -c "import os, sys; print(os.path.dirname(sys.executable))") | Out-String).trim()
+          $PYTHON_DIRECTORY = Split-Path -Path $PYTHON_LOCATION -Leaf
+
+          $DLL_PATH = (Join-Path $PYTHON_LOCATION "miniupnpc.dll")
+
+          echo "miniupnpc.dll will be installed in $PYTHON_LOCATION"
+          curl.exe -L -O "https://github.com/mrx23dot/miniupnp/releases/download/miniupnpd_2_2_24/$MINIUPNPC_ZIP"
+
+          echo "Downloaded miniupnpc.zip"
+
+          Expand-Archive -Force -Path ".\$MINIUPNPC_ZIP" -DestinationPath $PYTHON_LOCATION
+
+          echo "Unzipped miniupnpc to $PYTHON_LOCATION`nDone with miniupnpc"
+          Get-ChildItem -Path $PYTHON_LOCATION
+          (Get-Command python).Path
+        shell: powershell
+
+      - name: Install dependencies
+        run: |
+          uv sync --locked --group dev --group lint --group ci
+
+      - name: Run tests
+        env:
+          PYTEST_ARGS: '--durations=150'
+          FORCE_COLOR: 1
+          MATRIX_JOB: ${{ matrix.test-group }}
+        run: |
+          if [ "$COLLECT_COVERAGE" = 'true' ]; then
+            export COVERAGE_FILE=".coverage.$MATRIX_JOB"
+            COVERAGE_ARGS='--cov=rotkehlchen --cov-report=term-missing'
+          else
+            COVERAGE_ARGS=''
+          fi
+
+          export CASSETTES_DIR="$(pwd)/test-caching"
+
+          if [ "$MATRIX_JOB" == 'accounting' ]
+          then
+            ROTKI_ACCOUNTING_UPDATE=True uv run pytest $PYTEST_ARGS $COVERAGE_ARGS -n 6 -v -m accounting_update rotkehlchen/tests/
+          elif [ "$MATRIX_JOB" == 'api' ]
+          then
+            uv run pytest $PYTEST_ARGS $COVERAGE_ARGS -n 6 -v rotkehlchen/tests/api
+          elif [ "$MATRIX_JOB" == 'decoders' ]
+          then
+            uv run pytest $PYTEST_ARGS $COVERAGE_ARGS -n 6 -v rotkehlchen/tests/unit/decoders rotkehlchen/tests/unit/solana_decoders
+          else
+            uv run pytest $PYTEST_ARGS $COVERAGE_ARGS -n 6 -v --ignore=rotkehlchen/tests/api --ignore=rotkehlchen/tests/unit/decoders --ignore=rotkehlchen/tests/unit/solana_decoders rotkehlchen/tests/
+          fi
+
+          if [ "$MATRIX_JOB" == 'others' ]
+          then
+            # dead-fixtures needs only one full collection, so run it once in this leg
+            uv run pytest --dead-fixtures
+          fi
+        shell: bash
+
+      - name: Upload coverage artifacts
+        if: ${{ inputs.collect_coverage }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: coverage-${{ inputs.os }}-${{ matrix.test-group }}
+          path: .coverage.${{ matrix.test-group }}
+          include-hidden-files: true

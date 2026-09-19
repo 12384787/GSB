@@ -1,0 +1,183 @@
+from typing import TYPE_CHECKING, Any, Final, TypedDict, Unpack, overload
+
+from rotkehlchen.chain.evm.types import string_to_evm_address
+from rotkehlchen.db.constants import EXTRAINTERNALTXPREFIX
+from rotkehlchen.types import BTCAddress, ChecksumEvmAddress, SolanaAddress, Timestamp
+from rotkehlchen.utils.mixins.enums import Enum
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+IGNORED_CUSTOMIZED_EVENT_DUPLICATE_PREFIX: Final = 'ignored_ced_'
+
+
+class DBCacheStatic(Enum):
+    """It contains all the keys that don't depend on a variable
+    that can be stored in the `key_value_cache` table"""
+    LAST_BALANCE_SAVE: Final = 'last_balance_save'
+    LAST_DATA_UPLOAD_TS: Final = 'last_data_upload_ts'
+    LAST_DATA_UPDATES_TS: Final = 'last_data_updates_ts'
+    LAST_OWNED_ASSETS_UPDATE: Final = 'last_owned_assets_update'
+    LAST_EVM_ACCOUNTS_DETECT_TS: Final = 'last_evm_accounts_detect_ts'
+    LAST_SPAM_ASSETS_DETECT_KEY: Final = 'last_spam_assets_detect_key'
+    LAST_AUGMENTED_SPAM_ASSETS_DETECT_KEY: Final = 'last_augmented_spam_assets_detect_key'
+    LAST_ETH2_EVENTS_PROCESSING_TS: Final = 'last_eth2_events_processing_ts'
+    LAST_WITHDRAWALS_EXIT_QUERY_TS: Final = 'last_withdrawals_exit_query_ts'
+    LAST_MONERIUM_QUERY_TS: Final = 'last_monerium_query_ts'
+    LAST_AAVE_V3_ASSETS_UPDATE: Final = 'last_aave_v3_assets_update'
+    LAST_DELETE_PAST_CALENDAR_EVENTS: Final = 'last_delete_past_calendar_events'
+    LAST_CREATE_REMINDER_CHECK_TS: Final = 'last_create_reminder_check_ts'
+    LAST_GRAPH_DELEGATIONS_CHECK_TS: Final = 'last_graph_delegations_check_ts'
+    LAST_GNOSISPAY_QUERY_TS: Final = 'last_gnosispay_query_ts'
+    GNOSIS_PAY_SAFE_MIGRATION: Final = 'gnosis_pay_safe_migration'
+    LAST_SPARK_ASSETS_UPDATE: Final = 'last_spark_assets_update'
+    LAST_DB_UPGRADE: Final = 'last_db_upgrade'
+    DOCKER_DEVICE_INFO: Final = 'docker_device_info'
+    MONERIUM_OAUTH_CREDENTIALS: Final = 'monerium_oauth_credentials'
+    # Earliest timestamp from which balance caches are stale due to event modifications.
+    # When events are added/edited/deleted, balances must be recalculated from this point.
+    STALE_BALANCES_FROM_TS: Final = 'stale_balances_from_ts'
+    # Timestamp when events were last modified. Used to detect concurrent modifications
+    # during historical balance processing.
+    STALE_BALANCES_MODIFICATION_TS: Final = 'stale_balances_modification_ts'
+    LAST_HISTORICAL_BALANCE_PROCESSING_TS: Final = 'last_historical_balance_processing_ts'
+    LAST_DATA_ISSUE_REMEDIATION_TS: Final = 'last_data_issue_remediation_ts'
+    LAST_INTERNAL_TX_CONFLICTS_REPULL_TS: Final = 'last_internal_tx_conflicts_repull_ts'
+    BEACONCHAIN_VALIDATOR_QUERY_LIMIT: Final = 'beaconchain_validator_query_limit'
+    ETHERSCAN_API_KEY_TIER: Final = 'etherscan_api_key_tier'
+
+
+class LabeledLocationArgsType(TypedDict):
+    """Type of kwargs, used to get the value of `DBCacheDynamic.LAST_CRYPTOTX_OFFSET` and `DBCacheDynamic.BANK_SESSION`"""  # noqa: E501
+    location: str
+    location_name: str
+
+
+class LabeledLocationIdArgsType(LabeledLocationArgsType):
+    """Type of kwargs, used to get the value of `DBCacheDynamic.LAST_QUERY_TS` and `DBCacheDynamic.LAST_QUERY_ID`"""  # noqa: E501
+    account_id: str
+
+
+class AddressArgType(TypedDict):
+    """Type of kwargs, used to get the value of following `WITHDRAWALS_TS`, `WITHDRAWALS_IDX`, `LAST_BTC_TX_BLOCK`, `LAST_BCH_TX_BLOCK` and `SOLANA_TOKEN_ACCOUNT`"""  # noqa: E501
+    address: ChecksumEvmAddress | BTCAddress | SolanaAddress
+
+
+class BlockchainArgType(TypedDict):
+    """Type of kwargs, used to get the value of `LAST_BLOCKCHAIN_BALANCES_QUERY_TS`"""
+    blockchain: str
+
+
+class IndexArgType(TypedDict):
+    """Type of kwargs, used to get the value of `DBCacheDynamic.LAST_PRODUCED_BLOCKS_QUERY_TS`"""
+    index: int
+
+
+class ExtraTxArgType(TypedDict):
+    """Type of kwargs, used to get the value of `DBCacheDynamic.EXTRA_INTERNAL_TX`"""
+    chain_id: int
+    # Receiver is optional since in at least one decoder (rainbow) the receiver address
+    # of the needed internal transaction is unknown.
+    receiver: ChecksumEvmAddress | None
+    tx_hash: str  # using str instead of EVMTxHash because DB schema is in TEXT
+
+
+class BinancePairLastTradeArgsType(TypedDict):
+    """Type of kwargs used for Binance pair-specific progress caches."""
+    location: str
+    location_name: str
+    queried_pair: str
+
+
+class CustomizedEventOriginalArgType(TypedDict):
+    """Type of kwargs for `DBCacheDynamic.CUSTOMIZED_EVENT_ORIGINAL_SEQ_IDX`"""
+    group_identifier: str
+    sequence_index: int
+
+
+def _deserialize_int_from_str(value: str) -> int | None:
+    return int(value)
+
+
+def _deserialize_timestamp_from_str(value: str) -> Timestamp | None:
+    return Timestamp(int(value))
+
+
+def _deserialize_solana_token_account_from_str(value: str) -> tuple[SolanaAddress, SolanaAddress] | None:  # noqa: E501
+    """Deserialize cached token account data as (owner, mint) tuple from comma-separated string."""
+    try:
+        owner, mint = value.split(',')
+        return SolanaAddress(owner), SolanaAddress(mint)
+    except ValueError:
+        return None
+
+
+class DBCacheDynamic(Enum):
+    """It contains all the formattable keys that depend on a variable
+    that can be stored in the `key_value_cache` table"""
+    LAST_CRYPTOTX_OFFSET: Final = '{location}_{location_name}_last_cryptotx_offset', _deserialize_int_from_str  # noqa: E501
+    BANK_SESSION: Final = '{location}_{location_name}_bank_session', lambda x: x  # opaque connector session blob  # noqa: E501
+    LAST_QUERY_TS: Final = '{location}_{location_name}_{account_id}_last_query_ts', _deserialize_timestamp_from_str  # noqa: E501
+    LAST_QUERY_ID: Final = '{location}_{location_name}_{account_id}_last_query_id', lambda x: x  # return it as is, a string  # noqa: E501
+    LAST_BLOCK_ID: Final = '{location}_{location_name}_{account_id}_last_block_id', _deserialize_int_from_str  # noqa: E501
+    WITHDRAWALS_TS: Final = 'ethwithdrawalsts_{address}', _deserialize_timestamp_from_str
+    WITHDRAWALS_IDX: Final = 'ethwithdrawalsidx_{address}', _deserialize_int_from_str
+    EXTRA_INTERNAL_TX: Final = f'{EXTRAINTERNALTXPREFIX}_{{chain_id}}_{{receiver}}_{{tx_hash}}', string_to_evm_address  # noqa: E501
+    LAST_PRODUCED_BLOCKS_QUERY_TS: Final = 'last_produced_blocks_query_ts_{index}', _deserialize_timestamp_from_str  # noqa: E501
+    BINANCE_PAIR_LAST_ID: Final = '{location}_{location_name}_{queried_pair}', _deserialize_int_from_str  # noqa: E501  # notice that location is added because it can be either binance or binance_us
+    BINANCE_PAIR_LAST_QUERY_TS: Final = '{location}_{location_name}_{queried_pair}_last_query_ts', _deserialize_timestamp_from_str  # noqa: E501
+    LAST_BTC_TX_BLOCK: Final = 'last_btc_tx_block_{address}', _deserialize_int_from_str
+    LAST_BCH_TX_BLOCK: Final = 'last_bch_tx_block_{address}', _deserialize_int_from_str
+    LINEA_AIRDROP_ALLOCATION: Final = 'linea_airdrop_allocation_{address}', lambda x: x
+    ZKSYNC_LITE_BALANCES_CLAIMED: Final = 'zksync_lite_balances_claimed_{address}', _deserialize_int_from_str  # noqa: E501
+    ZKSYNC_LITE_ELIGIBILITY: Final = 'zksync_lite_eligibility_{address}', lambda x: x
+    SOLANA_TOKEN_ACCOUNT: Final = 'solana_token_account_{address}', _deserialize_solana_token_account_from_str  # noqa: E501
+    CUSTOMIZED_EVENT_ORIGINAL_SEQ_IDX: Final = 'customized_event_original_{group_identifier}_{sequence_index}', _deserialize_int_from_str  # noqa: E501
+    LAST_BLOCKCHAIN_BALANCES_QUERY_TS: Final = (
+        '{blockchain}_last_balances_query_ts',
+        _deserialize_timestamp_from_str,
+    )
+
+    @overload
+    def get_db_key(self, **kwargs: Unpack[LabeledLocationArgsType]) -> str:
+        ...
+
+    @overload
+    def get_db_key(self, **kwargs: Unpack[LabeledLocationIdArgsType]) -> str:
+        ...
+
+    @overload
+    def get_db_key(self, **kwargs: Unpack[BinancePairLastTradeArgsType]) -> str:
+        ...
+
+    @overload
+    def get_db_key(self, **kwargs: Unpack[AddressArgType]) -> str:
+        ...
+
+    @overload
+    def get_db_key(self, **kwargs: Unpack[BlockchainArgType]) -> str:
+        ...
+
+    @overload
+    def get_db_key(self, **kwargs: Unpack[ExtraTxArgType]) -> str:
+        ...
+
+    @overload
+    def get_db_key(self, **kwargs: Unpack[IndexArgType]) -> str:
+        ...
+
+    @overload
+    def get_db_key(self, **kwargs: Unpack[CustomizedEventOriginalArgType]) -> str:
+        ...
+
+    def get_db_key(self, **kwargs: Any) -> str:
+        """Get the key that is used in the DB schema for the given kwargs.
+
+        May Raise KeyError if incompatible kwargs are passed. Pass the kwargs according to the
+        supported overloads only. The potential KeyError is handled by type checking. It is
+        considered a programming error and it is not handled explicitly."""
+        return self.value[0].format(**kwargs)
+
+    @property
+    def deserialize_callback(self) -> Callable[[str], int | Timestamp | ChecksumEvmAddress | None]:
+        return self.value[1]

@@ -1,0 +1,162 @@
+import type { FixtureManualBalance } from './types';
+import { expect, type Page } from '@playwright/test';
+import { BigNumber, toSentenceCase } from '@rotki/common';
+import { TIMEOUT_LONG } from '../helpers/constants';
+import { confirmDialog, formatAmount, selectAsset, updateLocationBalance } from '../helpers/utils';
+import { RotkiApp } from './rotki-app';
+
+export class ManualBalancesPage {
+  constructor(private readonly page: Page) {}
+
+  async visit(): Promise<void> {
+    await RotkiApp.navigateTo(this.page, 'balances', 'balances-manual');
+  }
+
+  async addBalance(balance: FixtureManualBalance): Promise<void> {
+    await this.page.locator('[data-testid=bottom-dialog]').waitFor({ state: 'visible' });
+    await selectAsset(this.page, '[data-testid=manual-balances-form-asset]', balance.keyword, balance.asset);
+    await this.page.locator('[data-testid=manual-balances-form-label] input').fill(balance.label);
+    await this.page.locator('[data-testid=manual-balances-form-amount] input').fill(balance.amount);
+
+    for (const tag of balance.tags) {
+      const tagsField = this.page.locator('[data-testid=manual-balances-form-tags]');
+      const tagsInput = tagsField.locator('input');
+      await tagsField.locator('[data-id=activator]').click();
+      await tagsInput.fill(tag);
+      await tagsInput.press('Enter');
+      await tagsField.locator('[data-id=activator] > button + span').click();
+    }
+
+    // Handle location field as autocomplete
+    const locationField = this.page.locator('[data-testid=manual-balances-form-location]');
+    const locationInput = locationField.locator('input');
+    await locationField.locator('[data-id=activator]').click();
+    // Use last() since there may be multiple menus, and location menu opens last
+    const locationMenu = this.page.locator('[role=menu]').last();
+    await locationMenu.waitFor({ state: 'visible' });
+    await locationInput.fill(balance.location);
+    const locationOption = locationMenu.getByText(balance.location, { exact: false }).first();
+    await locationOption.waitFor({ state: 'visible' });
+    await locationOption.click();
+    await this.page.locator('[data-testid=bottom-dialog] [data-testid=confirm]').click();
+    await this.page.locator('[data-testid=bottom-dialog]').waitFor({ state: 'detached', timeout: TIMEOUT_LONG });
+    await expect(this.page.locator('[data-testid=price-refresh]')).not.toBeDisabled();
+  }
+
+  /**
+   * Asserts how many balance entries the table shows.
+   *
+   * @remarks
+   * The expected row count is one higher than the number of entries, because the table appends a
+   * total row that is not an entry.
+   */
+  async visibleEntries(visible: number): Promise<void> {
+    await expect(this.page.locator('[data-testid=manual-balances] tbody tr')).toHaveCount(visible + 1);
+  }
+
+  private rowByLabel(label: string) {
+    return this.page
+      .locator('[data-testid=manual-balances] tbody tr')
+      .filter({ has: this.page.locator(`[data-testid=label][title="${label}"]`) });
+  }
+
+  async balanceShouldMatch(balances: FixtureManualBalance[]): Promise<void> {
+    for (const balance of balances) {
+      const row = this.rowByLabel(balance.label);
+      await expect(row.locator('[data-testid=manual-balance-amount]')).toContainText(formatAmount(balance.amount));
+    }
+  }
+
+  async balanceShouldNotMatch(balances: FixtureManualBalance[]): Promise<void> {
+    for (const balance of balances) {
+      const row = this.rowByLabel(balance.label);
+      await expect(row.locator('[data-testid=manual-balance-amount]')).not.toContainText(formatAmount(balance.amount));
+    }
+  }
+
+  async isVisible(balance: FixtureManualBalance): Promise<void> {
+    const row = this.rowByLabel(balance.label);
+
+    await expect(row.locator('[data-testid=label]')).toContainText(balance.label);
+    await expect(row.locator('[data-testid=manual-balance-amount]')).toContainText(formatAmount(balance.amount));
+
+    await this.page.locator('[data-testid=manual-balances] thead').first().scrollIntoViewIfNeeded();
+
+    await expect(row.locator('[data-testid=manual-balance-location]')).toContainText(toSentenceCase(balance.location));
+    await expect(row.locator('[data-testid=list-title]')).toContainText(balance.asset);
+
+    for (const tag of balance.tags) {
+      await expect(row.locator('[data-testid=tag]')).toContainText(tag);
+    }
+  }
+
+  private async getLocationBalances(): Promise<Map<string, BigNumber>> {
+    const balances = new Map<string, BigNumber>();
+    // Get all data rows (excluding the total row which is typically last)
+    const rows = this.page.locator('[data-testid=manual-balances] tbody tr');
+    const count = await rows.count();
+
+    // Skip the last row (total row)
+    for (let i = 0; i < count - 1; i++) {
+      const row = rows.nth(i);
+      const locationElement = row.locator('[data-testid=manual-balance-location]');
+      const location = await locationElement.getAttribute('data-location');
+      if (!location)
+        continue;
+
+      const amountText = await row.locator('[data-testid=display-amount]').last().textContent();
+      updateLocationBalance(amountText ?? '0', balances, location);
+    }
+
+    return balances;
+  }
+
+  async getTotals(): Promise<{ total: BigNumber; balances: { location: string; value: BigNumber }[] }> {
+    const balancesMap = await this.getLocationBalances();
+    let total = new BigNumber(0);
+    const balances: { location: string; value: BigNumber }[] = [];
+
+    balancesMap.forEach((value, location) => {
+      total = total.plus(value.toFixed(2, BigNumber.ROUND_DOWN));
+      balances.push({ location, value });
+    });
+
+    return { total, balances };
+  }
+
+  async editBalance(label: string, amount: string): Promise<void> {
+    const editButton = this.rowByLabel(label).locator('button[data-testid=row-edit]');
+
+    await editButton.waitFor({ state: 'visible' });
+    await expect(editButton).not.toBeDisabled();
+    await editButton.click();
+
+    const editForm = this.page.locator('[data-testid=manual-balance-form]');
+    await editForm.locator('[data-testid=manual-balances-form-amount] input').clear();
+    await editForm.locator('[data-testid=manual-balances-form-amount] input').fill(amount);
+    await this.page.locator('[data-testid=bottom-dialog] [data-testid=confirm]').click();
+    await this.page.locator('[data-testid=bottom-dialog]').waitFor({ state: 'detached', timeout: TIMEOUT_LONG });
+    await expect(this.page.locator('[data-testid=price-refresh]')).not.toBeDisabled();
+  }
+
+  async deleteBalance(label: string): Promise<void> {
+    await this.rowByLabel(label).locator('button[data-testid=row-delete]').click();
+    await this.confirmDelete();
+  }
+
+  async confirmDelete(): Promise<void> {
+    await confirmDialog(this.page, 'Delete manually tracked balance');
+  }
+
+  async showsCurrency(currency: string): Promise<void> {
+    await this.page.locator('[data-testid=manual-balances]').first().scrollIntoViewIfNeeded();
+    await expect(this.page.locator('[data-testid=manual-balances]').first()).toContainText(`${currency} Value`);
+    await this.page.locator('[data-testid=manual-balances]').first().waitFor({ state: 'visible' });
+  }
+
+  async openAddDialog(): Promise<void> {
+    await this.page.locator('[data-testid=manual-balances-add-button]').waitFor({ state: 'visible' });
+    await expect(this.page.locator('[data-testid=manual-balances-add-button]')).not.toBeDisabled();
+    await this.page.locator('[data-testid=manual-balances-add-button]').click();
+  }
+}

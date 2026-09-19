@@ -1,0 +1,226 @@
+import { HistoryEventEntryType, NumericString } from '@rotki/common';
+import { z } from 'zod';
+import { CollectionCommonFields } from '@/modules/core/common/collection';
+import { MatchedAssetMovementResolution } from '@/modules/history/events/asset-movement-resolution';
+import { EntryMeta } from '@/modules/history/meta';
+
+const CommonHistoryEvent = z.object({
+  actualGroupIdentifier: z.string().optional(),
+  amount: NumericString,
+  asset: z.string(),
+  autoNotes: z.string().optional(),
+  eventSubtype: z.string(),
+  eventType: z.string(),
+  groupIdentifier: z.string(),
+  identifier: z.number(),
+  location: z.string(),
+  locationLabel: z.string().nullable(),
+  sequenceIndex: z.number().or(z.string()),
+  timestamp: z.number(),
+  userNotes: z.string().optional(),
+});
+
+export const EvmHistoryEvent = CommonHistoryEvent.extend({
+  address: z.string().nullable(),
+  counterparty: z.string().nullable(),
+  entryType: z.literal(HistoryEventEntryType.EVM_EVENT),
+  extraData: z.unknown().nullish(),
+  txRef: z.string(),
+});
+
+export type EvmHistoryEvent = z.infer<typeof EvmHistoryEvent>;
+
+export const OnlineHistoryEvent = CommonHistoryEvent.extend({
+  entryType: z.literal(HistoryEventEntryType.HISTORY_EVENT),
+  /** Declared so the resolution stamp survives parsing: zod strips what a schema does not name. */
+  extraData: z.object({
+    matchedAssetMovement: MatchedAssetMovementResolution.nullish(),
+  }).nullish(),
+  txRef: z.string().optional(),
+});
+
+export type OnlineHistoryEvent = z.infer<typeof OnlineHistoryEvent>;
+
+export const BankTransactionEvent = CommonHistoryEvent.extend({
+  entryType: z.literal(HistoryEventEntryType.BANK_TRANSACTION_EVENT),
+  extraData: z.object({
+    bankAccountId: z.string(),
+    counterpartyAccount: z.string().nullish(),
+    kind: z.string(),
+    reference: z.string().nullish(),
+  }).nullable(),
+});
+
+export type BankTransactionEvent = z.infer<typeof BankTransactionEvent>;
+
+export const EthWithdrawalEvent = CommonHistoryEvent.extend({
+  entryType: z.literal(HistoryEventEntryType.ETH_WITHDRAWAL_EVENT),
+  isExit: z.boolean(),
+  validatorIndex: z.number(),
+});
+
+export type EthWithdrawalEvent = z.infer<typeof EthWithdrawalEvent>;
+
+export const EthBlockEvent = CommonHistoryEvent.extend({
+  blockNumber: z.number(),
+  entryType: z.literal(HistoryEventEntryType.ETH_BLOCK_EVENT),
+  validatorIndex: z.number(),
+});
+
+export type EthBlockEvent = z.infer<typeof EthBlockEvent>;
+
+export const EthDepositEvent = CommonHistoryEvent.extend({
+  address: z.string().nullable(),
+  counterparty: z.string().nullable(),
+  entryType: z.literal(HistoryEventEntryType.ETH_DEPOSIT_EVENT),
+  extraData: z.unknown().nullable().nullish(),
+  txRef: z.string(),
+  validatorIndex: z.number(),
+});
+
+export type EthDepositEvent = z.infer<typeof EthDepositEvent>;
+
+export const AssetMovementEvent = CommonHistoryEvent.extend({
+  entryType: z.literal(HistoryEventEntryType.ASSET_MOVEMENT_EVENT),
+  extraData: z.object({
+    address: z.string().nullish(),
+    blockchain: z.string().nullish(),
+    reference: z.string().nullish(),
+    transactionId: z.string().nullish(),
+  }).nullable(),
+});
+
+export type AssetMovementEvent = z.infer<typeof AssetMovementEvent>;
+
+const SwapEventSchema = CommonHistoryEvent.extend({
+  entryType: z.literal(HistoryEventEntryType.SWAP_EVENT),
+  extraData: z.unknown().nullable(),
+});
+
+export type SwapEvent = z.infer<typeof SwapEventSchema>;
+
+const EvmSwapEventSchema = CommonHistoryEvent.extend({
+  address: z.string().nullable(),
+  counterparty: z.string().nullable(),
+  entryType: z.literal(HistoryEventEntryType.EVM_SWAP_EVENT),
+  extraData: z.unknown().nullable(),
+  txRef: z.string(),
+});
+
+export type EvmSwapEvent = z.infer<typeof EvmSwapEventSchema>;
+
+const BitcoinEventSchema = CommonHistoryEvent.extend({
+  address: z.string().nullable(),
+  counterparty: z.string().nullable(),
+  entryType: z.literal(HistoryEventEntryType.BITCOIN_EVENT),
+  extraData: z.unknown().nullish(),
+  txRef: z.string(),
+});
+
+export type BitcoinEvent = z.infer<typeof BitcoinEventSchema>;
+
+const SolanaEventSchema = CommonHistoryEvent.extend({
+  address: z.string().nullable(),
+  counterparty: z.string().nullable(),
+  entryType: z.literal(HistoryEventEntryType.SOLANA_EVENT),
+  extraData: z.unknown().nullish(),
+  txRef: z.string(),
+});
+
+export type SolanaEvent = z.infer<typeof SolanaEventSchema>;
+
+const SolanaSwapEventSchema = CommonHistoryEvent.extend({
+  address: z.string().nullable(),
+  counterparty: z.string().nullable(),
+  entryType: z.literal(HistoryEventEntryType.SOLANA_SWAP_EVENT),
+  extraData: z.unknown().nullish(),
+  txRef: z.string(),
+});
+
+export type SolanaSwapEvent = z.infer<typeof SolanaSwapEventSchema>;
+
+export const HistoryEvent = z.union([
+  EvmHistoryEvent,
+  AssetMovementEvent,
+  OnlineHistoryEvent,
+  BankTransactionEvent,
+  EthWithdrawalEvent,
+  EthBlockEvent,
+  EthDepositEvent,
+  SwapEventSchema,
+  EvmSwapEventSchema,
+  SolanaEventSchema,
+  SolanaSwapEventSchema,
+  BitcoinEventSchema,
+]);
+
+export type GroupEditableHistoryEvents = AssetMovementEvent | SwapEvent | EvmSwapEvent | SolanaSwapEvent;
+
+export type StandaloneEditableEvents = EvmHistoryEvent | OnlineHistoryEvent | BankTransactionEvent | EthWithdrawalEvent | EthBlockEvent | EthDepositEvent | SolanaEvent | BitcoinEvent;
+
+export type HistoryEvent = StandaloneEditableEvents | GroupEditableHistoryEvents;
+
+export enum HistoryEventAccountingRuleStatus {
+  HAS_RULE = 'has rule',
+  NOT_PROCESSED = 'not processed',
+  PROCESSED = 'processed',
+}
+
+const HistoryEventAccountingRuleStatusEnum = z.enum(HistoryEventAccountingRuleStatus);
+
+export enum HistoryEventState {
+  MATCHED = 'matched',
+  CUSTOMIZED = 'customized',
+  IMPORTED_FROM_CSV = 'imported from csv',
+  PROFIT_ADJUSTMENT = 'profit adjustment',
+  SYNTHETIC = 'synthetic',
+}
+
+const HistoryEventStateEnum = z.enum(HistoryEventState);
+
+const HistoryEventMeta = z.object({
+  ...EntryMeta.shape,
+  eventAccountingRuleStatus: HistoryEventAccountingRuleStatusEnum,
+  groupedEventsNum: z.number().nullish(),
+  hasDetails: z.boolean().optional(),
+  hasIgnoredAssets: z.boolean().optional(),
+  hidden: z.boolean().optional(),
+  states: z.array(HistoryEventStateEnum).optional(),
+});
+
+export type HistoryEventMeta = z.infer<typeof HistoryEventMeta>;
+
+const HistoryEventEntryWithMeta = z.object({
+  entry: HistoryEvent,
+  ...HistoryEventMeta.shape,
+});
+
+export type HistoryEventEntryWithMeta = z.infer<typeof HistoryEventEntryWithMeta>;
+
+const HistoryEventCollectionRowSchema = z.array(HistoryEventEntryWithMeta.or(z.array(HistoryEventEntryWithMeta)));
+
+export type HistoryEventCollectionRow = HistoryEventEntryWithMeta | HistoryEventEntryWithMeta[];
+
+export const HistoryEventsCollectionResponse = CollectionCommonFields.extend({
+  entries: HistoryEventCollectionRowSchema,
+});
+
+export type HistoryEventsCollectionResponse = z.infer<typeof HistoryEventsCollectionResponse>;
+
+export type HistoryEventEntry = HistoryEvent & HistoryEventMeta;
+
+export type HistoryEventRow = HistoryEventEntry | HistoryEventEntry[];
+
+export const OnlineHistoryEventsQueryType = {
+  BLOCK_PRODUCTIONS: 'block_productions',
+  ETH_WITHDRAWALS: 'eth_withdrawals',
+  GNOSIS_PAY: 'gnosis_pay',
+  MONERIUM: 'monerium',
+} as const;
+
+export type OnlineHistoryEventsQueryType = typeof OnlineHistoryEventsQueryType[keyof typeof OnlineHistoryEventsQueryType];
+
+export interface OnlineHistoryEventsRequestPayload {
+  readonly asyncQuery: boolean;
+  readonly queryType: OnlineHistoryEventsQueryType;
+}

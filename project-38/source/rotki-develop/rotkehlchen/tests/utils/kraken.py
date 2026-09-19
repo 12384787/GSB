@@ -1,0 +1,621 @@
+import json
+import random
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from rotkehlchen.errors.misc import RemoteError
+from rotkehlchen.exchanges.kraken import Kraken, KrakenApiMethod
+from rotkehlchen.globaldb.handler import GlobalDBHandler
+from rotkehlchen.tests.utils.factories import (
+    make_random_positive_fval,
+    make_random_timestamp,
+    make_random_uppercasenumeric_string,
+)
+from rotkehlchen.types import ApiKey, ApiSecret, Location, Timestamp
+from rotkehlchen.utils.misc import ts_now
+from rotkehlchen.utils.serialization import jsonloads_dict
+
+if TYPE_CHECKING:
+    from rotkehlchen.db.dbhandler import DBHandler
+    from rotkehlchen.fval import FVal
+    from rotkehlchen.user_messages import MessagesAggregator
+
+KRAKEN_DELISTED = (
+    'XDAO',
+    'XXVN',
+    'ZKRW',
+    'XNMC',
+    'BSV',
+    'XICN',
+    'PLA',
+    'WAVES',
+)
+
+KRAKEN_SPECIFIC_TRADES_HISTORY_RESPONSE = """{
+    "trades": {
+        "1": {
+            "ordertxid": "1",
+            "postxid": 1,
+            "pair": "XXBTZEUR",
+            "time": "1458994442.0000",
+            "type": "buy",
+            "ordertype": "market",
+            "price": "100",
+            "vol": "1",
+            "fee": "0.1",
+            "cost": "100",
+            "margin": "0.0",
+            "misc": ""},
+        "2": {
+            "ordertxid": "2",
+            "postxid": 2,
+            "pair": "XETHZEUR",
+            "time": "1456994442.0000",
+            "type": "buy",
+            "ordertype": "market",
+            "price": "100",
+            "vol": "1",
+            "fee": "0.1",
+            "cost": "100",
+            "margin": "0.0",
+            "misc": ""},
+        "3": {
+            "ordertxid": "3",
+            "postxid": 3,
+            "pair": "IDONTEXISTZEUR",
+            "time": "1458994442.0000",
+            "type": "buy",
+            "ordertype": "market",
+            "price": "100",
+            "vol": "1",
+            "fee": "0.1",
+            "cost": "100",
+            "margin": "0.0",
+            "misc": ""
+        },
+        "4": {
+            "ordertxid": "4",
+            "postxid": 4,
+            "pair": "XETHIDONTEXISTTOO",
+            "time": "1458994442.0000",
+            "type": "buy",
+            "ordertype": "market",
+            "price": "100",
+            "vol": "1",
+            "fee": "0.1",
+            "cost": "100",
+            "margin": "0.0",
+            "misc": ""
+        },
+        "5": {
+            "ordertxid": "5",
+            "postxid": 5,
+            "pair": "%$#%$#%$#%$#%$#%",
+            "time": "1458994442.0000",
+            "type": "buy",
+            "ordertype": "market",
+            "price": "100",
+            "vol": "1",
+            "fee": "0.1",
+            "cost": "100",
+            "margin": "0.0",
+            "misc": ""
+        }},
+    "count": 5
+}"""
+
+KRAKEN_SPECIFIC_DEPOSITS_RESPONSE = """
+      {
+            "ledger": {
+                "1": {
+                    "refid": "1",
+                    "time": "1458994442",
+                    "type": "deposit",
+                    "aclass": "currency",
+                    "asset": "BTC",
+                    "amount": "5.0",
+                    "balance": "10.0",
+                    "fee": "0.1"
+                },
+                "2": {
+                    "refid": "2",
+                    "time": "1448994442",
+                    "type": "deposit",
+                    "aclass": "currency",
+                    "asset": "ETH",
+                    "amount": "10.0",
+                    "balance": "100.0",
+                    "fee": "0.11"
+                },
+                "3": {
+                    "refid": "3",
+                    "time": "1438994442",
+                    "type": "deposit",
+                    "aclass": "currency",
+                    "asset": "IDONTEXIST",
+                    "amount": "10.0",
+                    "balance": "100.0",
+                    "fee": "0.11"
+                }
+            },
+            "count": 3
+}"""
+
+KRAKEN_SPECIFIC_WITHDRAWALS_RESPONSE = """
+{
+            "ledger": {
+                "4": {
+                    "refid": "4",
+                    "time": "1428994442",
+                    "type": "withdrawal",
+                    "aclass": "currency",
+                    "asset": "BTC",
+                    "amount": "5.0",
+                    "balance": "10.0",
+                    "fee": "0.1"
+                },
+                "5": {
+                    "refid": "5",
+                    "time": "1439994442",
+                    "type": "withdrawal",
+                    "aclass": "currency",
+                    "asset": "ETH",
+                    "amount": "10.0",
+                    "balance": "100.0",
+                    "fee": "0.11"
+                },
+                "6": {
+                    "refid": "6",
+                    "time": "1408994442",
+                    "type": "withdrawal",
+                    "aclass": "currency",
+                    "asset": "IDONTEXISTEITHER",
+                    "amount": "10.0",
+                    "balance": "100.0",
+                    "fee": "0.11"
+                }
+            },
+            "count": 3
+}"""
+
+KRAKEN_GENERAL_LEDGER_RESPONSE = """
+{
+    "ledger": {
+        "L12382343925": {
+            "refid": "D1",
+            "time": 1458994442,
+            "type": "deposit",
+            "subtype": "",
+            "aclass": "currency",
+            "asset": "BTC",
+            "amount": "5.0",
+            "fee": "0",
+            "balance": "10"
+        },
+        "L12382343926": {
+            "refid": "D2",
+            "time": 1448994442,
+            "type": "deposit",
+            "subtype": "",
+            "aclass": "currency",
+            "asset": "ETH",
+            "amount": "10.0000",
+            "fee": "0",
+            "balance": "100.25"
+        },
+        "L12382343927": {
+            "refid": "D3",
+            "time": 1408994442,
+            "type": "deposit",
+            "subtype": "",
+            "aclass": "currency",
+            "asset": "IDONTEXISTEITHER",
+            "amount": "10",
+            "fee": "0",
+            "balance": "100"
+        },
+        "L12382343965": {
+            "refid": "W1",
+            "time": 1428994442,
+            "type": "withdrawal",
+            "subtype": "",
+            "aclass": "currency",
+            "asset": "BTC",
+            "amount": "-5.0",
+            "fee": "0.1",
+            "balance": "10"
+        },
+        "L12382343966": {
+            "refid": "W2",
+            "time": 1439994442,
+            "type": "withdrawal",
+            "subtype": "",
+            "aclass": "currency",
+            "asset": "ETH",
+            "amount": "-10.0000",
+            "fee": "1.7500",
+            "balance": "100.25"
+        },
+        "L12382343967": {
+            "refid": "W3",
+            "time": 1408994442,
+            "type": "withdrawal",
+            "subtype": "",
+            "aclass": "currency",
+            "asset": "IDONTEXISTEITHER",
+            "amount": "-10",
+            "fee": "0.11",
+            "balance": "100"
+        },
+        "L1": {
+            "refid": "AOEXXV-61T63-AKPSJ0",
+            "time": 1609950165.4497,
+            "type": "trade",
+            "subtype": "",
+            "aclass": "currency",
+            "asset": "KFEE",
+            "amount": "0.00",
+            "fee": "0.11",
+            "balance": "100"
+        },
+        "L2": {
+            "refid": "AOEXXV-61T63-AKPSJ0",
+            "time": 1609950165.4492,
+            "type": "trade",
+            "subtype": "",
+            "aclass": "currency",
+            "asset": "ZEUR",
+            "amount": "50",
+            "fee": "0.4429",
+            "balance": "500"
+        },
+        "L3": {
+            "refid": "AOEXXV-61T63-AKPSJ0",
+            "time": 1609950165.4486,
+            "type": "trade",
+            "subtype": "",
+            "aclass": "currency",
+            "asset": "XETH",
+            "amount": "-0.1",
+            "fee": "0.0000000000",
+            "balance": 1.1
+        },
+        "0": {
+            "refid": "2",
+            "time": 1439994442,
+            "type": "withdrawal",
+            "subtype": "",
+            "aclass": "currency",
+            "asset": "XETH",
+            "amount": "-1.0000000000",
+            "fee": "0.0035000000",
+            "balance": "0.0000100000"
+        },
+        "L343242342": {
+            "refid": "1",
+            "time": 1458994442.064,
+            "type": "trade",
+            "subtype": "",
+            "aclass": "currency",
+            "asset": "XXBT",
+            "amount": "1",
+            "fee": "0.0000000000",
+            "balance": "0.0437477300"
+        },
+        "L5354645643": {
+            "refid": "1",
+            "time": 1458994442.063,
+            "type": "trade",
+            "subtype": "",
+            "aclass": "currency",
+            "asset": "ZEUR",
+            "amount": "-100",
+            "fee": "0.1",
+            "balance": "200"
+        },
+        "L12382343902": {
+            "refid": "0",
+            "time": 1458994441.396,
+            "type": "deposit",
+            "subtype": "",
+            "aclass": "currency",
+            "asset": "EUR.HOLD",
+            "amount": "4000000.0000",
+            "fee": "1.7500",
+            "balance": "3999998.25"
+        }
+    },
+    "count": 13
+}
+"""
+
+KRAKEN_FUTURES_BALANCES_RESPONSE = """{"accounts":{"cash":{"balances":{"bch":10.0184941402,"eth":1.5717981686,"eur":4000.0,"gbp":3791.9006,"ltc":52.1910861801,"usd":5000.0,"usd credit":0,"usdc":5000.65008452,"usdt":5003.96313881,"xbt":0.0524990493,"xrp":2213.8685582},"type":"cashAccount"},"fi_bchusd":{"auxiliary":{"af":10.0184941402,"funding":0.0,"pnl":0.0,"pv":10.0184941402,"usd":0},"balances":{"bch":10.0184941402},"currency":"bch","marginRequirements":{"im":0.0,"lt":0.0,"mm":0.0,"tt":0.0},"triggerEstimates":{"im":0.0,"lt":0.0,"mm":0.0,"tt":0.0},"type":"marginAccount"},"fi_ethusd":{"auxiliary":{"af":1.5717981686,"funding":0.0,"pnl":0.0,"pv":1.5717981686,"usd":0},"balances":{"eth":1.5717981686},"currency":"eth","marginRequirements":{"im":0.0,"lt":0.0,"mm":0.0,"tt":0.0},"triggerEstimates":{"im":0.0,"lt":0.0,"mm":0.0,"tt":0.0},"type":"marginAccount"},"fi_ltcusd":{"auxiliary":{"af":52.1910861801,"funding":0.0,"pnl":0.0,"pv":52.1910861801,"usd":0},"balances":{"ltc":52.1910861801},"currency":"ltc","marginRequirements":{"im":0.0,"lt":0.0,"mm":0.0,"tt":0.0},"triggerEstimates":{"im":0.0,"lt":0.0,"mm":0.0,"tt":0.0},"type":"marginAccount"},"fi_xbtusd":{"auxiliary":{"af":0.0524990493,"funding":0.0,"pnl":0.0,"pv":0.0524990493,"usd":0},"balances":{"xbt":0.0524990493},"currency":"xbt","marginRequirements":{"im":0.0,"lt":0.0,"mm":0.0,"tt":0.0},"triggerEstimates":{"im":0.0,"lt":0.0,"mm":0.0,"tt":0.0},"type":"marginAccount"},"fi_xrpusd":{"auxiliary":{"af":2213.8685582,"funding":0.0,"pnl":0.0,"pv":2213.8685582,"usd":0},"balances":{"xrp":2213.8685582},"currency":"xrp","marginRequirements":{"im":0.0,"lt":0.0,"mm":0.0,"tt":0.0},"triggerEstimates":{"im":0.0,"lt":0.0,"mm":0.0,"tt":0.0},"type":"marginAccount"},"flex":{"availableMargin":21637.99025058772,"balanceValue":22082.18306965742,"collateralValue":21637.99025058772,"currencies":{"BTC":{"available":0.0524990493,"collateral":4726.015720056976,"quantity":0.0524990493,"value":4822.465020466302},"ETH":{"available":1.5717981686,"collateral":4995.828447848938,"quantity":1.5717981686,"value":5203.98796650931},"EUR":{"available":6000,"collateral":6839.616,"quantity":6000,"value":6979.2},"USD":{"available":5076.53008268181,"collateral":5076.53008268181,"quantity":5076.53008268181,"value":5076.53008268181}},"initialMargin":0,"initialMarginWithOrders":0,"maintenanceMargin":0,"marginEquity":21637.99025058772,"pnl":0,"portfolioValue":22082.18306965742,"totalUnrealized":0,"totalUnrealizedAsMargin":0,"type":"multiCollateralMarginAccount","unrealizedFunding":0},"fv_etheur":{"auxiliary":{"af":5000.0,"funding":0.0,"pnl":0.0,"pv":5000.0,"usd":0},"balances":{"eur":5000.0},"currency":"eur","marginRequirements":{"im":0.0,"lt":0.0,"mm":0.0,"tt":0.0},"triggerEstimates":{"im":0.0,"lt":0.0,"mm":0.0,"tt":0.0},"type":"marginAccount"},"fv_xbteur":{"auxiliary":{"af":5000.0,"funding":0.0,"pnl":0.0,"pv":5000.0,"usd":0},"balances":{"eur":5000.0},"currency":"eur","marginRequirements":{"im":0.0,"lt":0.0,"mm":0.0,"tt":0.0},"triggerEstimates":{"im":0.0,"lt":0.0,"mm":0.0,"tt":0.0},"type":"marginAccount"}},"result":"success","serverTime":"2025-12-10T12:40:02.904Z"}"""  # noqa: E501
+KRAKEN_FUTURES_ACCOUNT_LOG_RESPONSE = """{"result":"success","logs":[{"asset":"eth","contract":"pi_ethusd","booking_uid":"7cb41fd7-1fce-42c5-9433-657b107ed10a","collateral":"eth","date":"2026-02-22T08:14:52.886Z","execution":"df5aa63a-5ef0-47da-bf67-3770b6e1a8ca","fee":7.59E-7,"funding_rate":3.39980465E-10,"id":400,"info":"futures trade","margin_account":"f-eth:usd","mark_price":1982.78771918663,"new_average_entry_price":null,"new_balance":1.57167857762,"old_average_entry_price":null,"old_balance":1.57179340552,"realized_funding":-1E-11,"realized_pnl":-0.00011406889,"trade_price":1976.3,"conversion_spread_percentage":null,"liquidation_fee":null,"position_uid":null},{"asset":"pi_ethusd","contract":"pi_ethusd","booking_uid":"70d4c68d-463b-49cb-a17b-2f8337a8c566","collateral":"eth","date":"2026-02-22T08:14:52.886Z","execution":"df5aa63a-5ef0-47da-bf67-3770b6e1a8ca","fee":null,"funding_rate":null,"id":399,"info":"futures trade","margin_account":"f-eth:usd","mark_price":1982.78771918663,"new_average_entry_price":2136.875,"new_balance":0.0,"old_average_entry_price":2136.875,"old_balance":3.0,"realized_funding":null,"realized_pnl":null,"trade_price":1976.3,"conversion_spread_percentage":null,"liquidation_fee":null,"position_uid":null},{"asset":"eth","contract":"pi_ethusd","booking_uid":"7de6e258-acc2-48b2-966a-3693577e84c6","collateral":"eth","date":"2026-02-17T05:00:00.000Z","execution":null,"fee":null,"funding_rate":3.06429973E-10,"id":372,"info":"funding rate change","margin_account":"f-eth:usd","mark_price":null,"new_average_entry_price":null,"new_balance":1.57179791308,"old_average_entry_price":null,"old_balance":1.57179791277,"realized_funding":3.1E-10,"realized_pnl":null,"trade_price":null,"conversion_spread_percentage":null,"liquidation_fee":null,"position_uid":null},{"asset":"usd","contract":"pf_xbtusd","booking_uid":"5c731408-03ad-4b41-ad37-392dc0eeb4a9","collateral":null,"date":"2026-02-14T11:22:04.000Z","execution":"4351dd56-5a36-45c0-b688-1366735fa0c7","fee":0.0035521,"funding_rate":0.011327689493862697,"id":328,"info":"futures assignor","margin_account":"flex","mark_price":70339.03061297766,"new_average_entry_price":null,"new_balance":5048.88357584045,"old_average_entry_price":null,"old_balance":5049.02717794045,"realized_funding":0.0,"realized_pnl":-0.14005,"trade_price":71042.0,"conversion_spread_percentage":null,"liquidation_fee":null,"position_uid":null},{"asset":"pf_xbtusd","contract":"pf_xbtusd","booking_uid":"8f33144d-7277-409d-b970-5cb8ac91e358","collateral":null,"date":"2026-02-14T11:22:04.000Z","execution":"4351dd56-5a36-45c0-b688-1366735fa0c7","fee":null,"funding_rate":null,"id":327,"info":"futures assignor","margin_account":"flex","mark_price":70339.03061297766,"new_average_entry_price":69641.5,"new_balance":0.0,"old_average_entry_price":69641.5,"old_balance":-0.0001,"realized_funding":null,"realized_pnl":null,"trade_price":71042.0,"conversion_spread_percentage":null,"liquidation_fee":null,"position_uid":null},{"asset":"usd","contract":"pf_xbtusd","booking_uid":"2bb781e4-7017-4a1b-a9c7-b04501b398d7","collateral":null,"date":"2026-02-14T11:22:04.000Z","execution":"dcda8bdf-986e-4660-8750-11e27903d322","fee":0.0985838,"funding_rate":0.011327689493862697,"id":312,"info":"futures liquidation","margin_account":"flex","mark_price":70339.03061297766,"new_average_entry_price":null,"new_balance":5050.03239264045,"old_average_entry_price":null,"old_balance":5053.31217819045,"realized_funding":0.0,"realized_pnl":-2.1714,"trade_price":70417.0,"conversion_spread_percentage":null,"liquidation_fee":1.00980175,"position_uid":null},{"asset":"pf_xbtusd","contract":"pf_xbtusd","booking_uid":"583c2aa3-dc14-4f16-9620-d8a4fcb93f81","collateral":null,"date":"2026-02-14T11:22:04.000Z","execution":"dcda8bdf-986e-4660-8750-11e27903d322","fee":null,"funding_rate":null,"id":311,"info":"futures liquidation","margin_account":"flex","mark_price":70339.03061297766,"new_average_entry_price":69641.5,"new_balance":-0.0008,"old_average_entry_price":69641.5,"old_balance":-0.0036,"realized_funding":null,"realized_pnl":null,"trade_price":70417.0,"conversion_spread_percentage":null,"liquidation_fee":null,"position_uid":null}]}"""  # noqa: E501# noqa: E501
+
+
+def get_kraken_assets_from_globaldb() -> list[str]:
+    with GlobalDBHandler().conn.read_ctx() as cursor:
+        return cursor.execute(
+            'SELECT exchange_symbol FROM location_asset_mappings WHERE location IS ? OR location IS NULL;',  # noqa: E501
+            (Location.KRAKEN.serialize_for_db(),),
+        ).fetchall()
+
+
+def get_random_kraken_asset() -> str:
+    kraken_assets = set(get_kraken_assets_from_globaldb()) - set(KRAKEN_DELISTED)
+    return random.choice(list(kraken_assets))
+
+
+def generate_random_kraken_balance_response() -> dict[str, FVal]:
+    kraken_assets = set(get_kraken_assets_from_globaldb()) - set(KRAKEN_DELISTED)
+    number_of_assets = random.randrange(0, len(kraken_assets))
+    chosen_assets = random.sample(list(kraken_assets), number_of_assets)
+
+    balances = {}
+    for asset in chosen_assets:
+        balances[asset] = make_random_positive_fval()
+
+    return balances
+
+
+def generate_random_kraken_id() -> str:
+    return (
+        make_random_uppercasenumeric_string(6) + '-' +
+        make_random_uppercasenumeric_string(5) + '-' +
+        make_random_uppercasenumeric_string(6)
+    )
+
+
+def get_exchange_name_from_assetid(exchange: Location, asset_identifier: str) -> str | None:
+    """Returns the ticker symbol used in the given exchange from asset's identifier according
+        to location_asset_mappings table. If the mapping is not present returns None."""
+    with GlobalDBHandler().conn.read_ctx() as cursor:
+        identifier = cursor.execute(
+            'SELECT exchange_symbol FROM location_asset_mappings WHERE (location IS ? OR location IS NULL) AND local_id=?',  # noqa: E501
+            (exchange.serialize_for_db(), asset_identifier),
+        ).fetchone()
+
+        return None if identifier is None else identifier[0]
+
+
+def create_kraken_trade(
+        tradeable_pairs: list[str],
+        base_asset: str | None = None,
+        quote_asset: str | None = None,
+        time: Timestamp | None = None,
+        start_ts: Timestamp | None = None,
+        end_ts: Timestamp | None = None,
+        rate: FVal | None = None,
+        amount: FVal | None = None,
+        fee: FVal | None = None,
+) -> dict[str, str]:
+    trade = {}
+    trade['ordertxid'] = str(generate_random_kraken_id())
+    trade['postxid'] = str(generate_random_kraken_id())
+    if base_asset is None or quote_asset is None:
+        pair = random.choice(tradeable_pairs)
+    else:
+        base_symbol = get_exchange_name_from_assetid(
+            exchange=Location.KRAKEN,
+            asset_identifier=base_asset,
+        )
+        quote_symbol = get_exchange_name_from_assetid(
+            exchange=Location.KRAKEN,
+            asset_identifier=quote_asset,
+        )
+        assert base_symbol is not None
+        assert quote_symbol is not None
+        pair = base_symbol + quote_symbol
+
+    trade['pair'] = pair
+    if time:
+        trade['time'] = str(time) + '.0000'
+    else:
+        trade['time'] = str(make_random_timestamp(start=start_ts, end=end_ts)) + '.0000'
+
+    trade['type'] = random.choice(('buy', 'sell'))
+    trade['ordertype'] = random.choice(('limit', 'market'))
+    if rate:
+        price = rate
+    else:
+        price = make_random_positive_fval()
+    trade['price'] = str(price)
+
+    if amount:
+        volume = amount
+    else:
+        volume = make_random_positive_fval()
+    trade['vol'] = str(volume)
+
+    if fee:
+        trade['fee'] = str(fee)
+    else:
+        trade['fee'] = str(make_random_positive_fval(max_num=2))
+
+    trade['fee'] = str(make_random_positive_fval(max_num=2))
+    trade['cost'] = str(price * volume)
+    trade['margin'] = '0.0'
+    trade['misc'] = ''
+    return trade
+
+
+def generate_random_kraken_trade_data(
+        tradeable_pairs: list[str],
+        start_ts: Timestamp,
+        end_ts: Timestamp,
+) -> dict[str, str]:
+    return create_kraken_trade(
+        tradeable_pairs=tradeable_pairs,
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )
+
+
+def generate_random_single_kraken_ledger_data(
+        start_ts: Timestamp,
+        end_ts: Timestamp,
+        ledger_type: str,
+) -> dict[str, str]:
+    ledger = {}
+    ledger['refid'] = str(generate_random_kraken_id())
+    ledger['time'] = str(make_random_timestamp(start=start_ts, end=end_ts)) + '.0000'
+    ledger['type'] = ledger_type
+    ledger['aclass'] = 'currency'
+    ledger['asset'] = get_random_kraken_asset()
+    ledger['amount'] = str(make_random_positive_fval())
+    ledger['balance'] = str(make_random_positive_fval())
+    ledger['fee'] = str(make_random_positive_fval(max_num=2))
+    return ledger
+
+
+def generate_random_kraken_ledger_data(start: Timestamp, end: Timestamp, ledger_type: str):
+    ledgers_num = random.randint(1, 49)
+    # Ledgers is a dict with txid as the key
+    ledgers = {}
+    for _ in range(ledgers_num):
+        ledger = generate_random_single_kraken_ledger_data(
+            start_ts=start,
+            end_ts=end,
+            ledger_type=ledger_type,
+        )
+        ledgers[ledger['refid']] = ledger
+
+    response_str = json.dumps({'ledger': ledgers, 'count': ledgers_num})
+    return json.loads(response_str)
+
+
+def generate_random_kraken_trades_data(
+        start: Timestamp,
+        end: Timestamp,
+        tradeable_pairs: list[str],
+):
+    trades_num = random.randint(1, 49)
+
+    # Trades is a dict with txid as the key
+    trades = {}
+    for _ in range(trades_num):
+        trade = generate_random_kraken_trade_data(
+            tradeable_pairs,
+            start,
+            end,
+        )
+        trades[trade['ordertxid']] = trade
+
+    response_str = json.dumps({'trades': trades, 'count': trades_num})
+    return json.loads(response_str)
+
+
+class MockKraken(Kraken):
+
+    def __init__(
+            self,
+            name: str,
+            api_key: ApiKey,
+            secret: ApiSecret,
+            database: DBHandler,
+            msg_aggregator: MessagesAggregator,
+    ):
+        super().__init__(
+            name=name,
+            api_key=api_key,
+            secret=secret,
+            database=database,
+            msg_aggregator=msg_aggregator,
+        )
+
+        self.random_trade_data = True
+        self.random_balance_data = True
+        self.random_ledgers_data = False
+        self.remote_errors = False
+        self.use_original_kraken = False
+
+        self.balance_data_return = {'XXBT': '5.0', 'XETH': '10.0', 'NOTAREALASSET': '15.0'}
+        self.query_trades_data: dict[str, Any] = {}
+        self.extra_asset_pairs: dict[str, Any] = {}
+        # Not required in the real Kraken instance but we use it in the tests
+        self.tradeable_pairs = self.api_query('AssetPairs')
+
+    @staticmethod
+    def _load_results_from_file(filename: str) -> dict[str, Any]:
+        dir_path = Path(__file__).resolve().parent.parent
+        return jsonloads_dict((dir_path / 'data' / filename).read_text(encoding='utf8'))
+
+    def api_query(
+            self,
+            method: KrakenApiMethod,
+            req: dict | None = None,
+    ) -> dict:
+        # Pretty ugly ... mock a kraken remote error
+        if self.remote_errors:
+            raise RemoteError('Kraken remote error')
+
+        if self.use_original_kraken:
+            return super().api_query(method, req)
+
+        if method == 'Balance':
+            if self.random_balance_data:
+                return generate_random_kraken_balance_response()
+            # else
+            return self.balance_data_return
+        if method == 'accounts':
+            return jsonloads_dict(KRAKEN_FUTURES_BALANCES_RESPONSE)
+        if method == 'TradesHistory':
+            assert req, 'Should have given arguments for kraken TradesHistory endpoint call'
+            if self.random_trade_data:
+                return generate_random_kraken_trades_data(
+                    start=req['start'],
+                    end=req['end'],
+                    tradeable_pairs=list(self.tradeable_pairs.keys()),
+                )
+            # else
+            return jsonloads_dict(KRAKEN_SPECIFIC_TRADES_HISTORY_RESPONSE)
+        if method == 'account-log':
+            futures_response = jsonloads_dict(KRAKEN_FUTURES_ACCOUNT_LOG_RESPONSE)
+            futures_response['accountUid'] = '1ca86f16-f900-4631-88b5-8f729bac6d53'
+            return futures_response
+        if method == 'QueryTrades':
+            return self.query_trades_data
+        if method == 'AssetPairs':
+            data = self._load_results_from_file('assets_kraken.json')['result'] | self.extra_asset_pairs  # noqa: E501
+            if req is not None and (pair := req.get('pair')) is not None:
+                return {pair: data[pair]}
+            return data
+        if method == 'Assets':
+            data = self._load_results_from_file('assets_only_kraken.json')
+            return data['result']
+        if method == 'Ledgers':
+            if req is None:
+                req = {}
+            ledger_type: str = req.get('type', '')
+            if self.random_ledgers_data:
+                assert req is not None
+                return generate_random_kraken_ledger_data(
+                    start=req.get('start', 0),
+                    end=req.get('end', ts_now),
+                    ledger_type=ledger_type,
+                )
+
+            # else use specific data
+            if ledger_type in {'deposit', 'withdrawal'}:
+                data = json.loads(
+                    KRAKEN_SPECIFIC_DEPOSITS_RESPONSE if ledger_type == 'deposit'
+                    else KRAKEN_SPECIFIC_WITHDRAWALS_RESPONSE,
+                )
+            else:
+                data = json.loads(KRAKEN_GENERAL_LEDGER_RESPONSE)
+            new_data: dict[str, Any] = {'ledger': {}}
+            for key, val in data['ledger'].items():
+                try:
+                    ts = int(val['time'])
+                except ValueError:
+                    # can happen for tests of invalid data -- let it through
+                    ts = req.get('start', 0)
+                if ts < req.get('start', 0) or ts > req.get('end', ts_now):
+                    continue
+                new_data['ledger'][key] = val
+
+            new_data['count'] = len(new_data['ledger'])
+            response = json.dumps(new_data)
+            return jsonloads_dict(response)
+        # else
+        return super().api_query(method, req)  # type: ignore[unreachable]

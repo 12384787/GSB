@@ -1,0 +1,67 @@
+<script setup lang="ts">
+import type { Message } from '@rotki/common';
+import type { RuiIcons } from '@rotki/ui-library';
+
+const { message } = defineProps<{
+  message: Message;
+}>();
+
+const emit = defineEmits<{
+  dismiss: [];
+}>();
+
+const { t } = useI18n({ useScope: 'global' });
+
+const icon = computed<RuiIcons>(() => (message.success ? 'lu-circle-check' : 'lu-circle-alert'));
+</script>
+
+<template>
+  <RuiDialog
+    model-value
+    max-width="500"
+    persistent
+    z-index="10000"
+    @close="emit('dismiss')"
+    @keydown.esc="emit('dismiss')"
+    @keydown.enter="emit('dismiss')"
+  >
+    <RuiCard>
+      <template #header>
+        <h5
+          :class="message.success ? 'text-rui-success' : 'text-rui-error'"
+          class="text-h5"
+          data-testid="message-dialog-title"
+        >
+          {{ message.title }}
+        </h5>
+      </template>
+
+      <div class="flex items-center gap-2">
+        <div>
+          <RuiIcon
+            size="40"
+            :name="icon"
+            :class="message.success ? 'text-rui-success' : 'text-rui-error'"
+          />
+        </div>
+        <div
+          class="hyphens-auto break-words"
+          data-testid="message-dialog-description"
+        >
+          {{ message.description }}
+        </div>
+      </div>
+
+      <template #footer>
+        <div class="grow" />
+        <RuiButton
+          data-testid="message-dialog-ok"
+          :color="message.success ? 'success' : 'error'"
+          @click="emit('dismiss')"
+        >
+          {{ t('common.actions.ok') }}
+        </RuiButton>
+      </template>
+    </RuiCard>
+  </RuiDialog>
+</template>

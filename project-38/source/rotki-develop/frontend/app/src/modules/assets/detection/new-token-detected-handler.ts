@@ -1,0 +1,50 @@
+import type { NewDetectedToken } from '@/modules/assets/detection/types';
+import type { MessageHandler } from '@/modules/core/messaging/interfaces';
+import { NotificationCategory, NotificationGroup, Priority, Severity } from '@rotki/common';
+import { useNewlyDetectedTokens } from '@/modules/assets/detection/use-newly-detected-tokens';
+import { createStateWithNotificationHandler } from '@/modules/core/messaging/utils';
+import { useNotificationsStore } from '@/modules/core/notifications/use-notifications-store';
+
+export function createNewTokenDetectedHandler(
+  t: ReturnType<typeof useI18n>['t'],
+  router: ReturnType<typeof useRouter>,
+): MessageHandler<NewDetectedToken> {
+  const { addNewDetectedToken } = useNewlyDetectedTokens();
+  const notificationsStore = useNotificationsStore();
+  const { data: notifications } = storeToRefs(notificationsStore);
+
+  return createStateWithNotificationHandler<NewDetectedToken, number>(
+    async (data: NewDetectedToken) => {
+      const existingNotification = get(notifications).find(
+        ({ group }) => group === NotificationGroup.NEW_DETECTED_TOKENS,
+      );
+      const countAdded = await addNewDetectedToken(data);
+      return (existingNotification?.groupCount ?? 0) + +countAdded;
+    },
+    async (data: NewDetectedToken, count: number) => {
+      if (count === 0)
+        return null;
+
+      return {
+        action: {
+          action: async () => router.push({ name: '/asset-manager/more/newly-detected/' }),
+          label: t('notification_messages.new_detected_token.action'),
+        },
+        category: NotificationCategory.DEFAULT,
+        group: NotificationGroup.NEW_DETECTED_TOKENS,
+        groupCount: count,
+        message: t(
+          'notification_messages.new_detected_token.message',
+          {
+            count,
+            identifier: data.tokenIdentifier,
+          },
+          count,
+        ),
+        priority: Priority.ACTION,
+        severity: Severity.INFO,
+        title: t('notification_messages.new_detected_token.title', count),
+      };
+    },
+  );
+}

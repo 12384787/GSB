@@ -1,0 +1,28 @@
+{
+  "extends": "@tsconfig/node24/tsconfig.json",
+  "compilerOptions": {
+    "composite": true,
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
+
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "types": ["node", "vite/client"],
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  "include": [
+    "vite.config.*",
+    "vitest.config.*",
+    "vitest.contract.config.*",
+    "playwright.config.*",
+    "tailwind.config.*",
+    "scripts/**/*",
+    "shared/cargo-env.ts",
+    "shared/port-utils.ts",
+    "shared/uv.ts",
+    "shared/external-links.ts",
+    "shared/starling/**/*",
+    ".electron-builder.config.*",
+    "backend-icons.generated.ts"
+  ]
+}

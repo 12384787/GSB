@@ -1,0 +1,97 @@
+{
+  "about": {
+    "copy_data_directory_tooltip": "Datenverzeichnis kopieren",
+    "copy_information_tooltip": "Programminformationen kopieren",
+    "data_directory": "Datenverzeichnis:",
+    "open_data_dir_tooltip": "Datenverzeichnis öffnen",
+    "release_notes": "Was gibt's Neues"
+  },
+  "account_balance_table": {
+    "liabilities": "Verbindlichkeiten"
+  },
+  "account_balances": {
+    "confirm_delete": {
+      "description_address": "Sind Sie sicher, dass Sie die Adresse {address} aus der Kette {chain} löschen möchten?",
+      "description_xpub": "Sind Sie sicher dass Sie {address} entfernen möchten",
+      "title": "Konto entfernen"
+    },
+    "data_table": {
+      "loading": "Bitte warten während rotki die Blockchain abfragt..."
+    },
+    "detect_tokens": {
+      "tooltip": {
+        "last_detected": "Zuletzt erfasst: {time}",
+        "redetect": "Neuerfassung Tokens"
+      }
+    },
+    "edit_tooltip": "Konto ändern",
+    "refresh_tooltip": "Aktualisierung der {blockchain} Salden - gecachte Einträge werden ignoriert"
+  },
+  "account_form": {
+    "advanced_tooltip": "Zeige erweiterte xpub Optionen | Verstecke erweiterte xpub Optionen",
+    "error": {
+      "description": "Fehler beim hinzufügen des Kontos: {error}",
+      "title": "Konto hinzufügen"
+    },
+    "labels": {
+      "addresses": "Adressen",
+      "addresses_entries": "keine Einträge | {count} einmaliger Eintrag | {count} einmalige Einträge",
+      "addresses_hint": "Fügen Sie mehrere Adressen ein, getrennt durch Kommas oder Zeilenumbrüche",
+      "blockchain": "Wähle Blockchain",
+      "multiple": "Mehrere Adressen hinzufügen"
+    },
+    "validation": {
+      "address_non_empty": "Die Adresse darf nicht leer sein",
+      "xpub_non_empty": "Das XPUB Feld draf nicht leer sein"
+    }
+  },
+  "account_management": {
+    "about_tooltip": "Über Programm Modal anzeigen",
+    "creation": {
+      "error": "Kontoerstellung fehlgeschlagen"
+    }
+  },
+  "actions": {
+    "balances": {
+      "all_balances": {
+        "error": {
+          "message": "Abfrage der Salden und Speichern des Snapshots fehlgeschlagen: {message}",
+          "title": "Bilanz-Snapshot fehlgeschlagen"
+        },
+        "task": {
+          "description": "Alle Salden werden abgefragt und ein Snapshot für die Statistik gespeichert.",
+          "ignore_errors_note": "Fehler während der Abfrage werden ignoriert."
+        }
+      }
+    },
+    "defi": {
+      "liquity_pools": {
+        "error": {
+          "description": "Die Abfrage der Liquity Pools ist fehlgeschlagen: {message}"
+        }
+      }
+    },
+    "get_accounts": {
+      "error": {
+        "description": "Abfrage der Konten für {blockchain} fehlgeschlagen: {message}",
+        "title": "Kontenabfrage"
+      }
+    }
+  },
+  "common": {
+    "never": "Niemals",
+    "refresh": "Αktualisieren"
+  },
+  "evm_rpc_node_manager": {
+    "connected": {
+      "failure": "Fehlgeschlagen",
+      "false": "Bereit"
+    }
+  },
+  "managed_asset_content": {
+    "add_asset": "Vermögenswert hinzufügen"
+  },
+  "snapshot_action_button": {
+    "force_save": "Speichern forcieren"
+  }
+}

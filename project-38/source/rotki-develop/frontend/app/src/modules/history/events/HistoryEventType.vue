@@ -1,0 +1,168 @@
+<script setup lang="ts">
+import type { RuiIcons } from '@rotki/ui-library';
+import type { HistoryEventEntry, HistoryEventState } from '@/modules/history/events/schemas';
+import { HistoryEventEntryType } from '@rotki/common';
+import { useSupportedChains } from '@/modules/core/common/use-supported-chains';
+import HistoryEventAccount from '@/modules/history/events/HistoryEventAccount.vue';
+import HistoryEventStateChip from '@/modules/history/events/HistoryEventStateChip.vue';
+import HistoryEventTypeCombination from '@/modules/history/events/HistoryEventTypeCombination.vue';
+import HistoryEventTypeCounterparty from '@/modules/history/events/HistoryEventTypeCounterparty.vue';
+import HistoryEventTypeLocationBadge from '@/modules/history/events/HistoryEventTypeLocationBadge.vue';
+import { useHistoryEventMappings } from '@/modules/history/events/mapping/use-history-event-mappings';
+import HashLink from '@/modules/shell/components/HashLink.vue';
+
+const { event, groupLocationLabel, icon, label, highlight, hideStateChips, linkedLeg } = defineProps<{
+  event: HistoryEventEntry;
+  groupLocationLabel?: string;
+  icon?: RuiIcons;
+  /** Overrides the label derived from the event's category (e.g. a combined row
+   * representing both legs of a transfer instead of a single event). */
+  label?: string;
+  highlight?: boolean;
+  hideStateChips?: boolean;
+  /** Set when the event is rendered inside an expanded linked (matched) movement. */
+  linkedLeg?: boolean;
+}>();
+
+const { getEventTypeData } = useHistoryEventMappings();
+const { matchChain } = useSupportedChains();
+
+const attrs = getEventTypeData(() => event);
+
+const counterparty = computed<string | undefined>(() =>
+  'counterparty' in event ? (event.counterparty ?? undefined) : undefined,
+);
+
+const address = computed<string | undefined>(() =>
+  'address' in event ? (event.address ?? undefined) : undefined,
+);
+
+const isInformational = computed<boolean>(() => event.eventType === 'informational');
+
+// Whether the event's own location is an exchange (e.g. kraken) rather than a blockchain.
+const isExchangeLocation = computed<boolean>(() => !matchChain(event.location));
+
+const hasCounterpartyBadge = computed<boolean>(() => !!get(counterparty) || !!get(address));
+
+const isExchangeMovementLeg = computed<boolean>(() =>
+  !!linkedLeg
+  && get(isExchangeLocation)
+  && event.entryType === HistoryEventEntryType.ASSET_MOVEMENT_EVENT,
+);
+
+// The on-chain leg of a linked movement: the transfer that happened on a blockchain.
+const isOnChainLeg = computed<boolean>(() => !!linkedLeg && !get(isExchangeLocation));
+
+/**
+ * Resolves the transaction hash to link from this leg of a linked movement.
+ *
+ * @remarks
+ * The legs of a linked subgroup come from different transactions (on different chains for
+ * bridges), so each leg surfaces its own hash as an explorer link.
+ */
+const legTxRef = computed<string | undefined>(() => {
+  if (!linkedLeg || !('txRef' in event) || !event.txRef)
+    return undefined;
+  return event.txRef;
+});
+
+/**
+ * Whether to show a location icon: the exchange icon on the exchange-side asset movement, and the
+ * chain icon on the on-chain leg.
+ */
+const showLocationBadge = computed<boolean>(() => get(isExchangeMovementLeg) || get(isOnChainLeg));
+
+/**
+ * Whether to show the counterparty badge.
+ *
+ * @remarks
+ * The on-chain leg carries a synthetic counterparty pointing at the exchange, so it is suppressed
+ * there and the chain icon shows on that leg instead.
+ */
+const showCounterpartyBadge = computed<boolean>(() =>
+  get(hasCounterpartyBadge) && !get(isOnChainLeg),
+);
+
+const eventStates = computed<HistoryEventState[]>(() => event.states ?? []);
+
+const showLocationLabel = computed<boolean>(() => {
+  const eventLabel = event.locationLabel;
+  if (!eventLabel)
+    return false;
+
+  // Show only when different from group (or no group context)
+  return !groupLocationLabel || eventLabel !== groupLocationLabel;
+});
+</script>
+
+<template>
+  <div
+    data-testid="event-type"
+    class="flex items-center text-left min-w-0"
+  >
+    <HistoryEventTypeCounterparty
+      v-if="showCounterpartyBadge"
+      :counterparty="counterparty"
+      :address="address"
+      :location="event.location"
+      class="shrink-0"
+    >
+      <HistoryEventTypeCombination
+        :highlight="highlight"
+        :icon="icon"
+        :type="attrs"
+        :show-info="isInformational"
+      />
+    </HistoryEventTypeCounterparty>
+    <HistoryEventTypeLocationBadge
+      v-else-if="showLocationBadge"
+      :location="event.location"
+      class="shrink-0"
+    >
+      <HistoryEventTypeCombination
+        :highlight="highlight"
+        :icon="icon"
+        :type="attrs"
+        :show-info="isInformational"
+      />
+    </HistoryEventTypeLocationBadge>
+    <HistoryEventTypeCombination
+      v-else
+      :highlight="highlight"
+      :icon="icon"
+      :type="attrs"
+      :show-info="isInformational"
+      class="shrink-0"
+    />
+
+    <div class="ml-3 min-w-0">
+      <div class="font-medium uppercase text-sm truncate">
+        {{ label ?? attrs.label }}
+      </div>
+      <HistoryEventAccount
+        v-if="showLocationLabel"
+        :location="event.location"
+        :location-label="event.locationLabel!"
+        class="text-rui-text-secondary"
+      />
+      <HashLink
+        v-if="legTxRef"
+        :text="legTxRef"
+        type="transaction"
+        :location="event.location"
+        :truncate-length="6"
+        class="text-xs text-rui-text-secondary"
+      />
+      <div
+        v-if="eventStates.length > 0 && !hideStateChips"
+        class="flex flex-wrap gap-0.5"
+      >
+        <HistoryEventStateChip
+          v-for="state in eventStates"
+          :key="state"
+          :state="state"
+        />
+      </div>
+    </div>
+  </div>
+</template>

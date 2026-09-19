@@ -1,0 +1,81 @@
+<script setup lang="ts">
+import type { UnmatchedAssetMovement } from '@/modules/history/events/use-unmatched-asset-movements';
+import PotentialMatchesContent from '@/modules/history/events/PotentialMatchesContent.vue';
+import { useMovementUnmatchableExplanation } from '@/modules/history/events/use-untracked-movement-destination';
+import { PinnedNames } from '@/modules/session/types';
+import CardTitle from '@/modules/shell/components/CardTitle.vue';
+import { usePinnedPanel } from '@/modules/shell/pinned/use-pinned-panel';
+
+const modelValue = defineModel<boolean>({ required: true });
+
+const { movement } = defineProps<{
+  movement: UnmatchedAssetMovement;
+}>();
+
+const emit = defineEmits<{
+  matched: [];
+  pinned: [];
+}>();
+
+const { t } = useI18n({ useScope: 'global' });
+const { pin } = usePinnedPanel(PinnedNames.MATCH_ASSET_MOVEMENTS);
+const { unmatchableExplanation: emptyExplanation } = useMovementUnmatchableExplanation(() => movement);
+
+function closeDialog(): void {
+  set(modelValue, false);
+}
+
+function onMatched(): void {
+  set(modelValue, false);
+  emit('matched');
+}
+
+function showUnmatchedInEvents(): void {
+  pin({ highlightedGroupIdentifier: movement.groupIdentifier });
+  set(modelValue, false);
+  emit('pinned');
+}
+
+function showPotentialMatchInEvents(data: { identifier: number; groupIdentifier: string }): void {
+  pin({
+    highlightedGroupIdentifier: movement.groupIdentifier,
+    highlightedPotentialMatchIdentifier: data.identifier,
+    potentialMatchGroupIdentifier: data.groupIdentifier,
+  });
+  set(modelValue, false);
+  emit('pinned');
+}
+</script>
+
+<template>
+  <RuiDialog
+    v-model="modelValue"
+    max-width="1000"
+  >
+    <RuiCard :class-names="{ content: '!pb-0' }">
+      <template #custom-header>
+        <div class="flex items-center justify-between w-full px-4 pt-2">
+          <CardTitle>
+            {{ t('asset_movement_matching.dialog.select_match_title') }}
+          </CardTitle>
+          <RuiButton
+            variant="text"
+            icon
+            @click="closeDialog()"
+          >
+            <RuiIcon name="lu-x" />
+          </RuiButton>
+        </div>
+      </template>
+
+      <PotentialMatchesContent
+        :movement="movement"
+        :empty-explanation="emptyExplanation"
+        @close="closeDialog()"
+        @matched="onMatched()"
+        @show-in-events="showPotentialMatchInEvents($event)"
+        @show-unmatched-in-events="showUnmatchedInEvents()"
+      />
+    </RuiCard>
+  </RuiDialog>
+</template>

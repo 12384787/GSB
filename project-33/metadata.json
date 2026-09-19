@@ -1,0 +1,10 @@
+{
+  "number": 33,
+  "repository": "Stremio/stremio-web",
+  "url": "https://github.com/Stremio/stremio-web",
+  "description": "Stremio - Freedom to Stream",
+  "language": "JavaScript",
+  "stars": 13912,
+  "default_branch": "main",
+  "source_zip_url": "https://github.com/Stremio/stremio-web/archive/refs/heads/main.zip"
+}

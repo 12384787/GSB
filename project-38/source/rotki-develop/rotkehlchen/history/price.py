@@ -1,0 +1,589 @@
+import logging
+from collections import defaultdict
+from contextlib import suppress
+from http import HTTPStatus
+from typing import TYPE_CHECKING, NamedTuple
+
+from rotkehlchen.api.websockets.typedefs import ProgressUpdateSubType, WSMessageType
+from rotkehlchen.assets.asset import Asset, EvmToken
+from rotkehlchen.assets.resolver import AssetResolver
+from rotkehlchen.chain.evm.decoding.uniswap.constants import CPT_UNISWAP_V2, CPT_UNISWAP_V3
+from rotkehlchen.chain.evm.decoding.uniswap.v3.utils import get_uniswap_v3_position_price
+from rotkehlchen.chain.evm.decoding.velodrome.constants import CPT_AERODROME, CPT_VELODROME
+from rotkehlchen.chain.evm.decoding.velodrome.utils import get_slipstream_position_price
+from rotkehlchen.chain.evm.utils import lp_price_from_uniswaplike_pool_contract
+from rotkehlchen.constants import HOUR_IN_SECONDS, ONE, ZERO
+from rotkehlchen.constants.assets import (
+    A_ETH,
+    A_ETH2,
+    A_EUR,
+    A_KFEE,
+    A_USD,
+)
+from rotkehlchen.constants.prices import ZERO_PRICE
+from rotkehlchen.db.settings import CachedSettings
+from rotkehlchen.errors.asset import UnknownAsset, WrongAssetType
+from rotkehlchen.errors.misc import RemoteError
+from rotkehlchen.errors.price import NoPriceForGivenTimestamp, PriceQueryUnsupportedAsset
+from rotkehlchen.fval import FVal
+from rotkehlchen.globaldb.handler import GlobalDBHandler
+from rotkehlchen.inquirer import Inquirer
+from rotkehlchen.logging import RotkehlchenLogsAdapter
+from rotkehlchen.types import Price, Timestamp, TokenKind
+from rotkehlchen.utils.misc import timestamp_to_daystart_timestamp
+
+from .types import (
+    DAILY_GRANULARITY_ORACLES,
+    HistoricalPrice,
+    HistoricalPriceOracle,
+    HistoricalPriceOracleInstance,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+    from pathlib import Path
+
+    from rotkehlchen.chain.ethereum.oracles.uniswap import UniswapV2Oracle, UniswapV3Oracle
+    from rotkehlchen.externalapis.alchemy import Alchemy
+    from rotkehlchen.externalapis.birdeye import Birdeye
+    from rotkehlchen.externalapis.coingecko import Coingecko
+    from rotkehlchen.externalapis.cryptocompare import Cryptocompare
+    from rotkehlchen.externalapis.defillama import Defillama
+    from rotkehlchen.externalapis.moralis import Moralis
+    from rotkehlchen.history.price_oracles.coinbase import CoinbaseHistoricalPriceOracle
+    from rotkehlchen.user_messages import MessagesAggregator
+
+logger = logging.getLogger(__name__)
+log = RotkehlchenLogsAdapter(logger)
+
+
+def query_price_or_use_default(
+        asset: Asset,
+        time: Timestamp,
+        default_value: FVal,
+        location: str,
+) -> Price:
+    """Query price in the user's main currency, or use default if unavailable"""
+    main_currency = CachedSettings().main_currency
+    try:
+        price = PriceHistorian().query_historical_price(
+            from_asset=asset,
+            to_asset=main_currency,
+            timestamp=time,
+        )
+    except (RemoteError, NoPriceForGivenTimestamp):
+        log.error(
+            f'Could not query price for {asset.identifier} and time {time} in {main_currency=} '
+            f'when processing {location}. Assuming price of {default_value!s}',
+        )
+        price = Price(default_value)
+
+    return price
+
+
+class HistoricalOracleState(NamedTuple):
+    """The oracle order and the matching oracle instances.
+
+    Kept as a single immutable unit swapped with one attribute assignment so that
+    concurrent history queries can never observe a new oracle list paired with the
+    old instances (or vice versa) while set_oracles_order runs on another thread.
+    """
+    oracles: tuple[HistoricalPriceOracle, ...]
+    instances: list[HistoricalPriceOracleInstance]
+
+
+class PriceHistorian:
+    __instance: PriceHistorian | None = None
+    _cryptocompare: Cryptocompare
+    _coingecko: Coingecko
+    _defillama: Defillama
+    _alchemy: Alchemy
+    _moralis: Moralis
+    _birdeye: Birdeye
+    _coinbase: CoinbaseHistoricalPriceOracle | None
+    _uniswapv2: UniswapV2Oracle
+    _uniswapv3: UniswapV3Oracle
+    _oracle_state: HistoricalOracleState | None = None
+
+    def __new__(   # noqa: PYI034  # singleton is an exception
+            cls,
+            data_directory: Path | None = None,
+            cryptocompare: Cryptocompare | None = None,
+            coingecko: Coingecko | None = None,
+            defillama: Defillama | None = None,
+            alchemy: Alchemy | None = None,
+            moralis: Moralis | None = None,
+            birdeye: Birdeye | None = None,
+            coinbase: CoinbaseHistoricalPriceOracle | None = None,
+            uniswapv2: UniswapV2Oracle | None = None,
+            uniswapv3: UniswapV3Oracle | None = None,
+    ) -> PriceHistorian:
+        if PriceHistorian.__instance is not None:
+            return PriceHistorian.__instance
+
+        error_msg = 'arguments should be given at the first instantiation'
+        assert data_directory, error_msg
+        assert cryptocompare, error_msg
+        assert coingecko, error_msg
+        assert defillama, error_msg
+        assert alchemy, error_msg
+        assert moralis, error_msg
+        assert birdeye, error_msg
+        assert uniswapv2, error_msg
+        assert uniswapv3, error_msg
+
+        PriceHistorian.__instance = object.__new__(cls)
+        PriceHistorian._cryptocompare = cryptocompare
+        PriceHistorian._coingecko = coingecko
+        PriceHistorian._defillama = defillama
+        PriceHistorian._alchemy = alchemy
+        PriceHistorian._moralis = moralis
+        PriceHistorian._birdeye = birdeye
+        PriceHistorian._coinbase = coinbase
+        PriceHistorian._uniswapv2 = uniswapv2
+        PriceHistorian._uniswapv3 = uniswapv3
+
+        return PriceHistorian.__instance
+
+    @property
+    def _oracles(self) -> tuple[HistoricalPriceOracle, ...] | None:
+        """Convenience view into _oracle_state. Code needing the oracle/instance
+        pairing must read _oracle_state once instead of combining these properties."""
+        return state.oracles if (state := self._oracle_state) is not None else None
+
+    @property
+    def _oracle_instances(self) -> list[HistoricalPriceOracleInstance] | None:
+        return state.instances if (state := self._oracle_state) is not None else None
+
+    @staticmethod
+    def set_oracles_order(oracles: Sequence[HistoricalPriceOracle]) -> None:
+        assert len(oracles) != 0 and len(oracles) == len(set(oracles)), (
+            "Oracles can't be empty or have repeated items"
+        )
+        instance = PriceHistorian()
+        # Build both locally and publish them with a single _oracle_state assignment
+        # so concurrent readers never observe a mismatched oracle/instance pairing
+        new_oracles = tuple(
+            oracle for oracle in oracles
+            if (
+                (
+                    oracle != HistoricalPriceOracle.CRYPTOCOMPARE or
+                    instance._cryptocompare.has_api_key()
+                ) and (
+                    oracle != HistoricalPriceOracle.COINBASE or
+                    instance._coinbase is not None
+                )
+            )
+        )
+        instance._oracle_state = HistoricalOracleState(
+            oracles=new_oracles,
+            instances=[getattr(instance, f'_{oracle!s}') for oracle in new_oracles],
+        )
+
+    @staticmethod
+    def _get_cached_price_or_query(
+            from_asset: Asset,
+            to_asset: Asset,
+            timestamp: Timestamp,
+            max_seconds_distance: int | None,
+    ) -> Price | None:
+        """Helper method to get price from cache if `max_seconds_distance`
+        is given, otherwise query normally.
+        """
+        if from_asset == to_asset:
+            return Price(ONE)
+
+        if max_seconds_distance is not None:
+            cached_price_entry = GlobalDBHandler.get_historical_price(
+                from_asset=from_asset,
+                to_asset=to_asset,
+                timestamp=timestamp,
+                max_seconds_distance=max_seconds_distance,
+            )
+            # we return None here by design to avoid making remote queries in cache-only mode
+            return cached_price_entry.price if cached_price_entry is not None else None
+        else:
+            return PriceHistorian.query_historical_price(
+                from_asset=from_asset,
+                to_asset=to_asset,
+                timestamp=timestamp,
+            )
+
+    @staticmethod
+    def get_price_for_special_asset(
+            from_asset: Asset,
+            to_asset: Asset,
+            timestamp: Timestamp,
+            max_seconds_distance: int | None = None,
+    ) -> Price | None:
+        """
+        Query the historical price on `timestamp` for `from_asset` in `to_asset`
+        for the case where `from_asset` needs a special handling.
+
+        Can return None if the from asset is not in the list of special cases
+
+        Args:
+            from_asset: The ticker symbol of the asset for which we want to know
+                        the price.
+            to_asset: The ticker symbol of the asset against which we want to
+                      know the price.
+            timestamp: The timestamp at which to query the price
+            max_seconds_distance: Maximum time distance for cache lookups
+
+        May raise:
+        - NoPriceForGivenTimestamp if we can't find a price for the asset in the given
+        timestamp from the external service.
+        """
+        if from_asset == A_ETH2:
+            return PriceHistorian._get_cached_price_or_query(
+                from_asset=A_ETH,
+                to_asset=to_asset,
+                timestamp=timestamp,
+                max_seconds_distance=max_seconds_distance,
+            )
+
+        if from_asset == A_KFEE:
+            # For KFEE the price is fixed at 0.01$
+            usd_price = Price(FVal(0.01))
+            if to_asset == A_USD:
+                return usd_price
+
+            usd_to_target_price = PriceHistorian._get_cached_price_or_query(
+                from_asset=A_USD,
+                to_asset=to_asset,
+                timestamp=timestamp,
+                max_seconds_distance=max_seconds_distance,
+            )
+            return Price(usd_price * usd_to_target_price) if usd_to_target_price is not None else None  # noqa: E501
+
+        if from_asset.identifier in Inquirer.eur_pegged_assets:  # part of the EURe collection  # todo: Super hacky. Figure out a way to generalize  # noqa: E501
+            return PriceHistorian._get_cached_price_or_query(
+                from_asset=A_EUR,
+                to_asset=to_asset,
+                timestamp=timestamp,
+                max_seconds_distance=max_seconds_distance,
+            )
+
+        if from_asset.is_evm_token() and (pool_token := from_asset.resolve_to_evm_token()).protocol in {CPT_UNISWAP_V2, CPT_UNISWAP_V3}:  # noqa: E501
+            if max_seconds_distance is not None:
+                cached_price_entry = GlobalDBHandler.get_historical_price(
+                    from_asset=from_asset,
+                    to_asset=to_asset,
+                    timestamp=timestamp,
+                    max_seconds_distance=max_seconds_distance,
+                )
+                return cached_price_entry.price if cached_price_entry is not None else None
+            else:
+                try:
+                    return PriceHistorian.query_uniswap_position_price(
+                        pool_token=pool_token,
+                        pool_token_amount=ONE,
+                        to_asset=to_asset,
+                        timestamp=timestamp,
+                    )
+                except (RemoteError, NoPriceForGivenTimestamp):
+                    log.error(f'Could not query uniswap position price for {from_asset.identifier} and time {timestamp}.')  # noqa: E501
+                    return None
+
+        if (
+            from_asset.is_evm_token() and
+            (position_token := from_asset.resolve_to_evm_token()).protocol in (CPT_AERODROME, CPT_VELODROME) and  # noqa: E501
+            position_token.token_kind == TokenKind.ERC721
+        ):  # Slipstream concentrated liquidity position
+            if max_seconds_distance is not None:
+                cached_price_entry = GlobalDBHandler.get_historical_price(
+                    from_asset=from_asset,
+                    to_asset=to_asset,
+                    timestamp=timestamp,
+                    max_seconds_distance=max_seconds_distance,
+                )
+                return cached_price_entry.price if cached_price_entry is not None else None
+
+            try:
+                evm_inquirer = Inquirer.get_evm_manager(chain_id=position_token.chain_id).node_inquirer  # noqa: E501
+                return get_slipstream_position_price(
+                    token=position_token,
+                    evm_inquirer=evm_inquirer,
+                    block_identifier=evm_inquirer.get_blocknumber_by_time(timestamp),
+                    price_func=lambda asset: PriceHistorian.query_historical_price(asset, to_asset, timestamp),  # noqa: E501
+                )
+            except (RemoteError, NoPriceForGivenTimestamp):
+                log.error(
+                    'Could not query Slipstream position price',
+                    asset=from_asset.identifier,
+                    timestamp=timestamp,
+                )
+                return None
+
+        if from_asset.is_evm_token() and (evm_token := from_asset.resolve_to_evm_token()).underlying_tokens is not None:  # noqa: E501
+            aggregated_price = ZERO
+            for underlying_token in evm_token.underlying_tokens:
+                underlying_asset = EvmToken(underlying_token.get_identifier(parent_chain=evm_token.chain_id))  # noqa: E501
+                if (underlying_price := PriceHistorian._get_cached_price_or_query(
+                    from_asset=underlying_asset,
+                    to_asset=to_asset,
+                    timestamp=timestamp,
+                    max_seconds_distance=max_seconds_distance,
+                )) is None:
+                    # if any underlying token can't be priced the aggregated price would be
+                    # incomplete (too low), so treat the whole token as unpriced instead of
+                    # returning a partial value the user would mistake for the real one.
+                    return None
+
+                aggregated_price += FVal(underlying_price) * underlying_token.weight
+
+            if aggregated_price != ZERO:
+                return Price(aggregated_price)
+
+        # Last resort: an asset that is a non-main member of a collection is the same
+        # asset on another chain, so it must be priced as the collection's main asset.
+        # Without this, each member is priced through its own oracle mapping and members
+        # whose mapping differs from the main asset's silently get a different price.
+        # Mirrors Inquirer._maybe_replace_asset so current and historical prices agree.
+        if (
+            (main_asset_id := AssetResolver.get_collection_main_asset(from_asset.identifier)) is not None and  # noqa: E501
+            main_asset_id != from_asset.identifier  # the main asset is a member of its own collection  # noqa: E501
+        ):
+            return PriceHistorian._get_cached_price_or_query(
+                from_asset=Asset(main_asset_id),
+                to_asset=to_asset,
+                timestamp=timestamp,
+                max_seconds_distance=max_seconds_distance,
+            )
+
+        return None
+
+    @staticmethod
+    def query_historical_price(
+            from_asset: Asset,
+            to_asset: Asset,
+            timestamp: Timestamp,
+    ) -> Price:
+        """
+        Query the historical price on `timestamp` for `from_asset` in `to_asset`.
+        So how much `to_asset` does 1 unit of `from_asset` cost.
+
+        Args:
+            from_asset: The ticker symbol of the asset for which we want to know
+                        the price.
+            to_asset: The ticker symbol of the asset against which we want to
+                        know the price.
+            timestamp: The timestamp at which to query the price
+
+        May raise:
+        - NoPriceForGivenTimestamp if we can't find a price for the asset in the given
+        timestamp from the external service.
+        """
+        log.debug(
+            'Querying historical price',
+            from_asset=from_asset,
+            to_asset=to_asset,
+            timestamp=timestamp,
+        )
+        if from_asset == to_asset:
+            return Price(ONE)
+
+        special_asset_price = PriceHistorian().get_price_for_special_asset(
+            from_asset=from_asset,
+            to_asset=to_asset,
+            timestamp=timestamp,
+        )
+        if special_asset_price is not None:
+            return special_asset_price
+
+        # Querying historical forex data is attempted first via the external apis
+        # and then via any price oracle that has fiat to fiat.
+        with suppress(UnknownAsset, WrongAssetType):
+            from_asset = from_asset.resolve_to_fiat_asset()
+            to_asset = to_asset.resolve_to_fiat_asset()
+            price = Inquirer().query_historical_fiat_exchange_rates(
+                from_fiat_currency=from_asset,
+                to_fiat_currency=to_asset,
+                timestamp=timestamp,
+            )
+            if price is not None:
+                return price
+
+        instance = PriceHistorian()
+        # Read the state once: a concurrent set_oracles_order swaps it atomically, while
+        # two separate attribute loads could pair oracles with mismatched instances
+        state = instance._oracle_state
+        assert state is not None, 'PriceHistorian should never be called before setting the oracles'  # noqa: E501
+        oracles, oracle_instances = state.oracles, state.instances
+        # try to get the price from the cache using only enabled historical sources
+        sources = (
+            HistoricalPriceOracle.MANUAL,
+            HistoricalPriceOracle.XRATESCOM,
+            *oracles,
+        )
+        if HistoricalPriceOracle.CRYPTOCOMPARE not in oracles:
+            # Consider cached cryptocompare prices if they exist. We removed it
+            # from the oracle list since they went paid.
+            sources = (*sources, HistoricalPriceOracle.CRYPTOCOMPARE)
+
+        if (cached_price_entry := GlobalDBHandler.get_historical_price(
+            from_asset=from_asset,
+            to_asset=to_asset,
+            timestamp=timestamp,
+            max_seconds_distance=HOUR_IN_SECONDS,
+            sources=sources,
+        )) is not None:
+            return cached_price_entry.price
+
+        # Daily-granularity oracles have a single price per UTC day, cached at the
+        # day-start timestamp, so any same-day query can reuse it without a remote call
+        if (cached_price_entry := GlobalDBHandler.get_historical_price(
+            from_asset=from_asset,
+            to_asset=to_asset,
+            timestamp=timestamp_to_daystart_timestamp(timestamp),
+            max_seconds_distance=0,
+            sources=tuple(source for source in sources if source in DAILY_GRANULARITY_ORACLES),
+        )) is not None:
+            return cached_price_entry.price
+
+        # else cryptocompare also has historical fiat to fiat data
+        rate_limited = False
+        for oracle, oracle_instance in zip(oracles, oracle_instances, strict=True):
+            if not oracle_instance.can_query_history(
+                from_asset=from_asset,
+                to_asset=to_asset,
+                timestamp=timestamp,
+            ):
+                continue
+
+            try:
+                price = oracle_instance.query_historical_price(
+                    from_asset=from_asset,
+                    to_asset=to_asset,
+                    timestamp=timestamp,
+                )
+            except (
+                PriceQueryUnsupportedAsset,
+                NoPriceForGivenTimestamp,
+                UnknownAsset,
+                WrongAssetType,
+            ):
+                continue
+            except RemoteError as e:
+                # Raise the flag if any of the services was rate limited
+                rate_limited = rate_limited or e.error_code == HTTPStatus.TOO_MANY_REQUESTS
+                continue
+
+            log.debug(
+                f'Historical price oracle {oracle} got price',
+                price=price,
+                from_asset=from_asset,
+                to_asset=to_asset,
+                timestamp=timestamp,
+            )
+            GlobalDBHandler.add_historical_prices([HistoricalPrice(
+                from_asset=from_asset,
+                to_asset=to_asset,
+                source=oracle,
+                # daily-granularity sources return the same price for the whole UTC
+                # day, so cache at day start to make it reusable by same-day queries
+                timestamp=(
+                    timestamp_to_daystart_timestamp(timestamp)
+                    if oracle in DAILY_GRANULARITY_ORACLES else timestamp
+                ),
+                price=price,
+            )])
+            return price
+
+        raise NoPriceForGivenTimestamp(
+            from_asset=from_asset,
+            to_asset=to_asset,
+            time=timestamp,
+            rate_limited=rate_limited,
+        )
+
+    @staticmethod
+    def query_multiple_prices(
+            assets_timestamp: list[tuple[Asset, Timestamp]],
+            target_asset: Asset,
+            msg_aggregator: MessagesAggregator,
+    ) -> Mapping[Asset, Mapping[Timestamp, Price]]:
+        """Return the price of the assets at the given timestamps in the target
+        asset currency.
+        """
+        log.debug(
+            f'Querying the historical {target_asset.identifier} price of these assets: '
+            f'{", ".join(f"{asset.identifier} at {ts}" for asset, ts in assets_timestamp)}',
+            assets_timestamp=assets_timestamp,
+        )
+        assets_price: defaultdict[Asset, defaultdict] = defaultdict(
+            lambda: defaultdict(lambda: ZERO_PRICE),
+        )
+        unique_pairs = list(dict.fromkeys(assets_timestamp))
+        send_ws_every_prices = msg_aggregator.how_many_events_per_ws(
+            total_events=(total_events := len(unique_pairs)),
+        )
+        for idx, (asset, timestamp) in enumerate(unique_pairs):
+            if idx % send_ws_every_prices == 0:
+                msg_aggregator.add_message(
+                    message_type=WSMessageType.PROGRESS_UPDATES,
+                    data={
+                        'total': total_events,
+                        'processed': idx,
+                        'subtype': str(ProgressUpdateSubType.MULTIPLE_PRICES_QUERY_STATUS),
+                    },
+                )
+
+            try:
+                assets_price[asset][timestamp] = PriceHistorian.query_historical_price(
+                    from_asset=asset,
+                    to_asset=target_asset,
+                    timestamp=timestamp,
+                )
+            except (RemoteError, NoPriceForGivenTimestamp) as e:
+                log.warning(
+                    f'Could not query the historical {target_asset.identifier} price for '
+                    f'{asset.identifier} at time {timestamp} due to: {e!s}. Skipping',
+                )
+                continue
+
+        msg_aggregator.add_message(
+            message_type=WSMessageType.PROGRESS_UPDATES,
+            data={
+                'total': total_events,
+                'processed': total_events,
+                'subtype': str(ProgressUpdateSubType.MULTIPLE_PRICES_QUERY_STATUS),
+            },
+        )
+
+        return assets_price
+
+    @staticmethod
+    def query_uniswap_position_price(
+            pool_token: EvmToken,
+            pool_token_amount: FVal,
+            to_asset: Asset,
+            timestamp: Timestamp,
+    ) -> Price:
+        """Return the uniswap position value at the given timestamp. Works both with V2 and V3.
+
+        Note: This function should only be called for a Uniswap liquidity token.
+
+        May raise:
+            RemoteError: If an unexpected response is returned on get_blocknumber_by_time function
+            NoPriceForGivenTimestamp if we can't find a price for the asset in the given timestamp
+        """
+        evm_inquirer = Inquirer.get_evm_manager(chain_id=pool_token.chain_id).node_inquirer
+        block_number = evm_inquirer.get_blocknumber_by_time(timestamp)
+        if pool_token.protocol == CPT_UNISWAP_V2:
+            if (pool_price := lp_price_from_uniswaplike_pool_contract(
+                evm_inquirer=evm_inquirer,
+                token=pool_token,
+                price_func=lambda asset: PriceHistorian.query_historical_price(asset, to_asset, timestamp),  # noqa: E501
+                block_identifier=block_number,
+            )) is not None:
+                return Price(pool_token_amount * pool_price)
+
+            return ZERO_PRICE
+
+        return get_uniswap_v3_position_price(
+            token=pool_token,
+            evm_inquirer=evm_inquirer,
+            block_identifier=block_number,
+            price_func=lambda asset: PriceHistorian.query_historical_price(asset, to_asset, timestamp),  # noqa: E501
+        )

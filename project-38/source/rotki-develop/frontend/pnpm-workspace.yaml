@@ -1,0 +1,142 @@
+allowUnusedPatches: true
+blockExoticSubdeps: true
+minimumReleaseAge: 10080
+minimumReleaseAgeExcludePrune: true
+
+minimumReleaseAgeExclude:
+  - '@rotki/ui-library'
+  - '@rotki/eslint-config'
+  - '@rotki/eslint-plugin'
+  - plainfp
+  - electron-builder@26.15.3
+  - dmg-builder@26.15.3
+  - app-builder-lib@26.15.3
+  - electron-builder-squirrel-windows@26.15.3
+  - electron-publish@26.15.3
+trustPolicy: no-downgrade
+trustPolicyExclude:
+  - 'semver@5.7.2 || 6.3.1'
+  - undici-types@6.19.8
+  - '@noble/curves@1.8.0'
+  - '@noble/hashes@1.7.0'
+  - slow-redact@0.3.2
+  - tailwind-merge@2.6.1
+peerDependencyRules:
+  allowedVersions:
+    tailwind-variants>tailwind-merge: '>=2.0.0 <3.0.0'
+shamefullyHoist: true
+shellEmulator: true
+strictDepBuilds: true
+saveExact: true
+packages:
+  - app
+  - common
+  - dev-proxy
+  - 'eslint/*'
+overrides:
+  chokidar: 5.0.0
+  ws: 8.21.3
+patchedDependencies:
+  app-builder-lib: patches/app-builder-lib.patch
+  bignumber.js@11.1.5: patches/bignumber.js@11.1.5.patch
+allowBuilds:
+  '@parcel/watcher': true
+  bufferutil: true
+  core-js-pure: false
+  electron: true
+  electron-winstaller: true
+  esbuild: true
+  keccak: true
+  msw: false
+  utf-8-validate: true
+  vue-demi: true
+catalog:
+  '@clack/prompts': 1.7.0
+  '@electron/notarize': 3.1.1
+  '@fontsource/roboto': 5.3.0
+  '@fontsource/roboto-mono': 5.3.0
+  '@intlify/eslint-plugin-vue-i18n': 4.5.1
+  '@intlify/unplugin-vue-i18n': 11.2.5
+  '@pinia/testing': 2.0.1
+  '@playwright/test': 1.62.1
+  '@rotki/eslint-config': 8.3.0
+  '@rotki/eslint-plugin': 1.8.0
+  '@rotki/ui-library': 2.24.0
+  '@tsconfig/node24': 24.0.5
+  '@types/node': 24.13.3
+  '@types/qrcode': 1.5.6
+  '@types/semver': 7.8.0
+  '@types/ws': 8.18.1
+  '@vitejs/plugin-vue': 6.0.8
+  '@vitest/coverage-v8': 5.0.0
+  '@vitest/ui': 5.0.0
+  '@vue/devtools-api': 8.2.1
+  '@vue/test-utils': 2.5.0
+  '@vue/tsconfig': 0.9.1
+  '@vueuse/core': 14.4.0
+  '@vueuse/math': 14.4.0
+  '@vueuse/shared': 14.4.0
+  '@walletconnect/core': 2.24.0
+  '@walletconnect/universal-provider': 2.24.0
+  autoprefixer: 10.5.4
+  bignumber.js: 11.1.5
+  bufferutil: 4.1.0
+  c8: 12.0.0
+  cac: 7.0.0
+  consola: 3.4.2
+  dayjs: 1.11.23
+  dexie: 4.4.5
+  dmg-license: 1.0.11
+  dotenv: 17.4.2
+  echarts: 6.1.0
+  electron: 43.5.0
+  electron-builder: 26.15.3
+  electron-updater: 6.8.9
+  electron-window-state: 5.0.3
+  es-toolkit: 1.52.0
+  eslint: 10.9.1
+  eslint-plugin-tsdoc: 0.5.2
+  fake-indexeddb: 6.2.5
+  flag-icons: 7.5.0
+  flush-promises: 1.0.2
+  happy-dom: 20.12.0
+  httpxy: 0.5.5
+  husky: 9.1.7
+  imask: 7.6.1
+  knip: 6.34.0
+  lint-staged: 17.4.1
+  mitt: 3.0.1
+  msw: 2.15.0
+  npm-run-all2: 9.0.3
+  ofetch: 1.5.1
+  pinia: 4.0.3
+  plainfp: 0.1.1
+  postcss: 8.5.26
+  postcss-html: 2.0.0
+  qrcode: 1.5.4
+  rimraf: 6.1.3
+  semver: 7.8.5
+  stylelint: 17.14.1
+  stylelint-config-recommended-vue: 2.0.0
+  stylelint-order: 8.1.1
+  tailwindcss: 3.4.19
+  theme-colors: 0.1.0
+  tsx: 4.23.13
+  typescript: 6.0.3
+  unplugin-auto-import: 21.1.0
+  unplugin-vue-components: 32.1.0
+  utf-8-validate: 6.0.6
+  vanilla-jsoneditor: 3.13.0
+  viem: 2.56.1
+  vite: 8.2.2
+  vite-plugin-checker: 0.14.5
+  vite-plugin-vue-devtools: 8.2.1
+  vitest: 5.0.0
+  vue: 3.5.42
+  vue-component-type-helpers: 3.3.11
+  vue-echarts: 8.2.0
+  vue-i18n: 11.4.10
+  vue-router: 5.3.0
+  vue-tsc: 3.3.11
+  ws: 8.21.3
+  zod: 4.5.4

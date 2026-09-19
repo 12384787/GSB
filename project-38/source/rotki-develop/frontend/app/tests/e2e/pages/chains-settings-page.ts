@@ -1,0 +1,106 @@
+import { expect, type Page } from '@playwright/test';
+import { confirmInlineSuccess } from '../helpers/utils';
+import { RotkiApp } from './rotki-app';
+
+export class ChainsSettingsPage {
+  constructor(private readonly page: Page) {}
+
+  async visit(): Promise<void> {
+    await this.page.locator('[data-testid=user-menu-button]').click();
+    await this.page.locator('[data-testid=user-dropdown]').waitFor({ state: 'visible' });
+    await this.page.locator('[data-testid=settings-button]').click();
+    await this.page.locator('[data-testid=user-dropdown]').waitFor({ state: 'detached' });
+    await this.page.locator('[data-testid=nav-tab][data-key="settings-chains"]').click();
+    await this.page.locator('[data-testid=chains-to-skip-detection]').waitFor({ state: 'visible' });
+  }
+
+  async navigateAway(): Promise<void> {
+    await RotkiApp.navigateTo(this.page, 'dashboard');
+  }
+
+  /**
+   * The two settings that both read as "skip this chain" are deliberately co-located under one
+   * category: query skipping (all chains) and detection skipping (EVM only). They used to sit a
+   * page apart, so assert they render together rather than only that each renders somewhere.
+   */
+  async verifyChainQueriesCategory(): Promise<void> {
+    const category = this.page.locator('#chain_queries');
+    await expect(category).toBeVisible();
+    await expect(category.locator('[data-testid=rule-add]')).toBeVisible();
+    await expect(category.locator('[data-testid=chains-to-skip-detection]')).toBeVisible();
+  }
+
+  getIndexerOrderSection() {
+    return this.page.locator('[data-testid=indexer-order-setting]');
+  }
+
+  async clickAddChainButton(): Promise<void> {
+    await this.page.locator('[data-testid=add-chain-button]').click();
+  }
+
+  async isAddChainButtonDisabled(): Promise<boolean> {
+    return this.page.locator('[data-testid=add-chain-button]').isDisabled();
+  }
+
+  async selectChainFromMenu(chainId: string): Promise<void> {
+    await this.page.locator('[data-testid=chain-menu]').waitFor({ state: 'visible' });
+    await this.page.locator(`[data-testid=chain-menu-item][data-key="${chainId}"]`).click();
+  }
+
+  async addChain(chainId: string): Promise<void> {
+    await this.clickAddChainButton();
+    await this.selectChainFromMenu(chainId);
+  }
+
+  async removeChain(chainId: string): Promise<void> {
+    await this.page.locator(`[data-testid=remove-chain][data-key="${chainId}"]`).click();
+  }
+
+  async selectTab(tabId: string): Promise<void> {
+    await this.page.locator(`[data-testid=indexer-tab][data-key="${tabId}"]`).click();
+  }
+
+  async verifyTabExists(tabId: string): Promise<void> {
+    await expect(this.page.locator(`[data-testid=indexer-tab][data-key="${tabId}"]`)).toBeAttached();
+  }
+
+  async verifyTabNotExists(tabId: string): Promise<void> {
+    await expect(this.page.locator(`[data-testid=indexer-tab][data-key="${tabId}"]`)).not.toBeAttached();
+  }
+
+  async selectChainToIgnore(value: string, waitForMessageToDisappear: boolean = true): Promise<void> {
+    const field = this.page.locator('[data-testid=chains-to-skip-detection]');
+    if (await field.locator(`[data-value=${value}]`).first().isVisible()) {
+      return;
+    }
+
+    const menu = this.page.locator('[role=menu]');
+    if (!await menu.isVisible()) {
+      await field.locator('[data-id=activator]').click();
+      await menu.waitFor({ state: 'visible' });
+    }
+    // Click the menu option button that contains the target chain id
+    const menuOption = menu.locator(`button:has([data-value="${value}"])`).first();
+    await menuOption.scrollIntoViewIfNeeded();
+    await menuOption.click();
+    await expect(field.locator(`[data-value=${value}]`).first()).toBeAttached();
+
+    // Always wait for the success message to appear
+    await confirmInlineSuccess(
+      this.page,
+      '[data-testid=chains-to-skip-detection] .details',
+      'EVM Chains for which to skip automatic token detection saved successfully',
+    );
+
+    if (waitForMessageToDisappear) {
+      await expect(this.page.locator('[data-testid=chains-to-skip-detection] .details')).toBeEmpty();
+    }
+  }
+
+  async verifySkipped(entries: string[]): Promise<void> {
+    for (const item of entries) {
+      // Use .first() since the selector may match both chip and dropdown option
+      await expect(this.page.locator(`[data-testid=chains-to-skip-detection] [data-value=${item}]`).first()).toBeAttached();
+    }
+  }
+}

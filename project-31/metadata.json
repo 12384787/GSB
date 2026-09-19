@@ -1,0 +1,10 @@
+{
+  "number": 31,
+  "repository": "OpenPrinting/cups",
+  "url": "https://github.com/OpenPrinting/cups",
+  "description": "OpenPrinting CUPS Sources",
+  "language": "C",
+  "stars": 1749,
+  "default_branch": "main",
+  "source_zip_url": "https://github.com/OpenPrinting/cups/archive/refs/heads/main.zip"
+}

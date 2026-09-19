@@ -1,0 +1,270 @@
+<script setup lang="ts">
+import type { NftAsset } from '@/modules/assets/nfts';
+import AssetActionButton from '@/modules/assets/AssetActionButton.vue';
+import { isSpammableAssetType } from '@/modules/assets/types';
+import { useAssetInfoRetrieval } from '@/modules/assets/use-asset-info-retrieval';
+import { useAssetPageNavigation } from '@/modules/assets/use-asset-page-navigation';
+import { useAssetsStore } from '@/modules/assets/use-assets-store';
+import { useIgnoredAssetOperations } from '@/modules/assets/use-ignored-asset-operations';
+import { useSpamAsset } from '@/modules/assets/use-spam-asset';
+import { injectEventPriceUpdate } from '@/modules/history/events/prices/use-event-price-update-trigger';
+import HashLink from '@/modules/shell/components/HashLink.vue';
+
+type ConfirmType = 'ignore' | 'mark_as_spam' | 'unignore' | 'unmark_spam';
+
+const { asset, hideActions, isCollectionParent, iconOnly, timestamp } = defineProps<{
+  asset: NftAsset;
+  hideActions?: boolean;
+  isCollectionParent?: boolean;
+  iconOnly: boolean;
+  timestamp?: number;
+}>();
+
+const emit = defineEmits<{
+  refresh: [];
+}>();
+
+const { t } = useI18n({ useScope: 'global' });
+
+const confirm = ref<boolean>(false);
+const confirmType = ref<ConfirmType>('ignore');
+
+const { navigateToDetails } = useAssetPageNavigation(() => asset.identifier, () => isCollectionParent);
+const { ignoreAsset, unignoreAsset } = useIgnoredAssetOperations();
+const { useIsAssetIgnored } = useAssetsStore();
+const { markAssetsAsSpam, removeAssetFromSpamList } = useSpamAsset();
+
+const isIgnoredAsset = useIsAssetIgnored(() => asset.identifier);
+const { refetchAssetInfo, useAssetContractInfo } = useAssetInfoRetrieval();
+
+const contractInfo = useAssetContractInfo(() => asset.identifier);
+
+const priceUpdateTrigger = injectEventPriceUpdate();
+const canUpdatePrice = computed<boolean>(() => timestamp !== undefined && priceUpdateTrigger !== null);
+
+function openPriceUpdate(): void {
+  if (timestamp === undefined || !priceUpdateTrigger)
+    return;
+  priceUpdateTrigger.open({ asset: asset.identifier, timestamp });
+}
+
+function actionClick(action: ConfirmType): void {
+  set(confirm, true);
+  set(confirmType, action);
+}
+
+function confirmMessage(): string {
+  const type = get(confirmType);
+  if (type === 'ignore')
+    return t('assets.action.confirm.ignore');
+  else if (type === 'mark_as_spam')
+    return t('assets.action.confirm.mark_as_spam');
+  else if (type === 'unignore')
+    return t('assets.action.confirm.unignore');
+  else
+    return t('assets.action.confirm.unmark_as_spam');
+}
+
+async function confirmAction(): Promise<void> {
+  const id = asset.identifier;
+  const type = get(confirmType);
+
+  if (type === 'ignore') {
+    await ignoreAsset(id);
+  }
+  else if (type === 'mark_as_spam') {
+    await markAssetsAsSpam([id]);
+  }
+  else if (type === 'unignore') {
+    await unignoreAsset(id);
+  }
+  else {
+    await removeAssetFromSpamList(id);
+  }
+
+  refetchAssetInfo(id);
+  emit('refresh');
+  set(confirm, false);
+}
+
+function setConfirm(value: boolean): void {
+  set(confirm, value);
+}
+
+defineExpose({
+  setConfirm,
+});
+</script>
+
+<template>
+  <div class="px-2 break-words">
+    <div class="py-1 relative">
+      <Transition
+        enter-active-class="transition-all duration-100 ease-out"
+        leave-active-class="transition-all duration-100 ease-in"
+        enter-from-class="translate-y-5 opacity-0"
+        enter-to-class="translate-y-0 opacity-100"
+        leave-from-class="translate-y-0 opacity-100"
+        leave-to-class="translate-y-[-20px] opacity-0"
+        mode="out-in"
+      >
+        <div
+          v-if="confirm"
+          key="confirm"
+          class="w-full flex items-center gap-2 justify-between text-rui-text-secondary pl-1 py-[1px]"
+        >
+          <div class="text-rui-warning text-xs leading-[1]">
+            {{ confirmMessage() }}
+          </div>
+          <div class="flex gap-1">
+            <RuiButton
+              variant="text"
+              icon
+              size="sm"
+              color="error"
+              @click="confirm = false"
+            >
+              <RuiIcon
+                size="16"
+                color="error"
+                name="lu-x"
+              />
+            </RuiButton>
+            <RuiButton
+              variant="text"
+              icon
+              size="sm"
+              @click="confirmAction()"
+            >
+              <RuiIcon
+                size="16"
+                color="success"
+                name="lu-check"
+              />
+            </RuiButton>
+          </div>
+        </div>
+        <div
+          v-else
+          key="actions"
+          class="flex items-center gap-1"
+        >
+          <RuiButton
+            variant="text"
+            color="primary"
+            size="sm"
+            class="!py-0.5"
+            @click="navigateToDetails()"
+          >
+            {{ t('assets.go_to_asset_detail') }}
+            <template #append>
+              <RuiIcon
+                name="lu-arrow-up-right"
+                size="18"
+              />
+            </template>
+          </RuiButton>
+          <template v-if="canUpdatePrice">
+            <RuiDivider
+              vertical
+              class="h-6"
+            />
+            <AssetActionButton
+              icon="lu-dollar-sign"
+              color="primary"
+              data-testid="asset-update-price"
+              :tooltip="t('assets.action.update_price')"
+              @click="openPriceUpdate()"
+            />
+          </template>
+          <template v-if="!hideActions && (isIgnoredAsset || asset.isSpam)">
+            <RuiDivider
+              vertical
+              class="h-6"
+            />
+            <AssetActionButton
+              v-if="asset.isSpam"
+              icon="lu-shield-off"
+              color="warning"
+              :tooltip="t('assets.action.unmark_as_spam')"
+              @click="actionClick('unmark_spam')"
+            />
+            <AssetActionButton
+              v-else
+              icon="lu-eye"
+              color="warning"
+              :tooltip="t('assets.action.unignore')"
+              @click="actionClick('unignore')"
+            />
+          </template>
+          <template v-else-if="!hideActions">
+            <RuiDivider
+              vertical
+              class="h-6"
+            />
+            <div class="w-full flex items-center gap-1">
+              <AssetActionButton
+                icon="lu-eye-off"
+                color="error"
+                :tooltip="t('assets.action.ignore')"
+                @click="actionClick('ignore')"
+              />
+              <AssetActionButton
+                v-if="isSpammableAssetType(asset.assetType)"
+                icon="lu-ban"
+                color="error"
+                :tooltip="t('assets.action.mark_as_spam')"
+                @click="actionClick('mark_as_spam')"
+              />
+            </div>
+          </template>
+        </div>
+      </Transition>
+    </div>
+    <template v-if="contractInfo">
+      <div
+        class="pt-2 pb-1 px-1 border-t border-default"
+      >
+        <div class="!text-[10px] !leading-[1] text-caption text-rui-text-secondary uppercase">
+          {{ t('transactions.events.form.contract_address.label') }}
+        </div>
+
+        <HashLink
+          :text="contractInfo.address"
+          :location="contractInfo.location"
+          type="token"
+          class="text-[11px]"
+          :truncate-length="9"
+        />
+      </div>
+
+      <div
+        v-if="contractInfo.nftId"
+        class="pt-2 pb-1 px-1 border-t border-default"
+      >
+        <div class="!text-[10px] !leading-[1] text-caption text-rui-text-secondary uppercase">
+          {{ t('nft_balance_table.token_id') }}
+        </div>
+
+        <div class="text-xs py-1">
+          #{{ contractInfo.nftId }}
+        </div>
+      </div>
+    </template>
+    <div
+      v-if="iconOnly"
+      class="pt-2 pb-1 px-1 border-t border-default"
+    >
+      <div class="!text-[10px] !leading-[1] text-caption text-rui-text-secondary uppercase">
+        {{ t('common.name') }}
+      </div>
+
+      <div class="text-xs py-0.5">
+        {{ asset.name }}
+        <template v-if="asset.name !== asset.symbol">
+          {{ t('assets.asset_symbol', { symbol: asset.symbol }) }}
+        </template>
+      </div>
+    </div>
+  </div>
+</template>

@@ -1,0 +1,68 @@
+import type { ComputedRef, MaybeRefOrGetter, Ref } from 'vue';
+import { ofetch } from 'ofetch';
+import { useNfts } from '@/modules/assets/use-asset-nft';
+import { getPublicPlaceholderImagePath } from '@/modules/core/common/file/file';
+
+interface UseNftImageReturnType {
+  shouldRender: ComputedRef<boolean>;
+  isVideo: Readonly<Ref<boolean>>;
+  renderedMedia: ComputedRef<string>;
+}
+
+export function useNftImage(mediaUrl: MaybeRefOrGetter<string | null>): UseNftImageReturnType {
+  const { shouldRenderImage } = useNfts();
+
+  const isMediaVideo = async (url: string): Promise<boolean> => {
+    try {
+      const response = await ofetch.raw(url, { method: 'HEAD' });
+      const contentType = response.headers.get('content-type');
+      return contentType?.startsWith('video') ?? false;
+    }
+    catch {
+      return false;
+    }
+  };
+
+  const placeholder = getPublicPlaceholderImagePath('image.svg');
+
+  const shouldRender = computed<boolean>(() => {
+    const media = toValue(mediaUrl);
+
+    if (!media)
+      return true;
+
+    return shouldRenderImage(media);
+  });
+
+  const checkingType = shallowRef<boolean>(false);
+
+  const isVideo = shallowRef<boolean>(false);
+
+  watch([(): string | null => toValue(mediaUrl), shouldRender], async ([media, shouldRender], [prevMedia, prevShouldRender]) => {
+    if (media === prevMedia && shouldRender === prevShouldRender)
+      return;
+
+    if (!media || !shouldRender) {
+      set(isVideo, false);
+      return;
+    }
+
+    set(checkingType, true);
+    set(isVideo, await isMediaVideo(media));
+    set(checkingType, false);
+  });
+
+  const renderedMedia = computed(() => {
+    const media = toValue(mediaUrl);
+    if (get(checkingType) || !media || !get(shouldRender))
+      return placeholder;
+
+    return media;
+  });
+
+  return {
+    isVideo: readonly(isVideo),
+    renderedMedia,
+    shouldRender,
+  };
+}

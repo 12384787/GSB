@@ -1,0 +1,379 @@
+import type { AppConfig } from '@electron/main/app-config';
+import type { LogService } from '@electron/main/log-service';
+import type { SettingsManager } from '@electron/main/settings-manager';
+import fs from 'node:fs';
+import { IpcCommands } from '@electron/ipc-commands';
+import { assert } from '@rotki/common';
+import { externalLinks } from '@shared/external-links';
+import { DebugStateGroup } from '@shared/ipc';
+import { app, type BaseWindow, BrowserWindow, Menu, type MenuItem, type MenuItemConstructorOptions, shell } from 'electron';
+
+interface MenuManagerListener {
+  onDisplayTrayChanged: (displayTray: boolean) => void;
+}
+
+const DATA_DIRECTORY_ID = 'DATA_DIRECTORY';
+
+function isDirectory(path: string): boolean {
+  if (!path)
+    return false;
+
+  try {
+    return fs.statSync(path).isDirectory();
+  }
+  catch {
+    return false;
+  }
+}
+
+export class MenuManager {
+  private menu: Menu | null = null;
+  private listener: MenuManagerListener | null = null;
+  private readonly separator: MenuItemConstructorOptions = { type: 'separator' };
+  private isPremium: boolean = false;
+  /**
+   * The data directory the running backend resolved, empty until the renderer
+   * reports it. Electron only passes `--data-dir` when the user picked one, so
+   * the platform default is starling's to compute and only it knows the answer
+   * (see `shared/starling/starling-args.ts`). The menu entry stays disabled
+   * rather than guessing a path that would be wrong for dev/nightly builds.
+   */
+  private dataDirectory: string = '';
+
+  constructor(
+    private readonly logger: LogService,
+    private readonly settings: SettingsManager,
+    private readonly config: AppConfig,
+  ) {
+  }
+
+  initialize(listener: MenuManagerListener): void {
+    this.listener = listener;
+    this.updateMenu();
+  }
+
+  cleanup(): void {
+    this.menu?.removeAllListeners();
+    this.menu = null;
+    this.listener = null;
+  }
+
+  updatePremiumStatus(isPremium: boolean): void {
+    this.isPremium = isPremium;
+    this.updateMenu();
+  }
+
+  /**
+   * Point the data directory entry at the directory the backend is using, or
+   * pass an empty string when the backend goes away to disable it again. Only
+   * the entry's enabled state changes, so the menu is not rebuilt: a rebuild on
+   * every connect and disconnect would collapse any open menu.
+   *
+   * @remarks
+   * Anything that is not a real directory disables the entry, because the click handler ends in
+   * `shell.openPath`, which opens a file as readily as a folder. Without the check, a path that
+   * named a file would hand the user's OS a file to open from a menu entry labelled Data Directory.
+   */
+  setDataDirectory(dataDirectory: string): void {
+    this.dataDirectory = isDirectory(dataDirectory) ? dataDirectory : '';
+    const item = this.menu?.getMenuItemById(DATA_DIRECTORY_ID);
+    if (item)
+      item.enabled = !!this.dataDirectory;
+  }
+
+  private updateMenu(): void {
+    this.menu = Menu.buildFromTemplate(this.getMenuTemplate());
+    Menu.setApplicationMenu(this.menu);
+  }
+
+  private openLink(url: string): void {
+    shell.openExternal(url).catch(error => this.logger.error(error));
+  }
+
+  /**
+   * Hands a local path to the OS file manager, logging whichever way it fails.
+   *
+   * @remarks
+   * Both arms are needed. `shell.openPath` reports a failure it reached the OS with by resolving
+   * with a non-empty message rather than by rejecting, so the `then` arm is the usual failure
+   * path and an empty string is success. The `catch` only covers the call itself throwing.
+   */
+  private openPath(path: string): void {
+    shell.openPath(path)
+      .then((error) => {
+        if (error)
+          this.logger.error(`could not open ${path}: ${error}`);
+      })
+      .catch(error => this.logger.error(error));
+  }
+
+  private getMenuTemplate(): MenuItemConstructorOptions[] {
+    const macAppMenu: MenuItemConstructorOptions = {
+      label: app.name,
+      submenu: [
+        { role: 'hide' },
+        { role: 'hideOthers' },
+        { role: 'unhide' },
+        this.separator,
+        { role: 'quit' },
+      ],
+    };
+    return [
+      ...(this.config.isMac ? [macAppMenu] : []),
+      this.getFileMenu(),
+      this.getEditMenu(),
+      this.getViewMenu(),
+      this.getHelpMenu(),
+      ...(this.config.isDev ? [this.getDebugMenu()] : []),
+      // A top-level item cannot be hidden, so it is added and removed instead (electron#8703).
+      ...(!this.isPremium ? [this.getPremiumMenu()] : []),
+    ];
+  }
+
+  private getHelpMenu(): MenuItemConstructorOptions {
+    return {
+      label: '&Help',
+      submenu: [
+        {
+          label: 'Usage Guide',
+          click: () => this.openLink(externalLinks.usageGuide),
+        },
+        {
+          label: 'Frequently Asked Questions',
+          click: () => this.openLink(externalLinks.faq),
+        },
+        this.separator,
+        {
+          label: 'Release Notes',
+          click: () => this.openLink(externalLinks.changeLog),
+        },
+        this.separator,
+        {
+          label: 'Issue / Feature Requests',
+          click: () => this.openLink(externalLinks.githubIssues),
+        },
+        {
+          label: 'Logs Directory',
+          click: () => this.openPath(this.logger.logDirectory),
+        },
+        {
+          id: DATA_DIRECTORY_ID,
+          label: 'Data Directory',
+          enabled: !!this.dataDirectory,
+          click: () => this.openPath(this.dataDirectory),
+        },
+        this.separator,
+        {
+          label: 'Clear Cache',
+          click: (_item: MenuItem, window?: BaseWindow) => {
+            if (!window || !(window instanceof BrowserWindow)) {
+              console.warn('window is not a BrowserWindow');
+              return;
+            }
+
+            this.logger.debug('clearing cache');
+            window.webContents.session.clearCache()
+              .then(() => window.webContents.reloadIgnoringCache())
+              .catch(error => this.logger.error(error));
+          },
+        },
+        {
+          label: 'Reset Settings / Restart Backend',
+          click: (_item: MenuItem, window?: BaseWindow) => {
+            if (!window || !(window instanceof BrowserWindow)) {
+              console.warn('window is not a BrowserWindow');
+              return;
+            }
+
+            window.webContents.session.clearStorageData().then(() => {
+              window.webContents.send(IpcCommands.REQUEST_RESTART);
+            }).catch(error => this.logger.error(error));
+          },
+        },
+        this.separator,
+        {
+          label: 'About',
+          click: (_item: MenuItem, window?: BaseWindow) => {
+            if (!window || !(window instanceof BrowserWindow)) {
+              console.warn('window is not a BrowserWindow');
+              return;
+            }
+
+            window.webContents.send(IpcCommands.ABOUT);
+          },
+        },
+      ],
+    };
+  }
+
+  private getDebugMenu(): MenuItemConstructorOptions {
+    return {
+      label: '&Debug',
+      submenu: [
+        {
+          label: 'Persist store',
+          type: 'checkbox',
+          checked: this.settings.appSettings.persistStore ?? false,
+          click: (item: MenuItem, window?: BaseWindow) => {
+            if (!window || !(window instanceof BrowserWindow)) {
+              console.warn('window is not a BrowserWindow');
+              return;
+            }
+
+            const enabled = item.checked;
+            this.settings.appSettings.persistStore = enabled;
+            this.settings.save();
+            window.webContents.send(IpcCommands.DEBUG_SETTINGS, { persistStore: enabled });
+            window.reload();
+          },
+        },
+        this.separator,
+        {
+          label: 'Reset local state',
+          submenu: [{
+            label: 'First-run state',
+            toolTip: 'Clears dismissals, version and asset-update throttles, then reloads. Backend url, login and preferences are kept.',
+            click: (_item: MenuItem, window?: BaseWindow) => {
+              this.resetDebugState(DebugStateGroup.FIRST_RUN, window);
+            },
+          }],
+        },
+      ],
+    };
+  }
+
+  /**
+   * The renderer owns the key patterns and does the reload, so this only names
+   * the group. Sending it to a window that is not a BrowserWindow is a no-op.
+   */
+  private resetDebugState(group: DebugStateGroup, window?: BaseWindow): void {
+    if (!window || !(window instanceof BrowserWindow)) {
+      console.warn('window is not a BrowserWindow');
+      return;
+    }
+
+    this.logger.debug(`resetting debug state group: ${group}`);
+    window.webContents.send(IpcCommands.RESET_DEBUG_STATE, group);
+  }
+
+  private getPremiumMenu(): MenuItemConstructorOptions {
+    return {
+      label: '&Get rotki Premium',
+      ...(this.config.isMac
+        ? {
+          // submenu is mandatory to be displayed on macOS
+            submenu: [
+              {
+                label: 'Get rotki Premium',
+                id: 'premium-button',
+                click: () => this.openLink(externalLinks.premium),
+              },
+            ],
+          }
+        : {
+            id: 'premium-button',
+            click: () => this.openLink(externalLinks.premium),
+          }),
+    };
+  }
+
+  private getEditMenu(): MenuItemConstructorOptions {
+    const macEditOptions: MenuItemConstructorOptions[] = [
+      { role: 'pasteAndMatchStyle' },
+      { role: 'delete' },
+      { role: 'selectAll' },
+      this.separator,
+      {
+        label: 'Speech',
+        submenu: [{ role: 'startSpeaking' }, { role: 'stopSpeaking' }],
+      },
+    ];
+
+    const editOptions: MenuItemConstructorOptions[] = [
+      { role: 'delete' },
+      this.separator,
+      { role: 'selectAll' },
+    ];
+
+    return {
+      label: '&Edit',
+      submenu: [
+        { role: 'undo' },
+        { role: 'redo' },
+        this.separator,
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        // Macs have special copy/paste and speech functionality
+        ...(this.config.isMac ? macEditOptions : editOptions),
+      ],
+    };
+  }
+
+  private getFileMenu(): MenuItemConstructorOptions {
+    return {
+      label: 'File',
+      submenu: [this.config.isMac ? { role: 'close' } : { role: 'quit' }],
+    };
+  }
+
+  private getViewMenu(): MenuItemConstructorOptions {
+    const minimize: MenuItemConstructorOptions = {
+      id: 'MINIMIZE_TO_TRAY',
+      label: 'Minimize to tray',
+      enabled: this.settings.appSettings.displayTray,
+      click: (_: MenuItem, window?: BaseWindow) => {
+        window?.hide();
+      },
+    };
+
+    const developmentDevTools: MenuItemConstructorOptions[] = [
+      { role: 'reload' },
+      { role: 'forceReload' },
+      { role: 'toggleDevTools' },
+      this.separator,
+    ];
+
+    const productionDevTools: MenuItemConstructorOptions[] = [
+      { role: 'toggleDevTools', visible: false },
+    ];
+
+    const displayTrayIcon: MenuItemConstructorOptions = {
+      label: 'Display Tray Icon',
+      type: 'checkbox',
+      checked: this.settings.appSettings.displayTray,
+      click: (item: MenuItem) => {
+        const displayTray = item.checked;
+        this.settings.appSettings.displayTray = displayTray;
+        this.settings.save();
+
+        const applicationMenu = Menu.getApplicationMenu();
+        if (applicationMenu) {
+          const menuItem = applicationMenu.getMenuItemById('MINIMIZE_TO_TRAY');
+          if (menuItem)
+            menuItem.enabled = displayTray;
+        }
+
+        const listener = this.listener;
+        assert(listener);
+        listener.onDisplayTrayChanged(displayTray);
+      },
+    };
+
+    return {
+      label: '&View',
+      submenu: [
+        ...(this.config.isDev ? developmentDevTools : productionDevTools),
+        { role: 'minimize' },
+        { role: 'resetZoom' },
+        { role: 'zoomIn' },
+        { role: 'zoomOut' },
+        this.separator,
+        { role: 'togglefullscreen' },
+        minimize,
+        this.separator,
+        displayTrayIcon,
+      ],
+    };
+  }
+}

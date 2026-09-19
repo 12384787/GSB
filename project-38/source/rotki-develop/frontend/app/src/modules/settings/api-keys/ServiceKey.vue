@@ -1,0 +1,171 @@
+<script setup lang="ts">
+const {
+  apiKey,
+  hideActions = false,
+  hint = '',
+  label = '',
+  loading = false,
+  name,
+  status,
+  tooltip = '',
+} = defineProps<{
+  apiKey: string;
+  name: string;
+  loading?: boolean;
+  tooltip?: string;
+  hint?: string;
+  label?: string;
+  status?: { message: string; success?: boolean };
+  hideActions?: boolean;
+}>();
+
+const emit = defineEmits<{
+  'delete-key': [value: string];
+  'save': [value: { name: string; apiKey: string }];
+}>();
+
+defineSlots<{
+  default: () => any;
+}>();
+
+const { t } = useI18n({ useScope: 'global' });
+
+const currentValue = ref<string>('');
+const editMode = ref<boolean>(false);
+const cancellable = ref<boolean>(false);
+
+const errorMessages = computed<string[]>(() => {
+  if (!status || status.success)
+    return [];
+  return [status.message];
+});
+
+const successMessages = computed<string[]>(() => {
+  if (!status || !status.success)
+    return [];
+  return [status.message];
+});
+
+function updateStatus() {
+  if (!apiKey) {
+    set(cancellable, false);
+    set(editMode, true);
+  }
+  else {
+    set(cancellable, true);
+    set(editMode, false);
+  }
+  set(currentValue, apiKey);
+}
+
+function saveHandler() {
+  if (get(editMode) || hideActions) {
+    emit('save', {
+      apiKey: get(currentValue),
+      name,
+    });
+
+    if (!status || status?.success) {
+      set(editMode, false);
+      set(cancellable, true);
+    }
+  }
+  else {
+    set(editMode, true);
+  }
+}
+
+function cancel() {
+  set(editMode, false);
+  set(currentValue, apiKey);
+}
+
+onMounted(() => {
+  updateStatus();
+});
+
+watch(() => apiKey, () => {
+  updateStatus();
+});
+
+watch(() => status, (newStatus) => {
+  if (newStatus && !newStatus.success)
+    set(editMode, true);
+});
+
+defineExpose({
+  currentValue,
+  saveHandler,
+});
+</script>
+
+<template>
+  <div class="flex flex-col gap-4">
+    <div
+      class="flex items-start gap-4"
+      data-testid="service-key-content"
+    >
+      <RuiRevealableTextField
+        v-model.trim="currentValue"
+        variant="outlined"
+        color="primary"
+        class="grow"
+        data-testid="service-key-api-key"
+        :text-color="!editMode && !hideActions && errorMessages.length === 0 ? 'success' : undefined"
+        :error-messages="errorMessages"
+        :success-messages="successMessages"
+        :hint="currentValue ? '' : hint"
+        :disabled="!editMode && !hideActions"
+        :label="label"
+        prepend-icon="lu-key"
+      />
+
+      <RuiTooltip
+        v-if="!hideActions"
+        :open-delay="400"
+        :options="{ placement: 'top' }"
+      >
+        <template #activator>
+          <RuiButton
+            icon
+            variant="text"
+            data-testid="service-key-delete"
+            class="mt-1"
+            :disabled="loading || !apiKey"
+            color="primary"
+            @click="emit('delete-key', name)"
+          >
+            <RuiIcon name="lu-trash-2" />
+          </RuiButton>
+        </template>
+        {{ tooltip }}
+      </RuiTooltip>
+    </div>
+
+    <div
+      v-if="!hideActions"
+      class="flex gap-2"
+      data-testid="service-key-buttons"
+    >
+      <RuiButton
+        v-if="editMode && cancellable"
+        data-testid="service-key-cancel"
+        variant="outlined"
+        color="primary"
+        @click="cancel()"
+      >
+        {{ t('common.actions.cancel') }}
+      </RuiButton>
+
+      <RuiButton
+        data-testid="service-key-save"
+        color="primary"
+        :disabled="(editMode && !currentValue) || loading"
+        @click="saveHandler()"
+      >
+        {{ editMode ? t('common.actions.save') : t('common.actions.edit') }}
+      </RuiButton>
+    </div>
+    <slot v-if="$slots.default" />
+  </div>
+</template>

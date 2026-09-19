@@ -1,0 +1,92 @@
+import { NotificationGroup } from '@rotki/common';
+import { startPromise } from '@shared/utils';
+import { isEqual } from 'es-toolkit';
+import { useConnectedExchangesStore } from '@/modules/balances/exchanges/use-connected-exchanges-store';
+import { useRefWithDebounce } from '@/modules/core/common/use-ref-debounce';
+import { useNotifications } from '@/modules/core/notifications/use-notifications';
+import { useHistoricalBalances } from '@/modules/history/balances/use-historical-balances';
+import { useHistoryEventsStatus } from '@/modules/history/events/use-history-events-status';
+import { useUnmatchedAssetMovements } from '@/modules/history/events/use-unmatched-asset-movements';
+import { useUnmatchedBridgeTransactions } from '@/modules/history/events/use-unmatched-bridge-transactions';
+import { useHistoryDataFetching } from '@/modules/history/use-history-data-fetching';
+import { useHistoryStore } from '@/modules/history/use-history-store';
+import { useProtocolCacheStatusStore } from '@/modules/history/use-protocol-cache-status-store';
+import { ActivityKind } from '@/modules/task-center/core/types';
+import { useTaskCenter } from '@/modules/task-center/use-task-center';
+
+const HISTORY_EVENTS_MODIFIED_DEBOUNCE_MS = 15_000;
+
+export function useHistoryWatchers(): void {
+  const { processing } = useHistoryEventsStatus();
+  const { fetchTransactionStatusSummary } = useHistoryDataFetching();
+  const historyStore = useHistoryStore();
+  const { hasUnprocessedModifications } = storeToRefs(historyStore);
+  const { triggerAssetMovementAutoMatching } = useUnmatchedAssetMovements();
+  const { triggerBridgeAutoMatching } = useUnmatchedBridgeTransactions();
+  const { triggerHistoricalBalancesProcessing } = useHistoricalBalances();
+  const { connectedExchanges } = storeToRefs(useConnectedExchangesStore());
+  const { removeMatching } = useNotifications();
+  const router = useRouter();
+
+  const processingDebounced = useRefWithDebounce(processing, 500);
+
+  const { useIsActive } = useTaskCenter();
+  const refreshProtocolCacheTaskRunning = useIsActive(ActivityKind.PROTOCOL_CACHE);
+  const protocolCacheStore = useProtocolCacheStatusStore();
+  const { protocolCacheUpdateStatus } = storeToRefs(protocolCacheStore);
+
+  watch(refreshProtocolCacheTaskRunning, (curr, prev) => {
+    if (
+      !curr &&
+      prev &&
+      !Object.values(get(protocolCacheUpdateStatus)).some(entry => entry.cancelled)
+    ) {
+      protocolCacheStore.resetProtocolCacheUpdatesStatus();
+    }
+  });
+
+  // Debounced reprocessing after manual event modifications
+  watchDebounced(
+    () => historyStore.eventsVersion,
+    () => {
+      if (get(hasUnprocessedModifications)) {
+        historyStore.acknowledgeModifications();
+        startPromise(triggerHistoricalBalancesProcessing());
+      }
+    },
+    { debounce: HISTORY_EVENTS_MODIFIED_DEBOUNCE_MS },
+  );
+
+  watch(
+    [processing, connectedExchanges],
+    async (
+      [currentProcessing, connectedExchanges],
+      [previousProcessing, previousConnectedExchanges],
+    ) => {
+      if (
+        currentProcessing !== previousProcessing ||
+        !isEqual(connectedExchanges, previousConnectedExchanges)
+      ) {
+        await fetchTransactionStatusSummary();
+      }
+    },
+  );
+
+  watch(processingDebounced, async (processing, wasProcessing) => {
+    if (!processing && wasProcessing) {
+      historyStore.acknowledgeModifications();
+      await triggerHistoricalBalancesProcessing();
+      await triggerAssetMovementAutoMatching();
+      await triggerBridgeAutoMatching();
+    }
+  });
+
+  watchImmediate(router.currentRoute, (to) => {
+    if (to.name === '/history/events/') {
+      removeMatching(
+        notification => notification.group === NotificationGroup.UNMATCHED_ASSET_MOVEMENTS
+          || notification.group === NotificationGroup.UNMATCHED_BRIDGE_TRANSACTIONS,
+      );
+    }
+  });
+}

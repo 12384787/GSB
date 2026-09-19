@@ -1,0 +1,779 @@
+import datetime
+import json
+import logging
+import os
+import re
+import shutil
+import sys
+import sysconfig
+import tempfile
+import threading
+import warnings as test_warnings
+from contextlib import contextmanager, suppress
+from enum import auto
+from functools import wraps
+from http import HTTPStatus
+from pathlib import Path
+from subprocess import PIPE, Popen, check_output  # noqa: S404
+from typing import TYPE_CHECKING, Any, Final
+from urllib.parse import parse_qs, urlparse
+
+import freezegun
+import freezegun.config
+import py
+import pytest
+from eth_utils import to_checksum_address
+
+from rotkehlchen.assets import asset as asset_module
+from rotkehlchen.chain.ethereum.modules.eth2.beacon import BeaconNode
+from rotkehlchen.config import default_data_directory
+from rotkehlchen.constants import resolver as resolver_module
+from rotkehlchen.errors.misc import RemoteError
+from rotkehlchen.errors.serialization import DeserializationError
+from rotkehlchen.externalapis.coingecko import Coingecko
+from rotkehlchen.externalapis.cryptocompare import Cryptocompare
+from rotkehlchen.externalapis.defillama import Defillama
+from rotkehlchen.feature_flags import is_accounting_update_enabled
+from rotkehlchen.logging import TRACE, RotkehlchenLogsAdapter, add_logging_level, configure_logging
+from rotkehlchen.tests.utils.args import default_args
+from rotkehlchen.utils.mixins.enums import SerializableEnumNameMixin
+from rotkehlchen.utils.network import create_session
+from rotkehlchen.utils.rate_limiter import TokenBucket
+from rotkehlchen.utils.serialization import jsonloads_dict
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
+    from vcr import VCR
+
+
+# freezegun's default ignore list contains 'threading', and its call-stack inspection
+# looks only 5 frames up: any time call made near the top of a task thread's stack sees
+# the threading bootstrap frames and silently gets the REAL time instead of the frozen
+# one. Greenlets had detached stacks so this never triggered before the gevent removal,
+# but now every business-logic task runs on a thread and must see the frozen clock.
+# Thread timeout machinery is unaffected as CPython threading uses time.monotonic,
+# which freezegun does not patch.
+freezegun.configure(default_ignore_list=[
+    entry for entry in freezegun.config.DEFAULT_IGNORE_LIST if entry != 'threading'
+])
+
+
+def _make_vcr_thread_safe() -> None:
+    """Serialize vcrpy's global unpatch/repatch windows against connection checkout.
+
+    vcrpy's force_reset() (vcr/patch.py) REMOVES all VCR patches process-wide and
+    reapplies them afterwards. It runs on every stub connection creation and every
+    passthrough send -- including the ignore_localhost requests our tests use to poll
+    the API server. Under gevent only one OS thread existed so nothing could observe
+    the unpatched window, but with real threads a background task's outbound request
+    can race into it, construct a real (unstubbed) connection and hit the live network
+    while a cassette is supposedly recording/playing.
+
+    Guard both sides with one re-entrant lock: force_reset holds it for the whole
+    unpatch->work->repatch cycle, and the cassette's patched _get_conn/_new_conn
+    wrappers hold it while checking out a connection, so a connection can never be
+    created or class-checked inside another thread's unpatched window. The RLock
+    keeps the nested case (stub __init__ calling force_reset inside a locked
+    checkout on the same thread) deadlock-free.
+    """
+    import vcr.patch  # import here to keep the patching self-contained
+
+    vcr_reset_lock = threading.RLock()
+    original_force_reset = vcr.patch.force_reset
+
+    @contextmanager
+    def locked_force_reset() -> Iterator[None]:
+        with vcr_reset_lock, original_force_reset():
+            yield
+
+    vcr.patch.force_reset = locked_force_reset
+
+    def make_locked(original_method: Callable) -> Callable:
+        def locked_method(self: Any, *args: Any, **kwargs: Any) -> Callable:
+            inner = original_method(self, *args, **kwargs)
+
+            @wraps(inner)
+            def wrapper(*inner_args: Any, **inner_kwargs: Any) -> Any:
+                with vcr_reset_lock:
+                    return inner(*inner_args, **inner_kwargs)
+
+            return wrapper
+        return locked_method
+
+    builder = vcr.patch.CassettePatcherBuilder
+    builder._patched_get_conn = make_locked(builder._patched_get_conn)
+    builder._patched_new_conn = make_locked(builder._patched_new_conn)
+
+
+_make_vcr_thread_safe()
+logger = logging.getLogger(__name__)
+log = RotkehlchenLogsAdapter(logger)
+
+TESTS_ROOT_DIR: Final = Path(__file__).parent
+SUBPROCESS_TIMEOUT: Final = 30
+DB_SETTINGS_REGEX: Final = re.compile(r'-db_settings[^]]*|\[db_settings[^]]*\]')
+
+
+def _assert_gil_remains_disabled() -> None:
+    if sysconfig.get_config_var('Py_GIL_DISABLED') == 1:
+        assert not sys._is_gil_enabled(), 'A native dependency enabled the GIL'
+
+
+@pytest.fixture(autouse=True, scope='session')
+def _fixture_gil_remains_disabled() -> Iterator[None]:
+    """Ensure native dependencies do not enable the GIL during the test session."""
+    _assert_gil_remains_disabled()
+    yield
+    _assert_gil_remains_disabled()
+
+
+def _normalize_solana_rpc_uri(uri: str) -> str:
+    """Ignore the root slash that VCR.py 8.2's HTTPX transport no longer preserves."""
+    return uri.removesuffix('/')
+
+
+def _normalize_solana_rpc_payload(payload: Any) -> Any:
+    """Normalize semantically equivalent Solana JSON-RPC request payloads."""
+    if isinstance(payload, dict):
+        result = {
+            key: _normalize_solana_rpc_payload(value)
+            for key, value in payload.items()
+            if key != 'id'
+        }
+        for default_none_key in ('dataSlice', 'minContextSlot', 'sortResults', 'withContext'):
+            if result.get(default_none_key) is None:
+                result.pop(default_none_key, None)
+        if result.get('commitment') == 'finalized':
+            result.pop('commitment')
+        if result.get('encoding') == 'base58':
+            result.pop('encoding')
+        if (
+            result.get('jsonrpc') == '2.0' and
+            'method' in result and
+            result.get('params') == []
+        ):
+            result.pop('params')
+        return result
+    if isinstance(payload, list):
+        return [_normalize_solana_rpc_payload(item) for item in payload]
+    return payload
+
+
+class TestEnvironment(SerializableEnumNameMixin):
+    __test__ = False  # tell pytest not to collect this class
+
+    STANDARD = auto()  # test during normal development
+    NIGHTLY = auto()  # all tests
+    NFTS = auto()  # nft tests
+
+
+add_logging_level('TRACE', TRACE)
+configure_logging(default_args())
+# sql instructions for global DB are customizable here:
+# https://github.com/rotki/rotki/blob/eb5bef269207e8b84075ee36ce7c3804115ed6a0/rotkehlchen/tests/fixtures/globaldb.py#L33
+
+from rotkehlchen.tests.fixtures import *  # noqa: F403
+
+assert sys.version_info.major == 3, 'Need to use python 3 for rotki'
+assert sys.version_info.minor == 14, 'Need to use python 3.14 for rotki'
+
+
+@pytest.fixture(name='force_beacon_rpc_fallback')
+def fixture_force_beacon_rpc_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep a beacon node configured but make its queries fail.
+
+    This lets VCR tests continue exercising the recorded beaconcha.in paths while
+    also covering the beacon RPC -> beaconcha.in fallback introduced for eth2.
+    """
+    def set_rpc_endpoint(node: BeaconNode, rpc_endpoint: str) -> None:
+        node.session = create_session()
+        node.rpc_endpoint = rpc_endpoint.rstrip('/')
+
+    def fail_beacon_rpc(*args: Any, **kwargs: Any) -> None:  # pylint: disable=unused-argument
+        raise RemoteError('Beacon RPC intentionally disabled in test')
+
+    monkeypatch.setattr(BeaconNode, 'set_rpc_endpoint', set_rpc_endpoint)
+    monkeypatch.setattr(BeaconNode, 'query', fail_beacon_rpc)
+    monkeypatch.setattr(BeaconNode, 'query_chunked', fail_beacon_rpc)
+    monkeypatch.setattr(BeaconNode, 'query_validators_by_id', fail_beacon_rpc)
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        '--initial-port',
+        type=int,
+        default=29870,
+        help='Base port number used to avoid conflicts while running parallel tests.',
+    )
+    parser.addoption(
+        '--no-network-mocking',
+        action='store_true',
+        help='If set then all tests that are aware of their mocking the network will not do that. Use this in order to easily skip mocks and test that using the network, the remote queries are still working fine and mocks dont need any changing.',  # noqa: E501
+    )
+    parser.addoption('--profiler', default=None, choices=['flamegraph-trace'])
+
+
+@pytest.fixture(scope='session', autouse=True)
+def _asset_case_diagnostics() -> Iterator[None]:
+    """Turn asset identifier casing diagnostics into hard failures for the whole suite.
+
+    Asset identifiers are compared exactly, so one that reaches the core without having been
+    normalized silently matches nothing. This catches both halves of that: an unchecksummed
+    EVM address at the point it is formatted into an identifier (the cause), and two
+    identifiers differing only in casing at the point they are compared (the symptom).
+
+    Catching the cause matters more than catching the symptom, since the symptom additionally
+    needs the bad identifier to meet its correctly-cased twin, while the cause fires on its own.
+    """
+    def raise_on_case_mismatch(first: str, second: str) -> None:
+        if first.lower() == second.lower():
+            raise AssertionError(
+                f'Asset identifiers {first} and {second} differ only in casing. An identifier '
+                f'reached comparison without being normalized. Normalize it at the boundary '
+                f'via check_existence()/resolve_*()/to_checksum_address().',
+            )
+
+    def raise_on_non_checksummed_address(address: str) -> None:
+        try:
+            checksummed = to_checksum_address(address)
+        except (ValueError, TypeError):
+            return  # not an EVM address at all, which is not what this check is about
+
+        if address != checksummed:
+            raise AssertionError(
+                f'Non-checksummed EVM address {address} used to build an asset identifier. '
+                f'Expected {checksummed}. The identifier built from it will not compare equal '
+                f'to the canonical one for the same address.',
+            )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(asset_module, 'ASSET_CASE_DIAGNOSTICS', True)
+        monkeypatch.setattr(asset_module, 'report_case_mismatch', raise_on_case_mismatch)
+        monkeypatch.setattr(resolver_module, 'ASSET_CASE_DIAGNOSTICS', True)
+        monkeypatch.setattr(
+            resolver_module,
+            'report_non_checksummed_address',
+            raise_on_non_checksummed_address,
+        )
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _bypass_rate_limiter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disable rate-limit machinery in tests:
+    1. TokenBucket.acquire() — production pacing exists to throttle real HTTP
+       calls against free-tier ceilings. Mocked tests respond instantly so
+       the bucket's sleep becomes pure overhead.
+    2. The per-client _maybe_probe() tier-discovery HTTP requests on
+       Coingecko / Cryptocompare / Defillama. Cryptocompare in particular
+       hits /stats/rate/limit unconditionally on first use; in CI that
+       request escapes VCR cassettes (cassette miss → test fails) and on
+       non-VCR tests it waits the full connect+read timeout, accumulating
+       over the suite into multi-minute-per-test stalls.
+
+    test_rate_limiter.py overrides this fixture so its tests exercise the
+    real acquire()/widen()/shrink behaviour.
+    """
+    monkeypatch.setattr(TokenBucket, 'acquire', lambda self: None)
+    for client in (Coingecko, Cryptocompare, Defillama):
+        monkeypatch.setattr(client, '_maybe_probe', lambda self: None)
+
+
+if sys.platform == 'darwin':
+    # On macOS the temp directory base path is already very long.
+    # To avoid failures on ipc tests (ipc path length is limited to 104/108 chars on macOS/linux)
+    # we override the pytest tmpdir machinery to produce shorter paths.
+
+    @pytest.fixture(scope='session', autouse=True)
+    def _tmpdir_short(request):
+        """Shorten tmpdir paths"""
+
+        def getbasetemp(self):
+            """ return base temporary directory. """
+            try:
+                return self._basetemp
+            except AttributeError:
+                basetemp = self.config.option.basetemp
+                if basetemp:
+                    basetemp = py.path.local(basetemp)  # pylint: disable=no-member
+                    if basetemp.check():
+                        basetemp.remove()
+                    basetemp.mkdir()
+                else:
+                    rootdir = py.path.local.get_temproot()  # pylint: disable=no-member
+                    rootdir.ensure(dir=1)
+                    basetemp = py.path.local.make_numbered_dir(  # pylint: disable=no-member
+                        prefix='pyt',
+                        rootdir=rootdir,
+                    )
+                self._basetemp = t = basetemp.realpath()
+                self.trace('new basetemp', t)
+                return t
+
+        pytest.TempdirFactory.getbasetemp = getbasetemp
+        with suppress(AttributeError):
+            del request.config._tmpdirhandler._basetemp
+
+    @pytest.fixture
+    def tmpdir(request, tmpdir_factory):
+        """Return a temporary directory path object
+        which is unique to each test function invocation,
+        created as a sub directory of the base temporary
+        directory.  The returned object is a `py.path.local`_
+        path object.
+        # pytest-deadfixtures ignore
+        """
+        name = request.node.name
+        name = re.sub(r'[\W]', '_', name)
+        max_val = 1
+        if len(name) > max_val:
+            name = name[:max_val]
+        return tmpdir_factory.mktemp(name, numbered=True)
+
+
+@pytest.fixture(autouse=True, scope='session', name='profiler')
+def _fixture_profiler(request):
+    profiler_instance = None
+    stack_stream = None
+
+    if request.config.option.profiler is None:
+        yield  # no profiling
+    elif request.config.option.profiler != 'flamegraph-trace':
+        raise ValueError(f'Gave unknown profiler option: {request.config.option.profiler}')
+    else:  # flamegraph profiler on
+        from tools.profiling.sampler import (  # pylint: disable=import-outside-toplevel
+            FlameGraphCollector,
+            TraceSampler,
+        )
+
+        now = datetime.datetime.now(tz=datetime.UTC)
+        tmpdirname = tempfile.gettempdir()
+        stack_path = Path(tmpdirname) / f'{now:%Y%m%d_%H%M}_stack.data'
+        with open(stack_path, 'w', encoding='utf8') as stack_stream:
+            test_warnings.warn(UserWarning(
+                f'Stack data is saved at: {stack_path}',
+            ))
+            flame = FlameGraphCollector(stack_stream)
+            profiler_instance = TraceSampler(flame)
+            yield
+
+            if profiler_instance is not None:
+                profiler_instance.stop()
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if is_accounting_update_enabled():
+        return
+
+    skip_accounting_update = pytest.mark.skip(
+        reason='Accounting update tests require ROTKI_ACCOUNTING_UPDATE=True',
+    )
+    for item in items:
+        if 'accounting_update' in item.keywords:
+            item.add_marker(skip_accounting_update)
+
+
+def pytest_terminal_summary(terminalreporter: Any) -> None:
+    """Report interactions dropped while recording, since the cassette is then incomplete.
+
+    A dropped interaction is invisible at record time: the run passes because the code
+    falls back to another provider, and the gap only surfaces later as a confusing
+    CannotOverwriteExistingCassetteException on replay.
+    """
+    if len(DISCARDED_RECORDINGS) == 0:
+        return
+
+    terminalreporter.section('VCR recording warnings', red=True)
+    terminalreporter.write_line(
+        f'Discarded {len(DISCARDED_RECORDINGS)} transient failure(s) while recording. The '
+        f'cassettes just written are INCOMPLETE and will fail on replay, since the code '
+        f'fell back to another provider that was not recorded. Re-record them once the '
+        f'service below answers again:',
+    )
+    for entry in DISCARDED_RECORDINGS:
+        terminalreporter.write_line(f'  {entry}')
+
+
+def requires_env(allowed_envs: list[TestEnvironment]):
+    """Conditionally run tests if the environment is in the list of allowed environments"""
+    try:
+        env = TestEnvironment.deserialize(os.environ.get('TEST_ENVIRONMENT', 'standard'))
+    except DeserializationError:
+        env = TestEnvironment.STANDARD
+
+    return pytest.mark.skipif(
+        'CI' in os.environ and env not in allowed_envs,
+        reason=f'Not suitable environment {env} for current test',
+    )
+
+
+def get_cassette_dir(request: pytest.FixtureRequest) -> Path:
+    """
+    Directory structure for cassettes in each test file resembles the file's path
+    e.g. for tests in       `tests/unit/decoders/test_aave.py`
+         cassettes are in   `cassettes/unit/decoders/test_aave/`
+    """
+    return Path(request.node.path).relative_to(TESTS_ROOT_DIR).with_suffix('')
+
+
+# populated while recording, reported by pytest_terminal_summary
+DISCARDED_RECORDINGS: Final[list[str]] = []
+
+
+def should_discard_recorded_response(response: dict[str, Any]) -> bool:
+    """Whether a response is a transient failure that must not be written to a cassette"""
+    status = response['status']['code']
+
+    return (
+        (
+            'RECORD_CASSETTES' in os.environ
+            and (
+                status == HTTPStatus.TOO_MANY_REQUESTS
+                or 500 <= status < 600  # transient http status errors
+            )
+        )
+        or is_etherscan_rate_limited(response)
+    )
+
+
+def is_etherscan_rate_limited(response: dict[str, Any]) -> bool:
+    """Checks if etherscan is rate limited.
+    Suppression is for errors parsing when response does not match etherscan"""
+    rate_limited = False
+    with suppress(json.JSONDecodeError, KeyError, UnicodeDecodeError, ValueError, TypeError):
+        body = jsonloads_dict(response['body']['string'])
+        rate_limited = (
+            int(body.get('status', 0)) == 0 and
+            (body_result := body.get('result', None)) is not None and
+            'rate limit reached' in body_result
+        )
+    return rate_limited
+
+
+@pytest.fixture
+def vcr_cassette_name(request: pytest.FixtureRequest) -> str:
+    """
+    When adding more indexers to certain chains we use this fixture to avoid encoding
+    the settings fixture into the name of the cassette so we don't have to rename
+    all the VCR files.
+
+    Fixture is used indirectly by pytest-vcr
+    # pytest-deadfixtures ignore
+    """
+    callspec = getattr(request.node, 'callspec', None)
+    db_settings = getattr(callspec, 'params', {}).get('db_settings', None) if callspec else None
+    if isinstance(db_settings, dict) and 'evm_indexers_order' in db_settings:
+        # drop any `[db_settings...` segment, keep the rest (e.g., optimism_accounts)
+        return DB_SETTINGS_REGEX.sub('', request.node.name)
+
+    return request.node.name
+
+
+@pytest.fixture(scope='module', name='vcr')
+def vcr_fixture(vcr: VCR) -> VCR:
+    """
+    Update VCR instance to discard error responses during the record mode.
+    This target directly etherscan that is the service we are first focusing on
+    # pytest-deadfixtures ignore
+    """
+
+    last_request_uri = ['']  # best-effort label for a discarded response
+
+    def before_record_request(request: Any) -> Any:
+        last_request_uri[0] = request.uri
+        return request
+
+    def before_record_response(response: dict[str, Any]) -> dict[str, Any] | None:
+        if should_discard_recorded_response(response):
+            DISCARDED_RECORDINGS.append(
+                f'{response["status"]["code"]} {last_request_uri[0]}',
+            )
+            return None
+
+        return response
+
+    # the built-in filters (filter_query_parameters etc.) still run before this one
+    vcr.before_record_request = before_record_request
+    vcr.before_record_response = before_record_response
+
+    def beaconchain_matcher(r1, r2):
+        """
+        Special matcher to match beaconcha.in validator query bodies
+        no matter the order of validator identifiers.
+        """
+        if (
+            r1.uri.startswith('https://beaconcha.in/api/v2/ethereum/') and
+            r2.uri.startswith('https://beaconcha.in/api/v2/ethereum/')
+        ):
+            body1 = json.loads(r1.body.decode())
+            body2 = json.loads(r2.body.decode())
+            validator1 = body1.get('validator', {})
+            validator2 = body2.get('validator', {})
+            if (
+                (identifiers1 := validator1.get('validator_identifiers')) is not None and
+                (identifiers2 := validator2.get('validator_identifiers')) is not None
+            ):
+                validator1['validator_identifiers'] = sorted(identifiers1)
+                validator2['validator_identifiers'] = sorted(identifiers2)
+
+            return r1.uri == r2.uri and body1 == body2
+
+        return etherscan_matcher(r1, r2)  # other queries in these tests may also be etherscan
+
+    def alchemy_api_matcher(r1, r2):
+        """Match Alchemy price API paths, ignoring API key."""
+        if (
+            (base_url := 'https://api.g.alchemy.com/prices/v1/') and
+            r1.uri.startswith(base_url) and
+            r2.uri.startswith(base_url)
+        ):
+            # Extract everything after API key by finding second '/' after base_url
+            path1 = r1.uri[r1.uri.find('/', len(base_url)) + 1:]
+            path2 = r2.uri[r2.uri.find('/', len(base_url)) + 1:]
+            return path1 == path2 and r1.method == r2.method
+        return r1.uri == r2.uri and r1.method == r2.method
+
+    def github_branch_matcher(r1, r2):
+        """Match GitHub raw URLs, ignoring the branch part."""
+        base_url = 'https://raw.githubusercontent.com/rotki/data/'
+        if r1.uri.startswith(base_url) and r2.uri.startswith(base_url):
+            # Extract path after the base URL
+            path1 = r1.uri[len(base_url):].split('/')
+            path2 = r2.uri[len(base_url):].split('/')
+            # Compare everything except the branch (first part after base_url)
+            return path1[1:] == path2[1:] and r1.method == r2.method
+        return r1.uri == r2.uri and r1.method == r2.method
+
+    def match_rpc_calls(r1, r2):
+        """Match RPC calls without transport IDs and support accompanying indexer requests."""
+        if r1.body is None or r2.body is None:
+            return r1.body == r2.body and etherscan_matcher(r1, r2)
+
+        b1, b2 = json.loads(r1.body), json.loads(r2.body)
+        if 'id' in b1:
+            b1.pop('id')
+        if 'id' in b2:
+            b2.pop('id')
+
+        return r1.uri == r2.uri and b1 == b2
+
+    def solana_rpc_matcher(r1, r2):
+        """Match Solana JSON-RPC calls by method/params while ignoring request id."""
+        if 'solana' not in r1.uri and 'solana' not in r2.uri:
+            return etherscan_matcher(r1, r2)
+        if (
+            _normalize_solana_rpc_uri(r1.uri) != _normalize_solana_rpc_uri(r2.uri) or
+            r1.method != r2.method
+        ):
+            return False
+
+        try:
+            b1 = _normalize_solana_rpc_payload(json.loads(r1.body))
+            b2 = _normalize_solana_rpc_payload(json.loads(r2.body))
+        except (TypeError, json.JSONDecodeError):
+            return r1.body == r2.body
+
+        return b1 == b2
+
+    def etherscan_matcher(r1, r2):
+        """Match Etherscan API calls with case-insensitive query parameters.
+        This allows old VCR cassettes to still work after refactoring some of the etherscan
+        code into the EtherscanLikeApi class, which uses lowercase query parameters to work
+        properly with Blockscout.
+        """
+        uri_pair = f'{r1.uri} {r2.uri}'
+        if 'solana' in uri_pair:
+            return (
+                _normalize_solana_rpc_uri(r1.uri) == _normalize_solana_rpc_uri(r2.uri) and
+                r1.method == r2.method
+            )
+        if 'etherscan.io' not in uri_pair and 'blockscout.com' not in uri_pair:
+            return r1.uri == r2.uri and r1.method == r2.method
+
+        # Check base URL (scheme + netloc + path) matches
+        parsed1, parsed2 = urlparse(r1.uri), urlparse(r2.uri)
+        if (
+            parsed1.scheme != parsed2.scheme or
+            parsed1.netloc != parsed2.netloc or
+            parsed1.path != parsed2.path or
+            r1.method != r2.method
+        ):
+            return False
+
+        def normalized_query_params(query: str) -> dict[str, list[str]]:
+            return {
+                k.lower(): v for k, v in parse_qs(query).items()
+                if k.lower() not in {'apikey', 'api_key'}
+            }
+
+        params1 = normalized_query_params(parsed1.query)
+        params2 = normalized_query_params(parsed2.query)
+        # Existing cassettes may not have explicit default pagination params. Allow matching
+        # only when one side omits the param and the other side has the newly-added default.
+        # If both sides specify pagination, compare it normally so non-default pages don't
+        # accidentally match.
+        for key, default_values in (('page', {'1'}), ('offset', {'1000', '10000'})):
+            if key not in params1 and key in params2 and set(params2[key]).issubset(default_values):  # noqa: E501
+                params2.pop(key)
+            elif key not in params2 and key in params1 and set(params1[key]).issubset(default_values):  # noqa: E501
+                params1.pop(key)
+
+        return params1 == params2
+
+    vcr.register_matcher('alchemy_api_matcher', alchemy_api_matcher)
+    vcr.register_matcher('beaconchain_matcher', beaconchain_matcher)
+    vcr.register_matcher('github_branch_matcher', github_branch_matcher)
+    vcr.register_matcher('match_rpc_calls', match_rpc_calls)
+    vcr.register_matcher('solana_rpc_matcher', solana_rpc_matcher)
+    vcr.register_matcher('etherscan_matcher', etherscan_matcher)
+    return vcr
+
+
+@pytest.fixture(scope='session')
+def vcr_config() -> dict[str, Any]:
+    """
+    vcrpy config
+    - record_mode: allow rewriting multiple cassettes using CASSETTE_REWRITE_PATH env variable
+    - decode_compressed_response: True to correctly inspect the responses
+    - ignore_localhost: Don't record queries made to localhost
+    - match_on: Use custom matcher for etherscan APIs with case-insensitive query parameters
+    # pytest-deadfixtures ignore
+    ^^^ this allows our fork of pytest-deadfixtures to ignore this fixture for usage detection
+    since it cannot detect dynamic usage (request.getfixturevalue) in pytest-recording
+    """
+    if 'RECORD_CASSETTES' in os.environ:
+        record_mode = 'once'
+    else:
+        record_mode = 'none'
+
+    return {
+        'record_mode': record_mode,
+        'decode_compressed_response': True,
+        'ignore_localhost': True,
+        'filter_query_parameters': ['apikey', 'api_key'],
+        # redact api key headers (e.g. Moralis' X-API-Key) so they never enter cassettes
+        'filter_headers': [('X-API-Key', 'DUMMY')],
+        'match_on': ['etherscan_matcher'],
+    }
+
+
+def get_branch_distance(branch1: str, branch2: str) -> int:
+    """Get the distance between branch1 and branch2 in number of commits"""
+    merge_base = check_output(
+        args=f'git merge-base {branch1} {branch2}',
+        shell=True,
+    ).decode('utf-8').strip()
+    distance_to_branch1 = int(check_output(
+        args=f'git rev-list --count {merge_base}..{branch1}',
+        shell=True,
+    ).decode('utf-8').strip())
+    distance_to_branch2 = int(check_output(
+        args=f'git rev-list --count {merge_base}..{branch2}',
+        shell=True,
+    ).decode('utf-8').strip())
+    return distance_to_branch1 + distance_to_branch2
+
+
+def find_closest_branch(target_branch: str) -> str:
+    """Find the branch among develop and bugfixes that is closer to target_branch"""
+    all_branches = ('develop', 'bugfixes', 'master')
+    distances = {branch: get_branch_distance(branch, target_branch) for branch in all_branches}
+    return min(distances, key=distances.get)  # type: ignore
+
+
+@pytest.fixture(scope='session', name='vcr_base_dir')
+def fixture_vcr_base_dir() -> Path:
+    """Determine the base dir for vcr cassettes
+    # pytest-deadfixtures ignore
+    """
+    depth_arg = ''  # In local environment we fetch all history to avoid making the local repo a shallow clone  # noqa: E501
+    if 'CI' in os.environ and 'CASSETTES_DIR' in os.environ:
+        # the CI action Ensure VCR branch is fully rebased handles it. Do nothing
+        # Also important since running this with xdist and -n X then this runs X
+        # times and causes the CI to fail dueto inconsistencies and multi cloning
+        return Path(os.environ['CASSETTES_DIR']) / 'cassettes'
+
+    current_branch = os.environ.get('VCR_BRANCH')
+    root_dir = default_data_directory().parent / 'test-caching'
+    base_dir = root_dir / 'cassettes'
+
+    # Clone repo if needed
+    if (root_dir / '.git').exists() is False:
+        if root_dir.exists():  # test-caching dir exists but is not a git repo
+            shutil.rmtree(root_dir)  # that means accounting rules or other test-caching was pulled first. Delete and repull.  # noqa: E501
+
+        cmd = f'git clone https://github.com/rotki/test-caching.git "{root_dir}"'
+        log.debug(f'Cloning test caching repo to {root_dir}')
+        os.popen(cmd).read()
+
+    if current_branch is None:
+        current_branch = os.popen('git rev-parse --abbrev-ref HEAD').read().rstrip('\n')
+    log.debug(f'At VCR setup, {current_branch=} {root_dir=}')
+
+    checkout_proc = Popen(f'cd "{root_dir}" && git fetch {depth_arg} origin && git checkout {current_branch}', env=dict(os.environ, LANG='en_US.UTF-8'), shell=True, stdout=PIPE, stderr=PIPE)  # noqa: E501
+    _, stderr = checkout_proc.communicate(timeout=SUBPROCESS_TIMEOUT)
+
+    if (
+        len(stderr) != 0 and
+        b'Already on' not in stderr and
+        b'Switched to' not in stderr
+    ):
+        fallback_branch = find_closest_branch(current_branch)  # either master, develop or bugfixes but always the closest  # noqa: E501
+        default_branch = os.environ.get('GITHUB_BASE_REF', os.environ.get('DEFAULT_VCR_BRANCH', fallback_branch))  # noqa: E501
+        if default_branch == '' and 'CI' in os.environ:
+            # In the case of the CI when the job is executed and not due to a PR then
+            # GITHUB_BASE_REF is set to ''
+            default_branch = 'develop'
+
+        log.error(f'Could not find branch {current_branch} in {root_dir}. Defaulting to {default_branch}')  # noqa: E501
+        checkout_proc = Popen(f'cd "{root_dir}" && git checkout {default_branch}', shell=True, stdout=PIPE, stderr=PIPE)  # noqa: E501
+        _, stderr = checkout_proc.communicate(timeout=SUBPROCESS_TIMEOUT)
+        if (
+                len(stderr) != 0 and
+                b'Already on' not in stderr and
+                b'Switched to' not in stderr
+        ):
+            log.error(f'Could not find branch {default_branch} in {root_dir}. Bailing and leaving current branch')  # noqa: E501
+            return base_dir
+        current_branch = default_branch
+
+    log.debug(f'VCR setup: Checked out test-caching {current_branch} branch')
+
+    # see if we have any uncommitted work
+    for diff_type in ('diff', 'diff --staged'):
+        diff_result = os.popen(f'cd "{root_dir}" && git {diff_type}').read()
+        if diff_result != '':
+            log.debug('VCR setup: There is uncommitted work at the test-caching repository. Not modifying it')  # noqa: E501
+            return base_dir
+
+    # see if the branch is ahead of origin, meaning local is being worked on
+    compare_result = os.popen(f'cd "{root_dir}" && git rev-list --left-right --count {current_branch}...origin/{current_branch}').read()  # noqa: E501
+    result_split = compare_result.split()
+    commits_ahead = 0 if len(result_split) == 0 else int(result_split[0])
+    if commits_ahead > 0:
+        log.debug(f'VCR setup: The local test-caching branch {current_branch} is {commits_ahead} commits ahead of the remote. Not modifying it.')  # noqa: E501
+        return base_dir
+
+    # since we got here reset to origin's equivalent branch
+    reset_proc = Popen(f'cd "{root_dir}" && git reset --hard origin/{current_branch}', shell=True, stdout=PIPE, stderr=PIPE)  # noqa: E501
+    _, stderr = reset_proc.communicate(timeout=SUBPROCESS_TIMEOUT)
+    if len(stderr) != 0:
+        prefix = 'Failed to '
+        error = f' due to {stderr!r}'
+    else:
+        prefix = ''
+        error = ''
+
+    log.debug(f'VCR setup: {prefix}reset test caching branch: {current_branch} to match origin{error}')  # noqa: E501
+
+    return base_dir
+
+
+@pytest.fixture(scope='module')
+def vcr_cassette_dir(request: pytest.FixtureRequest, vcr_base_dir) -> str:
+    """
+    Override pytest-vcr's bundled fixture to store cassettes outside source code
+    # pytest-deadfixtures ignore
+    """
+    return str(vcr_base_dir / get_cassette_dir(request))

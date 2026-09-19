@@ -1,0 +1,74 @@
+import type { MatchSuggestions } from '@/modules/history/events/matching/types';
+import { api } from '@/modules/core/api/rotki-api';
+import { snakeCaseTransformer } from '@/modules/core/api/transformers';
+import { type PendingTask, PendingTaskSchema } from '@/modules/core/tasks/types';
+import { useTaskApi } from '@/modules/core/tasks/use-task-api';
+
+/**
+ * How to resolve a bridge leg that has no counterpart event to match with:
+ * `external` treats it as a payment to / income from an untracked address, while
+ * `createCounterpart` manufactures the missing mirror leg on the other chain as a
+ * synthetic event and links the two.
+ */
+type BridgeLegResolution = 'external' | 'createCounterpart';
+
+/**
+ * An unresolved bridge leg as reported by the backend. Legs are reported individually
+ * since a single transaction group can carry several bridge legs that are matched or
+ * ignored independently.
+ */
+interface UnmatchedBridgeLeg {
+  identifier: number;
+  groupIdentifier: string;
+}
+
+interface UseBridgeMatchingApiReturn {
+  getUnmatchedBridgeTransactions: (onlyIgnored?: boolean) => Promise<UnmatchedBridgeLeg[]>;
+  getBridgeMatches: (bridgeEvent: number, timeRange: number, onlyExpectedAssets: boolean, tolerance: string) => Promise<MatchSuggestions>;
+  matchBridgeTransactions: (bridgeEvent: number, matchedEvents?: number[], resolution?: BridgeLegResolution) => Promise<boolean>;
+  unlinkBridgeTransaction: (identifier: number) => Promise<boolean>;
+  triggerBridgeMatching: () => Promise<PendingTask>;
+}
+
+export function useBridgeMatchingApi(): UseBridgeMatchingApiReturn {
+  const { triggerTask } = useTaskApi();
+
+  const getUnmatchedBridgeTransactions = async (onlyIgnored?: boolean): Promise<UnmatchedBridgeLeg[]> =>
+    api.get<UnmatchedBridgeLeg[]>('/history/events/match/bridges', {
+      params: onlyIgnored !== undefined ? snakeCaseTransformer({ onlyIgnored }) : undefined,
+    });
+
+  const getBridgeMatches = async (bridgeEvent: number, timeRange: number, onlyExpectedAssets: boolean, tolerance: string): Promise<MatchSuggestions> =>
+    api.post<MatchSuggestions>('/history/events/match/bridges', {
+      bridgeEvent,
+      onlyExpectedAssets,
+      timeRange,
+      tolerance,
+    });
+
+  const matchBridgeTransactions = async (bridgeEvent: number, matchedEvents?: number[], resolution?: BridgeLegResolution): Promise<boolean> =>
+    api.put<boolean>('/history/events/match/bridges', {
+      bridgeEvent,
+      createCounterpart: resolution === 'createCounterpart',
+      external: resolution === 'external',
+      ...(matchedEvents && matchedEvents.length > 0 && { matchedEvents }),
+    });
+
+  const unlinkBridgeTransaction = async (identifier: number): Promise<boolean> =>
+    api.delete<boolean>('/history/events/match/bridges', {
+      body: { identifier },
+    });
+
+  const triggerBridgeMatching = async (): Promise<PendingTask> => {
+    const response = await triggerTask('bridge_matching');
+    return PendingTaskSchema.parse(response);
+  };
+
+  return {
+    getBridgeMatches,
+    getUnmatchedBridgeTransactions,
+    matchBridgeTransactions,
+    triggerBridgeMatching,
+    unlinkBridgeTransaction,
+  };
+}

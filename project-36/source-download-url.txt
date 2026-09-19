@@ -1,0 +1,1 @@
+https://github.com/strapi/strapi/archive/refs/heads/main.zip

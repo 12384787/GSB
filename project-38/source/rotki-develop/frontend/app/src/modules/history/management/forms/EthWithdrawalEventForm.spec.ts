@@ -1,0 +1,362 @@
+import type { AssetMap } from '@/modules/assets/types';
+import type { EthWithdrawalEvent } from '@/modules/history/events/schemas';
+import { bigNumberify, HistoryEventEntryType } from '@rotki/common';
+import { createMock } from '@test/utils/create-mock';
+import { selectorContract } from '@test/utils/selector-contract';
+import { type ComponentMountingOptions, mount, type VueWrapper } from '@vue/test-utils';
+import dayjs from 'dayjs';
+import { createPinia, type Pinia, setActivePinia } from 'pinia';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { nextTick } from 'vue';
+import { useAssetInfoApi } from '@/modules/assets/api/use-asset-info-api';
+import { useAssetPricesApi } from '@/modules/assets/api/use-asset-prices-api';
+import { useBalancePricesStore } from '@/modules/balances/use-balance-prices-store';
+import { setupDayjs } from '@/modules/core/common/data/date';
+import { useHistoryEvents } from '@/modules/history/events/use-history-events';
+import EthWithdrawalEventForm from '@/modules/history/management/forms/EthWithdrawalEventForm.vue';
+
+vi.mock('@/modules/balances/use-balance-prices-store', () => ({
+  useBalancePricesStore: vi.fn(),
+}));
+
+vi.mock('@/modules/assets/api/use-asset-info-api', () => ({
+  useAssetInfoApi: vi.fn(),
+}));
+
+vi.mock('@/modules/history/events/use-history-events', () => ({
+  useHistoryEvents: vi.fn(),
+}));
+
+vi.mock('@/modules/assets/api/use-asset-prices-api', () => ({
+  useAssetPricesApi: vi.fn(),
+}));
+
+describe('forms/EthWithdrawalEventForm.vue', () => {
+  let wrapper: VueWrapper<InstanceType<typeof EthWithdrawalEventForm>>;
+  let addHistoryEventMock: ReturnType<typeof vi.fn<ReturnType<typeof useHistoryEvents>['addHistoryEvent']>>;
+  let editHistoryEventMock: ReturnType<typeof vi.fn<ReturnType<typeof useHistoryEvents>['editHistoryEvent']>>;
+  let addHistoricalPriceMock: ReturnType<typeof vi.fn<ReturnType<typeof useAssetPricesApi>['addHistoricalPrice']>>;
+  let pinia: Pinia;
+
+  const asset = {
+    assetType: 'own chain',
+    isCustomAsset: false,
+    name: 'Ethereum',
+    symbol: 'ETH',
+  };
+
+  const mapping: AssetMap = {
+    assetCollections: {},
+    assets: { [asset.symbol]: asset },
+  };
+
+  const event: EthWithdrawalEvent = {
+    amount: bigNumberify('2.5'),
+    asset: asset.symbol,
+    entryType: HistoryEventEntryType.ETH_WITHDRAWAL_EVENT,
+    eventSubtype: 'remove asset',
+    eventType: 'staking',
+    groupIdentifier: 'EW_123_19647',
+    identifier: 11343,
+    isExit: true,
+    location: 'ethereum',
+    locationLabel: '0x2B888954421b424C5D3D9Ce9bB67c9bD47537d12',
+    sequenceIndex: 0,
+    timestamp: 1697517629000,
+    userNotes: 'Exit validator 123 with 2.5 ETH',
+    validatorIndex: 123,
+  };
+
+  beforeAll(() => {
+    setupDayjs();
+    pinia = createPinia();
+    setActivePinia(pinia);
+  });
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    addHistoryEventMock = vi.fn<ReturnType<typeof useHistoryEvents>['addHistoryEvent']>();
+    editHistoryEventMock = vi.fn<ReturnType<typeof useHistoryEvents>['editHistoryEvent']>();
+    addHistoricalPriceMock = vi.fn<ReturnType<typeof useAssetPricesApi>['addHistoricalPrice']>();
+    const assetMapping = vi.fn().mockResolvedValue(mapping);
+    vi.mocked(useBalancePricesStore).mockReturnValue(createMock<ReturnType<typeof useBalancePricesStore>>());
+    vi.mocked(useAssetInfoApi).mockReturnValue(createMock<ReturnType<typeof useAssetInfoApi>>({ assetMapping }));
+    vi.mocked(useHistoryEvents).mockReturnValue(createMock<ReturnType<typeof useHistoryEvents>>({
+      addHistoryEvent: addHistoryEventMock,
+      editHistoryEvent: editHistoryEventMock,
+    }));
+    vi.mocked(useAssetPricesApi).mockReturnValue(createMock<ReturnType<typeof useAssetPricesApi>>({
+      addHistoricalPrice: addHistoricalPriceMock,
+    }));
+  });
+
+  afterEach(() => {
+    wrapper.unmount();
+    vi.useRealTimers();
+  });
+
+  const createWrapper = (options: ComponentMountingOptions<typeof EthWithdrawalEventForm> = {
+    props: {
+      data: { nextSequenceId: '0', type: 'add' },
+    },
+  }): VueWrapper<InstanceType<typeof EthWithdrawalEventForm>> => mount(EthWithdrawalEventForm, {
+    global: {
+      plugins: [pinia],
+    },
+    ...options,
+  });
+
+  it('should render the documented e2e selector contract', () => {
+    wrapper = createWrapper();
+    // The e2e suite finds every field through these selectors; losing one is an e2e break.
+    expect(selectorContract(wrapper)).toMatchInlineSnapshot(`
+      [
+        "data-testid=amount",
+        "data-testid=asset",
+        "data-testid=datetime",
+        "data-testid=eth-withdrawal-event-form-advance",
+        "data-testid=group-identifier",
+        "data-testid=grouped-amount-input-swap",
+        "data-testid=is-exit",
+        "data-testid=primary",
+        "data-testid=secondary",
+        "data-testid=validator-index",
+        "data-testid=withdrawal-address",
+      ]
+    `);
+  });
+
+  it('should show the default state when adding a new event', async () => {
+    wrapper = createWrapper();
+    await vi.advanceTimersToNextTimerAsync();
+
+    const validatorIndexInput = wrapper.find<HTMLInputElement>('[data-testid=validator-index] input');
+    const withdrawalAddressInput = wrapper.find<HTMLInputElement>('[data-testid=withdrawal-address] .input-value');
+    const isExitCheckbox = wrapper.find<HTMLInputElement>('[data-testid=is-exit] input');
+
+    expect(validatorIndexInput.element.value).toBe('');
+    expect(withdrawalAddressInput.element.value).toBe('');
+    expect(isExitCheckbox.element.checked).toBe(false);
+  });
+
+  it('should update the fields when adding an event in an existing group', async () => {
+    wrapper = createWrapper();
+    await vi.advanceTimersToNextTimerAsync();
+    await wrapper.setProps({ data: { group: event, nextSequenceId: '1', type: 'group-add' } });
+
+    const validatorIndexInput = wrapper.find<HTMLInputElement>('[data-testid=validator-index] input');
+    const withdrawalAddressInput = wrapper.find<HTMLInputElement>('[data-testid=withdrawal-address] .input-value');
+    const amountInput = wrapper.find<HTMLInputElement>('[data-testid=amount] input');
+    const isExitedCheckbox = wrapper.find<HTMLInputElement>('[data-testid=is-exit] input');
+
+    expect(validatorIndexInput.element.value).toBe(event.validatorIndex.toString());
+    expect(withdrawalAddressInput.element.value).toBe(event.locationLabel);
+    expect(amountInput.element.value).toBe('0');
+    expect(isExitedCheckbox.element.checked).toBe(false);
+  });
+
+  it('should update the fields when editing an event', async () => {
+    wrapper = createWrapper();
+    await vi.advanceTimersToNextTimerAsync();
+    await wrapper.setProps({ data: { event, nextSequenceId: '1', type: 'edit' } });
+
+    const validatorIndexInput = wrapper.find<HTMLInputElement>('[data-testid=validator-index] input');
+    const withdrawalAddressInput = wrapper.find<HTMLInputElement>('[data-testid=withdrawal-address] .input-value');
+    const amountInput = wrapper.find<HTMLInputElement>('[data-testid=amount] input');
+    const isExitedCheckbox = wrapper.find<HTMLInputElement>('[data-testid=is-exit] input');
+
+    expect(validatorIndexInput.element.value).toBe(event.validatorIndex.toString());
+    expect(withdrawalAddressInput.element.value).toBe(event.locationLabel);
+    expect(amountInput.element.value).toBe(event.amount.toString());
+    expect(isExitedCheckbox.element.checked).toBe(true);
+  });
+
+  it('should add a new withdrawal event when form is submitted', async () => {
+    wrapper = createWrapper();
+    await nextTick();
+    await vi.advanceTimersToNextTimerAsync();
+
+    const now = dayjs();
+    const nowInMs = now.valueOf();
+
+    await wrapper.find('[data-testid=amount] input').setValue('2.5');
+    await wrapper.find('[data-testid=validator-index] input').setValue('123');
+    await wrapper.find('[data-testid=withdrawal-address] .input-value').setValue('0x2B888954421b424C5D3D9Ce9bB67c9bD47537d12');
+    await wrapper.find<HTMLInputElement>('[data-testid=datetime] input').setValue(dayjs(nowInMs).format('DD/MM/YYYY HH:mm:ss.SSS'));
+    await wrapper.find('[data-testid=is-exit] input').setValue(true);
+
+    const saveMethod = wrapper.vm.save;
+
+    addHistoryEventMock.mockResolvedValueOnce({ success: true });
+
+    const saveResult = await saveMethod();
+    expect(saveResult).toBe(true);
+
+    expect(addHistoryEventMock).toHaveBeenCalledTimes(1);
+
+    expect(addHistoryEventMock).toHaveBeenCalledWith({
+      amount: bigNumberify('2.5'),
+      entryType: HistoryEventEntryType.ETH_WITHDRAWAL_EVENT,
+      groupIdentifier: null,
+      isExit: true,
+      timestamp: nowInMs,
+      validatorIndex: 123,
+      withdrawalAddress: '0x2B888954421b424C5D3D9Ce9bB67c9bD47537d12',
+    });
+  });
+
+  it('should not call editHistoryEvent when nothing changed', async () => {
+    wrapper = createWrapper({
+      props: {
+        data: {
+          event,
+          nextSequenceId: '1',
+          type: 'edit',
+        },
+      },
+    });
+    await vi.advanceTimersToNextTimerAsync();
+
+    editHistoryEventMock.mockResolvedValueOnce({ success: true });
+    addHistoricalPriceMock.mockResolvedValueOnce(true);
+
+    await wrapper.vm.save();
+    await nextTick();
+    expect(editHistoryEventMock).not.toHaveBeenCalled();
+  });
+
+  it('should not call editHistoryEvent when the historic price is the only edit', async () => {
+    wrapper = createWrapper({
+      props: {
+        data: {
+          event,
+          nextSequenceId: '1',
+          type: 'edit',
+        },
+      },
+    });
+    await vi.advanceTimersToNextTimerAsync();
+
+    editHistoryEventMock.mockResolvedValueOnce({ success: true });
+    addHistoricalPriceMock.mockResolvedValueOnce(true);
+    await wrapper.find('[data-testid=primary] input').setValue('1000');
+
+    await wrapper.vm.save();
+    await nextTick();
+    expect(editHistoryEventMock).not.toHaveBeenCalled();
+  });
+
+  it('should edit an existing deposit event when form is submitted', async () => {
+    wrapper = createWrapper({
+      props: {
+        data: {
+          event,
+          nextSequenceId: '1',
+          type: 'edit',
+        },
+      },
+    });
+    await vi.advanceTimersToNextTimerAsync();
+
+    await wrapper.find('[data-testid=amount] input').setValue('4.5');
+    await wrapper.find('[data-testid=validator-index] input').setValue('224');
+    await wrapper.find('[data-testid=is-exit] input').setValue(false);
+
+    const saveMethod = wrapper.vm.save;
+
+    editHistoryEventMock.mockResolvedValueOnce({ success: true });
+
+    const saveResult = await saveMethod();
+    expect(saveResult).toBe(true);
+
+    expect(editHistoryEventMock).toHaveBeenCalledTimes(1);
+
+    expect(editHistoryEventMock).toHaveBeenCalledWith({
+      amount: bigNumberify('4.5'),
+      entryType: HistoryEventEntryType.ETH_WITHDRAWAL_EVENT,
+      groupIdentifier: event.groupIdentifier,
+      identifier: event.identifier,
+      isExit: false,
+      timestamp: event.timestamp,
+      validatorIndex: 224,
+      withdrawalAddress: '0x2B888954421b424C5D3D9Ce9bB67c9bD47537d12',
+    });
+  });
+
+  it('should handle server validation errors', async () => {
+    wrapper = createWrapper({
+      props: {
+        data: {
+          event,
+          nextSequenceId: '1',
+          type: 'edit',
+        },
+      },
+    });
+
+    editHistoryEventMock.mockResolvedValueOnce({
+      message: { withdrawalAddress: ['withdrawal address is required'] },
+      success: false,
+    });
+
+    await wrapper.find('[data-testid=amount] input').setValue('4.5');
+
+    await vi.advanceTimersToNextTimerAsync();
+
+    const saveMethod = wrapper.vm.save;
+
+    const saveResult = await saveMethod();
+    await nextTick();
+
+    expect(editHistoryEventMock).toHaveBeenCalled();
+    expect(saveResult).toBe(false);
+    expect(wrapper.find('[data-testid=withdrawal-address] .details').text()).toBe('withdrawal address is required');
+  });
+
+  it('should display validation errors when the form is invalid', async () => {
+    wrapper = createWrapper();
+    const saveMethod = wrapper.vm.save;
+
+    await saveMethod();
+    await vi.advanceTimersToNextTimerAsync();
+
+    expect(wrapper.find('[data-testid=withdrawal-address] .details').exists()).toBe(true);
+    expect(wrapper.find('[data-testid=validator-index] .details').exists()).toBe(true);
+  });
+
+  describe('actualGroupIdentifier', () => {
+    const eventWithActualGroupIdentifier: EthWithdrawalEvent = {
+      ...event,
+      actualGroupIdentifier: 'ACTUAL123',
+      groupIdentifier: 'LINKED456',
+    };
+
+    it('should use actualGroupIdentifier when present and disable the field', async () => {
+      wrapper = createWrapper({
+        props: { data: { event: eventWithActualGroupIdentifier, nextSequenceId: '1', type: 'edit' } },
+      });
+      await vi.advanceTimersToNextTimerAsync();
+
+      await wrapper.find('[data-testid=eth-withdrawal-event-form-advance] [data-accordion-trigger]').trigger('click');
+      await vi.advanceTimersToNextTimerAsync();
+
+      const groupIdentifierInput = wrapper.find<HTMLInputElement>('[data-testid=group-identifier] input');
+      expect(groupIdentifierInput.element.value).toBe('ACTUAL123');
+      expect(groupIdentifierInput.element.disabled).toBe(true);
+    });
+
+    it('should use groupIdentifier when actualGroupIdentifier is not present', async () => {
+      wrapper = createWrapper({
+        props: { data: { event, nextSequenceId: '1', type: 'edit' } },
+      });
+      await vi.advanceTimersToNextTimerAsync();
+
+      await wrapper.find('[data-testid=eth-withdrawal-event-form-advance] [data-accordion-trigger]').trigger('click');
+      await vi.advanceTimersToNextTimerAsync();
+
+      const groupIdentifierInput = wrapper.find<HTMLInputElement>('[data-testid=group-identifier] input');
+      expect(groupIdentifierInput.element.value).toBe(event.groupIdentifier);
+      expect(groupIdentifierInput.element.disabled).toBe(false);
+    });
+  });
+});

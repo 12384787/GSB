@@ -1,0 +1,26 @@
+{
+  "name": "@rotki/dev-proxy",
+  "version": "1.0.0",
+  "description": "",
+  "type": "module",
+  "keywords": [],
+  "license": "AGPL-3.0",
+  "author": "Rotki Solutions GmbH",
+  "scripts": {
+    "serve": "tsx --env-file-if-exists=.env --watch ./src/index.ts",
+    "test:smoke": "node test/smoke.mjs",
+    "test:unit": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "httpxy": "catalog:"
+  },
+  "devDependencies": {
+    "@tsconfig/node24": "catalog:",
+    "@types/node": "catalog:",
+    "consola": "catalog:",
+    "tsx": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

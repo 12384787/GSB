@@ -1,0 +1,52 @@
+import { ThemeColors } from '@rotki/common';
+import { startPromise } from '@shared/utils';
+import { useSettingsOperations } from '@/modules/settings/use-settings-operations';
+import { useThemeSettings } from '@/modules/shell/theme/use-theme-settings';
+import { CURRENT_DEFAULT_THEME_VERSION, DARK_COLORS, DEFAULT_THEME_HISTORIES, LIGHT_COLORS } from '@/plugins/theme';
+
+interface UseThemeMigrationReturn { checkDefaultThemeVersion: () => void }
+
+export function useThemeMigration(): UseThemeMigrationReturn {
+  const { darkTheme, defaultThemeVersion, lightTheme } = useThemeSettings();
+  const { updateFrontendSetting } = useSettingsOperations();
+
+  function checkDefaultThemeVersion(): void {
+    const defaultThemeVersionSetting = get(defaultThemeVersion);
+    if (defaultThemeVersionSetting >= CURRENT_DEFAULT_THEME_VERSION)
+      return;
+
+    const historicDefaultTheme = DEFAULT_THEME_HISTORIES.find(({ version }) => version === defaultThemeVersionSetting);
+
+    if (!historicDefaultTheme)
+      return;
+
+    const newLightTheme: ThemeColors = { ...LIGHT_COLORS };
+    const newDarkTheme: ThemeColors = { ...DARK_COLORS };
+    const savedLightTheme = get(lightTheme);
+    const savedDarkTheme = get(darkTheme);
+    const accentColors = Object.keys(ThemeColors.shape);
+
+    const isKeyOfThemeColors = (key: string): key is keyof ThemeColors => accentColors.includes(key);
+
+    accentColors.forEach((key) => {
+      if (!isKeyOfThemeColors(key))
+        return;
+
+      if (historicDefaultTheme.lightColors[key] !== savedLightTheme[key])
+        newLightTheme[key] = savedLightTheme[key];
+
+      if (historicDefaultTheme.darkColors[key] !== savedDarkTheme[key])
+        newDarkTheme[key] = savedDarkTheme[key];
+    });
+
+    startPromise(
+      updateFrontendSetting({
+        darkTheme: newDarkTheme,
+        defaultThemeVersion: CURRENT_DEFAULT_THEME_VERSION,
+        lightTheme: newLightTheme,
+      }),
+    );
+  }
+
+  return { checkDefaultThemeVersion };
+}

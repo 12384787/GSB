@@ -1,0 +1,347 @@
+<script setup lang="ts">
+import type { HistoryEventEntryType } from '@rotki/common';
+import { externalLinks } from '@shared/external-links';
+import { checkIfDevelopment } from '@shared/utils';
+import { kebabCase } from 'es-toolkit';
+import { type HighlightSegment, splitHighlight } from '@/modules/history/events/action-picker/highlight-match';
+import HistoryEventActionDirectionBadge from '@/modules/history/events/action-picker/HistoryEventActionDirectionBadge.vue';
+import { useEventActionDescriptions } from '@/modules/history/events/action-picker/use-event-action-descriptions';
+import { type EventActionRow, useEventActionPicker } from '@/modules/history/events/action-picker/use-event-action-picker';
+import { useRecentActions } from '@/modules/history/events/action-picker/use-recent-actions';
+import { useHistoryEventMappings } from '@/modules/history/events/mapping/use-history-event-mappings';
+import ExternalLink from '@/modules/shell/components/ExternalLink.vue';
+
+interface ModelValue {
+  eventType: string;
+  eventSubtype: string;
+}
+
+const modelValue = defineModel<ModelValue | undefined>({ required: true });
+const { entryType, disabled = false, label, errorMessages, required = false, hint } = defineProps<{
+  entryType?: HistoryEventEntryType;
+  disabled?: boolean;
+  label?: string;
+  errorMessages?: string | string[];
+  required?: boolean;
+  hint?: string;
+}>();
+/**
+ * Synthetic group and key prefix for the recently picked rows.
+ *
+ * @remarks
+ * A recent row reuses a real row's data, so it needs its own group and key to avoid colliding with
+ * the canonical row in its taxonomy group.
+ */
+const RECENT_GROUP_ID = '__recent__';
+const RECENT_KEY_PREFIX = 'recent:';
+
+const { t } = useI18n({ useScope: 'global' });
+
+const isDevelopment = checkIfDevelopment();
+
+const search = ref<string>('');
+
+const { findRowByTypeSubtype, rows } = useEventActionPicker(() => entryType);
+const { recent, record } = useRecentActions(() => entryType);
+const { describe } = useEventActionDescriptions();
+const { eventCategoryGroupsData, getHistoryEventSubTypeName, getHistoryEventTypeName } = useHistoryEventMappings();
+
+const selectedVerbKey = computed<string | undefined>(() => {
+  const value = get(modelValue);
+  if (!value)
+    return undefined;
+
+  return findRowByTypeSubtype(value.eventType, value.eventSubtype)?.verbKey;
+});
+
+watch([selectedVerbKey, rows], ([verbKey, currentRows]) => {
+  if (!get(modelValue) || verbKey || currentRows.length === 0)
+    return;
+
+  set(modelValue, undefined);
+});
+
+const triggerLabel = computed<string>(() => label ?? t('history_event_action.picker.label'));
+
+const trimmedSearch = computed<string>(() => get(search).trim());
+
+// Persisted recent keys mapped back onto live rows, dropping any the entry type filtered out.
+const recentRows = computed<EventActionRow[]>(() => {
+  const byKey = new Map(get(rows).map(row => [row.verbKey, row]));
+  const result: EventActionRow[] = [];
+
+  for (const verbKey of get(recent)) {
+    const row = byKey.get(verbKey);
+    if (row)
+      result.push({ ...row, groupId: RECENT_GROUP_ID, verbKey: `${RECENT_KEY_PREFIX}${verbKey}` });
+  }
+
+  return result;
+});
+
+// Recents are dropped once a query is typed, where they would duplicate the filtered results.
+const displayRows = computed<EventActionRow[]>(() => {
+  const base = [...get(rows)];
+  if (get(trimmedSearch) || get(recentRows).length === 0)
+    return base;
+
+  return [...get(recentRows), ...base];
+});
+
+function highlightLabel(value: string): HighlightSegment[] {
+  return splitHighlight(value, get(search));
+}
+
+const FALLBACK_GROUP: Readonly<{ label: string; icon: string }> = {
+  icon: 'lu-circle-question-mark',
+  label: '',
+};
+
+interface GroupHeaderConfig {
+  label: string;
+  icon: string;
+  classes: string;
+  testId?: string;
+}
+
+function getGroupConfig(groupId: string): GroupHeaderConfig {
+  if (groupId === RECENT_GROUP_ID) {
+    return {
+      classes: 'text-rui-primary font-medium',
+      icon: 'lu-history',
+      label: t('history_event_action.picker.recent'),
+      testId: 'event-action-picker-recent-header',
+    };
+  }
+
+  const group = get(eventCategoryGroupsData)[groupId] ?? FALLBACK_GROUP;
+  return { classes: 'text-rui-text-secondary', icon: group.icon, label: group.label };
+}
+
+/**
+ * Reports the human label the picker groups `row` under and titles its detail pane with.
+ *
+ * @remarks
+ * RuiCategoryPicker uses one category string for both, so handing it the raw group id would print
+ * `__recent__` as a heading.
+ */
+function categoryLabelOf(row: EventActionRow): string {
+  return getGroupConfig(row.groupId).label || row.groupId;
+}
+
+// Reverse lookup: the rail slot only gets the label back, and needs the rest of the config.
+const categoryConfigByLabel = computed<Map<string, GroupHeaderConfig>>(() => {
+  const map = new Map<string, GroupHeaderConfig>();
+  const recent = getGroupConfig(RECENT_GROUP_ID);
+  map.set(recent.label, recent);
+  for (const groupId in get(eventCategoryGroupsData)) {
+    const config = getGroupConfig(groupId);
+    map.set(config.label || groupId, config);
+  }
+  return map;
+});
+
+function categoryConfig(category: string): GroupHeaderConfig {
+  return get(categoryConfigByLabel).get(category)
+    ?? { classes: 'text-rui-text-secondary', icon: FALLBACK_GROUP.icon, label: category };
+}
+
+function rowEventTypes(row: EventActionRow): string {
+  return row.combinations.map(c => `${c.eventType}:${c.eventSubtype}`).join(' ');
+}
+
+function subtitleFor(row: EventActionRow): string {
+  const first = row.combinations[0];
+  if (!first)
+    return '';
+
+  // Recent rows carry a prefixed key; the description lookup only hits on the canonical one.
+  const realKey = row.verbKey.startsWith(RECENT_KEY_PREFIX) ? row.verbKey.slice(RECENT_KEY_PREFIX.length) : row.verbKey;
+  const description = describe(realKey);
+  if (description)
+    return description;
+
+  const verb = row.label.toLowerCase();
+  const typeLabel = getHistoryEventTypeName(first.eventType).trim();
+  const subtypeLabel = getHistoryEventSubTypeName(first.eventSubtype).trim();
+  const parts: string[] = [];
+
+  if (typeLabel && typeLabel.toLowerCase() !== verb)
+    parts.push(typeLabel);
+
+  if (subtypeLabel && subtypeLabel.toLowerCase() !== verb && subtypeLabel.toLowerCase() !== typeLabel.toLowerCase())
+    parts.push(subtypeLabel);
+
+  return parts.join(' · ');
+}
+
+function onUpdate(verbKey: string | undefined): void {
+  if (!verbKey)
+    return;
+
+  // A pick from the recent group carries the prefixed key; the model and the store want the verb.
+  const realKey = verbKey.startsWith(RECENT_KEY_PREFIX) ? verbKey.slice(RECENT_KEY_PREFIX.length) : verbKey;
+
+  const row = get(rows).find(r => r.verbKey === realKey);
+  if (!row)
+    return;
+
+  const first = row.combinations[0];
+  if (!first)
+    return;
+
+  // Record even when re-picking the current value so it bubbles back to the top.
+  record(realKey);
+
+  const current = get(modelValue);
+  if (current && row.combinations.some(c => c.eventType === current.eventType && c.eventSubtype === current.eventSubtype))
+    return;
+
+  set(modelValue, { eventSubtype: first.eventSubtype, eventType: first.eventType });
+}
+</script>
+
+<template>
+  <RuiCategoryPicker
+    v-model:search="search"
+    :model-value="selectedVerbKey"
+    :items="displayRows"
+    key-attr="verbKey"
+    text-attr="label"
+    variant="outlined"
+    :category-of="categoryLabelOf"
+    :label="triggerLabel"
+    :placeholder="t('history_event_action.picker.placeholder')"
+    :disabled="disabled"
+    :required="required"
+    :error-messages="errorMessages"
+    :hint="hint"
+    data-testid="event-action-picker"
+    @update:model-value="onUpdate($event)"
+  >
+    <template #selection="{ item }">
+      <div
+        class="flex items-center gap-2 min-w-0 w-full"
+        data-testid="event-action-picker-selection"
+      >
+        <RuiIcon
+          :name="item.icon"
+          size="16"
+          class="shrink-0 text-rui-text"
+        />
+        <span class="font-medium text-rui-text shrink-0">{{ item.label }}</span>
+        <span
+          v-if="subtitleFor(item)"
+          class="text-xs text-rui-text-secondary truncate min-w-0"
+          data-testid="event-action-picker-selection-description"
+        >
+          {{ subtitleFor(item) }}
+        </span>
+        <HistoryEventActionDirectionBadge
+          :direction="item.direction"
+          class="shrink-0 ml-auto"
+        />
+      </div>
+    </template>
+    <template #category="{ category, label: categoryLabel }">
+      <div
+        v-if="category === null"
+        class="flex items-center gap-2 text-rui-text-secondary"
+      >
+        <RuiIcon
+          name="lu-layers"
+          size="16"
+        />
+        <span class="truncate">{{ categoryLabel }}</span>
+      </div>
+      <div
+        v-else
+        class="flex items-center gap-2 min-w-0"
+        :class="categoryConfig(category).classes"
+        :data-testid="categoryConfig(category).testId"
+      >
+        <RuiIcon
+          :name="categoryConfig(category).icon"
+          size="16"
+          class="shrink-0"
+        />
+        <span class="truncate">{{ category }}</span>
+      </div>
+    </template>
+    <template #item="{ item }">
+      <div
+        class="flex items-center gap-3 w-full"
+        data-testid="event-action-picker-row"
+        :data-key="kebabCase(item.verbKey)"
+        :data-event-types="rowEventTypes(item)"
+      >
+        <RuiIcon
+          :name="item.icon"
+          size="18"
+          class="shrink-0 text-rui-text"
+        />
+        <div class="flex-1 min-w-0">
+          <div class="text-sm text-rui-text truncate">
+            <span
+              v-for="(segment, index) in highlightLabel(item.label)"
+              :key="index"
+              :class="{ 'font-bold text-rui-primary': segment.matched }"
+            >
+              {{ segment.text }}
+            </span>
+          </div>
+          <div
+            v-if="subtitleFor(item)"
+            class="text-xs text-rui-text-secondary whitespace-normal line-clamp-2"
+          >
+            {{ subtitleFor(item) }}
+          </div>
+          <div
+            v-if="isDevelopment"
+            class="text-xs text-rui-text-disabled font-mono whitespace-normal break-all"
+            data-testid="event-action-picker-row-dev-hint"
+          >
+            {{ rowEventTypes(item) }}
+          </div>
+        </div>
+        <HistoryEventActionDirectionBadge
+          :direction="item.direction"
+          class="shrink-0"
+        />
+      </div>
+    </template>
+    <template #empty>
+      <div
+        class="flex flex-col gap-1 px-4 py-3 text-sm text-rui-text-secondary"
+        data-testid="event-action-picker-empty"
+      >
+        <span v-if="trimmedSearch">
+          {{ t('history_event_action.picker.empty_state.with_query', { query: trimmedSearch }) }}
+        </span>
+        <span v-else>
+          {{ t('history_event_action.picker.empty_state.no_query') }}
+        </span>
+        <span class="text-xs">
+          {{ t('history_event_action.picker.empty_state.hint') }}
+        </span>
+      </div>
+    </template>
+    <template #footer>
+      <div class="px-3 py-1.5 text-[10px] text-rui-text-secondary flex justify-between items-center gap-2">
+        <ExternalLink
+          :url="externalLinks.usageGuideSection.eventTypes"
+          color="primary"
+          class="inline-flex items-center gap-1"
+          data-testid="event-action-picker-learn-more"
+        >
+          <RuiIcon
+            name="lu-book-open"
+            size="12"
+          />
+          {{ t('history_event_action.picker.learn_more') }}
+        </ExternalLink>
+        <span>{{ t('history_event_action.picker.keyboard_hint') }}</span>
+      </div>
+    </template>
+  </RuiCategoryPicker>
+</template>

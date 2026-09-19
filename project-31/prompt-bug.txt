@@ -1,0 +1,5 @@
+任务类型：Bug 修复
+任务难度：困难
+语言/框架：C
+
+请在已有的 OpenPrinting/cups 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：OpenPrinting CUPS Sources。围绕真实入口（.dockerignore,.gitattributes .github,.gitignore .mailmap,CHANGES.md CONTRIBUTING.md,CREDITS.md DEVELOPING.md,DOCKER.md Dockerfile,INSTALL.md LICENSE,Makedefs.in Makefile,NOTICE README.md,REPORTING_ISSUES.md SECURITY.md,backend berkeley,cgi-bin conf,config-scripts config.guess,config.h.in config.sub,configure configure.ac,cups.pc.in cups,data desktop,doc docker-compose.yaml,examples filter,install-sh locale,man monitor,notifier packaging,ppdc scheduler,scripts systemv,templates test,tools vcnet,xcode）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。

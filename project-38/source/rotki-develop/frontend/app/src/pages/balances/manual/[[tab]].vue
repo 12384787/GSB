@@ -1,0 +1,141 @@
+<script setup lang="ts">
+import type { ManualBalance, RawManualBalance } from '@/modules/balances/types/manual-balances';
+import { Zero } from '@rotki/common';
+import { startPromise } from '@shared/utils';
+import { msg } from '@/message-key';
+import ManualBalancesDialog from '@/modules/accounts/manual-balances/ManualBalancesDialog.vue';
+import ManualBalanceTable from '@/modules/accounts/manual-balances/ManualBalanceTable.vue';
+import PriceRefresh from '@/modules/assets/prices/PriceRefresh.vue';
+import { useManualBalances } from '@/modules/balances/manual/use-manual-balances';
+import { BalanceType } from '@/modules/balances/types/balances';
+import { TRADE_LOCATION_EXTERNAL } from '@/modules/core/common/defaults';
+import { NoteLocation } from '@/modules/core/common/notes';
+import { useAddQuery } from '@/modules/core/common/use-add-query';
+import { useHistoryDataFetching } from '@/modules/history/use-history-data-fetching';
+import HideSmallBalances from '@/modules/settings/HideSmallBalances.vue';
+import { BalanceSource } from '@/modules/settings/types/frontend-settings';
+import TablePageLayout from '@/modules/shell/layout/TablePageLayout.vue';
+import { ActivityKind } from '@/modules/task-center/core/types';
+import { useTaskCenter } from '@/modules/task-center/use-task-center';
+
+definePage({
+  meta: {
+    nav: { labelKey: msg.$t('navigation_menu.balances_sub.manual_balances'), icon: 'lu-notebook-pen', parent: '/balances/', order: 30, drawer: 'balances-manual', addAction: { labelKey: msg.$t('manual_balances.dialog.add.title') } },
+    noteLocation: NoteLocation.BALANCES_MANUAL,
+  },
+  props: true,
+});
+
+const { tab } = defineProps<{
+  tab: string;
+}>();
+
+const balance = ref<ManualBalance | RawManualBalance>();
+
+const { t } = useI18n({ useScope: 'global' });
+const router = useRouter();
+const route = useRoute('/balances/manual/[[tab]]');
+
+const { fetchManualBalances } = useManualBalances();
+const { fetchAssociatedLocations } = useHistoryDataFetching();
+const { useIsActive } = useTaskCenter();
+const loading = useIsActive(ActivityKind.MANUAL_BALANCES);
+
+function add() {
+  set(balance, {
+    amount: Zero,
+    asset: '',
+    balanceType: tab === 'liabilities' ? BalanceType.LIABILITY : BalanceType.ASSET,
+    label: '',
+    location: TRADE_LOCATION_EXTERNAL,
+    tags: null,
+  } satisfies RawManualBalance);
+}
+
+function goToTab(tab: string | number) {
+  const currentRoute = get(route);
+  if (currentRoute.params.tab === tab)
+    return;
+  router.push(`/balances/manual/${tab}`);
+}
+
+watchImmediate(route, (route) => {
+  const { params } = route;
+
+  if (!params.tab || params.tab === '0')
+    router.replace('/balances/manual/assets');
+}, { deep: true });
+
+const { consumeAddQuery } = useAddQuery(() => {
+  startPromise(nextTick(() => add()));
+});
+
+onBeforeMount(async () => {
+  await consumeAddQuery();
+  await fetchManualBalances();
+  await fetchAssociatedLocations();
+});
+</script>
+
+<template>
+  <TablePageLayout
+    :title="[
+      t('navigation_menu.balances'),
+      t('navigation_menu.balances_sub.manual_balances'),
+    ]"
+  >
+    <template #buttons>
+      <PriceRefresh />
+      <RuiButton
+        color="primary"
+        size="lg"
+        data-testid="manual-balances-add-button"
+        :disabled="loading"
+        @click="add()"
+      >
+        <template #prepend>
+          <RuiIcon name="lu-plus" />
+        </template>
+        {{ t('manual_balances.add_manual_balance') }}
+      </RuiButton>
+      <HideSmallBalances :source="BalanceSource.MANUAL" />
+    </template>
+
+    <div>
+      <RuiTabs
+        :model-value="tab"
+        color="primary"
+        class="border border-default rounded bg-white dark:bg-rui-grey-900 flex max-w-min mb-3"
+        @update:model-value="goToTab($event)"
+      >
+        <RuiTab value="assets">
+          {{ t('common.assets') }}
+        </RuiTab>
+        <RuiTab value="liabilities">
+          {{ t('common.liabilities') }}
+        </RuiTab>
+      </RuiTabs>
+      <RuiTabItems :model-value="tab">
+        <RuiTabItem value="assets">
+          <ManualBalanceTable
+            data-testid="manual-balances"
+            type="balances"
+            @edit="balance = $event"
+          />
+        </RuiTabItem>
+        <RuiTabItem value="liabilities">
+          <ManualBalanceTable
+            data-testid="manual-liabilities"
+            type="liabilities"
+            @edit="balance = $event"
+          />
+        </RuiTabItem>
+      </RuiTabItems>
+    </div>
+
+    <ManualBalancesDialog
+      v-model="balance"
+      @update-tab="goToTab($event)"
+    />
+  </TablePageLayout>
+</template>

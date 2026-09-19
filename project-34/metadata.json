@@ -1,0 +1,29 @@
+{
+  "number": 34,
+  "repository": "koajs/koa",
+  "url": "https://github.com/koajs/koa",
+  "description": "Expressive middleware for node.js using ES2017 async functions",
+  "language": "JavaScript",
+  "stars": 35688,
+  "default_branch": "master",
+  "source_zip_url": "https://github.com/koajs/koa/archive/refs/heads/master.zip",
+  "source_root": "source/koa-master",
+  "top_level_entries": [
+    ".codecov.yml",
+    ".editorconfig",
+    ".github",
+    ".gitignore",
+    ".mailmap",
+    "AUTHORS",
+    "CODE_OF_CONDUCT.md",
+    "History.md",
+    "LICENSE",
+    "Readme.md",
+    "__tests__",
+    "docs",
+    "lib",
+    "package-lock.json",
+    "package.json",
+    "test-helpers"
+  ]
+}

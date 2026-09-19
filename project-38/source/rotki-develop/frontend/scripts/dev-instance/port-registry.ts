@@ -1,0 +1,365 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { z } from 'zod/v4';
+import { DEFAULT_COLIBRI_PORT, DEFAULT_MCP_PORT, DEFAULT_PORT, DEFAULT_PROXY_PORT } from '../../app/shared/port-utils';
+import { createDevLogger } from '../dev/logger';
+import { atomicWriteJson } from './atomic-json';
+import { errorCode, errorMessage } from './format';
+import { ensureInstanceParent, resolveInstanceDir, resolveInstanceParent, sanitizeName } from './paths';
+import { readMetadata } from './sidecar';
+
+/**
+ * Note the two distinct proxies: `proxy` is the optional premium dev-proxy
+ * (`@rotki/dev-proxy`), `starlingProxy` is the reverse proxy starling itself
+ * serves — the single origin the renderer talks to. Both need their own port.
+ */
+export const DEFAULT_PORTS = {
+  restApi: DEFAULT_PORT,
+  proxy: 4243,
+  colibri: DEFAULT_COLIBRI_PORT,
+  dev: 8080,
+  starlingProxy: DEFAULT_PROXY_PORT,
+  mcp: DEFAULT_MCP_PORT,
+} as const;
+
+export type PortName = keyof typeof DEFAULT_PORTS;
+
+/** Highest valid TCP port (IANA, 16-bit unsigned). */
+export const MAX_PORT = 65_535;
+
+/**
+ * Instance slots ≥ 1 are packed into a tight contiguous block starting here.
+ * Picked because:
+ *   - it is above Chromium's last restricted port (10080 = amanda); the old
+ *     layout (defaults + slot*200) put slot 10's dev port on 10080, which
+ *     Chrome/Vivaldi refuse to load.
+ *   - it is far below the e2e fixed ports (30301–30304 in playwright.config.ts).
+ *   - it is well inside the user range (1024–49151), nowhere near ephemeral.
+ */
+export const INSTANCE_BASE_PORT = 13_000;
+
+/**
+ * Each slot owns 6 contiguous ports (dev, backend, dev-proxy, colibri, starling
+ * proxy, mcp). A step of 10 leaves 4 ports of slack between neighbours so
+ * TIME_WAIT sockets from one slot can't bleed into the next. With the 1000-slot
+ * cap below, the highest port we'd ever pick is 13_000 + 999*10 + 5 = 22_995.
+ */
+export const INSTANCE_SLOT_STEP = 10;
+
+/** First slot index handed out by the allocator. Slot 0 = `DEFAULT_PORTS`,
+ *  reserved for the non-instance ("plain `pnpm dev`") case. */
+export const RESERVED_SLOTS_END = 1;
+
+const NODE_INSPECT_PORT = 9229;
+const PORT_INDEX_FILENAME = '.port-index.json';
+
+/**
+ * Ports we must never allocate to a dev instance, even if the math lands on
+ * them. Currently:
+ *   - 9229: default node --inspect port; a slot landing here breaks debugger
+ *     attach.
+ *   - 30301–30304: hard-coded e2e ports (playwright.config.ts). Running an
+ *     instance on one of these would clash with a Playwright run.
+ */
+const RESERVED_PORTS = new Set<number>([NODE_INSPECT_PORT, 30_301, 30_302, 30_303, 30_304]);
+
+export interface PortSet {
+  restApi: number;
+  proxy: number;
+  colibri: number;
+  dev: number;
+  /** starling's own reverse proxy — the origin the renderer addresses. */
+  starlingProxy: number;
+  /** starling's MCP server. */
+  mcp: number;
+}
+
+const PortIndexSchema = z.object({
+  version: z.number().default(1),
+  slots: z.record(z.string(), z.number()).default({}),
+});
+
+export type PortIndex = z.infer<typeof PortIndexSchema>;
+
+const logger = createDevLogger('dev-instance:port-registry');
+
+/**
+ * The ports an instance slot owns.
+ *
+ * @remarks
+ * dev sits on the base port, so the URL opened in a browser is the round number (13000, say),
+ * and the services follow in order: python, dev-proxy, colibri, starling proxy, mcp. The first
+ * four keep their original offsets, so an instance created before starling stays on its ports.
+ */
+export function portsForSlot(slot: number): PortSet {
+  if (slot === 0) {
+    return { ...DEFAULT_PORTS };
+  }
+  const base = INSTANCE_BASE_PORT + (slot - 1) * INSTANCE_SLOT_STEP;
+  return {
+    dev: base,
+    restApi: base + 1,
+    proxy: base + 2,
+    colibri: base + 3,
+    starlingProxy: base + 4,
+    mcp: base + 5,
+  };
+}
+
+function slotHasReservedConflict(slot: number): boolean {
+  if (slot < 1)
+    return true; // slot 0 belongs to the default (non-instance) mode
+  const ports = portsForSlot(slot);
+  return Object.values(ports).some(p => p > MAX_PORT || RESERVED_PORTS.has(p));
+}
+
+export function readPortIndex(): PortIndex {
+  const file = path.join(resolveInstanceParent(), PORT_INDEX_FILENAME);
+  if (!fs.existsSync(file)) {
+    return { version: 1, slots: {} };
+  }
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    const result = PortIndexSchema.safeParse(parsed);
+    if (!result.success) {
+      logger.warn(`Port index at ${file} has unexpected shape, ignoring: ${result.error.message}`);
+      return { version: 1, slots: {} };
+    }
+    return result.data;
+  }
+  catch (error) {
+    logger.warn(`Failed to read port index at ${file}: ${errorMessage(error)}`);
+    return { version: 1, slots: {} };
+  }
+}
+
+export function writePortIndex(index: PortIndex): void {
+  ensureInstanceParent();
+  atomicWriteJson(path.join(resolveInstanceParent(), PORT_INDEX_FILENAME), index);
+}
+
+const LOCK_DIR_NAME = '.port-index.lock';
+const LOCK_STALE_MS = 10_000;
+const LOCK_POLL_MS = 50;
+const LOCK_MAX_WAIT_MS = 5_000;
+
+export async function withRegistryLock<T>(fn: () => Promise<T> | T): Promise<T> {
+  ensureInstanceParent();
+  const lockDir = path.join(resolveInstanceParent(), LOCK_DIR_NAME);
+  const start = Date.now();
+  while (true) {
+    try {
+      fs.mkdirSync(lockDir);
+      break;
+    }
+    catch (error) {
+      if (errorCode(error) !== 'EEXIST') {
+        throw error;
+      }
+      try {
+        const age = Date.now() - fs.statSync(lockDir).mtimeMs;
+        if (age > LOCK_STALE_MS) {
+          logger.warn(`Removing stale port-index lock (${age}ms old)`);
+          fs.rmSync(lockDir, { recursive: true, force: true });
+          continue;
+        }
+      }
+      catch {
+        continue;
+      }
+      if (Date.now() - start > LOCK_MAX_WAIT_MS) {
+        throw new Error(`Timed out waiting for port-index lock at ${lockDir}`);
+      }
+      await new Promise(resolve => setTimeout(resolve, LOCK_POLL_MS));
+    }
+  }
+  try {
+    return await fn();
+  }
+  finally {
+    try {
+      fs.rmSync(lockDir, { recursive: true, force: true });
+    }
+    catch {
+      // best-effort
+    }
+  }
+}
+
+/**
+ * Thrown by `allocatePortSlot` for conditions a developer can resolve (slot
+ * conflicts, exhausted range). The CLI catches these and prints `.message`
+ * without a stack trace.
+ */
+export class PortSlotAllocationError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'PortSlotAllocationError';
+  }
+}
+
+function isSlotInUse(index: PortIndex, slot: number, exceptName?: string): boolean {
+  for (const [name, s] of Object.entries(index.slots)) {
+    if (s === slot && name !== exceptName) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * How long a slot reservation outlives its last use. An instance keeps its ports
+ * across restarts, but not forever: worktrees get deleted and branches get
+ * merged, and their instances are rarely cleaned up, so without an expiry the
+ * allocator keeps climbing while the low slots sit idle.
+ */
+export const SLOT_EXPIRY_MS = 48 * 60 * 60 * 1000;
+
+/**
+ * When the instance was last started, or null when that cannot be determined.
+ * Falls back to the directory mtime for an instance with no (or an unreadable)
+ * metadata sidecar.
+ */
+function lastUsedAt(dir: string): number | null {
+  const meta = readMetadata(dir);
+  if (meta?.lastUsedAt) {
+    const parsed = Date.parse(meta.lastUsedAt);
+    if (!Number.isNaN(parsed)) {
+      return parsed;
+    }
+  }
+  try {
+    return fs.statSync(dir).mtimeMs;
+  }
+  catch {
+    return null;
+  }
+}
+
+/** Why this instance's reservation is stale, or null when it is still current. */
+function staleReason(dir: string, now: number): string | null {
+  if (!fs.existsSync(dir)) {
+    return 'removed';
+  }
+  const used = lastUsedAt(dir);
+  if (used === null || now - used <= SLOT_EXPIRY_MS) {
+    return null;
+  }
+  return `unused for ${Math.floor((now - used) / (24 * 60 * 60 * 1000))}d`;
+}
+
+/**
+ * Drop slot reservations that no longer describe an instance you are using:
+ * one whose directory is gone (only `--clean` calls `releasePortSlot`, so an
+ * instance deleted by hand keeps its slot forever), and one untouched for
+ * longer than `SLOT_EXPIRY_MS`. Both are how you end up being handed slot 8
+ * while slots 1-7 sit idle.
+ *
+ * An expired instance keeps its data directory; it just loses its claim on
+ * those ports, and picks up a fresh slot the next time it starts.
+ *
+ * `keepName` is the instance currently being allocated: `prepareInstance`
+ * creates its directory before it calls in here, but keeping it exempt means a
+ * caller that has not done so yet cannot have its own reservation pruned.
+ *
+ * Returns a line per dropped name, for logging.
+ */
+async function pruneOrphanedSlots(
+  index: PortIndex,
+  keepName: string,
+  now: number,
+  isSlotLive: (slot: number) => Promise<boolean>,
+): Promise<string[]> {
+  const dropped: string[] = [];
+  for (const [name, slot] of Object.entries(index.slots)) {
+    if (name === keepName) {
+      continue;
+    }
+    const reason = staleReason(resolveInstanceDir(name), now);
+    if (reason === null) {
+      continue;
+    }
+    // Stale on paper, but demonstrably still serving, so leave its ports alone.
+    if (await isSlotLive(slot)) {
+      continue;
+    }
+    delete index.slots[name];
+    dropped.push(`${name} (${reason})`);
+  }
+  return dropped;
+}
+
+export interface AllocateSlotOptions {
+  /** Explicit slot from `INSTANCE_PORT_SLOT`. */
+  hint?: number;
+  /**
+   * Liveness probe, injected by the caller so this module does not depend on
+   * `port-probe` (which depends on this one). Defaults to "nothing is live",
+   * which only ever makes the prune more eager, so callers that cannot probe
+   * still get correct-on-paper behaviour.
+   */
+  isSlotLive?: (slot: number) => Promise<boolean>;
+}
+
+export async function allocatePortSlot(name: string, options: AllocateSlotOptions = {}): Promise<number> {
+  const { hint, isSlotLive = async (): Promise<boolean> => false } = options;
+  const sanitized = sanitizeName(name);
+  return withRegistryLock(async () => {
+    const index = readPortIndex();
+    const orphaned = await pruneOrphanedSlots(index, sanitized, Date.now(), isSlotLive);
+    if (orphaned.length > 0) {
+      logger.info(`Released port slot(s): ${orphaned.join(', ')}`);
+      writePortIndex(index);
+    }
+
+    if (hint !== undefined) {
+      if (slotHasReservedConflict(hint)) {
+        throw new PortSlotAllocationError(
+          `Port slot ${hint} resolves to a reserved port (node --inspect on ${NODE_INSPECT_PORT}, the e2e ports 30301–30304) or exceeds the max TCP port.\n`
+          + `  Pick a different slot (1 or higher) or unset INSTANCE_PORT_SLOT.`,
+        );
+      }
+      if (isSlotInUse(index, hint, sanitized)) {
+        const owner = Object.entries(index.slots).find(([n, s]) => s === hint && n !== sanitized)?.[0];
+        throw new PortSlotAllocationError(
+          `Port slot ${hint} is already owned by instance "${owner}", not "${sanitized}".\n`
+          + `  To resolve, pick ONE:\n`
+          + `    --clean ${owner}              free the slot by removing that instance\n`
+          + `    INSTANCE_PORT_SLOT=<other>    pick a different slot\n`
+          + `    unset INSTANCE_PORT_SLOT      let dev:web allocate a fresh slot for "${sanitized}"`,
+        );
+      }
+      index.slots[sanitized] = hint;
+      writePortIndex(index);
+      return hint;
+    }
+
+    const existing = index.slots[sanitized];
+    if (existing !== undefined) {
+      return existing;
+    }
+
+    let slot = RESERVED_SLOTS_END;
+    while (isSlotInUse(index, slot) || slotHasReservedConflict(slot)) {
+      slot += 1;
+      if (slot > 1000) {
+        throw new PortSlotAllocationError('Unable to allocate a free port slot (exhausted search space).');
+      }
+    }
+    index.slots[sanitized] = slot;
+    writePortIndex(index);
+    return slot;
+  });
+}
+
+export async function releasePortSlot(name: string): Promise<void> {
+  const sanitized = sanitizeName(name);
+  await withRegistryLock(() => {
+    const index = readPortIndex();
+    if (!(sanitized in index.slots)) {
+      return;
+    }
+    delete index.slots[sanitized];
+    writePortIndex(index);
+  });
+}

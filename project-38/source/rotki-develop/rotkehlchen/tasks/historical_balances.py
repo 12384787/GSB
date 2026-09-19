@@ -1,0 +1,1138 @@
+import logging
+import time
+from collections import defaultdict
+from contextlib import suppress
+from typing import TYPE_CHECKING, Final, Literal, NamedTuple
+
+from rotkehlchen.api.websockets.typedefs import ProgressUpdateSubType, WSMessageType
+from rotkehlchen.assets.asset import Asset
+from rotkehlchen.assets.types import AssetFlag
+from rotkehlchen.chain.evm.decoding.cowswap.constants import CPT_COWSWAP
+from rotkehlchen.chain.evm.types import string_to_evm_address
+from rotkehlchen.concurrency import TaskCancelledError, checkpoint
+from rotkehlchen.constants import ZERO
+from rotkehlchen.constants.assets import A_ETH, A_ETH2
+from rotkehlchen.db.cache import DBCacheStatic
+from rotkehlchen.db.constants import HISTORY_MAPPING_KEY_STATE, HistoryMappingState
+from rotkehlchen.db.filtering import HistoryEventFilterQuery
+from rotkehlchen.db.history_events import DBHistoryEvents, get_bitcoin_counterparty_addresses
+from rotkehlchen.db.settings import CachedSettings
+from rotkehlchen.db.utils import get_query_chunks
+from rotkehlchen.errors.asset import UnknownAsset, WrongAssetType
+from rotkehlchen.errors.misc import NotFoundError
+from rotkehlchen.exchanges.constants import ALL_SUPPORTED_EXCHANGES
+from rotkehlchen.fval import FVal
+from rotkehlchen.globaldb.handler import GlobalDBHandler
+from rotkehlchen.history.data_issues.constants import IssueKind, IssueState
+from rotkehlchen.history.data_issues.manager import (
+    DataIssuesManager,
+    make_auto_remediation_attempt,
+)
+from rotkehlchen.history.data_issues.types import (
+    NegativeBalanceIssuePayload,
+    RebasingQueryFailure,
+    RebasingTokenIssuePayload,
+    UnmatchedBridgeIssuePayload,
+)
+from rotkehlchen.history.events.structures.evm_event import EvmEvent
+from rotkehlchen.history.events.structures.onchain_event import OnchainEvent
+from rotkehlchen.history.events.structures.types import (
+    EventDirection,
+    HistoryEventSubType,
+    HistoryEventType,
+)
+from rotkehlchen.logging import RotkehlchenLogsAdapter
+from rotkehlchen.tasks.bridges import (
+    get_bridge_match_window,
+    get_event_bridge_data,
+    get_unmatched_bridge_events,
+)
+from rotkehlchen.types import (
+    EVM_CHAIN_IDS_WITH_TRANSACTIONS,
+    ChainID,
+    EventMetricKey,
+    Location,
+    Timestamp,
+    TimestampMS,
+)
+from rotkehlchen.utils.misc import ts_ms_to_sec, ts_now, ts_sec_to_ms
+from rotkehlchen.utils.mixins.lockable import skip_if_running
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from rotkehlchen.chain.aggregator import ChainsAggregator
+    from rotkehlchen.db.dbhandler import DBHandler
+    from rotkehlchen.db.drivers.sqlite import DBCursor
+    from rotkehlchen.history.events.structures.base import HistoryBaseEntry
+    from rotkehlchen.user_messages import MessagesAggregator
+
+logger = logging.getLogger(__name__)
+log = RotkehlchenLogsAdapter(logger)
+
+type EventTypeSubtypePairs = set[tuple[HistoryEventType, HistoryEventSubType]]
+type MetricRow = tuple[
+    int | None,
+    str,
+    str | None,
+    str | None,
+    str,
+    str,
+    str,
+    int,
+    int,
+    int,
+]
+
+# Event subtypes that route to a protocol bucket (single bucket).
+# These represent positions within a protocol (e.g., generating debt).
+PROTOCOL_BUCKET_SUBTYPES: Final = {
+    HistoryEventSubType.GENERATE_DEBT,
+    HistoryEventSubType.PAYBACK_DEBT,
+}
+
+# Protocol withdrawals that can trigger synthetic interest events when withdrawal exceeds deposit.
+PROTOCOL_WITHDRAWAL_EVENTS: Final[EventTypeSubtypePairs] = {
+    (HistoryEventType.WITHDRAWAL, HistoryEventSubType.WITHDRAW_FROM_PROTOCOL),
+    (HistoryEventType.STAKING, HistoryEventSubType.REMOVE_ASSET),
+}
+
+# Events that affect both wallet and protocol buckets.
+# Wallet direction comes from get_event_direction, protocol direction is the opposite.
+DUAL_BUCKET_PROTOCOL_EVENTS: Final[EventTypeSubtypePairs] = {
+    *PROTOCOL_WITHDRAWAL_EVENTS,
+    (HistoryEventType.DEPOSIT, HistoryEventSubType.DEPOSIT_TO_PROTOCOL),
+    (HistoryEventType.STAKING, HistoryEventSubType.DEPOSIT_ASSET),
+}
+
+# Kraken staking/unstaking events are internal spot <-> staking lock state changes.
+# They don't move the asset out of the user's Kraken account, so they should not affect balances.
+KRAKEN_INTERNAL_STAKING_EVENTS: Final[EventTypeSubtypePairs] = {
+    (HistoryEventType.STAKING, HistoryEventSubType.DEPOSIT_ASSET),
+    (HistoryEventType.STAKING, HistoryEventSubType.REMOVE_ASSET),
+}
+
+# Events that affect both sender and receiver wallet buckets.
+# Sender direction is OUT, receiver direction is IN.
+DUAL_BUCKET_TRANSFER_EVENTS: Final[EventTypeSubtypePairs] = {
+    (HistoryEventType.TRANSFER, HistoryEventSubType.NONE),
+    (HistoryEventType.TRANSFER, HistoryEventSubType.DONATE),
+}
+
+# CowSwap native asset order deposits, refunds and cancellations are an escrow lifecycle. A
+# successful order is accounted by its eventual trade, while refunds and cancellations only return
+# escrowed assets, so none of these escrow transfers should affect wallet balances.
+COWSWAP_ORDER_EVENTS_TO_IGNORE: Final[EventTypeSubtypePairs] = {
+    (HistoryEventType.DEPOSIT, HistoryEventSubType.PLACE_ORDER),
+    (HistoryEventType.WITHDRAWAL, HistoryEventSubType.CANCEL_ORDER),
+    (HistoryEventType.WITHDRAWAL, HistoryEventSubType.REFUND),
+}
+
+METRICS_BATCH_SIZE: Final = 500
+# How many events to process before voluntarily releasing the GIL, so concurrent
+# DB readers (e.g. the history page) interleave instead of waiting out the switch
+# interval per row while this pure-Python loop runs.
+MIN_EVENTS_PROCESSED_TO_SLEEP: Final = 25
+
+
+class Bucket(NamedTuple):
+    """Represents a unique bucket for tracking historical balances.
+
+    A bucket uniquely identifies where an asset balance is held:
+    - location: The blockchain/exchange location (e.g., 'ethereum', 'kraken')
+    - location_label: The specific address or account label
+    - protocol: The DeFi protocol if funds are deposited there (e.g., 'aave'), or None for wallet
+    - asset: The asset identifier
+    """
+    location: str
+    location_label: str | None
+    protocol: str | None
+    asset: str
+
+    @classmethod
+    def from_db(cls, row: tuple[str, str | None, str | None, str]) -> Bucket:
+        return cls(location=row[0], location_label=row[1], protocol=row[2], asset=row[3])
+
+    def serialize(self) -> dict[str, str | None]:
+        return {
+            'asset': self.asset,
+            'protocol': self.protocol,
+            'location': Location.deserialize_from_db(self.location).serialize(),
+            'location_label': self.location_label,
+        }
+
+    @classmethod
+    def from_event(
+            cls,
+            event: HistoryBaseEntry,
+            treat_eth2_as_eth: bool = False,
+    ) -> list[tuple[Bucket, Literal[EventDirection.IN, EventDirection.OUT]]]:
+        """Returns list of (Bucket, direction) pairs affected by this event.
+
+        Handles the following cases:
+        - CowSwap native asset order deposits/refunds/cancellations: ignored as escrow transfers
+        - Protocol deposits/withdrawals: affects both wallet and protocol buckets
+        - Transfers: affects sender (OUT) and receiver (IN) wallet buckets.
+        - Wrapped token deposits/redemptions: tracked as wallet-held asset conversions
+        - Debt positions: tracked in protocol bucket
+        - Everything else: tracked in wallet bucket
+        """
+        location = event.location.serialize_for_db()
+        asset = (
+            A_ETH.identifier if treat_eth2_as_eth is True and event.asset == A_ETH2 else
+            event.asset.resolve_swapped_for().identifier
+        )
+        event_key = (event.event_type, event.event_subtype)
+        counterparty = getattr(event, 'counterparty', None)
+        address = getattr(event, 'address', None)
+        if (  # Bitcoin/BCH events are plain HistoryEvents with no address column, so recover the
+            # counterparty from the notes. Without it a transfer between two owned addresses
+            # would only debit the sender bucket and never credit the receiver.
+            address is None and
+            event_key in DUAL_BUCKET_TRANSFER_EVENTS and
+            event.location in (Location.BITCOIN, Location.BITCOIN_CASH) and
+            len(addresses := get_bitcoin_counterparty_addresses(
+                location=event.location,
+                notes=event.notes,
+            )) == 1
+        ):
+            address = addresses[0]
+
+        if (
+            event_key in COWSWAP_ORDER_EVENTS_TO_IGNORE and
+            counterparty == CPT_COWSWAP
+        ):
+            return []
+
+        if (
+            location == Location.KRAKEN.serialize_for_db() and
+            event_key in KRAKEN_INTERNAL_STAKING_EVENTS
+        ):
+            return []
+
+        if (
+            event.event_type == HistoryEventType.TRANSFER and
+            event.location in ALL_SUPPORTED_EXCHANGES
+        ):
+            return []
+
+        if (  # Depositing/withdrawing to protocols affects both wallet and protocol buckets
+            event_key in DUAL_BUCKET_PROTOCOL_EVENTS and
+            (event.extra_data or {}).get('liquidity_pool') is not True and
+            counterparty not in (None, '') and
+            (wallet_direction := event.maybe_get_direction(for_balance_tracking=True)) is not None
+        ):
+            return [
+                (cls(  # type: ignore[list-item]  # wallet_direction will not be neutral for dual bucket protocol events.
+                    location=location,
+                    location_label=event.location_label,
+                    protocol=None,
+                    asset=asset,
+                ), wallet_direction),
+                (cls(
+                    location=location,
+                    location_label=event.location_label,
+                    protocol=counterparty,
+                    asset=asset,
+                ), EventDirection.IN if wallet_direction == EventDirection.OUT else EventDirection.OUT),  # noqa: E501
+            ]
+
+        if (  # Transfers affect both sender and receiver wallet buckets.
+            event_key in DUAL_BUCKET_TRANSFER_EVENTS and
+            address is not None
+        ):
+            return [
+                (cls(
+                    location=location,
+                    location_label=event.location_label,
+                    protocol=None,
+                    asset=asset,
+                ), EventDirection.OUT),
+                (cls(
+                    location=location,
+                    location_label=address,
+                    protocol=None,
+                    asset=asset,
+                ), EventDirection.IN),
+            ]
+
+        if (
+            (direction := event.maybe_get_direction(for_balance_tracking=True)) is None or
+            direction == EventDirection.NEUTRAL
+        ):
+            return []
+
+        if event.event_subtype in PROTOCOL_BUCKET_SUBTYPES and counterparty not in (None, ''):
+            return [(cls(
+                location=location,
+                location_label=event.location_label,
+                protocol=counterparty,
+                asset=asset,
+            ), direction)]
+
+        # Everything else: wallet bucket. Token protocol metadata describes asset identity,
+        # not custody.
+        return [(cls(
+            location=location,
+            location_label=event.location_label,
+            protocol=None,
+            asset=asset,
+        ), direction)]
+
+
+type ModifiedBucketData = tuple[TimestampMS, int]
+type ModifiedBuckets = dict[Bucket, ModifiedBucketData]
+type EventIssueScope = tuple[str, str | None, str | None, str, int]
+type RebasingReconciliationPoints = dict[tuple[int, Bucket], int | None]
+type PendingRebasingEvents = dict[Bucket, HistoryBaseEntry]
+
+
+def _load_bucket_balances_before_ts(
+        database: DBHandler,
+        from_ts: TimestampMS,
+) -> dict[Bucket, FVal]:
+    """Load the latest balance per bucket before from_ts.
+
+    We use MAX(sort_key) to identify the most recent row per bucket,
+    relying on SQLite's bare column behavior to return non-aggregated columns from
+    that row. See https://www.sqlite.org/lang_select.html#bareagg
+    """
+    bucket_balances: dict[Bucket, FVal] = {}
+    with database.conn.read_ctx() as cursor:
+        treat_eth2_as_eth = CachedSettings().get_entry('treat_eth2_as_eth') is True
+        cursor.execute(
+            """
+            SELECT location, location_label, protocol, asset, metric_value, MAX(sort_key)
+            FROM event_metrics WHERE metric_key = ? AND timestamp < ?
+            GROUP BY location, location_label, protocol, asset
+            """,
+            (EventMetricKey.BALANCE.serialize(), from_ts),
+        )
+        for row in cursor:
+            asset = (
+                A_ETH.identifier if treat_eth2_as_eth is True and row[3] == A_ETH2.identifier else
+                row[3]
+            )
+            bucket = Bucket.from_db((row[0], row[1], row[2], asset))
+            bucket_balances[bucket] = bucket_balances.get(bucket, ZERO) + FVal(row[4])
+
+    log.debug('Loaded %s bucket balances before ts=%s', len(bucket_balances), from_ts)
+    return bucket_balances
+
+
+def _get_rebasing_reconciliation_points(
+        database: DBHandler,
+        events: Sequence[HistoryBaseEntry],
+        rebasing_assets: frozenset[str],
+        treat_eth2_as_eth: bool,
+) -> RebasingReconciliationPoints:
+    """Return the final rebasing event per timestamp and bucket with its highest block.
+
+    Events are processed by timestamp and sequence index, while chains with sub-second blocks can
+    have multiple blocks at the same timestamp whose log indexes do not preserve block order.
+    Reconciling once at the timestamp's final event against its highest block ensures the queried
+    end-of-block balance covers every event applied for that timestamp and no later event.
+    """
+    if len(rebasing_assets) == 0:
+        return {}
+
+    event_buckets: list[tuple[EvmEvent, list[Bucket]]] = []
+    transaction_keys: set[tuple[bytes, int]] = set()
+    for event in events:
+        if (
+            event.identifier is None or
+            not isinstance(event, EvmEvent) or
+            event.asset.identifier not in rebasing_assets
+        ):
+            continue
+
+        if len(buckets := [
+            bucket for bucket, _direction in Bucket.from_event(
+                event=event,
+                treat_eth2_as_eth=treat_eth2_as_eth,
+            )
+        ]) == 0:
+            continue
+
+        event_buckets.append((event, buckets))
+        transaction_keys.add((
+            bytes(event.tx_ref),
+            event.location.to_chain_id(),
+        ))
+
+    transaction_blocks: dict[tuple[bytes, int], int] = {}
+    hashes_by_chain: defaultdict[int, list[bytes]] = defaultdict(list)
+    for tx_hash, chain_id in transaction_keys:
+        hashes_by_chain[chain_id].append(tx_hash)
+
+    with database.conn.read_ctx() as cursor:
+        for chain_id, tx_hashes in hashes_by_chain.items():
+            for chunk, placeholders in get_query_chunks(data=tx_hashes):
+                transaction_blocks.update({
+                    (bytes(tx_hash), chain_id): block_number
+                    for tx_hash, block_number in cursor.execute(
+                        'SELECT tx_hash, block_number FROM evm_transactions '
+                        f'WHERE chain_id=? AND tx_hash IN ({placeholders})',
+                        [chain_id, *chunk],
+                    )
+                })
+
+    last_points: dict[tuple[int, TimestampMS, Bucket], tuple[int, int]] = {}
+    missing_points: dict[tuple[bytes, int, Bucket], int] = {}
+    for event, buckets in event_buckets:
+        assert event.identifier is not None
+        chain_id = event.location.to_chain_id()
+        tx_key = (bytes(event.tx_ref), chain_id)
+        if (block_number := transaction_blocks.get(tx_key)) is None:
+            for bucket in buckets:
+                missing_points[*tx_key, bucket] = event.identifier
+            continue
+
+        for bucket in buckets:
+            point_key = (chain_id, event.timestamp, bucket)
+            previous = last_points.get(point_key)
+            last_points[point_key] = (
+                event.identifier,
+                block_number if previous is None else max(block_number, previous[1]),
+            )
+
+    return {
+        **{(event_identifier, bucket): block_number for (
+            _chain_id, _timestamp, bucket,
+        ), (event_identifier, block_number) in last_points.items()},
+        **{(event_identifier, bucket): None for (
+            _tx_hash, _chain_id, bucket,
+        ), event_identifier in missing_points.items()},
+    }
+
+
+def _query_rebasing_balance(
+        event: HistoryBaseEntry,
+        bucket: Bucket,
+        block_number: int | None,
+        chains_aggregator: ChainsAggregator | None,
+) -> tuple[FVal | None, RebasingQueryFailure | None]:
+    """Return the cached or queried post-block token balance for a rebasing wallet bucket."""
+    if block_number is None:
+        return None, 'missing_transaction'
+    if (
+        chains_aggregator is None or
+        bucket.location_label is None or
+        bucket.protocol is not None or
+        not isinstance(event, EvmEvent)
+    ):
+        return None, 'unsupported_bucket'
+
+    try:
+        token = Asset(bucket.asset).resolve_to_evm_token()
+        chain_id = ChainID(event.location.to_chain_id())
+    except (UnknownAsset, ValueError, WrongAssetType):
+        return None, 'unsupported_bucket'
+
+    if chain_id not in EVM_CHAIN_IDS_WITH_TRANSACTIONS:
+        return None, 'unsupported_bucket'
+    evm_manager = chains_aggregator.get_evm_manager(chain_id)
+
+    balance = evm_manager.node_inquirer.get_historical_token_balance(
+        address=string_to_evm_address(bucket.location_label),
+        token=token,
+        block_number=block_number,
+        queried_timestamp=ts_ms_to_sec(event.timestamp),
+    )
+    if balance is not None:
+        return balance, None
+    if evm_manager.node_inquirer.has_archive_node() is False:
+        return None, 'archive_node_unavailable'
+    return None, 'historical_balance_query_failed'
+
+
+def _write_rebasing_issue(
+        database: DBHandler,
+        event: HistoryBaseEntry,
+        bucket: Bucket,
+        block_number: int | None,
+        reason: RebasingQueryFailure,
+) -> None:
+    """Persist why a rebasing balance could not be verified."""
+    assert event.identifier is not None, 'Processed history events should have identifiers'
+    issues_manager = DataIssuesManager(database)
+    issue_id, issue_state = issues_manager.write_issue_with_state(
+        kind=IssueKind.REBASING_TOKEN,
+        location=bucket.location,
+        location_label=bucket.location_label,
+        protocol=bucket.protocol,
+        asset=bucket.asset,
+        payload=RebasingTokenIssuePayload(
+            event_identifier=event.identifier,
+            block_number=block_number,
+            reason=reason,
+        ),
+        ts_start=event.timestamp,
+        ts_end=event.timestamp,
+    )
+    if issue_state == IssueState.AUTO_REMEDIATING:
+        issues_manager.update_state(
+            issue_id=issue_id,
+            state=IssueState.UNRESOLVED,
+            attempt=make_auto_remediation_attempt(success=False, reason=reason),
+        )
+
+
+@skip_if_running
+def process_historical_balances(
+        database: DBHandler,
+        msg_aggregator: MessagesAggregator,
+        from_ts: TimestampMS | None = None,
+        chains_aggregator: ChainsAggregator | None = None,
+) -> bool:
+    """Process events and compute balance metrics.
+
+    Returns True once processing runs to completion. The ``skip_if_running`` decorator returns
+    None instead when another run holds the lock; remediation callers must distinguish that case.
+    When a chain aggregator is supplied, negative rebasing balances can make cached or archive-node
+    historical balance queries. Results are cached per address, token and block.
+    """
+    log.debug(f'Starting historical balance processing from_ts={from_ts}')
+    rebasing_assets = GlobalDBHandler.get_asset_ids_with_flag(AssetFlag.REBASING)
+    bucket_balances: dict[Bucket, FVal] = {}
+    if from_ts is not None:
+        bucket_balances = _load_bucket_balances_before_ts(database, from_ts)
+
+    with database.conn.read_ctx() as cursor:
+        last_run_ts = database.get_static_cache(
+            cursor=cursor,
+            name=DBCacheStatic.LAST_HISTORICAL_BALANCE_PROCESSING_TS,
+        )
+        event_filter = HistoryEventFilterQuery.make(
+            order_by_rules=[
+                ('timestamp', True),
+                ('sequence_index', True),
+                ('history_events_identifier', True),
+            ],
+            exclude_ignored_assets=True,
+            exclude_untracked_withdrawals=True,
+        )
+        if from_ts is not None:
+            event_filter.timestamp_filter.from_ts = Timestamp(from_ts)
+            event_filter.timestamp_filter.scaling_factor = None
+        events = DBHistoryEvents(database).get_history_events_internal(
+            cursor=cursor,
+            filter_query=event_filter,
+        )
+        # Snapshot the modification timestamp after reading events. This allows us to
+        # detect concurrent modifications: if the modification timestamp changed between
+        # the read and processing completion, events were modified during processing.
+        modification_ts_at_start = cursor.execute(
+            'SELECT value FROM key_value_cache WHERE name = ?',
+            (DBCacheStatic.STALE_BALANCES_MODIFICATION_TS.value,),
+        ).fetchone()
+        modification_ts_at_start = (
+            int(modification_ts_at_start[0])
+            if modification_ts_at_start else None
+        )
+        treat_eth2_as_eth = CachedSettings().get_entry('treat_eth2_as_eth') is True
+
+    rebasing_reconciliation_points = _get_rebasing_reconciliation_points(
+        database=database,
+        events=events,
+        rebasing_assets=rebasing_assets,
+        treat_eth2_as_eth=treat_eth2_as_eth,
+    )
+
+    if (total_events := len(events)) == 0:
+        log.debug('No events to process for historical balances')
+        _finalize_processing(
+            database=database,
+            modification_ts_at_start=modification_ts_at_start,
+        )
+        return True
+
+    metrics_batch: list[MetricRow] = []
+    modified_buckets: ModifiedBuckets = {}
+    pending_rebasing_events: PendingRebasingEvents = {}
+    reported_rebasing_buckets: set[Bucket] = set()
+    resolved_rebasing_events: list[EventIssueScope] = []
+    first_batch_written, send_ws_every = False, msg_aggregator.how_many_events_per_ws(total_events)
+    for idx, event in enumerate(events):
+        for event_to_apply in events_to_apply if (events_to_apply := _maybe_add_profit_event(
+            database=database,
+            event=event,
+            bucket_balances=bucket_balances,
+            rebasing_assets=rebasing_assets,
+            treat_eth2_as_eth=treat_eth2_as_eth,
+        )) is not None else (event,):
+            _apply_to_buckets(
+                database=database,
+                event=event_to_apply,
+                bucket_balances=bucket_balances,
+                chains_aggregator=chains_aggregator,
+                metrics_batch=metrics_batch,
+                modified_buckets=modified_buckets,
+                pending_rebasing_events=pending_rebasing_events,
+                reported_rebasing_buckets=reported_rebasing_buckets,
+                resolved_rebasing_events=resolved_rebasing_events,
+                last_run_ts=last_run_ts,
+                rebasing_assets=rebasing_assets,
+                rebasing_reconciliation_points=rebasing_reconciliation_points,
+                treat_eth2_as_eth=treat_eth2_as_eth,
+            )
+
+        if idx % MIN_EVENTS_PROCESSED_TO_SLEEP == 0:
+            time.sleep(0)  # release the GIL so concurrent DB readers interleave
+
+        if idx % send_ws_every == 0:
+            msg_aggregator.add_message(
+                message_type=WSMessageType.PROGRESS_UPDATES,
+                data={
+                    'subtype': str(ProgressUpdateSubType.HISTORICAL_BALANCE_PROCESSING),
+                    'total': total_events,
+                    'processed': idx,
+                },
+            )
+
+        if len(metrics_batch) >= METRICS_BATCH_SIZE:
+            with database.user_write() as write_cursor:
+                _write_metrics_batch(
+                    write_cursor=write_cursor,
+                    metrics_batch=metrics_batch,
+                    from_ts=from_ts,
+                    first_batch_written=first_batch_written,
+                )
+            first_batch_written, metrics_batch = True, []
+            checkpoint()  # cancellation checkpoint of the balance processing loop
+            time.sleep(0)
+
+    if len(metrics_batch) != 0:
+        with database.user_write() as write_cursor:
+            _write_metrics_batch(
+                write_cursor=write_cursor,
+                metrics_batch=metrics_batch,
+                from_ts=from_ts,
+                first_batch_written=first_batch_written,
+            )
+
+    issues_manager = DataIssuesManager(database)
+    issues_manager.resolve_superseded_negative_balance_issues(assets=rebasing_assets)
+    issues_manager.resolve_event_issues(
+        kind=IssueKind.REBASING_TOKEN,
+        issues=resolved_rebasing_events,
+    )
+
+    msg_aggregator.add_message(
+        message_type=WSMessageType.PROGRESS_UPDATES,
+        data={
+            'subtype': str(ProgressUpdateSubType.HISTORICAL_BALANCE_PROCESSING),
+            'total': total_events,
+            'processed': total_events,
+        },
+    )
+    _detect_unmatched_bridge_issues(database=database)
+    _finalize_processing(database=database, modification_ts_at_start=modification_ts_at_start)
+    log.debug(
+        'Completed historical balance processing for %s events with %s modified buckets',
+        total_events,
+        len(modified_buckets),
+    )
+    return True
+
+
+def _fail_rebasing_remediation(
+        database: DBHandler,
+        issue_id: int,
+        reason: str,
+) -> None:
+    issues_manager = DataIssuesManager(database)
+    if issues_manager.get_issue(issue_id).state != IssueState.AUTO_REMEDIATING:
+        return
+
+    issues_manager.update_state(
+        issue_id=issue_id,
+        state=IssueState.UNRESOLVED,
+        attempt=make_auto_remediation_attempt(success=False, reason=reason),
+    )
+
+
+def retry_rebasing_token_issue(
+        database: DBHandler,
+        msg_aggregator: MessagesAggregator,
+        chains_aggregator: ChainsAggregator,
+        issue_id: int,
+        from_ts: TimestampMS,
+) -> None:
+    """Reprocess balances from a rebasing issue and finish its remediation attempt.
+
+    A pending stale-balances marker older than the issue widens the reprocessed range because
+    finalizing this run clears that marker.
+    """
+    with database.conn.read_ctx() as cursor:
+        if (stale_from_ts := database.get_static_cache(
+            cursor=cursor,
+            name=DBCacheStatic.STALE_BALANCES_FROM_TS,
+        )) is not None:
+            from_ts = min(from_ts, TimestampMS(int(stale_from_ts)))
+
+    try:
+        processing_completed = process_historical_balances(
+            database=database,
+            msg_aggregator=msg_aggregator,
+            from_ts=from_ts,
+            chains_aggregator=chains_aggregator,
+        )
+    except TaskCancelledError:
+        with suppress(NotFoundError):
+            _fail_rebasing_remediation(database, issue_id, 'processing_cancelled')
+        raise
+    except Exception:  # remediation state must recover from any processing failure
+        with suppress(NotFoundError):
+            _fail_rebasing_remediation(database, issue_id, 'processing_failed')
+        raise
+
+    if processing_completed is None:
+        _fail_rebasing_remediation(database, issue_id, 'processing_already_running')
+        return
+
+    issues_manager = DataIssuesManager(database)
+    issue = issues_manager.get_issue(issue_id)
+    attempt = make_auto_remediation_attempt(success=True)
+    if issue.state == IssueState.AUTO_REMEDIATING:
+        issues_manager.update_state(
+            issue_id=issue_id,
+            state=IssueState.RESOLVED,
+            attempt=attempt,
+            resolution={'reason': 'no_longer_reproduces'},
+        )
+    elif issue.state == IssueState.RESOLVED:
+        issues_manager.append_auto_remediation_attempt(
+            issue_id=issue_id,
+            attempt=attempt,
+            resolution={'reason': 'no_longer_reproduces'},
+        )
+
+
+def _detect_unmatched_bridge_issues(database: DBHandler) -> None:
+    """Surface bridge legs whose counterpart is unknown as data issues.
+
+    A linked bridge pair is an internal transfer the scanner can follow across
+    chains. An unlinked deposit past its bridge's settlement window means money
+    left a tracked bucket for an unknown destination; an unlinked withdrawal is
+    an inflow from an unknown source. Both are reported in the issues inbox and
+    auto-resolved once the leg gets matched, ignored, or resolved as external.
+    """
+    deposits, withdrawals = get_unmatched_bridge_events(database=database)
+    issues_manager = DataIssuesManager(database=database)
+    now_ms = ts_sec_to_ms(ts_now())
+    default_window = CachedSettings().get_settings().bridge_match_time_range
+    unmatched_ids: set[int] = set()
+    for direction, events in (('deposit', deposits), ('withdrawal', withdrawals)):
+        for event in events:
+            if event.identifier is None:
+                continue
+
+            counterparty = getattr(event, 'counterparty', None)
+            window = get_bridge_match_window(
+                event=event,
+                default_window=default_window,
+            ) if direction == 'deposit' else default_window  # grace so we don't race the matcher
+            if now_ms < event.timestamp + window * 1000:
+                continue  # the counterpart leg may still legitimately appear
+
+            unmatched_ids.add(event.identifier)
+            payload = UnmatchedBridgeIssuePayload(
+                event_identifier=event.identifier,
+                group_identifier=event.group_identifier,
+                direction=direction,
+            )
+            if counterparty is not None:
+                payload['counterparty'] = counterparty
+            if len(bridge_data := get_event_bridge_data(event)) > 0:
+                payload['bridge'] = bridge_data
+            issues_manager.write_issue(
+                kind=IssueKind.UNMATCHED_BRIDGE,
+                location=event.location.serialize_for_db(),
+                location_label=event.location_label,
+                protocol=counterparty,
+                asset=event.asset.identifier,
+                payload=payload,
+                ts_start=event.timestamp,
+                ts_end=event.timestamp,
+            )
+
+    # System-resolve issues whose leg is no longer unmatched (got matched, ignored
+    # or resolved as external). This is an observed fact, not a user/remediation
+    # state transition, so it bypasses the state machine on purpose.
+    with database.user_write() as write_cursor:
+        query = (
+            'UPDATE data_issues SET state = ?, resolved_at = ? WHERE kind = ? '
+            'AND state != ? AND resolved_at IS NULL'
+        )
+        bindings: tuple = (
+            IssueState.RESOLVED,
+            ts_now(),
+            IssueKind.UNMATCHED_BRIDGE,
+            IssueState.DISMISSED,
+        )
+        if len(unmatched_ids) > 0:
+            placeholders = ','.join(['?'] * len(unmatched_ids))
+            query += f' AND event_identifier NOT IN ({placeholders})'
+            bindings += tuple(unmatched_ids)
+        write_cursor.execute(query, bindings)
+
+
+def _finalize_processing(
+        database: DBHandler,
+        modification_ts_at_start: int | None,
+) -> None:
+    """Update cache timestamps. Only clears stale marker if no modifications during processing.
+
+    Uses a snapshot of the modification timestamp taken after reading events. If the current
+    modification timestamp is strictly greater than the snapshot, events were modified during
+    processing and the stale marker is kept for the next run.
+    """
+    with database.user_write() as write_cursor:
+        database.set_static_cache(
+            write_cursor=write_cursor,
+            name=DBCacheStatic.LAST_HISTORICAL_BALANCE_PROCESSING_TS,
+            value=ts_now(),
+        )
+
+        if (
+            (modification_ts := write_cursor.execute(
+                'SELECT value FROM key_value_cache WHERE name = ?',
+                (DBCacheStatic.STALE_BALANCES_MODIFICATION_TS.value,),
+            ).fetchone()) is None or
+            int(modification_ts[0]) > (modification_ts_at_start or 0)
+        ):
+            if modification_ts is not None:
+                log.debug(
+                    'Events modified during historical balance processing, '
+                    'keeping stale marker for next run',
+                )
+            return
+
+        write_cursor.execute(
+            'DELETE FROM key_value_cache WHERE name IN (?, ?)',
+            (DBCacheStatic.STALE_BALANCES_FROM_TS.value,
+             DBCacheStatic.STALE_BALANCES_MODIFICATION_TS.value),
+        )
+
+
+def _write_metrics_batch(
+        write_cursor: DBCursor,
+        metrics_batch: list[MetricRow],
+        from_ts: TimestampMS | None,
+        first_batch_written: bool,
+) -> None:
+    """Write metrics batch to DB, deleting old entries on first write."""
+    if not first_batch_written:
+        if from_ts is not None:
+            write_cursor.execute(
+                'DELETE FROM event_metrics WHERE event_identifier IN '
+                '(SELECT identifier FROM history_events WHERE timestamp >= ?)',
+                (from_ts,),
+            )
+        else:
+            write_cursor.execute('DELETE FROM event_metrics')
+    write_cursor.executemany(
+        'INSERT OR REPLACE INTO event_metrics '
+        '(event_identifier, location, location_label, protocol, metric_key, metric_value, asset, timestamp, sequence_index, sort_key) '  # noqa: E501
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        metrics_batch,
+    )
+
+
+def _apply_to_buckets(
+        database: DBHandler,
+        event: HistoryBaseEntry,
+        bucket_balances: dict[Bucket, FVal],
+        chains_aggregator: ChainsAggregator | None,
+        metrics_batch: list[MetricRow],
+        modified_buckets: ModifiedBuckets,
+        pending_rebasing_events: PendingRebasingEvents,
+        reported_rebasing_buckets: set[Bucket],
+        resolved_rebasing_events: list[EventIssueScope],
+        last_run_ts: Timestamp | None,
+        rebasing_assets: frozenset[str],
+        rebasing_reconciliation_points: RebasingReconciliationPoints,
+        treat_eth2_as_eth: bool,
+) -> None:
+    """Apply the given event to the buckets it affects."""
+    if len(bucket_directions := Bucket.from_event(
+        event=event,
+        treat_eth2_as_eth=treat_eth2_as_eth,
+    )) == 0:
+        return
+
+    for bucket_idx, (bucket, direction) in enumerate(bucket_directions):
+        if (
+            (current_balance := bucket_balances.get(bucket, ZERO)) < ZERO and
+            bucket not in pending_rebasing_events
+        ):
+            continue
+
+        new_balance = (
+            current_balance + event.amount if direction == EventDirection.IN else
+            current_balance - event.amount
+        )
+        if (
+            bucket.asset in rebasing_assets and
+            event.asset.identifier in rebasing_assets
+        ):
+            assert event.identifier is not None, 'Processed history events should have identifiers'
+            if new_balance < ZERO and not isinstance(event, EvmEvent):
+                _write_rebasing_issue(
+                    database=database,
+                    event=event,
+                    bucket=bucket,
+                    block_number=None,
+                    reason='unsupported_bucket',
+                )
+                bucket_balances[bucket] = new_balance
+                continue
+
+            if new_balance < ZERO:
+                pending_rebasing_events.setdefault(bucket, event)
+
+            if (negative_event := pending_rebasing_events.get(bucket)) is not None:
+                reconciliation_key = (event.identifier, bucket)
+                if (
+                    reconciliation_key not in rebasing_reconciliation_points or
+                    any(other_bucket == bucket for other_bucket, _direction in bucket_directions[bucket_idx + 1:])  # noqa: E501
+                ):
+                    bucket_balances[bucket] = new_balance
+                    continue  # balanceOf is end-of-block state; reconcile only at the final event
+
+                block_number = rebasing_reconciliation_points[reconciliation_key]
+                onchain_balance, failure = _query_rebasing_balance(
+                    event=event,
+                    bucket=bucket,
+                    block_number=block_number,
+                    chains_aggregator=chains_aggregator,
+                )
+                if failure is not None:
+                    if bucket not in reported_rebasing_buckets:
+                        reported_rebasing_buckets.add(bucket)
+                        _write_rebasing_issue(
+                            database=database,
+                            event=negative_event,
+                            bucket=bucket,
+                            block_number=block_number,
+                            reason=failure,
+                        )
+                    bucket_balances[bucket] = new_balance
+                    continue
+
+                assert onchain_balance is not None
+                assert negative_event.identifier is not None
+                del pending_rebasing_events[bucket]
+                reported_rebasing_buckets.discard(bucket)
+                resolved_rebasing_events.append((
+                    bucket.location,
+                    bucket.location_label,
+                    bucket.protocol,
+                    bucket.asset,
+                    negative_event.identifier,
+                ))
+                metrics_batch.append((
+                    event.identifier,
+                    bucket.location,
+                    bucket.location_label,
+                    bucket.protocol,
+                    EventMetricKey.REBASE_YIELD.serialize(),
+                    str(onchain_balance - new_balance),
+                    bucket.asset,
+                    event.timestamp,
+                    event.sequence_index,
+                    event.timestamp + event.sequence_index,
+                ))
+                new_balance = onchain_balance
+        elif new_balance < ZERO:
+            assert event.identifier is not None, 'Processed history events should have identifiers'
+            payload: NegativeBalanceIssuePayload = {
+                'event_identifier': event.identifier,
+                'in_memory_negative_amount': str(new_balance),
+                'derived_balance_before_event': str(current_balance),
+            }
+            if (
+                isinstance(event, OnchainEvent) and
+                event.event_type == HistoryEventType.WITHDRAWAL and
+                event.event_subtype == HistoryEventSubType.REMOVE_ASSET and
+                event.counterparty is not None and
+                any(str(loc) == event.counterparty for loc in ALL_SUPPORTED_EXCHANGES) and
+                Location.deserialize(event.counterparty) not in database.get_associated_locations()
+            ):
+                payload['reason'] = 'untracked_exchange'
+
+            database.msg_aggregator.add_message(
+                message_type=WSMessageType.NEGATIVE_BALANCE_DETECTED,
+                data={
+                    'event_identifier': event.identifier,
+                    'group_identifier': event.group_identifier,
+                    'asset': event.asset.identifier,
+                    'bucket': bucket.serialize(),
+                    'balance_before': str(current_balance),
+                    'last_run_ts': last_run_ts,
+                },
+            )
+            DataIssuesManager(database).write_issue(
+                IssueKind.NEGATIVE_BALANCE,
+                location=bucket.location,
+                location_label=bucket.location_label,
+                protocol=bucket.protocol,
+                asset=bucket.asset,
+                payload=payload,
+                ts_start=event.timestamp,
+                ts_end=event.timestamp,
+            )
+            log.warning(
+                'Negative balance detected for %s at event %s. Skipping %s.',
+                event.asset.identifier,
+                event.identifier,
+                bucket,
+            )
+            bucket_balances[bucket] = new_balance
+            continue
+
+        bucket_balances[bucket] = new_balance
+        metrics_batch.append((
+            event.identifier,
+            bucket.location,
+            bucket.location_label,
+            bucket.protocol,
+            EventMetricKey.BALANCE.serialize(),
+            str(new_balance),
+            bucket.asset,
+            event.timestamp,
+            event.sequence_index,
+            event.timestamp + event.sequence_index,
+        ))
+        if event.identifier is not None:
+            modified_buckets[bucket] = (event.timestamp, event.identifier)
+
+
+def _maybe_add_profit_event(
+        database: DBHandler,
+        event: HistoryBaseEntry,
+        bucket_balances: dict[Bucket, FVal],
+        rebasing_assets: frozenset[str],
+        treat_eth2_as_eth: bool,
+) -> tuple[OnchainEvent, ...] | None:
+    """Maybe add a receive/reward event for the profit earned while an asset was in a protocol.
+    If the profit event is already present, take no action and return None. Otherwise, update the
+    amount of the given withdrawal event, and create the profit event.
+    Returns a tuple containing the new profit event and the updated withdrawal event or None
+    if there is no profit event needed or if it is already present.
+    """
+    if CachedSettings().get_entry('auto_create_profit_events') is False:
+        return None
+
+    if len(bucket_directions := Bucket.from_event(
+        event=event,
+        treat_eth2_as_eth=treat_eth2_as_eth,
+    )) == 0:
+        return None
+
+    for bucket, direction in bucket_directions:
+        if (current_balance := bucket_balances.get(bucket, ZERO)) < ZERO:
+            continue
+
+        if (
+            direction == EventDirection.OUT and
+            (new_balance := current_balance - event.amount) < ZERO and
+            bucket.asset not in rebasing_assets and
+            bucket.protocol is not None and
+            (event.event_type, event.event_subtype) in PROTOCOL_WITHDRAWAL_EVENTS and
+            isinstance(event, OnchainEvent)
+        ):
+            # Withdrawal exceeds deposit, meaning yield was earned. Only applies to
+            # protocol withdrawals without wrapped tokens (WITHDRAW_FROM_PROTOCOL,
+            # REMOVE_ASSET). Create a profit event to account for the earned yield.
+            break  # Break loop and create profit event.
+    else:
+        return None  # no yield earned detected
+
+    with database.conn.read_ctx() as cursor:
+        if cursor.execute(
+            'SELECT COUNT(*) FROM history_events he '
+            'JOIN chain_events_info cei ON he.identifier = cei.identifier '
+            'WHERE group_identifier=? AND type=? AND subtype=? '
+            'AND location_label=? AND asset=? AND amount=? AND counterparty=?',
+            (
+                event.group_identifier,
+                HistoryEventType.RECEIVE.serialize(),
+                HistoryEventSubType.REWARD.serialize(),
+                event.location_label,
+                event.asset.identifier,
+                str(profit_amount := abs(new_balance)),
+                bucket.protocol,
+            ),
+        ).fetchone()[0] != 0:
+            return None
+
+    db_events = DBHistoryEvents(database)
+    with database.user_write() as write_cursor:
+        # If the entire amount of the withdrawal is profit, convert the withdrawal itself
+        # to an receive/reward event
+        if (new_withdraw_amount := event.amount - profit_amount) == ZERO:
+            event.event_type = HistoryEventType.RECEIVE
+            event.event_subtype = HistoryEventSubType.REWARD
+            event.notes = f'Profit earned from {event.asset} in {bucket.protocol}'
+            write_cursor.execute(
+                'UPDATE history_events SET type=?, subtype=?, notes=? WHERE identifier=?',
+                (
+                    event.event_type.serialize(),
+                    event.event_subtype.serialize(),
+                    event.notes,
+                    event.identifier,
+                ),
+            )
+            write_cursor.execute(
+                'INSERT OR IGNORE INTO history_events_mappings(parent_identifier, name, value) '
+                'VALUES(?, ?, ?)',
+                (event.identifier, HISTORY_MAPPING_KEY_STATE, HistoryMappingState.PROFIT_ADJUSTMENT.serialize_for_db()),  # noqa: E501
+            )
+            return (event,)
+
+        # First increment the sequence indexes to ensure an unused index for the
+        # new event. Can't adjust in a single query or it may try to set an index
+        # to an existing index and cause unique constraint errors.
+        write_cursor.execute(  # Increment but make negative so it is unique
+            'UPDATE history_events SET sequence_index = -(sequence_index + 1) '
+            'WHERE group_identifier = ? AND sequence_index >= ?',
+            (event.group_identifier, event.sequence_index),
+        )
+        write_cursor.execute(  # Shift back to positive
+            'UPDATE history_events SET sequence_index = -sequence_index '
+            'WHERE group_identifier = ? AND sequence_index < 0',
+            (event.group_identifier,),
+        )
+        # Update the amount of the withdrawal event in both the amount and notes columns.
+        # Replace the amount in the notes with spaces on each side to prevent matching part of
+        # an address or something if the amount is only a single digit.
+        if event.notes is not None:
+            event.notes = event.notes.replace(f' {event.amount} ', f' {new_withdraw_amount} ')
+        event.amount = new_withdraw_amount
+        write_cursor.execute(
+            'UPDATE history_events SET amount=?, notes=? WHERE identifier=?',
+            (str(event.amount), event.notes, event.identifier),
+        )
+        # Add the profit event
+        identifier = db_events.add_history_event(
+            write_cursor=write_cursor,
+            event=(profit_event := type(event)(
+                tx_ref=event.tx_ref,
+                sequence_index=event.sequence_index,
+                timestamp=event.timestamp,
+                location=event.location,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.REWARD,
+                asset=event.asset,
+                amount=profit_amount,
+                location_label=event.location_label,
+                notes=f'Profit earned from {event.asset} in {bucket.protocol}',
+                counterparty=bucket.protocol,
+                address=event.address,
+            )),
+            mapping_values={HISTORY_MAPPING_KEY_STATE: HistoryMappingState.PROFIT_ADJUSTMENT},
+        )
+        profit_event.identifier = identifier
+        return profit_event, event

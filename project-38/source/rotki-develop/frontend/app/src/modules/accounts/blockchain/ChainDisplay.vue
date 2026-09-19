@@ -1,0 +1,66 @@
+<script setup lang="ts">
+import { Blockchain } from '@rotki/common';
+import { useSupportedChains } from '@/modules/core/common/use-supported-chains';
+import { useSetting } from '@/modules/settings/use-setting';
+import ChainIcon from '@/modules/shell/components/ChainIcon.vue';
+import EvmChainIcon from '@/modules/shell/components/EvmChainIcon.vue';
+import ListItem from '@/modules/shell/components/ListItem.vue';
+
+const { chain, dense = false, evmChain = false } = defineProps<{
+  chain: string;
+  evmChain?: boolean;
+  dense?: boolean;
+}>();
+
+const { t } = useI18n({ useScope: 'global' });
+
+const { getChainName } = useSupportedChains();
+const shouldShowAmount = useSetting('shouldShowAmount');
+const name = computed(() => {
+  if (chain === 'all')
+    return t('account_form.labels.all_supported_chains');
+
+  return getChainName(chain);
+});
+
+const evmChainsRepresentative = [Blockchain.ETH, Blockchain.ARBITRUM_ONE, Blockchain.BASE, Blockchain.OPTIMISM];
+</script>
+
+<template>
+  <ListItem
+    size="sm"
+    :title="name"
+    no-padding
+    no-hover
+    class="!py-0"
+    :blur-content="!shouldShowAmount"
+  >
+    <template #avatar>
+      <div
+        v-if="chain === 'all'"
+        class="grid grid-cols-2 gap-0.5 icon-bg"
+      >
+        <ChainIcon
+          v-for="item in evmChainsRepresentative"
+          :key="item"
+          :size="dense ? '9px' : '13px'"
+          class="!p-0"
+          :chain="item"
+        />
+      </div>
+
+      <EvmChainIcon
+        v-else-if="evmChain"
+        class="icon-bg"
+        :chain="chain"
+        :size="dense ? '20px' : '26px'"
+      />
+
+      <ChainIcon
+        v-else
+        :chain="chain"
+        :size="dense ? '20px' : '26px'"
+      />
+    </template>
+  </ListItem>
+</template>

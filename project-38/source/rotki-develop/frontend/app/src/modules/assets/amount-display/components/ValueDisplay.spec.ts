@@ -1,0 +1,138 @@
+import type { Pinia } from 'pinia';
+import { bigNumberify } from '@rotki/common';
+import { createCustomPinia } from '@test/utils/create-pinia';
+import { updateGeneralSettings } from '@test/utils/general-settings';
+import { mount, type VueWrapper } from '@vue/test-utils';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import ValueDisplay from '@/modules/assets/amount-display/components/ValueDisplay.vue';
+import { useCurrencies } from '@/modules/assets/amount-display/currencies';
+import { useSettingsRepo } from '@/modules/settings/settings-repo';
+
+describe('modules/amount-display/components/ValueDisplay', () => {
+  let wrapper: VueWrapper<InstanceType<typeof ValueDisplay>>;
+  let pinia: Pinia;
+
+  beforeEach(() => {
+    pinia = createCustomPinia();
+    setActivePinia(pinia);
+    const { findCurrency } = useCurrencies();
+
+    updateGeneralSettings({
+      mainCurrency: findCurrency('EUR'),
+      uiFloatingPrecision: 2,
+    });
+  });
+
+  afterEach(() => {
+    wrapper.unmount();
+  });
+
+  describe('value display', () => {
+    it('should display raw numeric value', async () => {
+      wrapper = mount(ValueDisplay, {
+        global: { plugins: [pinia] },
+        props: { value: bigNumberify(1.5) },
+      });
+      expect(wrapper.find('[data-testid=amount-display]').text()).toMatch('1.50');
+    });
+
+    it('should display value with custom symbol', async () => {
+      wrapper = mount(ValueDisplay, {
+        global: { plugins: [pinia] },
+        props: {
+          symbol: 'ETH',
+          value: bigNumberify(1.5),
+        },
+      });
+      expect(wrapper.find('[data-testid=amount-display]').text()).toMatch('1.50');
+      expect(wrapper.find('[data-testid=display-currency]').text()).toBe('ETH');
+    });
+
+    it('should display value without symbol when symbol is empty', async () => {
+      wrapper = mount(ValueDisplay, {
+        global: { plugins: [pinia] },
+        props: {
+          symbol: '',
+          value: bigNumberify(1.5),
+        },
+      });
+      expect(wrapper.find('[data-testid=display-currency]').exists()).toBe(false);
+    });
+  });
+
+  describe('pnl coloring', () => {
+    it('should show green for positive values', () => {
+      wrapper = mount(ValueDisplay, {
+        global: { plugins: [pinia] },
+        props: {
+          pnl: true,
+          value: bigNumberify(50),
+        },
+      });
+      expect(wrapper.find('[data-testid=amount-display].text-rui-success').exists()).toBe(true);
+    });
+
+    it('should show red for negative values', () => {
+      wrapper = mount(ValueDisplay, {
+        global: { plugins: [pinia] },
+        props: {
+          pnl: true,
+          value: bigNumberify(-50),
+        },
+      });
+      expect(wrapper.find('[data-testid=amount-display].text-rui-error').exists()).toBe(true);
+    });
+  });
+
+  describe('scramble data', () => {
+    beforeEach(async () => {
+      useSettingsRepo().updateFrontend({ scrambleData: true, scrambleMultiplier: 1.02 });
+    });
+
+    it('should scramble the value', async () => {
+      wrapper = mount(ValueDisplay, {
+        global: { plugins: [pinia] },
+        props: { value: bigNumberify(1.5) },
+      });
+      expect(wrapper.find('[data-testid="display-amount"]').text()).toBe('1.53');
+    });
+
+    it('should not scramble the value when noScramble is true', async () => {
+      wrapper = mount(ValueDisplay, {
+        global: { plugins: [pinia] },
+        props: {
+          noScramble: true,
+          value: bigNumberify(1.5),
+        },
+      });
+      expect(wrapper.find('[data-testid="display-amount"]').text()).toBe('1.50');
+    });
+  });
+
+  describe('format options', () => {
+    it('should round an integer format up, using the amount rounding mode rather than the value one', () => {
+      wrapper = mount(ValueDisplay, {
+        global: { plugins: [pinia] },
+        props: {
+          format: { integer: true },
+          value: bigNumberify(128.205),
+        },
+      });
+      expect(wrapper.find('[data-testid="display-amount"]').text()).toBe('129');
+    });
+  });
+
+  describe('loading state', () => {
+    it('should show loading skeleton', () => {
+      wrapper = mount(ValueDisplay, {
+        global: { plugins: [pinia] },
+        props: {
+          loading: true,
+          value: bigNumberify(1.5),
+        },
+      });
+      expect(wrapper.find('[data-testid="amount-display"].skeleton').exists()).toBe(true);
+      expect(wrapper.find('[data-testid="display-amount"]').exists()).toBe(false);
+    });
+  });
+});

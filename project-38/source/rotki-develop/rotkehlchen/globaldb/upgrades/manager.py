@@ -1,0 +1,251 @@
+import logging
+import shutil
+import traceback
+from typing import TYPE_CHECKING
+
+import rsqlite
+
+from rotkehlchen.globaldb.asset_updates.manager import AssetsUpdater
+from rotkehlchen.globaldb.migrations.manager import (
+    LAST_GLOBALDB_DATA_MIGRATION,
+    maybe_apply_globaldb_migrations,
+)
+from rotkehlchen.globaldb.schema import DB_SCRIPT_CREATE_TABLES
+from rotkehlchen.globaldb.utils import (
+    GLOBAL_DB_ASSETS_BREAKING_VERSIONS,
+    GLOBAL_DB_VERSION,
+    MIN_SUPPORTED_GLOBAL_DB_VERSION,
+    globaldb_get_setting_value,
+)
+from rotkehlchen.logging import RotkehlchenLogsAdapter
+from rotkehlchen.utils.misc import ts_now
+from rotkehlchen.utils.upgrades import DBUpgradeProgressHandler, UpgradeRecord
+
+from .v2_v3 import migrate_to_v3
+from .v3_v4 import migrate_to_v4
+from .v4_v5 import migrate_to_v5
+from .v5_v6 import migrate_to_v6
+from .v6_v7 import migrate_to_v7
+from .v7_v8 import migrate_to_v8
+from .v8_v9 import migrate_to_v9
+from .v9_v10 import migrate_to_v10
+from .v10_v11 import migrate_to_v11
+from .v11_v12 import migrate_to_v12
+from .v12_v13 import migrate_to_v13
+from .v13_v14 import migrate_to_v14
+from .v14_v15 import migrate_to_v15
+from .v15_v16 import migrate_to_v16
+from .v16_v17 import migrate_to_v17
+from .v17_v18 import migrate_to_v18
+from .v18_v19 import migrate_to_v19
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from rotkehlchen.db.drivers.sqlite import DBConnection
+    from rotkehlchen.globaldb.handler import GlobalDBHandler
+    from rotkehlchen.user_messages import MessagesAggregator
+
+
+logger = logging.getLogger(__name__)
+log = RotkehlchenLogsAdapter(logger)
+
+
+UPGRADES_LIST = [
+    UpgradeRecord(from_version=2, function=migrate_to_v3),
+    UpgradeRecord(from_version=3, function=migrate_to_v4),
+    UpgradeRecord(from_version=4, function=migrate_to_v5),
+    UpgradeRecord(from_version=5, function=migrate_to_v6),
+    UpgradeRecord(from_version=6, function=migrate_to_v7),
+    UpgradeRecord(from_version=7, function=migrate_to_v8),
+    UpgradeRecord(from_version=8, function=migrate_to_v9),
+    UpgradeRecord(from_version=9, function=migrate_to_v10),
+    UpgradeRecord(from_version=10, function=migrate_to_v11),
+    UpgradeRecord(from_version=11, function=migrate_to_v12),
+    UpgradeRecord(from_version=12, function=migrate_to_v13),
+    UpgradeRecord(from_version=13, function=migrate_to_v14),
+    UpgradeRecord(from_version=14, function=migrate_to_v15),
+    UpgradeRecord(from_version=15, function=migrate_to_v16),
+    UpgradeRecord(from_version=16, function=migrate_to_v17),
+    UpgradeRecord(from_version=17, function=migrate_to_v18),
+    UpgradeRecord(from_version=18, function=migrate_to_v19),
+]
+
+
+def maybe_upgrade_globaldb(
+        connection: DBConnection,
+        global_dir: Path,
+        db_filename: str,
+        msg_aggregator: MessagesAggregator,
+        globaldb: GlobalDBHandler | None = None,
+) -> bool:
+    """Maybe upgrade the global DB and ensure that the foreign keys
+    are on along the journal mode.
+
+    Returns True if this is a fresh DB. In that
+    case the caller should make sure to input the latest version
+    and also the latest migration in the settings. In all other cases returns False.
+
+    The globaldb parameter is needed to handle schema-breaking changes that require
+    updating assets data before the DB schema is modified.
+    """
+    with connection.write_ctx() as write_cursor:  # ensure that foreign keys are always turned on both for new and existing databases  # noqa: E501
+        write_cursor.executescript('PRAGMA foreign_keys=on;')
+        write_cursor.execute('PRAGMA journal_mode=WAL;')
+
+    try:
+        with connection.read_ctx() as cursor:
+            db_version = globaldb_get_setting_value(cursor, 'version', GLOBAL_DB_VERSION)
+    except rsqlite.OperationalError:  # pylint: disable=no-member
+        return True  # fresh DB -- nothing to upgrade
+
+    if db_version < MIN_SUPPORTED_GLOBAL_DB_VERSION:
+        raise ValueError(
+            f'Your account was last opened by a very old version of rotki and its '
+            f'globaldb version is {db_version}. To be able to use it you will need to '
+            f'first use a previous version of rotki and then use this one. '
+            f'Refer to the documentation for more information. '
+            f'https://docs.rotki.com/usage-guides#upgrading-rotki-after-a-long-time',
+        )
+    if db_version > GLOBAL_DB_VERSION:
+        raise ValueError(
+            f'Tried to open a rotki version intended to work with GlobalDB v{GLOBAL_DB_VERSION} '
+            f'but the GlobalDB found in the system is v{db_version}. Bailing ...',
+        )
+    elif db_version < GLOBAL_DB_VERSION:
+        progress_handler = DBUpgradeProgressHandler(
+            messages_aggregator=msg_aggregator,
+            target_version=GLOBAL_DB_VERSION,
+        )
+        for upgrade in UPGRADES_LIST:
+            if (
+                globaldb is not None and
+                upgrade.from_version in GLOBAL_DB_ASSETS_BREAKING_VERSIONS and
+                upgrade.from_version >= db_version
+            ):
+                # make sure that if we need to do assets updates the foreign keys
+                # are off and back to on after finishing. This is done to be explicit
+                # about the state we expect.
+                with connection.write_ctx() as write_cursor:
+                    write_cursor.executescript('PRAGMA foreign_keys=off;')
+
+                AssetsUpdater(
+                    globaldb=globaldb,
+                    msg_aggregator=msg_aggregator,
+                ).apply_pending_compatible_updates()
+
+                with connection.write_ctx() as write_cursor:
+                    write_cursor.executescript('PRAGMA foreign_keys=on;')
+
+            _perform_single_upgrade(
+                upgrade=upgrade,
+                connection=connection,
+                global_dir=global_dir,
+                db_filename=db_filename,
+                progress_handler=progress_handler,
+            )
+
+    # Finally make sure to always have latest version in the DB
+    with connection.write_ctx() as write_cursor:
+        write_cursor.execute(
+            'INSERT OR REPLACE INTO settings(name, value) VALUES(?, ?)',
+            ('version', GLOBAL_DB_VERSION),
+        )
+
+    return False  # not fresh DB
+
+
+def _perform_single_upgrade(
+        upgrade: UpgradeRecord,
+        connection: DBConnection,
+        global_dir: Path,
+        db_filename: str,
+        progress_handler: DBUpgradeProgressHandler,
+) -> None:
+    with connection.read_ctx() as cursor:
+        current_version = globaldb_get_setting_value(cursor, 'version', GLOBAL_DB_VERSION)
+
+    if current_version != upgrade.from_version:
+        return
+    to_version = upgrade.from_version + 1
+    progress_handler.new_round(version=to_version)
+
+    # WAL checkpoint at start to make sure everything is in the file we copy for backup. For more info check comment in the user DB upgrade.  # noqa: E501
+    connection.wal_checkpoint('(FULL)')
+
+    # Create a backup
+    tmp_db_filename = f'{ts_now()}_global_db_v{upgrade.from_version}.backup'
+    tmp_db_path = global_dir / tmp_db_filename
+    shutil.copyfile(global_dir / db_filename, tmp_db_path)
+
+    with connection.write_ctx() as cursor:
+        cursor.execute(
+            'INSERT OR REPLACE INTO settings(name, value) VALUES(?, ?)',
+            ('ongoing_upgrade_from_version', str(upgrade.from_version)),
+        )
+
+    try:
+        upgrade.function(connection=connection, progress_handler=progress_handler)
+    except BaseException as e:
+        # Problem .. restore DB backup, log all info and bail out
+        error_message = (
+            f'Failed at global DB upgrade from version {upgrade.from_version} to '
+            f'{to_version}: {e!s}'
+        )
+        stacktrace = traceback.format_exc()
+        log.error(f'{error_message}\n{stacktrace}')
+        shutil.copyfile(tmp_db_path, global_dir / db_filename)
+        raise ValueError(error_message) from e
+
+    # single upgrade successful
+    with connection.write_ctx() as write_cursor:
+        write_cursor.execute(
+            'DELETE FROM settings WHERE name=?',
+            ('ongoing_upgrade_from_version',),
+        )
+        write_cursor.execute(
+            'INSERT OR REPLACE INTO settings(name, value) VALUES(?, ?)',
+            ('version', str(to_version)),
+        )
+
+
+def configure_globaldb(
+        global_dir: Path,
+        db_filename: str,
+        connection: DBConnection,
+        msg_aggregator: MessagesAggregator,
+        globaldb: GlobalDBHandler | None = None,
+) -> None:
+    """Configure the global database and handle schema upgrades.
+
+    - global_dir: Directory containing the global database
+    - db_filename: Name of the database file (typically global.db)
+    - connection: The database connection object
+    - msg_aggregator: Message aggregator for logging
+    - globaldb: Optional handler instance - determines whether asset updates are attempted
+
+    May raise:
+        - DBSchemaError if the database schema is invalid.
+    """
+    is_fresh_db = maybe_upgrade_globaldb(  # foreign keys and WAL mode are turned on before upgrading  # noqa: E501
+        globaldb=globaldb,
+        connection=connection,
+        global_dir=global_dir,
+        db_filename=db_filename,
+        msg_aggregator=msg_aggregator,
+    )
+
+    if is_fresh_db is True:
+        with connection.write_ctx() as write_cursor:
+            write_cursor.executescript(DB_SCRIPT_CREATE_TABLES)
+            write_cursor.executemany(
+                'INSERT OR REPLACE INTO settings(name, value) VALUES(?, ?)',
+                [('version', str(GLOBAL_DB_VERSION)), ('last_data_migration', str(LAST_GLOBALDB_DATA_MIGRATION))],  # noqa: E501
+            )
+    else:
+        maybe_apply_globaldb_migrations(connection)
+
+    connection.schema_sanity_check()
+    # Only now that WAL mode and the final schema are guaranteed, spin up the pool
+    # of read-only connections that isolates read_ctx() readers from write commits
+    connection.enable_read_pool()

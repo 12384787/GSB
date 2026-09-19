@@ -1,0 +1,10 @@
+{
+  "number": 39,
+  "repository": "coder/coder",
+  "url": "https://github.com/coder/coder",
+  "description": "Secure environments for developers and their agents",
+  "language": "Go",
+  "stars": 15062,
+  "default_branch": "main",
+  "source_zip_url": "https://github.com/coder/coder/archive/refs/heads/main.zip"
+}

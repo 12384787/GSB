@@ -1,0 +1,17 @@
+{
+  "references": [
+    {
+      "path": "tsconfig.node.json"
+    },
+    {
+      "path": "app/tsconfig.json"
+    },
+    {
+      "path": "common/tsconfig.json"
+    },
+    {
+      "path": "dev-proxy/tsconfig.json"
+    }
+  ],
+  "files": []
+}

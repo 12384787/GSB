@@ -1,0 +1,135 @@
+import type { Blockchain } from '@rotki/common';
+import type { ComputedRef, MaybeRefOrGetter } from 'vue';
+import type { HistoryEventEntry } from '@/modules/history/events/schemas';
+import type { UseHistoryEventsSelectionModeReturn } from '@/modules/history/events/use-selection-mode';
+import { useAssetInfoRetrieval } from '@/modules/assets/use-asset-info-retrieval';
+import { useAssetsStore } from '@/modules/assets/use-assets-store';
+import { useSupportedChains } from '@/modules/core/common/use-supported-chains';
+import { isEventMissingAccountingRule } from '@/modules/history/event-utils';
+
+export interface UseHistoryEventItemProps {
+  event: MaybeRefOrGetter<HistoryEventEntry>;
+  selection?: UseHistoryEventsSelectionModeReturn;
+  /**
+   * The other events that belong to the same group. Used to recover data that
+   * an event does not carry itself but a sibling does (e.g. the block number for
+   * MEV reward transaction events grouped under a block production event).
+   */
+  groupEvents?: MaybeRefOrGetter<HistoryEventEntry[]>;
+}
+
+export interface UseHistoryEventItemReturn {
+  isIgnoredAsset: ComputedRef<boolean>;
+  isSpam: ComputedRef<boolean>;
+  hiddenEvent: ComputedRef<boolean>;
+  showCheckbox: ComputedRef<boolean>;
+  isCheckboxDisabled: ComputedRef<boolean>;
+  isSelected: ComputedRef<boolean>;
+  toggleSelected: () => void;
+  hasMissingRule: ComputedRef<boolean>;
+  chain: ComputedRef<Blockchain>;
+  notes: ComputedRef<string | undefined>;
+  counterparty: ComputedRef<string | undefined>;
+  validatorIndex: ComputedRef<number | undefined>;
+  blockNumber: ComputedRef<number | undefined>;
+  extraData: ComputedRef<Record<string, any> | undefined>;
+}
+
+/** Recovers a block number from the first sibling in the group that carries one. */
+function blockNumberFromSibling(groupEvents: HistoryEventEntry[] | undefined): number | undefined {
+  const sibling = groupEvents?.find(other => 'blockNumber' in other);
+  return sibling && 'blockNumber' in sibling ? sibling.blockNumber : undefined;
+}
+
+/** `extraData` is declared loosely on the event schemas, so confirm it is indexable before use. */
+function isExtraData(value: unknown): value is Record<string, any> {
+  return typeof value === 'object' && value !== null;
+}
+
+export function useHistoryEventItem(
+  props: UseHistoryEventItemProps,
+): UseHistoryEventItemReturn {
+  const { event, groupEvents, selection } = props;
+  const { getChain } = useSupportedChains();
+  const { useAssetInfo } = useAssetInfoRetrieval();
+  const { useIsAssetIgnored } = useAssetsStore();
+
+  const eventAsset = computed<string>(() => toValue(event).asset);
+  const isIgnoredAsset = useIsAssetIgnored(eventAsset);
+  const asset = useAssetInfo(eventAsset, { collectionParent: false });
+  const isSpam = computed<boolean>(() => get(asset)?.protocol === 'spam');
+  const hiddenEvent = logicOr(isIgnoredAsset, isSpam);
+
+  const showCheckbox = computed<boolean>(() => {
+    if (!selection)
+      return false;
+    return get(selection.isSelectionMode);
+  });
+
+  const isCheckboxDisabled = computed<boolean>(() => {
+    if (!selection)
+      return false;
+    return get(selection.isSelectAllMatching);
+  });
+
+  const isSelected = computed<boolean>(() => {
+    if (!selection)
+      return false;
+    return selection.isEventSelected(toValue(event).identifier);
+  });
+
+  function toggleSelected(): void {
+    selection?.actions.toggleEvent(toValue(event).identifier);
+  }
+
+  const hasMissingRule = computed<boolean>(() => isEventMissingAccountingRule(toValue(event)));
+
+  const chain = computed<Blockchain>(() => getChain(toValue(event).location));
+
+  const notes = computed<string | undefined>(() => {
+    const ev = toValue(event);
+    const autoNotes = 'autoNotes' in ev ? ev.autoNotes : undefined;
+    const userNotes = 'userNotes' in ev ? ev.userNotes : undefined;
+    return (userNotes ?? autoNotes) ?? undefined;
+  });
+
+  const counterparty = computed<string | undefined>(() => {
+    const ev = toValue(event);
+    return 'counterparty' in ev ? (ev.counterparty ?? undefined) : undefined;
+  });
+
+  const validatorIndex = computed<number | undefined>(() => {
+    const ev = toValue(event);
+    return 'validatorIndex' in ev ? ev.validatorIndex : undefined;
+  });
+
+  const blockNumber = computed<number | undefined>(() => {
+    const ev = toValue(event);
+    if ('blockNumber' in ev)
+      return ev.blockNumber;
+
+    return blockNumberFromSibling(toValue(groupEvents));
+  });
+
+  const extraData = computed<Record<string, any> | undefined>(() => {
+    const ev = toValue(event);
+    return 'extraData' in ev && isExtraData(ev.extraData) ? ev.extraData : undefined;
+  });
+
+  return {
+    blockNumber,
+    chain,
+    counterparty,
+    extraData,
+    hasMissingRule,
+    hiddenEvent,
+    isCheckboxDisabled,
+    isIgnoredAsset,
+    isSelected,
+    isSpam,
+    notes,
+    showCheckbox,
+    toggleSelected,
+    validatorIndex,
+  };
+}

@@ -1,0 +1,1701 @@
+#!/usr/bin/env python
+
+import contextlib
+import logging
+import os
+import threading
+import time
+from collections import defaultdict
+from pathlib import Path
+from types import FunctionType
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
+
+from rotkehlchen.accounting.accountant import Accountant
+from rotkehlchen.accounting.structures.balance import Balance, BalanceType
+from rotkehlchen.api.websockets.notifier import RotkiNotifier
+from rotkehlchen.api.websockets.typedefs import WSMessageType
+from rotkehlchen.assets.asset import Asset, AssetWithOracles, Nft
+from rotkehlchen.balances.manual import (
+    account_for_manually_tracked_asset_balances,
+    get_manually_tracked_balances,
+)
+from rotkehlchen.banks.manager import BankManager
+from rotkehlchen.chain.accounts import OptionalBlockchainAccount, SingleBlockchainAccountData
+from rotkehlchen.chain.aggregator import ChainsAggregator
+from rotkehlchen.chain.arbitrum_one.manager import ArbitrumOneManager
+from rotkehlchen.chain.arbitrum_one.node_inquirer import ArbitrumOneInquirer
+from rotkehlchen.chain.avalanche.manager import AvalancheManager
+from rotkehlchen.chain.base.manager import BaseManager
+from rotkehlchen.chain.base.node_inquirer import BaseInquirer
+from rotkehlchen.chain.binance_sc.manager import BinanceSCManager
+from rotkehlchen.chain.binance_sc.node_inquirer import BinanceSCInquirer
+from rotkehlchen.chain.bitcoin.bch.manager import BitcoinCashManager
+from rotkehlchen.chain.bitcoin.btc.manager import BitcoinManager
+from rotkehlchen.chain.ethereum.manager import EthereumManager
+from rotkehlchen.chain.ethereum.node_inquirer import EthereumInquirer
+from rotkehlchen.chain.ethereum.oracles.uniswap import UniswapV2Oracle, UniswapV3Oracle
+from rotkehlchen.chain.evm.contracts import EvmContracts
+from rotkehlchen.chain.evm.names import NamePrioritizer
+from rotkehlchen.chain.evm.nodes import populate_rpc_nodes_in_database
+from rotkehlchen.chain.gnosis.manager import GnosisManager
+from rotkehlchen.chain.gnosis.node_inquirer import GnosisInquirer
+from rotkehlchen.chain.hyperliquid.manager import HyperliquidManager
+from rotkehlchen.chain.hyperliquid.node_inquirer import HyperliquidInquirer
+from rotkehlchen.chain.ink.manager import InkManager
+from rotkehlchen.chain.ink.node_inquirer import InkInquirer
+from rotkehlchen.chain.monad.manager import MonadManager
+from rotkehlchen.chain.monad.node_inquirer import MonadInquirer
+from rotkehlchen.chain.optimism.manager import OptimismManager
+from rotkehlchen.chain.optimism.node_inquirer import OptimismInquirer
+from rotkehlchen.chain.polygon_pos.manager import PolygonPOSManager
+from rotkehlchen.chain.polygon_pos.node_inquirer import PolygonPOSInquirer
+from rotkehlchen.chain.robinhood.manager import RobinhoodManager
+from rotkehlchen.chain.robinhood.node_inquirer import RobinhoodInquirer
+from rotkehlchen.chain.scroll.manager import ScrollManager
+from rotkehlchen.chain.scroll.node_inquirer import ScrollInquirer
+from rotkehlchen.chain.solana.manager import SolanaManager
+from rotkehlchen.chain.solana.node_inquirer import SolanaInquirer
+from rotkehlchen.chain.sonic.manager import SonicManager
+from rotkehlchen.chain.sonic.node_inquirer import SonicInquirer
+from rotkehlchen.chain.substrate.manager import SubstrateManager
+from rotkehlchen.chain.substrate.utils import (
+    KUSAMA_NODES_TO_CONNECT_AT_START,
+    POLKADOT_NODES_TO_CONNECT_AT_START,
+)
+from rotkehlchen.chain.zksync_lite.manager import ZksyncLiteManager
+from rotkehlchen.concurrency import DEFAULT_CANCEL_GRACE_SECONDS, Task, result_of, spawn, wait
+from rotkehlchen.config import default_data_directory
+from rotkehlchen.constants import ONE, ZERO
+from rotkehlchen.constants.assets import A_USD
+from rotkehlchen.constants.misc import CONTRACT_TAG_NAME, NFT_DIRECTIVE
+from rotkehlchen.data_handler import DataHandler
+from rotkehlchen.data_import.manager import CSVDataImporter
+from rotkehlchen.data_migrations.manager import DataMigrationManager
+from rotkehlchen.db.addressbook import DBAddressbook
+from rotkehlchen.db.cache import DBCacheStatic
+from rotkehlchen.db.filtering import NFTFilterQuery
+from rotkehlchen.db.settings import CachedSettings, DBSettings, ModifiableDBSettings
+from rotkehlchen.db.updates import RotkiDataUpdater
+from rotkehlchen.db.utils import replace_tag_mappings, table_exists
+from rotkehlchen.errors.api import PremiumAuthenticationError, PremiumPermissionError
+from rotkehlchen.errors.asset import UnknownAsset
+from rotkehlchen.errors.misc import (
+    EthSyncError,
+    InputError,
+    RemoteError,
+    SystemPermissionError,
+)
+from rotkehlchen.exchanges.manager import ExchangeManager
+from rotkehlchen.externalapis.alchemy import Alchemy
+from rotkehlchen.externalapis.beaconchain.service import BeaconChain
+from rotkehlchen.externalapis.birdeye import Birdeye
+from rotkehlchen.externalapis.blockscout import Blockscout
+from rotkehlchen.externalapis.coingecko import Coingecko
+from rotkehlchen.externalapis.cryptocompare import Cryptocompare
+from rotkehlchen.externalapis.defillama import Defillama
+from rotkehlchen.externalapis.etherscan import Etherscan
+from rotkehlchen.externalapis.helius import Helius
+from rotkehlchen.externalapis.jupiter import Jupiter
+from rotkehlchen.externalapis.kraken import Kraken
+from rotkehlchen.externalapis.monerium import Monerium
+from rotkehlchen.externalapis.moralis import Moralis
+from rotkehlchen.externalapis.routescan import Routescan
+from rotkehlchen.fval import FVal
+from rotkehlchen.globaldb.asset_updates.manager import AssetsUpdater
+from rotkehlchen.globaldb.handler import GlobalDBHandler
+from rotkehlchen.globaldb.manual_price_oracles import ManualCurrentOracle
+from rotkehlchen.history.data_issues.manager import DataIssuesManager
+from rotkehlchen.history.manager import HistoryQueryingManager
+from rotkehlchen.history.price import Price, PriceHistorian
+from rotkehlchen.history.price_oracles.coinbase import CoinbaseHistoricalPriceOracle
+from rotkehlchen.history.processing import HistoryProcessingCoordinator
+from rotkehlchen.history.types import HistoricalPrice, HistoricalPriceOracle
+from rotkehlchen.icons import IconManager
+from rotkehlchen.inquirer import Inquirer
+from rotkehlchen.logging import RotkehlchenLogsAdapter
+from rotkehlchen.oracles.structures import CurrentPriceOracle
+from rotkehlchen.premium.premium import (
+    Premium,
+    PremiumCredentials,
+    has_premium_check,
+    premium_create_and_verify,
+)
+from rotkehlchen.premium.sync import PremiumSyncManager
+from rotkehlchen.tasks.manager import DEFAULT_MAX_TASKS_NUM, TaskManager
+from rotkehlchen.tasks.supervisor import TaskSupervisor
+from rotkehlchen.types import (
+    EVM_CHAINS_WITH_TRANSACTIONS,
+    SUPPORTED_BITCOIN_CHAINS_TYPE,
+    SUPPORTED_EVM_CHAINS_TYPE,
+    SUPPORTED_EVM_EVMLIKE_CHAINS_TYPE,
+    SUPPORTED_SUBSTRATE_CHAINS_TYPE,
+    AddressbookEntry,
+    AddressbookType,
+    ApiKey,
+    ApiSecret,
+    BTCAddress,
+    ChainType,
+    ChecksumEvmAddress,
+    ExternalService,
+    ListOfBlockchainAddresses,
+    Location,
+    SubstrateAddress,
+    SupportedBlockchain,
+    Timestamp,
+)
+from rotkehlchen.usage_analytics import maybe_submit_usage_analytics
+from rotkehlchen.user_messages import MessagesAggregator
+from rotkehlchen.utils.datadir import maybe_restructure_rotki_data_directory
+from rotkehlchen.utils.misc import combine_dicts, ts_now
+
+if TYPE_CHECKING:
+    import argparse
+    from collections.abc import Callable, Sequence
+
+    from rotkehlchen.chain.bitcoin.xpub import XpubData
+    from rotkehlchen.db.drivers.sqlite import DBConnection, DBCursor
+    from rotkehlchen.exchanges.gate import GateLocation
+    from rotkehlchen.exchanges.kraken import KrakenAccountType
+    from rotkehlchen.exchanges.okx import OkxLocation
+
+logger = logging.getLogger(__name__)
+log = RotkehlchenLogsAdapter(logger)
+
+MAIN_LOOP_SECS_DELAY = 10
+
+
+class Rotkehlchen:
+    def __init__(self, args: argparse.Namespace) -> None:
+        """Initialize the Rotkehlchen object
+
+        This runs during backend initialization so it should be as light as possible.
+
+        May Raise:
+        - SystemPermissionError if the given data directory's permissions
+        are not correct.
+        - DBSchemaError if GlobalDB's schema is malformed
+        """
+        # Can also be None after unlock if premium credentials did not
+        # authenticate or premium server temporarily offline
+        self.premium: Premium | None = None
+        self.user_is_logged_in: bool = False
+
+        self.args = args
+        if self.args.data_dir is None:
+            self.data_dir = default_data_directory()
+        else:
+            self.data_dir = Path(self.args.data_dir)
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+
+        maybe_restructure_rotki_data_directory(self.data_dir)
+
+        if not os.access(self.data_dir, os.W_OK | os.R_OK):
+            raise SystemPermissionError(
+                f'The given data directory {self.data_dir} is not readable or writable',
+            )
+        self.main_loop_spawned = False
+        self.api_tasks: list[Task] = []
+        self.msg_aggregator = MessagesAggregator()
+        self.task_supervisor = TaskSupervisor(msg_aggregator=self.msg_aggregator)
+        self.rotki_notifier = RotkiNotifier()
+        self.msg_aggregator.rotki_notifier = self.rotki_notifier
+        self.rotki_notifier.undelivered_callback = self.msg_aggregator.requeue_undelivered
+        self.exchange_manager = ExchangeManager(msg_aggregator=self.msg_aggregator)
+        self.bank_manager = BankManager(msg_aggregator=self.msg_aggregator)
+        # Initialize the GlobalDBHandler singleton. Has to be initialized BEFORE asset resolver
+        globaldb = GlobalDBHandler(
+            data_dir=self.data_dir,
+            perform_assets_updates=True,
+            sql_vm_instructions_cb=self.args.sqlite_instructions,
+            msg_aggregator=self.msg_aggregator,
+        )
+        if globaldb.used_backup is True:
+            self.msg_aggregator.add_warning(
+                'Your global database was left in an half-upgraded state. '
+                'Restored from the latest backup we could find',
+            )
+        self.data = DataHandler(
+            self.data_dir,
+            self.msg_aggregator,
+            sql_vm_instructions_cb=args.sqlite_instructions,
+        )
+        self.cryptocompare = Cryptocompare(database=None, msg_aggregator=self.msg_aggregator)
+        self.coingecko = Coingecko(database=None, msg_aggregator=self.msg_aggregator)
+        self.defillama = Defillama(database=None, msg_aggregator=self.msg_aggregator)
+        self.kraken = Kraken()
+        self.alchemy = Alchemy(database=None, msg_aggregator=self.msg_aggregator)
+        self.moralis = Moralis(database=None, msg_aggregator=self.msg_aggregator)
+        self.birdeye = Birdeye(database=None)
+        self.icon_manager = IconManager(
+            data_dir=self.data_dir,
+            coingecko=self.coingecko,
+            task_supervisor=self.task_supervisor,
+        )
+        self.assets_updater = AssetsUpdater(
+            msg_aggregator=self.msg_aggregator,
+            globaldb=GlobalDBHandler(),
+        )
+
+        # Initialize the Inquirer singleton
+        Inquirer(
+            data_dir=self.data_dir,
+            cryptocompare=self.cryptocompare,
+            coingecko=self.coingecko,
+            defillama=self.defillama,
+            kraken=self.kraken,
+            alchemy=self.alchemy,
+            moralis=self.moralis,
+            birdeye=self.birdeye,
+            manualcurrent=ManualCurrentOracle(),
+            msg_aggregator=self.msg_aggregator,
+        )
+        # Initialize EVM Contracts common abis
+        EvmContracts.initialize_common_abis()
+        self.task_manager: TaskManager | None = None
+        self.monerium: Monerium | None = None
+        self.shutdown_event = threading.Event()
+        self.migration_manager = DataMigrationManager(self)
+
+    def maybe_cancel_running_tx_query_tasks(
+            self,
+            blockchain: SupportedBlockchain,
+            addresses: list[ChecksumEvmAddress],
+    ) -> None:
+        """Checks for running tasks related to transactions query for the given addresses,
+        cancels them if they exist and gives them a short grace period to wind down so
+        that the subsequent account removal does not race with their DB writes. A task
+        that does not exit within the grace period (e.g. stuck in a remote query) is
+        left to die at its next cancellation checkpoint."""
+        assert self.task_manager is not None, 'task manager should have been initialized at this point'  # noqa: E501
+
+        cancelled_tasks = []
+        for address in addresses:
+            account_data = OptionalBlockchainAccount(address=address, chain=blockchain)
+            # iterate a snapshot: api threads pop finished tasks concurrently and an
+            # index shift mid-iteration would silently skip a task that must be cancelled
+            for task in list(self.api_tasks):
+                is_evm_tx_task = (
+                    task.dead is False and
+                    isinstance(command := getattr(task, 'api_command', None), FunctionType) and
+                    command.__qualname__ == 'RestAPI.refresh_transactions'
+                )
+                if (
+                        is_evm_tx_task and
+                        # accounts is None when all tracked accounts are being refreshed,
+                        # which includes the address being removed
+                        ((accounts := task.kwargs['accounts']) is None or
+                         account_data in accounts) and
+                        task.request_cancellation('Cancelled due to request for evm address removal')  # noqa: E501
+                ):
+                    cancelled_tasks.append(task)
+
+        cancelled_tasks.extend(
+            task
+            for task in self.task_manager.running_tasks.get(self.task_manager._maybe_query_evm_transactions, [])  # noqa: E501
+            if (
+                task.dead is False and
+                task.kwargs['address'] in addresses and
+                task.request_cancellation('Cancelled due to request for evm address removal')
+            )
+        )
+        if len(cancelled_tasks) == 0:
+            return
+
+        wait(cancelled_tasks, timeout=DEFAULT_CANCEL_GRACE_SECONDS)
+        if len(survivors := [x for x in cancelled_tasks if not x.dead]) != 0:
+            log.warning(
+                '%s cancelled transaction query tasks did not exit within %s seconds '
+                'and will die at their next checkpoint',
+                len(survivors),
+                DEFAULT_CANCEL_GRACE_SECONDS,
+            )
+
+    def reset_after_failed_account_creation_or_login(self) -> None:
+        """If the account creation or login failed make sure that the rotki instance is clear
+
+        Tricky instances are when after either failed premium credentials or user refusal
+        to sync premium databases we relogged in
+        """
+        self.cryptocompare.db = None
+        self.exchange_manager.delete_all_exchanges()
+        self.bank_manager.delete_all_banks()
+        self.data.logout()
+        self.monerium = None
+        for instance in (self.cryptocompare, self.defillama, self.coingecko, self.alchemy, self.moralis, self.birdeye, Inquirer()._manualcurrent):  # noqa: E501
+            if instance.db is not None:  # unset DB if needed
+                instance.unset_database()
+        CachedSettings().reset()
+
+    def _perform_new_db_actions(self) -> None:
+        """Actions to perform at creation of a new DB"""
+        with (
+            self.data.db.user_write() as write_cursor,
+            GlobalDBHandler().conn.read_ctx() as cursor,
+        ):
+            populate_rpc_nodes_in_database(
+                db_write_cursor=write_cursor,
+                globaldb_cursor=cursor,
+            )
+
+    def unlock_user(
+            self,
+            user: str,
+            password: str,
+            create_new: bool,
+            sync_approval: Literal['yes', 'no', 'unknown'],
+            premium_credentials: PremiumCredentials | None,
+            resume_from_backup: bool,
+            initial_settings: ModifiableDBSettings | None = None,
+            sync_database: bool = True,
+    ) -> None:
+        """Unlocks an existing user or creates a new one if `create_new` is True
+
+        May raise:
+        - PremiumAuthenticationError if the password can't unlock the database.
+        - AuthenticationError if premium_credentials are given and are invalid
+        or can't authenticate with the server
+        - DBUpgradeError if the rotki DB version is newer than the software or
+        there is a DB upgrade and there is an error or if the version is older
+        than the one supported.
+        - SystemPermissionError if the directory or DB file can not be accessed
+        - sqlcipher.OperationalError: If some very weird error happens with the DB.
+        For example unexpected schema.
+        - DBSchemaError if database schema is malformed.
+        """
+        log.info(
+            'Unlocking user',
+            user=user,
+            create_new=create_new,
+            sync_approval=sync_approval,
+            sync_database=sync_database,
+            initial_settings=initial_settings,
+            resume_from_backup=resume_from_backup,
+        )
+
+        # lift the previous logout's cancel-at-registration latch before anything
+        # of this session spawns supervised tasks
+        self.task_supervisor.allow_new_tasks()
+        # unlock or create the DB
+        self.user_directory = self.data.unlock(
+            username=user,
+            password=password,
+            create_new=create_new,
+            initial_settings=initial_settings,
+            resume_from_backup=resume_from_backup,
+        )
+        if create_new:
+            self._perform_new_db_actions()
+
+        self.data_importer = CSVDataImporter(db=self.data.db)
+        self.premium_sync_manager = PremiumSyncManager(
+            migration_manager=self.migration_manager,
+            data=self.data,
+        )
+        # set the DB in the instances that need it
+        self.cryptocompare.set_database(self.data.db)
+        self.defillama.set_database(self.data.db)
+        self.coingecko.set_database(self.data.db)
+        self.alchemy.set_database(self.data.db)
+        self.moralis.set_database(self.data.db)
+        self.birdeye.set_database(self.data.db)
+        Inquirer()._manualcurrent.set_database(database=self.data.db)
+
+        # Anything that was set above here has to be cleaned in case of failure in the next step
+        # by reset_after_failed_account_creation_or_login()
+        try:
+            self.premium = self.premium_sync_manager.try_premium_at_start(
+                given_premium_credentials=premium_credentials,
+                username=user,
+                create_new=create_new,
+                sync_approval=sync_approval,
+                sync_database=sync_database,
+            )
+        except PremiumAuthenticationError as e:
+            # Reraise it only if this is during the creation of a new account where
+            # the premium credentials were given by the user
+            if create_new:
+                raise
+            self.msg_aggregator.add_warning(
+                'Could not authenticate the rotki premium API keys found in the DB. '
+                f'Error: {e}. Check logs for more details',
+            )
+            # else let's just continue. User signed in successfully, but he just
+            # has unauthenticable/invalid premium credentials remaining in his DB
+
+        DataIssuesManager(self.data.db).reset_orphaned_remediations()
+        with self.data.db.conn.read_ctx() as cursor:
+            settings = self.get_settings(cursor)
+            CachedSettings().initialize(settings)  # initialize with saved DB settings
+            self.task_supervisor.spawn_and_track(
+                after_seconds=None,
+                task_name='submit_usage_analytics',
+                exception_is_error=False,
+                method=maybe_submit_usage_analytics,
+                data_dir=self.data_dir,
+                should_submit=settings.submit_usage_analytics,
+            )
+            self.beaconchain = BeaconChain(database=self.data.db, msg_aggregator=self.msg_aggregator)  # noqa: E501
+
+            exchange_credentials = self.data.db.get_exchange_credentials(cursor)
+            self.exchange_manager.initialize_exchanges(
+                exchange_credentials=exchange_credentials,
+                database=self.data.db,
+            )
+            self.bank_manager.initialize_banks(
+                credentials=exchange_credentials,  # same table; the manager keeps bank locations
+                database=self.data.db,
+            )
+            blockchain_accounts = self.data.db.get_blockchain_accounts(cursor)
+
+        self.monerium = Monerium(database=self.data.db)
+
+        # Initialize blockchain querying modules
+        self.chains_aggregator = ChainsAggregator(
+            blockchain_accounts=blockchain_accounts,
+            ethereum_manager=EthereumManager(
+                node_inquirer=(ethereum_inquirer := EthereumInquirer(
+                    task_supervisor=self.task_supervisor,
+                    database=self.data.db,
+                    etherscan=(etherscan := Etherscan(
+                        database=self.data.db,
+                        msg_aggregator=self.data.db.msg_aggregator,
+                    )),
+                    blockscout=(blockscout := Blockscout(
+                        database=self.data.db,
+                        msg_aggregator=self.msg_aggregator,
+                    )),
+                    routescan=(routescan := Routescan(
+                        database=self.data.db,
+                        msg_aggregator=self.msg_aggregator,
+                    )),
+                )),
+                premium=self.premium,
+                beacon_chain=self.beaconchain,
+                monerium=self.monerium,
+            ),
+            optimism_manager=OptimismManager(
+                node_inquirer=OptimismInquirer(
+                    task_supervisor=self.task_supervisor,
+                    database=self.data.db,
+                    etherscan=etherscan,
+                    blockscout=blockscout,
+                    routescan=routescan,
+                ),
+                premium=self.premium,
+            ),
+            polygon_pos_manager=PolygonPOSManager(
+                node_inquirer=PolygonPOSInquirer(
+                    task_supervisor=self.task_supervisor,
+                    database=self.data.db,
+                    etherscan=etherscan,
+                    blockscout=blockscout,
+                    routescan=routescan,
+                ),
+                premium=self.premium,
+                monerium=self.monerium,
+            ),
+            arbitrum_one_manager=ArbitrumOneManager(
+                node_inquirer=ArbitrumOneInquirer(
+                    task_supervisor=self.task_supervisor,
+                    database=self.data.db,
+                    etherscan=etherscan,
+                    blockscout=blockscout,
+                    routescan=routescan,
+                ),
+                premium=self.premium,
+                monerium=self.monerium,
+            ),
+            base_manager=BaseManager(
+                node_inquirer=BaseInquirer(
+                    task_supervisor=self.task_supervisor,
+                    database=self.data.db,
+                    etherscan=etherscan,
+                    blockscout=blockscout,
+                    routescan=routescan,
+                ),
+                premium=self.premium,
+                monerium=self.monerium,
+            ),
+            hyperliquid_manager=HyperliquidManager(
+                node_inquirer=HyperliquidInquirer(
+                    task_supervisor=self.task_supervisor,
+                    database=self.data.db,
+                    etherscan=etherscan,
+                    blockscout=blockscout,
+                    routescan=routescan,
+                ),
+                premium=self.premium,
+            ),
+            gnosis_manager=GnosisManager(
+                node_inquirer=GnosisInquirer(
+                    task_supervisor=self.task_supervisor,
+                    database=self.data.db,
+                    etherscan=etherscan,
+                    blockscout=blockscout,
+                    routescan=routescan,
+                ),
+                premium=self.premium,
+                monerium=self.monerium,
+            ),
+            scroll_manager=ScrollManager(
+                node_inquirer=ScrollInquirer(
+                    task_supervisor=self.task_supervisor,
+                    database=self.data.db,
+                    etherscan=etherscan,
+                    blockscout=blockscout,
+                    routescan=routescan,
+                ),
+                premium=self.premium,
+                monerium=self.monerium,
+            ),
+            binance_sc_manager=BinanceSCManager(
+                node_inquirer=BinanceSCInquirer(
+                    task_supervisor=self.task_supervisor,
+                    database=self.data.db,
+                    etherscan=etherscan,
+                    blockscout=blockscout,
+                    routescan=routescan,
+                ),
+                premium=self.premium,
+            ),
+            monad_manager=MonadManager(
+                node_inquirer=MonadInquirer(
+                    task_supervisor=self.task_supervisor,
+                    database=self.data.db,
+                    etherscan=etherscan,
+                    blockscout=blockscout,
+                    routescan=routescan,
+                ),
+                premium=self.premium,
+            ),
+            sonic_manager=SonicManager(
+                node_inquirer=SonicInquirer(
+                    task_supervisor=self.task_supervisor,
+                    database=self.data.db,
+                    etherscan=etherscan,
+                    blockscout=blockscout,
+                    routescan=routescan,
+                ),
+                premium=self.premium,
+            ),
+            robinhood_manager=RobinhoodManager(
+                node_inquirer=RobinhoodInquirer(
+                    task_supervisor=self.task_supervisor,
+                    database=self.data.db,
+                    etherscan=etherscan,
+                    blockscout=blockscout,
+                    routescan=routescan,
+                ),
+                premium=self.premium,
+            ),
+            ink_manager=InkManager(
+                node_inquirer=InkInquirer(
+                    task_supervisor=self.task_supervisor,
+                    database=self.data.db,
+                    etherscan=etherscan,
+                    blockscout=blockscout,
+                    routescan=routescan,
+                ),
+                premium=self.premium,
+            ),
+            kusama_manager=SubstrateManager(
+                chain=SupportedBlockchain.KUSAMA,
+                msg_aggregator=self.msg_aggregator,
+                task_supervisor=self.task_supervisor,
+                connect_at_start=KUSAMA_NODES_TO_CONNECT_AT_START,
+                connect_on_startup=len(blockchain_accounts.ksm) != 0,
+                own_rpc_endpoint=settings.ksm_rpc_endpoint,
+            ),
+            polkadot_manager=SubstrateManager(
+                chain=SupportedBlockchain.POLKADOT,
+                msg_aggregator=self.msg_aggregator,
+                task_supervisor=self.task_supervisor,
+                connect_at_start=POLKADOT_NODES_TO_CONNECT_AT_START,
+                connect_on_startup=len(blockchain_accounts.dot) != 0,
+                own_rpc_endpoint=settings.dot_rpc_endpoint,
+            ),
+            avalanche_manager=AvalancheManager(
+                avaxrpc_endpoint='https://api.avax.network/ext/bc/C/rpc',
+                msg_aggregator=self.msg_aggregator,
+            ),
+            zksync_lite_manager=ZksyncLiteManager(
+                ethereum_inquirer=ethereum_inquirer,
+                database=self.data.db,
+            ),
+            bitcoin_manager=BitcoinManager(database=self.data.db),
+            bitcoin_cash_manager=BitcoinCashManager(database=self.data.db),
+            solana_manager=SolanaManager(
+                node_inquirer=SolanaInquirer(
+                    task_supervisor=self.task_supervisor,
+                    database=self.data.db,
+                    helius=Helius(database=self.data.db),
+                ),
+                jupiter=Jupiter(database=self.data.db),
+                premium=self.premium,
+            ),
+            msg_aggregator=self.msg_aggregator,
+            database=self.data.db,
+            task_supervisor=self.task_supervisor,
+            premium=self.premium,
+            eth_modules=settings.active_modules,
+            data_directory=self.data_dir,
+            beaconchain=self.beaconchain,
+            btc_derivation_gap_limit=settings.btc_derivation_gap_limit,
+        )
+        # Expose the etherscan-like singletons on self so the External Services
+        # save hook can reset their rate limiters when the user changes the api key.
+        self.etherscan = etherscan
+        self.blockscout = blockscout
+        self.routescan = routescan
+        Inquirer().inject_evm_managers([
+            (chain.to_chain_id(), self.chains_aggregator.get_chain_manager(chain))
+            for chain in EVM_CHAINS_WITH_TRANSACTIONS
+        ])
+
+        price_historian = PriceHistorian(  # Initialize the price historian singleton
+            data_directory=self.data_dir,
+            cryptocompare=self.cryptocompare,
+            coingecko=self.coingecko,
+            defillama=self.defillama,
+            alchemy=self.alchemy,
+            moralis=self.moralis,
+            birdeye=self.birdeye,
+            coinbase=CoinbaseHistoricalPriceOracle(exchange_manager=self.exchange_manager),
+            uniswapv2=(uniswap_v2_oracle := UniswapV2Oracle()),
+            uniswapv3=(uniswap_v3_oracle := UniswapV3Oracle()),
+        )
+        price_historian.set_oracles_order(settings.historical_price_oracles)
+
+        Inquirer().add_defi_oracles(
+            uniswap_v2=uniswap_v2_oracle,
+            uniswap_v3=uniswap_v3_oracle,
+        )
+        Inquirer().set_oracles_order(settings.current_price_oracles)
+
+        self.history_processing_coordinator = HistoryProcessingCoordinator()
+        self.accountant = Accountant(
+            db=self.data.db,
+            msg_aggregator=self.msg_aggregator,
+            chains_aggregator=self.chains_aggregator,
+            premium=self.premium,
+        )
+        self.history_querying_manager = HistoryQueryingManager(
+            user_directory=self.user_directory,
+            db=self.data.db,
+            msg_aggregator=self.msg_aggregator,
+            exchange_manager=self.exchange_manager,
+            bank_manager=self.bank_manager,
+            chains_aggregator=self.chains_aggregator,
+            processing_coordinator=self.history_processing_coordinator,
+        )
+        self.data_updater = RotkiDataUpdater(
+            msg_aggregator=self.msg_aggregator,
+            user_db=self.data.db,
+        )
+        self.task_manager = TaskManager(
+            max_tasks_num=DEFAULT_MAX_TASKS_NUM,
+            task_supervisor=self.task_supervisor,
+            api_tasks=self.api_tasks,
+            database=self.data.db,
+            cryptocompare=self.cryptocompare,
+            premium_sync_manager=self.premium_sync_manager,
+            chains_aggregator=self.chains_aggregator,
+            exchange_manager=self.exchange_manager,
+            bank_manager=self.bank_manager,
+            deactivate_premium=self.deactivate_premium_status,
+            activate_premium=self.activate_premium_status,
+            query_balances=self.query_balances,
+            msg_aggregator=self.msg_aggregator,
+            data_updater=self.data_updater,
+            username=user,
+            history_processing_coordinator=self.history_processing_coordinator,
+        )
+
+        self.migration_manager.maybe_migrate_data()
+        self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name='Check data updates',
+            exception_is_error=False,
+            method=self.data_updater.check_for_updates,
+        )
+
+        self.addressbook_prioritizer = NamePrioritizer(self.data.db)  # Initialize here since it's reused by the api for addressbook endpoints.  # noqa: E501
+        self.user_is_logged_in = True
+        log.debug('User unlocking complete')
+
+        # Send a notification to the user if data associated with
+        # old erc721 tokens has been saved during the db upgrade.
+        # TODO: Remove this after a couple versions (added in version 1.38).
+        self._check_migration_table_and_notify(
+            conn=self.data.db.conn,
+            table_name='temp_erc721_data',
+            notification_callback=lambda: self.msg_aggregator.add_warning(
+                'Data associated with invalid ERC721 assets is present in your database. '
+                'Please contact rotki support via our discord to resolve this issue.',
+            ),
+        )
+
+        # Send a notification to the user if custom Solana tokens were previously
+        # added and need to be migrated manually in the app.
+        # TODO: Remove this after a couple versions (added in version 1.40).
+        with (global_conn := GlobalDBHandler().conn).cursor() as cursor:
+            self._check_migration_table_and_notify(
+                conn=global_conn,
+                table_name='user_added_solana_tokens',
+                notification_callback=lambda: self.msg_aggregator.add_message(
+                    message_type=WSMessageType.SOLANA_TOKENS_MIGRATION,
+                    data={'identifiers': [i[0] for i in cursor.execute('SELECT identifier FROM user_added_solana_tokens')]},  # noqa: E501
+                ),
+                extra_check_callback=lambda: cursor.execute('SELECT COUNT(*) FROM user_added_solana_tokens').fetchone()[0] > 0,  # noqa: E501
+            )
+
+    def _logout(self) -> None:
+        if not self.user_is_logged_in:
+            return
+        user = self.data.username
+        log.info('Logging out user', user=user)
+
+        self.deactivate_premium_status()
+        del self.chains_aggregator
+        self.exchange_manager.delete_all_exchanges()
+        self.bank_manager.delete_all_banks()
+
+        del self.accountant
+        del self.history_querying_manager
+        del self.data_importer
+
+        self.task_manager.clear()  # type: ignore  # task_manager is not None here
+        self.task_manager = None
+        self.task_supervisor.clear()
+
+        self.data.logout()
+        self.monerium = None
+        # unset the DB in the instances that need unsetting
+        self.cryptocompare.unset_database()
+        self.defillama.unset_database()
+        self.coingecko.unset_database()
+        self.alchemy.unset_database()
+        self.moralis.unset_database()
+        self.birdeye.unset_database()
+        Inquirer()._manualcurrent.unset_database()
+        CachedSettings().reset()
+
+        # Make sure no messages leak to other user sessions
+        self.msg_aggregator.consume_errors()
+        self.msg_aggregator.consume_warnings()
+        PriceHistorian._PriceHistorian__instance = None  # type: ignore  #  has no attribute "_PriceHistorian__instance" but is the name used by python
+        Inquirer.clear()
+
+        self.user_is_logged_in = False
+        log.info('User successfully logged out', user=user)
+
+    def logout(self) -> None:
+        if self.task_manager is None:  # no user logged in?
+            return
+
+        with self.task_manager.schedule_lock:
+            self._logout()
+
+    def set_premium_credentials(self, credentials: PremiumCredentials) -> None:
+        """
+        Sets the premium credentials for rotki
+
+        Raises PremiumAuthenticationError if the given key is rejected by the Rotkehlchen server
+        """
+        log.info('Setting new premium credentials')
+        if self.premium is not None:
+            self.premium.set_credentials(credentials)
+        else:
+            try:
+                self.premium = premium_create_and_verify(
+                    credentials=credentials,
+                    username=self.data.username,
+                    msg_aggregator=self.msg_aggregator,
+                    db=self.data.db,
+                )
+            except (PremiumPermissionError, RemoteError) as e:
+                raise PremiumAuthenticationError(self.premium_sync_manager.maybe_add_device_limit_link(  # noqa: E501
+                    exception=e,
+                    msg=str(e),
+                )) from e
+
+        self.premium_sync_manager.premium = self.premium
+        self.accountant.activate_premium_status(self.premium)
+        self.chains_aggregator.activate_premium_status(self.premium)
+
+        self.data.db.set_rotkehlchen_premium(credentials)
+
+    def deactivate_premium_status(self) -> None:
+        """Deactivate premium in the current session"""
+        self.premium = None
+        self.premium_sync_manager.premium = None
+        self.accountant.deactivate_premium_status()
+        self.chains_aggregator.deactivate_premium_status()
+
+    def activate_premium_status(self, premium: Premium) -> None:
+        """Activate premium in the current session if was deactivated"""
+        self.premium = premium
+        self.premium_sync_manager.premium = self.premium
+        self.accountant.activate_premium_status(self.premium)
+        self.chains_aggregator.activate_premium_status(self.premium)
+
+    def delete_premium_credentials(self) -> tuple[bool, str]:
+        """Deletes the premium credentials for rotki"""
+        msg = ''
+
+        success = self.data.db.delete_premium_credentials()
+        if success is False:
+            msg = 'The database was unable to delete the Premium keys for the logged-in user'
+        self.deactivate_premium_status()
+        return success, msg
+
+    def start(self) -> Task:
+        assert not self.main_loop_spawned, 'Tried to spawn the main loop twice'
+        task = Task(name='rotki main loop', target=self.main_loop).start()
+        self.main_loop_spawned = True
+        return task
+
+    def main_loop(self) -> None:
+        """rotki main loop that fires often and runs the task manager's scheduler"""
+        while self.shutdown_event.wait(timeout=MAIN_LOOP_SECS_DELAY) is not True:
+            # read the attribute once: logout sets it to None concurrently and a second
+            # read hitting that window would kill the main loop with AttributeError
+            if (task_manager := self.task_manager) is not None and self.args.disable_task_manager is False:  # noqa: E501
+                task_manager.schedule()
+
+    def get_blockchain_account_data(
+            self,
+            cursor: DBCursor,
+            blockchain: SupportedBlockchain,
+    ) -> list[SingleBlockchainAccountData] | dict[str, Any]:
+        account_data = self.data.db.get_blockchain_account_data(cursor, blockchain)
+        if blockchain not in (SupportedBlockchain.BITCOIN, SupportedBlockchain.BITCOIN_CASH):
+            return account_data
+
+        xpub_data = self.data.db.get_bitcoin_xpub_data(
+            cursor=cursor,
+            blockchain=blockchain,
+        )
+        addresses_to_account_data = {x.address: x for x in account_data}
+        address_to_xpub_mappings = self.data.db.get_addresses_to_xpub_mapping(
+            cursor=cursor,
+            blockchain=blockchain,
+            addresses=list(addresses_to_account_data.keys()),
+        )
+
+        xpub_mappings: dict[XpubData, list[SingleBlockchainAccountData]] = {}
+        for address, xpub_entry in address_to_xpub_mappings.items():
+            if xpub_entry not in xpub_mappings:
+                xpub_mappings[xpub_entry] = []
+            xpub_mappings[xpub_entry].append(addresses_to_account_data[address])
+
+        data: dict[str, Any] = {'standalone': [], 'xpubs': []}
+        # Add xpub data
+        for xpub_entry in xpub_data:
+            data_entry = xpub_entry.serialize()
+            addresses = xpub_mappings.get(xpub_entry)
+            data_entry['addresses'] = addresses if addresses and len(addresses) != 0 else None
+            data['xpubs'].append(data_entry)
+        # Add standalone addresses
+        data['standalone'] = [x for x in account_data if x.address not in address_to_xpub_mappings]
+        return data
+
+    def add_evm_accounts(
+            self,
+            account_data: list[SingleBlockchainAccountData[ChecksumEvmAddress]],
+    ) -> tuple[
+        list[tuple[SUPPORTED_EVM_EVMLIKE_CHAINS_TYPE, ChecksumEvmAddress]],
+        list[tuple[SUPPORTED_EVM_EVMLIKE_CHAINS_TYPE, ChecksumEvmAddress]],
+        list[tuple[SUPPORTED_EVM_EVMLIKE_CHAINS_TYPE, ChecksumEvmAddress]],
+        list[tuple[SUPPORTED_EVM_EVMLIKE_CHAINS_TYPE, ChecksumEvmAddress]],
+    ]:
+        """Adds each account for all evm addresses
+
+        Counting ethereum mainnet as the main chain we check if the account is a contract
+        in mainnet. If not we check if there is any transactions/activity in that chain for
+        the address and if yes we add it too.
+        If it's already added in a chain we just ignore that chain.
+
+        Returns four lists:
+        - list address, chain tuples for all newly added addresses.
+        - list address, chain tuples for all addresses already tracked.
+        - list address, chain tuples for all addresses that failed to be added.
+        - list address, chain tuples for all addresses that have no activity in their chain.
+
+        May raise:
+        - TagConstraintError if any of the given account data contain unknown tags.
+        - RemoteError if an external service such as Etherscan is queried and
+          there is a problem with its query.
+        """
+        account_data_map: dict[ChecksumEvmAddress, SingleBlockchainAccountData[ChecksumEvmAddress]] = {x.address: x for x in account_data}  # noqa: E501
+        with self.data.db.conn.read_ctx() as cursor:
+            self.data.db.ensure_tags_exist(
+                cursor=cursor,
+                given_data=account_data,
+                action='adding',
+                data_type='blockchain accounts',
+            )
+
+        (
+            added_accounts,
+            existed_accounts,
+            failed_accounts,
+            no_activity_accounts,
+            evm_contract_addresses,
+        ) = self.chains_aggregator.add_accounts_to_all_evm(accounts=[entry.address for entry in account_data])  # noqa: E501
+        with self.data.db.user_write() as write_cursor:
+            for chain, address in added_accounts:
+                account_data_entry = account_data_map[address]
+                self.data.db.add_blockchain_accounts(
+                    write_cursor=write_cursor,
+                    account_data=[account_data_entry.to_blockchain_account_data(chain)],
+                )
+
+            if len(evm_contract_addresses) != 0:
+                write_cursor.executemany(
+                    'INSERT OR IGNORE INTO tag_mappings(object_reference, tag_name) VALUES (?, ?)',
+                    [(address, CONTRACT_TAG_NAME) for address in evm_contract_addresses],
+                )
+
+        return (
+            added_accounts,
+            existed_accounts,
+            failed_accounts,
+            no_activity_accounts,
+        )
+
+    @overload
+    def add_single_blockchain_accounts(
+            self,
+            chain: SUPPORTED_EVM_CHAINS_TYPE,
+            account_data: list[SingleBlockchainAccountData[ChecksumEvmAddress]],
+    ) -> None:
+        ...
+
+    @overload
+    def add_single_blockchain_accounts(
+            self,
+            chain: SUPPORTED_SUBSTRATE_CHAINS_TYPE,
+            account_data: list[SingleBlockchainAccountData[SubstrateAddress]],
+    ) -> None:
+        ...
+
+    @overload
+    def add_single_blockchain_accounts(
+            self,
+            chain: SUPPORTED_BITCOIN_CHAINS_TYPE,
+            account_data: list[SingleBlockchainAccountData[BTCAddress]],
+    ) -> None:
+        ...
+
+    @overload
+    def add_single_blockchain_accounts(
+            self,
+            chain: SupportedBlockchain,
+            account_data: list[SingleBlockchainAccountData],
+    ) -> None:
+        ...
+
+    def add_single_blockchain_accounts(
+            self,
+            chain: SupportedBlockchain,
+            account_data: list[SingleBlockchainAccountData],
+    ) -> None:
+        """Adds new blockchain accounts
+
+        Adds the accounts to the blockchain instance and queries them to get the
+        updated balances. Also adds them in the DB
+
+        May raise:
+        - InputError if the given accounts list is empty.
+        - TagConstraintError if any of the given account data contain unknown tags.
+        - RemoteError if an external service such as Etherscan is queried and
+          there is a problem with its query.
+        """
+        if len(account_data) == 0:
+            raise InputError('Empty list of blockchain accounts to add was given')
+
+        with self.data.db.user_write() as write_cursor:
+            # check tags inside the write transaction: as a plain read_ctx read, a
+            # concurrent account addition's commit resets the pending statement
+            # mid-fetch and the cursor can no longer be fetched from
+            self.data.db.ensure_tags_exist(
+                cursor=write_cursor,
+                given_data=account_data,
+                action='adding',
+                data_type='blockchain accounts',
+            )
+            self.chains_aggregator.modify_blockchain_accounts(
+                write_cursor=write_cursor,
+                blockchain=chain,
+                accounts=[entry.address for entry in account_data],
+                append_or_remove='append',
+            )
+            self.data.db.add_blockchain_accounts(
+                write_cursor=write_cursor,
+                account_data=[x.to_blockchain_account_data(chain) for x in account_data],
+            )
+
+    def edit_single_blockchain_accounts(
+            self,
+            write_cursor: DBCursor,
+            blockchain: SupportedBlockchain,
+            account_data: list[SingleBlockchainAccountData],
+    ) -> None:
+        """Edits blockchain accounts data for a single chain
+
+        May raise:
+        - InputError if the given accounts list is empty or if
+        any of the accounts to edit do not exist.
+        - TagConstraintError if any of the given account data contain unknown tags.
+        """
+        # First check for validity of account data addresses
+        if len(account_data) == 0:
+            raise InputError('Empty list of blockchain account data to edit was given')
+        accounts = [x.address for x in account_data]
+        unknown_accounts = set(accounts).difference(self.chains_aggregator.accounts.get(blockchain))  # noqa: E501
+        if len(unknown_accounts) != 0:
+            raise InputError(
+                f'Tried to edit unknown {blockchain!s} accounts {",".join(unknown_accounts)}',
+            )
+
+        self.data.db.ensure_tags_exist(
+            cursor=write_cursor,
+            given_data=account_data,
+            action='editing',
+            data_type='blockchain accounts',
+        )
+        # Finally edit the accounts
+        self.data.db.edit_blockchain_accounts(
+            write_cursor=write_cursor,
+            account_data=[x.to_blockchain_account_data(blockchain) for x in account_data],
+        )
+
+    def edit_chain_type_accounts_labels(
+            self,
+            cursor: DBCursor,
+            account_data: list[SingleBlockchainAccountData],
+    ) -> None:
+        """Edit the tags and labels for the accounts in all the chains
+        where they are tracked.
+        May raise:
+        - TagConstraintError: if the new tags don't exist
+        - InputError: If not all the selected addresses get updated
+        """
+        self.data.db.ensure_tags_exist(
+            cursor=cursor,
+            given_data=account_data,
+            action='editing',
+            data_type='blockchain accounts',
+        )
+
+        address_book_db = DBAddressbook(db_handler=self.data.db)
+        for account in account_data:
+            if account.label is None:
+                continue
+
+            address_book_db.update_addressbook_entries(
+                book_type=AddressbookType.PRIVATE,
+                entries=[AddressbookEntry(
+                    address=account.address,
+                    name=account.label,
+                    blockchain=None,
+                )],
+            )
+
+        with self.data.db.user_write() as write_cursor:
+            replace_tag_mappings(
+                write_cursor=write_cursor,
+                data=account_data,
+                object_reference_keys=['address'],
+            )
+
+    def remove_chain_type_accounts(
+            self,
+            chain_type: ChainType,
+            accounts: ListOfBlockchainAddresses,
+    ) -> None:
+        """Remove the provided accounts from the specified chains
+        May raise:
+        - InputError: If we are trying to remove a non tracked account, the
+        removal fails or an invalid chain_type is provided.
+        """
+        blockchain_to_addresses, blockchains, accounts_seen = defaultdict(list), chain_type.type_to_blockchains(), set()  # noqa: E501
+        for blockchain in blockchains:
+            blockchain_accounts = self.chains_aggregator.accounts.get(blockchain)
+            for account in accounts:
+                if account in blockchain_accounts:
+                    accounts_seen.add(account)
+                    blockchain_to_addresses[blockchain].append(account)
+
+        if len(missing_accounts := set(accounts).difference(accounts_seen)) != 0:
+            raise InputError(f'Tried to delete non tracked addresses {missing_accounts}')
+
+        for blockchain, tracked_accounts in blockchain_to_addresses.items():
+            self.remove_single_blockchain_accounts(
+                blockchain=blockchain,
+                accounts=tracked_accounts,  # type: ignore  # mypy doesn't detect this as a list of blockchain addresses
+            )
+
+    def remove_single_blockchain_accounts(
+            self,
+            blockchain: SupportedBlockchain,
+            accounts: ListOfBlockchainAddresses,
+    ) -> None:
+        """Removes blockchain accounts
+
+        Removes the accounts from the blockchain instance. Also removes them from the DB.
+
+        May raise:
+        - InputError if a non-existing account was given to remove
+        """
+        self.chains_aggregator.check_accounts_existence(
+            blockchain=blockchain,
+            accounts=accounts,
+            append_or_remove='remove',
+        )
+        with contextlib.ExitStack() as stack:
+            if blockchain in EVM_CHAINS_WITH_TRANSACTIONS:
+                evm_manager = self.chains_aggregator.get_chain_manager(blockchain)
+                evm_addresses: list[ChecksumEvmAddress] = cast('list[ChecksumEvmAddress]', accounts)  # noqa: E501
+                self.maybe_cancel_running_tx_query_tasks(blockchain, evm_addresses)
+                stack.enter_context(evm_manager.transactions.wait_until_no_query_for(evm_addresses))
+                stack.enter_context(evm_manager.transactions.missing_receipts_lock)
+                if hasattr(evm_manager.transactions_decoder, 'undecoded_tx_query_lock'):
+                    stack.enter_context(evm_manager.transactions_decoder.undecoded_tx_query_lock)
+            write_cursor = stack.enter_context(self.data.db.user_write())
+            self.chains_aggregator.remove_single_blockchain_accounts(
+                write_cursor=write_cursor,
+                blockchain=blockchain,
+                accounts=accounts,
+            )
+            self.data.db.remove_single_blockchain_accounts(write_cursor, blockchain, accounts)
+
+    def get_history_query_status(self) -> dict[str, str]:
+        if self.history_querying_manager.progress < FVal('100'):
+            processing_state = self.history_querying_manager.processing_state_name
+            progress = self.history_querying_manager.progress / 2
+        elif self.accountant.first_processed_timestamp == -1:
+            processing_state = 'Processing all retrieved historical events'
+            progress = FVal(50)
+        else:
+            processing_state = 'Processing all retrieved historical events'
+            # start_ts is min of the query start or the first action timestamp since action
+            # processing can start well before query start to calculate cost basis
+            start_ts = min(
+                self.accountant.query_start_ts,
+                self.accountant.first_processed_timestamp,
+            )
+            diff = self.accountant.query_end_ts - start_ts
+            progress = 50 + 100 * (
+                FVal(self.accountant.currently_processing_timestamp - start_ts) /
+                FVal(diff) / 2)
+
+        return {'processing_state': str(processing_state), 'total_progress': str(progress)}
+
+    def process_history(
+            self,
+            start_ts: Timestamp,
+            end_ts: Timestamp,
+    ) -> tuple[int, str]:
+        error_or_empty, events = self.history_querying_manager.get_history(
+            start_ts=start_ts,
+            end_ts=end_ts,
+            has_premium=has_premium_check(self.premium),
+        )
+        report_id = self.accountant.process_history(
+            start_ts=start_ts,
+            end_ts=end_ts,
+            events=events,
+        )
+        return report_id, error_or_empty
+
+    def query_balances(
+            self,
+            requested_save_data: bool = False,
+            save_despite_errors: bool = False,
+            timestamp: Timestamp | None = None,
+            ignore_cache: bool = False,
+    ) -> dict[str, Any]:
+        """Query all balances rotkehlchen can see.
+
+        If requested_save_data is True then the data are always saved in the DB,
+        if it is False then data are saved if self.data.should_save_balances()
+        is True.
+        If save_despite_errors is True then even if there is any error the snapshot
+        will be saved.
+        If timestamp is None then the current timestamp is used.
+        If a timestamp is given then that is the time that the balances are going
+        to be saved in the DB
+        If ignore_cache is True then all underlying calls that have a cache ignore it
+
+        Returns a dictionary with the queried balances.
+        """
+        log.info(
+            'query_balances called',
+            requested_save_data=requested_save_data,
+            save_despite_errors=save_despite_errors,
+        )
+
+        if self.task_manager is not None:
+            self.task_manager.last_balance_query_ts = ts_now()
+
+        # Warm the price cache with the assets of the last balance snapshot so that the
+        # per-component price queries below are mostly served from the cache instead of
+        # each component doing its own oracle request. Assets acquired since the last
+        # snapshot are still priced normally by the per-component queries.
+        with self.data.db.conn.read_ctx() as cursor:
+            snapshot_assets = [Asset(row[0]) for row in cursor.execute(
+                'SELECT DISTINCT currency FROM timed_balances WHERE timestamp='
+                '(SELECT MAX(timestamp) FROM timed_balances) AND currency NOT LIKE ?',
+                (f'{NFT_DIRECTIVE}%',),
+            )]
+        if len(snapshot_assets) != 0:
+            try:
+                Inquirer.find_main_currency_prices(snapshot_assets)
+            except RemoteError as e:
+                log.warning(
+                    'Price cache warm-up failed during balance query',
+                    error=str(e),
+                )
+
+        balances: dict[str, dict[Asset, Balance]] = {}
+        problem_free = True
+        # Query every exchange and all the chains concurrently. Each exchange talks to its own
+        # remote and is guarded by its own per-instance lock, and the chain query already fans
+        # out internally, so the total wait becomes the slowest single source instead of the
+        # sum of all of them.
+        exchange_tasks = [
+            (source, spawn(source.query_balances, ignore_cache=ignore_cache))
+            for source in (*self.exchange_manager.iterate_exchanges(), *self.bank_manager.iterate_banks())  # noqa: E501
+        ]
+        blockchain_task = spawn(
+            self.chains_aggregator.query_balances,
+            blockchain=None,
+            ignore_cache=ignore_cache,
+        )
+        wait([task for _, task in exchange_tasks] + [blockchain_task])
+
+        exchange_balances: dict[AssetWithOracles, Balance] | None
+        for exchange, task in exchange_tasks:
+            # result_of reraises whatever the query died with, as the serial call used to
+            exchange_balances, error_msg = result_of(task)
+            # If we got an error, disregard that exchange but make sure we don't save data
+            if not isinstance(exchange_balances, dict):
+                problem_free = False
+                self.msg_aggregator.add_message(
+                    message_type=WSMessageType.BALANCE_SNAPSHOT_ERROR,
+                    data={'location': exchange.name, 'error': error_msg},
+                )
+            else:
+                location_str = str(exchange.location)
+                if location_str not in balances:  # need to widen type at assignment here
+                    balances[location_str] = cast('dict[Asset, Balance]', exchange_balances)
+                else:  # multiple exchange of same type. Combine balances
+                    balances[location_str] = combine_dicts(
+                        balances[location_str],
+                        exchange_balances,  # type: ignore
+                    )
+
+        liabilities: dict[Asset, Balance]
+        try:
+            # copies below since if cache is used we end up modifying the balance sheet object
+            blockchain_result = result_of(blockchain_task)
+            # chains that failed keep the balances of their last successful query
+            for chain, error in blockchain_result.failed_chains.items():
+                problem_free = False
+                self.msg_aggregator.add_message(
+                    message_type=WSMessageType.BALANCE_SNAPSHOT_ERROR,
+                    data={'location': f'{chain!s} balances query', 'error': error},
+                )
+
+            blockchain_assets: dict[Asset, Balance] = {}
+            for asset, asset_balances in blockchain_result.totals.assets.items():
+                total_balance = Balance()
+                for balance in asset_balances.values():
+                    total_balance += balance
+                if total_balance.amount != ZERO:
+                    blockchain_assets[asset] = total_balance
+
+            if len(blockchain_assets) != 0:
+                balances[str(Location.BLOCKCHAIN)] = blockchain_assets
+
+            liabilities = {}
+            for asset, asset_balances in blockchain_result.totals.liabilities.items():
+                total_balance = Balance()
+                for balance in asset_balances.values():
+                    total_balance += balance
+                if total_balance.amount != ZERO:
+                    liabilities[asset] = total_balance
+
+        except (RemoteError, EthSyncError) as e:
+            problem_free = False
+            liabilities = {}
+            log.error(f'Querying blockchain balances failed due to: {e!s}')
+            self.msg_aggregator.add_message(
+                message_type=WSMessageType.BALANCE_SNAPSHOT_ERROR,
+                data={'location': 'blockchain balances query', 'error': str(e)},
+            )
+
+        manually_tracked_liabilities = get_manually_tracked_balances(
+            db=self.data.db,
+            balance_type=BalanceType.LIABILITY,
+        )
+        manual_liabilities_as_dict: defaultdict[Asset, Balance] = defaultdict(Balance)
+        for manual_liability in manually_tracked_liabilities:
+            manual_liabilities_as_dict[manual_liability.asset] += manual_liability.value
+
+        liabilities = combine_dicts(liabilities, manual_liabilities_as_dict)
+        # retrieve nft balances if module is activated
+        nfts = self.chains_aggregator.get_module('nfts')
+        if nfts is not None:
+            try:
+                nft_balances = nfts.get_db_nft_balances(filter_query=NFTFilterQuery.make())['entries']  # noqa: E501
+            except RemoteError as e:
+                log.error(
+                    f'At balance snapshot NFT balances query failed due to {e!s}. Error '
+                    f'is ignored and balance snapshot will still be saved.',
+                )
+            else:
+                if len(nft_balances) != 0:
+                    if (blockchain_location := str(Location.BLOCKCHAIN)) not in balances:
+                        balances[str(Location.BLOCKCHAIN)] = {}
+
+                    for balance_entry in nft_balances:
+                        if balance_entry['price'] == ZERO:
+                            continue
+
+                        # It can happen that the asset was manually added
+                        # as a token and we don't want to ignore NFTs from the token query since
+                        # they might not be tracked by Opensea. In case of them being already
+                        # in the chain balances we update the price and continue
+                        blockchain_balances = balances[blockchain_location]
+                        nft = Nft(balance_entry['id'])
+                        if (nft_as_token := GlobalDBHandler.get_evm_token(
+                            address=nft.evm_address,
+                            chain_id=nft.chain_id,
+                        )) in blockchain_balances:  # we need the eip155 identifier instead of the _nft_ one.  # noqa: E501
+                            blockchain_balances[nft_as_token].value = balance_entry['price']
+                        else:
+                            blockchain_balances[nft] = Balance(
+                                amount=ONE,
+                                value=balance_entry['price'],
+                            )
+
+        balances = account_for_manually_tracked_asset_balances(db=self.data.db, balances=balances)
+
+        # Calculate value totals (in main currency)
+        assets_total_balance: defaultdict[Asset, Balance] = defaultdict(Balance)
+        total_value_per_location: dict[str, FVal] = {}
+        for location, asset_balance in balances.items():
+            total_value_per_location[location] = ZERO
+            for asset, balance in asset_balance.items():
+                assets_total_balance[asset] += balance
+                total_value_per_location[location] += balance.value
+
+        net_value = sum((balance.value for balance in assets_total_balance.values()), ZERO)
+        liabilities_total_value = sum((liability.value for liability in liabilities.values()), ZERO)  # noqa: E501
+        net_value -= liabilities_total_value
+
+        # Calculate location stats
+        location_stats: dict[str, Any] = {}
+        for location, total_value in total_value_per_location.items():
+            if location == str(Location.BLOCKCHAIN):
+                total_value -= liabilities_total_value  # noqa: PLW2901
+
+            percentage = (total_value / net_value).to_percentage() if net_value != ZERO else '0%'
+            location_stats[location] = {
+                'value': total_value,
+                'percentage_of_net_value': percentage,
+            }
+
+        # Calculate 'percentage_of_net_value' per asset
+        assets_total_balance_as_dict: dict[Asset, dict[str, Any]] = {
+            asset: balance.to_dict() for asset, balance in assets_total_balance.items()
+        }
+        liabilities_as_dict: dict[Asset, dict[str, Any]] = {
+            asset: balance.to_dict() for asset, balance in liabilities.items()
+        }
+        for asset, balance_dict in assets_total_balance_as_dict.items():
+            percentage = (balance_dict['value'] / net_value).to_percentage() if net_value != ZERO else '0%'  # noqa: E501
+            assets_total_balance_as_dict[asset]['percentage_of_net_value'] = percentage
+
+        for asset, balance_dict in liabilities_as_dict.items():
+            percentage = (balance_dict['value'] / net_value).to_percentage() if net_value != ZERO else '0%'  # noqa: E501
+            liabilities_as_dict[asset]['percentage_of_net_value'] = percentage
+
+        # Compose balances response
+        result_dict = {
+            'assets': assets_total_balance_as_dict,
+            'liabilities': liabilities_as_dict,
+            'location': location_stats,
+            'net_value': net_value,
+        }
+        with self.data.db.conn.read_ctx() as cursor:
+            allowed_to_save = requested_save_data or self.data.db.should_save_balances(cursor)
+            if (problem_free or save_despite_errors) and allowed_to_save:
+                if not timestamp:
+                    timestamp = Timestamp(int(time.time()))
+                main_to_usd_rate = PriceHistorian.query_historical_price(
+                    from_asset=main_currency,
+                    to_asset=A_USD,
+                    timestamp=timestamp,
+                ) if (main_currency := CachedSettings().main_currency) != A_USD else Price(ONE)
+                with self.data.db.user_write() as write_cursor:
+                    self.data.db.save_balances_data(
+                        write_cursor=write_cursor,
+                        data=result_dict,
+                        timestamp=timestamp,
+                        main_to_usd_rate=main_to_usd_rate,
+                    )
+                self._save_manual_prices_as_historical(result_dict)
+                log.debug('query_balances data saved')
+            else:
+                log.debug(
+                    'query_balances data not saved',
+                    allowed_to_save=allowed_to_save,
+                    problem_free=problem_free,
+                    save_despite_errors=save_despite_errors,
+                )
+
+        return result_dict
+
+    @staticmethod
+    def _save_manual_prices_as_historical(result_dict: dict[str, Any]) -> None:
+        """Save manual prices as historical prices
+
+        Takes manual prices for assets in the balance snapshot and saves them
+        as historical prices for use in charts and historical data.
+        """
+        all_assets: set[Asset] = set()
+        for assets_dict in (result_dict['assets'], result_dict['liabilities']):
+            all_assets.update(assets_dict)
+
+        if len(all_assets) == 0:
+            return
+
+        historical_prices, current_ts = [], ts_now()
+        for asset in all_assets:
+            # Only save assets that have manual prices
+            if (manual_price_info := GlobalDBHandler.get_manual_current_price(asset)) is not None:
+                manual_to_asset, manual_price = manual_price_info
+                historical_prices.append(HistoricalPrice(
+                    from_asset=asset,
+                    to_asset=manual_to_asset,
+                    source=HistoricalPriceOracle.MANUAL,
+                    timestamp=current_ts,
+                    price=manual_price,
+                ))
+
+        if len(historical_prices) > 0:
+            GlobalDBHandler.add_historical_prices(historical_prices)
+
+    def set_settings(self, settings: ModifiableDBSettings) -> tuple[bool, str]:
+        """Tries to set new settings. Returns True in success or False with message if error"""
+        # TODO: https://github.com/orgs/rotki/projects/11?pane=issue&itemId=52425560
+        # For those rpc endpoints improve the logic and make it similar to EVM rpc endpoints
+        if settings.ksm_rpc_endpoint is not None:
+            result, msg = self.chains_aggregator.set_ksm_rpc_endpoint(settings.ksm_rpc_endpoint)
+            if not result:
+                return False, msg
+
+        if settings.dot_rpc_endpoint is not None:
+            result, msg = self.chains_aggregator.set_dot_rpc_endpoint(settings.dot_rpc_endpoint)
+            if not result:
+                return False, msg
+
+        if settings.btc_mempool_api is not None:
+            result, msg = self.chains_aggregator.set_btc_mempool_api(settings.btc_mempool_api)
+            if not result:
+                return False, msg
+
+        if settings.beacon_rpc_endpoint is not None and (eth2 := self.chains_aggregator.get_module('eth2')) is not None:  # noqa: E501
+            try:
+                eth2.beacon_inquirer.set_rpc_endpoint(settings.beacon_rpc_endpoint)
+            except RemoteError as e:
+                msg = str(e)
+                log.error(f'Failed to connect to given beacon node {settings.beacon_rpc_endpoint} due to {msg}')  # noqa: E501
+                return False, msg
+
+        if settings.btc_derivation_gap_limit is not None:
+            self.chains_aggregator.btc_derivation_gap_limit = settings.btc_derivation_gap_limit
+
+        success, msg = self._validate_and_set_oracles(
+            oracle_type=CurrentPriceOracle,
+            oracles=settings.current_price_oracles,
+            set_oracles_order_method=Inquirer().set_oracles_order,
+        )
+        if not success:
+            return False, msg
+
+        success, msg = self._validate_and_set_oracles(
+            oracle_type=HistoricalPriceOracle,
+            oracles=settings.historical_price_oracles,
+            set_oracles_order_method=PriceHistorian().set_oracles_order,
+        )
+        if not success:
+            return False, msg
+
+        if settings.active_modules is not None:
+            self.chains_aggregator.process_new_modules_list(settings.active_modules)
+
+        with self.data.db.user_write() as cursor:
+            self.data.db.set_settings(cursor, settings)
+
+        return True, ''
+
+    def _validate_and_set_oracles(
+            self,
+            oracle_type: type[CurrentPriceOracle | HistoricalPriceOracle],
+            oracles: Sequence[CurrentPriceOracle] | Sequence[HistoricalPriceOracle] | None,
+            set_oracles_order_method: Callable,
+    ) -> tuple[bool, str]:
+        if oracles is None:
+            return True, ''
+
+        for oracle_name, external_service in (
+            ('Alchemy', ExternalService.ALCHEMY),
+            ('Moralis', ExternalService.MORALIS),
+            ('Birdeye', ExternalService.BIRDEYE),
+        ):
+            if (
+                oracle_type[external_service.name] in oracles and
+                self.data.db.get_external_service_credentials(external_service) is None
+            ):
+                return False, (
+                    f'You have enabled the {oracle_name} price oracle but you do not have an '
+                    'API key set. Please go to API Keys -> External Services and add one.'
+                )
+
+        if (
+                oracle_type is HistoricalPriceOracle and
+                HistoricalPriceOracle.COINBASE in oracles and
+                not self.exchange_manager.connected_exchanges.get(Location.COINBASE)
+        ):
+            return False, (
+                'You have enabled the Coinbase price oracle but you do not have a Coinbase '
+                'exchange connection configured.'
+            )
+
+        set_oracles_order_method(oracles)
+        return True, ''
+
+    def get_settings(self, cursor: DBCursor) -> DBSettings:
+        """Returns the db settings with a check whether premium is active or not"""
+        return self.data.db.get_settings(cursor, have_premium=self.premium is not None)
+
+    def setup_exchange(
+            self,
+            name: str,
+            location: Location,
+            api_key: ApiKey,
+            api_secret: ApiSecret | None,
+            passphrase: str | None = None,
+            kraken_account_type: KrakenAccountType | None = None,
+            kraken_futures_api_key: ApiKey | None = None,
+            kraken_futures_api_secret: ApiSecret | None = None,
+            binance_selected_trade_pairs: list[str] | None = None,
+            binance_history_start_ts: Timestamp | None = None,
+            okx_location: OkxLocation | None = None,
+            gate_location: GateLocation | None = None,
+    ) -> tuple[bool, str]:
+        """
+        Setup a new exchange with an api key and an api secret and optionally a passphrase.
+        The manager registers it and saves it in the DB atomically w.r.t. concurrent deletes.
+        """
+        return self.exchange_manager.setup_exchange(
+            name=name,
+            location=location,
+            api_key=api_key,
+            api_secret=api_secret,
+            kraken_account_type=kraken_account_type,
+            kraken_futures_api_key=kraken_futures_api_key,
+            kraken_futures_api_secret=kraken_futures_api_secret,
+            database=self.data.db,
+            passphrase=passphrase,
+            binance_selected_trade_pairs=binance_selected_trade_pairs,
+            binance_history_start_ts=binance_history_start_ts,
+            okx_location=okx_location,
+            gate_location=gate_location,
+        )
+
+    def query_periodic_data(self) -> dict[str, bool | (dict[str, list[str]] | Timestamp)]:
+        """Query for frequently changing data"""
+        result: dict[str, bool | (dict[str, list[str]] | Timestamp)] = {}
+
+        if self.user_is_logged_in:
+            with self.data.db.conn.read_ctx() as cursor:
+                result[DBCacheStatic.LAST_BALANCE_SAVE.value] = self.data.db.get_last_balance_save_time(cursor)  # noqa: E501
+                connected_nodes: dict[str, list[str]] = {}
+                failed_to_connect: dict[str, list[str]] = {}
+                cooling_down_nodes: dict[str, list[str]] = {}
+                for chain_manager in self.chains_aggregator.iterate_chain_managers_with_nodes():
+                    inquirer = chain_manager.node_inquirer
+                    serialized_chain = inquirer.blockchain.serialize()
+                    connected_nodes[serialized_chain] = [
+                        node.name for node in inquirer.get_connected_nodes()
+                    ]
+                    if len(inquirer.failed_to_connect_nodes) != 0:
+                        failed_to_connect[serialized_chain] = list(
+                            inquirer.failed_to_connect_nodes,
+                        )
+                    cooling = [
+                        wnode.node_info.name
+                        for wnode in inquirer._get_configured_nodes()
+                        if inquirer.is_node_in_cooldown(wnode.node_info)
+                    ]
+                    if cooling:
+                        cooling_down_nodes[serialized_chain] = cooling
+
+                result['connected_nodes'] = connected_nodes
+                if len(failed_to_connect) != 0:
+                    result['failed_to_connect'] = failed_to_connect
+                if len(cooling_down_nodes) != 0:
+                    result['cooling_down_nodes'] = cooling_down_nodes
+
+                result[DBCacheStatic.LAST_DATA_UPLOAD_TS.value] = Timestamp(self.premium_sync_manager.last_remote_data_upload_ts)  # noqa: E501
+        return result
+
+    def shutdown(self) -> None:
+        self.logout()
+        self.shutdown_event.set()
+
+    def create_oracle_cache(
+            self,
+            oracle: HistoricalPriceOracle,
+            from_asset: AssetWithOracles,
+            to_asset: AssetWithOracles,
+            purge_old: bool,
+    ) -> None:
+        """Creates the cache of the given asset pair from the start of time
+        until now for the given oracle.
+
+        if purge_old is true then any old cache in memory and in a file is purged
+
+        May raise:
+            - RemoteError if there is a problem reaching the oracle
+            - UnsupportedAsset if any of the two assets is not supported by the oracle
+        """
+        if oracle != HistoricalPriceOracle.CRYPTOCOMPARE:
+            return  # only for cryptocompare for now
+
+        with contextlib.suppress(UnknownAsset):  # if suppress -> assets are not crypto or fiat, so we can't query cryptocompare  # noqa: E501
+            self.cryptocompare.create_cache(
+                from_asset=from_asset,
+                to_asset=to_asset,
+                purge_old=purge_old,
+            )
+
+    @staticmethod
+    def _check_migration_table_and_notify(
+            conn: DBConnection,
+            table_name: str,
+            notification_callback: Callable,
+            extra_check_callback: Callable | None = None,
+    ) -> None:
+        """Helper function to check if a migration table
+        exists and send notification if it does.
+        """
+        with conn.read_ctx() as cursor:
+            if table_exists(cursor, table_name) and (extra_check_callback is None or extra_check_callback()):  # noqa: E501
+                notification_callback()

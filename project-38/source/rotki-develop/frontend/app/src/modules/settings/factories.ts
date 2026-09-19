@@ -1,0 +1,66 @@
+import type { Currency } from '@/modules/assets/amount-display/currencies';
+import { Defaults } from '@/modules/core/common/defaults';
+import { McpPrivacyMode } from '@/modules/settings/types/mcp';
+import { type AccountingSettings, CostBasisMethod, type GeneralSettings } from '@/modules/settings/types/user-settings';
+
+export function defaultGeneralSettings(mainCurrency: Currency): GeneralSettings {
+  return {
+    activeModules: [],
+    addressNamePriority: [],
+    askUserUponSizeDiscrepancy: true,
+    assetMovementAmountTolerance: Defaults.ASSET_MOVEMENT_AMOUNT_TOLERANCE,
+    assetMovementTimeRange: Defaults.ASSET_MOVEMENT_TIME_RANGE,
+    bridgeMatchAmountTolerance: Defaults.BRIDGE_MATCH_AMOUNT_TOLERANCE,
+    bridgeMatchTimeRange: Defaults.BRIDGE_MATCH_TIME_RANGE,
+    autoCreateCalendarReminders: true,
+    autoCreateProfitEvents: false,
+    autoDeleteCalendarEntries: true,
+    autoDetectTokens: true,
+    balanceSaveFrequency: Defaults.BALANCE_SAVE_FREQUENCY,
+    beaconRpcEndpoint: Defaults.BEACON_RPC_ENDPOINT,
+    btcDerivationGapLimit: Defaults.BTC_DERIVATION_GAP_LIMIT,
+    btcMempoolApi: Defaults.BTC_MEMPOOL_API,
+    connectTimeout: Defaults.DEFAULT_CONNECT_TIMEOUT,
+    csvExportDelimiter: Defaults.DEFAULT_CSV_EXPORT_DELIMITER,
+    currentPriceOracles: [],
+    dateDisplayFormat: Defaults.DEFAULT_DATE_DISPLAY_FORMAT,
+    defaultEvmIndexerOrder: [],
+    disabledChainQueries: {},
+    displayDateInLocaltime: Defaults.DISPLAY_DATE_IN_LOCALTIME,
+    dotRpcEndpoint: Defaults.DOT_RPC_ENDPOINT,
+    evmchainsToSkipDetection: [],
+    evmIndexersOrder: {},
+    historicalPriceOracles: [],
+    inferZeroTimedBalances: false,
+    internalTxConflictRepullFrequency: Defaults.DEFAULT_INTERNAL_TX_CONFLICT_REPULL_FREQUENCY,
+    internalTxsToRepull: Defaults.DEFAULT_INTERNAL_TXS_TO_REPULL,
+    ksmRpcEndpoint: Defaults.KSM_RPC_ENDPOINT,
+    mainCurrency,
+    mcpPrivacyMode: McpPrivacyMode.BALANCED,
+    nonSyncingExchanges: [],
+    oraclePenaltyDuration: Defaults.DEFAULT_ORACLE_PENALTY_DURATION,
+    oraclePenaltyThresholdCount: Defaults.DEFAULT_ORACLE_PENALTY_THRESHOLD_COUNT,
+    queryRetryLimit: Defaults.DEFAULT_QUERY_RETRY_LIMIT,
+    readTimeout: Defaults.DEFAULT_READ_TIMEOUT,
+    ssfGraphMultiplier: 0,
+    submitUsageAnalytics: Defaults.ANONYMOUS_USAGE_ANALYTICS,
+    suppressMissingKeyMsgServices: [],
+    treatEth2AsEth: false,
+    uiFloatingPrecision: Defaults.FLOATING_PRECISION,
+  };
+}
+
+export function defaultAccountingSettings(): AccountingSettings {
+  return {
+    calculatePastCostBasis: true,
+    costBasisMethod: CostBasisMethod.FIFO,
+    ethStakingTaxableAfterWithdrawalEnabled: false,
+    includeCrypto2crypto: true,
+    includeFeesInCostBasis: false,
+    includeGasCosts: true,
+    pnlCsvHaveSummary: false,
+    pnlCsvWithFormulas: true,
+    taxfreeAfterPeriod: null,
+    useAssetCollectionsInCostBasis: true,
+  };
+}

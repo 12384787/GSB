@@ -1,0 +1,450 @@
+from http import HTTPStatus
+from typing import TYPE_CHECKING
+from unittest.mock import ANY, patch
+
+import pytest
+
+from rotkehlchen.api.websockets.typedefs import WSMessageType
+from rotkehlchen.chain.evm.types import string_to_evm_address
+from rotkehlchen.chain.optimism.constants import OP_BEDROCK_BLOCK, OP_BEDROCK_UPGRADE
+from rotkehlchen.chain.structures import TimestampOrBlockRange
+from rotkehlchen.constants.assets import A_ETH
+from rotkehlchen.db.filtering import EthWithdrawalFilterQuery
+from rotkehlchen.db.history_events import DBHistoryEvents
+from rotkehlchen.errors.misc import RemoteError
+from rotkehlchen.externalapis.blockscout import BLOCKSCOUT_PAGINATION_LIMIT, Blockscout
+from rotkehlchen.externalapis.etherscan_like import HasChainActivity
+from rotkehlchen.fval import FVal
+from rotkehlchen.history.events.structures.eth2 import EthWithdrawalEvent
+from rotkehlchen.tests.fixtures.messages import MockRotkiNotifier
+from rotkehlchen.tests.utils.factories import make_evm_address, make_evm_tx_hash
+from rotkehlchen.tests.utils.mock import MockResponse
+from rotkehlchen.types import ApiKey, ChainID, ExternalService, Timestamp, TimestampMS
+
+if TYPE_CHECKING:
+    from rotkehlchen.db.dbhandler import DBHandler
+
+
+@pytest.fixture(name='blockscout')
+def fixture_blockscout(database, messages_aggregator):
+    return Blockscout(
+        database=database,
+        msg_aggregator=messages_aggregator,
+    )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+def test_query_withdrawals(blockscout: Blockscout, database: DBHandler):
+    """Test the querying logic of eth withdrawal for blockscout"""
+    address = string_to_evm_address('0xE12799BC799fc024db69E118fD2A6eA293DBFF7d')
+    dbevents = DBHistoryEvents(database)
+    blockscout.query_withdrawals(address)
+
+    with database.conn.read_ctx() as cursor:
+        events = dbevents.get_history_events_internal(
+            cursor=cursor,
+            filter_query=EthWithdrawalFilterQuery.make(
+                order_by_rules=[('timestamp', True), ('history_events_identifier', True)],
+            ),
+            aggregate_by_group_ids=False,
+        )
+
+    assert len(events) == 1277
+
+    expected_samples, seen_samples = {
+        (747239, TimestampMS(1689555347000), FVal('0.003935554')),
+        (747236, TimestampMS(1690528667000), FVal('0.014550492')),
+        (747239, TimestampMS(1695990095000), FVal('0.016267026')),
+    }, set()
+
+    for x in events:
+        if (key := (x.validator_index, x.timestamp, x.amount)) in expected_samples:
+            assert x.location_label == address
+            assert x.is_exit_or_blocknumber is False
+            seen_samples.add(key)
+
+    assert seen_samples == expected_samples
+
+    for x in events[:183]:
+        assert isinstance(x, EthWithdrawalEvent)
+        assert x.location_label == address
+        assert x.validator_index in (763318, 763317, 763316, 763315, 763314, 747239, 747238, 747237, 747236, 747235, 747234)  # noqa: E501
+        assert x.is_exit_or_blocknumber is False
+        assert x.asset == A_ETH
+        assert isinstance(x.amount, FVal)
+        assert FVal('0.003') <= x.amount <= FVal('0.09')
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+def test_hash_activity(blockscout):
+    for chain in (
+        ChainID.ETHEREUM,
+        ChainID.OPTIMISM,
+        ChainID.ARBITRUM_ONE,
+        ChainID.GNOSIS,
+        ChainID.BASE,
+    ):
+        assert blockscout.has_activity(  # yabir.eth
+            chain_id=chain,
+            account=string_to_evm_address('0xc37b40ABdB939635068d3c5f13E7faF686F03B65'),
+        ) == HasChainActivity.TRANSACTIONS
+
+    assert blockscout.has_activity(
+        chain_id=ChainID.ETHEREUM,
+        account=string_to_evm_address('0x3C69Bc9B9681683890ad82953Fe67d13Cd91D5EE'),
+    ) == HasChainActivity.NONE
+
+
+def test_optimism_pre_bedrock_internal_txs_skipped(blockscout: Blockscout) -> None:
+    """Blockscout does not properly index internal transactions on Optimism for blocks
+    predating the Bedrock upgrade. Queries touching that range must raise RemoteError so
+    that _try_indexers falls back to other indexers (Etherscan, Routescan) that may have
+    the data, rather than silently returning empty results.
+    """
+    with patch.object(blockscout.session, 'request') as mock_request:
+        # Block range entirely before Bedrock: RemoteError, no network call
+        with pytest.raises(RemoteError):
+            next(blockscout.get_transactions(
+                chain_id=ChainID.OPTIMISM,
+                account=make_evm_address(),
+                action='txlistinternal',
+                period_or_hash=TimestampOrBlockRange(
+                    range_type='blocks',
+                    from_value=0,
+                    to_value=OP_BEDROCK_BLOCK - 1,
+                ),
+            ))
+        assert mock_request.call_count == 0
+
+        # Block range crossing the Bedrock boundary: also RemoteError so the full range
+        # is retried by another indexer rather than returning only post-Bedrock results
+        with pytest.raises(RemoteError):
+            next(blockscout.get_transactions(
+                chain_id=ChainID.OPTIMISM,
+                account=make_evm_address(),
+                action='txlistinternal',
+                period_or_hash=TimestampOrBlockRange(
+                    range_type='blocks',
+                    from_value=OP_BEDROCK_BLOCK - 1000,
+                    to_value=OP_BEDROCK_BLOCK + 1000,
+                ),
+            ))
+        assert mock_request.call_count == 0
+
+        # Timestamp range entirely before Bedrock: RemoteError, no network call
+        with pytest.raises(RemoteError):
+            next(blockscout.get_transactions(
+                chain_id=ChainID.OPTIMISM,
+                account=make_evm_address(),
+                action='txlistinternal',
+                period_or_hash=TimestampOrBlockRange(
+                    range_type='timestamps',
+                    from_value=0,
+                    to_value=OP_BEDROCK_UPGRADE - 1,
+                ),
+            ))
+        assert mock_request.call_count == 0
+
+        # Hash-based query with a pre-Bedrock timestamp: RemoteError, no network call
+        with pytest.raises(RemoteError):
+            next(blockscout.get_transactions(
+                chain_id=ChainID.OPTIMISM,
+                account=None,
+                action='txlistinternal',
+                period_or_hash=make_evm_tx_hash(),
+                tx_timestamp=Timestamp(OP_BEDROCK_UPGRADE - 1),
+            ))
+        assert mock_request.call_count == 0
+
+    # Post-Bedrock block range on Optimism should reach the network normally
+    with patch.object(blockscout.session, 'request', return_value=MockResponse(
+        status_code=HTTPStatus.OK,
+        text='{"message":"No internal transactions found","result":[],"status":"0"}',
+    )) as mock_post:
+        list(blockscout.get_transactions(
+            chain_id=ChainID.OPTIMISM,
+            account=make_evm_address(),
+            action='txlistinternal',
+            period_or_hash=TimestampOrBlockRange(
+                range_type='blocks',
+                from_value=OP_BEDROCK_BLOCK + 1,
+                to_value=OP_BEDROCK_BLOCK + 1000,
+            ),
+        ))
+        assert mock_post.call_count == 1
+
+    # Same pre-Bedrock block range on Ethereum should reach the network (no Bedrock concept)
+    with patch.object(blockscout.session, 'request', return_value=MockResponse(
+        status_code=HTTPStatus.OK,
+        text='{"message":"No internal transactions found","result":[],"status":"0"}',
+    )) as mock_eth:
+        list(blockscout.get_transactions(
+            chain_id=ChainID.ETHEREUM,
+            account=make_evm_address(),
+            action='txlistinternal',
+            period_or_hash=TimestampOrBlockRange(
+                range_type='blocks',
+                from_value=0,
+                to_value=OP_BEDROCK_BLOCK - 1,
+            ),
+        ))
+        assert mock_eth.call_count == 1
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('include_blockscout_key', [True])
+def test_live_query_transactions_and_rpc(blockscout: Blockscout) -> None:
+    """Exercise real Blockscout API calls (v1 account txlist + json-rpc block number) for hyperEVM
+
+    This test intentionally does not patch network requests and validates that the
+    configured Blockscout API key flow works against production endpoints.
+    """
+    transactions = blockscout._query(
+        chain_id=ChainID.HYPERLIQUID,
+        module='account',
+        action='txlist',
+        options={
+            'address': string_to_evm_address('0xc37b40ABdB939635068d3c5f13E7faF686F03B65'),
+            'page': 1,
+            'offset': 5,
+            'sort': 'desc',
+        },
+    )
+    assert isinstance(transactions, list)
+    assert len(transactions) > 0
+    assert all('hash' in entry for entry in transactions)
+
+    block_number = blockscout._query_rpc_method(
+        chain_id=ChainID.HYPERLIQUID,
+        method='eth_blockNumber',
+    )
+    assert isinstance(block_number, str)
+    assert block_number.startswith('0x')
+    assert int(block_number, 16) > 0x1f6e0f7
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+def test_missing_data_error(blockscout: Blockscout) -> None:
+    """Test that we properly handle the custom status 2 missing data error from blockscout
+    when querying internal transactions. Should raise a remote error so that we fall back to
+    a different indexer.
+    """
+    with (
+        pytest.raises(RemoteError, match='Blockscout is missing data'),
+        patch.object(blockscout.session, 'request', return_value=MockResponse(
+            status_code=HTTPStatus.OK,
+            text='{"message": "Internal transactions for this transaction have not been processed yet","result": [],"status": "2"}',  # noqa: E501
+        )),
+    ):
+        next(blockscout.get_transactions(
+            chain_id=ChainID.ETHEREUM,
+            account=make_evm_address(),
+            action='txlistinternal',
+            period_or_hash=make_evm_tx_hash(),
+        ))
+
+
+def test_pro_api_urls_for_v1_v2_and_rpc(blockscout: Blockscout) -> None:
+    api_keys = {
+        ChainID.ETHEREUM: ApiKey('proapi_ethereum'),
+        ChainID.BASE: ApiKey('proapi_base'),
+        ChainID.OPTIMISM: ApiKey('proapi_optimism'),
+    }
+    with patch.object(blockscout, '_get_api_key_for_chain', side_effect=api_keys.get):
+        with patch.object(blockscout.session, 'request', return_value=MockResponse(
+            status_code=HTTPStatus.OK,
+            text='{"message":"OK","result":[],"status":"1"}',
+        )) as mock_request:
+            blockscout._query(
+                chain_id=ChainID.ETHEREUM,
+                module='account',
+                action='txlist',
+                options={'address': make_evm_address()},
+            )
+            mock_request.assert_called_once_with(
+                method='get',
+                url='https://api.blockscout.com/1/api',
+                timeout=ANY,
+                params={
+                    'module': 'account',
+                    'action': 'txlist',
+                    'address': ANY,
+                    'apikey': 'proapi_ethereum',
+                },
+            )
+
+        with patch.object(blockscout.session, 'request', return_value=MockResponse(
+            status_code=HTTPStatus.OK,
+            text='{"items":[],"next_page_params":null}',
+        )) as mock_request:
+            blockscout._query_v2(
+                chain_id=ChainID.BASE,
+                module='addresses',
+                encoded_args='0x123',
+                endpoint='withdrawals',
+            )
+            mock_request.assert_called_once_with(
+                method='get',
+                url='https://api.blockscout.com/8453/api/v2/addresses/0x123/withdrawals',
+                timeout=ANY,
+                params={'apikey': 'proapi_base'},
+            )
+
+        with patch.object(blockscout.session, 'request', return_value=MockResponse(
+            status_code=HTTPStatus.OK,
+            text='{"result":"0x1"}',
+        )) as mock_request:
+            assert blockscout._query_rpc_method(
+                chain_id=ChainID.OPTIMISM,
+                method='eth_blockNumber',
+            ) == '0x1'
+            mock_request.assert_called_once_with(
+                method='post',
+                url='https://api.blockscout.com/10/json-rpc',
+                timeout=ANY,
+                params={'apikey': 'proapi_optimism'},
+                json={
+                    'id': 0,
+                    'jsonrpc': '2.0',
+                    'method': 'eth_blockNumber',
+                    'params': [],
+                },
+            )
+
+        with patch.object(blockscout.session, 'request', return_value=MockResponse(
+            status_code=HTTPStatus.OK,
+            text='{"message":"OK","result":[],"status":"1"}',
+        )) as mock_request:
+            blockscout._query(
+                chain_id=ChainID.HYPERLIQUID,
+                module='account',
+                action='txlist',
+                options={'address': make_evm_address()},
+            )
+            mock_request.assert_called_once_with(
+                method='get',
+                url='https://www.hyperscan.com/api',
+                timeout=ANY,
+                params={
+                    'module': 'account',
+                    'action': 'txlist',
+                    'address': ANY,
+                },
+            )
+
+        with patch.object(blockscout.session, 'request', return_value=MockResponse(
+            status_code=HTTPStatus.OK,
+            text='{"result":"0x1"}',
+        )) as mock_request:
+            assert blockscout._query_rpc_method(
+                chain_id=ChainID.HYPERLIQUID,
+                method='eth_blockNumber',
+            ) == '0x1'
+            mock_request.assert_called_once_with(
+                method='post',
+                url='https://www.hyperscan.com/api/eth-rpc',
+                timeout=ANY,
+                json={
+                    'id': 0,
+                    'jsonrpc': '2.0',
+                    'method': 'eth_blockNumber',
+                    'params': [],
+                },
+            )
+
+
+def test_eth_call_historical_block_passes_tag(blockscout: Blockscout) -> None:
+    """Blockscout honors the eth_call block tag, so historical calls should forward it"""
+    with patch.object(blockscout, '_query_rpc_method', return_value='0x1') as query_mock:
+        assert blockscout.eth_call(
+            chain_id=ChainID.ETHEREUM,
+            to_address=(dai := string_to_evm_address('0x6B175474E89094C44Da98b954EedeAC495271d0F')),  # noqa: E501
+            input_data='0x18160ddd',
+            block_identifier=10000000,
+        ) == '0x1'
+
+    query_mock.assert_called_once_with(
+        chain_id=ChainID.ETHEREUM,
+        method='eth_call',
+        options={'to': dai, 'data': '0x18160ddd', 'tag': '0x989680'},
+    )
+
+
+@pytest.mark.parametrize('include_blockscout_key', [False])
+def test_missing_api_key_warns_once(blockscout: Blockscout) -> None:
+    """Blockscout's PRO endpoints require an api key, so a missing one should emit a
+    MISSING_API_KEY websocket message (once) instead of silently skipping the query."""
+    blockscout.db.msg_aggregator.rotki_notifier = (notifier := MockRotkiNotifier())  # type: ignore[assignment]
+    assert blockscout._get_api_key_for_chain(ChainID.ETHEREUM) is None
+    assert (message := notifier.pop_message()) is not None
+    assert message.message_type == WSMessageType.MISSING_API_KEY
+    assert message.data == {'service': ExternalService.BLOCKSCOUT.serialize()}
+    # querying again must not re-warn, as the warning is given only once per session
+    assert blockscout._get_api_key_for_chain(ChainID.ETHEREUM) is None
+    assert notifier.pop_message() is None
+
+
+@pytest.mark.parametrize('include_blockscout_key', [False])
+def test_keyless_pro_query_is_skipped_without_a_request(blockscout: Blockscout) -> None:
+    """The PRO endpoints reject keyless queries, so we must not spend a request on one.
+
+    Bailing out with a RemoteError is what lets _try_indexers move on to the next indexer, so
+    a user holding only a paid etherscan key can still query the chains blockscout leads on.
+    """
+    with patch.object(blockscout.session, 'request') as request_mock:
+        with pytest.raises(RemoteError, match='no API key configured'):
+            blockscout._get_url(chain_id=ChainID.GNOSIS)
+
+        with pytest.raises(RemoteError, match='no API key configured'):
+            blockscout._get_url(chain_id=ChainID.GNOSIS, endpoint='rpc')
+
+        request_mock.assert_not_called()
+
+    # the self-hosted instances need no key, so they must stay queryable
+    assert blockscout._get_url(chain_id=ChainID.HYPERLIQUID) == 'https://www.hyperscan.com/api'
+
+
+def test_keyed_pro_query_is_allowed(blockscout: Blockscout) -> None:
+    """With a key present the PRO url is returned as normal (the fixtures add one by default)"""
+    assert blockscout._get_url(chain_id=ChainID.GNOSIS) == 'https://api.blockscout.com/100/api'
+
+
+def test_blockscout_uses_account_pagination_limit(blockscout: Blockscout) -> None:
+    """The account endpoints must ask for the page size explicitly.
+
+    Without it blockscout picks its own, and _maybe_paginate then reads the mismatch as
+    "the server ignored our page size" and stops after the first page, silently dropping
+    everything past it.
+    """
+    for action in ('txlist', 'txlistinternal', 'tokentx'):
+        assert blockscout._get_account_pagination_options(action=action, options={}) == {
+            'page': '1',
+            'offset': str(BLOCKSCOUT_PAGINATION_LIMIT),
+        }
+
+    # blockscout disregards the block range for getminedblocks, so it must keep its own paging
+    assert blockscout._get_account_pagination_options(
+        action='getminedblocks',
+        options={},
+    ) is None
+    assert blockscout._get_account_pagination_options(action='getLogs', options={}) is None
+
+
+def test_blockscout_internal_by_txhash_keeps_server_paging(blockscout: Blockscout) -> None:
+    """Internal txs of one parent hash paginate by page number, not by block range.
+
+    Blockscout rejects any request where PageNo * Offset exceeds its cap, and no single
+    transaction has anywhere near a full page of internal txs, so this path leaves the page
+    size to the server and never paginates.
+    """
+    with patch.object(Blockscout, '_query', return_value=[]) as query_mock:
+        list(blockscout.get_transactions(
+            chain_id=ChainID.GNOSIS,
+            account=None,
+            action='txlistinternal',
+            period_or_hash=make_evm_tx_hash(),
+        ))
+
+    query_options = query_mock.call_args.kwargs['options']
+    assert 'page' not in query_options
+    assert 'offset' not in query_options

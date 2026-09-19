@@ -1,0 +1,438 @@
+import type { ActionResult } from '@rotki/common';
+import { server } from '@test/setup-files/server';
+import { http, HttpResponse } from 'msw';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { effectScope, ref } from 'vue';
+import { ApiValidationError } from '@/modules/core/api/types/errors';
+import { useDisabledChainQueriesState } from '@/modules/settings/general/disabled-chain-queries/use-disabled-chain-queries-state';
+import { useSettingsApi } from './use-settings-api';
+
+const backendUrl = process.env.VITE_BACKEND_URL;
+const ETH_ADDRESS = '0x5A0b54D5dc17e0AadC383d2db43B0a0D3E029c4c';
+const MULTI_WORD_CHAIN_ID = 'polygon_pos';
+
+interface CapturedRequest {
+  body: unknown;
+  headers: Headers;
+  url: string;
+  method: string;
+}
+
+function createSettingsResponse(overrides: Record<string, unknown> = {}): ActionResult<Record<string, unknown>> {
+  return {
+    result: {
+      have_premium: false,
+      version: 42,
+      last_write_ts: 1712774152,
+      premium_should_sync: false,
+      include_crypto2crypto: true,
+      ui_floating_precision: 2,
+      taxfree_after_period: 31536000,
+      balance_save_frequency: 24,
+      include_gas_costs: true,
+      ksm_rpc_endpoint: 'http://localhost:9933',
+      dot_rpc_endpoint: '',
+      beacon_rpc_endpoint: '',
+      btc_mempool_api: '',
+      main_currency: 'EUR',
+      date_display_format: '%d/%m/%Y %H:%M:%S %Z',
+      submit_usage_analytics: true,
+      active_modules: [],
+      btc_derivation_gap_limit: 20,
+      calculate_past_cost_basis: true,
+      display_date_in_localtime: true,
+      current_price_oracles: ['coingecko'],
+      historical_price_oracles: ['cryptocompare'],
+      pnl_csv_with_formulas: true,
+      pnl_csv_have_summary: false,
+      ssf_graph_multiplier: 0,
+      last_data_migration: 13,
+      non_syncing_exchanges: [],
+      evmchains_to_skip_detection: [],
+      disabled_chain_queries: {},
+      cost_basis_method: 'fifo',
+      treat_eth2_as_eth: true,
+      eth_staking_taxable_after_withdrawal_enabled: true,
+      address_name_priority: ['private_addressbook'],
+      include_fees_in_cost_basis: true,
+      infer_zero_timed_balances: false,
+      query_retry_limit: 5,
+      connect_timeout: 30,
+      read_timeout: 30,
+      oracle_penalty_threshold_count: 5,
+      oracle_penalty_duration: 1800,
+      last_balance_save: 0,
+      last_data_upload_ts: 0,
+      auto_delete_calendar_entries: true,
+      auto_create_calendar_reminders: true,
+      ask_user_upon_size_discrepancy: true,
+      auto_detect_tokens: true,
+      csv_export_delimiter: ',',
+      default_evm_indexer_order: [],
+      evm_indexers_order: {},
+      asset_movement_amount_tolerance: '0.000001',
+      asset_movement_time_range: 3600,
+      suppress_missing_key_msg_services: [],
+      auto_create_profit_events: false,
+      ...overrides,
+    },
+    message: '',
+  };
+}
+
+function createBackendConfigResponse(): ActionResult<Record<string, unknown>> {
+  return {
+    result: {
+      loglevel: { is_default: true, value: 'DEBUG' },
+      max_logfiles_num: { is_default: true, value: 3 },
+      max_size_in_mb_all_logs: { is_default: true, value: 300 },
+      sqlite_instructions: { is_default: true, value: 5000 },
+    },
+    message: '',
+  };
+}
+
+describe('composables/api/settings/settings-api', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe('getSettings', () => {
+    it('should send GET request and transforms response from snake_case to camelCase', async () => {
+      let capturedRequest: CapturedRequest | null = null;
+
+      server.use(
+        http.get(`${backendUrl}/api/1/settings`, ({ request }) => {
+          capturedRequest = {
+            body: null,
+            headers: request.headers,
+            url: request.url,
+            method: request.method,
+          };
+          return HttpResponse.json(createSettingsResponse({ main_currency: 'USD' }));
+        }),
+      );
+
+      const { getSettings } = useSettingsApi();
+      const result = await getSettings();
+
+      expect(capturedRequest).not.toBeNull();
+      expect(capturedRequest!.method).toBe('GET');
+      expect(capturedRequest!.url).toBe(`${backendUrl}/api/1/settings`);
+
+      expect(result.general.mainCurrency).toBeDefined();
+      expect(result.other.havePremium).toBe(false);
+      expect(result.accounting.includeCrypto2crypto).toBe(true);
+    });
+
+    it('should keep chain-keyed settings keyed by the chain id', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/settings`, () => HttpResponse.json(createSettingsResponse({
+          disabled_chain_queries: { base: [], binance_sc: [], [MULTI_WORD_CHAIN_ID]: [] },
+          evm_indexers_order: { [MULTI_WORD_CHAIN_ID]: ['etherscan'] },
+        }))),
+      );
+
+      const { general } = await useSettingsApi().getSettings();
+
+      expect(Object.keys(general.disabledChainQueries).sort()).toStrictEqual(['base', 'binance_sc', MULTI_WORD_CHAIN_ID]);
+      expect(general.evmIndexersOrder).toStrictEqual({ [MULTI_WORD_CHAIN_ID]: ['etherscan'] });
+    });
+
+    it('should throw error when result is null', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/settings`, () =>
+          HttpResponse.json({
+            result: null,
+            message: 'No settings found',
+          }, { status: 200 })),
+      );
+
+      const { getSettings } = useSettingsApi();
+
+      await expect(getSettings()).rejects.toThrow('No settings found');
+    });
+  });
+
+  describe('setSettings', () => {
+    it('should send PUT request with snake_case payload', async () => {
+      let capturedRequest: CapturedRequest | null = null;
+      let capturedBody: unknown = null;
+
+      server.use(
+        http.put(`${backendUrl}/api/1/settings`, async ({ request }) => {
+          capturedBody = JSON.parse(await request.text());
+          capturedRequest = {
+            body: capturedBody,
+            headers: request.headers,
+            url: request.url,
+            method: request.method,
+          };
+          return HttpResponse.json(createSettingsResponse({ main_currency: 'GBP' }));
+        }),
+      );
+
+      const { setSettings } = useSettingsApi();
+      await setSettings({ mainCurrency: 'GBP', uiFloatingPrecision: 4 });
+
+      expect(capturedRequest).not.toBeNull();
+      expect(capturedRequest!.method).toBe('PUT');
+
+      expect(capturedBody).toEqual({
+        settings: {
+          main_currency: 'GBP',
+          ui_floating_precision: 4,
+        },
+      });
+    });
+
+    it('should transform response from snake_case to camelCase', async () => {
+      server.use(
+        http.put(`${backendUrl}/api/1/settings`, () =>
+          HttpResponse.json(createSettingsResponse({
+            main_currency: 'GBP',
+            ui_floating_precision: 4,
+          }))),
+      );
+
+      const { setSettings } = useSettingsApi();
+      const result = await setSettings({ mainCurrency: 'GBP' });
+
+      expect(result.general.uiFloatingPrecision).toBe(4);
+    });
+
+    it('should keep chain-keyed settings keyed by the chain id', async () => {
+      server.use(
+        http.put(`${backendUrl}/api/1/settings`, () => HttpResponse.json(createSettingsResponse({
+          disabled_chain_queries: { base: [], [MULTI_WORD_CHAIN_ID]: [] },
+        }))),
+      );
+
+      const { general } = await useSettingsApi().setSettings({ disabledChainQueries: { [MULTI_WORD_CHAIN_ID]: [] } });
+
+      expect(Object.keys(general.disabledChainQueries).sort()).toStrictEqual(['base', MULTI_WORD_CHAIN_ID]);
+    });
+
+    it('should throw ApiValidationError on 400 response', async () => {
+      server.use(
+        http.put(`${backendUrl}/api/1/settings`, () =>
+          HttpResponse.json({
+            result: null,
+            message: '{"main_currency": ["Invalid currency code"]}',
+          }, { status: 400 })),
+      );
+
+      const { setSettings } = useSettingsApi();
+
+      await expect(setSettings({ mainCurrency: 'INVALID' }))
+        .rejects
+        .toThrow(ApiValidationError);
+    });
+
+    it('should throw ApiValidationError whose error keys are camelCased, not the wire snake_case', async () => {
+      server.use(
+        http.put(`${backendUrl}/api/1/settings`, () =>
+          HttpResponse.json({
+            result: null,
+            message: '{"ui_floating_precision": ["Must be between 0 and 8"]}',
+          }, { status: 400 })),
+      );
+
+      const { setSettings } = useSettingsApi();
+
+      try {
+        await setSettings({ uiFloatingPrecision: 100 });
+        expect.fail('Should have thrown ApiValidationError');
+      }
+      catch (error) {
+        expect(error).toBeInstanceOf(ApiValidationError);
+        if (!(error instanceof ApiValidationError))
+          throw new Error('Expected ApiValidationError');
+        expect(error.errors).toHaveProperty('uiFloatingPrecision');
+      }
+    });
+
+    it('should throw generic Error on non-400 error response', async () => {
+      server.use(
+        http.put(`${backendUrl}/api/1/settings`, () =>
+          HttpResponse.json({
+            result: null,
+            message: 'Internal server error',
+          }, { status: 500 })),
+      );
+
+      const { setSettings } = useSettingsApi();
+
+      await expect(setSettings({ mainCurrency: 'EUR' }))
+        .rejects
+        .toThrow('Internal server error');
+    });
+  });
+
+  describe('patchFrontendSettings', () => {
+    async function capturePatchBody(call: (api: ReturnType<typeof useSettingsApi>) => Promise<void>): Promise<unknown> {
+      let capturedBody: unknown = null;
+      server.use(
+        http.patch(`${backendUrl}/api/1/settings/frontend`, async ({ request }) => {
+          capturedBody = await request.json();
+          return HttpResponse.json({ message: '', result: true });
+        }),
+      );
+
+      await call(useSettingsApi());
+      return capturedBody;
+    }
+
+    it('should send only the patch when nothing is being removed', async () => {
+      expect(await capturePatchBody(async api => api.patchFrontendSettings({ decimalSeparator: ';' })))
+        .toEqual({ patch: { decimal_separator: ';' } });
+    });
+
+    it('should snake_case the keys being removed, not just the patch', async () => {
+      expect(await capturePatchBody(async api => api.patchFrontendSettings(
+        { balanceValueThreshold: {} },
+        ['balanceUsdValueThreshold'],
+      ))).toEqual({
+        patch: { balance_value_threshold: {} },
+        remove: ['balance_usd_value_threshold'],
+      });
+    });
+  });
+
+  describe('getRawSettings', () => {
+    it('should return raw settings without UserSettingsModel transformation', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/settings`, () =>
+          HttpResponse.json(createSettingsResponse())),
+      );
+
+      const { getRawSettings } = useSettingsApi();
+      const result = await getRawSettings();
+
+      expect(result).toHaveProperty('mainCurrency');
+      expect(result).toHaveProperty('uiFloatingPrecision');
+      expect(result).not.toHaveProperty('general');
+      expect(result).not.toHaveProperty('accounting');
+    });
+
+    it('should keep chain-keyed settings keyed by the chain id on the path a resumed session reads', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/settings`, () => HttpResponse.json(createSettingsResponse({
+          disabled_chain_queries: { base: [], [MULTI_WORD_CHAIN_ID]: [] },
+        }))),
+      );
+
+      const result = await useSettingsApi().getRawSettings();
+
+      expect(Object.keys(result.disabledChainQueries!).sort()).toStrictEqual(['base', MULTI_WORD_CHAIN_ID]);
+    });
+  });
+
+  describe('chain-keyed settings round trip', () => {
+    it('should send the chain ids the settings UI built, in snake_case, and read them back unchanged', async () => {
+      let capturedBody: unknown = null;
+
+      server.use(
+        http.put(`${backendUrl}/api/1/settings`, async ({ request }) => {
+          capturedBody = JSON.parse(await request.text());
+          return HttpResponse.json(createSettingsResponse({
+            disabled_chain_queries: { binance_sc: [], [MULTI_WORD_CHAIN_ID]: [ETH_ADDRESS] },
+          }));
+        }),
+      );
+
+      const scope = effectScope();
+      const state = scope.run(() => useDisabledChainQueriesState({
+        matchChain: (raw: string): string => raw,
+        ready: ref(true),
+        source: ref({}),
+      }))!;
+      state.addRule({ chainId: 'binance_sc', kind: 'chain' });
+      state.addRule({ address: ETH_ADDRESS, chainIds: [MULTI_WORD_CHAIN_ID], kind: 'address' });
+
+      const { general } = await useSettingsApi().setSettings({ disabledChainQueries: state.buildPayload() });
+      scope.stop();
+
+      expect(capturedBody).toStrictEqual({
+        settings: { disabled_chain_queries: { binance_sc: [], [MULTI_WORD_CHAIN_ID]: [ETH_ADDRESS] } },
+      });
+      expect(general.disabledChainQueries).toStrictEqual({ binance_sc: [], [MULTI_WORD_CHAIN_ID]: [ETH_ADDRESS] });
+    });
+  });
+
+  describe('backendSettings', () => {
+    it('should send GET request to configuration endpoint', async () => {
+      let capturedUrl: string | null = null;
+
+      server.use(
+        http.get(`${backendUrl}/api/1/settings/configuration`, ({ request }) => {
+          capturedUrl = request.url;
+          return HttpResponse.json(createBackendConfigResponse());
+        }),
+      );
+
+      const { backendSettings } = useSettingsApi();
+      const result = await backendSettings();
+
+      expect(capturedUrl).toBe(`${backendUrl}/api/1/settings/configuration`);
+      expect(result.loglevel).toBeDefined();
+      expect(result.loglevel.isDefault).toBe(true);
+    });
+
+    it('should transform response correctly', async () => {
+      server.use(
+        http.get(`${backendUrl}/api/1/settings/configuration`, () =>
+          HttpResponse.json(createBackendConfigResponse())),
+      );
+
+      const { backendSettings } = useSettingsApi();
+      const result = await backendSettings();
+
+      expect(result.loglevel.isDefault).toBe(true);
+      expect(result.maxLogfilesNum.value).toBe(3);
+      expect(result.maxSizeInMbAllLogs.value).toBe(300);
+      expect(result.sqliteInstructions.value).toBe(5000);
+    });
+  });
+
+  describe('updateBackendConfiguration', () => {
+    it('should send PUT request with uppercase loglevel', async () => {
+      let capturedBody: unknown = null;
+
+      server.use(
+        http.put(`${backendUrl}/api/1/settings/configuration`, async ({ request }) => {
+          capturedBody = JSON.parse(await request.text());
+          return HttpResponse.json(createBackendConfigResponse());
+        }),
+      );
+
+      const { updateBackendConfiguration } = useSettingsApi();
+      await updateBackendConfiguration('debug');
+
+      expect(capturedBody).toEqual({
+        loglevel: 'DEBUG',
+      });
+    });
+
+    it('should return parsed BackendConfiguration with the loglevel lowercased', async () => {
+      server.use(
+        http.put(`${backendUrl}/api/1/settings/configuration`, () =>
+          HttpResponse.json({
+            result: {
+              loglevel: { is_default: false, value: 'WARNING' },
+              max_logfiles_num: { is_default: true, value: 3 },
+              max_size_in_mb_all_logs: { is_default: true, value: 300 },
+              sqlite_instructions: { is_default: true, value: 5000 },
+            },
+            message: '',
+          })),
+      );
+
+      const { updateBackendConfiguration } = useSettingsApi();
+      const result = await updateBackendConfiguration('warning');
+
+      expect(result.loglevel.value).toBe('warning');
+      expect(result.loglevel.isDefault).toBe(false);
+    });
+  });
+});

@@ -1,0 +1,10 @@
+{
+  "number": 36,
+  "repository": "strapi/strapi",
+  "url": "https://github.com/strapi/strapi",
+  "description": "🚀 Strapi is the leading open-source headless CMS. It’s 100% JavaScript/TypeScript, fully customizable, and developer-first.",
+  "language": "TypeScript",
+  "stars": 73186,
+  "default_branch": "main",
+  "source_zip_url": "https://github.com/strapi/strapi/archive/refs/heads/main.zip"
+}

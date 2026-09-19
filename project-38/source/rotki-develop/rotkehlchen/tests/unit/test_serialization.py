@@ -1,0 +1,258 @@
+import json
+from unittest.mock import MagicMock
+
+import pytest
+from marshmallow.exceptions import ValidationError
+
+from rotkehlchen.accounting.structures.balance import BalanceType
+from rotkehlchen.api.v1.fields import BlockchainField
+from rotkehlchen.api.v1.schemas import HistoryEventsDeletionSchema
+from rotkehlchen.assets.asset import EvmToken, UnderlyingToken
+from rotkehlchen.balances.manual import ManuallyTrackedBalance, add_manually_tracked_balances
+from rotkehlchen.constants import ONE
+from rotkehlchen.constants.assets import A_BTC, A_ETH
+from rotkehlchen.errors.serialization import DeserializationError
+from rotkehlchen.externalapis.utils import read_hash
+from rotkehlchen.fval import FVal
+from rotkehlchen.serialization.deserialize import (
+    deserialize_evm_address,
+    deserialize_evm_transaction,
+    deserialize_int_from_hex_or_int,
+)
+from rotkehlchen.serialization.schemas import ExportedAssetsSchema
+from rotkehlchen.serialization.serialize import PreSerializedList, process_result
+from rotkehlchen.types import (
+    ChainID,
+    EvmTransaction,
+    Location,
+    SupportedBlockchain,
+    Timestamp,
+    TokenKind,
+    deserialize_evm_tx_hash,
+)
+from rotkehlchen.utils.serialization import rlk_jsondumps
+
+TEST_DATA = {
+    'a': FVal('5.4'),
+    'b': 'foo',
+    'c': FVal('32.1'),
+    'd': 5,
+    'e': [1, 'a', FVal('5.1')],
+    'f': A_ETH,
+    A_BTC: 'test_with_asset_key',
+}
+
+
+def test_rlk_jsondumps():
+    result = rlk_jsondumps(TEST_DATA)
+    assert result == (
+        '{"a": "5.4", "b": "foo", "c": "32.1", "d": 5, '
+        '"e": [1, "a", "5.1"], "f": "ETH", "BTC": "test_with_asset_key"}'
+    )
+
+
+def test_pre_serialized_list_skips_rewalk() -> None:
+    """A PreSerializedList must be returned untouched by process_result (no deep
+    re-walk) while producing byte-identical json to walking a plain list. This guards
+    the history-events hot path where the entries are already JSON primitives -- note
+    extra_data can hold floats (it is json.loads'd from the DB), so the output must
+    match plain json.dumps and not go through an FVal-only encoder.
+    """
+    entries = [
+        {'entry': {'identifier': 1, 'asset': 'BTC', 'amount': '0.5', 'extra_data': {'ratio': 1.5, 'x': None}}, 'hidden': True},  # noqa: E501
+        [  # a grouped sub-list of events
+            {'entry': {'identifier': 2, 'asset': 'ETH', 'amount': '3'}, 'states': [0, 1]},
+            {'entry': {'identifier': 3, 'asset': 'ETH', 'amount': '1', 'extra_data': {'n': 2}}},
+        ],
+    ]
+    marker = PreSerializedList(entries)
+    processed = process_result({'result': {'entries': marker, 'entries_found': 2}, 'message': ''})
+    # the wrapped list is the very same object -> no rebuild/deep copy happened
+    assert processed['result']['entries'] is marker
+    # and the emitted json is identical to re-walking a plain list
+    plain = process_result({'result': {'entries': entries, 'entries_found': 2}, 'message': ''})
+    assert json.dumps(plain) == json.dumps(processed)
+
+
+@pytest.mark.parametrize('use_clean_caching_directory', [True])
+def test_deserialize_location(database):
+    balances = []
+    for idx, data in enumerate(Location):
+        assert Location.deserialize(str(data)) == data
+        balances.append(ManuallyTrackedBalance(
+            identifier=-1,
+            asset=A_BTC,
+            label='Test' + str(idx),
+            amount=ONE,
+            location=data,
+            tags=None,
+            balance_type=BalanceType.ASSET,
+        ))
+
+    with pytest.raises(DeserializationError):
+        Location.deserialize('dsadsad')
+
+    with pytest.raises(DeserializationError):
+        Location.deserialize(15)
+
+    # Also write and read each location to DB to make sure that
+    # location.serialize_for_db() and deserialize_location_from_db work fine
+    add_manually_tracked_balances(database, balances)
+    with database.conn.read_ctx() as cursor:
+        balances = database.get_manually_tracked_balances(cursor)
+    for data in Location:
+        assert data in (x.location for x in balances)
+
+
+def test_deserialize_int_from_hex_or_int():
+    # Etherscan can return logIndex 0x if it's the 0th log in the hash
+    # https://etherscan.io/tx/0x6f1370cd9fa19d550031a30290b062dd3b56f44caf6344c05545ef15428de7ef
+    assert deserialize_int_from_hex_or_int('0x', 'whatever') == 0
+    assert deserialize_int_from_hex_or_int('0x1', 'whatever') == 1
+    assert deserialize_int_from_hex_or_int('0x33', 'whatever') == 51
+    assert deserialize_int_from_hex_or_int(66, 'whatever') == 66
+
+
+def test_deserialize_deployment_ethereum_transaction():
+    data = {
+        'timeStamp': 0,
+        'blockNumber': 1,
+        'hash': '0xc5be14f87be25174846ed53ed239517e4c45c1fe024b184559c17d4f1fefa736',
+        'from': '0x568Ab4b8834646f97827bB966b13d60246157B8E',
+        'to': None,
+        'value': 0,
+        'gas': 1,
+        'gasPrice': 1,
+        'gasUsed': 1,
+        'input': '',
+        'nonce': 1,
+    }
+    tx, _ = deserialize_evm_transaction(
+        data=data,
+        internal=False,
+        chain_id=ChainID.ETHEREUM,
+        evm_inquirer=None,
+    )
+    expected = EvmTransaction(
+        chain_id=ChainID.ETHEREUM,
+        timestamp=Timestamp(0),
+        block_number=1,
+        tx_hash=deserialize_evm_tx_hash(data['hash']),
+        from_address=deserialize_evm_address(data['from']),
+        to_address=None,
+        value=data['value'],
+        gas=data['gas'],
+        gas_price=data['gasPrice'],
+        gas_used=data['gasUsed'],
+        input_data=read_hash(data, 'input'),
+        nonce=data['nonce'],
+    )
+    assert tx == expected
+
+
+def test_blockchain_field_allow_only():
+    """Test that BlockchainField properly validates the allow_only parameter."""
+    field = BlockchainField(allow_only=[SupportedBlockchain.ETHEREUM, SupportedBlockchain.OPTIMISM])  # noqa: E501
+    assert field.deserialize('ETH') == SupportedBlockchain.ETHEREUM
+    assert field.deserialize('OPTIMISM') == SupportedBlockchain.OPTIMISM
+
+    with pytest.raises(ValidationError, match='is not allowed in this endpoint'):
+        field.deserialize('ETH2')
+
+    with pytest.raises(ValidationError, match='is not allowed in this endpoint'):
+        field.deserialize('BTC')
+
+
+def test_exported_assets_schema_accepts_empty_symbol():
+    """Regression test for ExportedAssetsSchema to accept assets with empty symbol."""
+    data = '{"version": "15", "assets": [{"asset_type": "own chain", "name": "Test Asset", "symbol": "", "identifier": "TEST123"}]}'  # noqa: E501
+    result = ExportedAssetsSchema().loads(data)
+    assert result['assets'][0]['asset'].symbol is None
+
+
+def test_evm_token_serialization_normalizes_underlying_token_weights() -> None:
+    token = EvmToken.initialize(
+        address=deserialize_evm_address('0x5a0b54d5dc17e0aadc383d2db43b0a0d3e029c4c'),
+        chain_id=ChainID.ETHEREUM,
+        token_kind=TokenKind.ERC20,
+        name='Pool Token',
+        symbol='POOL',
+        decimals=18,
+        underlying_tokens=[UnderlyingToken(
+            address=deserialize_evm_address('0x5a0b54d5dc17e0aadc383d2db43b0a0d3e029c4d'),
+            token_kind=TokenKind.ERC20,
+            weight=FVal('0.4'),
+        ), UnderlyingToken(
+            address=deserialize_evm_address('0x5a0b54d5dc17e0aadc383d2db43b0a0d3e029c4e'),
+            token_kind=TokenKind.ERC20,
+            weight=FVal('0.599999999999999999999999999999999999999999999999999999999999999999999999999999'),
+        )],
+    )
+    serialized = token.to_dict()
+    assert serialized['underlying_tokens'] is not None
+    normalized_weights = [FVal(entry['weight']) / FVal(100) for entry in serialized['underlying_tokens']]  # noqa: E501
+    assert normalized_weights == [FVal('0.4'), FVal('0.6')]
+
+
+def test_history_events_deletion_schema_field_coverage() -> None:
+    """Test that all fields in HistoryEventsDeletionSchema are explicitly categorized.
+
+    If this test fails, add the new field to either KNOWN_FILTER_FIELDS here
+    or _NON_FILTER_FIELDS in the schema.
+    """
+    known_filter_fields = {
+        'from_timestamp',
+        'to_timestamp',
+        'event_types',
+        'event_subtypes',
+        'counterparties',
+        'group_identifiers',
+        'location',
+        'location_labels',
+        'asset',
+        'entry_types',
+        'state_markers',
+        'identifiers',
+        'notes_substring',
+        'min_amount',
+        'max_amount',
+        'tx_refs',
+        'addresses',
+        'validator_indices',
+    }
+
+    schema = HistoryEventsDeletionSchema()
+    all_fields = set(schema.fields.keys())
+    assert all_fields - known_filter_fields - schema._NON_FILTER_FIELDS == set()
+
+
+def test_deserialize_evm_transaction_empty_gas_price():
+    """Test that transactions with empty gasPrice fall back to effectiveGasPrice from receipt."""
+    mock_indexer = MagicMock()
+    mock_indexer.get_transaction_receipt.return_value = {
+        'effectiveGasPrice': (expected_gas_price := '0x1234'),
+        'gasUsed': '0x5208',
+    }
+
+    tx, _ = deserialize_evm_transaction(
+        data={
+            'timeStamp': 1688269337,
+            'blockNumber': 739995,
+            'hash': '0x847267ff6d61f991df9c2bbfa8d0cf20f97386bb2fba2e2bb6136d9fc471b547',
+            'from': '0x5153493bB1E1642A63A098A65dD3913daBB6AE24',
+            'to': '0xde0B295669a9FD93d5F28D9Ec85E40f4cb697BAe',
+            'value': 0,
+            'gas': 21000,
+            'gasPrice': '',
+            'gasUsed': 21000,
+            'input': '0x',
+            'nonce': 0,
+        },
+        internal=False,
+        chain_id=ChainID.ETHEREUM,
+        evm_inquirer=None,
+        indexer=mock_indexer,
+    )
+
+    assert tx.gas_price == int(expected_gas_price, 16)
+    assert tx.gas_used == 21000

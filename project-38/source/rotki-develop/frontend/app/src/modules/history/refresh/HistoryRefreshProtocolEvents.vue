@@ -1,0 +1,124 @@
+<script setup lang="ts">
+import { getTextToken, toHumanReadable } from '@rotki/common';
+import { get, set } from '@vueuse/core';
+import { isEqual } from 'es-toolkit';
+import { OnlineHistoryEventsQueryType } from '@/modules/history/events/schemas';
+import { useMoneriumOAuth } from '@/modules/integrations/monerium/use-monerium-auth';
+import { PremiumFeature, useFeatureAccess } from '@/modules/premium/use-feature-access';
+import { useExternalApiKeys } from '@/modules/settings/api-keys/external/use-external-api-keys';
+
+const modelValue = defineModel<OnlineHistoryEventsQueryType[]>({ required: true });
+const search = defineModel<string>('search', { required: true });
+
+defineProps<{
+  processing: boolean;
+}>();
+
+const emit = defineEmits<{ 'update:all-selected': [allSelected: boolean] }>();
+
+const queries: OnlineHistoryEventsQueryType[] = [
+  OnlineHistoryEventsQueryType.GNOSIS_PAY,
+  OnlineHistoryEventsQueryType.MONERIUM,
+];
+
+const { t } = useI18n({ useScope: 'global' });
+
+const { getApiKey } = useExternalApiKeys();
+const { authenticated: moneriumAuthenticated } = useMoneriumOAuth();
+const { allowed: gnosisPayAllowed } = useFeatureAccess(PremiumFeature.GNOSIS_PAY);
+const { allowed: moneriumAllowed } = useFeatureAccess(PremiumFeature.MONERIUM);
+
+interface QueryConfig {
+  enabled: boolean;
+  tooltip?: string;
+}
+
+// Only the two gated protocols have a config; every reader already treats a missing one as enabled.
+const queryConfigs = computed<Partial<Record<OnlineHistoryEventsQueryType, QueryConfig>>>(() => {
+  const gnosisPayEnabled = get(gnosisPayAllowed) && !!getApiKey('gnosis_pay');
+  const moneriumEnabled = get(moneriumAllowed) && get(moneriumAuthenticated);
+
+  return {
+    [OnlineHistoryEventsQueryType.GNOSIS_PAY]: {
+      enabled: gnosisPayEnabled,
+      tooltip: gnosisPayEnabled ? undefined : t('history_refresh_selection.refresh_disabled', { service: toHumanReadable(OnlineHistoryEventsQueryType.GNOSIS_PAY) }),
+    },
+    [OnlineHistoryEventsQueryType.MONERIUM]: {
+      enabled: moneriumEnabled,
+      tooltip: moneriumEnabled ? undefined : t('history_refresh_selection.refresh_disabled', { service: toHumanReadable(OnlineHistoryEventsQueryType.MONERIUM) }),
+    },
+  };
+});
+
+const enabledQueries = computed<OnlineHistoryEventsQueryType[]>(() =>
+  queries.filter(query => get(queryConfigs)[query]?.enabled ?? true),
+);
+
+const filteredQueries = computed<OnlineHistoryEventsQueryType[]>(() => {
+  const query = getTextToken(get(search));
+  return queries.filter(queryType => getTextToken(queryType).includes(query));
+});
+
+function toggleSelect(query: OnlineHistoryEventsQueryType): void {
+  const config = get(queryConfigs)[query];
+  if (!config?.enabled)
+    return;
+
+  const current = get(modelValue);
+  const isSelected = current.includes(query);
+  updateSelection(isSelected ? current.filter(item => item !== query) : [...current, query]);
+}
+
+function toggleSelectAll() {
+  updateSelection(get(modelValue).length > 0 ? [] : get(enabledQueries));
+}
+
+function updateSelection(selection: OnlineHistoryEventsQueryType[]): void {
+  set(modelValue, selection);
+  emit('update:all-selected', isEqual(selection.sort(), get(enabledQueries).sort()));
+}
+
+defineExpose({
+  toggleSelectAll,
+});
+</script>
+
+<template>
+  <div>
+    <div
+      v-for="query in filteredQueries"
+      :key="query"
+      class="flex items-center px-4 py-1 pr-2 transition"
+      :class="{
+        'cursor-pointer hover:bg-rui-grey-100 hover:dark:bg-rui-grey-900': queryConfigs[query]?.enabled && !processing,
+        'opacity-50 cursor-not-allowed': !queryConfigs[query]?.enabled || processing,
+      }"
+      @click="queryConfigs[query]?.enabled && !processing && toggleSelect(query)"
+    >
+      <RuiTooltip
+        :disabled="!queryConfigs[query]?.tooltip"
+        :options="{ placement: 'top-start' }"
+      >
+        <template #activator>
+          <div class="flex items-center">
+            <RuiCheckbox
+              :model-value="modelValue.includes(query)"
+              :disabled="!queryConfigs[query]?.enabled || processing"
+              color="primary"
+              size="sm"
+              hide-details
+              @click.prevent
+            />
+
+            <span class="capitalize text-sm text-rui-text-secondary">
+              {{ toHumanReadable(query) }}
+            </span>
+          </div>
+        </template>
+        {{ queryConfigs[query]?.tooltip || '' }}
+      </RuiTooltip>
+
+      <div class="grow" />
+    </div>
+  </div>
+</template>

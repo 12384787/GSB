@@ -1,0 +1,1 @@
+.devcontainer,.dockerignore .editorconfig,.github .gitignore,.gitmodules .husky,.vscode .zed,CODE_OF_CONDUCT.md CONTRIBUTING.md,Cargo.cef.lock Cargo.lock,Cargo.toml Dockerfile,LICENSE README.md,SECURITY.md apps,biome.json data,docker docs,fastlane flake.lock,flake.nix nix,package.json packages,patches pnpm-lock.yaml,pnpm-workspace.yaml tsconfig.json

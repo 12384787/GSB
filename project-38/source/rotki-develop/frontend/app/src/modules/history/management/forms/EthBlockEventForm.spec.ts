@@ -1,0 +1,354 @@
+import type { AssetMap } from '@/modules/assets/types';
+import type { EthBlockEvent } from '@/modules/history/events/schemas';
+import { bigNumberify, HistoryEventEntryType } from '@rotki/common';
+import { createMock } from '@test/utils/create-mock';
+import { selectorContract } from '@test/utils/selector-contract';
+import { type ComponentMountingOptions, mount, type VueWrapper } from '@vue/test-utils';
+import dayjs from 'dayjs';
+import { createPinia, type Pinia, setActivePinia } from 'pinia';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { nextTick } from 'vue';
+import { useAssetInfoApi } from '@/modules/assets/api/use-asset-info-api';
+import { useAssetPricesApi } from '@/modules/assets/api/use-asset-prices-api';
+import { setupDayjs } from '@/modules/core/common/data/date';
+import { useHistoryEvents } from '@/modules/history/events/use-history-events';
+import EthBlockEventForm from '@/modules/history/management/forms/EthBlockEventForm.vue';
+
+vi.mock('@/modules/history/events/use-history-events', () => ({
+  useHistoryEvents: vi.fn(),
+}));
+
+vi.mock('@/modules/assets/api/use-asset-prices-api', () => ({
+  useAssetPricesApi: vi.fn().mockReturnValue({
+    addHistoricalPrice: vi.fn(),
+  }),
+}));
+
+describe('forms/EthBlockEventForm.vue', () => {
+  let wrapper: VueWrapper<InstanceType<typeof EthBlockEventForm>>;
+  let addHistoryEventMock: ReturnType<typeof vi.fn<ReturnType<typeof useHistoryEvents>['addHistoryEvent']>>;
+  let editHistoryEventMock: ReturnType<typeof vi.fn<ReturnType<typeof useHistoryEvents>['editHistoryEvent']>>;
+  let addHistoricalPriceMock: ReturnType<typeof vi.fn<ReturnType<typeof useAssetPricesApi>['addHistoricalPrice']>>;
+  let pinia: Pinia;
+
+  const asset = {
+    assetType: 'own chain',
+    isCustomAsset: false,
+    name: 'Ethereum',
+    symbol: 'ETH',
+  };
+
+  const mapping: AssetMap = {
+    assetCollections: {},
+    assets: { [asset.symbol]: asset },
+  };
+
+  const event: EthBlockEvent = {
+    amount: bigNumberify('100'),
+    asset: asset.symbol,
+    blockNumber: 444,
+    entryType: HistoryEventEntryType.ETH_BLOCK_EVENT,
+    eventSubtype: 'mev reward',
+    eventType: 'staking',
+    groupIdentifier: 'BP1_444',
+    identifier: 11336,
+    location: 'ethereum',
+    locationLabel: '0x106B62Fdd27B748CF2Da3BacAB91a2CaBaeE6dCa',
+    sequenceIndex: 0,
+    timestamp: 1697442021000,
+    userNotes:
+      'Validator 12 produced block 444 with 100 ETH going to 0x106B62Fdd27B748CF2Da3BacAB91a2CaBaeE6dCa as the mev reward',
+    validatorIndex: 122,
+  };
+
+  beforeAll(() => {
+    setupDayjs();
+    pinia = createPinia();
+    setActivePinia(pinia);
+  });
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    addHistoryEventMock = vi.fn<ReturnType<typeof useHistoryEvents>['addHistoryEvent']>();
+    editHistoryEventMock = vi.fn<ReturnType<typeof useHistoryEvents>['editHistoryEvent']>();
+    addHistoricalPriceMock = vi.fn<ReturnType<typeof useAssetPricesApi>['addHistoricalPrice']>();
+    vi.mocked(useAssetInfoApi().assetMapping).mockResolvedValue(mapping);
+
+    vi.mocked(useHistoryEvents).mockReturnValue(createMock<ReturnType<typeof useHistoryEvents>>({
+      addHistoryEvent: addHistoryEventMock,
+      editHistoryEvent: editHistoryEventMock,
+    }));
+
+    vi.mocked(useAssetPricesApi).mockReturnValue(createMock<ReturnType<typeof useAssetPricesApi>>({
+      addHistoricalPrice: addHistoricalPriceMock,
+    }));
+  });
+
+  afterEach(() => {
+    wrapper.unmount();
+    vi.useRealTimers();
+  });
+
+  const createWrapper = (options: ComponentMountingOptions<typeof EthBlockEventForm> = {
+    props: {
+      data: { nextSequenceId: '0', type: 'add' },
+    },
+  }): VueWrapper<InstanceType<typeof EthBlockEventForm>> =>
+    mount(EthBlockEventForm, {
+      global: {
+        plugins: [pinia],
+      },
+      ...options,
+    });
+
+  it('should render the documented e2e selector contract', () => {
+    wrapper = createWrapper();
+    // The e2e suite finds every field through these selectors; losing one is an e2e break.
+    expect(selectorContract(wrapper)).toMatchInlineSnapshot(`
+      [
+        "data-testid=amount",
+        "data-testid=asset",
+        "data-testid=block-number",
+        "data-testid=datetime",
+        "data-testid=eth-block-event-form-advance",
+        "data-testid=fee-recipient",
+        "data-testid=group-identifier",
+        "data-testid=grouped-amount-input-swap",
+        "data-testid=is-mev-reward",
+        "data-testid=primary",
+        "data-testid=secondary",
+        "data-testid=validator-index",
+      ]
+    `);
+  });
+
+  it('should show the default state when adding a new event', async () => {
+    wrapper = createWrapper();
+    await vi.advanceTimersToNextTimerAsync();
+
+    const blockNumberInput = wrapper.find<HTMLInputElement>('[data-testid=block-number] input');
+    const validatorIndexInput = wrapper.find<HTMLInputElement>('[data-testid=validator-index] input');
+    const feeRecipientInput = wrapper.find<HTMLInputElement>('[data-testid=fee-recipient] .input-value');
+    const mevRewardCheckbox = wrapper.find<HTMLInputElement>('[data-testid=is-mev-reward] input');
+
+    expect(blockNumberInput.element.value).toBe('');
+    expect(validatorIndexInput.element.value).toBe('');
+    expect(feeRecipientInput.element.value).toBe('');
+    expect(mevRewardCheckbox.element.checked).toBe(false);
+  });
+
+  it('should update the relevant fields when adding an event to a group', async () => {
+    wrapper = createWrapper();
+    await vi.advanceTimersToNextTimerAsync();
+    await wrapper.setProps({ data: { group: event, nextSequenceId: '1', type: 'group-add' } });
+
+    const blockNumberInput = wrapper.find<HTMLInputElement>('[data-testid=block-number] input');
+    const validatorIndexInput = wrapper.find<HTMLInputElement>('[data-testid=validator-index] input');
+    const feeRecipientInput = wrapper.find<HTMLInputElement>('[data-testid=fee-recipient] .input-value');
+    const amountInput = wrapper.find<HTMLInputElement>('[data-testid=amount] input');
+    const isMevCheckbox = wrapper.find<HTMLInputElement>('[data-testid=is-mev-reward] input');
+
+    expect(blockNumberInput.element.value).toBe(event.blockNumber.toString());
+    expect(validatorIndexInput.element.value).toBe(event.validatorIndex.toString());
+    expect(feeRecipientInput.element.value).toBe(event.locationLabel);
+    expect(amountInput.element.value).toBe('0');
+    expect(isMevCheckbox.element.checked).toBe(false);
+  });
+
+  it('should update the fields when editing an event', async () => {
+    wrapper = createWrapper();
+    await vi.advanceTimersToNextTimerAsync();
+    await wrapper.setProps({ data: { event, nextSequenceId: '1', type: 'edit' } });
+
+    const blockNumberInput = wrapper.find<HTMLInputElement>('[data-testid=block-number] input');
+    const validatorIndexInput = wrapper.find<HTMLInputElement>('[data-testid=validator-index] input');
+    const feeRecipientInput = wrapper.find<HTMLInputElement>('[data-testid=fee-recipient] .input-value');
+    const amountInput = wrapper.find<HTMLInputElement>('[data-testid=amount] input');
+    const isMevCheckbox = wrapper.find<HTMLInputElement>('[data-testid=is-mev-reward] input');
+
+    expect(blockNumberInput.element.value).toBe(event.blockNumber.toString());
+    expect(validatorIndexInput.element.value).toBe(event.validatorIndex.toString());
+    expect(feeRecipientInput.element.value).toBe(event.locationLabel);
+    expect(amountInput.element.value).toBe(event.amount.toString());
+    expect(isMevCheckbox.element.checked).toBe(true);
+  });
+
+  it('should call addHistoryEvent when adding a new block event on save', async () => {
+    wrapper = createWrapper();
+    await vi.advanceTimersToNextTimerAsync();
+
+    const now = dayjs();
+    const nowInMs = now.valueOf();
+
+    const blockNumberInput = wrapper.find<HTMLInputElement>('[data-testid=block-number] input');
+    const validatorIndexInput = wrapper.find<HTMLInputElement>('[data-testid=validator-index] input');
+    const feeRecipientInput = wrapper.find<HTMLInputElement>('[data-testid=fee-recipient] .input-value');
+    const amountInput = wrapper.find<HTMLInputElement>('[data-testid=amount] input');
+    const isMevCheckbox = wrapper.find<HTMLInputElement>('[data-testid=is-mev-reward] input');
+    const dateInput = wrapper.find<HTMLInputElement>('[data-testid=datetime] input');
+
+    await blockNumberInput.setValue(event.blockNumber);
+    await validatorIndexInput.setValue(event.validatorIndex);
+    await feeRecipientInput.setValue(event.locationLabel);
+    await amountInput.setValue('50');
+    await isMevCheckbox.setValue(event.eventSubtype === 'mev reward');
+    await dateInput.setValue(dayjs(nowInMs).format('DD/MM/YYYY HH:mm:ss.SSS'));
+
+    const saveMethod = wrapper.vm.save;
+
+    addHistoryEventMock.mockResolvedValueOnce({ success: true });
+
+    const saveResult = await saveMethod();
+    expect(saveResult).toBe(true);
+
+    expect(addHistoryEventMock).toHaveBeenCalledTimes(1);
+
+    expect(addHistoryEventMock).toHaveBeenCalledWith({
+      amount: bigNumberify('50'),
+      blockNumber: event.blockNumber,
+      entryType: HistoryEventEntryType.ETH_BLOCK_EVENT,
+      feeRecipient: event.locationLabel,
+      groupIdentifier: null,
+      isMevReward: event.eventSubtype === 'mev reward',
+      timestamp: nowInMs,
+      validatorIndex: event.validatorIndex,
+    });
+  });
+
+  it('should not call editHistoryEvent when nothing changed', async () => {
+    wrapper = createWrapper({
+      props: { data: { event, nextSequenceId: '1', type: 'edit' } },
+    });
+    await vi.advanceTimersToNextTimerAsync();
+
+    editHistoryEventMock.mockResolvedValueOnce({ success: true });
+    addHistoricalPriceMock.mockResolvedValueOnce(true);
+
+    await wrapper.vm.save();
+    await nextTick();
+    expect(editHistoryEventMock).not.toHaveBeenCalled();
+  });
+
+  it('should not call editHistoryEvent when the historic price is the only edit', async () => {
+    wrapper = createWrapper({
+      props: { data: { event, nextSequenceId: '1', type: 'edit' } },
+    });
+    await vi.advanceTimersToNextTimerAsync();
+
+    editHistoryEventMock.mockResolvedValueOnce({ success: true });
+    addHistoricalPriceMock.mockResolvedValueOnce(true);
+    await wrapper.find('[data-testid=primary] input').setValue('1000');
+
+    await wrapper.vm.save();
+    await nextTick();
+    expect(editHistoryEventMock).not.toHaveBeenCalled();
+  });
+
+  it('should call editHistoryEvent when editing a block event on save', async () => {
+    wrapper = createWrapper({
+      props: { data: { event, nextSequenceId: '1', type: 'edit' } },
+    });
+    await vi.advanceTimersToNextTimerAsync();
+
+    const amountInput = wrapper.find<HTMLInputElement>('[data-testid=amount] input');
+    await amountInput.setValue('52');
+
+    const saveMethod = wrapper.vm.save;
+
+    editHistoryEventMock.mockResolvedValueOnce({ success: true });
+
+    const saveResult = await saveMethod();
+    expect(saveResult).toBe(true);
+
+    expect(editHistoryEventMock).toHaveBeenCalledTimes(1);
+
+    expect(editHistoryEventMock).toHaveBeenCalledWith({
+      amount: bigNumberify('52'),
+      blockNumber: event.blockNumber,
+      entryType: HistoryEventEntryType.ETH_BLOCK_EVENT,
+      feeRecipient: event.locationLabel,
+      groupIdentifier: event.groupIdentifier,
+      identifier: event.identifier,
+      isMevReward: event.eventSubtype === 'mev reward',
+      timestamp: event.timestamp,
+      validatorIndex: event.validatorIndex,
+    });
+  });
+
+  it('should handle server validation errors', async () => {
+    wrapper = createWrapper({
+      props: {
+        data: {
+          event,
+          nextSequenceId: '1',
+          type: 'edit',
+        },
+      },
+    });
+
+    editHistoryEventMock.mockResolvedValueOnce({
+      message: { timestamp: ['invalid date passed'] },
+      success: false,
+    });
+
+    await wrapper.find('[data-testid=block-number] input').setValue('111');
+
+    await vi.advanceTimersToNextTimerAsync();
+
+    const saveMethod = wrapper.vm.save;
+
+    const saveResult = await saveMethod();
+    await nextTick();
+
+    expect(editHistoryEventMock).toHaveBeenCalled();
+    expect(saveResult).toBe(false);
+    expect(wrapper.find('[data-testid=datetime] .details').text()).toBe('invalid date passed');
+  });
+
+  it('should display validation errors when the form is invalid', async () => {
+    wrapper = createWrapper();
+    const saveMethod = wrapper.vm.save;
+
+    await saveMethod();
+    await vi.advanceTimersToNextTimerAsync();
+
+    expect(wrapper.find('[data-testid=block-number] .details').exists()).toBe(true);
+    expect(wrapper.find('[data-testid=validator-index] .details').exists()).toBe(true);
+  });
+
+  describe('actualGroupIdentifier', () => {
+    const eventWithActualGroupIdentifier: EthBlockEvent = {
+      ...event,
+      actualGroupIdentifier: 'ACTUAL123',
+      groupIdentifier: 'LINKED456',
+    };
+
+    it('should use actualGroupIdentifier when present and disable the field', async () => {
+      wrapper = createWrapper({
+        props: { data: { event: eventWithActualGroupIdentifier, nextSequenceId: '1', type: 'edit' } },
+      });
+      await vi.advanceTimersToNextTimerAsync();
+
+      await wrapper.find('[data-testid=eth-block-event-form-advance] [data-accordion-trigger]').trigger('click');
+      await vi.advanceTimersToNextTimerAsync();
+
+      const groupIdentifierInput = wrapper.find<HTMLInputElement>('[data-testid=group-identifier] input');
+      expect(groupIdentifierInput.element.value).toBe('ACTUAL123');
+      expect(groupIdentifierInput.element.disabled).toBe(true);
+    });
+
+    it('should use groupIdentifier when actualGroupIdentifier is not present', async () => {
+      wrapper = createWrapper({
+        props: { data: { event, nextSequenceId: '1', type: 'edit' } },
+      });
+      await vi.advanceTimersToNextTimerAsync();
+
+      await wrapper.find('[data-testid=eth-block-event-form-advance] [data-accordion-trigger]').trigger('click');
+      await vi.advanceTimersToNextTimerAsync();
+
+      const groupIdentifierInput = wrapper.find<HTMLInputElement>('[data-testid=group-identifier] input');
+      expect(groupIdentifierInput.element.value).toBe(event.groupIdentifier);
+      expect(groupIdentifierInput.element.disabled).toBe(false);
+    });
+  });
+});

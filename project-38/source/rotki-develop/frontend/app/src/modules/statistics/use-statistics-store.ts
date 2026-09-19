@@ -1,0 +1,198 @@
+import type { MaybeRef } from 'vue';
+import type { NetValueChartData } from '@/modules/dashboard/graph/types';
+import { type AssetBalanceWithPriceAndChains, type BigNumber, type NetValue, One, type TimeFramePeriod, timeframes, TimeUnit, Zero } from '@rotki/common';
+import dayjs from 'dayjs';
+import { CURRENCY_USD, type SupportedCurrency } from '@/modules/assets/amount-display/currencies';
+import { useAmountDisplaySettings } from '@/modules/assets/amount-display/use-amount-display-settings';
+import { useNumberScrambler } from '@/modules/assets/amount-display/use-number-scrambler';
+import { usePriceUtils } from '@/modules/assets/prices/use-price-utils';
+import { useAggregatedBalances } from '@/modules/balances/use-aggregated-balances';
+import { useBalancesStore } from '@/modules/balances/use-balances-store';
+import { millisecondsToSeconds } from '@/modules/core/common/data/date';
+import { useSetting } from '@/modules/settings/use-setting';
+
+function defaultNetValue(): NetValue {
+  return {
+    data: [],
+    times: [],
+  };
+}
+
+interface Overall {
+  currency: SupportedCurrency;
+  delta: string;
+  netWorth: string;
+  percentage: string;
+  period: TimeFramePeriod;
+  up?: boolean;
+}
+
+export const useStatisticsStore = defineStore('statistics', () => {
+  const netValue = ref<NetValue>(defaultNetValue());
+  /**
+   * Why the last net value read failed, or undefined when it succeeded.
+   *
+   * @remarks
+   * It lives here rather than in the composable that does the reading because the two are not the
+   * same instance: `useStatisticsDataFetching` is called from six places, and the dashboard that
+   * has to render the failure is none of them.
+   */
+  const netValueError = ref<string>();
+
+  const nftsInNetValue = useSetting('nftsInNetValue');
+  const timeframe = useSetting('timeframe');
+  const {
+    currencySymbol,
+    floatingPrecision,
+    scrambleData,
+    scrambleMultiplier,
+    shouldShowAmount,
+    valueRoundingMode,
+  } = useAmountDisplaySettings();
+  const { nonFungibleTotalValue } = storeToRefs(useBalancesStore());
+  const { getExchangeRate } = usePriceUtils();
+
+  const { getBalances, getLiabilities } = useAggregatedBalances();
+
+  /**
+   * Calculates the sum of balances using the `value` field (already in main currency)
+   */
+  function calculateSum(items: AssetBalanceWithPriceAndChains[]): BigNumber {
+    return items.reduce((sum, item) => sum.plus(item.value), Zero);
+  }
+
+  /** NFT value in the main currency; the balances store holds it in USD. */
+  const nftValue = computed<BigNumber>(() => get(nonFungibleTotalValue).multipliedBy(getExchangeRate(get(currencySymbol), One)));
+
+  const calculateTotalValue = (includeNft: MaybeRef<boolean> = false): ComputedRef<BigNumber> => computed<BigNumber>(() => {
+    const nftTotal = get(includeNft) ? get(nftValue) : Zero;
+    return calculateSum(getBalances()).plus(nftTotal).minus(calculateSum(getLiabilities()));
+  });
+
+  const totalNetWorth = calculateTotalValue(nftsInNetValue);
+
+  const scrambleEnabled = logicOr(scrambleData, logicNot(shouldShowAmount));
+
+  const balanceDelta = computed<BigNumber>(() => {
+    const selectedTimeframe = get(timeframe);
+    const allTimeframes = timeframes((unit, amount) => dayjs().subtract(amount, unit).startOf(TimeUnit.DAY).unix());
+    const startingDate = allTimeframes[selectedTimeframe].startingDate();
+    const data = getNetValue(startingDate).data;
+    let start = data[0];
+    if (start?.isZero()) {
+      for (let i = 1; i < data.length; i++) {
+        if (data[i].gt(0)) {
+          start = data[i];
+          break;
+        }
+      }
+    }
+    return get(totalNetWorth).minus(start ?? Zero);
+  });
+
+  const scrambledNetWorth = useNumberScrambler({
+    enabled: scrambleEnabled,
+    multiplier: scrambleMultiplier,
+    value: totalNetWorth,
+  });
+
+  const scrambledBalanceDelta = useNumberScrambler({
+    enabled: scrambleEnabled,
+    multiplier: scrambleMultiplier,
+    value: balanceDelta,
+  });
+
+  const overall = computed<Overall>(() => {
+    const currency = get(currencySymbol);
+    const selectedTimeframe = get(timeframe);
+    const delta = get(balanceDelta);
+
+    const percentage = ((): string => {
+      const starting = get(totalNetWorth).minus(delta);
+      const pct = delta.div(starting).multipliedBy(100);
+      return pct.isFinite() ? pct.toFormat(2) : '-';
+    })();
+
+    let up: boolean | undefined;
+    if (delta.isGreaterThan(0))
+      up = true;
+    else if (delta.isLessThan(0))
+      up = false;
+
+    const floatPrecision = get(floatingPrecision);
+    const rounding = get(valueRoundingMode);
+
+    return {
+      currency,
+      delta: get(scrambledBalanceDelta).toFormat(floatPrecision, rounding),
+      netWorth: get(scrambledNetWorth).toFormat(floatPrecision, rounding),
+      percentage,
+      period: selectedTimeframe,
+      up,
+    };
+  });
+
+  const totalNetWorthUsd = calculateTotalValue(true);
+
+  function getNetValue(startingDate: number): NetValueChartData {
+    const currency = get(currencySymbol);
+    const rate = getExchangeRate(currency, One);
+
+    const convert = (value: BigNumber): BigNumber => (currency === CURRENCY_USD ? value : value.multipliedBy(rate));
+
+    const { data, times } = get(netValue);
+
+    const now = millisecondsToSeconds(Date.now());
+    const netWorth = get(totalNetWorth);
+
+    if (times.length === 0 && data.length === 0) {
+      const oneDayTimestamp = 24 * 60 * 60;
+
+      return {
+        data: [Zero, netWorth],
+        snapshotCount: 0,
+        times: [now - oneDayTimestamp, now],
+      };
+    }
+
+    const nv: NetValue = { data: [], times: [] };
+
+    for (const [i, time] of times.entries()) {
+      if (time < startingDate)
+        continue;
+
+      nv.times.push(time);
+      nv.data.push(convert(data[i]));
+    }
+
+    return {
+      data: [...nv.data, netWorth],
+      snapshotCount: nv.data.length,
+      times: [...nv.times, now],
+    };
+  }
+
+  function useNetValue(startingDate: number): ComputedRef<NetValueChartData> {
+    return computed<NetValueChartData>(() => getNetValue(startingDate));
+  }
+
+  /** Records why a net value read failed, or clears it with no argument once one succeeds. */
+  function setNetValueError(message?: string): void {
+    set(netValueError, message);
+  }
+
+  return {
+    getNetValue,
+    netValue,
+    netValueError,
+    nftValue,
+    setNetValueError,
+    useNetValue,
+    overall,
+    totalNetWorth,
+    totalNetWorthUsd,
+  };
+});
+
+if (import.meta.hot)
+  import.meta.hot.accept(acceptHMRUpdate(useStatisticsStore, import.meta.hot));

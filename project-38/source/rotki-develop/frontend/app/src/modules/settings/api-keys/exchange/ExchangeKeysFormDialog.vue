@@ -1,0 +1,108 @@
+<script setup lang="ts">
+import type { ComponentExposed } from 'vue-component-type-helpers';
+import type { ExchangeFormData } from '@/modules/balances/types/exchanges';
+import { assert } from '@rotki/common';
+import { useExchanges } from '@/modules/balances/exchanges/use-exchanges';
+import { ApiValidationError, type ValidationErrors } from '@/modules/core/api/types/errors';
+import { getErrorMessage } from '@/modules/core/common/logging/error-handling';
+import { useMessageStore } from '@/modules/core/common/use-message-store';
+import ExchangeKeysForm from '@/modules/settings/api-keys/exchange/ExchangeKeysForm.vue';
+import BigDialog from '@/modules/shell/components/dialogs/BigDialog.vue';
+
+const modelValue = defineModel<ExchangeFormData | undefined>({ required: true });
+
+const emit = defineEmits<{
+  added: [exchange: { location: string; name: string }];
+}>();
+
+const submitting = ref<boolean>(false);
+const stateUpdated = ref<boolean>(false);
+const errorMessages = ref<ValidationErrors>({});
+const form = useTemplateRef<ComponentExposed<typeof ExchangeKeysForm>>('form');
+
+const { setupExchange } = useExchanges();
+const { setMessage } = useMessageStore();
+const { t } = useI18n({ useScope: 'global' });
+
+const title = computed<string>(() => {
+  if (!isDefined(modelValue)) {
+    return '';
+  }
+  const { mode } = get(modelValue);
+  return mode === 'edit' ? t('exchange_settings.dialog.edit.title') : t('exchange_settings.dialog.add.title');
+});
+
+async function save(): Promise<void> {
+  assert(isDefined(modelValue));
+  if (!get(form)?.validate()) {
+    return;
+  }
+
+  set(submitting, true);
+  set(errorMessages, {});
+
+  const exchange = get(modelValue);
+  const payload = {
+    ...exchange,
+    newName: exchange.name === exchange.newName ? undefined : exchange.newName,
+  };
+
+  let success = false;
+  try {
+    success = await setupExchange(payload);
+  }
+  catch (error: unknown) {
+    let errors: string | ValidationErrors = getErrorMessage(error);
+
+    if (error instanceof ApiValidationError) {
+      errors = error.getValidationErrors(payload);
+    }
+
+    if (typeof errors === 'string') {
+      setMessage({
+        description: t('actions.balances.exchange_setup.description', {
+          error: errors,
+          exchange: payload.location,
+        }),
+        title: t('actions.balances.exchange_setup.title'),
+      });
+    }
+    else {
+      set(errorMessages, errors);
+    }
+  }
+
+  set(submitting, false);
+  if (success) {
+    if (exchange.mode !== 'edit')
+      emit('added', { location: exchange.location, name: exchange.name });
+    set(modelValue, undefined);
+  }
+}
+
+watch(modelValue, (modelValue) => {
+  if (!modelValue) {
+    set(errorMessages, {});
+  }
+});
+</script>
+
+<template>
+  <BigDialog
+    :display="!!modelValue"
+    :title="title"
+    :action="{ primary: t('common.actions.save') }"
+    :loading="submitting"
+    :prompt-on-close="stateUpdated"
+    @confirm="save()"
+    @cancel="modelValue = undefined"
+  >
+    <ExchangeKeysForm
+      v-if="modelValue"
+      ref="form"
+      v-model="modelValue"
+      v-model:state-updated="stateUpdated"
+      v-model:error-messages="errorMessages"
+    />
+  </BigDialog>
+</template>

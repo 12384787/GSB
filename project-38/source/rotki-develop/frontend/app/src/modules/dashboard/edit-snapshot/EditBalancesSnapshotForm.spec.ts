@@ -1,0 +1,256 @@
+import type { BalanceSnapshotPayload } from '@/modules/dashboard/snapshots';
+import { bigNumberify } from '@rotki/common';
+import { mount, type VueWrapper } from '@vue/test-utils';
+import flushPromises from 'flush-promises';
+import { createPinia, type Pinia, setActivePinia } from 'pinia';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { nextTick } from 'vue';
+import { useAssetPricesApi } from '@/modules/assets/api/use-asset-prices-api';
+import { usePriceTaskManager } from '@/modules/assets/prices/use-price-task-manager';
+import { BalanceType } from '@/modules/balances/types/balances';
+import EditBalancesSnapshotAssetPriceForm from '@/modules/dashboard/edit-snapshot/EditBalancesSnapshotAssetPriceForm.vue';
+import EditBalancesSnapshotForm from '@/modules/dashboard/edit-snapshot/EditBalancesSnapshotForm.vue';
+import EditBalancesSnapshotLocationSelector from '@/modules/dashboard/edit-snapshot/EditBalancesSnapshotLocationSelector.vue';
+
+vi.mock('@/modules/assets/prices/use-price-task-manager', () => ({
+  usePriceTaskManager: vi.fn().mockReturnValue({
+    getHistoricPrice: vi.fn(),
+  }),
+}));
+
+vi.mock('@/modules/assets/api/use-asset-prices-api', () => ({
+  useAssetPricesApi: vi.fn().mockReturnValue({
+    addHistoricalPrice: vi.fn(),
+  }),
+}));
+
+interface BalanceSnapshotPayloadAndLocation extends BalanceSnapshotPayload {
+  location: string;
+}
+
+type FormInstance = InstanceType<typeof EditBalancesSnapshotForm>;
+
+describe('edit-snapshot/EditBalancesSnapshotForm.vue', () => {
+  let pinia: Pinia;
+  let wrapper: VueWrapper<FormInstance>;
+
+  const timestamp = 1700000000;
+
+  const baseModel = (): BalanceSnapshotPayloadAndLocation => ({
+    amount: '1.5',
+    assetIdentifier: 'ETH',
+    category: BalanceType.ASSET,
+    location: 'blockchain',
+    timestamp,
+    usdValue: '3000',
+  });
+
+  beforeAll(() => {
+    pinia = createPinia();
+    setActivePinia(pinia);
+  });
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.mocked(usePriceTaskManager().getHistoricPrice).mockResolvedValue(bigNumberify(2000));
+    vi.mocked(useAssetPricesApi().addHistoricalPrice).mockResolvedValue(true);
+  });
+
+  afterEach(() => {
+    wrapper?.unmount();
+    vi.useRealTimers();
+  });
+
+  function createWrapper(modelValue: BalanceSnapshotPayloadAndLocation = baseModel(), hideLocation = false, disabledLocations: string[] = []): VueWrapper<FormInstance> {
+    wrapper = mount(EditBalancesSnapshotForm, {
+      global: {
+        plugins: [pinia],
+      },
+      props: {
+        disabledLocations,
+        hideLocation,
+        'locations': ['blockchain', 'kraken'],
+        modelValue,
+        timestamp,
+        'onUpdate:modelValue': async (value: BalanceSnapshotPayloadAndLocation): Promise<void> =>
+          wrapper.setProps({ modelValue: value }),
+      },
+    });
+    return wrapper;
+  }
+
+  it('should pre-populate fields from the v-model', async () => {
+    wrapper = createWrapper();
+    await vi.advanceTimersToNextTimerAsync();
+
+    const amountInput = wrapper.find<HTMLInputElement>('[data-testid=amount] input');
+    expect(amountInput.element.value).toBe('1.5');
+
+    const assetInput = wrapper.find<HTMLInputElement>('[data-testid=asset] input');
+    expect(assetInput.element.value).toBe('ETH');
+  });
+
+  it('should fail validation when category is missing', async () => {
+    const model = baseModel();
+    // @ts-expect-error category is required by type but we simulate invalid state
+    model.category = undefined;
+    const originalWarn = console.warn;
+    const warn = vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]): void => {
+      const first = args[0];
+      if (typeof first === 'string' && first.includes('Invalid prop') && first.includes('modelValue'))
+        return;
+      originalWarn(...args);
+    });
+    wrapper = createWrapper(model);
+    await vi.advanceTimersToNextTimerAsync();
+
+    const valid = await wrapper.vm.validate();
+    expect(valid).toBe(false);
+    warn.mockRestore();
+  });
+
+  it('should pass validation when category is set', async () => {
+    wrapper = createWrapper();
+    await vi.advanceTimersToNextTimerAsync();
+
+    const valid = await wrapper.vm.validate();
+    expect(valid).toBe(true);
+  });
+
+  it('should fail validation when the location is missing', async () => {
+    const model = baseModel();
+    model.location = '';
+    wrapper = createWrapper(model);
+    await vi.advanceTimersToNextTimerAsync();
+
+    const valid = await wrapper.vm.validate();
+    expect(valid).toBe(false);
+  });
+
+  it('should not require a location while the selector is hidden (split mode)', async () => {
+    const model = baseModel();
+    model.location = '';
+    wrapper = createWrapper(model, true);
+    await vi.advanceTimersToNextTimerAsync();
+
+    const valid = await wrapper.vm.validate();
+    expect(valid).toBe(true);
+  });
+
+  it('should fail validation when the chosen location cannot absorb the value', async () => {
+    const model = baseModel();
+    model.location = 'blockchain';
+    wrapper = createWrapper(model, false, ['blockchain']);
+    await vi.advanceTimersToNextTimerAsync();
+
+    const valid = await wrapper.vm.validate();
+    expect(valid).toBe(false);
+  });
+
+  it('should show no validation message before anything is edited', async () => {
+    const model = baseModel();
+    model.location = '';
+    wrapper = createWrapper(model);
+    await vi.advanceTimersToNextTimerAsync();
+
+    expect(wrapper.find('[data-testid=snapshot-location] .details').exists()).toBe(false);
+  });
+
+  it('should reveal the location message once validate runs', async () => {
+    const model = baseModel();
+    model.location = '';
+    wrapper = createWrapper(model);
+    await vi.advanceTimersToNextTimerAsync();
+
+    await wrapper.vm.validate();
+    await vi.advanceTimersByTimeAsync(700);
+
+    expect(wrapper.find('[data-testid=snapshot-location] .details').text())
+      .toBe('dashboard.snapshot.edit.dialog.balances.rules.location');
+  });
+
+  it('should reveal the insufficient-location message once validate runs', async () => {
+    const model = baseModel();
+    model.location = 'blockchain';
+    wrapper = createWrapper(model, false, ['blockchain']);
+    await vi.advanceTimersToNextTimerAsync();
+
+    await wrapper.vm.validate();
+    await vi.advanceTimersByTimeAsync(700);
+
+    expect(wrapper.find('[data-testid=snapshot-location] .details').text())
+      .toBe('dashboard.snapshot.edit.dialog.balances.rules.location_insufficient');
+  });
+
+  it('should not flag stateUpdated for the price the mount fetch rewrites', async () => {
+    const model = baseModel();
+    const overwrittenOnMount = '1';
+    model.usdValue = overwrittenOnMount;
+    wrapper = createWrapper(model);
+    await vi.advanceTimersByTimeAsync(600);
+
+    const updates = wrapper.emitted<[BalanceSnapshotPayloadAndLocation]>('update:modelValue');
+    expect(updates?.at(-1)?.[0].usdValue).toBe('3000');
+    expect(wrapper.emitted('update:stateUpdated')?.flat() ?? []).not.toContain(true);
+  });
+
+  it('should flag stateUpdated once a field is edited', async () => {
+    wrapper = createWrapper();
+    await vi.advanceTimersByTimeAsync(600);
+
+    wrapper.findComponent(EditBalancesSnapshotLocationSelector).vm.$emit('update:modelValue', 'kraken');
+    await vi.advanceTimersToNextTimerAsync();
+
+    expect(wrapper.emitted('update:stateUpdated')?.at(-1)).toEqual([true]);
+  });
+
+  it('should forward update:asset emitted by the inner price form', async () => {
+    wrapper = createWrapper();
+    await vi.advanceTimersToNextTimerAsync();
+
+    const priceForm = wrapper.findComponent(EditBalancesSnapshotAssetPriceForm);
+    expect(priceForm.exists()).toBe(true);
+
+    priceForm.vm.$emit('update:asset', 'BTC');
+
+    expect(wrapper.emitted('update:asset')).toBeTruthy();
+    expect(wrapper.emitted('update:asset')?.[0]).toEqual(['BTC']);
+  });
+
+  it('should propagate amount edits through v-model', async () => {
+    wrapper = createWrapper();
+    await vi.advanceTimersToNextTimerAsync();
+
+    await wrapper.find('[data-testid=amount] input').setValue('5');
+    await vi.advanceTimersToNextTimerAsync();
+
+    const updates = wrapper.emitted<[BalanceSnapshotPayloadAndLocation]>('update:modelValue');
+    expect(updates).toBeTruthy();
+    const last = updates!.at(-1)![0];
+    expect(last.amount).toBe('5');
+    expect(last.assetIdentifier).toBe('ETH');
+  });
+
+  it('should expose submitPrice without throwing', async () => {
+    wrapper = createWrapper();
+    await vi.advanceTimersToNextTimerAsync();
+
+    expect(typeof wrapper.vm.submitPrice).toBe('function');
+    expect(() => wrapper.vm.submitPrice()).not.toThrow();
+  });
+
+  it('should force amount to 1 when the model carries an NFT identifier', async () => {
+    vi.useRealTimers();
+    const model = baseModel();
+    model.assetIdentifier = '_nft_0xabc/123';
+    model.amount = '42';
+    wrapper = createWrapper(model);
+    await flushPromises();
+    await nextTick();
+
+    const updates = wrapper.emitted<[BalanceSnapshotPayloadAndLocation]>('update:modelValue');
+    const nftUpdate = updates?.find(([payload]) => payload.amount === '1');
+    expect(nftUpdate).toBeDefined();
+    expect(nftUpdate?.[0].assetIdentifier).toBe('_nft_0xabc/123');
+  });
+});

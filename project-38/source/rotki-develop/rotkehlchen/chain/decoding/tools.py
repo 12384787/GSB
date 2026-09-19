@@ -1,0 +1,172 @@
+import logging
+import threading
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Any, TypeVar
+
+from rotkehlchen.logging import RotkehlchenLogsAdapter
+
+from .utils import decode_transfer_direction
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
+    from rotkehlchen.assets.asset import Asset
+    from rotkehlchen.db.dbhandler import DBHandler
+    from rotkehlchen.db.drivers.sqlite import DBCursor
+    from rotkehlchen.fval import FVal
+    from rotkehlchen.history.events.structures.types import HistoryEventSubType, HistoryEventType
+    from rotkehlchen.types import SupportedBlockchain, Timestamp
+
+logger = logging.getLogger(__name__)
+log = RotkehlchenLogsAdapter(logger)
+
+T = TypeVar('T')  # For transaction receipts/data
+R = TypeVar('R')  # For transaction references
+E = TypeVar('E')  # For events
+A = TypeVar('A')  # For addresses
+
+
+class BaseDecoderTools[T, A, R, E](ABC):
+    """Base class for chain-agnostic decoder tools providing common state and functionality"""
+
+    def __init__(
+            self,
+            database: DBHandler,
+            blockchain: SupportedBlockchain,
+            address_is_exchange_fn: Callable[[A], str | None],
+    ) -> None:
+        """Initialize base decoder tools with database connection and blockchain type"""
+        self.database = database
+        self.blockchain = blockchain
+        self.address_is_exchange = address_is_exchange_fn
+        with self.database.conn.read_ctx() as cursor:
+            tracked_accounts = self.database.get_blockchain_accounts(cursor)
+        self._tracked_addresses_for_chain: frozenset[A] = frozenset(tracked_accounts.get(self.blockchain))  # type: ignore[arg-type]  # noqa: E501
+        self.sequence_counter = 0
+        self.sequence_offset = 0
+        if __debug__:
+            # The sequence counters are per-decoder mutable state whose only
+            # thread-safety is that transaction decoding on one decoder is
+            # serialized (undecoded_tx_query_lock and callers). That protection is
+            # implicit, so track which thread last reset the counter and assert on
+            # use to catch unserialized concurrent decoding in develop.
+            self._sequence_counter_thread: int | None = None
+
+    def _assert_sequence_counter_thread(self) -> None:
+        """None is tolerated: a counter that was never reset is not evidence of
+        concurrent decoding, which is what this develop-only check is after"""
+        assert self._sequence_counter_thread in (None, threading.get_ident()), (
+            'sequence counter used from a different thread than the one that reset it. '
+            'Concurrent decoding on one decoder is not protected -- serialize it.'
+        )
+
+    def reset_sequence_counter(self, tx_data: T) -> None:
+        """Reset the sequence index counter before decoding a transaction.
+        Chain-specific implementations handle how to calculate sequence_offset from tx_data.
+        """
+        self.sequence_counter = 0
+        if __debug__:
+            self.get_sequence_index_called = False
+            self._sequence_counter_thread = threading.get_ident()
+
+    def get_next_sequence_index_pre_decoding(self) -> int:
+        """Get a sequence index for a new event created prior to running the decoding rules.
+        Used for gas/fee events, native transfers, etc. Must never be used after sequence
+        indexing with logs has started to prevent collisions.
+        Returns the current counter and increments it.
+        """
+        if __debug__:  # develop only test that sequence index was not called
+            assert not self.get_sequence_index_called  # Perhaps remove after some time.
+            self._assert_sequence_counter_thread()
+
+        value = self.sequence_counter
+        self.sequence_counter += 1
+        return value
+
+    def get_next_sequence_index(self) -> int:
+        """Get a sequence index for a new event with no associated transaction log/instruction.
+        Used during protocol decoding for informational or fee events.
+        Returns the current counter added to the sequence offset.
+        """
+        if __debug__:
+            self.get_sequence_index_called = True
+            self._assert_sequence_counter_thread()
+
+        value = self.sequence_counter
+        self.sequence_counter += 1
+        return value + self.sequence_offset
+
+    def refresh_tracked_accounts(self, cursor: DBCursor) -> None:
+        """Refresh tracked accounts from the database"""
+        self._tracked_addresses_for_chain = frozenset(
+            self.database.get_blockchain_accounts(cursor).get(self.blockchain),    # type: ignore[arg-type]
+        )
+
+    def is_tracked(self, address: A) -> bool:
+        """Check if an address is tracked"""
+        return address in self._tracked_addresses_for_chain
+
+    def any_tracked(self, addresses: Sequence[A]) -> bool:
+        """Check if any of the addresses are tracked"""
+        return not self._tracked_addresses_for_chain.isdisjoint(addresses)
+
+    def decode_direction(
+            self,
+            from_address: A | None,
+            to_address: A | None,
+    ) -> tuple[HistoryEventType, HistoryEventSubType, str | None, A | None, str, str] | None:
+        """Decode the direction of a transfer"""
+        return decode_transfer_direction(  # type: ignore[type-var]
+            from_address=from_address,
+            to_address=to_address,
+            tracked_accounts=self._tracked_addresses_for_chain,
+            maybe_get_exchange_fn=self.address_is_exchange,
+        )
+
+    @abstractmethod
+    def make_event(
+            self,
+            tx_ref: R,
+            sequence_index: int,
+            timestamp: Timestamp,
+            event_type: HistoryEventType,
+            event_subtype: HistoryEventSubType,
+            asset: Asset,
+            amount: FVal,
+            location_label: str | None = None,
+            notes: str | None = None,
+            counterparty: str | None = None,
+            address: A | None = None,
+            extra_data: dict[str, Any] | None = None,
+    ) -> E:
+        """Create an event of the appropriate type for this chain"""
+
+    def make_event_next_index(
+            self,
+            tx_ref: R,
+            timestamp: Timestamp,
+            event_type: HistoryEventType,
+            event_subtype: HistoryEventSubType,
+            asset: Asset,
+            amount: FVal,
+            location_label: str | None = None,
+            notes: str | None = None,
+            counterparty: str | None = None,
+            address: A | None = None,
+            extra_data: dict[str, Any] | None = None,
+    ) -> E:
+        """Convenience function to use next sequence index"""
+        return self.make_event(
+            tx_ref=tx_ref,
+            sequence_index=self.get_next_sequence_index(),
+            timestamp=timestamp,
+            event_type=event_type,
+            event_subtype=event_subtype,
+            asset=asset,
+            amount=amount,
+            location_label=location_label,
+            notes=notes,
+            counterparty=counterparty,
+            address=address,
+            extra_data=extra_data,
+        )

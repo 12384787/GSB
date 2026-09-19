@@ -1,0 +1,176 @@
+<script setup lang="ts">
+import type { DataTableColumn } from '@rotki/ui-library';
+import { SolanaTokenKind } from '@rotki/common';
+import { msg } from '@/message-key';
+import MergeDialog from '@/modules/assets/admin/MergeDialog.vue';
+import SolanaTokenMigrationDialog from '@/modules/assets/admin/solana-token-migration/SolanaTokenMigrationDialog.vue';
+import { useSolanaTokenMigrationStore } from '@/modules/assets/admin/solana-token-migration/use-solana-token-migration-store';
+import AssetDetails from '@/modules/assets/AssetDetails.vue';
+import { useConfirmStore } from '@/modules/core/common/use-confirm-store';
+import TablePageLayout from '@/modules/shell/layout/TablePageLayout.vue';
+
+definePage({
+  meta: {
+    nav: { labelKey: msg.$t('navigation_menu.manage_assets_sub.solana_token_migration'), icon: 'lu-coins', parent: '/asset-manager/' },
+  },
+});
+
+const { t } = useI18n({ useScope: 'global' });
+
+const solanaTokenMigrationStore = useSolanaTokenMigrationStore();
+const { identifiers } = storeToRefs(solanaTokenMigrationStore);
+const { removeIdentifier } = solanaTokenMigrationStore;
+const { show } = useConfirmStore();
+
+const migrationData = ref<{
+  address: string;
+  decimals: number | null;
+  tokenKind: string;
+} | undefined>();
+
+const oldAsset = ref<string>();
+const mergeTool = ref<boolean>(false);
+const mergeSourceIdentifier = ref<string>();
+const mergeTargetIdentifier = ref<string>();
+
+const rows = computed(() => get(identifiers).map((identifier, index) => ({
+  id: index,
+  identifier,
+})));
+
+const cols = computed<DataTableColumn<{ id: number; identifier: string }>[]>(() => [
+  {
+    class: 'w-full',
+    key: 'identifier',
+    label: t('common.asset'),
+    sortable: true,
+  },
+  {
+    align: 'end',
+    key: 'actions',
+    label: t('common.actions_text'),
+    sortable: true,
+  },
+]);
+
+function openMigrationDialog(identifier: string) {
+  set(migrationData, {
+    address: '',
+    decimals: null,
+    tokenKind: SolanaTokenKind.SPL_TOKEN,
+  });
+  set(oldAsset, identifier);
+}
+
+function openMergeDialog(identifier: string) {
+  set(mergeSourceIdentifier, identifier);
+  set(mergeTool, true);
+}
+
+function handleMergeSuggestion({ sourceAsset, targetAsset }: { sourceAsset: string; targetAsset: string }) {
+  show(
+    {
+      message: t('asset_management.solana_token_migration.merge_suggestion.message', {
+        sourceAsset,
+        targetAsset,
+      }),
+      title: t('asset_management.solana_token_migration.merge_suggestion.title'),
+    },
+    () => openMergePrefilledWith(sourceAsset, targetAsset),
+  );
+}
+
+/**
+ * Opens the merge tool with both assets already chosen.
+ *
+ * @remarks
+ * Runs only once the user has accepted the suggestion, so the merge dialog opens on the pair the
+ * suggestion named rather than empty.
+ */
+function openMergePrefilledWith(sourceAsset: string, targetAsset: string): void {
+  set(mergeSourceIdentifier, sourceAsset);
+  set(mergeTargetIdentifier, targetAsset);
+  set(mergeTool, true);
+}
+
+function handleMergeCompleted({ sourceIdentifier }: { sourceIdentifier: string; targetIdentifier: string }): void {
+  removeIdentifier(sourceIdentifier);
+
+  set(mergeSourceIdentifier, undefined);
+  set(mergeTargetIdentifier, undefined);
+}
+</script>
+
+<template>
+  <TablePageLayout
+    child
+    hide-header
+    class="lg:!-mt-5"
+  >
+    <RuiCard>
+      <RuiDataTable
+        dense
+        :rows="rows"
+        :cols="cols"
+        :pagination="{
+          limit: 10,
+          page: 1,
+          total: rows.length,
+        }"
+        row-attr="id"
+        outlined
+      >
+        <template #item.identifier="{ row }">
+          <AssetDetails
+            :asset="row.identifier"
+            :display="{ dense: true }"
+          />
+        </template>
+        <template #item.actions="{ row }">
+          <div class="flex gap-2">
+            <RuiButton
+              color="primary"
+              variant="text"
+              @click="openMigrationDialog(row.identifier)"
+            >
+              {{ t('asset_management.solana_token_migration.migrate_button') }}
+              <template #append>
+                <RuiIcon
+                  name="lu-arrow-right"
+                  size="16"
+                />
+              </template>
+            </RuiButton>
+            <RuiDivider vertical />
+            <RuiButton
+              color="primary"
+              variant="text"
+              @click="openMergeDialog(row.identifier)"
+            >
+              {{ t('asset_management.merge_assets') }}
+              <template #append>
+                <RuiIcon
+                  name="lu-combine"
+                  size="16"
+                />
+              </template>
+            </RuiButton>
+          </div>
+        </template>
+      </RuiDataTable>
+    </RuiCard>
+
+    <SolanaTokenMigrationDialog
+      v-model="migrationData"
+      v-model:old-asset="oldAsset"
+      @suggest-merge="handleMergeSuggestion($event)"
+    />
+
+    <MergeDialog
+      v-model="mergeTool"
+      :source-identifier="mergeSourceIdentifier"
+      :target-identifier="mergeTargetIdentifier"
+      @merged="handleMergeCompleted($event)"
+    />
+  </TablePageLayout>
+</template>

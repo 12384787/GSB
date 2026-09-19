@@ -1,0 +1,77 @@
+import { RequestTarget } from '@/modules/core/api/constants';
+import { api } from '@/modules/core/api/rotki-api';
+import { HTTPStatus } from '@/modules/core/api/types/http';
+
+interface CheckAssetOptions {
+  abortController?: AbortController;
+}
+
+interface UseAssetIconApiReturn {
+  assetImageUrl: (identifier: string, randomString?: string | number) => string;
+  uploadIcon: (identifier: string, file: File) => Promise<boolean>;
+  setIcon: (asset: string, file: string) => Promise<boolean>;
+  refreshIcon: (asset: string) => Promise<boolean>;
+  clearIconCache: (assets: string[] | null) => Promise<boolean>;
+  checkAsset: (identifier: string, options: CheckAssetOptions) => Promise<number>;
+}
+
+export function useAssetIconApi(): UseAssetIconApiReturn {
+  /**
+   * The absolute icon url for an asset, for use as an `<img src>`.
+   *
+   * @remarks
+   * Fully resolved rather than a path, because nothing fetches this: the browser does, and it has
+   * no api client to resolve a relative target against.
+   *
+   * Pass `randomString` as a cache-buster, to force a re-fetch after an icon changes.
+   */
+  const assetImageUrl = (identifier: string, randomString?: string | number): string => {
+    const params = new URLSearchParams();
+    params.set('asset_id', identifier);
+
+    if (randomString)
+      params.set('t', String(randomString));
+
+    return `${api.colibriBaseURL}/assets/icon?${params.toString()}`;
+  };
+
+  const checkAsset = async (identifier: string, options: CheckAssetOptions): Promise<number> => {
+    const params = new URLSearchParams();
+    params.set('asset_id', identifier);
+    return api.headStatus(`/assets/icon?${params.toString()}`, {
+      signal: options.abortController?.signal,
+      target: RequestTarget.COLIBRI,
+      validStatuses: [HTTPStatus.OK, HTTPStatus.ACCEPTED, HTTPStatus.NOT_FOUND],
+    });
+  };
+
+  const uploadIcon = async (identifier: string, file: File): Promise<boolean> => {
+    const data = new FormData();
+    data.append('file', file);
+    data.append('asset', identifier);
+    return api.post<boolean>(`/assets/icon/modify`, data);
+  };
+
+  const setIcon = async (asset: string, file: string): Promise<boolean> => api.put<boolean>(`/assets/icon/modify`, {
+    asset,
+    file,
+  });
+
+  const refreshIcon = async (asset: string): Promise<boolean> => api.patch<boolean>(`/assets/icon/modify`, {
+    asset,
+  });
+
+  const clearIconCache = async (assets: string[] | null): Promise<boolean> => api.post<boolean>(
+    '/cache/icons/clear',
+    { entries: assets },
+  );
+
+  return {
+    assetImageUrl,
+    checkAsset,
+    clearIconCache,
+    refreshIcon,
+    setIcon,
+    uploadIcon,
+  };
+}

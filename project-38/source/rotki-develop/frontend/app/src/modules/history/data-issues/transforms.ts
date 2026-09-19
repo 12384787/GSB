@@ -1,0 +1,228 @@
+import type { RouteLocationRaw } from 'vue-router';
+import type {
+  IssueDescription,
+  RemediationTimelineItem,
+} from '@/modules/history/data-issues/types';
+import { fromNullable, getOr } from 'plainfp/option';
+import { pipe } from 'plainfp/pipe';
+import { type MessageKey, msg } from '@/message-key';
+import { IssueKind } from '@/modules/history/data-issues/constants';
+import {
+  type AutoRemediationAttempt,
+  CurrentBalanceMismatchPayload,
+  type DataIssue,
+  NegativeBalancePayload,
+  RebasingTokenPayload,
+  UnmatchedBridgePayload,
+} from '@/modules/history/data-issues/schemas';
+
+/**
+ * Turns a raw strategy identifier (e.g. `reprocess_event`) into a human label
+ * (`Reprocess event`).
+ */
+export function humanizeStrategy(strategy: string): string {
+  const normalized = strategy.replaceAll(/[_-]+/g, ' ').trim();
+  if (normalized.length === 0)
+    return strategy;
+  return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+}
+
+/**
+ * The translated label for a strategy, for the few that have one.
+ *
+ * @remarks
+ * Returns a key rather than a translation so the label resolves in the component, through its own
+ * `t`, and follows a locale change. Strategies with no entry fall back to
+ * {@link humanizeStrategy}.
+ */
+export function strategyMessageKey(strategy: string): MessageKey | undefined {
+  return strategy === 'redecode_customized_transactions'
+    ? msg.$t('data_issues.detail.checked_customizations')
+    : undefined;
+}
+
+/**
+ * Describes what is wrong with an issue, narrowed by its `kind`. Returns the i18n
+ * keypath and its interpolation values (the asset as an identifier, the numbers as
+ * `BigNumber`s) so the display can render the asset as a resolved symbol and the
+ * amounts with the user's decimals setting, rather than baking raw values into a
+ * string. Also exposes an optional `eventIdentifier` to deep-link the offending event.
+ */
+function describeNegativeBalance(issue: DataIssue): IssueDescription | undefined {
+  const parsed = NegativeBalancePayload.safeParse(issue.payload);
+  if (!parsed.success)
+    return undefined;
+  const payload = parsed.data;
+  return {
+    amounts: {
+      amount: payload.inMemoryNegativeAmount,
+      before: payload.derivedBalanceBeforeEvent,
+    },
+    asset: issue.asset ?? undefined,
+    eventIdentifier: payload.eventIdentifier,
+    messageKey: payload.reason === 'untracked_exchange'
+      ? msg.$t('data_issues.description.negative_balance_untracked_exchange')
+      : msg.$t('data_issues.description.negative_balance'),
+    shortMessageKey: payload.reason === 'untracked_exchange'
+      ? msg.$t('data_issues.description_short.negative_balance_untracked_exchange')
+      : msg.$t('data_issues.description_short.negative_balance'),
+  };
+}
+
+function describeBalanceMismatch(issue: DataIssue): IssueDescription | undefined {
+  const parsed = CurrentBalanceMismatchPayload.safeParse(issue.payload);
+  if (!parsed.success)
+    return undefined;
+  const payload = parsed.data;
+  return {
+    amounts: {
+      delta: payload.delta,
+      derived: payload.derivedBalance,
+      observed: payload.observedBalance,
+    },
+    asset: issue.asset ?? undefined,
+    eventIdentifier: pipe(
+      fromNullable(payload.latestEventIdentifier),
+      (option): number | undefined => getOr(option, undefined),
+    ),
+    messageKey: msg.$t('data_issues.description.current_balance_mismatch'),
+    shortMessageKey: msg.$t('data_issues.description_short.current_balance_mismatch'),
+  };
+}
+
+function describeRebasingToken(issue: DataIssue): IssueDescription | undefined {
+  const parsed = RebasingTokenPayload.safeParse(issue.payload);
+  if (!parsed.success)
+    return undefined;
+
+  const description = {
+    amounts: {},
+    asset: issue.asset ?? undefined,
+    eventIdentifier: parsed.data.eventIdentifier,
+  };
+
+  switch (parsed.data.reason) {
+    case 'archive_node_unavailable':
+      return {
+        ...description,
+        messageKey: msg.$t('data_issues.description.rebasing_token_archive_node_unavailable'),
+        shortMessageKey: msg.$t('data_issues.description_short.rebasing_token_archive_node_unavailable'),
+      };
+    case 'historical_balance_query_failed':
+      return {
+        ...description,
+        messageKey: msg.$t('data_issues.description.rebasing_token_historical_balance_query_failed'),
+        shortMessageKey: msg.$t('data_issues.description_short.rebasing_token_historical_balance_query_failed'),
+      };
+    case 'missing_transaction':
+      return {
+        ...description,
+        messageKey: msg.$t('data_issues.description.rebasing_token_missing_transaction'),
+        shortMessageKey: msg.$t('data_issues.description_short.rebasing_token_missing_transaction'),
+      };
+    case 'unsupported_bucket':
+      return {
+        ...description,
+        messageKey: msg.$t('data_issues.description.rebasing_token_unsupported_bucket'),
+        shortMessageKey: msg.$t('data_issues.description_short.rebasing_token_unsupported_bucket'),
+      };
+  }
+}
+
+function describeUnmatchedBridge(issue: DataIssue): IssueDescription | undefined {
+  const parsed = UnmatchedBridgePayload.safeParse(issue.payload);
+  if (!parsed.success)
+    return undefined;
+  const payload = parsed.data;
+  return {
+    amounts: {},
+    asset: issue.asset ?? undefined,
+    eventIdentifier: payload.eventIdentifier,
+    messageKey: payload.direction === 'deposit'
+      ? msg.$t('data_issues.description.unmatched_bridge_deposit')
+      : msg.$t('data_issues.description.unmatched_bridge_withdrawal'),
+    shortMessageKey: payload.direction === 'deposit'
+      ? msg.$t('data_issues.description_short.unmatched_bridge_deposit')
+      : msg.$t('data_issues.description_short.unmatched_bridge_withdrawal'),
+  };
+}
+
+const KIND_DESCRIBERS: Partial<Record<IssueKind, (issue: DataIssue) => IssueDescription | undefined>> = {
+  [IssueKind.CURRENT_BALANCE_MISMATCH]: describeBalanceMismatch,
+  [IssueKind.NEGATIVE_BALANCE]: describeNegativeBalance,
+  [IssueKind.REBASING_TOKEN]: describeRebasingToken,
+  [IssueKind.UNMATCHED_BRIDGE]: describeUnmatchedBridge,
+};
+
+export function describeIssue(issue: DataIssue): IssueDescription {
+  const described = KIND_DESCRIBERS[issue.kind]?.(issue);
+  return described ?? {
+    amounts: {},
+    messageKey: msg.$t('data_issues.description.unknown'),
+    shortMessageKey: msg.$t('data_issues.description_short.unknown'),
+  };
+}
+
+/**
+ * Deep-link to the offending history event for an issue, or `undefined` when the
+ * issue carries no event identifier. For a negative-balance issue the events view
+ * needs both `highlightedNegativeBalanceEvent` (the event) and
+ * `targetGroupIdentifier` (its group) to page to and highlight the row, so we pass
+ * both when the backend supplied the group identifier. When the issue carries an
+ * asset we also add it to the query so the events view filters to that asset on
+ * arrival (the `asset` matcher key is read straight from the route). Shared by the
+ * detail drawer and the inbox panel so both navigate consistently.
+ */
+export function relatedEventRoute(
+  kind: IssueKind,
+  eventIdentifier: number | undefined,
+  groupIdentifier?: string | null,
+  asset?: string | null,
+): RouteLocationRaw | undefined {
+  if (eventIdentifier === undefined)
+    return undefined;
+
+  const name = '/history/events/';
+  const query: Record<string, string> = {};
+
+  if (kind === IssueKind.UNMATCHED_BRIDGE) {
+    return { name, query: { openMatchBridgesDialog: 'true' } };
+  }
+
+  if (kind === IssueKind.NEGATIVE_BALANCE || kind === IssueKind.REBASING_TOKEN) {
+    query.highlightedNegativeBalanceEvent = eventIdentifier.toString();
+    if (groupIdentifier)
+      query.targetGroupIdentifier = groupIdentifier;
+  }
+
+  if (asset)
+    query.asset = asset;
+
+  return Object.keys(query).length > 0 ? { name, query } : { name };
+}
+
+function toTimelineItem(attempt: AutoRemediationAttempt): RemediationTimelineItem {
+  return {
+    attribution: attempt.attribution,
+    changedTransactionCount: attempt.changedTransactionCount,
+    customizedTransactionCount: attempt.customizedTransactionCount,
+    result: attempt.result,
+    strategy: attempt.strategy,
+    success: attempt.success,
+    timestamp: attempt.timestamp,
+    transactions: attempt.transactions,
+  };
+}
+
+/**
+ * Maps the raw auto-remediation attempts into ordered timeline items. Attempts
+ * that carry a timestamp are shown oldest-first; the order of timestamp-less
+ * attempts (older backend rows) is preserved.
+ */
+export function toTimelineItems(issue: DataIssue): RemediationTimelineItem[] {
+  return issue.autoRemediationAttempts.map(toTimelineItem).sort((a, b) => {
+    const left = pipe(fromNullable(a.timestamp), option => getOr(option, 0));
+    const right = pipe(fromNullable(b.timestamp), option => getOr(option, 0));
+    return left - right;
+  });
+}

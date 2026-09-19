@@ -1,0 +1,307 @@
+import type { APIRequestContext, Page } from '@playwright/test';
+import process from 'node:process';
+import {
+  apiAddEtherscanKey,
+  apiCreateAccount,
+  apiDisableModules,
+  apiLogin,
+  apiLogout,
+  apiUpdateAssets,
+} from '../helpers/api';
+import { TIMEOUT_LONG, TIMEOUT_MEDIUM, TIMEOUT_SHORT } from '../helpers/constants';
+import { confirmDialog, disableAnimations, TK } from '../helpers/utils';
+
+export class RotkiApp {
+  constructor(
+    private readonly page: Page,
+    private readonly request: APIRequestContext,
+  ) {}
+
+  /**
+   * Seeds the external-service keys the run needs.
+   *
+   * @remarks
+   * Under `MOCK_RPC_MODE` no key is set at all. A real etherscan key would let the app reach the
+   * live API for anything the mock does not answer, which is exactly the non-determinism the mock
+   * exists to remove.
+   */
+  private async loadEnv(): Promise<void> {
+    if (process.env.MOCK_RPC_MODE) {
+      return;
+    }
+
+    const apiKey = process.env.ETHERSCAN_API_KEY ?? TK.join('');
+    if (apiKey) {
+      await apiAddEtherscanKey(this.request, apiKey);
+    }
+    else {
+      console.warn('ETHERSCAN_API_KEY not set');
+    }
+  }
+
+  async visit(): Promise<void> {
+    await this.page.goto('/#/user/login?skip_update=1');
+    await disableAnimations(this.page);
+  }
+
+  async createAccount(username: string, password: string = '1234'): Promise<void> {
+    await apiLogout(this.request);
+
+    // Navigate to login page first
+    await this.page.goto('/#/user/login?skip_update=1', { timeout: TIMEOUT_MEDIUM });
+    await disableAnimations(this.page);
+
+    await this.page.locator('[data-testid=connection-loading-content]').waitFor({ state: 'detached' });
+    await this.page.locator('[data-testid=account-management-forms]').waitFor({ state: 'visible' });
+
+    // Existing accounts give the login page; a fresh start may open the create form directly.
+    const newAccountButton = this.page.locator('[data-testid=new-account]');
+    const introductionContinue = this.page.locator('[data-testid=create-account-introduction-create]');
+
+    const visibleElement = await Promise.race([
+      newAccountButton.waitFor({ state: 'visible', timeout: TIMEOUT_SHORT }).then(() => 'login'),
+      introductionContinue.waitFor({ state: 'visible', timeout: TIMEOUT_SHORT }).then(() => 'create'),
+    ]).catch(() => 'login');
+
+    // If on login page, click "Create account" button first
+    if (visibleElement === 'login' && await newAccountButton.isVisible()) {
+      await newAccountButton.click();
+    }
+
+    await this.page.locator('[data-testid=create-account-introduction-create]').click();
+    await this.page.locator('[data-testid=create-account-premium-continue]').click();
+    await this.page.locator('[data-testid=create-account-username] input').fill(username);
+    await this.page.locator('[data-testid=create-account-password] input').fill(password);
+    await this.page.locator('[data-testid=create-account-password-repeat] input').fill(password);
+    await this.page.locator('[data-testid=create-account-user-prompted] > label').click();
+    await this.page.locator('[data-testid=create-account-credentials-continue]').click();
+    await this.page.locator('[data-testid=create-account-analytics-continue]').click();
+    await this.page.locator('[data-testid=account-management-forms]').waitFor({ state: 'detached' });
+    await this.checkGetPremiumButton();
+    await apiUpdateAssets(this.request);
+    await this.loadEnv();
+    await this.dismissSettingsSuggestionsIfVisible();
+  }
+
+  async clear(): Promise<void> {
+    await this.logout();
+  }
+
+  async fasterLogin(username: string, password: string = '1234', disableModules: boolean = false): Promise<void> {
+    await apiLogout(this.request);
+
+    // Try to login first (for existing users), create account only if login fails
+    const loginSuccess = await apiLogin(this.request, username, password);
+    if (!loginSuccess) {
+      // User doesn't exist, create account
+      await apiCreateAccount(this.request, username, password);
+    }
+
+    if (disableModules) {
+      await apiDisableModules(this.request);
+    }
+
+    await this.loadEnv();
+    await this.visit();
+    await this.login(username, password);
+  }
+
+  async dismissSettingsSuggestionsIfVisible(): Promise<void> {
+    const keepCurrentButton = this.page.getByRole('button', { name: 'Keep current' });
+    try {
+      await keepCurrentButton.waitFor({ state: 'visible', timeout: 3000 });
+      await keepCurrentButton.click();
+      await keepCurrentButton.waitFor({ state: 'detached', timeout: TIMEOUT_SHORT });
+    }
+    catch {
+      // Dialog didn't appear — nothing to dismiss
+    }
+  }
+
+  async checkGetPremiumButton(): Promise<void> {
+    await this.page.locator('[data-testid=get-premium-button]').waitFor({ state: 'visible' });
+  }
+
+  async relogin(username: string, password: string = '1234'): Promise<void> {
+    await this.clear();
+    await this.login(username, password);
+  }
+
+  async login(username: string, password: string = '1234'): Promise<void> {
+    const usernameField = this.page.locator('[data-testid=username-input]');
+    const usernameInput = usernameField.locator('input');
+    const passwordInput = this.page.locator('[data-testid=password-input] input');
+    const submitButton = this.page.locator('[data-testid=login-submit]');
+    const premiumButton = this.page.locator('[data-testid=get-premium-button]');
+
+    await usernameInput.waitFor({ state: 'visible' });
+
+    // Check if autocomplete activator exists (not rendered when VITE_TEST=true)
+    const activator = usernameField.locator('[data-id=activator]');
+    const hasAutocomplete = await activator.count() > 0;
+
+    if (hasAutocomplete) {
+      await activator.click();
+      // Wait for dropdown menu to appear
+      const menu = this.page.locator('[role=menu]');
+      await menu.waitFor({ state: 'visible', timeout: TIMEOUT_SHORT });
+      await usernameInput.fill(username);
+      const option = menu.getByText(username, { exact: true });
+      await option.waitFor({ state: 'visible', timeout: TIMEOUT_SHORT });
+      await option.click();
+    }
+    else {
+      // Simple text field mode (when VITE_TEST=true)
+      await usernameInput.fill(username);
+    }
+
+    await passwordInput.fill(password);
+    await submitButton.waitFor({ state: 'visible' });
+    await submitButton.click();
+
+    // Either the asset update dialog appears, or the premium button means login went through.
+    const updateButton = this.page.getByRole('button', { name: 'Update' });
+
+    const result = await Promise.race([
+      updateButton.waitFor({ state: 'visible', timeout: TIMEOUT_LONG / 4 }).then(() => 'update'),
+      premiumButton.waitFor({ state: 'visible', timeout: TIMEOUT_LONG / 4 }).then(() => 'logged-in'),
+    ]).catch(() => 'logged-in');
+
+    if (result === 'update') {
+      await updateButton.click();
+
+      // Handle conflicts dialog if it appears - use Promise.race again
+      const keepRemoteButton = this.page.getByRole('button', { name: 'Keep All Remote' });
+      const conflictResult = await Promise.race([
+        keepRemoteButton.waitFor({ state: 'visible', timeout: TIMEOUT_MEDIUM }).then(() => 'conflict'),
+        premiumButton.waitFor({ state: 'visible', timeout: TIMEOUT_LONG }).then(() => 'done'),
+      ]).catch(() => 'done');
+
+      if (conflictResult === 'conflict') {
+        await keepRemoteButton.click();
+        await premiumButton.waitFor({ state: 'visible', timeout: TIMEOUT_LONG });
+      }
+    }
+
+    await this.dismissSettingsSuggestionsIfVisible();
+  }
+
+  async logout(): Promise<void> {
+    await this.page.locator('[data-testid=user-menu-button]').click();
+    await this.page.locator('[data-testid=user-dropdown]').waitFor({ state: 'visible' });
+    await this.page.locator('[data-testid=logout-button]').click();
+    await confirmDialog(this.page);
+    await this.page.locator('[data-testid=username-input] input').waitFor({ state: 'visible' });
+  }
+
+  async changeCurrency(currency: string): Promise<void> {
+    await this.page.locator('[data-testid=currency-dropdown]').click();
+    await this.page.locator(`#change-to-${currency.toLowerCase()}`).click();
+  }
+
+  async togglePrivacyMenu(show?: boolean): Promise<void> {
+    const menuButton = this.page.locator('[data-testid=privacy-menu]');
+    const menuContent = this.page.locator('[data-testid=privacy-menu-content]');
+
+    if (show) {
+      await menuButton.click();
+      // Wait for the slider to be visible (the slider is inside the menu content)
+      await this.page.locator('[data-testid=privacy-mode-dropdown-input]').waitFor({ state: 'visible' });
+    }
+    else {
+      const isVisible = await menuContent.isVisible();
+      if (isVisible) {
+        await menuButton.click();
+        // Wait for menu content to be hidden
+        await this.page.locator('[data-testid=privacy-mode-dropdown-input]').waitFor({ state: 'hidden' });
+      }
+    }
+  }
+
+  async changePrivacyMode(mode: number): Promise<void> {
+    await this.togglePrivacyMenu(true);
+    // Mode 0 = Normal, 1 = Semi Private, 2 = Private
+    const label = this.page.locator(`[data-testid=privacy-mode-option][data-mode="${mode}"]`);
+    await label.waitFor({ state: 'visible' });
+    await label.click();
+    await this.togglePrivacyMenu();
+  }
+
+  async toggleScrambler(enable: boolean): Promise<void> {
+    const input = this.page.locator('[data-testid=privacy-mode-scramble-toggle] input[type=checkbox]');
+    const isChecked = await input.isChecked();
+
+    if (enable !== isChecked) {
+      await input.click({ force: true });
+    }
+  }
+
+  async changeScrambleValue(multiplier: string): Promise<void> {
+    await this.toggleScrambler(true);
+    const input = this.page.locator('[data-testid=privacy-mode-scramble-multiplier] input');
+    await input.fill(multiplier);
+  }
+
+  async changeRandomScrambleValue(): Promise<void> {
+    await this.toggleScrambler(true);
+    const button = this.page.locator('[data-testid=privacy-mode-scramble-random-multiplier]');
+    await button.click();
+  }
+
+  async shouldHaveQueryParam(key: string, value: string): Promise<void> {
+    const url = this.page.url();
+    const query = new URL(url).searchParams;
+    const actualValue = query.get(key);
+    if (actualValue !== value) {
+      throw new Error(`Expected query param "${key}" to be "${value}" but got "${actualValue}"`);
+    }
+  }
+
+  async shouldNotHaveQueryParam(key: string): Promise<void> {
+    const url = this.page.url();
+    const query = new URL(url).searchParams;
+    const actualValue = query.get(key);
+    if (actualValue !== null) {
+      throw new Error(`Expected query param "${key}" to not exist but got "${actualValue}"`);
+    }
+  }
+
+  static async navigateTo(page: Page, menu: string, submenu?: string): Promise<void> {
+    const click = async (selector: string, scroll: boolean = false): Promise<void> => {
+      const element = page.locator(selector);
+      if (scroll) {
+        await element.scrollIntoViewIfNeeded();
+        await element.waitFor({ state: 'visible' });
+      }
+      await element.hover();
+      await element.click();
+    };
+
+    const menuSelector = `[data-testid=navigation][data-key="${menu}"]`;
+    const menuElement = page.locator(menuSelector);
+
+    // Check if the submenu wrapper exists and if it's expanded
+    const submenuWrapper = menuElement.locator('[data-testid=submenu-wrapper]');
+    const hasSubmenuWrapper = await submenuWrapper.count() > 0;
+
+    if (hasSubmenuWrapper) {
+      const isExpanded = await submenuWrapper.getAttribute('data-expanded') === 'true';
+
+      if (!isExpanded) {
+        await click(menuSelector, true);
+      }
+    }
+    else {
+      // It's a simple menu item, just click it
+      await click(menuSelector, true);
+    }
+
+    if (submenu) {
+      await submenuWrapper.scrollIntoViewIfNeeded();
+      await submenuWrapper.waitFor({ state: 'visible' });
+
+      const subMenuSelector = `[data-testid=navigation][data-key="${submenu}"]`;
+      await click(subMenuSelector);
+    }
+  }
+}

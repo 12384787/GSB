@@ -1,0 +1,1028 @@
+from typing import TYPE_CHECKING
+
+import pytest
+
+from rotkehlchen.assets.asset import Asset, UnderlyingToken
+from rotkehlchen.assets.utils import get_or_create_evm_token
+from rotkehlchen.chain.decoding.constants import CPT_GAS
+from rotkehlchen.chain.ethereum.modules.gearbox.constants import GEAR_STAKING_CONTRACT
+from rotkehlchen.chain.evm.constants import ZERO_ADDRESS
+from rotkehlchen.chain.evm.decoding.gearbox.constants import CPT_GEARBOX
+from rotkehlchen.chain.evm.types import string_to_evm_address
+from rotkehlchen.constants.assets import A_DAI, A_ETH, A_USDC
+from rotkehlchen.constants.misc import ONE, ZERO
+from rotkehlchen.fval import FVal
+from rotkehlchen.globaldb.cache import (
+    compute_cache_key,
+    globaldb_set_general_cache_values,
+    globaldb_set_unique_cache_value,
+)
+from rotkehlchen.history.events.structures.evm_event import EvmEvent
+from rotkehlchen.history.events.structures.types import HistoryEventSubType, HistoryEventType
+from rotkehlchen.tests.unit.test_types import LEGACY_TESTS_INDEXER_ORDER
+from rotkehlchen.tests.utils.ethereum import get_decoded_events_of_transaction
+from rotkehlchen.types import (
+    CacheType,
+    ChecksumEvmAddress,
+    Location,
+    TimestampMS,
+    TokenKind,
+    deserialize_evm_tx_hash,
+)
+from rotkehlchen.utils.misc import ts_now
+
+if TYPE_CHECKING:
+    from rotkehlchen.chain.arbitrum_one.node_inquirer import ArbitrumOneInquirer
+    from rotkehlchen.chain.ethereum.node_inquirer import EthereumInquirer
+    from rotkehlchen.chain.optimism.node_inquirer import OptimismInquirer
+    from rotkehlchen.globaldb.handler import GlobalDBHandler
+
+
+@pytest.fixture(name='setup_gearbox_cache')
+def _setup_gearbox_cache(globaldb):
+    """Setup the global DB cache with Gearbox pool data for testing."""
+    str_chain_id = '1'
+    pool_address = string_to_evm_address('0x9ef444a6d7F4A5adcd68FD5329aA5240C90E14d2')
+    farming_token_address = string_to_evm_address('0x73302b63Ad4a16C498f26dB89cb27F37a72E4E04')
+    lp_token_address = string_to_evm_address('0x7F5c764cBc14f9669B88837ca1490cCa17c31607')
+
+    with globaldb.conn.write_ctx() as cursor:
+        cursor.execute(  # Add pool address to cache
+            'INSERT OR REPLACE INTO general_cache(key, value, last_queried_ts) VALUES(?, ?, ?)',
+            (compute_cache_key((CacheType.GEARBOX_POOL_ADDRESS, str_chain_id)), pool_address, (now := ts_now())),  # noqa: E501
+        )
+        cursor.execute(  # Add pool name to cache
+            'INSERT OR REPLACE INTO unique_cache(key, value, last_queried_ts) VALUES(?, ?, ?)',
+            (compute_cache_key((CacheType.GEARBOX_POOL_NAME, pool_address, str_chain_id)), 'Farming of Trade USDC v3', now),  # noqa: E501
+        )
+        cursor.execute(  # Add farming token to cache
+            'INSERT OR REPLACE INTO unique_cache(key, value, last_queried_ts) VALUES(?, ?, ?)',
+            (compute_cache_key((CacheType.GEARBOX_POOL_FARMING_TOKEN, pool_address, str_chain_id)), farming_token_address, now),  # noqa: E501
+        )
+        cursor.execute(  # Add LP token to cache
+            'INSERT OR REPLACE INTO general_cache(key, value, last_queried_ts) VALUES(?, ?, ?)',
+            (compute_cache_key((CacheType.GEARBOX_POOL_LP_TOKENS, pool_address, str_chain_id, lp_token_address)), lp_token_address, now),  # noqa: E501
+        )
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('load_global_caches', [[CPT_GEARBOX]])
+@pytest.mark.parametrize('ethereum_accounts', [['0xfAebCbFbB35935e45afBD6b7EAfA93aB9c4fEc05']])
+def test_gearbox_deposit_non_farming_pool(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        load_global_caches: list[str],
+        globaldb: GlobalDBHandler,
+):
+    """Test a deposit to a pool that doesn't have any farming/lp tokens."""
+    pool_token = get_or_create_evm_token(
+        userdb=ethereum_inquirer.database,
+        evm_address=string_to_evm_address('0x31426271449F60d37Cc5C9AEf7bD12aF3BdC7A94'),
+        chain_id=ethereum_inquirer.chain_id,
+        symbol='dDOLAV3',
+        name='Trade DOLA v3',
+        protocol=CPT_GEARBOX,
+        underlying_tokens=[UnderlyingToken(
+            (underlying_token := get_or_create_evm_token(
+                userdb=ethereum_inquirer.database,
+                evm_address=string_to_evm_address('0x865377367054516e17014CcdED1e7d814EDC9ce4'),
+                chain_id=ethereum_inquirer.chain_id,
+                symbol='DOLA',
+                name='Dola USD Stablecoin',
+            )).evm_address,
+            token_kind=TokenKind.ERC20,
+            weight=ONE,
+        )],
+    )
+    with globaldb.conn.write_ctx() as write_cursor:
+        globaldb_set_general_cache_values(
+            write_cursor=write_cursor,
+            key_parts=(
+                CacheType.GEARBOX_POOL_ADDRESS,
+                (chain_id_str := str(ethereum_inquirer.chain_id.serialize_for_db())),
+            ),
+            values=(pool_token.evm_address,),
+        )
+        globaldb_set_unique_cache_value(
+            write_cursor=write_cursor,
+            key_parts=(CacheType.GEARBOX_POOL_NAME, pool_token.evm_address, chain_id_str),
+            value='Trade DOLA v3',
+        )
+
+    events, _ = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=(tx_hash := deserialize_evm_tx_hash('0x20a0e17d547a76f797bab8c60c2aa65a6cdbceecb1f50f92a4de4408a461c963')),  # noqa: E501
+        load_global_caches=load_global_caches,
+    )
+    assert events == [EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=0,
+        timestamp=(timestamp := TimestampMS(1754383247000)),
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.FEE,
+        asset=A_ETH,
+        amount=FVal('0.000026282468494372'),
+        location_label=(user_address := ethereum_accounts[0]),
+        counterparty=CPT_GAS,
+    ), EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=693,
+        timestamp=timestamp,
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.DEPOSIT,
+        event_subtype=HistoryEventSubType.DEPOSIT_FOR_WRAPPED,
+        asset=underlying_token,
+        amount=FVal(deposit_amount := '3162.315537981174820203'),
+        location_label=user_address,
+        notes=f'Deposit {deposit_amount} DOLA to Gearbox',
+        counterparty=CPT_GEARBOX,
+        address=pool_token.evm_address,
+    ), EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=694,
+        timestamp=timestamp,
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.RECEIVE,
+        event_subtype=HistoryEventSubType.RECEIVE_WRAPPED,
+        asset=pool_token,
+        amount=FVal(lp_amount := '3128.937248998913842767'),
+        location_label=user_address,
+        notes=f'Receive {lp_amount} dDOLAV3 after depositing in Gearbox',
+        counterparty=CPT_GEARBOX,
+        address=ZERO_ADDRESS,
+    )]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('load_global_caches', [[CPT_GEARBOX]])
+@pytest.mark.parametrize('ethereum_accounts', [['0x3630220f243288E3EAC4C5676fC191CFf5756431']])
+def test_gearbox_deposit(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        load_global_caches: list[str],
+):
+    events, _ = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=(tx_hash := deserialize_evm_tx_hash('0x04e3bcebf71873a5de1c4d9b40f1c97631a3958ef0d8d743a1a1b4d50361855d')),  # noqa: E501
+        load_global_caches=load_global_caches,
+    )
+    assert events == [
+        EvmEvent(
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1716770963000)),
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.0006562535'),
+            location_label=ethereum_accounts[0],
+            tx_ref=tx_hash,
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            sequence_index=513,
+            timestamp=timestamp,
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.DEPOSIT_FOR_WRAPPED,
+            asset=A_DAI,
+            amount=FVal(deposit_amount := '156164.834098036387706577'),
+            location_label=ethereum_accounts[0],
+            notes=f'Deposit {deposit_amount} DAI to Gearbox',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0x1aD0780a152fE66FAf7c44A7F875A36b1bf790F0'),
+        ), EvmEvent(
+            sequence_index=520,
+            timestamp=timestamp,
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.RECEIVE,
+            event_subtype=HistoryEventSubType.RECEIVE_WRAPPED,
+            asset=Asset('eip155:1/erc20:0xC853E4DA38d9Bd1d01675355b8c8f3BBC1451973'),
+            amount=FVal(lp_token_amount := '151038.694912640397702932'),
+            location_label=ethereum_accounts[0],
+            notes=f'Receive {lp_token_amount} farmdDAIV3 after depositing in Gearbox',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0x1aD0780a152fE66FAf7c44A7F875A36b1bf790F0'),
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('load_global_caches', [[CPT_GEARBOX]])
+@pytest.mark.parametrize('ethereum_accounts', [['0xb99a2c4C1C4F1fc27150681B740396F6CE1cBcF5']])
+def test_gearbox_deposit_usdc(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        load_global_caches: list[str],
+):
+    events, _ = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=(tx_hash := deserialize_evm_tx_hash('0x92d178bbe5152cad47029b0c130450848ee46084e72addd09ba955631af1325b')),  # noqa: E501
+        load_global_caches=load_global_caches,
+    )
+    deposit_amount = '6500000'
+    assert events == [
+        EvmEvent(
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1716899027000)),
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.004946659515956316'),
+            location_label=ethereum_accounts[0],
+            tx_ref=tx_hash,
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            sequence_index=154,
+            timestamp=timestamp,
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.INFORMATIONAL,
+            event_subtype=HistoryEventSubType.APPROVE,
+            asset=A_USDC,
+            amount=FVal(6500000),
+            location_label=ethereum_accounts[0],
+            tx_ref=tx_hash,
+            address=string_to_evm_address('0x53D5BD0E7fAa9ee3eafEf7C5572D54DB1b7f5b25'),
+        ), EvmEvent(
+            sequence_index=155,
+            timestamp=timestamp,
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.DEPOSIT_FOR_WRAPPED,
+            asset=A_USDC,
+            amount=FVal(deposit_amount),
+            location_label=ethereum_accounts[0],
+            notes=f'Deposit {deposit_amount} USDC to Gearbox',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0x53D5BD0E7fAa9ee3eafEf7C5572D54DB1b7f5b25'),
+        ), EvmEvent(
+            sequence_index=162,
+            timestamp=timestamp,
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.RECEIVE,
+            event_subtype=HistoryEventSubType.RECEIVE_WRAPPED,
+            asset=Asset('eip155:1/erc20:0x9ef444a6d7F4A5adcd68FD5329aA5240C90E14d2'),
+            amount=FVal(lp_token_amount := '6147276.510091'),
+            location_label=ethereum_accounts[0],
+            notes=f'Receive {lp_token_amount} farmdUSDCV3 after depositing in Gearbox',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0x53D5BD0E7fAa9ee3eafEf7C5572D54DB1b7f5b25'),
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('load_global_caches', [[CPT_GEARBOX]])
+@pytest.mark.parametrize('ethereum_accounts', [['0x9167B9d55BA7E7D6163bAAa97C099dfE3d1D9420']])
+def test_gearbox_withdraw(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        load_global_caches: list[str],
+):
+    events, _ = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=(tx_hash := deserialize_evm_tx_hash('0xb286e618ec2e5961c696df1855006dea0343fb635c7f199621f8592db342dfba')),  # noqa: E501
+        load_global_caches=load_global_caches,
+    )
+    assert events == [
+        EvmEvent(
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1716739091000)),
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.002506078391975991'),
+            location_label=ethereum_accounts[0],
+            tx_ref=tx_hash,
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            sequence_index=500,
+            timestamp=timestamp,
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.RETURN_WRAPPED,
+            asset=Asset('eip155:1/erc20:0xC853E4DA38d9Bd1d01675355b8c8f3BBC1451973'),
+            amount=FVal(lp_amount := '29394.203983328624199078'),
+            location_label=ethereum_accounts[0],
+            notes=f'Return {lp_amount} farmdDAIV3',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0x1aD0780a152fE66FAf7c44A7F875A36b1bf790F0'),
+        ), EvmEvent(
+            sequence_index=504,
+            timestamp=timestamp,
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.WITHDRAWAL,
+            event_subtype=HistoryEventSubType.REDEEM_WRAPPED,
+            asset=A_DAI,
+            amount=FVal(withdrawn := '30388.281725016794033508'),
+            location_label=ethereum_accounts[0],
+            notes=f'Withdraw {withdrawn} DAI from Gearbox',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0xe7146F53dBcae9D6Fa3555FE502648deb0B2F823'),
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('load_global_caches', [[CPT_GEARBOX]])
+@pytest.mark.parametrize('arbitrum_one_accounts', [['0x0e414c1c4780df6c09c2f1070990768D44B70b1D']])
+def test_gearbox_deposit_arbitrum(
+        arbitrum_one_inquirer: ArbitrumOneInquirer,
+        arbitrum_one_accounts: list[ChecksumEvmAddress],
+        load_global_caches: list[str],
+):
+    events, _ = get_decoded_events_of_transaction(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_hash=(tx_hash := deserialize_evm_tx_hash('0x00db27b8c09c9ec4478f27da7e40b90afbb577cfb4822536eab5a52dcae321e6')),  # noqa: E501
+        load_global_caches=load_global_caches,
+    )
+    assert events == [
+        EvmEvent(
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1716815867000)),
+            location=Location.ARBITRUM_ONE,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.00000249681'),
+            location_label=arbitrum_one_accounts[0],
+            tx_ref=tx_hash,
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            sequence_index=1,
+            timestamp=timestamp,
+            location=Location.ARBITRUM_ONE,
+            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.DEPOSIT_FOR_WRAPPED,
+            asset=A_ETH,
+            amount=FVal(deposit_amount := '0.001'),
+            location_label=arbitrum_one_accounts[0],
+            notes=f'Deposit {deposit_amount} ETH to Gearbox',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0x78c1B41b825f89FAE4736878Fa63752F8D789BD6'),
+        ), EvmEvent(
+            sequence_index=40,
+            timestamp=timestamp,
+            location=Location.ARBITRUM_ONE,
+            event_type=HistoryEventType.RECEIVE,
+            event_subtype=HistoryEventSubType.RECEIVE_WRAPPED,
+            asset=Asset('eip155:42161/erc20:0x6773fF780Dd38175247795545Ee37adD6ab6139a'),
+            amount=FVal(lp_token_amount := '0.00098428586189406'),
+            location_label=arbitrum_one_accounts[0],
+            notes=f'Receive {lp_token_amount} farmdWETHV3 after depositing in Gearbox',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0x78c1B41b825f89FAE4736878Fa63752F8D789BD6'),
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('load_global_caches', [[CPT_GEARBOX]])
+@pytest.mark.parametrize('arbitrum_one_accounts', [['0x0e414c1c4780df6c09c2f1070990768D44B70b1D']])
+def test_gearbox_deposit_arbitrum_lp(
+        arbitrum_one_inquirer: ArbitrumOneInquirer,
+        arbitrum_one_accounts: list[ChecksumEvmAddress],
+        load_global_caches: list[str],
+):
+    events, _ = get_decoded_events_of_transaction(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_hash=(tx_hash := deserialize_evm_tx_hash('0x7dbb02839dab23bc87ed6f4f5899fc77986c576e6fedf16cfbd9751fbe09e2eb')),  # noqa: E501
+        load_global_caches=load_global_caches,
+    )
+    assert events == [
+        EvmEvent(
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1716899425000)),
+            location=Location.ARBITRUM_ONE,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.0000022431'),
+            location_label=arbitrum_one_accounts[0],
+            tx_ref=tx_hash,
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            sequence_index=1,
+            timestamp=timestamp,
+            location=Location.ARBITRUM_ONE,
+            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.DEPOSIT_FOR_WRAPPED,
+            asset=A_ETH,
+            amount=FVal(deposit_amount := '0.001'),
+            location_label=arbitrum_one_accounts[0],
+            notes=f'Deposit {deposit_amount} ETH to Gearbox',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0xA909d7924a5aeb6c31c6A3AD30E9950d4B40F8cB'),
+        ), EvmEvent(
+            sequence_index=33,
+            timestamp=timestamp,
+            location=Location.ARBITRUM_ONE,
+            event_type=HistoryEventType.RECEIVE,
+            event_subtype=HistoryEventSubType.RECEIVE_WRAPPED,
+            asset=Asset('eip155:42161/erc20:0x04419d3509f13054f60d253E0c79491d9E683399'),
+            amount=FVal(lp_token_amount := '0.000984005521495659'),
+            location_label=arbitrum_one_accounts[0],
+            notes=f'Receive {lp_token_amount} dWETHV3 after providing liquidity in Gearbox',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=ZERO_ADDRESS,
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('load_global_caches', [[CPT_GEARBOX]])
+@pytest.mark.parametrize('arbitrum_one_accounts', [['0xE2fb883fDc13BEA0bFa73a329718323f00FBb777']])
+def test_gearbox_deposit_arbitrum_receive_leg_from_farming_wrapper(
+        arbitrum_one_inquirer: ArbitrumOneInquirer,
+        arbitrum_one_accounts: list[ChecksumEvmAddress],
+        load_global_caches: list[str],
+):
+    """Regression test for wrapper-based Gearbox deposits with farm-token receive."""
+    events, _ = get_decoded_events_of_transaction(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_hash=(tx_hash := deserialize_evm_tx_hash('0x78849bf915173b94692a3bc3384582b51f3680938e01162fc53b33a4d6424889')),  # noqa: E501
+        load_global_caches=load_global_caches,
+    )
+    assert events == [
+        EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1729918139000)),
+            location=Location.ARBITRUM_ONE,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.00000246911'),
+            location_label=arbitrum_one_accounts[0],
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=1,
+            timestamp=timestamp,
+            location=Location.ARBITRUM_ONE,
+            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.DEPOSIT_FOR_WRAPPED,
+            asset=A_ETH,
+            amount=FVal(deposit_amount := '0.1188'),
+            location_label=arbitrum_one_accounts[0],
+            notes=f'Deposit {deposit_amount} ETH to Gearbox',
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0xC371b6c94ac59757706cE13004e5B23ad37B46f4'),
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=29,
+            timestamp=timestamp,
+            location=Location.ARBITRUM_ONE,
+            event_type=HistoryEventType.RECEIVE,
+            event_subtype=HistoryEventSubType.RECEIVE_WRAPPED,
+            asset=Asset('eip155:42161/erc20:0xf3b7994e4dA53E04155057Fd61dc501599d57877'),
+            amount=FVal(farm_token_amount := '0.11502876455851981'),
+            location_label=arbitrum_one_accounts[0],
+            notes=f'Receive {farm_token_amount} farmdWETHV3 after depositing in Gearbox',
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0xC371b6c94ac59757706cE13004e5B23ad37B46f4'),
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('load_global_caches', [[CPT_GEARBOX]])
+@pytest.mark.parametrize('arbitrum_one_accounts', [['0x3a212d3d7504dC4A39E21C731d0E80b114A2108b']])
+def test_gearbox_withdraw_arbitrum(
+        arbitrum_one_inquirer: EthereumInquirer,
+        arbitrum_one_accounts: list[ChecksumEvmAddress],
+        load_global_caches: list[str],
+):
+    events, _ = get_decoded_events_of_transaction(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_hash=(tx_hash := deserialize_evm_tx_hash('0x9b3f388e53c6b0f2eb12c323aebb05d47e27f6d9f511bd1176ed826a351c6c06')),  # noqa: E501
+        load_global_caches=load_global_caches,
+    )
+    assert events == [
+        EvmEvent(
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1717435594000)),
+            location=Location.ARBITRUM_ONE,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.00000250989'),
+            location_label=arbitrum_one_accounts[0],
+            tx_ref=tx_hash,
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            sequence_index=1,
+            timestamp=timestamp,
+            location=Location.ARBITRUM_ONE,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.RETURN_WRAPPED,
+            asset=Asset('eip155:42161/erc20:0x6773fF780Dd38175247795545Ee37adD6ab6139a'),
+            amount=FVal(lp_amount := '0.7'),
+            location_label=arbitrum_one_accounts[0],
+            notes=f'Return {lp_amount} farmdWETHV3',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0x78c1B41b825f89FAE4736878Fa63752F8D789BD6'),
+        ), EvmEvent(
+            sequence_index=2,
+            timestamp=timestamp,
+            location=Location.ARBITRUM_ONE,
+            event_type=HistoryEventType.WITHDRAWAL,
+            event_subtype=HistoryEventSubType.REDEEM_WRAPPED,
+            asset=A_ETH,
+            amount=FVal(withdrawn := '0.712544409227268693'),
+            location_label=arbitrum_one_accounts[0],
+            notes=f'Withdraw {withdrawn} ETH from Gearbox',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0x78c1B41b825f89FAE4736878Fa63752F8D789BD6'),
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('load_global_caches', [[CPT_GEARBOX]])
+@pytest.mark.parametrize('arbitrum_one_accounts', [['0x7b007E8c0f77B50bEC8009f0e97F523DBa6FE506']])
+def test_gearbox_deposit_usdc_arbitrum(
+        arbitrum_one_inquirer: ArbitrumOneInquirer,
+        arbitrum_one_accounts: list[ChecksumEvmAddress],
+        load_global_caches: list[str],
+):
+    events, _ = get_decoded_events_of_transaction(
+        evm_inquirer=arbitrum_one_inquirer,
+        tx_hash=(tx_hash := deserialize_evm_tx_hash('0xc7a3b95862eba49a86b8eefe81837ea141037feda8c0da236d9c3adb370fdfb3')),  # noqa: E501
+        load_global_caches=load_global_caches,
+    )
+    assert events == [
+        EvmEvent(
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1717508317000)),
+            location=Location.ARBITRUM_ONE,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.00000368093'),
+            location_label=arbitrum_one_accounts[0],
+            tx_ref=tx_hash,
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            sequence_index=7,
+            timestamp=timestamp,
+            location=Location.ARBITRUM_ONE,
+            event_type=HistoryEventType.INFORMATIONAL,
+            event_subtype=HistoryEventSubType.APPROVE,
+            asset=Asset('eip155:42161/erc20:0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8'),
+            amount=FVal('125.164428'),
+            location_label=arbitrum_one_accounts[0],
+            tx_ref=tx_hash,
+            address=string_to_evm_address('0xD72e1B9A5FC74b35435f71603a81dAE217c2D863'),
+        ), EvmEvent(
+            sequence_index=8,
+            timestamp=timestamp,
+            location=Location.ARBITRUM_ONE,
+            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.DEPOSIT_FOR_WRAPPED,
+            asset=Asset('eip155:42161/erc20:0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8'),
+            amount=FVal(deposit_amount := '125.164428'),
+            location_label=arbitrum_one_accounts[0],
+            notes=f'Deposit {deposit_amount} USDC.e to Gearbox',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0xD72e1B9A5FC74b35435f71603a81dAE217c2D863'),
+        ), EvmEvent(
+            sequence_index=9,
+            timestamp=timestamp,
+            location=Location.ARBITRUM_ONE,
+            event_type=HistoryEventType.INFORMATIONAL,
+            event_subtype=HistoryEventSubType.APPROVE,
+            asset=Asset('eip155:42161/erc20:0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8'),
+            amount=ZERO,
+            location_label=arbitrum_one_accounts[0],
+            tx_ref=tx_hash,
+            address=string_to_evm_address('0xD72e1B9A5FC74b35435f71603a81dAE217c2D863'),
+        ), EvmEvent(
+            sequence_index=17,
+            timestamp=timestamp,
+            location=Location.ARBITRUM_ONE,
+            event_type=HistoryEventType.RECEIVE,
+            event_subtype=HistoryEventSubType.RECEIVE_WRAPPED,
+            asset=Asset('eip155:42161/erc20:0x608F9e2E8933Ce6b39A8CddBc34a1e3E8D21cE75'),
+            amount=FVal(lp_token_amount := '121.463529'),
+            location_label=arbitrum_one_accounts[0],
+            notes=f'Receive {lp_token_amount} farmdUSDCV3 after depositing in Gearbox',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0xD72e1B9A5FC74b35435f71603a81dAE217c2D863'),
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('db_settings', LEGACY_TESTS_INDEXER_ORDER)
+@pytest.mark.parametrize('load_global_caches', [[CPT_GEARBOX]])
+@pytest.mark.parametrize('optimism_accounts', [['0xb8150a1B6945e75D05769D685b127b41E6335Bbc']])
+def test_gearbox_deposit_optimism(
+        optimism_inquirer: OptimismInquirer,
+        optimism_accounts: list[ChecksumEvmAddress],
+        load_global_caches: list[str],
+):
+    events, _ = get_decoded_events_of_transaction(
+        evm_inquirer=optimism_inquirer,
+        tx_hash=(tx_hash := deserialize_evm_tx_hash('0x1dc1803865e909909bf20a82b0d88b476bcac13c7a0efa57c531baa06b0cb27e')),  # noqa: E501
+        load_global_caches=load_global_caches,
+    )
+    assert events == [
+        EvmEvent(
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1714433685000)),
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.000010672234173866'),
+            location_label=optimism_accounts[0],
+            tx_ref=tx_hash,
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            sequence_index=1,
+            timestamp=timestamp,
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.DEPOSIT_FOR_WRAPPED,
+            asset=A_ETH,
+            amount=FVal(deposit_amount := '0.1'),
+            location_label=optimism_accounts[0],
+            notes=f'Deposit {deposit_amount} ETH to Gearbox',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0xEa8ca794aEe0f998Ed6AB50F4042c28807E546Eb'),
+        ), EvmEvent(
+            sequence_index=97,
+            timestamp=timestamp,
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.RECEIVE,
+            event_subtype=HistoryEventSubType.RECEIVE_WRAPPED,
+            asset=Asset('eip155:10/erc20:0x704c4C9F0d29257E5b0E526b20b48EfFC8f758b2'),
+            amount=FVal(lp_token_amount := '0.099957406908026936'),
+            location_label=optimism_accounts[0],
+            notes=f'Receive {lp_token_amount} farmdWETHV3 after depositing in Gearbox',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0xEa8ca794aEe0f998Ed6AB50F4042c28807E546Eb'),
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('db_settings', LEGACY_TESTS_INDEXER_ORDER)
+@pytest.mark.parametrize('load_global_caches', [[CPT_GEARBOX]])
+@pytest.mark.parametrize('optimism_accounts', [['0xb8150a1B6945e75D05769D685b127b41E6335Bbc']])
+def test_gearbox_deposit_usdc_optimism(
+        optimism_inquirer: OptimismInquirer,
+        optimism_accounts: list[ChecksumEvmAddress],
+        load_global_caches: list[str],
+):
+    events, _ = get_decoded_events_of_transaction(
+        evm_inquirer=optimism_inquirer,
+        tx_hash=(tx_hash := deserialize_evm_tx_hash('0x25baef6edb2fae8fde18b7ee49dbba94bdaa500db1388cc5b22bdb4ba953d7b4')),  # noqa: E501
+        load_global_caches=load_global_caches,
+    )
+    assert events == [
+        EvmEvent(
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1714434001000)),
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.000011648221611152'),
+            location_label=optimism_accounts[0],
+            tx_ref=tx_hash,
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            sequence_index=3,
+            timestamp=timestamp,
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.DEPOSIT_FOR_WRAPPED,
+            asset=Asset('eip155:10/erc20:0x7F5c764cBc14f9669B88837ca1490cCa17c31607'),
+            amount=FVal(deposit_amount := '300'),
+            location_label=optimism_accounts[0],
+            notes=f'Deposit {deposit_amount} USDC.e to Gearbox',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0x931BC69a32BE7A36f9B00Bf63D17Fa8fB9a8C525'),
+        ), EvmEvent(
+            sequence_index=4,
+            timestamp=timestamp,
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.INFORMATIONAL,
+            event_subtype=HistoryEventSubType.APPROVE,
+            asset=Asset('eip155:10/erc20:0x7F5c764cBc14f9669B88837ca1490cCa17c31607'),
+            amount=FVal('394.3605'),
+            location_label=optimism_accounts[0],
+            tx_ref=tx_hash,
+            address=string_to_evm_address('0x931BC69a32BE7A36f9B00Bf63D17Fa8fB9a8C525'),
+        ), EvmEvent(
+            sequence_index=12,
+            timestamp=timestamp,
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.RECEIVE,
+            event_subtype=HistoryEventSubType.RECEIVE_WRAPPED,
+            asset=Asset('eip155:10/erc20:0x73302b63Ad4a16C498f26dB89cb27F37a72E4E04'),
+            amount=FVal(deposit_amount),
+            location_label=optimism_accounts[0],
+            notes=f'Receive {deposit_amount} farmdUSDCV3 after depositing in Gearbox',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0x931BC69a32BE7A36f9B00Bf63D17Fa8fB9a8C525'),
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('db_settings', LEGACY_TESTS_INDEXER_ORDER)
+@pytest.mark.parametrize('load_global_caches', [[CPT_GEARBOX]])
+@pytest.mark.parametrize('optimism_accounts', [['0x42ccF4f456D7c7fEBF274242CACcD74AAa0a53d7']])
+def test_gearbox_withdraw_optimism_usdc(
+        optimism_inquirer: OptimismInquirer,
+        optimism_accounts: list[ChecksumEvmAddress],
+        load_global_caches: list[str],
+):
+    events, _ = get_decoded_events_of_transaction(
+        evm_inquirer=optimism_inquirer,
+        tx_hash=(tx_hash := deserialize_evm_tx_hash('0x03569fa219dd445c120a38eb294a21feee8da7f0e1d3b6aed1d87a3ca519b16d')),  # noqa: E501
+        load_global_caches=load_global_caches,
+    )
+    assert events == [
+        EvmEvent(
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1712552439000)),
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.000001104938540339'),
+            location_label=optimism_accounts[0],
+            tx_ref=tx_hash,
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            sequence_index=125,
+            timestamp=timestamp,
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.RETURN_WRAPPED,
+            asset=Asset('eip155:10/erc20:0x73302b63Ad4a16C498f26dB89cb27F37a72E4E04'),
+            amount=FVal(lp_amount := '50'),
+            location_label=optimism_accounts[0],
+            notes=f'Return {lp_amount} farmdUSDCV3',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0x931BC69a32BE7A36f9B00Bf63D17Fa8fB9a8C525'),
+        ), EvmEvent(
+            sequence_index=129,
+            timestamp=timestamp,
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.WITHDRAWAL,
+            event_subtype=HistoryEventSubType.REDEEM_WRAPPED,
+            asset=Asset('eip155:10/erc20:0x7F5c764cBc14f9669B88837ca1490cCa17c31607'),
+            amount=FVal(lp_amount),
+            location_label=optimism_accounts[0],
+            notes=f'Withdraw {lp_amount} USDC.e from Gearbox',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=string_to_evm_address('0x5520dAa93A187f4Ec67344e6D2C4FC9B080B6A35'),
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0x0e414c1c4780df6c09c2f1070990768D44B70b1D']])
+def test_gearbox_staking(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+):
+    tx_hash = deserialize_evm_tx_hash('0x5de7647a4c8f8ca1e5434725dd09b27ce05e41954d72c3f1f4d639c8b7019f4a')  # noqa: E501
+    events, _ = get_decoded_events_of_transaction(evm_inquirer=ethereum_inquirer, tx_hash=tx_hash)
+    assert events == [
+        EvmEvent(
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1718177819000)),
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.0008970313372218'),
+            location_label=ethereum_accounts[0],
+            tx_ref=tx_hash,
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            sequence_index=509,
+            timestamp=timestamp,
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.INFORMATIONAL,
+            event_subtype=HistoryEventSubType.APPROVE,
+            asset=Asset('eip155:1/erc20:0xBa3335588D9403515223F109EdC4eB7269a9Ab5D'),
+            amount=FVal(stake_amount := '260.869836197270890866'),
+            location_label=ethereum_accounts[0],
+            tx_ref=tx_hash,
+            address=GEAR_STAKING_CONTRACT,
+        ), EvmEvent(
+            sequence_index=510,
+            timestamp=timestamp,
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.INFORMATIONAL,
+            event_subtype=HistoryEventSubType.APPROVE,
+            asset=Asset('eip155:1/erc20:0xBa3335588D9403515223F109EdC4eB7269a9Ab5D'),
+            amount=ZERO,
+            location_label=ethereum_accounts[0],
+            tx_ref=tx_hash,
+            address=GEAR_STAKING_CONTRACT,
+        ), EvmEvent(
+            sequence_index=511,
+            timestamp=timestamp,
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.STAKING,
+            event_subtype=HistoryEventSubType.DEPOSIT_ASSET,
+            asset=Asset('eip155:1/erc20:0xBa3335588D9403515223F109EdC4eB7269a9Ab5D'),
+            amount=FVal(stake_amount),
+            location_label='0x0e414c1c4780df6c09c2f1070990768D44B70b1D',
+            notes=f'Stake {stake_amount} GEAR',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=GEAR_STAKING_CONTRACT,
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0xe4283e107fB8E96F3175955EC7269afb51ECa6ea']])
+def test_gearbox_unstaking(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+):
+    tx_hash = deserialize_evm_tx_hash('0xb50badadb71b7c8c4ab2d0f9691931396322b2395da2396bee1ed65755e3882a')  # noqa: E501
+    events, _ = get_decoded_events_of_transaction(evm_inquirer=ethereum_inquirer, tx_hash=tx_hash)
+    assert events == [
+        EvmEvent(
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1717241039000)),
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.000287410296179888'),
+            location_label=ethereum_accounts[0],
+            tx_ref=tx_hash,
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            sequence_index=308,
+            timestamp=timestamp,
+            location=Location.ETHEREUM,
+            event_type=HistoryEventType.STAKING,
+            event_subtype=HistoryEventSubType.REMOVE_ASSET,
+            asset=Asset('eip155:1/erc20:0xBa3335588D9403515223F109EdC4eB7269a9Ab5D'),
+            amount=FVal(stake_amount := '1210105.252774990252868034'),
+            location_label=ethereum_accounts[0],
+            notes=f'Unstake {stake_amount} GEAR',
+            tx_ref=tx_hash,
+            counterparty=CPT_GEARBOX,
+            address=GEAR_STAKING_CONTRACT,
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('load_global_caches', [[CPT_GEARBOX]])
+@pytest.mark.parametrize('ethereum_accounts', [['0xC5d494aa0CBabD7871af0Ef122fB410Fa25c3379']])
+def test_gearbox_claim_from_angle(
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        load_global_caches: list[str],
+):
+    events, _ = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=(tx_hash := deserialize_evm_tx_hash('0x6539828c45548f323febc685498457880b0651375ca5077338a162676574048c')),  # noqa: E501
+        load_global_caches=load_global_caches,
+    )
+    assert events == [EvmEvent(
+        sequence_index=0,
+        timestamp=(timestamp := TimestampMS(1745790011000)),
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.FEE,
+        asset=A_ETH,
+        amount=FVal('0.00005385590405946'),
+        location_label=(user_account := ethereum_accounts[0]),
+        tx_ref=tx_hash,
+        counterparty=CPT_GAS,
+    ), EvmEvent(
+        sequence_index=371,
+        timestamp=timestamp,
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.RECEIVE,
+        event_subtype=HistoryEventSubType.REWARD,
+        asset=Asset('eip155:1/erc20:0xBa3335588D9403515223F109EdC4eB7269a9Ab5D'),
+        amount=FVal(gear_amount := '1412.737469800492924993'),
+        location_label=user_account,
+        notes=f'Claim {gear_amount} GEAR reward from Gearbox',
+        tx_ref=tx_hash,
+        counterparty=CPT_GEARBOX,
+        address=string_to_evm_address('0x3Ef3D8bA38EBe18DB133cEc108f4D14CE00Dd9Ae'),
+    )]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('load_global_caches', [[CPT_GEARBOX]])
+@pytest.mark.parametrize('ethereum_accounts', [['0xC5d494aa0CBabD7871af0Ef122fB410Fa25c3379']])
+def test_gearbox_claim(
+        setup_gearbox_cache,
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        load_global_caches: list[str],
+):
+    events, _ = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=(tx_hash := deserialize_evm_tx_hash('0x0e0efdf539b2882192958891ff9d0005297e0301ecd594763c87da8a84f1aca8')),  # noqa: E501
+        load_global_caches=load_global_caches,
+    )
+    assert events == [EvmEvent(
+        sequence_index=0,
+        timestamp=(timestamp := TimestampMS(1745790059000)),
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.FEE,
+        asset=A_ETH,
+        amount=FVal('0.000026898409237966'),
+        location_label=(user_account := ethereum_accounts[0]),
+        tx_ref=tx_hash,
+        counterparty=CPT_GAS,
+    ), EvmEvent(
+        sequence_index=339,
+        timestamp=timestamp,
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.RECEIVE,
+        event_subtype=HistoryEventSubType.REWARD,
+        asset=Asset('eip155:1/erc20:0xBa3335588D9403515223F109EdC4eB7269a9Ab5D'),
+        amount=FVal(gear_amount := '46983.327727303683938594'),
+        location_label=user_account,
+        notes=f'Claim {gear_amount} GEAR reward from Gearbox',
+        tx_ref=tx_hash,
+        counterparty=CPT_GEARBOX,
+        address=string_to_evm_address('0x9ef444a6d7F4A5adcd68FD5329aA5240C90E14d2'),
+    )]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('load_global_caches', [[CPT_GEARBOX]])
+@pytest.mark.parametrize('ethereum_accounts', [['0xC5d494aa0CBabD7871af0Ef122fB410Fa25c3379']])
+def test_gearbox_claim_farming_token(
+        setup_gearbox_cache,
+        ethereum_inquirer: EthereumInquirer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        load_global_caches: list[str],
+):
+    """Getting a transfer from a gearbox farming token should be a reward claim"""
+    events, _ = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=(tx_hash := deserialize_evm_tx_hash('0xaa841ada5e5e30bf1f516b6690b480cbe7e4f5629d93685306ff33b87b6f3f6d')),  # noqa: E501
+        load_global_caches=load_global_caches,
+    )
+    expected_events = [EvmEvent(
+        sequence_index=0,
+        timestamp=(timestamp := TimestampMS(1769851043000)),
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.FEE,
+        asset=A_ETH,
+        amount=FVal('0.00000905784'),
+        location_label=(user_account := ethereum_accounts[0]),
+        tx_ref=tx_hash,
+        counterparty=CPT_GAS,
+    ), EvmEvent(
+        sequence_index=521,
+        timestamp=timestamp,
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.RECEIVE,
+        event_subtype=HistoryEventSubType.REWARD,
+        asset=Asset('eip155:1/erc20:0xBa3335588D9403515223F109EdC4eB7269a9Ab5D'),
+        amount=FVal(gear_amount := '554.695350540591551374'),
+        location_label=user_account,
+        notes=f'Claim {gear_amount} GEAR reward from Gearbox',
+        tx_ref=tx_hash,
+        counterparty=CPT_GEARBOX,
+        address=string_to_evm_address('0x9ef444a6d7F4A5adcd68FD5329aA5240C90E14d2'),
+    )]
+    assert events == expected_events

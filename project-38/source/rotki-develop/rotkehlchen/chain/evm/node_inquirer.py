@@ -1,0 +1,2186 @@
+import itertools
+import json
+import logging
+from collections import defaultdict
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
+from itertools import zip_longest
+from typing import TYPE_CHECKING, Any, Final, Literal, TypeVar, overload
+
+import requests
+from eth_utils.abi import get_abi_output_types
+from web3 import Web3
+from web3._utils.contracts import find_matching_event_abi
+from web3._utils.filters import construct_event_filter_params
+from web3.datastructures import MutableAttributeDict
+from web3.exceptions import InvalidAddress, TransactionNotFound, Web3Exception
+
+from rotkehlchen.api.websockets.typedefs import WSMessageType
+from rotkehlchen.assets.utils import CHAIN_TO_WRAPPED_TOKEN, token_normalized_value_decimals
+from rotkehlchen.chain.constants import DEFAULT_RPC_TIMEOUT, SAFE_BASIC_ABI
+from rotkehlchen.chain.ethereum.constants import EVM_INDEXERS_NODE_NAME
+from rotkehlchen.chain.ethereum.utils import MULTICALL_CHUNKS, should_update_protocol_cache
+from rotkehlchen.chain.evm.constants import (
+    DEFAULT_TOKEN_DECIMALS,
+    EIP7702_DELEGATION_CODE_LENGTH,
+    EIP7702_DELEGATION_PREFIX,
+    ERC20_PROPERTIES,
+    ERC721_PROPERTIES,
+    ETHERSCAN_MAX_ARGUMENTS_TO_CONTRACT,
+    FAKE_GENESIS_TX_RECEIPT,
+    GENESIS_HASH,
+)
+from rotkehlchen.chain.evm.contracts import (
+    EvmContract,
+    EvmContracts,
+    checksum_decoded_addresses,
+)
+from rotkehlchen.chain.evm.l2_with_l1_fees.types import L2_CHAINIDS_WITH_L1_FEES
+from rotkehlchen.chain.evm.proxies_inquirer import EvmProxiesInquirer
+from rotkehlchen.chain.evm.types import (
+    DEFAULT_EVM_INDEXER_ORDER,
+    DEFAULT_INDEXERS_ORDER,
+    ETHERSCAN_PAID_TIER_ONLY_CHAINS,
+    EvmIndexer,
+    RemoteDataQueryStatus,
+    WeightedNode,
+)
+from rotkehlchen.chain.mixins.rpc_nodes import EVMRPCMixin, _is_rate_limit_error
+from rotkehlchen.chain.structures import TimestampOrBlockRange
+from rotkehlchen.concurrency import checkpoint
+from rotkehlchen.constants import ONE
+from rotkehlchen.db.settings import CachedSettings
+from rotkehlchen.errors.misc import (
+    BlockchainQueryError,
+    ChainNotSupported,
+    EventNotInABI,
+    InputError,
+    NoAvailableIndexers,
+    NotERC20Conformant,
+    NotERC721Conformant,
+    RemoteError,
+    RequestTooLargeError,
+)
+from rotkehlchen.errors.serialization import DeserializationError
+from rotkehlchen.externalapis.utils import read_integer
+from rotkehlchen.fval import FVal
+from rotkehlchen.logging import RotkehlchenLogsAdapter
+from rotkehlchen.serialization.deserialize import (
+    deserialize_evm_transaction,
+    deserialize_int_from_hex,
+)
+from rotkehlchen.serialization.serialize import process_result
+from rotkehlchen.types import (
+    SUPPORTED_CHAIN_IDS,
+    SUPPORTED_EVM_CHAINS_TYPE,
+    CacheType,
+    ChainID,
+    ChecksumEvmAddress,
+    EvmInternalTransaction,
+    EvmTransaction,
+    EVMTxHash,
+    Timestamp,
+    TokenKind,
+)
+from rotkehlchen.utils.data_structures import LRUCacheWithRemove
+from rotkehlchen.utils.misc import from_wei, get_chunks
+from rotkehlchen.utils.mixins.lockable import LockableQueryMixIn, protect_with_lock
+
+if TYPE_CHECKING:
+    from eth_typing.abi import ABI
+    from web3.types import BlockIdentifier, FilterParams
+
+    from rotkehlchen.assets.asset import CryptoAsset, EvmToken
+    from rotkehlchen.chain.ethereum.types import LogIterationCallback
+    from rotkehlchen.chain.gnosis.transactions import GnosisWithdrawalsQueryParameters
+    from rotkehlchen.db.dbhandler import DBHandler
+    from rotkehlchen.externalapis.blockscout import Blockscout
+    from rotkehlchen.externalapis.etherscan import Etherscan
+    from rotkehlchen.externalapis.etherscan_like import EtherscanLikeApi, HasChainActivity
+    from rotkehlchen.externalapis.routescan import Routescan
+    from rotkehlchen.tasks.supervisor import TaskSupervisor
+
+logger = logging.getLogger(__name__)
+log = RotkehlchenLogsAdapter(logger)
+
+# Indexers that could not resolve the block range currently being queried. Scoped to the
+# body of block_range_skipping_stale_indexers, since an indexer being behind is a property
+# of the range asked for and not of the indexer itself.
+DEGRADED_INDEXERS: Final[ContextVar[frozenset[EvmIndexer]]] = ContextVar(
+    'evm_degraded_indexers',
+    default=frozenset(),
+)
+
+T = TypeVar('T')
+
+
+def _connect_task_prefix(chain_name: str) -> str:
+    """Helper function to create the connection task greenlet name"""
+    return f'Attempt connection to {chain_name} node'
+
+
+WEB3_LOGQUERY_BLOCK_RANGE = 250000
+MAX_NODE_LOG_QUERY_CALLS = 500  # max queries for a node that can query logs from up to 1000/10_000 blocks  # noqa: E501
+
+
+def _query_web3_get_logs(
+        web3: Web3,
+        filter_args: FilterParams,
+        from_block: int,
+        to_block: int | Literal['latest'],
+        contract_address: ChecksumEvmAddress,
+        event_name: str,
+        argument_filters: dict[str, Any],
+        initial_block_range: int,
+        log_iteration_cb: LogIterationCallback | None = None,
+        log_iteration_cb_arguments: GnosisWithdrawalsQueryParameters | None = None,
+) -> list[dict[str, Any]]:
+    until_block = web3.eth.block_number if to_block == 'latest' else to_block
+    events: list[dict[str, Any]] = []
+    start_block = from_block
+    block_range = initial_block_range
+
+    while start_block <= until_block:
+        checkpoint()  # cancellation checkpoint: this loop can make hundreds of node queries
+        filter_args['fromBlock'] = start_block
+        end_block = min(start_block + block_range, until_block)
+        filter_args['toBlock'] = end_block
+        log.debug(
+            'Querying web3 node for contract event',
+            contract_address=contract_address,
+            event_name=event_name,
+            argument_filters=argument_filters,
+            from_block=filter_args['fromBlock'],
+            to_block=filter_args['toBlock'],
+        )
+        # As seen in https://github.com/rotki/rotki/issues/1787, the json RPC, if it
+        # is infura can throw an error here which we can only parse by catching the  exception
+        try:
+            new_events_web3: list[dict[str, Any]] = [dict(x) for x in web3.eth.get_logs(filter_args)]  # noqa: E501
+        except (Web3Exception, ValueError, KeyError) as e:
+            if isinstance(e, ValueError | Web3Exception):
+                try:
+                    decoded_error = json.loads(str(e).replace("'", '"'))
+                except json.JSONDecodeError:
+                    # reraise the value error if the error is not json
+                    raise e from None
+
+                msg = decoded_error.get('message', '')
+            else:  # temporary hack for key error seen from pokt
+                msg = 'query returned more than 10000 results'
+
+            # errors from: https://infura.io/docs/ethereum/json-rpc/eth-getLogs
+            if msg == 'query returned more than 10000 results':
+                if (until_block - start_block) // 10_000 > MAX_NODE_LOG_QUERY_CALLS:
+                    log.debug(f'Querying logs with a range of 10_000 from {web3} will take too much time. Stopping here')  # noqa: E501
+                    raise
+
+                block_range = initial_block_range = 9999  # ensure that block range doesn't get reset to a range bigger than what is allowed for this node  # noqa: E501
+                continue
+            elif msg == 'eth_getLogs is limited to a 1000 blocks range':  # seen in https://1rpc.io/gnosis
+                if (until_block - start_block) // 1_000 > MAX_NODE_LOG_QUERY_CALLS:
+                    log.debug(f'Querying logs with a range of 1000 from {web3} will take too much time. Stopping here')  # noqa: E501
+                    raise
+
+                block_range = initial_block_range = 999
+                continue
+            elif msg == 'query timeout exceeded':
+                block_range //= 2
+                if block_range < 50:
+                    raise  # stop retrying if block range gets too small
+                # repeat the query with smaller block range
+                continue
+            else:  # else, well we tried .. reraise the error
+                raise
+
+        # Turn all HexBytes into hex strings
+        for e_idx, event in enumerate(new_events_web3):
+            new_events_web3[e_idx]['blockHash'] = event['blockHash'].to_0x_hex()
+            new_events_web3[e_idx]['data'] = event['data'].to_0x_hex()
+            new_topics = [topic.to_0x_hex() for topic in event['topics']]
+            new_events_web3[e_idx]['topics'] = new_topics
+            new_events_web3[e_idx]['transactionHash'] = event['transactionHash'].to_0x_hex()
+
+        if log_iteration_cb is not None:
+            log_iteration_cb(
+                last_block_queried=end_block,
+                filters=argument_filters,
+                new_events=new_events_web3,
+                cb_arguments=log_iteration_cb_arguments,
+            )
+
+        start_block = end_block + 1
+        events.extend(new_events_web3)
+        # end of the loop, end of 1 query. Reset the block range to max
+        block_range = initial_block_range
+
+    return events
+
+
+class EvmNodeInquirer(EVMRPCMixin, LockableQueryMixIn):
+    """Class containing generic functionality for querying evm nodes
+
+    The child class must implement the following methods:
+    - _have_archive
+    - _is_pruned
+    - get_blocknumber_by_time
+
+    The child class may optionally implement the following:
+    - logquery_block_range
+    """
+    methods_that_query_past_data = (
+        '_get_transaction_receipt',
+        '_get_transaction_by_hash',
+        '_get_logs',
+    )
+    INDEXER_CHUNK_SIZE = ETHERSCAN_MAX_ARGUMENTS_TO_CONTRACT
+
+    def __init__(
+            self,
+            task_supervisor: TaskSupervisor,
+            database: DBHandler,
+            etherscan: Etherscan,
+            blockscout: Blockscout,
+            routescan: Routescan,
+            blockchain: SUPPORTED_EVM_CHAINS_TYPE,
+            contracts: EvmContracts,
+            contract_scan: EvmContract,
+            contract_multicall: EvmContract,
+            native_token: CryptoAsset,
+            rpc_timeout: int = DEFAULT_RPC_TIMEOUT,
+    ) -> None:
+        self.task_supervisor = task_supervisor
+        self.database = database
+        self.blockchain = blockchain
+        self.etherscan = etherscan
+        self.routescan = routescan
+        self.blockscout = blockscout
+        self.available_indexers: dict[EvmIndexer, Blockscout | Etherscan | Routescan | None] = {
+            EvmIndexer.ETHERSCAN: self.etherscan,
+            EvmIndexer.BLOCKSCOUT: self.blockscout,
+            EvmIndexer.ROUTESCAN: self.routescan,
+        }
+        self.contracts = contracts
+        self.rpc_timeout = rpc_timeout
+        self.chain_id: SUPPORTED_CHAIN_IDS = blockchain.to_chain_id()
+        self.chain_name = self.chain_id.to_name()
+        self.native_token = native_token
+        self.wrapped_native_token = CHAIN_TO_WRAPPED_TOKEN[self.blockchain].resolve_to_evm_token()
+        # BalanceScanner from mycrypto: https://github.com/MyCryptoHQ/eth-scan
+        self.contract_scan = contract_scan
+        # Multicall from MakerDAO: https://github.com/makerdao/multicall/
+        self.contract_multicall = contract_multicall
+        # keep a cache per chain id of timestamp to block to avoid querying multiple times
+        # the same information. Remove from here with
+        # https://github.com/rotki/rotki/issues/9998
+        self.timestamp_to_block_cache: dict[ChainID, LRUCacheWithRemove[Timestamp, int]] = defaultdict(lambda: LRUCacheWithRemove(maxsize=32))  # noqa: E501
+        # Cache block_number -> timestamp to avoid extra block header calls when transaction
+        # lists from indexers already include the timestamp.
+        self.block_to_timestamp_cache: LRUCacheWithRemove[int, Timestamp] = LRUCacheWithRemove(maxsize=2048)  # noqa: E501
+        # Which indexers could not resolve a given timestamp range to blocks. Kept next to
+        # the range cache above so every query over the range sees the same verdict.
+        self.range_indexer_failures: LRUCacheWithRemove[tuple[Timestamp, Timestamp], frozenset[EvmIndexer]] = LRUCacheWithRemove(maxsize=32)  # noqa: E501
+
+        # A cache for erc20 and erc721 contract info to not requery the info
+        self.contract_info_erc20_cache: LRUCacheWithRemove[ChecksumEvmAddress, dict[str, Any]] = LRUCacheWithRemove(maxsize=1024)  # noqa: E501
+        self.contract_info_erc721_cache: LRUCacheWithRemove[ChecksumEvmAddress, dict[str, Any]] = LRUCacheWithRemove(maxsize=512)  # noqa: E501
+        # cache used by is_safe_proxy_or_eoa
+        self._known_accounts_cache: LRUCacheWithRemove[ChecksumEvmAddress, bool] = LRUCacheWithRemove(maxsize=50)  # noqa: E501
+        # tracks the request length that failed to proactively use smaller chunks per node type
+        self._multicall_failed_length: dict[Literal['nodes', 'indexers'], int] = {}
+        self._no_indexer_notified: bool = False
+        # Set once etherscan refuses this chain for the configured key, which happens on the
+        # chains its free tier does not cover. Used to tell the user a paid key is needed.
+        self._etherscan_refused_chain: bool = False
+        LockableQueryMixIn.__init__(self)
+        EVMRPCMixin.__init__(self)
+        # Log the available nodes so we have extra information when debugging connection errors.
+        nodes = '\n'.join([str(x.serialize()) for x in self.default_call_order()])  # variable because \ is not valid in f-strings  # noqa: E501
+        log.debug(f'RPC nodes at startup {nodes}')
+
+    def get_multi_balance(
+            self,
+            accounts: Sequence[ChecksumEvmAddress],
+            call_order: Sequence[WeightedNode] | None = None,
+    ) -> dict[ChecksumEvmAddress, FVal]:
+        """Returns a dict with keys being accounts and balances in the chain native token.
+
+        May raise:
+        - RemoteError if an external service such as Etherscan is queried and
+          there is a problem with its query.
+        """
+        balances: dict[ChecksumEvmAddress, FVal] = {}
+        if len(accounts) == 0:
+            return balances
+
+        log.debug(
+            f'Querying {self.chain_name} chain for {self.blockchain.serialize()} balance',
+            eth_addresses=accounts,
+        )
+        result = self.contract_scan.call(
+            node_inquirer=self,
+            method_name='ether_balances',
+            arguments=[accounts],
+            call_order=call_order if call_order is not None else self.default_call_order(),
+        )
+        balances = {}
+        for idx, account in enumerate(accounts):
+            balances[account] = from_wei(result[idx])
+        return balances
+
+    @staticmethod
+    def _get_balance(
+            node_web3: Web3,
+            address: ChecksumEvmAddress,
+            block_identifier: int,
+    ) -> int:
+        return node_web3.eth.get_balance(
+            account=address,
+            block_identifier=block_identifier,
+        )
+
+    def get_historical_native_balance(
+            self,
+            address: ChecksumEvmAddress,
+            block_number: int,
+            queried_timestamp: Timestamp,
+            web3: Web3 | None = None,
+            save_query: bool = True,
+    ) -> FVal | None:
+        """Attempts to get the historical native token balance using the node provided.
+
+        If `web3` is None, it uses the local own node.
+        Returns None if there is no local node or node cannot query historical balance.
+
+        save_query is set to False when testing the capabilities of a node, in that case we don't
+        want to save any value in the db.
+        """
+        with self.database.conn.read_ctx() as cursor:  # first try to hit cache
+            if (cached_balance := self.database.get_historical_balance_cache(
+                cursor=cursor,
+                blockchain=self.blockchain,
+                address=address,
+                asset=self.native_token,
+                block_number=block_number,
+            )) is not None:
+                return cached_balance
+
+        archive_call_order = self.get_archive_call_order()
+        if web3 is None and len(archive_call_order) == 0:
+            return None
+
+        if web3 is None:
+            try:
+                result = self._query(
+                    method=self._get_balance,
+                    call_order=archive_call_order,
+                    address=address,
+                    block_identifier=block_number,
+                )
+            except RemoteError:
+                return None
+        else:
+            try:
+                result = self._get_balance(
+                    node_web3=web3,
+                    address=address,
+                    block_identifier=block_number,
+                )
+            except (
+                    requests.RequestException,
+                    BlockchainQueryError,
+                    KeyError,  # saw this happen inside web3.py if resulting json contains unexpected key. Happened with mycrypto's node  # noqa: E501
+                    Web3Exception,
+                    ValueError,  # can still happen in web3py v6 for missing trieerror. Essentially historical balance call  # noqa: E501
+            ):
+                return None
+
+        try:
+            balance = from_wei(FVal(result))
+        except ValueError:
+            return None
+
+        if save_query:
+            with self.database.user_write() as write_cursor:
+                self.database.set_historical_balance_cache(
+                    write_cursor=write_cursor,
+                    blockchain=self.blockchain,
+                    address=address,
+                    asset=self.native_token,
+                    amount=balance,
+                    timestamp=queried_timestamp,
+                    block_number=block_number,
+                )
+
+        return balance
+
+    def get_historical_token_balance(
+            self,
+            address: ChecksumEvmAddress,
+            token: EvmToken,
+            block_number: int,
+            queried_timestamp: Timestamp | None = None,
+    ) -> FVal | None:
+        """Query historical ERC20 token balance at a specific block using archive node.
+
+        Returns None if query fails (e.g., no archive node available, contract doesn't exist
+        at that block, etc.).
+        """
+        with self.database.conn.read_ctx() as cursor:
+            if (cached_balance := self.database.get_historical_balance_cache(
+                cursor=cursor,
+                blockchain=self.blockchain,
+                address=address,
+                asset=token,
+                block_number=block_number,
+            )) is not None:
+                return cached_balance
+
+        if len(archive_call_order := self.get_archive_call_order()) == 0:
+            return None
+
+        try:
+            raw_balance = self.call_contract(
+                contract_address=token.evm_address,
+                abi=self.contracts.erc20_abi,
+                method_name='balanceOf',
+                arguments=[address],
+                block_identifier=block_number,
+                call_order=archive_call_order,
+            )
+        except (RemoteError, BlockchainQueryError) as e:
+            log.error(
+                f'Failed to query historical token balance for {address} '
+                f'token {token.evm_address} at block {block_number}: {e!s}',
+            )
+            return None
+
+        balance = token_normalized_value_decimals(
+            token_amount=raw_balance,
+            token_decimals=token.decimals,
+        )
+        if queried_timestamp is not None:
+            with self.database.user_write() as write_cursor:
+                self.database.set_historical_balance_cache(
+                    write_cursor=write_cursor,
+                    blockchain=self.blockchain,
+                    address=address,
+                    asset=token,
+                    amount=balance,
+                    timestamp=queried_timestamp,
+                    block_number=block_number,
+                )
+
+        return balance
+
+    def has_archive_node(self) -> bool:
+        """Check if any connected RPC node is an archive node."""
+        # iterate a snapshot: spawned connect tasks insert into the mapping concurrently
+        return any(rpc_node.is_archive for rpc_node in list(self.rpc_mapping.values()))
+
+    def get_archive_call_order(self) -> list[WeightedNode]:
+        """Get connected archive nodes for historical queries."""
+        return [
+            WeightedNode(node_info=node, active=True, weight=ONE)
+            # iterate a snapshot: spawned connect tasks insert into the mapping concurrently
+            for node, rpc_node in list(self.rpc_mapping.items())
+            if rpc_node.is_archive
+        ]
+
+    def _have_archive(self, web3: Web3) -> bool:
+        """Returns a boolean representing if node is an archive one."""
+        address_to_check, block_to_check, expected_balance = self._get_archive_check_data()
+        return self.get_historical_native_balance(
+            address=address_to_check,
+            block_number=block_to_check,
+            queried_timestamp=Timestamp(0),  # not used
+            web3=web3,
+            save_query=False,
+        ) == expected_balance
+
+    def _query(self, method: Callable, call_order: Sequence[WeightedNode] | None = None, **kwargs: Any) -> Any:  # noqa: E501
+        """Queries evm related data by performing a query of the provided method to all given nodes
+
+        The first node in the call order that gets a successful response returns.
+        May raise:
+        - RemoteError if none of the RPC nodes can get a result
+        - RequestTooLargeError if we encounter a 414 error from etherscan-like
+          indexers or gas limit errors from RPC nodes.
+        """
+        if call_order is None:
+            call_order = self.default_call_order()
+        gas_limit_error_seen = False
+        transaction_not_found_seen = False
+        for node_idx, weighted_node in enumerate(call_order):
+            node_info = weighted_node.node_info
+            if (rpc_node := self.rpc_mapping.get(node_info, None)) is None:
+                if node_info.name in self.failed_to_connect_nodes:
+                    continue
+
+                if node_info.name != EVM_INDEXERS_NODE_NAME:
+                    success, _ = self.attempt_connect(node=node_info)
+                    if success is False:
+                        self.failed_to_connect_nodes.add(node_info.name)
+                        continue
+
+                    if (rpc_node := self.rpc_mapping.get(node_info, None)) is None:
+                        log.error(f'Unexpected missing node {node_info} at {self.chain_id}')
+                        continue
+
+            if rpc_node is not None and ((
+                method.__name__ in self.methods_that_query_past_data and
+                rpc_node.is_pruned is True
+            ) or (
+                kwargs.get('block_identifier', 'latest') != 'latest' and
+                rpc_node.is_archive is False
+            )):
+                # If the block_identifier is different from 'latest'
+                # this query should be routed to an archive node
+                continue
+
+            try:
+                web3 = rpc_node.rpc_client if rpc_node is not None else None
+                result = method(web3, **kwargs)
+            except TransactionNotFound:
+                transaction_not_found_seen = True
+                if kwargs.get('must_exist', False) is True:
+                    continue  # try other nodes, as transaction has to exist
+                return None
+            except InvalidAddress as e:
+                raise RemoteError(  # no need to try other nodes since its not a node problem.
+                    f'Failed to query {node_info.name} for {method!s}: '
+                    f'non-checksum address {e.args[1]}',
+                ) from e
+            except RequestTooLargeError:
+                gas_limit_error_seen = True
+                continue
+            except requests.Timeout as e:  # Add node to failed_to_connect_nodes to prevent repeatedly timing out on the same node.  # noqa: E501
+                log.warning(
+                    f'Timed out while querying {node_info.name} for '
+                    f'{method.__name__}: {e!s}. Skipping this node in future queries.',
+                )
+                self.mark_node_failure(node_info, str(e))
+                self.failed_to_connect_nodes.add(node_info.name)
+                self.rpc_mapping.pop(node_info, None)
+                continue
+            except (
+                    RemoteError,
+                    requests.exceptions.RequestException,
+                    BlockchainQueryError,
+                    Web3Exception,
+                    TypeError,  # happened at the web3 level calling `apply_result_formatters` when the RPC node returned `None` in the response's result # noqa: E501
+                    ValueError,  # not removing yet due to possibility of raising from missing trie error  # noqa: E501
+                    AttributeError,  # happened at the web3 level when response is a string instead of dict # noqa: E501
+                    json.JSONDecodeError,  # happens when RPC returns empty or invalid JSON responses # noqa: E501
+            ) as e:
+                log.warning(
+                    f'Failed to query {node_info.name} with position on the query list {node_idx} '
+                    f'for {method.__name__} due to {e!s}',
+                )
+                if any(x in str(e).lower() for x in ('out of gas', 'exceeds block gas limit')):
+                    gas_limit_error_seen = True
+                elif _is_rate_limit_error(e):
+                    self.mark_node_rate_limited(node_info, str(e))
+                else:
+                    self.mark_node_failure(node_info, str(e))
+                # Catch all possible errors here and just try next node call
+                continue
+
+            self.mark_node_success(node_info)
+            return result
+
+        # no node in the call order list was successfully queried
+        log.error(
+            f'Failed to query {method.__name__} after trying the following '
+            f'nodes: {[x.node_info.name for x in call_order]}. Call parameters were {kwargs}',
+        )
+        if gas_limit_error_seen:
+            raise RequestTooLargeError(
+                f'Failed to query {method.__name__} for {self.blockchain} due to gas limit error',
+            )
+        if transaction_not_found_seen:
+            raise InputError(f'Transaction {kwargs["tx_hash"]!s} was not found on {self.chain_name}')  # noqa: E501
+
+        raise RemoteError(f'Error querying information from {self.blockchain!s}. Check logs for more information')  # noqa: E501
+
+    def _get_latest_block_number(self, web3: Web3 | None) -> int:
+        if web3 is not None:
+            return web3.eth.block_number
+
+        # else
+        return self._try_indexers(func=lambda indexer: indexer.get_latest_block_number(
+            chain_id=self.chain_id,
+        ))
+
+    def get_latest_block_number(self, call_order: Sequence[WeightedNode] | None = None) -> int:
+        return self._query(
+            method=self._get_latest_block_number,
+            call_order=call_order,
+        )
+
+    def get_block_by_number(
+            self,
+            num: int,
+            call_order: Sequence[WeightedNode] | None = None,
+            full_transactions: bool = True,
+    ) -> dict[str, Any]:
+        return self._query(
+            method=self._get_block_by_number,
+            call_order=call_order,
+            num=num,
+            full_transactions=full_transactions,
+        )
+
+    def _get_block_by_number(
+            self,
+            web3: Web3 | None,
+            num: int,
+            full_transactions: bool = True,
+    ) -> dict[str, Any]:
+        """Returns the block object corresponding to the given block number
+
+        full_transactions decides whether the transactions of the block come as objects or
+        as hashes. It only reaches the indexers, since web3 already returns hashes here.
+
+        May raise:
+        - RemoteError if an external service such as Etherscan is queried and
+        there is a problem with its query.
+        - BlockNotFound if number used to lookup the block can't be found. Raised
+        by web3.eth.get_block().
+        """
+        if web3 is None:
+            return self._try_indexers(func=lambda indexer: indexer.get_block_by_number(
+                chain_id=self.chain_id,
+                block_number=num,
+                full_transactions=full_transactions,
+            ))
+
+        block_data: MutableAttributeDict = MutableAttributeDict(web3.eth.get_block(num))  # type: ignore # pylint: disable=no-member
+        block_data['hash'] = block_data['hash'].to_0x_hex()
+        return dict(block_data)
+
+    def get_code(
+            self,
+            account: ChecksumEvmAddress,
+            call_order: Sequence[WeightedNode] | None = None,
+    ) -> str:
+        return self._query(
+            method=self._get_code,
+            call_order=call_order,
+            account=account,
+        )
+
+    def _get_code(self, web3: Web3 | None, account: ChecksumEvmAddress) -> str:
+        """Gets the deployment bytecode at the given address as a 0x hex string
+
+        May raise:
+        - RemoteError if an indexer is used and there is a problem querying it or
+        parsing its response
+        """
+        if web3 is None:
+            return self._try_indexers(func=lambda indexer: indexer.get_code(
+                chain_id=self.chain_id,
+                account=account,
+            ))
+
+        return web3.eth.get_code(account).to_0x_hex()
+
+    def _call_contract_indexers(
+            self,
+            contract_address: ChecksumEvmAddress,
+            abi: ABI,
+            method_name: str,
+            arguments: list[Any] | None = None,
+            block_identifier: BlockIdentifier = 'latest',
+    ) -> Any:
+        """Performs an eth_call to an evm contract via the indexers.
+
+        May raise:
+        - RemoteError if there is a problem reaching the indexers or with the returned result
+        """
+        web3 = Web3()
+        given_arguments = arguments or []
+        contract = web3.eth.contract(address=contract_address, abi=abi)
+        input_data = contract.encode_abi(method_name, args=given_arguments)
+        if (result := self._try_indexers(func=lambda indexer: indexer.eth_call(
+            chain_id=self.chain_id,
+            to_address=contract_address,
+            input_data=input_data,
+            block_identifier=block_identifier,
+        ))) == '0x':
+            raise BlockchainQueryError(
+                f'Error doing call on contract {contract_address} for {method_name} '
+                f'and chain {self.chain_name} with arguments: {arguments!s} '
+                f'via indexers. Returned 0x result',
+            )
+
+        fn_abi = contract._find_matching_fn_abi(
+            method_name,
+            *given_arguments,
+        )
+        output_types = get_abi_output_types(fn_abi)
+        output_data = checksum_decoded_addresses(
+            values=web3.codec.decode(output_types, bytes.fromhex(result[2:])),
+            output_types=output_types,
+        )
+
+        if len(output_data) == 1:
+            # due to https://github.com/PyCQA/pylint/issues/4114
+            return output_data[0]
+        return output_data
+
+    def call_contract(
+            self,
+            contract_address: ChecksumEvmAddress,
+            abi: ABI,
+            method_name: str,
+            arguments: list[Any] | None = None,
+            call_order: Sequence[WeightedNode] | None = None,
+            block_identifier: BlockIdentifier = 'latest',
+    ) -> Any:
+        return self._query(
+            method=self._call_contract,
+            call_order=call_order,
+            contract_address=contract_address,
+            abi=abi,
+            method_name=method_name,
+            arguments=arguments,
+            block_identifier=block_identifier,
+        )
+
+    def _call_contract(
+            self,
+            web3: Web3 | None,
+            contract_address: ChecksumEvmAddress,
+            abi: ABI,
+            method_name: str,
+            arguments: list[Any] | None = None,
+            block_identifier: BlockIdentifier = 'latest',
+    ) -> Any:
+        """Performs an eth_call to an evm contract
+
+        May raise:
+        - RemoteError if etherscan is used and there is a problem with
+        reaching it or with the returned result
+        - BlockchainQueryError if web3 is used and there is a VM execution error
+        """
+        if web3 is None:
+            return self._call_contract_indexers(
+                contract_address=contract_address,
+                abi=abi,
+                method_name=method_name,
+                arguments=arguments,
+                block_identifier=block_identifier,
+            )
+
+        contract = web3.eth.contract(address=contract_address, abi=abi)
+        try:
+            method = getattr(contract.caller(block_identifier=block_identifier), method_name)
+            result = method(*arguments or [])
+        except InvalidAddress:
+            raise  # propagate to _query() where it's handled properly
+        except (Web3Exception, ValueError) as e:
+            raise BlockchainQueryError(
+                f'Error doing call on contract {contract_address}: {e!s}',
+            ) from e
+        return result
+
+    def get_storage_at(
+            self,
+            account_address: ChecksumEvmAddress,
+            position: int,
+            call_order: Sequence[WeightedNode] | None = None,
+    ) -> bytes:
+        """Read the raw 32-byte storage word at the given slot of an address.
+
+        May raise:
+        - RemoteError if none of the nodes could return a result
+        """
+        return self._query(
+            method=self._get_storage_at,
+            call_order=call_order,
+            account_address=account_address,
+            position=position,
+        )
+
+    def _get_storage_at(
+            self,
+            web3: Web3 | None,
+            account_address: ChecksumEvmAddress,
+            position: int,
+    ) -> bytes:
+        """Read the raw 32-byte storage word at the given slot of an address.
+
+        May raise:
+        - RemoteError if web3 is None, since indexers can't read raw storage and we need to
+          fail over to an rpc node
+        - Web3Exception/ValueError propagated by web3 if the rpc call itself fails, which
+          _query() turns into a RemoteError so the next node is tried
+        """
+        if web3 is None:  # indexers can't read raw storage, fail over to an rpc node
+            raise RemoteError('Reading contract storage requires an rpc node')
+        return bytes(web3.eth.get_storage_at(account_address, position))
+
+    def _get_transaction_receipt(
+            self,
+            web3: Web3 | None,
+            tx_hash: EVMTxHash,
+            must_exist: bool = False,
+    ) -> dict[str, Any] | None:
+        if tx_hash == GENESIS_HASH:
+            return FAKE_GENESIS_TX_RECEIPT
+        if web3 is None:
+            if (tx_receipt := self._try_indexers(func=lambda indexer: indexer.get_transaction_receipt(  # noqa: E501
+                chain_id=self.chain_id,
+                tx_hash=tx_hash,
+            ))) is None:
+                if must_exist:  # fail, so other nodes can be tried
+                    raise RemoteError(f'Querying for {self.chain_name} receipt {tx_hash!s} returned None')  # noqa: E501
+
+                return None  # else it does not exist
+
+            try:
+                # Turn hex numbers to int
+                block_number = int(tx_receipt['blockNumber'], 16)
+                tx_receipt['blockNumber'] = block_number
+                tx_receipt['cumulativeGasUsed'] = int(tx_receipt['cumulativeGasUsed'], 16)
+                tx_receipt['gasUsed'] = int(tx_receipt['gasUsed'], 16)
+                tx_receipt['status'] = int(tx_receipt.get('status', '0x1'), 16)
+                tx_index = int(tx_receipt['transactionIndex'], 16)
+                tx_receipt['transactionIndex'] = tx_index
+                for receipt_log in tx_receipt['logs']:
+                    receipt_log['blockNumber'] = block_number
+                    receipt_log['logIndex'] = deserialize_int_from_hex(
+                        symbol=receipt_log['logIndex'],
+                        location='etherscan tx receipt',
+                    )
+                    receipt_log['transactionIndex'] = tx_index
+            except (DeserializationError, Web3Exception, ValueError, KeyError) as e:
+                msg = str(e)
+                if isinstance(e, KeyError):
+                    msg = f'missing key {msg}'
+                log.error(
+                    f'Couldnt deserialize transaction receipt {tx_receipt} data from '
+                    f'etherscan due to {msg}',
+                )
+                raise RemoteError(
+                    f'Couldnt deserialize transaction receipt data from etherscan '
+                    f'due to {msg}. Check logs for details',
+                ) from e
+
+            return tx_receipt
+
+        # Can raise TransactionNotFound if the user's node is pruned and transaction is old
+        try:
+            tx_receipt = web3.eth.get_transaction_receipt(tx_hash)  # type: ignore
+        except TransactionNotFound as e:
+            if must_exist:  # fail, so other nodes can be tried
+                raise RemoteError(f'Querying for {self.chain_name} receipt {tx_hash!s} returned None') from e  # noqa: E501
+
+            raise  # else re-raise e
+
+        return process_result(tx_receipt)
+
+    def maybe_get_transaction_receipt(
+            self,
+            tx_hash: EVMTxHash,
+            call_order: Sequence[WeightedNode] | None = None,
+            must_exist: bool = False,
+    ) -> dict[str, Any] | None:
+        return self._query(
+            method=self._get_transaction_receipt,
+            call_order=call_order,
+            tx_hash=tx_hash,
+            must_exist=must_exist,
+        )
+
+    def get_transaction_receipt(
+            self,
+            tx_hash: EVMTxHash,
+            call_order: Sequence[WeightedNode] | None = None,
+    ) -> dict[str, Any]:
+        """Retrieves the transaction receipt for the tx_hash provided.
+
+        This method assumes the tx_hash is present on-chain,
+        and we are connected to at least one node that can retrieve it.
+        """
+        tx_receipt = self.maybe_get_transaction_receipt(
+            call_order=call_order,
+            tx_hash=tx_hash,
+            must_exist=True,
+        )
+        if tx_receipt is None:
+            raise RemoteError(f'{self.chain_name} tx_receipt should exist for {tx_hash!s}')
+        return tx_receipt
+
+    def _get_transaction_receipts(
+            self,
+            web3: Web3 | None,
+            tx_hashes: Sequence[EVMTxHash],
+    ) -> list[dict[str, Any]]:
+        """Queries the receipts for all tx_hashes from a single node in one batched
+        JSON-RPC request and returns them in the order of the given hashes.
+
+        May raise:
+        - RemoteError if web3 is None (indexers don't support JSON-RPC batching) or if
+          the node errors on or mishandles the batched request (for example because it
+          does not support batching), so that _query() fails over to the next node
+        - TransactionNotFound if the node is missing any of the receipts, in which case
+          _query() returns None and the caller falls back to per-tx queries
+        """
+        if web3 is None:
+            raise RemoteError(f'Batched receipt queries for {self.chain_name} require an rpc node')
+
+        if len(batched_hashes := [x for x in tx_hashes if x != GENESIS_HASH]) == 0:
+            return [FAKE_GENESIS_TX_RECEIPT] * len(tx_hashes)
+
+        try:
+            with web3.batch_requests() as batch:
+                for tx_hash in batched_hashes:
+                    batch.add(web3.eth.get_transaction_receipt(tx_hash))  # type: ignore
+                results = batch.execute()
+        except (Web3Exception, KeyError) as e:
+            if isinstance(e, TransactionNotFound):
+                raise  # the node is missing a receipt. Handled by _query() as documented
+
+            # Any other web3-level error here most likely means the node does not
+            # properly support batched JSON-RPC requests
+            raise RemoteError(
+                f'Batched receipt query to a {self.chain_name} node failed, probably '
+                f'due to the node not supporting batched requests: {e!s}',
+            ) from e
+
+        if len(results) != len(batched_hashes):
+            raise RemoteError(
+                f'A {self.chain_name} node returned {len(results)} receipts to a '
+                f'batched query for {len(batched_hashes)} transactions',
+            )
+
+        results_iter = iter(results)
+        return [
+            FAKE_GENESIS_TX_RECEIPT if tx_hash == GENESIS_HASH else process_result(next(results_iter))  # noqa: E501
+            for tx_hash in tx_hashes
+        ]
+
+    def get_transaction_receipts(
+            self,
+            tx_hashes: Sequence[EVMTxHash],
+            call_order: Sequence[WeightedNode] | None = None,
+    ) -> list[dict[str, Any]] | None:
+        """Retrieves the receipts for the given tx hashes with a single batched JSON-RPC
+        request per attempted node and returns them in the order of the given hashes.
+
+        Only already-connected non-pruned rpc nodes are tried, since indexers don't
+        support batching and old receipts may be missing from pruned nodes. Returns None
+        if no such node exists or none of them could serve the full batch, in which case
+        the caller should fall back to per-tx queries which can also use indexers and
+        handle single missing receipts.
+        """
+        if len(tx_hashes) == 0:
+            return []
+
+        web3_call_order = [
+            node for node in (call_order if call_order is not None else self.default_call_order())
+            if (rpc_node := self.rpc_mapping.get(node.node_info)) is not None and
+            rpc_node.is_pruned is False
+        ]
+        if len(web3_call_order) == 0:
+            return None
+
+        try:
+            return self._query(
+                method=self._get_transaction_receipts,
+                call_order=web3_call_order,
+                tx_hashes=tx_hashes,
+            )
+        except RemoteError:
+            return None
+
+    def _get_transaction_by_hash(
+            self,
+            web3: Web3 | None,
+            tx_hash: EVMTxHash,
+            must_exist: bool = False,
+    ) -> tuple[EvmTransaction, dict[str, Any]] | None:
+        if web3 is None:
+            tx_data = self._try_indexers(func=lambda indexer: indexer.get_transaction_by_hash(
+                chain_id=self.chain_id,
+                tx_hash=tx_hash,
+            ))
+        else:
+            tx_data = web3.eth.get_transaction(tx_hash)  # type: ignore
+        if tx_data is None or tx_data == 'null' or (
+            isinstance(tx_data, Mapping) and 'result' in tx_data and tx_data['result'] is None
+        ):
+            log.debug('%s transaction %s was not found. Response was %s', self.chain_name, tx_hash, tx_data)  # noqa: E501
+            if must_exist:  # fail, so other nodes can be tried
+                raise TransactionNotFound(f'Transaction {tx_hash!s} was not found on {self.chain_name}')  # noqa: E501
+
+            return None  # else it does not exist
+
+        try:
+            transaction, receipt_data = deserialize_evm_transaction(
+                data=tx_data,
+                internal=False,
+                chain_id=self.chain_id,
+                evm_inquirer=self,
+            )
+        except (DeserializationError, ValueError) as e:
+            raise RemoteError(
+                f'Couldnt deserialize evm transaction data from {tx_data}. Error: {e!s}',
+            ) from e
+
+        if receipt_data is None:
+            raise RemoteError(f'{self.chain_name} transaction {tx_hash!s} receipt_data is expected to exist')  # noqa: E501  # as etherscan getTransactionByHash does not contains gasUsed'
+        return transaction, receipt_data
+
+    def maybe_get_transaction_by_hash(
+            self,
+            tx_hash: EVMTxHash,
+            call_order: Sequence[WeightedNode] | None = None,
+            must_exist: bool = False,
+    ) -> tuple[EvmTransaction, dict[str, Any]]:
+        """Gets transaction by hash and raw receipt data.
+
+        May raise:
+        - InputError if the transaction does not exist on-chain.
+        - RemoteError if no node can reliably answer the query.
+        """
+        if (result := self._query(
+            method=self._get_transaction_by_hash,
+            call_order=call_order,
+            tx_hash=tx_hash,
+            must_exist=must_exist,
+        )) is None:
+            raise InputError(f'Transaction {tx_hash!s} was not found on {self.chain_name}')
+
+        return result
+
+    def get_transaction_by_hash(
+            self,
+            tx_hash: EVMTxHash,
+            call_order: Sequence[WeightedNode] | None = None,
+    ) -> tuple[EvmTransaction, dict[str, Any]]:
+        """Retrieves information about a transaction from its hash.
+
+        This method assumes the tx_hash is present on-chain,
+        and we are connected to at least 1 node that can retrieve it.
+        """
+        return self.maybe_get_transaction_by_hash(
+            call_order=call_order,
+            tx_hash=tx_hash,
+            must_exist=True,
+        )
+
+    def get_logs(
+            self,
+            contract_address: ChecksumEvmAddress,
+            abi: ABI,
+            event_name: str,
+            argument_filters: dict[str, Any],
+            from_block: int,
+            to_block: int | Literal['latest'] = 'latest',
+            call_order: Sequence[WeightedNode] | None = None,
+            log_iteration_cb: LogIterationCallback | None = None,
+            log_iteration_cb_arguments: GnosisWithdrawalsQueryParameters | None = None,
+    ) -> list[dict[str, Any]]:
+        if call_order is None:  # Default call order for logs
+            call_order = [self.indexers_node]
+            if (node_info := self.get_own_node_info()) is not None:
+                call_order.append(
+                    WeightedNode(
+                        node_info=node_info,
+                        active=True,
+                        weight=ONE,
+                    ),
+                )
+        return self._query(
+            method=self._get_logs,
+            call_order=call_order,
+            contract_address=contract_address,
+            abi=abi,
+            event_name=event_name,
+            argument_filters=argument_filters,
+            from_block=from_block,
+            to_block=to_block,
+            log_iteration_cb=log_iteration_cb,
+            log_iteration_cb_arguments=log_iteration_cb_arguments,
+        )
+
+    def _get_logs(
+            self,
+            web3: Web3 | None,
+            contract_address: ChecksumEvmAddress,
+            abi: ABI,
+            event_name: str,
+            argument_filters: dict[str, Any],
+            from_block: int,
+            to_block: int | Literal['latest'] = 'latest',
+            log_iteration_cb: LogIterationCallback | None = None,
+            log_iteration_cb_arguments: GnosisWithdrawalsQueryParameters | None = None,
+    ) -> list[dict[str, Any]]:
+        """Queries logs of an evm contract
+        May raise:
+
+        - EventNotInABI if the given event is not in the ABI
+        - RemoteError if etherscan is used and there is a problem with
+        reaching it or with the returned result
+        """
+        try:
+            event_abi = find_matching_event_abi(abi=abi, event_name=event_name)
+        except ValueError as e:
+            raise EventNotInABI from e
+
+        _, filter_args = construct_event_filter_params(
+            event_abi=event_abi,
+            abi_codec=Web3().codec,
+            contract_address=contract_address,
+            argument_filters=argument_filters,
+            from_block=from_block,
+            to_block=to_block,
+        )
+
+        if event_abi.get('anonymous', False):
+            # web3.py does not handle the anonymous events correctly and adds the first topic
+            filter_args['topics'] = filter_args['topics'][1:]  # pyright: ignore  # I think FilterParams is not well defined. It always has topics
+        events: list[dict[str, Any]] = []
+        start_block = from_block
+
+        log.debug(f'Ready to query logs for {filter_args} at {contract_address} ({self.chain_id}) from {start_block} to {to_block}')  # noqa: E501
+        if web3 is not None:
+            events = _query_web3_get_logs(
+                web3=web3,
+                filter_args=filter_args,
+                from_block=from_block,
+                to_block=to_block,
+                contract_address=contract_address,
+                event_name=event_name,
+                argument_filters=argument_filters,
+                initial_block_range=self.logquery_block_range(web3=web3, contract_address=contract_address),  # noqa: E501
+                log_iteration_cb=log_iteration_cb,
+                log_iteration_cb_arguments=log_iteration_cb_arguments,
+            )
+        else:  # etherscan
+            until_block = (
+                self._get_latest_block_number(web3=None) if to_block == 'latest' else to_block
+            )
+            blocks_step = 300000
+            while start_block <= until_block:
+                checkpoint()  # cancellation checkpoint: this loop can make hundreds of queries
+                while True:  # loop to continuously reduce block range if need b
+                    end_block = min(start_block + blocks_step, until_block)
+                    try:
+                        new_events = self._try_indexers(func=lambda indexer, start=start_block, end=end_block: indexer.get_logs(  # type: ignore[misc]  # noqa: E501
+                            chain_id=self.chain_id,
+                            contract_address=contract_address,
+                            topics=filter_args.get('topics', []),
+                            from_block=start,
+                            to_block=end,
+                            existing_events=events,
+                        ))
+                    except RemoteError as e:
+                        if 'Please select a smaller result dataset' in str(e):
+
+                            blocks_step //= 2
+                            if blocks_step < 100:
+                                raise  # stop trying
+                            # else try with the smaller step
+                            continue
+
+                        # else some other error
+                        raise
+
+                    break  # we must have a result
+
+                if log_iteration_cb is not None:
+                    log_iteration_cb(
+                        last_block_queried=end_block,
+                        filters=argument_filters,
+                        new_events=new_events,
+                        cb_arguments=log_iteration_cb_arguments,
+                    )
+
+                # etherscan will only return 1000 events in one go. If more than 1000
+                # are returned such as when no filter args are provided then continue
+                # the query from the last block
+                if len(new_events) == 1000:
+                    start_block = new_events[-1]['blockNumber']
+                else:
+                    start_block = end_block + 1
+                events.extend(new_events)
+
+        return events
+
+    def multicall(
+            self,
+            calls: list[tuple[ChecksumEvmAddress, str]],
+            # only here to comply with multicall_2
+            require_success: bool = True,  # pylint: disable=unused-argument
+            call_order: Sequence[WeightedNode] | None = None,
+            block_identifier: BlockIdentifier = 'latest',
+            calls_chunk_size: int = MULTICALL_CHUNKS,
+    ) -> Any:
+        """Uses MULTICALL contract. Failure of one call is a failure of the entire multicall.
+        Tries regular nodes first, falls back to indexers if they fail.
+        source: https://etherscan.io/address/0xeefBa1e63905eF1D7ACbA5a8513c70307C1cE441#code
+        Can raise:
+        - RemoteError
+        """
+        call_order = self.default_call_order() if call_order is None else call_order
+        estimated_length = sum(len(call[1]) for call in calls)
+
+        # try regular nodes first
+        if len(regular_nodes := [n for n in call_order if n.node_info.name != EVM_INDEXERS_NODE_NAME]) != 0:  # noqa: E501
+            chunk_size = 3 if (
+                (failed := self._multicall_failed_length.get('nodes')) is not None and
+                estimated_length >= failed
+            ) else calls_chunk_size
+            try:
+                return self._execute_multicall(
+                    calls=calls,
+                    call_order=regular_nodes,
+                    block_identifier=block_identifier,
+                    calls_chunk_size=chunk_size,
+                    estimated_length=estimated_length,
+                    cache_key='nodes',
+                )
+            except RemoteError:
+                pass  # fall through to indexers
+
+        # fallback to indexers
+        chunk_size = 3 if (
+            (failed := self._multicall_failed_length.get('indexers')) is not None and
+            estimated_length >= failed
+        ) else calls_chunk_size
+        return self._execute_multicall(
+            calls=calls,
+            call_order=[self.indexers_node],
+            block_identifier=block_identifier,
+            calls_chunk_size=chunk_size,
+            estimated_length=estimated_length,
+            cache_key='indexers',
+        )
+
+    def _execute_multicall(
+            self,
+            calls: list[tuple[ChecksumEvmAddress, str]],
+            call_order: Sequence[WeightedNode],
+            block_identifier: BlockIdentifier,
+            calls_chunk_size: int,
+            estimated_length: int,
+            cache_key: Literal['nodes', 'indexers'],
+    ) -> Any:
+        """Execute multicall with retry on RequestTooLargeError using smaller chunks.
+
+        May raise:
+        - RemoteError if none of the rpcs can get a result
+        - RequestTooLargeError if we encounter a 414 error from etherscan-like
+          indexers or gas limit errors from rpcs and retrying with smaller chunks fails
+        """
+        try:
+            output = []
+            for call_chunk in get_chunks(calls, n=calls_chunk_size):
+                _, chunk_output = self.contract_multicall.call(
+                    node_inquirer=self,
+                    method_name='aggregate',
+                    arguments=[call_chunk],
+                    call_order=call_order,
+                    block_identifier=block_identifier,
+                )
+                output.extend(chunk_output)
+        except RequestTooLargeError:
+            if calls_chunk_size <= 3:
+                raise
+            self._multicall_failed_length[cache_key] = estimated_length
+            return self._execute_multicall(
+                calls=calls,
+                call_order=call_order,
+                block_identifier=block_identifier,
+                calls_chunk_size=3,
+                estimated_length=estimated_length,
+                cache_key=cache_key,
+            )
+        else:
+            return output
+
+    def multicall_2(
+            self,
+            calls: list[tuple[ChecksumEvmAddress, str]],
+            require_success: bool,
+            call_order: Sequence[WeightedNode] | None = None,
+            block_identifier: BlockIdentifier = 'latest',
+            # only here to comply with multicall
+            calls_chunk_size: int = MULTICALL_CHUNKS,  # pylint: disable=unused-argument
+    ) -> list[tuple[bool, bytes]]:
+        """
+        Uses MULTICALL_2 contract. If require success is set to False any call in the list
+        of calls is allowed to fail.
+        source: https://etherscan.io/address/0x5BA1e12693Dc8F9c48aAD8770482f4739bEeD696#code"""
+        return self.contract_multicall.call(
+            node_inquirer=self,
+            method_name='tryAggregate',
+            arguments=[require_success, calls],
+            call_order=call_order,
+            block_identifier=block_identifier,
+        )
+
+    def multicall_specific(
+            self,
+            contract: EvmContract,
+            method_name: str,
+            arguments: list[Any],
+            call_order: Sequence[WeightedNode] | None = None,
+            decode_result: bool = True,
+    ) -> Any:
+        calls = [(
+            contract.address,
+            contract.encode(method_name=method_name, arguments=i),
+        ) for i in arguments]
+        output = self.multicall(calls, True, call_order)
+        if decode_result is False:
+            return output
+        return [contract.decode(x, method_name, arguments[0]) for x in output]
+
+    def _process_and_create_erc20_info(
+            self,
+            output: list[tuple[bool, bytes]],
+            address: ChecksumEvmAddress,
+    ) -> dict[str, Any]:
+        """May raise:
+        - NotERC20Conformant
+        """
+        info: dict[str, Any] = {}
+        contract = EvmContract(address=address, abi=self.contracts.erc20_abi, deployed_block=0)
+        try:
+            decoded = self._process_contract_info(
+                output=output,
+                properties=ERC20_PROPERTIES,
+                contract=contract,
+                token_kind=TokenKind.ERC20,
+            )
+        except (OverflowError, DeserializationError) as e:
+            # This can happen when contract follows the ERC20 standard methods
+            # but name and symbol return bytes instead of string. UNIV1 LP is such a case
+            # It can also happen if the method is missing and they are all hitting
+            # the fallback function. old WETH contract is such a case
+            log.error(
+                f'{address} failed to decode as ERC20 token. '
+                f'Trying with token ABI using bytes. {e!s}',
+            )
+            abi = self.contracts.univ1lp_abi
+            contract = EvmContract(address=address, abi=abi, deployed_block=0)
+            try:
+                decoded = self._process_contract_info(
+                    output=output,
+                    properties=ERC20_PROPERTIES,
+                    contract=contract,
+                    token_kind=TokenKind.ERC20,
+                )
+            except (OverflowError, DeserializationError) as err:
+                # if even the bytes abi fails, this definitely isn't a valid erc20 token
+                raise NotERC20Conformant from err
+
+            log.debug(f'{address} was successfully decoded as ERC20 token')
+
+        for prop, value in zip_longest(ERC20_PROPERTIES, decoded):
+            if isinstance(value, bytes):
+                value = value.rstrip(b'\x00').decode()  # noqa: PLW2901
+            info[prop] = value
+
+        return info
+
+    def _query_token_contract(
+            self,
+            abi: ABI,
+            properties: tuple[str, ...],
+            address: ChecksumEvmAddress,
+    ) -> list[tuple[bool, bytes]]:
+        contract = EvmContract(address=address, abi=abi, deployed_block=0)
+        try:
+            # Output contains call status and result
+            output = self.multicall_2(
+                require_success=False,
+                calls=[(address, contract.encode(method_name=prop)) for prop in properties],
+            )
+        except RemoteError:
+            # If something happens in the connection the output should have
+            # the same length as the tuple of properties
+            output = [(False, b'')] * len(properties)
+
+        return output
+
+    def get_erc20_contract_info(self, address: ChecksumEvmAddress) -> dict[str, Any]:
+        """
+        Query an erc20 contract address and return basic information as:
+        - Decimals
+        - name
+        - symbol
+        At all times, the dictionary returned contains the keys; decimals, name & symbol.
+        Although the values might be None.
+        if it is provided in the contract. This method may raise:
+        - BadFunctionCallOutput: If there is an error calling a bad address
+        - NotERC20Conformant
+        """
+        if (cache := self.contract_info_erc20_cache.get(address)) is not None:
+            return cache
+
+        output = self._query_token_contract(abi=self.contracts.erc20_abi, properties=ERC20_PROPERTIES, address=address)  # noqa: E501
+        info = self._process_and_create_erc20_info(
+            output=output,
+            address=address,
+        )
+        self.contract_info_erc20_cache.add(address, info)
+        return info
+
+    def get_erc721_contract_info(self, address: ChecksumEvmAddress) -> dict[str, Any]:
+        """
+        Query an erc721 contract address and return basic information.
+        - name
+        - symbol
+        At all times, the dictionary returned contains the keys; name & symbol.
+        Although the values might be None. https://eips.ethereum.org/EIPS/eip-721
+        According to the standard both name and symbol are optional.
+        if it is provided in the contract. This method may raise:
+        - BadFunctionCallOutput: If there is an error calling a bad address
+        - NotERC721Conformant: If the address can't be decoded as an ERC721 contract
+        """
+        if (cache := self.contract_info_erc721_cache.get(address)) is not None:
+            return cache
+
+        output = self._query_token_contract(abi=self.contracts.erc721_abi, properties=ERC721_PROPERTIES, address=address)  # noqa: E501
+
+        try:
+            decoded = self._process_contract_info(
+                output=output,
+                properties=ERC721_PROPERTIES,
+                contract=EvmContract(address=address, abi=self.contracts.erc721_abi, deployed_block=0),  # noqa: E501
+                token_kind=TokenKind.ERC721,
+            )
+        except (OverflowError, DeserializationError) as e:
+            raise NotERC721Conformant(f'{address} token does not conform to the ERC721 spec') from e  # noqa: E501
+
+        info: dict[str, Any] = {}
+        for prop, value in zip_longest(ERC721_PROPERTIES, decoded):
+            if isinstance(value, bytes):
+                value = value.rstrip(b'\x00').decode()  # noqa: PLW2901
+            info[prop] = value
+
+        self.contract_info_erc721_cache.add(address, info)
+        return info
+
+    def _process_contract_info(
+            self,
+            output: list[tuple[bool, bytes]],
+            properties: tuple[str, ...],
+            contract: EvmContract,
+            token_kind: TokenKind,
+    ) -> list[int | (str | bytes) | None]:
+        """Decodes information i.e. (decimals, symbol, name) about the token contract.
+        - `decimals` property defaults to 18.
+        - `name` and `symbol` default to None.
+        May raise:
+        - OverflowError
+        - DeserializationError if the output of a method can't be decoded as its abi type
+        """
+        decoded_contract_info = []
+        for method_name, method_value in zip(properties, output, strict=True):
+            if method_value[0] is True and len(method_value[1]) != 0:
+                decoded_contract_info.append(contract.decode(method_value[1], method_name)[0])
+                continue
+
+            if token_kind == TokenKind.ERC20:
+                # for missing erc20 methods, use default decimals for decimals or None for others
+                if method_name == 'decimals':
+                    decoded_contract_info.append(DEFAULT_TOKEN_DECIMALS)
+                else:
+                    decoded_contract_info.append(None)
+            else:  # for all others default to None
+                decoded_contract_info.append(None)
+
+        return decoded_contract_info
+
+    def get_contract_deployed_block(self, address: ChecksumEvmAddress) -> int | None:
+        """Get the deployed block of a contract
+
+        Returns None if the address is not a contract.
+
+        May raise:
+        - RemoteError: in case of a problem contacting chain/nodes/remotes"""
+        if (deployed_hash := self.get_contract_creation_hash(
+            chain_id=self.chain_id,
+            address=address,
+        )) is None:
+            return None
+
+        transaction, _ = self.get_transaction_by_hash(deployed_hash)
+        return transaction.block_number
+
+    def timestamp_range_to_block_range(
+            self,
+            from_ts: Timestamp,
+            to_ts: Timestamp,
+    ) -> tuple[int, int]:
+        """Resolve both ends of a timestamp range to block numbers.
+
+        Whatever is not already cached is resolved by a single indexer, so the two ends of
+        the window cannot come from indexers holding different views of the chain. A cached
+        value is safe to mix in: it came from a resolution that succeeded, and blocks are
+        monotonic in time.
+
+        May raise:
+        - RemoteError if no indexer can resolve the range, or if the resolved window is
+        inverted. An inverted window would otherwise be handed to the indexers as-is, and
+        they answer it with an empty result and no error, which is indistinguishable from
+        the address genuinely having no history in that period.
+        - NoAvailableIndexers if there are no indexers available
+        """
+        return self._resolve_timestamp_range(from_ts=from_ts, to_ts=to_ts)[:2]
+
+    def _resolve_timestamp_range(
+            self,
+            from_ts: Timestamp,
+            to_ts: Timestamp,
+    ) -> tuple[int, int, frozenset[EvmIndexer]]:
+        """Like timestamp_range_to_block_range, also reporting who could not resolve it."""
+        cache = self.timestamp_to_block_cache[self.chain_id]
+        cached_from, cached_to = cache.get(from_ts), cache.get(to_ts)
+        # The block range is cached, so only the first of the three queries an address makes
+        # over a range actually resolves it. Remember who failed alongside it, or the
+        # internal transaction and token transfer queries would go straight back to the
+        # indexer the transaction query just found to be behind.
+        failed = self.range_indexer_failures.get((from_ts, to_ts)) or frozenset()
+        if cached_from is not None and cached_to is not None:
+            from_block, to_block = cached_from, cached_to
+        else:
+            def resolve(indexer: EtherscanLikeApi) -> tuple[int, int]:
+                resolved: dict[Timestamp, int] = {}
+                if cached_from is not None:
+                    resolved[from_ts] = cached_from
+                if cached_to is not None:
+                    resolved[to_ts] = cached_to
+
+                for ts in (from_ts, to_ts):  # a one element range asks for the same ts twice
+                    if ts not in resolved:
+                        resolved[ts] = indexer.get_blocknumber_by_time(
+                            chain_id=self.chain_id, ts=ts, closest='before',
+                        )
+
+                return resolved[from_ts], resolved[to_ts]
+
+            (from_block, to_block), _, failed = self._try_indexers_reporting_failures(
+                func=resolve,
+            )
+            cache.add(key=from_ts, value=from_block)
+            cache.add(key=to_ts, value=to_block)
+            self.range_indexer_failures.add(key=(from_ts, to_ts), value=failed)
+
+        if from_block > to_block:
+            raise RemoteError(
+                f'Resolved an inverted {self.chain_name} block range for {from_ts} - {to_ts}: '
+                f'{from_block} - {to_block}. An indexer is behind on the chain.',
+            )
+
+        return from_block, to_block, failed
+
+    @contextmanager
+    def block_range_skipping_stale_indexers(
+            self,
+            period: TimestampOrBlockRange,
+    ) -> Iterator[TimestampOrBlockRange]:
+        """Convert period to blocks, and inside the body skip indexers that could not.
+
+        An indexer that cannot resolve a block for a timestamp in the range has told us its
+        index does not reach that far. Asking it for the transactions of that same range is
+        then pointless, and its answer is actively dangerous: it reports no results rather
+        than an error, which reads as "the address had no activity" and gets the range
+        recorded as fully queried. That is how a stale indexer silently costs a user a day
+        of history that only a manual repull brings back.
+        """
+        if period.range_type != 'timestamps':
+            yield period  # already blocks, nothing was resolved and nothing can be stale
+            return
+
+        from_block, to_block, failed = self._resolve_timestamp_range(
+            from_ts=Timestamp(period.from_value),
+            to_ts=Timestamp(period.to_value),
+        )
+        if len(failed) != 0:
+            log.debug(
+                'Indexers %s could not resolve the %s range %s - %s. Not using them for its '
+                'transactions either.',
+                [x.serialize() for x in failed], self.chain_name,
+                period.from_value, period.to_value,
+            )
+
+        token = DEGRADED_INDEXERS.set(DEGRADED_INDEXERS.get() | failed)
+        try:
+            yield TimestampOrBlockRange(
+                range_type='blocks',
+                from_value=from_block,
+                to_value=to_block,
+            )
+        finally:
+            DEGRADED_INDEXERS.reset(token)
+
+    def maybe_timestamp_to_block_range(
+            self,
+            period: TimestampOrBlockRange,
+    ) -> TimestampOrBlockRange:
+        if period.range_type == 'timestamps':
+            from_block, to_block = self.timestamp_range_to_block_range(
+                from_ts=Timestamp(period.from_value),
+                to_ts=Timestamp(period.to_value),
+            )
+            return TimestampOrBlockRange(
+                range_type='blocks',
+                from_value=from_block,
+                to_value=to_block,
+            )
+
+        return period  # no op for block ranges
+
+    # -- methods to be implemented by child classes --
+
+    def get_blocknumber_by_time(
+            self,
+            ts: Timestamp,
+            closest: Literal['before', 'after'] = 'before',
+    ) -> int:
+        """Searches for the blocknumber of a specific timestamp, checking the cached values first
+        and then querying the indexers, with blockscout first, then etherscan.
+        May raise RemoteError if all indexers fail.
+        """
+        # check if value exists in the cache
+        if (block_number := self.timestamp_to_block_cache[self.chain_id].get(ts)) is not None:
+            return block_number
+
+        block_number = self._try_indexers(
+            func=lambda indexer: indexer.get_blocknumber_by_time(
+                chain_id=self.chain_id,
+                ts=ts,
+                closest=closest,
+            ),
+        )
+        self.timestamp_to_block_cache[self.chain_id].add(key=ts, value=block_number)
+        return block_number
+
+    def maybe_get_l1_fees(
+            self,
+            account: ChecksumEvmAddress,
+            tx_hash: EVMTxHash,
+            block_number: int,
+    ) -> int | None:
+        """Retrieve L1 fee data for L2 transactions from available indexers.
+
+        Returns L1 fee in wei if successful, None if chain unsupported or query fails.
+        """
+        if self.chain_id not in L2_CHAINIDS_WITH_L1_FEES:
+            return None
+
+        try:
+            return self._try_indexers(
+                func=lambda indexer: indexer.get_l1_fee(
+                    chain_id=self.chain_id,  # type: ignore[arg-type]  # mypy doesn't understand the check above
+                    account=account,
+                    tx_hash=tx_hash,
+                    block_number=block_number,
+                ),
+            )
+        except RemoteError as e:
+            log.error(f'Failed to get L1 fees for {account=} {tx_hash=} {block_number=} due to {e!s}')  # noqa: E501
+            return None
+
+    def get_block_timestamp(
+            self,
+            block_number: int,
+            full_transactions: bool = True,
+            call_order: Sequence[WeightedNode] | None = None,
+    ) -> Timestamp:
+        """Return block timestamp using cache first and falling back to block query.
+
+        full_transactions and call_order are only passed through to the block query. Nothing
+        but the timestamp is read here, so False asks for a payload that is an order of
+        magnitude smaller. It defaults to True to leave the shape of the existing callers'
+        requests alone.
+
+        May raise:
+        - RemoteError if the block cannot be queried
+        - DeserializationError or KeyError if the response carries no readable timestamp
+        """
+        if (cached_timestamp := self.block_to_timestamp_cache.get(block_number)) is not None:
+            return cached_timestamp
+
+        block_data = self.get_block_by_number(
+            num=block_number,
+            call_order=call_order,
+            full_transactions=full_transactions,
+        )
+        timestamp = Timestamp(read_integer(block_data, 'timestamp', 'web3'))
+        self.block_to_timestamp_cache.add(key=block_number, value=timestamp)
+        return timestamp
+
+    # -- methods to be optionally implemented by child classes --
+
+    def logquery_block_range(
+            self,
+            web3: Web3,  # pylint: disable=unused-argument
+            contract_address: ChecksumEvmAddress,  # pylint: disable=unused-argument
+    ) -> int:
+        """
+        May be optionally implemented by subclasses to set special rules on how to
+        decide the block range for a specific logquery.
+        """
+        return WEB3_LOGQUERY_BLOCK_RANGE
+
+    @protect_with_lock()
+    def ensure_cache_data_is_updated(
+            self,
+            cache_type: CacheType,
+            query_method: Callable,
+            force_refresh: bool = False,
+            chain_id: ChainID | None = None,
+            cache_key_parts: Sequence[str] | None = None,
+    ) -> RemoteDataQueryStatus:
+        """
+        It checks if the cache data is fresh enough and if not, it queries
+        the remote sources of the data and stores it to the globaldb cache tables.
+        Returns true if the cache was modified or false otherwise.
+
+        If the query_method logic fails due to a RemoteError this function handles
+        it and returns False. Other errors aren't handled in this function.
+
+        - cache type: The cache type to check for freshness
+        - query_method: The method that queries the remote source for the data
+        - save_method: The method that saves the data to the cache tables
+        - force_refresh: If True, the cache will be updated even if it is fresh, and limits will
+          be ignored, refreshing all the cached data.
+        - cache_key_parts: The parts to be used to check cache freshness along with cache_type
+        """
+        if cache_key_parts is None:
+            cache_key_parts = []
+        if (
+            should_update_protocol_cache(self.database, cache_type, cache_key_parts) is False and
+            force_refresh is False
+        ):
+            log.debug(f'Not refreshing cache {cache_type}. Queried recently')
+            return RemoteDataQueryStatus.NO_UPDATE
+
+        try:
+            new_data = query_method(
+                inquirer=self,
+                cache_type=cache_type,
+                msg_aggregator=self.database.msg_aggregator,
+                reload_all=force_refresh,
+            )
+        except RemoteError as e:
+            log.error(
+                f'Failed to call {query_method} when updating cache {cache_type} due to {e}',
+            )
+            return RemoteDataQueryStatus.FAILED
+
+        return (
+            RemoteDataQueryStatus.NEW_DATA if new_data is not None
+            else RemoteDataQueryStatus.NO_UPDATE
+        )
+
+    def is_safe_proxy_or_eoa(self, address: ChecksumEvmAddress) -> bool:
+        """
+        Check if an address is a SAFE contract or an EoA. We do this by checking the getThreshold,
+        VERSION and getChainId methods. We assume that if a contract has the same methods as a
+        safe then it is a safe. Also EoAs return (true, b'') for any method so this function
+        will also return True.
+        """
+        if (tracked_value := self._known_accounts_cache.get(address)) is not None:
+            # use a cache to avoid repeating the same query several times
+            return tracked_value
+
+        contract = EvmContract(address=address, abi=SAFE_BASIC_ABI)  # avoid creating the contract 3 times in the calls list  # noqa: E501
+        calls = [
+            (address, contract.encode(method_name=method_name, arguments=[]))
+            for method_name in ('getThreshold', 'VERSION', 'getChainId')
+        ]
+        try:
+            outputs = self.multicall_2(
+                calls=calls,
+                require_success=False,
+            )
+        except RemoteError as e:
+            log.error(
+                f'Failed to check SAFE properties for {address} in {self.chain_name} due to {e}. '
+                'Skipping',
+            )
+            return False
+
+        return all(result_tuple[0] for result_tuple in outputs)
+
+    def is_contract(self, address: ChecksumEvmAddress) -> bool:
+        """Check if an address is a smart contract on this chain.
+
+        EIP-7702 delegated EOAs have bytecode but are not contracts, so they are excluded.
+        """
+        try:
+            code = self.get_code(account=address)
+        except RemoteError as e:
+            log.error(
+                f'Failed to get code for {address} on {self.chain_name} due to {e}. '
+                'Assuming not a contract.',
+            )
+            return False
+
+        return not (
+            code == '0x' or
+            (code.lower().startswith(EIP7702_DELEGATION_PREFIX) and len(code) == EIP7702_DELEGATION_CODE_LENGTH)  # noqa: E501
+        )
+
+    @overload
+    def get_transactions(
+            self,
+            account: ChecksumEvmAddress | None,
+            action: Literal['txlistinternal'],
+            period_or_hash: TimestampOrBlockRange | EVMTxHash | None = None,
+            tx_timestamp: Timestamp | None = None,
+    ) -> Iterator[list[EvmInternalTransaction]]:
+        ...
+
+    @overload
+    def get_transactions(
+            self,
+            account: ChecksumEvmAddress | None,
+            action: Literal['txlist'],
+            period_or_hash: TimestampOrBlockRange | EVMTxHash | None = None,
+            tx_timestamp: Timestamp | None = None,
+    ) -> Iterator[list[EvmTransaction]]:
+        ...
+
+    def get_transactions(
+            self,
+            account: ChecksumEvmAddress | None,
+            action: Literal['txlist', 'txlistinternal'],
+            period_or_hash: TimestampOrBlockRange | EVMTxHash | None = None,
+            tx_timestamp: Timestamp | None = None,
+    ) -> Iterator[list[EvmTransaction]] | Iterator[list[EvmInternalTransaction]]:
+        """Return transaction batches from indexers in configured order.
+
+        For `action='txlist'`, this also stores each tx's block->timestamp mapping in
+        `self.block_to_timestamp_cache` so later RPC timestamp lookups can be skipped.
+
+        tx_timestamp is the timestamp of the parent transaction for hash-based internal
+        transaction queries. Passed through to indexers so they can gate queries without
+        an extra DB round-trip.
+        """
+        transactions_iterator, _ = self.get_transactions_with_source(
+            account=account,
+            period_or_hash=period_or_hash,
+            action=action,
+            tx_timestamp=tx_timestamp,
+        )
+        if action == 'txlist':
+            for tx_batch in transactions_iterator:
+                for tx in tx_batch:
+                    self.block_to_timestamp_cache.add(key=tx.block_number, value=tx.timestamp)    # type: ignore[union-attr]
+
+                yield tx_batch
+        else:
+            yield from transactions_iterator
+
+    @overload
+    def get_transactions_with_source(
+            self,
+            account: ChecksumEvmAddress | None,
+            action: Literal['txlistinternal'],
+            period_or_hash: TimestampOrBlockRange | EVMTxHash | None = None,
+            tx_timestamp: Timestamp | None = None,
+    ) -> tuple[Iterator[list[EvmInternalTransaction]], EvmIndexer]:
+        ...
+
+    @overload
+    def get_transactions_with_source(
+            self,
+            account: ChecksumEvmAddress | None,
+            action: Literal['txlist'],
+            period_or_hash: TimestampOrBlockRange | EVMTxHash | None = None,
+            tx_timestamp: Timestamp | None = None,
+    ) -> tuple[Iterator[list[EvmTransaction]], EvmIndexer]:
+        ...
+
+    def get_transactions_with_source(
+            self,
+            account: ChecksumEvmAddress | None,
+            action: Literal['txlist', 'txlistinternal'],
+            period_or_hash: TimestampOrBlockRange | EVMTxHash | None = None,
+            tx_timestamp: Timestamp | None = None,
+    ) -> tuple[Iterator[list[EvmTransaction]] | Iterator[list[EvmInternalTransaction]], EvmIndexer]:  # noqa: E501
+        """Like get_transactions(), but also returns the indexer used."""
+        if action == 'txlistinternal':
+            return self._try_indexers_iterable_with_source(
+                func=lambda indexer: indexer.get_transactions(
+                    chain_id=self.chain_id,
+                    account=account,
+                    period_or_hash=period_or_hash,
+                    action='txlistinternal',
+                    tx_timestamp=tx_timestamp,
+                ),
+            )
+
+        return self._try_indexers_iterable_with_source(
+            func=lambda indexer: indexer.get_transactions(
+                chain_id=self.chain_id,
+                account=account,
+                period_or_hash=period_or_hash,
+                action='txlist',
+                tx_timestamp=tx_timestamp,
+            ),
+        )
+
+    def get_token_transaction_hashes(
+            self,
+            account: ChecksumEvmAddress,
+            from_block: int | None = None,
+            to_block: int | None = None,
+    ) -> Iterator[list[EVMTxHash]]:
+        """Return ERC20/721 token transaction hash batches for an account.
+
+        The underlying indexer response also contains timestamps and block numbers, those are
+        cached in `self.block_to_timestamp_cache` while only transaction hashes are yielded.
+        """
+        for tx_data_batch in self._try_indexers_iterable(func=lambda indexer: indexer.get_token_transaction_data(  # noqa: E501
+                chain_id=self.chain_id,
+                account=account,
+                from_block=from_block,
+                to_block=to_block,
+        )):
+            for _, timestamp, block_number in tx_data_batch:
+                self.block_to_timestamp_cache.add(key=block_number, value=timestamp)
+
+            yield [tx_hash for tx_hash, _, _ in tx_data_batch]
+
+    def has_activity(
+            self,
+            chain_id: SUPPORTED_CHAIN_IDS,
+            account: ChecksumEvmAddress,
+    ) -> HasChainActivity:
+        return self._try_indexers(func=lambda indexer: indexer.has_activity(
+            chain_id=chain_id,
+            account=account,
+        ))
+
+    def get_contract_abi(
+            self,
+            chain_id: SUPPORTED_CHAIN_IDS,
+            address: ChecksumEvmAddress,
+    ) -> str | None:
+        return self._try_indexers(func=lambda indexer: indexer.get_contract_abi(
+            chain_id=chain_id,
+            address=address,
+        ))
+
+    def get_contract_creation_hash(
+            self,
+            chain_id: SUPPORTED_CHAIN_IDS,
+            address: ChecksumEvmAddress,
+    ) -> EVMTxHash | None:
+        return self._try_indexers(func=lambda indexer: indexer.get_contract_creation_hash(
+            chain_id=chain_id,
+            address=address,
+        ))
+
+    def _get_indexers_in_order(self) -> list[tuple[EvmIndexer, EtherscanLikeApi]]:
+        """Return available indexers respecting user-defined order and optional subset."""
+        configured_order = CachedSettings().get_evm_indexers_order_for_chain(chain_id=self.chain_id)  # noqa: E501
+        if (
+            self.chain_id in ETHERSCAN_PAID_TIER_ONLY_CHAINS and
+            configured_order == tuple(DEFAULT_INDEXERS_ORDER.get(self.chain_id, DEFAULT_EVM_INDEXER_ORDER)) and  # noqa: E501
+            EvmIndexer.ETHERSCAN in configured_order and
+            self.etherscan.has_paid_api_key
+        ):  # the default order only avoids etherscan because free keys are refused there
+            configured_order = (EvmIndexer.ETHERSCAN, *(x for x in configured_order if x != EvmIndexer.ETHERSCAN))  # noqa: E501
+
+        ordered: list[tuple[EvmIndexer, EtherscanLikeApi]] = [
+            (indexer_name, indexer)
+            for indexer_name in configured_order
+            if (indexer := self.available_indexers.get(indexer_name)) is not None
+        ]
+        if len(degraded := DEGRADED_INDEXERS.get()) == 0:
+            return ordered
+
+        if len(healthy := [entry for entry in ordered if entry[0] not in degraded]) != 0:
+            return healthy
+
+        # Nothing healthy is left for this range. Falling back to a degraded indexer is no
+        # worse than the behaviour before it was marked degraded, and beats reporting the
+        # chain as having no indexers at all.
+        return ordered
+
+    def _try_indexers(self, func: Callable[[EtherscanLikeApi], T]) -> T:
+        """Tries to call the given function on the indexers in order until one succeeds.
+        May raise:
+        - RemoteError if all indexers fail
+        - NoAvailableIndexers if there are no indexers available
+        - RequestTooLargeError to allow callers to retry with smaller chunks
+        """
+        result, _ = self._try_indexers_with_name(func=func)
+        return result
+
+    def _try_indexers_with_name(self, func: Callable[[EtherscanLikeApi], T]) -> tuple[T, EvmIndexer]:  # noqa: E501
+        """Like _try_indexers, but also returns the indexer used for the query."""
+        result, indexer_name, _ = self._try_indexers_reporting_failures(func=func)
+        return result, indexer_name
+
+    def _try_indexers_reporting_failures(
+            self,
+            func: Callable[[EtherscanLikeApi], T],
+    ) -> tuple[T, EvmIndexer, frozenset[EvmIndexer]]:
+        """Like _try_indexers_with_name, but also reports which indexers failed on the way.
+
+        Callers use the failures to avoid asking the same indexers for related data they have
+        just shown they cannot serve.
+        """
+        if len(ordered_indexers := self._get_indexers_in_order()) == 0:
+            self._maybe_notify_no_indexers()
+            raise NoAvailableIndexers(f'No indexers are available for {self.chain_name}')
+
+        errors: list[tuple[str, Exception]] = []
+        failed: set[EvmIndexer] = set()
+        for indexer_name, indexer in ordered_indexers:
+            if indexer_name not in self.available_indexers:
+                continue  # was removed while looping
+
+            try:
+                result = func(indexer)
+            except ChainNotSupported as e:
+                if indexer_name == EvmIndexer.ETHERSCAN:
+                    self._etherscan_refused_chain = True
+                if self.available_indexers.pop(indexer_name, None) is not None:
+                    log.warning(  # removed the indexer
+                        f'Indexer {indexer.name} doesnt support {self.chain_name} with the given '
+                        f'API key. {e!s} Removing it from the available indexers for this chain.',
+                    )
+                    errors.append((indexer.name, e))
+                    failed.add(indexer_name)
+            except RequestTooLargeError:
+                raise  # Let RequestTooLargeError bubble up for retry logic in callers
+            except (RemoteError, DeserializationError) as e:
+                log.warning(f'Failed to query {indexer.name} due to {e!s}. Trying next indexer.')
+                errors.append((indexer.name, e))
+                failed.add(indexer_name)
+            else:
+                return result, indexer_name, frozenset(failed)
+
+        if self._etherscan_refused_chain:  # what is left cannot serve the chain either
+            self._maybe_notify_no_indexers()
+
+        raise RemoteError(
+            f'Failed to query any indexer. '
+            f"Errors: {', '.join(f'{name}: {e!s}' for name, e in errors)}",
+        )
+
+    def _maybe_notify_no_indexers(self) -> None:
+        """Tell the user once that no indexer can serve this chain. If etherscan refused the
+        chain for the configured key, say so, since a paid etherscan key is then the fix."""
+        if self._no_indexer_notified:
+            return
+
+        self._no_indexer_notified = True
+        data: dict[str, str] = {'chain': self.blockchain.value}
+        if self._etherscan_refused_chain:
+            data['reason'] = 'etherscan_paid_key_required'
+        self.database.msg_aggregator.add_message(
+            message_type=WSMessageType.NO_AVAILABLE_INDEXERS,
+            data=data,
+        )
+
+    def _try_indexers_iterable(
+            self,
+            func: Callable[[EtherscanLikeApi], Iterator[T]],
+    ) -> Iterator[T]:
+        """Wrapper for _try_indexers that returns an iterator instead of a single value."""
+        generator, _ = self._try_indexers_iterable_with_source(func=func)
+        yield from generator
+
+    def _try_indexers_iterable_with_source(
+            self,
+            func: Callable[[EtherscanLikeApi], Iterator[T]],
+    ) -> tuple[Iterator[T], EvmIndexer]:
+        """Like _try_indexers_iterable, but also returns the indexer used."""
+        def _query_indexer_iterator(indexer: EtherscanLikeApi) -> Iterator[T]:
+            """Consume the first item in the iterator returned by `func` so if it fails the
+            exception is raised immediately, and _try_indexers goes to the next indexer.
+            """
+            generator = func(indexer)
+            # Force execution for first item so we go to the next indexer if this one fails.
+            first_batch = next(generator)
+            return itertools.chain([first_batch], generator)
+
+        return self._try_indexers_with_name(func=_query_indexer_iterator)
+
+
+class EvmNodeInquirerWithProxies(EvmNodeInquirer):
+    def __init__(
+            self,
+            task_supervisor: TaskSupervisor,
+            database: DBHandler,
+            etherscan: Etherscan,
+            blockscout: Blockscout,
+            routescan: Routescan,
+            blockchain: SUPPORTED_EVM_CHAINS_TYPE,
+            contracts: EvmContracts,
+            contract_scan: EvmContract,
+            contract_multicall: EvmContract,
+            dsproxy_registry: EvmContract,
+            native_token: CryptoAsset,
+            rpc_timeout: int = DEFAULT_RPC_TIMEOUT,
+    ) -> None:
+        super().__init__(
+            task_supervisor=task_supervisor,
+            database=database,
+            etherscan=etherscan,
+            blockscout=blockscout,
+            routescan=routescan,
+            blockchain=blockchain,
+            contracts=contracts,
+            contract_scan=contract_scan,
+            contract_multicall=contract_multicall,
+            rpc_timeout=rpc_timeout,
+            native_token=native_token,
+        )
+        self.proxies_inquirer = EvmProxiesInquirer(
+            node_inquirer=self,
+            dsproxy_registry=dsproxy_registry,
+        )
+
+
+class DSProxyInquirerWithCacheData(EvmNodeInquirerWithProxies):
+    """This is the inquirer that needs to be used by chains with modules (protocols)
+    that store data in the cache tables of the globaldb. For example velodrome in
+    optimism and curve in ethereum store data in cache tables."""
+
+    def __init__(
+            self,
+            task_supervisor: TaskSupervisor,
+            database: DBHandler,
+            etherscan: Etherscan,
+            blockscout: Blockscout,
+            routescan: Routescan,
+            blockchain: SUPPORTED_EVM_CHAINS_TYPE,
+            contracts: EvmContracts,
+            contract_scan: EvmContract,
+            contract_multicall: EvmContract,
+            dsproxy_registry: EvmContract,
+            native_token: CryptoAsset,
+            rpc_timeout: int = DEFAULT_RPC_TIMEOUT,
+    ) -> None:
+        super().__init__(
+            task_supervisor=task_supervisor,
+            database=database,
+            etherscan=etherscan,
+            blockscout=blockscout,
+            routescan=routescan,
+            blockchain=blockchain,
+            contracts=contracts,
+            contract_scan=contract_scan,
+            contract_multicall=contract_multicall,
+            rpc_timeout=rpc_timeout,
+            native_token=native_token,
+            dsproxy_registry=dsproxy_registry,
+        )

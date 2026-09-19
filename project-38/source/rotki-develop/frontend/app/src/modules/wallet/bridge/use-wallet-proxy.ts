@@ -1,0 +1,345 @@
+import { startPromise } from '@shared/utils';
+import { createSharedComposable, get, isDefined, set } from '@vueuse/core';
+import { computed, getCurrentScope, onScopeDispose, ref } from 'vue';
+import { waitForCondition } from '@/modules/core/common/async/async-utilities';
+import { getErrorMessage } from '@/modules/core/common/logging/error-handling';
+import { logger } from '@/modules/core/common/logging/logging';
+import { useWalletBridge } from '@/modules/shell/app/use-wallet-bridge';
+import { PROXY_CONFIG } from './bridge-config';
+import { createResourceManager } from './resource-management';
+
+interface ProxyState {
+  httpListening: boolean;
+  wsListening: boolean;
+  clientConnected: boolean;
+}
+
+interface UseWalletProxyReturn {
+  setupProxy: () => Promise<void>;
+  waitForProxyConnection: (timeoutMs?: number, signal?: AbortSignal) => Promise<void>;
+  waitForProxyClientReady: (timeoutMs?: number, signal?: AbortSignal) => Promise<void>;
+  startConnectionHealthCheck: (isConnected: () => boolean, onDisconnect: () => void) => void;
+  stopConnectionHealthCheck: () => void;
+  disconnectProxy: () => Promise<void>;
+}
+
+/**
+ * Drives the Electron wallet bridge proxy: setup, readiness waits, health check and teardown.
+ *
+ * @remarks
+ * Instantiate this inside a long-lived effect scope, which is what the wallet store gives it. Its
+ * teardown is bound with `onScopeDispose`, never a component lifecycle hook: because the instance
+ * is shared, a component hook would bind to whichever component happened to build the store first
+ * and tear the bridge down when that unrelated component unmounted.
+ */
+function _useWalletProxy(): UseWalletProxyReturn {
+  const { isProxyClientConnected, isProxyClientReady, isProxyHttpListening, isProxyWebSocketListening, openProxyPageInDefaultBrowser, proxyStopServers } = useWalletBridge();
+  const { cleanupResources: cleanupActiveResources, resources: activeResources } = createResourceManager();
+
+  const healthCheckInterval = ref<NodeJS.Timeout>();
+  const isHealthCheckActive = computed<boolean>(() => isDefined(healthCheckInterval));
+
+  const checkProxyState = async (): Promise<ProxyState> => {
+    const [httpListening, wsListening, clientConnected] = await Promise.all([
+      isProxyHttpListening(),
+      isProxyWebSocketListening(),
+      isProxyClientConnected(),
+    ]);
+
+    const state = { clientConnected, httpListening, wsListening };
+    logger.debug('Bridge state check:', {
+      client: state.clientConnected ? 'connected' : 'disconnected',
+      httpServer: state.httpListening ? 'listening' : 'not listening',
+      wsServer: state.wsListening ? 'listening' : 'not listening',
+    });
+
+    return state;
+  };
+
+  const waitForProxyConnection = async (
+    timeoutMs: number = PROXY_CONFIG.CONNECTION_TIMEOUT,
+    signal?: AbortSignal,
+  ): Promise<void> => {
+    await waitForCondition(
+      async () => isProxyClientConnected(),
+      connected => connected,
+      {
+        initialDelay: PROXY_CONFIG.BRIDGE_PAGE_DELAY,
+        interval: PROXY_CONFIG.RETRY_INTERVAL,
+        name: 'bridge connection',
+        signal,
+        timeout: timeoutMs,
+      },
+    );
+  };
+
+  const waitForProxyClientReady = async (
+    timeoutMs: number = PROXY_CONFIG.CONNECTION_TIMEOUT,
+    signal?: AbortSignal,
+  ): Promise<void> => {
+    await waitForCondition(
+      async () => isProxyClientReady(),
+      ready => ready,
+      {
+        initialDelay: PROXY_CONFIG.BRIDGE_PAGE_DELAY,
+        interval: PROXY_CONFIG.RETRY_INTERVAL,
+        name: 'bridge client ready',
+        signal,
+        timeout: timeoutMs,
+      },
+    );
+  };
+
+  /**
+   * Polls the connection and reports the first poll that finds it gone.
+   *
+   * @remarks
+   * Calling this again replaces the running check rather than adding a second one, so a
+   * reconnection does not end up with two intervals racing to report the same drop.
+   *
+   * @param isConnected - polled on each tick
+   * @param onDisconnect - called once, on the tick that first sees a disconnection
+   */
+  const startConnectionHealthCheck = (
+    isConnected: () => boolean,
+    onDisconnect: () => void,
+  ): void => {
+    stopConnectionHealthCheck();
+
+    set(healthCheckInterval, setInterval(() => {
+      startPromise(performHealthCheck(isConnected, onDisconnect));
+    }, PROXY_CONFIG.HEALTH_CHECK_INTERVAL));
+  };
+
+  /**
+   * Stop connection health monitoring
+   */
+  function stopConnectionHealthCheck(): void {
+    if (!isDefined(healthCheckInterval)) {
+      return;
+    }
+    clearInterval(get(healthCheckInterval));
+    set(healthCheckInterval, undefined);
+  }
+
+  /**
+   * Integrated health check logic
+   */
+  async function performHealthCheck(isConnected: () => boolean, onDisconnect: () => void): Promise<void> {
+    if (get(isHealthCheckActive) && isConnected()) {
+      try {
+        const connected = await isProxyClientConnected();
+        if (!connected) {
+          logger.debug('Health check detected disconnection');
+          onDisconnect();
+          stopConnectionHealthCheck();
+        }
+      }
+      catch (error) {
+        logger.error('Bridge health check error:', error);
+        onDisconnect();
+        stopConnectionHealthCheck();
+      }
+    }
+  }
+
+  function cleanupResources(): void {
+    logger.debug('Cleaning up bridge resources...');
+    stopConnectionHealthCheck();
+    // Aborting mid-setup would kill the setup that is still running, so leave its resources alone.
+    if (!activeResources.isSetupInProgress) {
+      cleanupActiveResources();
+    }
+    else {
+      logger.debug('Setup in progress, skipping abort of setup controller');
+    }
+  }
+
+  /**
+   * Resolves once both the HTTP and the WebSocket endpoint of the bridge accept connections.
+   *
+   * @remarks
+   * Either one alone is not enough: the page is served over HTTP but the client talks over the
+   * socket, so polling stops only when both answer. Rejects on timeout or on abort.
+   */
+  const waitForServersListening = async (
+    timeoutMs: number = PROXY_CONFIG.SERVER_TIMEOUT,
+    signal?: AbortSignal,
+  ): Promise<void> => {
+    await waitForCondition(
+      async () => {
+        const [httpListening, wsListening] = await Promise.all([
+          isProxyHttpListening(),
+          isProxyWebSocketListening(),
+        ]);
+        return { httpListening, wsListening };
+      },
+      result => result.httpListening && result.wsListening,
+      {
+        interval: PROXY_CONFIG.RETRY_INTERVAL,
+        name: 'servers to start listening',
+        signal,
+        timeout: timeoutMs,
+      },
+    );
+  };
+
+  async function initializeProxy(): Promise<void> {
+    const { walletBridge } = window;
+    if (!walletBridge) {
+      throw new Error('Wallet bridge not available in window object');
+    }
+
+    if (!walletBridge.isEnabled()) {
+      logger.debug('Enabling wallet bridge...');
+      try {
+        await walletBridge.enable();
+        logger.debug('Wallet bridge enabled successfully');
+      }
+      catch (error) {
+        throw new Error(`Failed to enable wallet bridge: ${getErrorMessage(error)}`);
+      }
+    }
+    else {
+      logger.debug('Wallet bridge already enabled');
+    }
+  }
+
+  /**
+   * Opens the bridge page in the default browser and waits out the three handshake stages.
+   *
+   * @remarks
+   * The servers are started by the page itself, so nothing is listening until the browser has
+   * loaded it. The stages must be awaited in order: listening, then client connected, then client
+   * ready for API calls. Any failure is rethrown as one setup error.
+   */
+  const startProxyServers = async (signal?: AbortSignal): Promise<void> => {
+    logger.debug('Starting bridge servers...');
+
+    try {
+      await openProxyPageInDefaultBrowser();
+      logger.debug('Bridge servers startup initiated');
+      await waitForServersListening(PROXY_CONFIG.SERVER_TIMEOUT, signal);
+      logger.debug('Bridge servers are now listening');
+      await waitForProxyConnection(PROXY_CONFIG.CONNECTION_TIMEOUT, signal);
+      logger.debug('Bridge client connection established');
+      await waitForProxyClientReady(PROXY_CONFIG.CONNECTION_TIMEOUT, signal);
+      logger.debug('Bridge client ready for API calls');
+    }
+    catch (error) {
+      logger.error('Bridge setup failed:', error);
+      throw new Error(`Failed to establish bridge connection during bridge setup: ${getErrorMessage(error)}`);
+    }
+  };
+
+  /**
+   * Brings the bridge up: enables it, checks its state, and connects the client.
+   *
+   * @remarks
+   * A second call while one is still running returns without doing anything, rather than queueing.
+   * Two setups in flight would each enable the bridge and open a client against it, leaving one
+   * socket nothing ever closes.
+   */
+  const setupProxy = async (): Promise<void> => {
+    if (activeResources.isSetupInProgress) {
+      logger.debug('Bridge setup already in progress, skipping...');
+      return;
+    }
+
+    logger.debug('Starting bridge setup process...');
+    activeResources.isSetupInProgress = true;
+
+    try {
+      await initializeProxy();
+      const bridgeState = await checkProxyState();
+
+      const isFullyConnected = bridgeState.httpListening && bridgeState.wsListening && bridgeState.clientConnected;
+
+      if (isFullyConnected) {
+        const isClientReady = await isProxyClientReady();
+        if (!isClientReady) {
+          logger.debug('Bridge is already fully operational, opening bridge page');
+          await openProxyPageInDefaultBrowser();
+        }
+
+        return;
+      }
+
+      // Step 4: Start servers if needed
+      const missingServices = [];
+      if (!bridgeState.httpListening)
+        missingServices.push('HTTP server');
+      if (!bridgeState.wsListening)
+        missingServices.push('WebSocket server');
+      if (!bridgeState.clientConnected)
+        missingServices.push('client connection');
+
+      logger.debug(`Bridge setup required for: ${missingServices.join(', ')}`);
+
+      // Step 5: Set up cancellation for the entire process with resource tracking
+      activeResources.setupAbortController = new AbortController();
+      const totalTimeout = PROXY_CONFIG.SERVER_TIMEOUT + PROXY_CONFIG.CONNECTION_TIMEOUT;
+      activeResources.setupTimeout = setTimeout(() => {
+        logger.debug('Bridge setup timeout reached, aborting...');
+        activeResources.setupAbortController?.abort();
+      }, totalTimeout);
+
+      try {
+        await startProxyServers(activeResources.setupAbortController.signal);
+        logger.debug('Bridge setup completed successfully');
+      }
+      finally {
+        if (activeResources.setupTimeout) {
+          clearTimeout(activeResources.setupTimeout);
+          activeResources.setupTimeout = null;
+        }
+        activeResources.setupAbortController = null;
+      }
+    }
+    finally {
+      activeResources.isSetupInProgress = false;
+    }
+  };
+
+  const disconnectProxy = async (): Promise<void> => {
+    logger.debug('Disconnecting bridge and stopping servers...');
+
+    cleanupResources();
+
+    try {
+      // Use the new proper server stop functionality instead of just disable
+      await proxyStopServers();
+      logger.debug('Bridge servers stopped successfully');
+    }
+    catch (error) {
+      logger.error('Failed to stop bridge servers:', error);
+      throw new Error(`Failed to stop bridge servers: ${getErrorMessage(error)}`);
+    }
+  };
+
+  if (getCurrentScope()) {
+    onScopeDispose(() => {
+      logger.debug('Scope disposed, cleaning up bridge resources...');
+      cleanupResources();
+    });
+  }
+
+  return {
+    disconnectProxy,
+    setupProxy,
+    startConnectionHealthCheck,
+    stopConnectionHealthCheck,
+    waitForProxyClientReady,
+    waitForProxyConnection,
+  };
+}
+
+/**
+ * Shared across every consumer on purpose. The proxy owns process-wide resources - the health
+ * check interval, the setup abort controller and its timeout - and two instances split that
+ * state: the wallet store held one (which ran `setupProxy`) while `useInjectedWallet` held
+ * another (which ran the health check and `disconnectProxy`). Disconnecting therefore could
+ * not abort a setup that was still in flight, because the abort controller belonged to the
+ * other instance.
+ */
+export const useWalletProxy = createSharedComposable(_useWalletProxy);

@@ -1,0 +1,996 @@
+import dataclasses
+import json
+from dataclasses import fields
+from http import HTTPStatus
+from operator import itemgetter
+from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
+
+import pytest
+import requests
+
+from rotkehlchen.chain.evm.types import EvmIndexer
+from rotkehlchen.constants import HOUR_IN_SECONDS
+from rotkehlchen.db.settings import (
+    DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_QUERY_RETRY_LIMIT,
+    DEFAULT_READ_TIMEOUT,
+    ROTKEHLCHEN_DB_VERSION,
+    CachedSettings,
+    DBSettings,
+    ModifiableDBSettings,
+)
+from rotkehlchen.oracles.structures import CurrentPriceOracle
+from rotkehlchen.tests.utils.api import (
+    api_url_for,
+    assert_error_response,
+    assert_proper_response,
+    assert_proper_response_with_result,
+    assert_proper_sync_response_with_result,
+    assert_simple_ok_response,
+)
+from rotkehlchen.tests.utils.constants import A_JPY
+from rotkehlchen.tests.utils.factories import make_evm_address
+from rotkehlchen.tests.utils.mock import MockWeb3
+from rotkehlchen.types import (
+    ApiKey,
+    ChainID,
+    ChecksumEvmAddress,
+    CostBasisMethod,
+    ExchangeLocationID,
+    ExternalService,
+    ExternalServiceApiCredentials,
+    Location,
+    ModuleName,
+    SupportedBlockchain,
+)
+
+if TYPE_CHECKING:
+    from rotkehlchen.api.server import APIServer
+
+
+@pytest.mark.parametrize('should_mock_settings', [False])
+def test_cached_settings(
+        rotkehlchen_api_server: APIServer,
+        username: str,
+        db_password: str,
+    ) -> None:
+    """Make sure that querying cached settings works"""
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+
+    # Make sure that the initialized cached settings match the database settings
+    with rotki.data.db.conn.read_ctx() as cursor:
+        db_settings = rotki.data.db.get_settings(cursor)
+
+    cached_settings = CachedSettings().get_settings()
+    for field in fields(cached_settings):
+        if field.name == 'last_write_ts':  # last_write_ts is not cached
+            continue
+        assert getattr(cached_settings, field.name) == getattr(db_settings, field.name)
+
+    # Make sure that the cached settings are initialized with the default values
+    assert CachedSettings().get_query_retry_limit() == DEFAULT_QUERY_RETRY_LIMIT
+    assert CachedSettings().get_timeout_tuple() == (DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)
+
+    # update a few settings
+    data: dict[str, Any] = {
+        'settings': {
+            'query_retry_limit': 3,
+            'connect_timeout': 45,
+            'read_timeout': 45,
+            'submit_usage_analytics': True,
+            'mcp_privacy_mode': 'strict',
+        },
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_proper_response(response)
+    json_data = response.json()
+
+    # Make sure the settings in the database were updated
+    assert json_data['result']['query_retry_limit'] == 3
+    assert json_data['result']['connect_timeout'] == 45
+    assert json_data['result']['read_timeout'] == 45
+    assert json_data['result']['submit_usage_analytics'] is True
+    assert json_data['result']['mcp_privacy_mode'] == 'strict'
+
+    # Now make sure that the cached settings are also updated
+    assert CachedSettings().get_query_retry_limit() == 3
+    assert CachedSettings().get_timeout_tuple() == (45, 45)
+    assert CachedSettings().get_entry('submit_usage_analytics') is True
+    assert CachedSettings().get_entry('mcp_privacy_mode') == 'strict'
+
+    # log the user out and make sure cached settings are reset to default values
+    data = {'action': 'logout'}
+    response = requests.patch(
+        api_url_for(rotkehlchen_api_server, 'usersbynameresource', name=username),
+        json=data,
+    )
+    assert_simple_ok_response(response)
+    assert rotki.user_is_logged_in is False
+
+    # Make sure that the cached settings are reset after logout
+    assert CachedSettings().get_settings() == DBSettings()
+
+    # Login again, we'd expect settings to remain updated
+    data = {'password': db_password, 'sync_approval': 'unknown', 'resume_from_backup': False}
+    response = requests.post(
+        api_url_for(rotkehlchen_api_server, 'usersbynameresource', name=username),
+        json=data,
+    )
+    assert_proper_response(response)
+    assert rotki.user_is_logged_in is True
+
+    # Cached settings and DBSettings match
+    with rotki.data.db.conn.read_ctx() as cursor:  # type: ignore
+        db_settings = rotki.data.db.get_settings(cursor)
+
+    cached_settings = CachedSettings().get_settings()
+    for field in fields(cached_settings):
+        if field.name == 'last_write_ts':  # last_write_ts is not cached
+            continue
+        assert getattr(cached_settings, field.name) == getattr(db_settings, field.name)
+
+    # API gives us the expected (updated) settings
+    response = requests.get(api_url_for(rotkehlchen_api_server, 'settingsresource'))
+    assert_proper_response(response)
+    json_data = response.json()
+
+    assert json_data['result']['query_retry_limit'] == 3
+    assert json_data['result']['connect_timeout'] == 45
+    assert json_data['result']['read_timeout'] == 45
+    assert json_data['result']['submit_usage_analytics'] is True
+
+
+def test_querying_settings(rotkehlchen_api_server: APIServer, username: str) -> None:
+    """Make sure that querying settings works for logged in user"""
+    response = requests.get(api_url_for(rotkehlchen_api_server, 'settingsresource'))
+    assert_proper_response(response)
+    json_data = response.json()
+
+    result = json_data['result']
+    assert json_data['message'] == ''
+    assert result['version'] == ROTKEHLCHEN_DB_VERSION
+    for setting in dataclasses.fields(DBSettings):
+        if setting.name == 'frontend_settings':
+            assert setting.name not in result
+            continue
+        assert setting.name in result
+
+    # Logout of the active user
+    data = {'action': 'logout'}
+    response = requests.patch(
+        api_url_for(rotkehlchen_api_server, 'usersbynameresource', name=username),
+        json=data,
+    )
+    assert_simple_ok_response(response)
+
+    # and now with no logged in user it should fail
+    response = requests.get(api_url_for(rotkehlchen_api_server, 'settingsresource'))
+    assert_error_response(
+        response=response,
+        contained_in_msg='No user is currently logged in',
+        status_code=HTTPStatus.UNAUTHORIZED,
+    )
+
+
+def test_set_settings(rotkehlchen_api_server: APIServer) -> None:
+    """Happy case settings modification test"""
+    # Get the starting settings
+    response = requests.get(api_url_for(rotkehlchen_api_server, 'settingsresource'))
+    assert_proper_response(response)
+    json_data = response.json()
+    original_settings = {
+        name: value
+        for name, value in json_data['result'].items()
+        if name in ModifiableDBSettings._fields
+    }
+    assert json_data['message'] == ''
+    # Create new settings which modify all of the original ones
+    new_settings = {}
+    unmodifiable_settings = (
+        'version',
+        'last_write_ts',
+        'have_premium',
+        'last_data_migration',
+    )
+    for setting, raw_value in original_settings.items():
+        if setting in unmodifiable_settings:
+            continue
+        value: str | list[str | dict] | dict[str, list[str]] | int | None = None
+        if setting == 'date_display_format':
+            value = '%d/%m/%Y-%H:%M:%S'
+        elif setting == 'main_currency':
+            value = 'JPY'
+        elif type(raw_value) is bool:  # pylint: disable=unidiomatic-typecheck
+            # here and below we HAVE to use type() equality checks since
+            # isinstance of a bool succeeds for both bool and int (due to inheritance)
+            value = not raw_value
+        elif type(raw_value) is int:  # pylint: disable=unidiomatic-typecheck
+            value = raw_value + 1
+        elif setting == 'active_modules':
+            value = ['makerdao_vaults']
+        elif setting == 'ksm_rpc_endpoint':
+            value = 'http://kusama.node.com:9933'
+        elif setting == 'dot_rpc_endpoint':
+            value = 'http://polkadot.node.com:9934'
+        elif setting == 'beacon_rpc_endpoint':
+            value = 'http://lighthouse.mynode.com:6969'
+        elif setting == 'btc_mempool_api':
+            value = 'http://localhost:4080'
+        elif setting == 'current_price_oracles':
+            value = ['coingecko', 'cryptocompare', 'uniswapv2', 'uniswapv3']
+        elif setting == 'historical_price_oracles':
+            value = ['coingecko', 'cryptocompare']
+        elif setting == 'evm_indexers_order':
+            value = {'ethereum': ['routescan', 'blockscout', 'etherscan'], 'optimism': ['etherscan', 'blockscout', 'routescan'], 'polygon_pos': ['etherscan', 'blockscout', 'routescan'], 'arbitrum_one': ['etherscan', 'blockscout', 'routescan'], 'base': ['etherscan', 'blockscout', 'routescan'], 'gnosis': ['etherscan', 'blockscout', 'routescan'], 'scroll': ['etherscan', 'blockscout', 'routescan'], 'binance_sc': ['etherscan', 'blockscout', 'routescan']}  # noqa: E501
+        elif setting == 'default_evm_indexer_order':
+            value = ['etherscan', 'blockscout', 'routescan']
+        elif setting == 'non_syncing_exchanges':
+            value = [ExchangeLocationID(name='test_name', location=Location.KRAKEN).serialize()]
+        elif setting == 'evmchains_to_skip_detection':
+            value = [x.serialize() for x in (SupportedBlockchain.POLYGON_POS, SupportedBlockchain.BASE, SupportedBlockchain.ETHEREUM, SupportedBlockchain.AVALANCHE)]  # noqa: E501
+        elif setting == 'disabled_chain_queries':
+            value = {
+                SupportedBlockchain.GNOSIS.serialize(): [],
+                SupportedBlockchain.ETHEREUM.serialize(): ['0x5A0b54D5dc17e0AadC383d2db43B0a0D3E029c4c'],  # noqa: E501
+            }
+        elif setting == 'cost_basis_method':
+            value = CostBasisMethod.LIFO.serialize()
+        elif setting == 'address_name_priority':
+            value = ['hardcoded_mappings', 'ethereum_tokens']
+        elif setting == 'csv_export_delimiter':
+            value = ';'
+        elif setting == 'events_processing_frequency':
+            value = HOUR_IN_SECONDS
+        elif setting in ('asset_movement_amount_tolerance', 'bridge_match_amount_tolerance'):
+            value = '0.0001'
+        elif setting in ('asset_movement_time_range', 'bridge_match_time_range'):
+            value = HOUR_IN_SECONDS * 2
+        elif setting == 'suppress_missing_key_msg_services':
+            value = [ExternalService.ETHERSCAN.serialize()]
+        elif setting == 'mcp_privacy_mode':
+            value = 'strict'
+        else:
+            raise AssertionError(f'Unexpected setting {setting} encountered')
+
+        new_settings[setting] = value
+
+    mock_web3 = patch('rotkehlchen.chain.ethereum.node_inquirer.Web3', MockWeb3)
+    ksm_connect_node = patch(
+        'rotkehlchen.chain.substrate.manager.SubstrateManager._connect_node',
+        return_value=(True, ''),
+    )
+    btc_connect_node = patch(
+        'rotkehlchen.chain.bitcoin.btc.manager.BitcoinManager._connect_node',
+        return_value=(True, ''),
+    )
+    with mock_web3, ksm_connect_node, btc_connect_node:
+        response = requests.put(
+            api_url_for(rotkehlchen_api_server, 'settingsresource'),
+            json={'settings': new_settings},
+        )
+    # Check that new settings are returned in the response
+    assert_proper_response(response)
+    json_data = response.json()
+    assert json_data['message'] == ''
+    result = json_data['result']
+    assert result['version'] == ROTKEHLCHEN_DB_VERSION
+    for setting, value in new_settings.items():
+        msg = f'Error for {setting} setting. Expected: {value}. Got: {result[setting]}'
+        assert result[setting] == value, msg
+
+    # now check that the same settings are returned in a settings query
+    response = requests.get(api_url_for(rotkehlchen_api_server, 'settingsresource'))
+    assert_proper_response(response)
+    json_data = response.json()
+    result = json_data['result']
+    assert json_data['message'] == ''
+    for setting, value in new_settings.items():
+        assert result[setting] == value
+
+
+@pytest.mark.parametrize(('rpc_setting', 'error_msg'), [
+    (
+        'ksm_rpc_endpoint',
+        'kusama failed to connect to own node at endpoint',
+    ),
+])
+def test_set_rpc_endpoint_fail_not_set_others(
+        rotkehlchen_api_server: APIServer,
+        rpc_setting: tuple[str, str],
+        error_msg: str,
+) -> None:
+    """Test that setting a non-existing eth rpc along with other settings does not modify them"""
+    rpc_endpoint = 'http://working.nodes.com:8545'
+    main_currency = A_JPY
+    data = {'settings': {
+        rpc_setting: rpc_endpoint,
+        'main_currency': main_currency.identifier,
+    }}
+
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg=f'{error_msg} {rpc_endpoint}',
+        status_code=HTTPStatus.CONFLICT,
+    )
+
+    # Get settings and make sure they have not been modified
+    response = requests.get(api_url_for(rotkehlchen_api_server, 'settingsresource'))
+    assert_proper_response(response)
+    json_data = response.json()
+    result = json_data['result']
+    assert json_data['message'] == ''
+    assert result['main_currency'] != 'JPY'
+    assert result[rpc_setting] != rpc_endpoint
+
+
+def test_default_evm_indexers_orders(rotkehlchen_api_server: APIServer) -> None:
+    settings = assert_proper_response_with_result(
+        response=requests.get(settings_url := api_url_for(rotkehlchen_api_server, 'settingsresource')),  # noqa: E501
+        rotkehlchen_api_server=rotkehlchen_api_server,
+    )
+    assert settings['default_evm_indexer_order'] == ['etherscan', 'blockscout', 'routescan']
+
+    assert_proper_response_with_result(
+        requests.put(settings_url, json={
+            'settings': {'default_evm_indexer_order': ['blockscout', 'routescan']},
+        }),
+        rotkehlchen_api_server=rotkehlchen_api_server,
+    )
+    settings = assert_proper_response_with_result(
+        response=requests.get(settings_url),
+        rotkehlchen_api_server=rotkehlchen_api_server,
+    )
+    assert settings['default_evm_indexer_order'] == ['blockscout', 'routescan']
+
+
+@pytest.mark.parametrize(('rpc_setting', 'initial_value'), [
+    ('ksm_rpc_endpoint', 'http://kusama.example:9933'),
+    ('dot_rpc_endpoint', 'http://polkadot.example:9934'),
+    ('beacon_rpc_endpoint', 'http://lighthouse.mynode.com:6969'),
+    ('btc_mempool_api', 'http://localhost:4080'),
+])
+def test_unset_rpc_endpoint(
+        rotkehlchen_api_server: APIServer,
+        rpc_setting: str,
+        initial_value: str,
+) -> None:
+    """Sending an empty string for these endpoint settings should remove the
+    DB row and revert the value to the dataclass default (which itself is
+    the empty string for ksm/dot/btc and the public node for beacon)."""
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    settings_url = api_url_for(rotkehlchen_api_server, 'settingsresource')
+    default_value = getattr(DBSettings(), rpc_setting)
+
+    ksm_connect_node = patch(
+        'rotkehlchen.chain.substrate.manager.SubstrateManager._connect_node',
+        return_value=(True, ''),
+    )
+    btc_connect_node = patch(
+        'rotkehlchen.chain.bitcoin.btc.manager.BitcoinManager._connect_node',
+        return_value=(True, ''),
+    )
+    beacon_set_endpoint = patch(
+        'rotkehlchen.chain.ethereum.modules.eth2.beacon.BeaconInquirer.set_rpc_endpoint',
+        return_value=None,
+    )
+    with ksm_connect_node, btc_connect_node, beacon_set_endpoint:
+        response = requests.put(settings_url, json={'settings': {rpc_setting: initial_value}})
+        assert_proper_response(response)
+        assert response.json()['result'][rpc_setting] == initial_value
+
+        # Sanity check: the row exists in the DB now.
+        with rotki.data.db.conn.read_ctx() as cursor:
+            assert cursor.execute(
+                'SELECT value FROM settings WHERE name=?', (rpc_setting,),
+            ).fetchone() == (initial_value,)
+
+        # Now unset by sending an empty string.
+        response = requests.put(settings_url, json={'settings': {rpc_setting: ''}})
+
+    assert_proper_response(response)
+    json_data = response.json()
+    assert json_data['message'] == ''
+    # Response reflects the dataclass default, not an empty string.
+    assert json_data['result'][rpc_setting] == default_value
+
+    # The DB row must have been removed entirely.
+    with rotki.data.db.conn.read_ctx() as cursor:
+        assert cursor.execute(
+            'SELECT value FROM settings WHERE name=?', (rpc_setting,),
+        ).fetchone() is None
+
+    # Cached settings must also reflect the default.
+    assert getattr(CachedSettings().get_settings(), rpc_setting) == default_value
+
+
+@pytest.mark.parametrize('rpc_setting', [
+    'ksm_rpc_endpoint',
+    'dot_rpc_endpoint',
+    'beacon_rpc_endpoint',
+    'btc_mempool_api',
+])
+def test_empty_rpc_endpoint_in_db_treated_as_default(
+        rotkehlchen_api_server: APIServer,
+        rpc_setting: str,
+) -> None:
+    """An empty string already present in the DB (legacy state) must be
+    deserialized as if the entry was missing, i.e. the dataclass default
+    is applied."""
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    default_value = getattr(DBSettings(), rpc_setting)
+
+    with rotki.data.db.conn.write_ctx() as write_cursor:
+        write_cursor.execute(
+            'INSERT OR REPLACE INTO settings(name, value) VALUES(?, ?)',
+            (rpc_setting, ''),
+        )
+
+    with rotki.data.db.conn.read_ctx() as cursor:
+        settings = rotki.data.db.get_settings(cursor)
+
+    assert getattr(settings, rpc_setting) == default_value
+
+
+def test_disable_taxfree_after_period(rotkehlchen_api_server: APIServer) -> None:
+    """Test that providing -1 for the taxfree_after_period setting disables it """
+    data = {
+        'settings': {'taxfree_after_period': -1},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_proper_response(response)
+    json_data = response.json()
+    assert json_data['result']['taxfree_after_period'] is None
+
+    # Test that any other negative value is refused
+    data = {
+        'settings': {'taxfree_after_period': -5},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='The taxfree_after_period value can not be negative',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+    # Test that zero value is refused
+    data = {
+        'settings': {'taxfree_after_period': 0},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='The taxfree_after_period value can not be set to zero',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+
+def test_set_unknown_settings(rotkehlchen_api_server: APIServer) -> None:
+    """Test that setting an unknown setting results in an error
+
+    This is the only test for unknown arguments in marshmallow schemas after
+    https://github.com/rotki/rotki/issues/532 was implemented"""
+    # Unknown setting
+    data = {
+        'settings': {'invalid_setting': 5555},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='{"invalid_setting": ["Unknown field."',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+
+def test_set_settings_errors(rotkehlchen_api_server: APIServer) -> None:
+    """set settings errors and edge cases test"""
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    # set timeout to 1 second to timeout faster
+    rotki.chains_aggregator.ethereum.node_inquirer.rpc_timeout = 1
+
+    # Invalid type for premium_should_sync
+    data: dict[str, Any] = {
+        'settings': {'premium_should_sync': 444},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='Not a valid boolean',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Invalid type for include_crypto2crypto
+    data = {
+        'settings': {'include_crypto2crypto': 'ffdsdasd'},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='Not a valid boolean',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Invalid range for ui_floating_precision
+    data = {
+        'settings': {'ui_floating_precision': -1},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='Floating numbers precision in the UI must be between 0 and 8',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+    data = {
+        'settings': {'ui_floating_precision': 9},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='Floating numbers precision in the UI must be between 0 and 8',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Invalid type for ui_floating_precision
+    data = {
+        'settings': {'ui_floating_precision': 'dasdsds'},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='Not a valid integer',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Invalid range for taxfree_after_period
+    data = {
+        'settings': {'taxfree_after_period': -2},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='The taxfree_after_period value can not be negative, except',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Invalid type for taxfree_after_period
+    data = {
+        'settings': {'taxfree_after_period': 'dsad'},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='dsad is not a valid integer',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Invalid range for balance_save_frequency
+    data = {
+        'settings': {'balance_save_frequency': 0},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='The number of hours after which balances should be saved should be >= 1',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Invalid range for balance_save_frequency
+    data = {
+        'settings': {'balance_save_frequency': 'dasdsd'},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='Not a valid integer',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Invalid type for include_gas_cost
+    data = {
+        'settings': {'include_gas_costs': 55.1},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='Not a valid boolean',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Invalid asset for main currency
+    data = {
+        'settings': {'main_currency': 'DSDSDSAD'},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='Unknown asset DSDSDSAD',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # invalid type main currency
+    data = {
+        'settings': {'main_currency': 243243},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='Tried to initialize an asset out of a non-string identifier',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # invalid type date_display_format
+    data = {
+        'settings': {'date_display_format': 124.1},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='Not a valid string',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # invalid type for active modules
+    data = {
+        'settings': {'active_modules': 55},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='"active_modules": ["Not a valid list."',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # invalid module for active modules
+    data = {
+        'settings': {'active_modules': ['makerdao_dsr', 'foo']},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='"active_modules": ["foo is not a valid module"]',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # setting illegal oracle in the current price oracles is an error
+    for oracle in (CurrentPriceOracle.MANUALCURRENT, CurrentPriceOracle.FIAT, CurrentPriceOracle.BLOCKCHAIN):  # noqa: E501
+        data = {
+            'settings': {'current_price_oracles': ['coingecko', str(oracle)]},
+        }
+        response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+        assert_error_response(
+            response=response,
+            contained_in_msg=f'"current_price_oracles": ["Invalid current price oracles given: {oracle!s}. ',  # noqa: E501
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+    for order in (['etherscan', 'etherscan'], []):
+        response = requests.put(
+            api_url_for(rotkehlchen_api_server, 'settingsresource'),
+            json={'settings': {'evm_indexers_order': {'ethereum': order}}},
+        )
+        assert_error_response(
+            response=response,
+            contained_in_msg='"evm_indexers_order": ["List of indexers has to contain unique elements and be non empty"]',  # noqa: E501
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+    for order in (['etherscan', 'etherscan'], []):
+        response = requests.put(
+            api_url_for(rotkehlchen_api_server, 'settingsresource'),
+            json={'settings': {'default_evm_indexer_order': order}},
+        )
+        assert_error_response(
+            response=response,
+            contained_in_msg='List of indexers has to contain unique elements and be non empty',
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+    data = {
+        'settings': {'evm_indexers_order': {'unknown': ['etherscan', 'etherscan']}},
+    }
+    response = requests.put(api_url_for(rotkehlchen_api_server, 'settingsresource'), json=data)
+    assert_error_response(
+        response=response,
+        contained_in_msg='"evm_indexers_order": ["Failed to deserialize evm chain value unknown"]',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+
+def test_set_evm_indexers_order(rotkehlchen_api_server: APIServer) -> None:
+    settings_url = api_url_for(rotkehlchen_api_server, 'settingsresource')
+    settings = assert_proper_response_with_result(
+        response=requests.get(settings_url),
+        rotkehlchen_api_server=rotkehlchen_api_server,
+    )
+    assert settings['evm_indexers_order'][ChainID.OPTIMISM.to_name()] == ['blockscout', 'routescan', 'etherscan']  # noqa: E501
+    # etherscan only serves gnosis to paid keys, so blockscout leads and it stays as fallback
+    assert settings['evm_indexers_order'][ChainID.GNOSIS.to_name()] == ['blockscout', 'etherscan']
+
+    # try editing the order of ethereum
+    assert_proper_response(
+        response=requests.put(
+            url=settings_url,
+            json={
+                'settings': {'evm_indexers_order': {'ethereum': ['blockscout', 'etherscan']}},
+            },
+        ),
+    )
+
+    # cached settings should be updated
+    indexers = CachedSettings().get_evm_indexers_order_for_chain(ChainID.ETHEREUM)
+    assert indexers == (EvmIndexer.BLOCKSCOUT, EvmIndexer.ETHERSCAN)
+    # and also settings endpoint
+    settings = assert_proper_response_with_result(
+        response=requests.get(settings_url),
+        rotkehlchen_api_server=rotkehlchen_api_server,
+    )
+    assert settings['evm_indexers_order'][ChainID.ETHEREUM.to_name()] == ['blockscout', 'etherscan']  # noqa: E501
+
+    # try editing an unsupported chain
+    assert_error_response(
+        response=requests.put(
+            url=settings_url,
+            json={
+                'settings': {'evm_indexers_order': {'celo': ['blockscout', 'etherscan']}},
+            },
+        ),
+        contained_in_msg='celo does not use indexers to query transactions',
+    )
+
+
+def assert_queried_addresses_match(
+        result: dict[ModuleName, list[ChecksumEvmAddress]],
+        expected: dict[ModuleName, list[ChecksumEvmAddress]],
+) -> None:
+    assert len(result) == len(expected)
+    for key, value in expected.items():
+        assert key in result, f'Was expecting module {key} but did not find it'
+        assert set(value) == set(result[key])
+
+
+def test_queried_addresses_per_protocol(rotkehlchen_api_server: APIServer) -> None:
+    # First add some queried addresses per protocol
+    address1 = make_evm_address()
+    data = {'module': 'eth2', 'address': address1}
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'queriedaddressesresource'), json=data,
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert result == {'eth2': [address1]}
+
+    address2 = make_evm_address()
+    data = {'module': 'makerdao_vaults', 'address': address2}
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'queriedaddressesresource'), json=data,
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert_queried_addresses_match(result, {
+        'eth2': [address1],
+        'makerdao_vaults': [address2],
+    })
+
+    # add same address to another module/protocol
+    data = {'module': 'eth2', 'address': address2}
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'queriedaddressesresource'), json=data,
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert_queried_addresses_match(result, {
+        'eth2': [address1, address2],
+        'makerdao_vaults': [address2],
+    })
+
+    # try to add an address that already exists for a module/protocol and assert we get an error
+    data = {'module': 'eth2', 'address': address1}
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'queriedaddressesresource'), json=data,
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg=f'{address1} is already in the queried addresses for eth2',
+        status_code=HTTPStatus.CONFLICT,
+    )
+
+    # add an address and then remove it
+    address3 = make_evm_address()
+    data = {'module': 'makerdao_dsr', 'address': address3}
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'queriedaddressesresource'), json=data,
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert_queried_addresses_match(result, {
+        'eth2': [address1, address2],
+        'makerdao_vaults': [address2],
+        'makerdao_dsr': [address3],
+    })
+
+    response = requests.delete(
+        api_url_for(rotkehlchen_api_server, 'queriedaddressesresource'), json=data,
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert_queried_addresses_match(result, {
+        'eth2': [address1, address2],
+        'makerdao_vaults': [address2],
+    })
+
+    # try to remove a non-existing address and module combination and assert we get an error
+    data = {'module': 'makerdao_vaults', 'address': address1}
+    response = requests.delete(
+        api_url_for(rotkehlchen_api_server, 'queriedaddressesresource'), json=data,
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg=f'{address1} is not in the queried addresses for makerdao_vaults',
+        status_code=HTTPStatus.CONFLICT,
+    )
+
+    # test that getting the queried addresses per module works
+    response = requests.get(api_url_for(rotkehlchen_api_server, 'queriedaddressesresource'))
+    result = assert_proper_sync_response_with_result(response)
+    assert_queried_addresses_match(result, {
+        'eth2': [address1, address2],
+        'makerdao_vaults': [address2],
+    })
+
+
+def test_excluded_exchanges_settings(rotkehlchen_api_server: APIServer) -> None:
+    exchanges_input = {
+        'settings': {
+            'non_syncing_exchanges': [
+                ExchangeLocationID(name='test_name', location=Location.KRAKEN).serialize(),
+                ExchangeLocationID(name='test_name2', location=Location.KRAKEN).serialize(),
+            ],
+        },
+    }
+    exchanges_expected = [
+        ExchangeLocationID(name='test_name', location=Location.KRAKEN).serialize(),
+        ExchangeLocationID(name='test_name2', location=Location.KRAKEN).serialize(),
+    ]
+
+    exchanges_bad_input = {
+        'settings': {
+            'non_syncing_exchanges': [
+                ExchangeLocationID(name='bad_name', location=Location.KRAKEN).serialize(),
+                ExchangeLocationID(name='bad_name', location=Location.KRAKEN).serialize(),
+            ],
+        },
+    }
+
+    requests.put(
+        api_url_for(rotkehlchen_api_server, 'settingsresource'),
+        json=exchanges_input,
+    )
+    response = requests.get(api_url_for(rotkehlchen_api_server, 'settingsresource')).json()
+    assert sorted(response['result']['non_syncing_exchanges'], key=itemgetter('name')) == sorted(exchanges_expected, key=itemgetter('name'))  # noqa: E501
+
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'settingsresource'),
+        json=exchanges_bad_input,
+    )
+    assert response.status_code == 400
+
+
+def test_update_oracles_order_settings(rotkehlchen_api_server: APIServer) -> None:
+    for oracles_setting in ('historical_price_oracles', 'current_price_oracles'):
+        response = requests.put(
+            api_url_for(rotkehlchen_api_server, 'settingsresource'),
+            json={'settings': {oracles_setting: ['alchemy']}},
+        )
+        assert_error_response(
+            response=response,
+            contained_in_msg='You have enabled the Alchemy price oracle but you do not have an API key set',  # noqa: E501
+            status_code=HTTPStatus.CONFLICT,
+        )
+
+    # add the api key and see that it passes.
+    with rotkehlchen_api_server.rest_api.rotkehlchen.data.db.user_write() as write_cursor:
+        rotkehlchen_api_server.rest_api.rotkehlchen.data.db.add_external_service_credentials(
+            write_cursor=write_cursor,
+            credentials=[ExternalServiceApiCredentials(
+                service=ExternalService.ALCHEMY,
+                api_key=ApiKey('123totallyrealapikey123'),
+            )],
+        )
+    for oracles_setting in ('historical_price_oracles', 'current_price_oracles'):
+        response = requests.put(
+            api_url_for(rotkehlchen_api_server, 'settingsresource'),
+            json={'settings': {oracles_setting: ['alchemy']}},
+        )
+        result = assert_proper_sync_response_with_result(response=response)
+        assert result[oracles_setting] == ['alchemy']
+
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'settingsresource'),
+        json={'settings': {'current_price_oracles': ['defillama', 'coingecko']}},
+    )
+    result = assert_proper_sync_response_with_result(response=response)
+    assert result['current_price_oracles'] == ['defillama', 'coingecko']
+
+
+def test_suppress_missing_key_msg_services_not_overwritten(
+        rotkehlchen_api_server: APIServer,
+) -> None:
+    """Test that suppress_missing_key_msg_services is not
+    overwritten when updating other settings."""
+    assert assert_proper_sync_response_with_result(requests.put(
+        api_url_for(rotkehlchen_api_server, 'settingsresource'),
+        json={'settings': {'suppress_missing_key_msg_services': ['etherscan']}},
+    ))['suppress_missing_key_msg_services'] == ['etherscan']
+
+    result = assert_proper_sync_response_with_result(requests.put(
+        api_url_for(rotkehlchen_api_server, 'settingsresource'),
+        json={'settings': {'ui_floating_precision': 4}},
+    ))
+    assert result['ui_floating_precision'] == 4
+    assert result['suppress_missing_key_msg_services'] == ['etherscan']
+    assert CachedSettings().get_settings().suppress_missing_key_msg_services == [ExternalService.ETHERSCAN]  # noqa: E501
+
+
+def test_patch_frontend_settings(rotkehlchen_api_server: APIServer) -> None:
+    """Test the partial update of the frontend settings blob"""
+    def read_frontend() -> dict[str, Any]:
+        return assert_proper_sync_response_with_result(requests.get(
+            api_url_for(rotkehlchen_api_server, 'frontendsettingsresource'),
+        ))
+
+    def patch_frontend(**kwargs: Any) -> dict[str, Any]:
+        """Patch, then read the persisted blob back"""
+        assert assert_proper_sync_response_with_result(requests.patch(
+            api_url_for(rotkehlchen_api_server, 'frontendsettingsresource'),
+            json=kwargs,
+        )) is True
+        return read_frontend()
+
+    # the blob starts out as the empty string, or with no row at all
+    assert patch_frontend(patch={'items_per_page': 10}) == {'items_per_page': 10}
+    assert patch_frontend() == {'items_per_page': 10}  # sending neither member is a no-op
+
+    # a record valued key is replaced wholesale, not merged into
+    assert patch_frontend(patch={'explorers': {
+        'eth': {'address': 'https://etherscan.io/address/', 'transaction': 'https://etherscan.io/tx/'},
+    }})['explorers']['eth']['address'] == 'https://etherscan.io/address/'
+    assert patch_frontend(patch={'explorers': {'eth': {'transaction': 'https://myexplorer.eth/'}}})['explorers'] == {  # noqa: E501
+        'eth': {'transaction': 'https://myexplorer.eth/'},
+    }
+
+    assert 'items_per_page' not in patch_frontend(remove=['items_per_page'])
+    assert patch_frontend(remove=['never_was_there']) == patch_frontend()  # removing an absent key
+
+    # a key the writing client does not know survives a write of another key
+    assert patch_frontend(patch={'a_key_from_the_future': {'nested': [1, 2]}, 'scramble_data': True})['a_key_from_the_future'] == {'nested': [1, 2]}  # noqa: E501
+    merged = patch_frontend(patch={'scramble_data': False})
+    assert merged['a_key_from_the_future'] == {'nested': [1, 2]}
+    assert merged['scramble_data'] is False
+
+    # GET reads from the DB, so check the cache separately
+    assert json.loads(CachedSettings().get_entry('frontend_settings')) == merged  # type: ignore[arg-type]  # it's a str
+
+    # a blob that is not a JSON object is reset by the patch. No endpoint writes one, so use the DB
+    db = rotkehlchen_api_server.rest_api.rotkehlchen.data.db
+    for blob in ('null', '[1, 2]', 'not json at all', ''):
+        with db.user_write() as write_cursor:
+            write_cursor.execute(
+                "INSERT INTO settings(name, value) VALUES('frontend_settings', ?) "
+                'ON CONFLICT(name) DO UPDATE SET value=?', (blob, blob),
+            )
+
+        assert read_frontend() == {}
+        assert patch_frontend(patch={'items_per_page': 25}) == {'items_per_page': 25}
+
+
+def test_patch_frontend_settings_key_validation(rotkehlchen_api_server: APIServer) -> None:
+    """Keys with characters that would change a json path are rejected"""
+    for payload in (
+        {'patch': {'has.a.dot': 1}},
+        {'patch': {'has"a"quote': 1}},
+        {'patch': {'has[0]': 1}},
+        {'patch': {'': 1}},
+        {'remove': ['has.a.dot']},
+    ):
+        assert_error_response(
+            response=requests.patch(
+                api_url_for(rotkehlchen_api_server, 'frontendsettingsresource'),
+                json=payload,
+            ),
+            status_code=HTTPStatus.BAD_REQUEST,
+        )

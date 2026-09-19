@@ -1,0 +1,110 @@
+import type { Credentials, DebugStateGroup, Interop, Listeners, StartupError, TrayUpdate } from '@shared/ipc';
+import type { LogLevel } from '@shared/log-level';
+import { IpcCommands } from '@electron/ipc-commands';
+import { checkIfDevelopment } from '@shared/utils';
+import { contextBridge, ipcRenderer } from 'electron';
+import { initializeWalletBridge } from './wallet-bridge';
+
+const isDevelopment = checkIfDevelopment();
+
+interface DebugSettings {
+  persistStore: boolean;
+}
+
+let debugSettings: DebugSettings | undefined = isDevelopment ? ipcRenderer.sendSync(IpcCommands.SYNC_GET_DEBUG) : undefined;
+
+if (isDevelopment) {
+  ipcRenderer.on(IpcCommands.DEBUG_SETTINGS, (event, args) => {
+    debugSettings = args;
+  });
+}
+
+contextBridge.exposeInMainWorld('interop', {
+  openUrl: async (url: string) => ipcRenderer.invoke(IpcCommands.INVOKE_OPEN_URL, url),
+  closeApp: async () => ipcRenderer.invoke(IpcCommands.INVOKE_CLOSE_APP),
+  openDirectory: async (title: string) => ipcRenderer.invoke(IpcCommands.INVOKE_OPEN_DIRECTORY, title),
+  premiumUserLoggedIn: (premiumUser: boolean) => ipcRenderer.send(IpcCommands.PREMIUM_LOGIN, premiumUser),
+  /**
+   * Subscribes the renderer's callbacks to the messages the main process pushes.
+   *
+   * @remarks
+   * A startup error raised before this ran is not delivered here. The renderer fetches that one
+   * synchronously on init instead, which is why the main process keeps it rather than only
+   * emitting it.
+   */
+  setListeners(listeners: Listeners): void {
+    ipcRenderer.on(IpcCommands.STARTUP_ERROR, (_event, error: StartupError) => {
+      listeners.onError(error.message, error.code);
+    });
+
+    ipcRenderer.on(IpcCommands.REQUEST_RESTART, () => {
+      listeners.onRestart();
+    });
+
+    ipcRenderer.on(IpcCommands.MCP_STATE, (_event, state) => {
+      listeners.onMcpState?.(state);
+    });
+
+    ipcRenderer.on(IpcCommands.ABOUT, () => {
+      listeners.onAbout();
+    });
+
+    const onOAuthCallback = listeners.onOAuthCallback;
+    if (onOAuthCallback) {
+      ipcRenderer.on('oauth-callback', (_event, oAuthResult) => {
+        onOAuthCallback(oAuthResult);
+      });
+    }
+
+    ipcRenderer.on(IpcCommands.APP_CLOSING, () => {
+      listeners.onAppClosing?.();
+    });
+
+    ipcRenderer.on(IpcCommands.RESET_DEBUG_STATE, (_event, group: DebugStateGroup) => {
+      listeners.onResetDebugState?.(group);
+    });
+
+    // Signal to main process that renderer is ready for async messages
+    ipcRenderer.send(IpcCommands.RENDERER_READY);
+  },
+  debugSettings: isDevelopment ? (): DebugSettings | undefined => debugSettings : undefined,
+  apiUrl: (): string => ipcRenderer.sendSync(IpcCommands.SYNC_API_URL),
+  metamaskImport: async () => ipcRenderer.invoke(IpcCommands.INVOKE_WALLET_IMPORT),
+  openWalletConnectBridge: async () => ipcRenderer.invoke(IpcCommands.OPEN_WALLET_CONNECT_BRIDGE),
+  restartBackend: async (options, forceRestart = false) => ipcRenderer.invoke(IpcCommands.INVOKE_SUBPROCESS_START, options, forceRestart),
+  checkForUpdates: async () => ipcRenderer.invoke(IpcCommands.INVOKE_UPDATE_CHECK),
+  downloadUpdate: async (progress) => {
+    ipcRenderer.on(IpcCommands.DOWNLOAD_PROGRESS, (event, args) => {
+      progress(args);
+    });
+    return ipcRenderer.invoke(IpcCommands.INVOKE_DOWNLOAD_UPDATE);
+  },
+  installUpdate: async () => ipcRenderer.invoke(IpcCommands.INVOKE_INSTALL_UPDATE),
+  setSelectedTheme: async selectedTheme => ipcRenderer.invoke(IpcCommands.INVOKE_THEME, selectedTheme),
+  version: async () => ipcRenderer.invoke(IpcCommands.INVOKE_VERSION),
+  isMac: async () => ipcRenderer.invoke(IpcCommands.INVOKE_IS_MAC),
+  openPath: async (path: string) => ipcRenderer.invoke(IpcCommands.INVOKE_OPEN_PATH, path),
+  config: async (defaults: boolean) => ipcRenderer.invoke(IpcCommands.INVOKE_CONFIG, defaults),
+  updateTray: (trayUpdate: TrayUpdate) => ipcRenderer.send(IpcCommands.TRAY_UPDATE, trayUpdate),
+  setDataDirectory: (dataDirectory: string) => ipcRenderer.send(IpcCommands.SET_DATA_DIRECTORY, dataDirectory),
+  logToFile: (level: LogLevel, message: string) => {
+    ipcRenderer.send(IpcCommands.LOG_TO_FILE, level, message);
+  },
+  setLogLevel: (level: LogLevel) => {
+    ipcRenderer.send(IpcCommands.SET_LOG_LEVEL, level);
+  },
+  storePassword: async (credentials: Credentials) => ipcRenderer.invoke(IpcCommands.INVOKE_STORE_PASSWORD, credentials),
+  getPassword: async (username: string) => ipcRenderer.invoke(IpcCommands.INVOKE_GET_PASSWORD, username),
+  clearPassword: async () => ipcRenderer.invoke(IpcCommands.INVOKE_CLEAR_PASSWORD),
+  getMcpServerStatus: async () => ipcRenderer.invoke(IpcCommands.INVOKE_MCP_STATUS),
+  setMcpAutoStart: async (enabled: boolean) => ipcRenderer.invoke(IpcCommands.INVOKE_MCP_AUTOSTART, enabled),
+  startMcpServer: async () => ipcRenderer.invoke(IpcCommands.INVOKE_MCP_START),
+  stopMcpServer: async () => ipcRenderer.invoke(IpcCommands.INVOKE_MCP_STOP),
+  resetMcpSession: async () => ipcRenderer.invoke(IpcCommands.INVOKE_MCP_RESET_SESSION),
+  notifyUserLogout: () => ipcRenderer.send(IpcCommands.USER_LOGOUT),
+  // Synchronously get any startup error that occurred before renderer was ready
+  getStartupError: (): StartupError | null => ipcRenderer.sendSync(IpcCommands.SYNC_GET_STARTUP_ERROR),
+} satisfies Interop);
+
+// Initialize wallet bridge
+initializeWalletBridge();

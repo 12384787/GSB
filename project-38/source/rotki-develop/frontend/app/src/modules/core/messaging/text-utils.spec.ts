@@ -1,0 +1,346 @@
+import {
+  consistOfNumbers,
+  decodeHtmlEntities,
+  getTextToken,
+  isValidAddress,
+  isValidBchAddress,
+  isValidBtcAddress,
+  isValidBtcTxHash,
+  isValidEthAddress,
+  isValidEvmTxHash,
+  isValidHyperliquidTokenAddress,
+  isValidSolanaAddress,
+  isValidSolanaSignature,
+  isValidSs58Address,
+  isValidTxHashOrSignature,
+  isValidUrl,
+  toCapitalCase,
+  toHumanReadable,
+  toSentenceCase,
+  toSnakeCase,
+  transformCase,
+} from '@rotki/common';
+import { HYPERLIQUID_TOKEN_ADDRESS } from '@test/utils/asset-test-data';
+import { describe, expect, it } from 'vitest';
+import { groupConsecutiveNumbers } from './text-utils';
+
+describe('text-utils', () => {
+  it('should return correct human readable value', () => {
+    expect(toHumanReadable('lorem_ipsum dolor sit_amet')).toBe('lorem ipsum dolor sit amet');
+    expect(toHumanReadable('polygon_pos')).toBe('polygon pos');
+    expect(toHumanReadable('polygon_pos', 'uppercase')).toBe('POLYGON POS');
+    expect(toHumanReadable('polygon_pos', 'capitalize')).toBe('Polygon Pos');
+    expect(toHumanReadable('polygon_POS', 'capitalize')).toBe('Polygon POS');
+    expect(toHumanReadable('polygon_pos', 'sentence')).toBe('Polygon pos');
+    expect(toHumanReadable('POLYGON_POS', 'sentence')).toBe('POLYGON POS');
+    expect(toHumanReadable('polygon_pos', 'lowercase')).toBe('polygon pos');
+    expect(toHumanReadable('POLYGON_POS', 'lowercase')).toBe('polygon pos');
+    expect(toHumanReadable('POLYGON_pos', 'lowercase')).toBe('polygon pos');
+  });
+
+  it('should return correct transform case value', () => {
+    expect(transformCase('lorem_ipsum_dolor_sit_amet', true)).toBe('loremIpsumDolorSitAmet');
+    expect(transformCase('lorem_ipsum_dolor_sit_amet')).toBe('lorem_ipsum_dolor_sit_amet');
+    expect(transformCase('loremIpsumDolorSitAmet')).toBe('lorem_ipsum_dolor_sit_amet');
+    expect(transformCase('loremIpsumDolorSitAmet', true)).toBe('loremIpsumDolorSitAmet');
+  });
+
+  it('should return correct toSentenceCase value', () => {
+    expect(toSentenceCase('this is a sentence')).toBe('This is a sentence');
+    expect(toSentenceCase('HELLO WORLD')).toBe('HELLO WORLD');
+    expect(toSentenceCase('hello')).toBe('Hello');
+    expect(toSentenceCase('h')).toBe('H');
+    expect(toSentenceCase('')).toBe('');
+    expect(toSentenceCase('123 numbers')).toBe('123 numbers');
+  });
+
+  it('should return correct getTextToken value', () => {
+    expect(getTextToken('this is a sentence')).toBe('thisisasentence');
+    expect(getTextToken('Hello World!')).toBe('helloworld');
+    expect(getTextToken('Test-123_abc')).toBe('test123abc');
+    expect(getTextToken('  SPACED  ')).toBe('spaced');
+    expect(getTextToken('special!@#$%^&*()chars')).toBe('specialchars');
+    expect(getTextToken('')).toBe('');
+    expect(getTextToken('123abc456')).toBe('123abc456');
+  });
+
+  it('should return correct toSnakeCase value', () => {
+    expect(toSnakeCase('thisIsAString')).toBe('this_is_a_string');
+    expect(toSnakeCase('ThisIsAString')).toBe('this_is_a_string');
+    expect(toSnakeCase('this is a sentence')).toBe('this_is_a_sentence');
+    expect(toSnakeCase('CONSTANT_CASE')).toBe('c_o_n_s_t_a_n_t__c_a_s_e');
+    expect(toSnakeCase('mixedCase123')).toBe('mixed_case123');
+    expect(toSnakeCase('')).toBe('');
+    expect(toSnakeCase('already_snake_case')).toBe('already_snake_case');
+  });
+
+  it('should return correct toCapitalCase value', () => {
+    expect(toCapitalCase('this is a sentence')).toBe('This Is A Sentence');
+    expect(toCapitalCase('hello world')).toBe('Hello World');
+    expect(toCapitalCase('it\'s a test')).toBe('It\'s A Test');
+    expect(toCapitalCase('ALREADY CAPS')).toBe('ALREADY CAPS');
+    expect(toCapitalCase('mixed CASE text')).toBe('Mixed CASE Text');
+    expect(toCapitalCase('123 numbers here')).toBe('123 Numbers Here');
+    expect(toCapitalCase('')).toBe('');
+  });
+
+  it.each([
+    ['a mixed-case address', '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEbB'],
+    ['the zero address', '0x0000000000000000000000000000000000000000'],
+    ['an all-f address', '0xFFfFfFffFFfffFFfFFfFFFFFffFFFffffFfFFFfF'],
+    ['an all-digit address', '0x1234567890123456789012345678901234567890'],
+  ])('should accept %s', (_case, address) => {
+    expect(isValidEthAddress(address)).toBe(true);
+  });
+
+  it.each([
+    ['an empty string', ''],
+    ['nothing at all', undefined],
+    ['a bare prefix', '0x'],
+    ['far too few characters', '0x123'],
+    ['one character short', '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb'],
+    ['no 0x prefix', '742d35Cc6634C0532925a3b844Bc9e7595f0bEbB'],
+    ['a non-hex character', '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEbBG'],
+    ['one character too many', '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEbB0'],
+  ])('should reject %s', (_case, address) => {
+    expect(isValidEthAddress(address)).toBe(false);
+  });
+
+  it('should validate Hyperliquid Core token addresses', () => {
+    expect(isValidHyperliquidTokenAddress(HYPERLIQUID_TOKEN_ADDRESS)).toBe(true);
+    expect(isValidHyperliquidTokenAddress(HYPERLIQUID_TOKEN_ADDRESS.toUpperCase().replace('0X', '0x'))).toBe(true);
+    expect(isValidHyperliquidTokenAddress('0x6781b92b6ea5d8ed37d275eb201f64a')).toBe(false);
+    expect(isValidHyperliquidTokenAddress('0x6781b92b6ea5d8ed37d275eb201f64ag')).toBe(false);
+    expect(isValidHyperliquidTokenAddress()).toBe(false);
+  });
+
+  it.each([
+    ['P2PKH', '1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa'],
+    ['P2PKH', '1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2'],
+    ['P2SH', '3J98t1WpEZ73CNmYviecrnyiWrnqRhWNLy'],
+    ['P2SH', '3QJmV3qfvL9SuYo34YihAf3sRCW3qSinyC'],
+    ['Bech32', 'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4'],
+    ['Bech32', 'bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq'],
+  ])('should accept a %s bitcoin address', (_format, address) => {
+    expect(isValidBtcAddress(address)).toBe(true);
+  });
+
+  it('should reject a malformed Bitcoin address', () => {
+    expect(isValidBtcAddress('')).toBe(false);
+    expect(isValidBtcAddress(undefined)).toBe(false);
+    expect(isValidBtcAddress('0A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa')).toBe(false); // Invalid first char
+    expect(isValidBtcAddress('1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfO')).toBe(false); // Contains O
+    expect(isValidBtcAddress('bc2qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4')).toBe(false); // Invalid prefix
+  });
+
+  it.each([
+    ['legacy', '1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa'],
+    ['legacy', '3J98t1WpEZ73CNmYviecrnyiWrnqRhWNLy'],
+    ['prefixed CashAddr', 'bitcoincash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a'],
+    ['prefixed CashAddr', 'bitcoincash:qr95sy3j9xwd2ap32xkykttr4cvcu7as4y0qverfuy'],
+    ['bare CashAddr', 'qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a'],
+    ['bare CashAddr', 'qr95sy3j9xwd2ap32xkykttr4cvcu7as4y0qverfuy'],
+  ])('should accept a %s bitcoin cash address', (_format, address) => {
+    expect(isValidBchAddress(address)).toBe(true);
+  });
+
+  it('should reject a malformed Bitcoin Cash address', () => {
+    expect(isValidBchAddress('')).toBe(false);
+    expect(isValidBchAddress(undefined)).toBe(false);
+    expect(isValidBchAddress('bitcoincash:')).toBe(false);
+    expect(isValidBchAddress('bitcoin:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a')).toBe(false); // Wrong prefix
+  });
+
+  it('should accept only base58 Solana addresses of 32 to 44 characters', () => {
+    expect(isValidSolanaAddress('7EqQdEULxWcraVx3mXKFjc84LhCkMGZCkRuDpvcMwJeK')).toBe(true);
+    expect(isValidSolanaAddress('DYw8jCTfwHNRJhhmFcbXvVDTqWMEVFBX6ZKUmG5CNSKK')).toBe(true);
+    expect(isValidSolanaAddress('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')).toBe(true);
+
+    expect(isValidSolanaAddress('')).toBe(false);
+    expect(isValidSolanaAddress(undefined)).toBe(false);
+    expect(isValidSolanaAddress('999999999999999999999999999999999999')).toBe(false);
+    expect(isValidSolanaAddress('tooshort')).toBe(false);
+    expect(isValidSolanaAddress('7EqQdEULxWcraVx3mXKFjc84LhCkMGZCkRuDpvcMwJeK0')).toBe(false); // Invalid character
+    expect(isValidSolanaAddress('InvalidBase58WithOandI')).toBe(false); // Contains invalid base58 chars
+  });
+
+  it.each([
+    ['ethereum', '0x742d35Cc6634C0532925a3b844Bc9e7595f0bEbB'],
+    ['bitcoin', '1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa'],
+    ['bitcoin cash', 'qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a'],
+    ['solana', '7EqQdEULxWcraVx3mXKFjc84LhCkMGZCkRuDpvcMwJeK'],
+    ['polkadot', '13UVJyLnbVp9RBZYFwFGyDvVd1y27Tt8tkntv6Q7JVPhFsTB'],
+    ['kusama', 'HNZata7iMYWmk5RvZRTiAsSDhV8366zq2YGb3tLH5Upf74F'],
+  ])('should accept a %s address as a generic one', (_chain, address) => {
+    expect(isValidAddress(address)).toBe(true);
+  });
+
+  it.each([
+    ['nonsense', 'invalid-address'],
+    ['an empty string', ''],
+    ['a bare 0x prefix', '0x'],
+    ['a half-typed evm address', '0x742d35Cc6634C0532925a3b844Bc9e7595f0'],
+  ])('should reject %s as a generic address', (_case, address) => {
+    expect(isValidAddress(address)).toBe(false);
+    expect(isValidAddress(undefined)).toBe(false);
+  });
+
+  it.each([
+    ['polkadot', '13UVJyLnbVp9RBZYFwFGyDvVd1y27Tt8tkntv6Q7JVPhFsTB'],
+    ['kusama', 'HNZata7iMYWmk5RvZRTiAsSDhV8366zq2YGb3tLH5Upf74F'],
+  ])('should accept a %s substrate address', (_chain, address) => {
+    expect(isValidSs58Address(address)).toBe(true);
+  });
+
+  it('should reject a generic prefix-42 address, well formed but not one the backend takes', () => {
+    const genericSubstratePrefix42 = '5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY';
+
+    expect(isValidSs58Address(genericSubstratePrefix42)).toBe(false);
+  });
+
+  it.each([
+    ['a truncated address', '13UVJyLnbVp9RBZYFwFGyDvVd1y27Tt8tkn'],
+    ['an empty string', ''],
+  ])('should reject %s as a substrate address', (_case, address) => {
+    expect(isValidSs58Address(address)).toBe(false);
+    expect(isValidSs58Address(undefined)).toBe(false);
+  });
+
+  it('should accept only EVM transaction hashes of 0x plus 64 hex characters', () => {
+    expect(isValidEvmTxHash('0x5c504ed432cb51138bcf09aa5e8a410dd4a1e204ef84bfed1be16dfba1b22060')).toBe(true);
+    expect(isValidEvmTxHash('0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef')).toBe(true);
+    expect(isValidEvmTxHash('0xABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890')).toBe(true);
+
+    expect(isValidEvmTxHash('')).toBe(false);
+    expect(isValidEvmTxHash(undefined)).toBe(false);
+    expect(isValidEvmTxHash('0x')).toBe(false);
+    expect(isValidEvmTxHash('0x5c504ed432cb51138bcf09aa5e8a410dd4a1e204ef84bfed1be16dfba1b2206')).toBe(false); // Too short
+    expect(isValidEvmTxHash('5c504ed432cb51138bcf09aa5e8a410dd4a1e204ef84bfed1be16dfba1b22060')).toBe(false); // Missing 0x
+    expect(isValidEvmTxHash('0x5c504ed432cb51138bcf09aa5e8a410dd4a1e204ef84bfed1be16dfba1b22060G')).toBe(false); // Invalid hex
+  });
+
+  it('should accept only Bitcoin transaction hashes of 64 hex characters with no 0x prefix', () => {
+    expect(isValidBtcTxHash('5c504ed432cb51138bcf09aa5e8a410dd4a1e204ef84bfed1be16dfba1b22060')).toBe(true);
+    expect(isValidBtcTxHash('1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef')).toBe(true);
+    expect(isValidBtcTxHash('ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890')).toBe(true);
+
+    expect(isValidBtcTxHash('')).toBe(false);
+    expect(isValidBtcTxHash(undefined)).toBe(false);
+    expect(isValidBtcTxHash('5c504ed432cb51138bcf09aa5e8a410dd4a1e204ef84bfed1be16dfba1b2206')).toBe(false); // Too short
+    expect(isValidBtcTxHash('0x5c504ed432cb51138bcf09aa5e8a410dd4a1e204ef84bfed1be16dfba1b22060')).toBe(false); // Has 0x
+    expect(isValidBtcTxHash('5c504ed432cb51138bcf09aa5e8a410dd4a1e204ef84bfed1be16dfba1b22060G')).toBe(false); // Invalid hex
+  });
+
+  it('should accept only base58 Solana signatures of 87 to 88 characters decoding to 64 bytes', () => {
+    expect(isValidSolanaSignature('5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW')).toBe(true);
+    expect(isValidSolanaSignature('3nGJm9dqGhfyJzkLhL7KMQqGGQqyL5aLqWJNF8JvqSDqWqCRAkVVdDhTZmTHJHVQtDk3LLwYvBSVCH9Tg4CKnWqA')).toBe(true);
+
+    expect(isValidSolanaSignature('')).toBe(false);
+    expect(isValidSolanaSignature(undefined)).toBe(false);
+    expect(isValidSolanaSignature('tooshort')).toBe(false);
+    expect(isValidSolanaSignature('5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW0')).toBe(false); // Invalid character '0'
+    expect(isValidSolanaSignature('999999999999999999999999999999999999999999999999999999999999999999999999999999999999999')).toBe(true); // Valid base58 encoding that decodes to 64 bytes
+  });
+
+  it.each([
+    ['an EVM transaction hash', '0x5c504ed432cb51138bcf09aa5e8a410dd4a1e204ef84bfed1be16dfba1b22060'],
+    ['a bitcoin transaction hash', '5c504ed432cb51138bcf09aa5e8a410dd4a1e204ef84bfed1be16dfba1b22060'],
+    ['a solana signature', '5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW'],
+  ])('should accept %s', (_kind, value) => {
+    expect(isValidTxHashOrSignature(value)).toBe(true);
+  });
+
+  it.each([
+    ['a string that is neither', 'invalid-hash'],
+    ['an empty string', ''],
+    ['undefined', undefined],
+  ])('should reject %s', (_kind, value) => {
+    expect(isValidTxHashOrSignature(value)).toBe(false);
+  });
+
+  it('should check if text consists of numbers only', () => {
+    expect(consistOfNumbers('123')).toBe(true);
+    expect(consistOfNumbers('0')).toBe(true);
+    expect(consistOfNumbers('999999')).toBe(true);
+    expect(consistOfNumbers('12345678901234567890')).toBe(true);
+
+    expect(consistOfNumbers('123abc')).toBe(false);
+    expect(consistOfNumbers('abc')).toBe(false);
+    expect(consistOfNumbers('12.34')).toBe(false);
+    expect(consistOfNumbers('12,34')).toBe(false);
+    expect(consistOfNumbers('12 34')).toBe(false);
+    expect(consistOfNumbers('-123')).toBe(false);
+    expect(consistOfNumbers('+123')).toBe(false);
+    expect(consistOfNumbers('')).toBe(false);
+    expect(consistOfNumbers(undefined)).toBe(false);
+  });
+
+  it('should validate URLs', () => {
+    expect(isValidUrl('https://example.com')).toBe(true);
+    expect(isValidUrl('http://example.com')).toBe(true);
+    expect(isValidUrl('https://www.example.com')).toBe(true);
+    expect(isValidUrl('https://example.com/path/to/page')).toBe(true);
+    expect(isValidUrl('https://example.com/path?query=value')).toBe(true);
+    expect(isValidUrl('https://example.com:8080')).toBe(true);
+    expect(isValidUrl('https://sub.example.com')).toBe(true);
+    expect(isValidUrl('https://example.com/path#anchor')).toBe(true);
+    expect(isValidUrl('https://example.com/path?q=1&p=2')).toBe(true);
+
+    expect(isValidUrl('')).toBe(false);
+    expect(isValidUrl(undefined)).toBe(false);
+    expect(isValidUrl('example.com')).toBe(false); // Missing protocol
+    expect(isValidUrl('ftp://example.com')).toBe(false); // Wrong protocol
+    expect(isValidUrl('https://')).toBe(false);
+    expect(isValidUrl('https://example')).toBe(false);
+    expect(isValidUrl('not a url')).toBe(false);
+  });
+
+  it('should decode HTML entities', () => {
+    expect(decodeHtmlEntities('&#8226;')).toBe('\u2022'); // Numeric, since happy-dom decodes only the basic named entities
+    expect(decodeHtmlEntities('&lt;div&gt;')).toBe('<div>');
+    expect(decodeHtmlEntities('&amp;')).toBe('&');
+    expect(decodeHtmlEntities('&quot;')).toBe('"');
+    expect(decodeHtmlEntities('&apos;')).toBe('\'');
+    expect(decodeHtmlEntities('&#169;')).toBe('\u00A9');
+    expect(decodeHtmlEntities('&#x2665;')).toBe('\u2665');
+    expect(decodeHtmlEntities('Hello &amp; welcome &lt;test&gt;')).toBe('Hello & welcome <test>');
+    expect(decodeHtmlEntities('plain text')).toBe('plain text');
+    expect(decodeHtmlEntities('')).toBe('');
+  });
+
+  it('should return empty string for empty array', () => {
+    expect(groupConsecutiveNumbers([])).toBe('');
+  });
+
+  it('should handle a single number', () => {
+    expect(groupConsecutiveNumbers([5])).toBe('5');
+  });
+
+  it('should handle consecutive numbers as a range', () => {
+    expect(groupConsecutiveNumbers([1, 2, 3])).toBe('1-3');
+  });
+
+  it('should handle non-consecutive numbers as individual values', () => {
+    expect(groupConsecutiveNumbers([1, 3, 5])).toBe('1, 3, 5');
+  });
+
+  it('should handle mixed consecutive and non-consecutive numbers', () => {
+    expect(groupConsecutiveNumbers([1, 2, 3, 5, 7, 10, 11, 12, 13])).toBe('1-3, 5, 7, 10-13');
+  });
+
+  it('should handle two consecutive numbers', () => {
+    expect(groupConsecutiveNumbers([4, 5])).toBe('4-5');
+  });
+
+  it('should handle multiple separate ranges', () => {
+    expect(groupConsecutiveNumbers([1, 2, 5, 6, 9, 10])).toBe('1-2, 5-6, 9-10');
+  });
+
+  it('should handle a single range followed by individual numbers', () => {
+    expect(groupConsecutiveNumbers([1, 2, 3, 7, 9])).toBe('1-3, 7, 9');
+  });
+
+  it('should handle individual numbers followed by a range', () => {
+    expect(groupConsecutiveNumbers([1, 5, 8, 9, 10])).toBe('1, 5, 8-10');
+  });
+});

@@ -1,0 +1,509 @@
+import datetime
+from contextlib import ExitStack
+from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
+
+import pytest
+
+from rotkehlchen.accounting.structures.balance import Balance
+from rotkehlchen.assets.asset import Asset
+from rotkehlchen.assets.utils import get_or_create_evm_token
+from rotkehlchen.chain.accounts import BlockchainAccountData
+from rotkehlchen.chain.aggregator import ChainsAggregator, _module_name_to_class
+from rotkehlchen.chain.evm.constants import LAST_SPAM_TXS_CACHE
+from rotkehlchen.chain.evm.types import (
+    EvmIndexer,
+    SerializableChainIndexerOrder,
+    string_to_evm_address,
+)
+from rotkehlchen.constants import DEFAULT_BALANCE_LABEL, ONE
+from rotkehlchen.constants.assets import A_ETH
+from rotkehlchen.db.addressbook import DBAddressbook
+from rotkehlchen.db.cache import DBCacheDynamic
+from rotkehlchen.errors.misc import RemoteError
+from rotkehlchen.fval import FVal
+from rotkehlchen.tests.utils.blockchain import setup_evm_addresses_activity_mock
+from rotkehlchen.tests.utils.factories import make_evm_address
+from rotkehlchen.types import (
+    AVAILABLE_MODULES_MAP,
+    SPAM_PROTOCOL,
+    AddressbookType,
+    ChainID,
+    ChecksumEvmAddress,
+    OptionalChainAddress,
+    SupportedBlockchain,
+)
+
+if TYPE_CHECKING:
+    from rotkehlchen.chain.base.manager import BaseManager
+    from rotkehlchen.chain.gnosis.manager import GnosisManager
+    from rotkehlchen.chain.polygon_pos.manager import PolygonPOSManager
+
+
+@pytest.mark.parametrize('ethereum_modules', [[]])
+def test_module_activation(blockchain):
+    for module_name in AVAILABLE_MODULES_MAP:
+        expected_module_type = _module_name_to_class(module_name)
+        module = blockchain.activate_module(module_name)
+        assert isinstance(module, expected_module_type)
+        assert blockchain.eth_modules[module_name] == module
+
+
+@pytest.mark.parametrize('ethereum_modules', [AVAILABLE_MODULES_MAP.keys()])
+def test_module_deactivation(blockchain):
+    for module_name in AVAILABLE_MODULES_MAP:
+        expected_module_type = _module_name_to_class(module_name)
+        assert isinstance(blockchain.eth_modules[module_name], expected_module_type)
+        blockchain.deactivate_module(module_name)
+        assert module_name not in blockchain.eth_modules
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [[]])
+def test_detect_evm_accounts(blockchain: ChainsAggregator) -> None:
+    """
+    Tests that the detection of EVM accounts activity in chains where they are not tracked yet
+    works as expected.
+    """
+    # Is a contract in ethereum mainnet. Now added to chains where it has activity (optimism, avax)
+    eth_addy_contract = string_to_evm_address('0x06FAC6fd222E59D3D8602795fdD88769bCB998Bd')
+
+    # Is an EOA in optimism. Has activity in all chains. Should be added to optimism, and avax
+    addy_eoa_1 = string_to_evm_address('0xFaa7Fa8B22704057B8345Ed8C9bE7d5081eefb81')
+
+    # Is an EOA in ethereum mainnet. Has activity only in ethereum and in optimism. Should be
+    # added to optimism and should not be added to avax
+    addy_eoa_2 = string_to_evm_address('0xeFB06924caC08837153f6544d029A8208b236196')
+    # polygon and mainnet - auto-detected on most of the other chains.
+    addy_eoa_3 = string_to_evm_address('0xDC50D9Ca7f5D062Acb2f9f8369da9919D9F08F8E')
+    # arbitrum and mainnet - auto-detected on polygon
+    addy_eoa_4 = string_to_evm_address('0x1cdE61EC6C5De8E479d463a1abeaF588E36F5326')
+
+    # Is an EOA that is initially already added everywhere. Has activity in all chains.
+    # Since is already added, should not be added again.
+    everywhere_addy = string_to_evm_address('0x0cBc2327D4E4aA011807C20ea81FAba73Ad603ab')
+
+    # Labels are as follows:
+    # addy_eoa_2 - same label set on both ethereum and polygon initially - Updated to multichain
+    # addy_eoa_3 - label set only on ethereum initially - Updated to multichain
+    # addy_eoa_4 - different labels on ethereum and arbitrum one - Not updated to multichain
+
+    initial_accounts_data = []
+    addies_to_start_with = [
+        (SupportedBlockchain.ETHEREUM, eth_addy_contract, None),
+        (SupportedBlockchain.OPTIMISM, addy_eoa_1, None),
+        (SupportedBlockchain.ETHEREUM, addy_eoa_2, (label1 := 'Label 1')),
+        (SupportedBlockchain.POLYGON_POS, addy_eoa_2, label1),
+        (SupportedBlockchain.ETHEREUM, addy_eoa_3, (label2 := 'Label 2')),
+        (SupportedBlockchain.ETHEREUM, addy_eoa_4, 'Label 3'),
+        (SupportedBlockchain.ARBITRUM_ONE, addy_eoa_4, 'Label 4'),
+        (SupportedBlockchain.ETHEREUM, everywhere_addy, None),
+        (SupportedBlockchain.OPTIMISM, everywhere_addy, None),
+        (SupportedBlockchain.AVALANCHE, everywhere_addy, None),
+        (SupportedBlockchain.POLYGON_POS, everywhere_addy, None),
+        (SupportedBlockchain.ARBITRUM_ONE, everywhere_addy, None),
+        (SupportedBlockchain.BASE, everywhere_addy, None),
+        (SupportedBlockchain.GNOSIS, everywhere_addy, None),
+        (SupportedBlockchain.SCROLL, everywhere_addy, None),
+        (SupportedBlockchain.BINANCE_SC, everywhere_addy, None),
+        (SupportedBlockchain.MONAD, everywhere_addy, None),
+          (SupportedBlockchain.SONIC, everywhere_addy, None),
+        (SupportedBlockchain.ROBINHOOD, everywhere_addy, None),
+        (SupportedBlockchain.INK, everywhere_addy, None),
+    ]
+
+    for chain, addy, label in addies_to_start_with:
+        with blockchain.database.user_write() as write_cursor:
+            blockchain.modify_blockchain_accounts(
+                write_cursor=write_cursor,
+                blockchain=chain,
+                accounts=[addy],
+                append_or_remove='append',
+            )
+        initial_accounts_data.append(BlockchainAccountData(
+            chain=chain,
+            address=addy,
+            label=label,
+        ))
+
+    with blockchain.database.user_write() as write_cursor:
+        blockchain.database.add_blockchain_accounts(
+            write_cursor=write_cursor,
+            account_data=initial_accounts_data,
+        )
+
+    with ExitStack() as stack:
+        setup_evm_addresses_activity_mock(
+            stack=stack,
+            chains_aggregator=blockchain,
+            eth_contract_addresses=[eth_addy_contract, everywhere_addy],
+            ethereum_addresses=[eth_addy_contract, everywhere_addy, addy_eoa_1, addy_eoa_2],
+            optimism_addresses=[eth_addy_contract, everywhere_addy, addy_eoa_1, addy_eoa_2],
+            avalanche_addresses=[eth_addy_contract, everywhere_addy, addy_eoa_1],
+            polygon_pos_addresses=[everywhere_addy, addy_eoa_3, addy_eoa_4],
+            arbitrum_one_addresses=[everywhere_addy, addy_eoa_3],
+            base_addresses=[everywhere_addy, addy_eoa_3],
+            gnosis_addresses=[everywhere_addy, addy_eoa_3],
+            scroll_addresses=[everywhere_addy, addy_eoa_3],
+            binance_sc_addresses=[everywhere_addy, addy_eoa_3],
+            monad_addresses=[everywhere_addy, addy_eoa_3],
+              sonic_addresses=[everywhere_addy, addy_eoa_3],
+            robinhood_addresses=[everywhere_addy, addy_eoa_3],
+            ink_addresses=[everywhere_addy, addy_eoa_3],
+        )
+
+        blockchain.detect_evm_accounts()
+
+    assert set(blockchain.accounts.eth) == {addy_eoa_1, addy_eoa_2, addy_eoa_3, addy_eoa_4, eth_addy_contract, everywhere_addy}  # noqa: E501
+    assert set(blockchain.accounts.optimism) == {addy_eoa_1, addy_eoa_2, eth_addy_contract, everywhere_addy}  # noqa: E501
+    assert set(blockchain.accounts.avax) == {addy_eoa_1, everywhere_addy, eth_addy_contract}
+    assert set(blockchain.accounts.polygon_pos) == {addy_eoa_2, addy_eoa_3, addy_eoa_4, everywhere_addy}  # noqa: E501
+    assert set(blockchain.accounts.arbitrum_one) == {addy_eoa_3, addy_eoa_4, everywhere_addy}
+    assert set(blockchain.accounts.base) == {addy_eoa_3, everywhere_addy}
+    assert set(blockchain.accounts.gnosis) == {addy_eoa_3, everywhere_addy}
+    assert set(blockchain.accounts.scroll) == {addy_eoa_3, everywhere_addy}
+    assert set(blockchain.accounts.binance_sc) == {addy_eoa_3, everywhere_addy}
+    assert set(blockchain.accounts.monad) == {addy_eoa_3, everywhere_addy}
+    assert set(blockchain.accounts.sonic) == {addy_eoa_3, everywhere_addy}
+    assert set(blockchain.accounts.robinhood) == {addy_eoa_3, everywhere_addy}
+    assert set(blockchain.accounts.ink) == {addy_eoa_3, everywhere_addy}
+
+    # Also check the db
+    expected_accounts_data = initial_accounts_data + [
+        BlockchainAccountData(chain=chain, address=address, label=label)
+        for chain, address, label in (
+            (SupportedBlockchain.ETHEREUM, addy_eoa_1, None),
+            (SupportedBlockchain.AVALANCHE, addy_eoa_1, None),
+            (SupportedBlockchain.AVALANCHE, eth_addy_contract, None),
+            (SupportedBlockchain.OPTIMISM, eth_addy_contract, None),
+            (SupportedBlockchain.OPTIMISM, addy_eoa_2, label1),
+            (SupportedBlockchain.POLYGON_POS, addy_eoa_4, None),
+            (SupportedBlockchain.POLYGON_POS, addy_eoa_3, label2),
+            (SupportedBlockchain.ARBITRUM_ONE, addy_eoa_3, label2),
+            (SupportedBlockchain.BASE, addy_eoa_3, label2),
+            (SupportedBlockchain.GNOSIS, addy_eoa_3, label2),
+            (SupportedBlockchain.SCROLL, addy_eoa_3, label2),
+            (SupportedBlockchain.BINANCE_SC, addy_eoa_3, label2),
+            (SupportedBlockchain.MONAD, addy_eoa_3, label2),
+              (SupportedBlockchain.SONIC, addy_eoa_3, label2),
+            (SupportedBlockchain.ROBINHOOD, addy_eoa_3, label2),
+            (SupportedBlockchain.INK, addy_eoa_3, label2),
+          )
+    ]
+
+    with blockchain.database.conn.read_ctx() as cursor:
+        raw_accounts = blockchain.database.get_blockchain_accounts(cursor)
+
+    accounts_in_db = [
+        BlockchainAccountData(
+            chain=chain,
+            address=account,
+            label=DBAddressbook(blockchain.database).get_addressbook_entry_name(
+                book_type=AddressbookType.PRIVATE,
+                chain_address=OptionalChainAddress(address=account, blockchain=chain),  # type: ignore[arg-type]  # account will be ChecksumAddress here
+            ),
+        )
+        for chain in (
+            SupportedBlockchain.ETHEREUM,
+            SupportedBlockchain.OPTIMISM,
+            SupportedBlockchain.AVALANCHE,
+            SupportedBlockchain.POLYGON_POS,
+            SupportedBlockchain.ARBITRUM_ONE,
+            SupportedBlockchain.BASE,
+            SupportedBlockchain.GNOSIS,
+            SupportedBlockchain.SCROLL,
+            SupportedBlockchain.BINANCE_SC,
+            SupportedBlockchain.MONAD,
+              SupportedBlockchain.SONIC,
+            SupportedBlockchain.ROBINHOOD,
+            SupportedBlockchain.INK,
+        ) for account in raw_accounts.get(chain)
+    ]
+
+    assert set(accounts_in_db) == set(expected_accounts_data)
+    assert len(accounts_in_db) == len(expected_accounts_data)
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.freeze_time('2023-06-19 05:16:10 GMT')
+@pytest.mark.parametrize('polygon_pos_accounts', [[make_evm_address()]])  # to connect to nodes
+@pytest.mark.skip(reason='requires a credentialed Polygon RPC cassette')
+def test_detect_evm_accounts_spam_tx(polygon_pos_manager: PolygonPOSManager) -> None:
+    """
+    Test that an account with only erc20 transfers of spam tokens gets marked as spam
+    and does not get detected as a tracked account in the EVM chain.
+
+    The tested address has received the following spam tokens
+    eip155:137/erc20:0x91bD4023A21bc12814905f251eb348e298DBC0F0
+    eip155:137/erc20:0xD6198855979714255d711A4bB8BF1763d28A473B
+    eip155:137/erc20:0xb76c90B51338016011Eaf27C348E3D84A623C5BF
+    eip155:137/erc20:0x5522962DCE6BE2a009D29E5699a67C38b392beb9
+    eip155:137/erc20:0xd9503c336512120Aa6834Ab5d9258a32940bB2C6
+    eip155:137/erc20:0x9715A23D25399EF10D819e4999689de3d14eB7e2
+    eip155:137/erc20:0xb266edC3706fC2A48ECFef7DD8831435f12D9966
+    eip155:137/erc20:0x06732174B52743C374445E88C9b01031Bd0FB28f
+    eip155:137/erc20:0xE2Ee00F49464d6B60771dc118A1bb4eb362bd154
+    eip155:137/erc20:0x37CC5F5610d91325c8A8C0eD74d26A01F19e7B51
+
+    first we check that it is marked as spammed by:
+    - ignoring the first asset
+    - adding the second as spam asset
+
+    to verify that the address has been spammed all the remaining assets are ignored
+    """
+    evm_address = string_to_evm_address('0xc1C736F2Ac0e0019A188982c7c8C063976A4d8d9')
+    db = polygon_pos_manager.node_inquirer.database
+    with db.user_write() as write_cursor:
+        db.add_to_ignored_assets(
+            write_cursor=write_cursor,
+            asset=Asset('eip155:137/erc20:0x91bD4023A21bc12814905f251eb348e298DBC0F0'),
+        )
+    get_or_create_evm_token(
+        userdb=polygon_pos_manager.node_inquirer.database,
+        evm_address=string_to_evm_address('0xD6198855979714255d711A4bB8BF1763d28A473B'),
+        chain_id=ChainID.POLYGON_POS,
+        protocol=SPAM_PROTOCOL,
+    )
+    assert polygon_pos_manager.transactions.address_has_been_spammed(evm_address) is True
+
+    spam_assets = [
+        Asset('eip155:137/erc20:0xb76c90B51338016011Eaf27C348E3D84A623C5BF'),
+        Asset('eip155:137/erc20:0x5522962DCE6BE2a009D29E5699a67C38b392beb9'),
+        Asset('eip155:137/erc20:0xd9503c336512120Aa6834Ab5d9258a32940bB2C6'),
+        Asset('eip155:137/erc20:0x9715A23D25399EF10D819e4999689de3d14eB7e2'),
+        Asset('eip155:137/erc20:0xb266edC3706fC2A48ECFef7DD8831435f12D9966'),
+        Asset('eip155:137/erc20:0x06732174B52743C374445E88C9b01031Bd0FB28f'),
+        Asset('eip155:137/erc20:0xE2Ee00F49464d6B60771dc118A1bb4eb362bd154'),
+        Asset('eip155:137/erc20:0x37CC5F5610d91325c8A8C0eD74d26A01F19e7B51'),
+    ]
+    with db.user_write() as write_cursor:
+        for asset in spam_assets:
+            db.add_to_ignored_assets(write_cursor=write_cursor, asset=asset)
+
+    assert polygon_pos_manager.transactions.address_has_been_spammed(evm_address) is True
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.freeze_time('2024-05-03 10:45:00 GMT')
+@pytest.mark.parametrize('gnosis_accounts', [[make_evm_address()]])  # to connect to nodes
+def test_detect_evm_accounts_spam_tx_gnosis(
+        gnosis_manager: GnosisManager,
+        allow_gnosis_etherscan: None,
+) -> None:
+    """
+    Test that an account with only erc20 transfers of spam tokens gets marked as spam
+    and does not get detected as a tracked account in the EVM chain.
+
+    The tested address has received the following spam tokens:
+    eip155:100/erc20:0x8786B9c1a0C676B191284A4Bc7e448321197BB05
+    eip155:100/erc20:0xC1BeC4618B212441E367ED363540D5D665e8e4F0
+    """
+    # This evm address has only received spam transactions
+    evm_address = string_to_evm_address('0xF5d90Ac6747CB3352F05BF61f48b991ACeaE28eB')
+    database = gnosis_manager.node_inquirer.database
+
+    # check that the cache is not set
+    with database.conn.read_ctx() as cursor:
+        result = database.get_dynamic_cache(
+            cursor=cursor,
+            name=DBCacheDynamic.LAST_QUERY_TS,
+            location=gnosis_manager.node_inquirer.chain_name,
+            location_name=LAST_SPAM_TXS_CACHE,
+            account_id=evm_address,
+        )
+    assert result is None
+
+    for spam_asset in (
+        '0x8786B9c1a0C676B191284A4Bc7e448321197BB05',
+        '0xC1BeC4618B212441E367ED363540D5D665e8e4F0',
+    ):  # spam tokens received by the address
+        get_or_create_evm_token(
+            userdb=gnosis_manager.node_inquirer.database,
+            evm_address=string_to_evm_address(spam_asset),
+            chain_id=ChainID.GNOSIS,
+            protocol=SPAM_PROTOCOL,
+        )
+
+    assert gnosis_manager.transactions.address_has_been_spammed(evm_address) is True
+
+    # check that the cache is updated
+    with database.conn.read_ctx() as cursor:
+        result = database.get_dynamic_cache(
+            cursor=cursor,
+            name=DBCacheDynamic.LAST_QUERY_TS,
+            location=gnosis_manager.node_inquirer.chain_name,
+            location_name=LAST_SPAM_TXS_CACHE,
+            account_id=evm_address,
+        )
+    assert result is not None
+
+    block_number = gnosis_manager.node_inquirer.get_blocknumber_by_time(ts=result, closest='before')  # noqa: E501
+    with patch('requests.get') as mocked_get:
+        assert gnosis_manager.transactions.address_has_been_spammed(evm_address) is True
+        # verify that the gnosiscan API get's queried with the last recorded blocknumber
+        assert all(f'startBlock={block_number}' in call.args[0] for call in mocked_get.mock_calls), "URL must contain 'startBlock=' and correct block number"  # noqa: E501
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('db_settings', [{
+    'evm_indexers_order': SerializableChainIndexerOrder(
+        order={ChainID.BASE: [EvmIndexer.BLOCKSCOUT]},
+    ),
+}])
+@pytest.mark.freeze_time(datetime.datetime.fromtimestamp(1717416305, tz=datetime.UTC))
+@pytest.mark.parametrize('base_accounts', [['0xeA2B3D309bC480Fe385BBF8aEF6D45D81825A784']])
+def test_detect_spammed_transaction_new_token(
+        base_manager: BaseManager,
+        base_accounts: list[ChecksumEvmAddress],
+) -> None:
+    """Check that the functionality to detect accounts that have been sent only spam tokens
+    works correctly when the received token hasn't been previously tracked.
+    The address used in this test has only one transaction in the time range of
+    [1717116105, 1717116305] where it received a spam token that is not in the database.
+    """
+    with patch.object(
+        base_manager.node_inquirer.database,
+        'get_dynamic_cache',
+        side_effect=lambda *args, **kwargs: 1717116105,
+    ):
+        assert base_manager.transactions.address_has_been_spammed(
+            address=base_accounts[0],
+        ) is True
+
+
+@pytest.mark.parametrize('ethereum_accounts', [[
+    '0x5A0b54D5dc17e0AadC383d2db43B0a0D3E029c4c',
+    '0xC0FfEE254729296a45a3885639AC7E10F9d54979',
+]])
+def test_get_active_addresses(blockchain: ChainsAggregator) -> None:
+    """`get_active_addresses` honors the `disabled_chain_queries` setting:
+    - missing key   => returns all tracked addresses
+    - empty frozen  => returns ()
+    - subset frozen => returns the complement
+    """
+    from rotkehlchen.db.settings import CachedSettings
+    addr_a, addr_b = blockchain.accounts.eth
+
+    # 1. Missing key => all tracked addresses returned
+    CachedSettings().update_entry('disabled_chain_queries', {})
+    assert blockchain.get_active_addresses(SupportedBlockchain.ETHEREUM) == (addr_a, addr_b)
+
+    # 2. Empty frozenset => entire chain disabled
+    CachedSettings().update_entry(
+        'disabled_chain_queries',
+        {SupportedBlockchain.ETHEREUM: frozenset()},
+    )
+    assert blockchain.get_active_addresses(SupportedBlockchain.ETHEREUM) == ()
+
+    # 3. Subset disabled => complement returned
+    CachedSettings().update_entry(
+        'disabled_chain_queries',
+        {SupportedBlockchain.ETHEREUM: frozenset({addr_a})},
+    )
+    assert blockchain.get_active_addresses(SupportedBlockchain.ETHEREUM) == (addr_b,)
+
+    # Reset for other tests in the same session
+    CachedSettings().update_entry('disabled_chain_queries', {})
+
+
+@pytest.mark.parametrize('ethereum_modules', [[]])
+@pytest.mark.parametrize('ethereum_accounts', [[]])
+def test_modify_blockchain_accounts_flushes_balance_cache(
+        blockchain: ChainsAggregator,
+) -> None:
+    """Regression test for balance result-cache invalidation on account changes.
+
+    The cached per-chain balance method was renamed to `_query_chain_balances` in commit
+    8fe3fdd874, but the `flush_cache` calls in `modify_blockchain_accounts` kept using the
+    old `query_balances` name, so the cache key never matched and the entry was never
+    invalidated. A non-ignore-cache balance query within the cache TTL would then return
+    stale balances (e.g. missing a newly added account).
+    """
+    chain = SupportedBlockchain.ETHEREUM
+    keys_before = set(blockchain.results_cache)
+    # Populate the cached full-chain balance query the way a non-ignore-cache query does.
+    # With no accounts the method short-circuits (no network) but still caches its result.
+    blockchain._query_chain_balances(blockchain=chain, ignore_cache=False, addresses=None)
+    cached_keys = set(blockchain.results_cache) - keys_before
+    assert len(cached_keys) == 1, 'the full-chain balance query should have been cached'
+
+    with blockchain.database.user_write() as write_cursor:
+        blockchain.modify_blockchain_accounts(
+            write_cursor=write_cursor,
+            blockchain=chain,
+            accounts=[make_evm_address()],
+            append_or_remove='append',
+        )
+
+    assert cached_keys.isdisjoint(blockchain.results_cache), (
+        'adding an account must invalidate the cached chain balance query'
+    )
+
+
+@pytest.mark.parametrize('ethereum_modules', [[]])
+@pytest.mark.parametrize('ethereum_accounts', [[]])
+def test_query_balances_skips_chains_without_accounts(
+        blockchain: ChainsAggregator,
+) -> None:
+    """Regression test: a full balance refresh must not touch the balances cache for
+    chains that have no tracked accounts.
+
+    Previously the refresh loop called `_update_blockchain_balances_cache` (which opens a
+    committed write transaction) for every supported chain on each refresh, even the ~14 a
+    typical user has no accounts on, deleting nothing each time.
+    """
+    with patch.object(
+        blockchain,
+        '_update_blockchain_balances_cache',
+        wraps=blockchain._update_blockchain_balances_cache,
+    ) as update_mock:
+        blockchain.query_balances(blockchain=None, ignore_cache=False)
+
+    updated_chains = {call.kwargs['blockchain'] for call in update_mock.call_args_list}
+    # with no accounts anywhere, only the beaconchain branch (handled before the guard)
+    # may update the cache; no account-less evm/bitcoin chain should.
+    assert updated_chains <= {SupportedBlockchain.ETHEREUM_BEACONCHAIN}, (
+        f'cache update ran for account-less chains: {updated_chains}'
+    )
+
+
+@pytest.mark.parametrize('ethereum_modules', [[]])
+@pytest.mark.parametrize('ethereum_accounts', [[make_evm_address()]])
+@pytest.mark.parametrize('optimism_accounts', [[make_evm_address()]])
+def test_query_balances_partial_chain_failure(blockchain: ChainsAggregator) -> None:
+    """When querying all chains, a chain whose query fails keeps the balances of its last
+    successful query and is reported in failed_chains, instead of the failure discarding
+    the balances of the chains that were queried fine. Querying the failing chain alone,
+    or having every chain fail, still raises."""
+    chains_aggregator = blockchain  # the mock below shadows the fixture name with the chain
+    eth_address, optimism_address = chains_aggregator.accounts.eth[0], chains_aggregator.accounts.optimism[0]  # noqa: E501
+    chains_aggregator.balances.optimism[optimism_address].assets[A_ETH][DEFAULT_BALANCE_LABEL] = Balance(amount=FVal(5), value=FVal(10))  # from a previous successful query  # noqa: E501
+    failing_chains = {SupportedBlockchain.OPTIMISM}
+
+    def mock_query_chain(blockchain: SupportedBlockchain, **kwargs: Any) -> None:
+        if blockchain in failing_chains:
+            raise RemoteError(f'Error querying information from {blockchain!s}')
+        if blockchain == SupportedBlockchain.ETHEREUM:
+            chains_aggregator.balances.eth[eth_address].assets[A_ETH][DEFAULT_BALANCE_LABEL] = Balance(amount=ONE, value=FVal(2))  # noqa: E501
+
+    with (
+        patch.object(chains_aggregator, '_query_chain_balances', side_effect=mock_query_chain),
+        patch.object(chains_aggregator, 'query_eth2_balances', side_effect=lambda **kwargs: mock_query_chain(SupportedBlockchain.ETHEREUM_BEACONCHAIN)),  # noqa: E501
+        patch.object(chains_aggregator, '_update_blockchain_balances_cache') as cache_mock,
+    ):
+        update = chains_aggregator.query_balances(ignore_cache=True)
+        assert update.failed_chains == {SupportedBlockchain.OPTIMISM: 'Error querying information from optimism'}  # noqa: E501
+        assert update.per_account.eth[eth_address].assets[A_ETH][DEFAULT_BALANCE_LABEL] == Balance(amount=ONE, value=FVal(2))  # noqa: E501
+        assert update.per_account.optimism[optimism_address].assets[A_ETH][DEFAULT_BALANCE_LABEL] == Balance(amount=FVal(5), value=FVal(10))  # noqa: E501
+        assert update.totals.assets[A_ETH][DEFAULT_BALANCE_LABEL] == Balance(amount=FVal(6), value=FVal(12))  # noqa: E501
+        assert {call.kwargs['blockchain'] for call in cache_mock.call_args_list} == {
+            SupportedBlockchain.ETHEREUM,
+            SupportedBlockchain.ETHEREUM_BEACONCHAIN,
+        }  # only the chains that succeeded get their cache updated
+
+        with pytest.raises(RemoteError):  # a single chain query still raises
+            chains_aggregator.query_balances(blockchain=SupportedBlockchain.OPTIMISM, ignore_cache=True)  # noqa: E501
+
+        failing_chains.update({SupportedBlockchain.ETHEREUM, SupportedBlockchain.ETHEREUM_BEACONCHAIN})  # noqa: E501
+        with pytest.raises(RemoteError):  # so does all queried chains failing
+            chains_aggregator.query_balances(ignore_cache=True)

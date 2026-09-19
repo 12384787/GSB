@@ -1,0 +1,146 @@
+import type { ComputedRef, InjectionKey, MaybeRefOrGetter } from 'vue';
+import type { BlockchainAssetBalances, EthBalance } from '@/modules/balances/types/blockchain-balances';
+import type { TradableAsset, TradableAssetWithoutValue } from '@/modules/wallet/types';
+import { Zero } from '@rotki/common';
+import { usePriceUtils } from '@/modules/assets/prices/use-price-utils';
+import { useAssetsStore } from '@/modules/assets/use-assets-store';
+import { useBalancesStore } from '@/modules/balances/use-balances-store';
+import { sortDesc } from '@/modules/core/common/data/bignumbers';
+import { useSupportedChains } from '@/modules/core/common/use-supported-chains';
+import { useWalletStore } from './use-wallet-store';
+
+interface UseTradableAssetReturn {
+  allOwnedAssets: ComputedRef<TradableAsset[]>;
+  getAssetDetail: (asset: MaybeRefOrGetter<string>, chain: MaybeRefOrGetter<string>) => ComputedRef<TradableAsset | undefined>;
+}
+
+type UseInjectedTradableAssetReturn = UseTradableAssetReturn;
+
+export function useTradableAsset(address: MaybeRefOrGetter<string | undefined>): UseTradableAssetReturn {
+  const { balances } = storeToRefs(useBalancesStore());
+  const { ignoredAssets } = storeToRefs(useAssetsStore());
+  const { supportedChainsForConnectedAccount } = storeToRefs(useWalletStore());
+  const { getAssetPrice } = usePriceUtils();
+  const { getNativeAsset, isEvm } = useSupportedChains();
+
+  function collectAddressBalances(
+    chain: string,
+    chainBalances: BlockchainAssetBalances,
+    addressVal: string,
+    result: TradableAssetWithoutValue[],
+    ignored: Set<string>,
+  ): void {
+    const addressBalance: EthBalance | undefined = chainBalances[addressVal];
+    if (!addressBalance?.assets)
+      return;
+
+    for (const [asset, balance] of Object.entries(addressBalance.assets)) {
+      if (balance.address?.amount && !ignored.has(asset)) {
+        result.push({ amount: balance.address.amount, asset, chain });
+      }
+    }
+  }
+
+  function collectDeduplicatedBalances(
+    chain: string,
+    chainBalances: BlockchainAssetBalances,
+    result: TradableAssetWithoutValue[],
+    seen: Set<string>,
+    ignored: Set<string>,
+  ): void {
+    for (const addressBalance of Object.values(chainBalances)) {
+      if (!addressBalance?.assets)
+        continue;
+
+      for (const [asset, balance] of Object.entries(addressBalance.assets)) {
+        if (balance.address?.amount && !seen.has(asset) && !ignored.has(asset)) {
+          seen.add(asset);
+          result.push({ amount: Zero, asset, chain });
+        }
+      }
+    }
+  }
+
+  /**
+   * Orders the list the send form picks its default from: the chain's native asset first,
+   * then by fiat value, then by identifier so an unpriced list still has a stable head.
+   */
+  function compareByPriority(a: TradableAsset, b: TradableAsset): number {
+    const aNative = getNativeAsset(a.chain) === a.asset;
+    const bNative = getNativeAsset(b.chain) === b.asset;
+
+    if (aNative !== bNative)
+      return aNative ? -1 : 1;
+
+    const byValue = sortDesc(a.fiatValue ?? Zero, b.fiatValue ?? Zero);
+    if (byValue !== 0)
+      return byValue;
+
+    return a.asset.localeCompare(b.asset);
+  }
+
+  function enhanceWithPrices(assets: TradableAssetWithoutValue[]): TradableAsset[] {
+    return assets.map((item) => {
+      const price = getAssetPrice(item.asset);
+      if (!price || price.lte(0)) {
+        return { ...item, fiatValue: undefined, price: undefined };
+      }
+      return {
+        ...item,
+        fiatValue: price.multipliedBy(item.amount),
+        price,
+      };
+    }).sort(compareByPriority);
+  }
+
+  const allOwnedAssets = computed<TradableAsset[]>(() => {
+    const addressVal = toValue(address);
+    const supportedChains = get(supportedChainsForConnectedAccount);
+    const balancesData = get(balances);
+    const ignored = new Set(get(ignoredAssets));
+
+    const result: TradableAssetWithoutValue[] = [];
+    const seen = new Set<string>();
+
+    for (const [chain, chainBalances] of Object.entries(balancesData)) {
+      if (!isEvm(chain) || !supportedChains.includes(chain))
+        continue;
+
+      if (addressVal)
+        collectAddressBalances(chain, chainBalances, addressVal, result, ignored);
+      else
+        collectDeduplicatedBalances(chain, chainBalances, result, seen, ignored);
+    }
+
+    if (!addressVal)
+      return result.sort(compareByPriority);
+
+    return enhanceWithPrices(result);
+  });
+
+  function getAssetDetail(
+    asset: MaybeRefOrGetter<string>,
+    chain: MaybeRefOrGetter<string>,
+  ): ComputedRef<TradableAsset | undefined> {
+    return computed<TradableAsset | undefined>(() =>
+      get(allOwnedAssets).find(item =>
+        item.asset === toValue(asset) && item.chain === toValue(chain),
+      ),
+    );
+  }
+
+  return {
+
+    allOwnedAssets,
+    getAssetDetail,
+  };
+}
+
+export const TradableAssetKey: InjectionKey<UseTradableAssetReturn> = Symbol('tradable-asset');
+
+export function useInjectedTradableAsset(): UseInjectedTradableAssetReturn {
+  const injected = inject(TradableAssetKey);
+  if (!injected)
+    throw new Error('useTradableAsset must be provided by a parent component');
+  return injected;
+}

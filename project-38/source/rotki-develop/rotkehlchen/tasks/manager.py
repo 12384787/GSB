@@ -1,0 +1,1282 @@
+import logging
+import random
+import threading
+from collections import defaultdict, deque
+from typing import TYPE_CHECKING, Final, NamedTuple, cast
+
+from rotkehlchen.api.websockets.typedefs import WSMessageType
+from rotkehlchen.chain.bitcoin.xpub import XpubManager
+from rotkehlchen.chain.ethereum.modules.makerdao.cache import (
+    query_ilk_registry_and_maybe_update_cache,
+)
+from rotkehlchen.chain.ethereum.utils import should_update_protocol_cache
+from rotkehlchen.chain.evm.decoding.flying_tulip.lend.constants import (
+    FLYING_TULIP_LEND_DEPLOYMENTS,
+    LAST_DEPOSIT_FOR_QUERY,
+)
+from rotkehlchen.chain.evm.decoding.flying_tulip.lend.discovery import (
+    query_deposit_for_transactions,
+)
+from rotkehlchen.constants import WEEK_IN_SECONDS
+from rotkehlchen.constants.timing import (
+    AAVE_V3_ASSETS_UPDATE,
+    DATA_UPDATES_REFRESH,
+    DAY_IN_SECONDS,
+    EVMLIKE_ACCOUNTS_DETECTION_REFRESH,
+    HOUR_IN_SECONDS,
+    OWNED_ASSETS_UPDATE,
+    SPAM_ASSETS_DETECTION_REFRESH,
+)
+from rotkehlchen.db.cache import DBCacheDynamic, DBCacheStatic
+from rotkehlchen.db.calendar import CalendarEntry, CalendarFilterQuery, DBCalendar
+from rotkehlchen.db.evmtx import DBEvmTx
+from rotkehlchen.db.filtering import (
+    EvmTransactionsFilterQuery,
+    EvmTransactionsNotDecodedFilterQuery,
+    SolanaTransactionsNotDecodedFilterQuery,
+)
+from rotkehlchen.db.settings import CachedSettings
+from rotkehlchen.db.solanatx import DBSolanaTx
+from rotkehlchen.db.utils import table_exists
+from rotkehlchen.errors.api import PremiumAuthenticationError, PremiumPermissionError
+from rotkehlchen.errors.asset import UnknownAsset, WrongAssetType
+from rotkehlchen.errors.misc import RemoteError
+from rotkehlchen.errors.serialization import DeserializationError
+from rotkehlchen.externalapis.google_calendar import GoogleCalendarAPI
+from rotkehlchen.feature_flags import is_accounting_update_enabled
+from rotkehlchen.globaldb.handler import GlobalDBHandler
+from rotkehlchen.history.types import HistoricalPriceOracle
+from rotkehlchen.logging import RotkehlchenLogsAdapter
+from rotkehlchen.premium.premium import Premium, premium_create_and_verify
+from rotkehlchen.tasks.assets import (
+    autodetect_spam_assets_in_db,
+    maybe_detect_new_tokens,
+    update_aave_v3_underlying_assets,
+    update_owned_assets,
+    update_spark_underlying_assets,
+)
+from rotkehlchen.tasks.calendar import (
+    CalendarNotification,
+    delete_past_calendar_entries,
+    maybe_create_calendar_reminders,
+    notify_reminders,
+)
+from rotkehlchen.tasks.data_issues import run_data_issue_remediation
+from rotkehlchen.tasks.historical_balances import (
+    process_historical_balances,
+    retry_rebasing_token_issue,
+)
+from rotkehlchen.tasks.internal_tx_conflicts import (
+    repull_internal_tx_conflicts,
+)
+from rotkehlchen.tasks.utils import (
+    prefetch_scheduler_task_timestamps,
+    should_run_periodic_task,
+)
+from rotkehlchen.types import (
+    CHAINS_WITH_TRANSACTION_DECODERS,
+    EVM_CHAINS_WITH_TRANSACTIONS,
+    SUPPORTED_BITCOIN_CHAINS,
+    CacheType,
+    ChecksumEvmAddress,
+    ExchangeLocationID,
+    SupportedBlockchain,
+    Timestamp,
+    TimestampMS,
+)
+from rotkehlchen.utils.misc import ts_now
+
+from .events import process_eth2_events
+
+HISTORICAL_BALANCE_PROCESSING_REFRESH: Final = DAY_IN_SECONDS
+HISTORICAL_BALANCE_PROCESSING_TASK_NAME: Final = 'Process historical balances'
+DATA_ISSUE_REMEDIATION_REFRESH: Final = DAY_IN_SECONDS
+DATA_ISSUE_REMEDIATION_TASK_NAME: Final = 'Auto-remediate data issues'
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+
+    from rotkehlchen.assets.asset import AssetWithOracles
+    from rotkehlchen.banks.manager import BankManager
+    from rotkehlchen.chain.aggregator import ChainsAggregator
+    from rotkehlchen.concurrency import Task
+    from rotkehlchen.db.dbhandler import DBHandler
+    from rotkehlchen.db.updates import RotkiDataUpdater
+    from rotkehlchen.exchanges.manager import ExchangeManager
+    from rotkehlchen.externalapis.cryptocompare import Cryptocompare
+    from rotkehlchen.history.processing import HistoryProcessingCoordinator
+    from rotkehlchen.premium.sync import PremiumSyncManager
+    from rotkehlchen.tasks.supervisor import TaskSupervisor
+    from rotkehlchen.types import SUPPORTED_CHAIN_IDS
+    from rotkehlchen.user_messages import MessagesAggregator
+
+    SchedulerTask = Callable[[], list[Task] | None]
+
+logger = logging.getLogger(__name__)
+log = RotkehlchenLogsAdapter(logger)
+
+
+CRYPTOCOMPARE_QUERY_AFTER_SECS = 86400  # a day
+DEFAULT_MAX_TASKS_NUM = 2
+CRYPTOCOMPARE_HISTOHOUR_FREQUENCY = 240  # at least 4 mins apart
+XPUB_DERIVATION_FREQUENCY = 3600  # every hour
+EVM_TX_QUERY_FREQUENCY = 3600  # every hour
+EXCHANGE_QUERY_FREQUENCY = 3600  # every hour
+PREMIUM_STATUS_CHECK = 3600  # every hour
+TX_RECEIPTS_QUERY_LIMIT = 500
+TX_DECODING_LIMIT = 500
+PREMIUM_CHECK_RETRY_LIMIT = 3
+
+
+def exchange_fail_cb(error: str) -> None:
+    log.error(error)
+
+
+class CCHistoQuery(NamedTuple):
+    from_asset: AssetWithOracles
+    to_asset: AssetWithOracles
+
+
+class TaskManager:
+
+    def __init__(
+            self,
+            max_tasks_num: int,
+            task_supervisor: TaskSupervisor,
+            api_tasks: list[Task],
+            database: DBHandler,
+            cryptocompare: Cryptocompare,
+            premium_sync_manager: PremiumSyncManager | None,
+            chains_aggregator: ChainsAggregator,
+            exchange_manager: ExchangeManager,
+            bank_manager: BankManager,
+            deactivate_premium: Callable[[], None],
+            activate_premium: Callable[[Premium], None],
+            query_balances: Callable,
+            msg_aggregator: MessagesAggregator,
+            data_updater: RotkiDataUpdater,
+            username: str,
+            history_processing_coordinator: HistoryProcessingCoordinator,
+    ) -> None:
+        self.should_schedule = False
+        self.max_tasks_num = max_tasks_num
+        self.task_supervisor = task_supervisor
+        self.api_tasks = api_tasks
+        self.database = database
+        self.cryptocompare = cryptocompare
+        self.exchange_manager = exchange_manager
+        self.bank_manager = bank_manager
+        self.cryptocompare_queries: set[CCHistoQuery] = set()
+        self.chains_aggregator = chains_aggregator
+        self.last_xpub_derivation_ts = 0
+        self.last_evm_tx_query_ts: defaultdict[tuple[ChecksumEvmAddress, SupportedBlockchain], int] = defaultdict(int)  # noqa: E501
+        self.last_exchange_query_ts: defaultdict[ExchangeLocationID, int] = defaultdict(int)
+        self.prepared_cryptocompare_query = False
+        self.running_tasks: dict[SchedulerTask, list[Task]] = {}
+        # Per-tick snapshot of periodic-task last-run timestamps, set for the duration of a
+        # _schedule pass so each task's should_run check reads from memory instead of the DB.
+        self._scheduler_task_timestamps: Mapping[str, str] | None = None
+        self.deactivate_premium = deactivate_premium
+        self.activate_premium = activate_premium
+        self.query_balances = query_balances
+        self.last_balance_query_ts = Timestamp(0)
+        self.last_premium_status_check = ts_now()
+        self.last_calendar_reminder_check = Timestamp(0)
+        self.last_google_calendar_sync = Timestamp(0)
+        self.msg_aggregator = msg_aggregator
+        self.premium_check_retries = 0
+        self.premium_sync_manager: PremiumSyncManager | None = premium_sync_manager
+        self.data_updater = data_updater
+        self.username = username
+        self.history_processing_coordinator = history_processing_coordinator
+
+        self.potential_tasks: list[SchedulerTask] = [
+            self._maybe_schedule_cryptocompare_query,
+            self._maybe_schedule_xpub_derivation,
+            self._maybe_query_evm_transactions,
+            self._maybe_schedule_exchange_history_query,
+            self._maybe_schedule_evm_txreceipts,
+            self._maybe_decode_transactions,
+            self._maybe_repull_internal_tx_conflicts,
+            self._maybe_check_premium_status,
+            self._maybe_check_data_updates,
+            self._maybe_update_snapshot_balances,
+            *(
+                [self._maybe_process_historical_balances, self._maybe_run_data_issue_remediation]
+                if is_accounting_update_enabled() else []
+            ),
+            self._maybe_detect_evm_accounts,
+            self._maybe_update_ilk_cache,
+            self._maybe_query_produced_blocks,
+            self._maybe_query_withdrawals,
+            self._maybe_process_eth2_events,
+            self._maybe_detect_withdrawal_exits,
+            self._maybe_detect_new_spam_tokens,
+            self._maybe_update_owned_assets,
+            self._maybe_update_aave_v3_underlying_assets,
+            self._maybe_update_spark_underlying_assets,
+            self._maybe_create_calendar_reminder,
+            self._maybe_trigger_calendar_reminder,
+            self._maybe_delete_past_calendar_events,
+            self._maybe_sync_google_calendar,
+            self._maybe_query_graph_delegated_tokens,
+            self._maybe_query_flying_tulip_deposits,
+        ]
+        if self.premium_sync_manager is not None:
+            self.potential_tasks.append(self._maybe_schedule_db_upload)
+        # Priority tasks are lightweight allow-listed scheduler checks that should run at
+        # least once when scheduling is allowed, even when the normal background-task capacity
+        # gate is closed. Keep this list small: every entry bypasses the normal capacity check.
+        self.priority_tasks_queue: deque[SchedulerTask] = deque((
+            self._maybe_trigger_calendar_reminder,
+        ))
+        self.schedule_lock = threading.Semaphore()
+
+    def _maybe_schedule_db_upload(self) -> list[Task] | None:
+        assert self.premium_sync_manager is not None, 'caller should make sure premium sync manager exists'  # noqa: E501
+        if self.premium_sync_manager.check_if_should_sync(force_upload=False) is False:
+            return None
+
+        log.debug('Scheduling task for DB upload to server')
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name='Upload data to server',
+            exception_is_error=True,
+            method=self.premium_sync_manager.maybe_upload_data_to_server,
+        )]
+
+    def _prepare_cryptocompare_queries(self) -> None:
+        """
+        Prepare the queries to do to cryptocompare
+        Runs only once and then has a number of queries prepared for the task manager to schedule
+        """
+        log.debug('Preparing cryptocompare historical price queries')
+        if self.cryptocompare.has_api_key() is False:
+            self.prepared_cryptocompare_query = True
+            return
+
+        if len(self.cryptocompare_queries) != 0:
+            return
+
+        with self.database.conn.read_ctx() as cursor:
+            assets = self.database.query_owned_assets(cursor)
+            main_currency = self.database.get_setting(cursor=cursor, name='main_currency').resolve_to_asset_with_oracles()  # noqa: E501
+
+        if main_currency.cryptocompare == '':  # main currency not supported
+            self.prepared_cryptocompare_query = True
+            return
+
+        now_ts = ts_now()
+        for raw_asset in assets:
+            try:
+                asset = raw_asset.resolve_to_asset_with_oracles()
+            except (UnknownAsset, WrongAssetType):
+                continue  # cryptocompare does not work with non-oracles assets
+
+            if asset.is_fiat() and main_currency.is_fiat():
+                continue  # ignore fiat to fiat
+
+            if asset.cryptocompare == '':
+                continue  # not supported in cryptocompare
+
+            if asset.cryptocompare is None and asset.symbol is None:  # pyright: ignore[reportUnnecessaryComparison]  # asset.symbol can be None for autogenerated underlying tokens.
+                continue  # type: ignore  # asset.symbol may be None for auto generated underlying tokens
+
+            data_range = GlobalDBHandler.get_historical_price_range(
+                from_asset=asset,
+                to_asset=main_currency,
+                source=HistoricalPriceOracle.CRYPTOCOMPARE,
+            )
+            if data_range is not None and now_ts - data_range[1] < CRYPTOCOMPARE_QUERY_AFTER_SECS:
+                continue
+
+            self.cryptocompare_queries.add(CCHistoQuery(from_asset=asset, to_asset=main_currency))
+
+        self.prepared_cryptocompare_query = True
+
+    def _maybe_schedule_cryptocompare_query(self) -> list[Task] | None:
+        """Schedules a cryptocompare query for a single asset history"""
+        if self.cryptocompare.has_api_key() is False:
+            self.cryptocompare_queries.clear()
+            return None
+
+        if self.prepared_cryptocompare_query is False:
+            self._prepare_cryptocompare_queries()
+
+        if len(self.cryptocompare_queries) == 0:
+            return None
+
+        # If there is already a cryptocompary query running don't schedule another
+        if any(
+                'Cryptocompare historical prices' in x.task_name
+                for x in self.task_supervisor.tasks
+        ):
+            return None
+
+        now_ts = ts_now()
+        # Make sure there is a long enough period between an asset's histohour query
+        # to avoid getting rate limited by cryptocompare
+        if now_ts - self.cryptocompare.last_histohour_query_ts <= CRYPTOCOMPARE_HISTOHOUR_FREQUENCY:  # noqa: E501
+            return None
+
+        query = self.cryptocompare_queries.pop()
+        task_name = f'Cryptocompare historical prices {query.from_asset} / {query.to_asset} query'
+        log.debug(f'Scheduling task for {task_name}')
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name=task_name,
+            exception_is_error=False,
+            method=self.cryptocompare.query_and_store_historical_data,
+            from_asset=query.from_asset,
+            to_asset=query.to_asset,
+            timestamp=now_ts,
+        )]
+
+    def _maybe_schedule_xpub_derivation(self) -> list[Task] | None:
+        """Schedules the xpub derivation task if enough time has passed and if user has xpubs"""
+        now = ts_now()
+        if now - self.last_xpub_derivation_ts <= XPUB_DERIVATION_FREQUENCY:
+            return None
+
+        with self.database.conn.read_ctx() as cursor:
+            btc_xpubs = self.database.get_bitcoin_xpub_data(
+                cursor=cursor,
+                blockchain=SupportedBlockchain.BITCOIN,
+            )
+            bch_xpubs = self.database.get_bitcoin_xpub_data(
+                cursor=cursor,
+                blockchain=SupportedBlockchain.BITCOIN_CASH,
+            )
+        should_derive_xpubs = {
+            SupportedBlockchain.BITCOIN: len(btc_xpubs) > 0,
+            SupportedBlockchain.BITCOIN_CASH: len(bch_xpubs) > 0,
+        }
+        if not any(should_derive_xpubs.values()):
+            return None
+
+        tasks = []
+        self.last_xpub_derivation_ts = now
+        xpub_manager = XpubManager(chains_aggregator=self.chains_aggregator)
+        for chain in SUPPORTED_BITCOIN_CHAINS:
+            if should_derive_xpubs[chain] is False:
+                continue
+
+            log.debug(f'Scheduling task for {chain} Xpub derivation')
+            tasks.append(self.task_supervisor.spawn_and_track(
+                after_seconds=None,
+                task_name=f'Derive new xpub addresses for {chain}',
+                exception_is_error=True,
+                method=xpub_manager.check_for_new_xpub_addresses,
+                blockchain=chain,
+            ))
+        return tasks
+
+    def _maybe_query_evm_transactions(self) -> list[Task] | None:
+        """Schedules the evm transaction query task if enough time has passed"""
+        shuffled_chains = list(EVM_CHAINS_WITH_TRANSACTIONS)
+        random.shuffle(shuffled_chains)
+        now = ts_now()
+        dbevmtx = DBEvmTx(self.database)
+        with self.database.conn.read_ctx() as cursor:
+            for blockchain in shuffled_chains:
+                if len(accounts := self.chains_aggregator.get_active_addresses(blockchain)) == 0:
+                    continue
+
+                queriable_accounts: list[ChecksumEvmAddress] = []
+                for account in accounts:
+                    # Skip the queried-range DB read when the in-memory timestamp already shows
+                    # the account was queried within the refresh period. It is set when we
+                    # schedule a query (below) or, in the else branch, when we confirm the
+                    # account is already up to date - so later ticks avoid re-reading the range.
+                    last_queried = self.last_evm_tx_query_ts[account, blockchain]
+                    if now - last_queried <= EVM_TX_QUERY_FREQUENCY:
+                        continue
+
+                    _, end_ts = dbevmtx.get_queried_range(cursor, account, blockchain)
+                    if now - max(last_queried, end_ts) > EVM_TX_QUERY_FREQUENCY:
+                        queriable_accounts.append(account)
+                    else:  # up to date: memoize so subsequent ticks skip the queried-range read
+                        self.last_evm_tx_query_ts[account, blockchain] = max(last_queried, end_ts)
+
+                if len(queriable_accounts) == 0:
+                    continue
+
+                evm_manager = self.chains_aggregator.get_chain_manager(blockchain)
+                address = random.choice(queriable_accounts)
+                task_name = f'Query {blockchain!s} transactions for {address}'
+                log.debug(f'Scheduling task to {task_name}')
+                self.last_evm_tx_query_ts[address, blockchain] = now
+                # Since this task is heavy we spawn it only for one chain at a time.
+                return [self.task_supervisor.spawn_and_track(
+                    after_seconds=None,
+                    task_name=task_name,
+                    exception_is_error=True,
+                    method=evm_manager.transactions.single_address_query_transactions,
+                    address=address,
+                    start_ts=0,
+                    end_ts=now,
+                )]
+        return None
+
+    def _maybe_schedule_evm_txreceipts(self) -> list[Task] | None:
+        """Schedules the evm transaction receipts query task
+
+        The DB check happens first here to see if scheduling would even be needed.
+        But the DB query will happen again inside the query task while having the
+        lock acquired.
+        """
+        dbevmtx = DBEvmTx(self.database)
+        tracker = self.database.pending_txs_tracker
+        now = ts_now()
+        shuffled_chains = list(EVM_CHAINS_WITH_TRANSACTIONS)
+        random.shuffle(shuffled_chains)
+        for blockchain in shuffled_chains:
+            if tracker.should_scan_receipts(blockchain, now) is False:
+                continue  # recently scanned with no missing receipts, untouched since -> skip scan
+
+            hash_results = dbevmtx.get_transaction_hashes_no_receipt(
+                tx_filter_query=EvmTransactionsFilterQuery.make(chain_id=blockchain.to_chain_id()),
+                limit=TX_RECEIPTS_QUERY_LIMIT,
+            )
+            if len(hash_results) == 0:
+                tracker.mark_receipts_clean(blockchain, now)
+                continue
+
+            evm_inquirer = self.chains_aggregator.get_chain_manager(blockchain)
+            task_name = f'Query {len(hash_results)} {blockchain!s} transactions receipts'
+            log.debug(f'Scheduling task to {task_name}')
+            # Since this task is heavy we spawn it only for one chain at a time.
+            return [self.task_supervisor.spawn_and_track(
+                after_seconds=None,
+                task_name=task_name,
+                exception_is_error=True,
+                method=evm_inquirer.transactions.get_receipts_for_transactions_missing_them,
+                limit=TX_RECEIPTS_QUERY_LIMIT,
+            )]
+        return None
+
+    def _maybe_schedule_exchange_history_query(self) -> list[Task] | None:
+        """Schedules the exchange history query task if enough time has passed"""
+        if len(self.exchange_manager.connected_exchanges) == 0 and len(self.bank_manager.connected_banks) == 0:  # noqa: E501
+            return None
+
+        now = ts_now()
+        queriable_exchanges = []
+        with self.database.conn.read_ctx() as cursor:
+            for exchange in (*self.exchange_manager.iterate_exchanges(), *self.bank_manager.iterate_banks()):  # noqa: E501
+                queried_range = self.database.get_used_query_range(cursor, f'{exchange.location!s}_history_events_{exchange.name}')  # noqa: E501
+                end_ts = queried_range[1] if queried_range else 0
+                if now - max(self.last_exchange_query_ts[exchange.location_id()], end_ts) > EXCHANGE_QUERY_FREQUENCY:  # noqa: E501
+                    queriable_exchanges.append(exchange)
+
+        if len(queriable_exchanges) == 0:
+            return None
+
+        exchange = random.choice(queriable_exchanges)
+        task_name = f'Query history of {exchange.name} exchange'
+        log.debug(f'Scheduling task to {task_name}')
+        self.last_exchange_query_ts[exchange.location_id()] = now
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name=task_name,
+            exception_is_error=True,
+            method=exchange.query_history_with_callbacks,
+            start_ts=0,
+            end_ts=now,
+            fail_callback=exchange_fail_cb,
+        )]
+
+    def _maybe_decode_transactions(self) -> list[Task] | None:
+        """Schedules the transaction decoding task
+
+        The DB check happens first here to see if scheduling would even be needed.
+        But the DB query will happen again inside the query task while having the
+        lock acquired.
+        """
+
+        tracker = self.database.pending_txs_tracker
+        now = ts_now()
+        shuffled_chains = list(CHAINS_WITH_TRANSACTION_DECODERS)
+        random.shuffle(shuffled_chains)
+        for blockchain in shuffled_chains:
+            if tracker.should_scan_decoding(blockchain, now) is False:
+                continue  # recently scanned with nothing to decode, untouched since -> skip scan
+
+            if blockchain == SupportedBlockchain.SOLANA:
+                number_of_tx_to_decode = DBSolanaTx(self.database).count_hashes_not_decoded(
+                    filter_query=SolanaTransactionsNotDecodedFilterQuery.make(),
+                )
+            else:
+                number_of_tx_to_decode = DBEvmTx(self.database).count_hashes_not_decoded(
+                    filter_query=EvmTransactionsNotDecodedFilterQuery.make(chain_id=blockchain.to_chain_id()),
+                )
+
+            if number_of_tx_to_decode == 0:
+                tracker.mark_decoding_clean(blockchain, now)
+                continue
+
+            chain_inquirer = self.chains_aggregator.get_chain_manager(blockchain)
+            task_name = f'decode {min(number_of_tx_to_decode, TX_DECODING_LIMIT)} {blockchain!s} transactions'  # noqa: E501
+            log.debug(f'Scheduling periodic task to {task_name}')
+            # Since this task is heavy we spawn it only for one chain at a time.
+            return [self.task_supervisor.spawn_and_track(
+                after_seconds=None,
+                task_name=task_name,
+                exception_is_error=True,
+                method=chain_inquirer.transactions_decoder.get_and_decode_undecoded_transactions,  # type: ignore[attr-defined]
+                limit=TX_DECODING_LIMIT,
+                send_ws_notifications=True,
+            )]
+        return None
+
+    def _maybe_check_premium_status(self) -> None:
+        """
+        Validates the premium status of the account and if the credentials are not valid
+        it retries 3 times before deactivating the user's premium status. If the
+        credentials are valid and the premium status is not correct it will reactivate
+        the user's premium status.
+        """
+        now = ts_now()
+        if now - self.last_premium_status_check < PREMIUM_STATUS_CHECK:
+            return
+
+        log.debug('Running the premium status check')
+        with self.database.conn.read_ctx() as cursor:
+            db_credentials = self.database.get_rotkehlchen_premium(cursor)
+        if db_credentials is None:
+            self.last_premium_status_check = now
+            return
+
+        try:
+            premium = premium_create_and_verify(
+                credentials=db_credentials,
+                username=self.username,
+                msg_aggregator=self.msg_aggregator,
+                db=self.database,
+            )
+        except PremiumPermissionError as e:  # only a device limit exceeded can happen here
+            log.debug(f'Device limit exceeded: {e}. Sending premium deactivate with reason')
+            self.msg_aggregator.add_message(
+                message_type=WSMessageType.PREMIUM_STATUS_UPDATE,
+                data={
+                    'is_premium_active': False,
+                    'expired': False,
+                    'reason': str(e),
+                },
+            )
+            self.deactivate_premium()
+        except RemoteError:
+            if self.premium_check_retries < PREMIUM_CHECK_RETRY_LIMIT:
+                self.premium_check_retries += 1
+                log.debug(
+                    f'Premium check failed {self.premium_check_retries} times. Not '
+                    f'sending deactivate message yet',
+                )
+                self.last_premium_status_check = now
+                return
+            log.debug('Premium check failed due to remote error. Sending deactivate message')
+            self.msg_aggregator.add_message(
+                message_type=WSMessageType.PREMIUM_STATUS_UPDATE,
+                data={
+                    'is_premium_active': False,
+                    'expired': False,
+                },
+            )
+            self.deactivate_premium()
+        except PremiumAuthenticationError:
+            log.debug('Premium check failed due to authentication error. Sending deactivate message')  # noqa: E501
+            self.deactivate_premium()
+            self.msg_aggregator.add_message(
+                message_type=WSMessageType.PREMIUM_STATUS_UPDATE,
+                data={
+                    'is_premium_active': False,
+                    'expired': True,
+                },
+            )
+        else:
+            log.debug('Premium check successful. Sending activate message')
+            self.activate_premium(premium)
+            self.msg_aggregator.add_message(
+                message_type=WSMessageType.PREMIUM_STATUS_UPDATE,
+                data={
+                    'is_premium_active': True,
+                    'expired': False,
+                },
+            )
+            self.premium_check_retries = 0
+        finally:
+            self.last_premium_status_check = now
+
+    def _spawn_historical_balance_processing(
+            self,
+            from_ts: TimestampMS | None,
+    ) -> list[Task]:
+        """Schedule historical balance processing with archive-node access.
+
+        Periodic runs may query configured archive nodes for negative rebasing balances.
+        Successful results are cached per address, token, and block, so the first pass over
+        uncached history can take longer even without a manual processing request.
+        """
+        log.debug('Scheduling task to %s', HISTORICAL_BALANCE_PROCESSING_TASK_NAME)
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name=HISTORICAL_BALANCE_PROCESSING_TASK_NAME,
+            exception_is_error=True,
+            method=process_historical_balances,
+            database=self.database,
+            msg_aggregator=self.msg_aggregator,
+            from_ts=from_ts,
+            chains_aggregator=self.chains_aggregator,
+        )]
+
+    def trigger_historical_balance_processing(self) -> list[Task] | None:
+        if (
+            is_accounting_update_enabled() is False or
+            self.history_processing_coordinator.is_history_fetching() or
+            self.task_supervisor.has_task(HISTORICAL_BALANCE_PROCESSING_TASK_NAME)
+        ):
+            return None
+        return self._spawn_historical_balance_processing(from_ts=None)
+
+    def retry_data_issue_auto_remediation(
+            self,
+            issue_id: int,
+            from_ts: TimestampMS,
+    ) -> bool:
+        if (
+            self.history_processing_coordinator.is_history_fetching() or
+            self.task_supervisor.has_task(HISTORICAL_BALANCE_PROCESSING_TASK_NAME)
+        ):
+            return False
+
+        self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name=f'{HISTORICAL_BALANCE_PROCESSING_TASK_NAME} for data issue {issue_id}',
+            exception_is_error=True,
+            method=retry_rebasing_token_issue,
+            database=self.database,
+            msg_aggregator=self.msg_aggregator,
+            chains_aggregator=self.chains_aggregator,
+            issue_id=issue_id,
+            from_ts=from_ts,
+        )
+        return True
+
+    def _maybe_process_historical_balances(self) -> list[Task] | None:
+        if (
+            self.history_processing_coordinator.is_history_fetching() or
+            self.task_supervisor.has_task(HISTORICAL_BALANCE_PROCESSING_TASK_NAME) or
+            self.task_supervisor.has_task(DATA_ISSUE_REMEDIATION_TASK_NAME)
+        ):
+            return None
+
+        with self.database.conn.read_ctx() as cursor:
+            stale_from_ts, last_processing_ts = self.database.get_static_caches(
+                cursor=cursor,
+                names=(
+                    DBCacheStatic.STALE_BALANCES_FROM_TS,
+                    DBCacheStatic.LAST_HISTORICAL_BALANCE_PROCESSING_TS,
+                ),
+            )
+
+        if (
+            stale_from_ts is None and
+            last_processing_ts is not None and
+            ts_now() - Timestamp(int(last_processing_ts)) < HISTORICAL_BALANCE_PROCESSING_REFRESH
+        ):
+            return None
+
+        return self._spawn_historical_balance_processing(
+            from_ts=TimestampMS(int(stale_from_ts)) if stale_from_ts is not None else None,
+        )
+
+    def _maybe_run_data_issue_remediation(self, force: bool = False) -> list[Task] | None:
+        """Schedule remediation, optionally bypassing the daily cooldown."""
+        if (
+            self.history_processing_coordinator.is_history_fetching() or
+            self.task_supervisor.has_task(HISTORICAL_BALANCE_PROCESSING_TASK_NAME) or
+            self.task_supervisor.has_task(DATA_ISSUE_REMEDIATION_TASK_NAME)
+        ):
+            return None
+
+        if not force and should_run_periodic_task(
+            database=self.database,
+            key_name=DBCacheStatic.LAST_DATA_ISSUE_REMEDIATION_TS,
+            refresh_period=DATA_ISSUE_REMEDIATION_REFRESH,
+            cached_timestamps=self._scheduler_task_timestamps,
+        ) is False:
+            return None
+
+        with self.database.conn.read_ctx() as cursor:
+            if self.database.get_static_cache(
+                cursor=cursor,
+                name=DBCacheStatic.LAST_HISTORICAL_BALANCE_PROCESSING_TS,
+            ) is None:
+                return None
+
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name=DATA_ISSUE_REMEDIATION_TASK_NAME,
+            exception_is_error=True,
+            method=run_data_issue_remediation,
+            database=self.database,
+            chains_aggregator=self.chains_aggregator,
+        )]
+
+    def trigger_data_issue_remediation(self) -> bool:
+        return self._maybe_run_data_issue_remediation(force=True) is not None
+
+    def _maybe_update_snapshot_balances(self) -> list[Task] | None:
+        """
+        Update the balances of a user if the difference between last time they were updated
+        and the current time exceeds the `balance_save_frequency`.
+        """
+        with self.database.conn.read_ctx() as read_cursor:
+            if not self.database.should_save_balances(
+                cursor=read_cursor,
+                last_query_ts=self.last_balance_query_ts,
+            ):
+                return None
+
+        maybe_detect_new_tokens(self.database)
+        task_name = 'Periodically update snapshot balances'
+        log.debug(f'Scheduling task to {task_name}')
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name=task_name,
+            exception_is_error=True,
+            method=self.query_balances,
+            requested_save_data=True,
+            save_despite_errors=False,
+            timestamp=None,
+            ignore_cache=True,
+        )]
+
+    def _query_produced_blocks(self, indices: list[int]) -> None:
+        if (eth2 := self.chains_aggregator.get_module('eth2')) is None:
+            return
+
+        try:
+            eth2.get_and_store_produced_blocks(indices=indices)
+        except RemoteError as e:
+            log.error(f'Skipping produced blocks query due to error: {e!s}')
+
+    def _maybe_query_produced_blocks(self) -> list[Task] | None:
+        """Schedules the blocks production query if enough time has passed"""
+        if (
+            self.chains_aggregator.get_module('eth2') is None or
+            (
+                self.chains_aggregator.beaconchain.has_api_key() and
+                self.chains_aggregator.beaconchain.is_rate_limited()
+            ) or
+            self.chains_aggregator.beaconchain.produced_blocks_lock.locked() or
+            len(indices := self.chains_aggregator.beaconchain.get_outdated_validators_to_query_for_blocks()) == 0  # noqa: E501
+        ):
+            return None
+
+        task_name = 'Periodically query produced blocks'
+        log.debug(f'Scheduling task to {task_name}')
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name=task_name,
+            exception_is_error=True,
+            method=self._query_produced_blocks,
+            indices=indices,
+        )]
+
+    def _maybe_query_withdrawals(self) -> list[Task] | None:
+        """Schedules the eth withdrawal query if enough time has passed"""
+        if (eth2 := self.chains_aggregator.get_module('eth2')) is None:
+            return None
+
+        if eth2.withdrawals_query_lock.locked():
+            return None  # already running
+
+        now = ts_now()
+        with self.database.conn.read_ctx() as cursor:
+            # Get user addresses that have validators that may need to be queried
+            key_name = DBCacheDynamic.WITHDRAWALS_TS.value[0][:17]
+            cursor.execute(
+                'SELECT DISTINCT ev.withdrawal_address FROM eth2_validators ev '
+                f"LEFT JOIN key_value_cache kv ON kv.name = '{key_name}' || ev.withdrawal_address "
+                'WHERE kv.value <= ? OR kv.name IS NULL',
+                (ts_now() - HOUR_IN_SECONDS * 3,),
+            )
+            if len(addresses := [row[0] for row in cursor]) == 0:
+                return None
+
+        task_name = 'Periodically query ethereum withdrawals'
+        log.debug(f'Scheduling task to {task_name}')
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name=task_name,
+            exception_is_error=True,
+            method=eth2.query_services_for_validator_withdrawals,
+            addresses=addresses,
+            to_ts=now,
+        )]
+
+    def _maybe_detect_withdrawal_exits(self) -> list[Task] | None:
+        """Schedules the task that detects if any of the withdrawals should be exits
+
+        Not putting a lock as it should probably not be a too heavy task?
+        """
+        if (eth2 := self.chains_aggregator.get_module('eth2')) is None:
+            return None
+
+        with self.database.conn.read_ctx() as cursor:
+            result = self.database.get_static_cache(
+                cursor=cursor, name=DBCacheStatic.LAST_WITHDRAWALS_EXIT_QUERY_TS,
+            )
+            if result is not None and ts_now() - result <= HOUR_IN_SECONDS * 2:
+                return None
+
+        task_name = 'Periodically detect withdrawal exits'
+        log.debug(f'Scheduling task to {task_name}')
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name=task_name,
+            exception_is_error=True,
+            method=eth2.detect_exited_validators,
+        )]
+
+    def _maybe_process_eth2_events(self) -> list[Task] | None:
+        if (
+            (self.chains_aggregator.get_module('eth2')) is None or
+            should_run_periodic_task(
+                database=self.database,
+                key_name=DBCacheStatic.LAST_ETH2_EVENTS_PROCESSING_TS,
+                refresh_period=HOUR_IN_SECONDS,
+                cached_timestamps=self._scheduler_task_timestamps,
+            ) is False
+        ):
+            return None
+
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name='Process eth2 events',
+            exception_is_error=True,
+            method=process_eth2_events,
+            chains_aggregator=self.chains_aggregator,
+            database=self.database,
+        )]
+
+    def _maybe_check_data_updates(self) -> list[Task] | None:
+        """
+        Function that schedules the data update task if either there is no data update
+        cache yet or this cache is older than `DATA_UPDATES_REFRESH`
+        """
+        if should_run_periodic_task(self.database, DBCacheStatic.LAST_DATA_UPDATES_TS, DATA_UPDATES_REFRESH, cached_timestamps=self._scheduler_task_timestamps) is False:  # noqa: E501
+            return None
+
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name='Data update task',
+            exception_is_error=True,
+            method=self.data_updater.check_for_updates,
+        )]
+
+    def _maybe_detect_evm_accounts(self) -> list[Task] | None:
+        """
+        Function that schedules the EVM accounts detection task if there has been more than
+        EVM_ACCOUNTS_DETECTION_REFRESH seconds since the last time it ran.
+        """
+        if should_run_periodic_task(self.database, DBCacheStatic.LAST_EVM_ACCOUNTS_DETECT_TS, EVMLIKE_ACCOUNTS_DETECTION_REFRESH, cached_timestamps=self._scheduler_task_timestamps) is False:  # noqa: E501
+            return None
+
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name='Detect EVM accounts',
+            exception_is_error=True,
+            method=self.chains_aggregator.detect_evm_accounts,
+            progress_handler=None,
+            chains=self.database.get_chains_to_detect_evm_accounts(),
+        )]
+
+    def _maybe_update_ilk_cache(self) -> list[Task] | None:
+        with self.database.conn.read_ctx() as cursor:
+            if len(self.database.get_single_blockchain_addresses(cursor, SupportedBlockchain.ETHEREUM)) == 0:  # noqa: E501
+                return None
+
+        if should_update_protocol_cache(self.database, CacheType.MAKERDAO_VAULT_ILK, 'ETH-A') is True:  # noqa: E501
+            return [self.task_supervisor.spawn_and_track(
+                after_seconds=None,
+                task_name='Update ilk cache',
+                exception_is_error=True,
+                method=query_ilk_registry_and_maybe_update_cache,
+                ethereum=self.chains_aggregator.ethereum.node_inquirer,
+            )]
+
+        return None
+
+    def _maybe_detect_new_spam_tokens(self) -> list[Task] | None:
+        """
+        This function queries the globaldb looking for assets that look like spam tokens
+        and ignores them in addition to marking them as spam tokens
+        """
+        if should_run_periodic_task(self.database, DBCacheStatic.LAST_SPAM_ASSETS_DETECT_KEY, SPAM_ASSETS_DETECTION_REFRESH, cached_timestamps=self._scheduler_task_timestamps) is False:  # noqa: E501
+            return None
+
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name='Detect spam assets in globaldb',
+            exception_is_error=True,
+            method=autodetect_spam_assets_in_db,
+            user_db=self.database,
+        )]
+
+    def _maybe_repull_internal_tx_conflicts(self) -> list[Task] | None:
+        with self.database.conn.read_ctx() as cursor:
+            if not table_exists(cursor, 'evm_internal_tx_conflicts'):  # temporary table, to be removed in a future release  # noqa: E501
+                return None
+
+        cached_settings = CachedSettings().get_settings()
+        if should_run_periodic_task(
+            database=self.database,
+            key_name=DBCacheStatic.LAST_INTERNAL_TX_CONFLICTS_REPULL_TS,
+            refresh_period=cached_settings.internal_tx_conflict_repull_frequency,
+            cached_timestamps=self._scheduler_task_timestamps,
+        ) is False:
+            return None
+
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name='Repull internal tx conflicts',
+            exception_is_error=True,
+            method=repull_internal_tx_conflicts,
+            database=self.database,
+            chains_aggregator=self.chains_aggregator,
+            limit=cached_settings.internal_txs_to_repull,
+        )]
+
+    def _maybe_update_owned_assets(self) -> list[Task] | None:
+        """
+        This function runs the logic to copy the owned assets from the user db to the globaldb.
+        This task is required to have a fresh status on the assets searches when the filter for
+        owned assets is used.
+        """
+        if should_run_periodic_task(self.database, DBCacheStatic.LAST_OWNED_ASSETS_UPDATE, OWNED_ASSETS_UPDATE, cached_timestamps=self._scheduler_task_timestamps) is False:  # noqa: E501
+            return None
+
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name='Update owned assets in globaldb',
+            exception_is_error=True,
+            method=update_owned_assets,
+            user_db=self.database,
+        )]
+
+    def _maybe_update_aave_v3_underlying_assets(self) -> list[Task] | None:
+        """
+        This function runs the logic to query the aave v3 contracts to get all the
+        underlying assets supported by them and save them in the globaldb.
+        """
+        if should_run_periodic_task(self.database, DBCacheStatic.LAST_AAVE_V3_ASSETS_UPDATE, AAVE_V3_ASSETS_UPDATE, cached_timestamps=self._scheduler_task_timestamps) is False:  # noqa: E501
+            return None
+
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name='Update aave v3 underlying assets in globaldb',
+            exception_is_error=True,
+            method=update_aave_v3_underlying_assets,
+            chains_aggregator=self.chains_aggregator,
+        )]
+
+    def _maybe_update_spark_underlying_assets(self) -> list[Task] | None:
+        """This function runs the logic to query the Spark contracts to get all the
+        underlying assets supported by them and save them in the globaldb.
+        """
+        if should_run_periodic_task(
+            database=self.database,
+            refresh_period=WEEK_IN_SECONDS,
+            key_name=DBCacheStatic.LAST_SPARK_ASSETS_UPDATE,
+            cached_timestamps=self._scheduler_task_timestamps,
+        ) is False:
+            return None
+
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name='Update Spark underlying assets in globaldb',
+            exception_is_error=True,
+            method=update_spark_underlying_assets,
+            chains_aggregator=self.chains_aggregator,
+        )]
+
+    def _maybe_create_calendar_reminder(self) -> list[Task] | None:
+        """Create upcoming reminders for specific history events, if not already created."""
+        if (
+            CachedSettings().get_entry('auto_create_calendar_reminders') is False or
+            should_run_periodic_task(
+                database=self.database,
+                key_name=DBCacheStatic.LAST_CREATE_REMINDER_CHECK_TS,
+                refresh_period=DAY_IN_SECONDS,
+                cached_timestamps=self._scheduler_task_timestamps,
+            ) is False
+        ):
+            return None
+
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name='Maybe create calendar reminders',
+            exception_is_error=True,
+            method=maybe_create_calendar_reminders,
+            database=self.database,
+            ethereum_inquirer=self.chains_aggregator.ethereum.node_inquirer,
+        )]
+
+    def _maybe_trigger_calendar_reminder(self) -> list[Task] | None:
+        """Get upcoming reminders and maybe process them"""
+        if (now := ts_now()) - self.last_calendar_reminder_check < 60 * 5:
+            return None
+
+        self.last_calendar_reminder_check = now
+        reminders: dict[int, list[CalendarNotification]] = defaultdict(list)
+        with self.database.conn.read_ctx() as cursor:
+            cursor.execute(
+                'SELECT event.identifier, event.name, event.description, event.counterparty, '
+                'event.timestamp, event.address, event.blockchain, event.color, '
+                'event.auto_delete, reminder.identifier, reminder.secs_before FROM '
+                'calendar_reminders AS reminder LEFT JOIN calendar AS event '
+                'ON reminder.event_id = event.identifier WHERE '
+                '? > event.timestamp - reminder.secs_before '
+                'AND reminder.acknowledged = 0 '
+                'ORDER BY event.identifier, reminder.secs_before ASC',
+                (now,),
+            )
+            for row in cursor:
+                reminders[row[0]].append(CalendarNotification(
+                    event=CalendarEntry.deserialize_from_db(row[:9]),
+                    identifier=row[9],
+                    secs_before=row[10],
+                ))
+
+        if len(reminders) == 0:
+            return None
+
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name='Notify calendar reminders',
+            exception_is_error=True,
+            method=notify_reminders,
+            reminders=reminders,
+            database=self.database,
+            msg_aggregator=self.msg_aggregator,
+        )]
+
+    def _maybe_delete_past_calendar_events(self) -> list[Task] | None:
+        """
+        Delete old calendar events if the setting for deleting them allows it and if they haven't
+        been marked to not be deleted.
+        """
+        if should_run_periodic_task(self.database, DBCacheStatic.LAST_DELETE_PAST_CALENDAR_EVENTS, DAY_IN_SECONDS, cached_timestamps=self._scheduler_task_timestamps) is False:  # noqa: E501
+            return None
+
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name='Delete old calendar entries',
+            exception_is_error=True,
+            method=delete_past_calendar_entries,
+            database=self.database,
+        )]
+
+    def _maybe_sync_google_calendar(self) -> list[Task] | None:
+        """
+        Periodically sync rotki calendar events to Google Calendar if authenticated.
+        Runs every 2 hours by default.
+        """
+        sync_interval = 2 * HOUR_IN_SECONDS  # Default 2 hours
+        if sync_interval <= 0:  # Disabled if 0 or negative
+            return None
+
+        if (now := ts_now()) - self.last_google_calendar_sync < sync_interval:
+            return None
+
+        # Check if Google Calendar integration is enabled and authenticated
+        google_calendar = GoogleCalendarAPI(self.database)
+        if not google_calendar.is_authenticated():
+            return None
+
+        self.last_google_calendar_sync = now
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name='Sync Google Calendar',
+            exception_is_error=False,  # Don't error out if sync fails
+            method=self._sync_google_calendar_task,
+        )]
+
+    def _sync_google_calendar_task(self) -> None:
+        """Background task to sync calendar events to Google Calendar."""
+        google_calendar = GoogleCalendarAPI(self.database)
+        db_calendar = DBCalendar(self.database)
+
+        # Get all calendar entries from rotki
+        calendar_result = db_calendar.query_calendar_entry(
+            CalendarFilterQuery.make(),
+        )
+        calendar_entries = calendar_result['entries']
+
+        # Sync to Google Calendar
+        result = google_calendar.sync_events(calendar_entries)
+        log.debug(f'Google Calendar sync completed: {result}')
+
+    def _maybe_query_graph_delegated_tokens(self) -> list[Task] | None:
+        """
+        Periodically query Ethereum transaction logs for Graph staking-related transactions,
+        particularly, search for DelegationTransferredToL2 event. If not found, it decodes
+        and adds them.
+        """
+        if should_run_periodic_task(self.database, DBCacheStatic.LAST_GRAPH_DELEGATIONS_CHECK_TS, DAY_IN_SECONDS, cached_timestamps=self._scheduler_task_timestamps) is False:  # noqa: E501
+            return None
+
+        if len(self.chains_aggregator.accounts.get(SupportedBlockchain.ETHEREUM)) == 0:
+            return None
+
+        return [self.task_supervisor.spawn_and_track(
+            after_seconds=None,
+            task_name="Search for Graph's GRT DelegationTransferredToL2 events",
+            exception_is_error=True,
+            method=self.chains_aggregator.ethereum.transactions.query_for_graph_delegation_txns,  # type: ignore[attr-defined]
+            addresses=self.chains_aggregator.accounts.eth,
+        )]
+
+    def _maybe_query_flying_tulip_deposits(self) -> list[Task] | None:
+        """Look for Flying Tulip lending deposits made for a tracked address by someone else.
+
+        Such a transaction moves no funds of the beneficiary, it only names them in a
+        DepositFor log, so the per address transaction query never brings it in.
+        """
+        tasks = []
+        for deployed_chain_id in FLYING_TULIP_LEND_DEPLOYMENTS:
+            chain_id = cast('SUPPORTED_CHAIN_IDS', deployed_chain_id)
+            blockchain = chain_id.to_blockchain()
+            if len(accounts := self.chains_aggregator.accounts.get(blockchain)) == 0:
+                continue
+
+            with self.database.conn.read_ctx() as cursor:
+                last_query_ts = self.database.get_dynamic_cache(
+                    cursor=cursor,
+                    name=DBCacheDynamic.LAST_QUERY_TS,
+                    location=chain_id.to_name(),
+                    location_name=LAST_DEPOSIT_FOR_QUERY,
+                    account_id='positions',
+                )
+            if last_query_ts is not None and ts_now() - last_query_ts < 3 * DAY_IN_SECONDS:
+                continue
+
+            tasks.append(self.task_supervisor.spawn_and_track(
+                after_seconds=None,
+                task_name=f'Search for Flying Tulip deposits made for {blockchain!s} accounts',
+                exception_is_error=True,
+                method=query_deposit_for_transactions,
+                transactions=self.chains_aggregator.get_evm_manager(chain_id).transactions,
+                addresses=accounts,
+            ))
+
+        return tasks if len(tasks) != 0 else None
+
+    def _clear_finished_task_references(self) -> None:
+        self.task_supervisor.clear_finished()
+        self.running_tasks = {
+            method: tasks
+            for method, tasks in self.running_tasks.items()
+            if not all(task.dead for task in tasks)
+        }
+
+    def _run_scheduler_check(self, scheduling_fn: SchedulerTask) -> bool:
+        if scheduling_fn in self.running_tasks:
+            return False  # the specified task is already running
+        try:
+            new_tasks = scheduling_fn()
+        except (RemoteError, PremiumAuthenticationError, DeserializationError, UnknownAsset) as e:
+            log.error(
+                'Scheduling function %s failed due to %s. '
+                'Skipping it for this scheduler tick',
+                scheduling_fn.__name__,
+                e,
+            )
+            return False
+        if new_tasks is None:
+            return False
+
+        self.running_tasks[scheduling_fn] = new_tasks
+        return True
+
+    def _drain_priority_tasks_queue(self) -> None:
+        """Run each queued priority check once, bypassing the normal task capacity gate.
+
+        This queue is reserved for small, bounded scheduler checks. It intentionally ignores
+        max_tasks_num so important lightweight checks are not starved by long-running work.
+        """
+        if len(self.priority_tasks_queue) == 0:
+            return
+
+        self._scheduler_task_timestamps = prefetch_scheduler_task_timestamps(self.database)
+        try:
+            while len(self.priority_tasks_queue) != 0:
+                self._run_scheduler_check(self.priority_tasks_queue.popleft())
+        finally:
+            self._scheduler_task_timestamps = None
+
+    def _schedule(self) -> None:
+        """Schedules background tasks"""
+        current_tasks = len(self.task_supervisor.tasks) + len(self.api_tasks)
+        not_proceed = current_tasks >= self.max_tasks_num
+        log.debug(
+            'At task scheduling. Current tasks: %s Max tasks: %s. %s.',
+            current_tasks,
+            self.max_tasks_num,
+            'Will not schedule' if not_proceed else 'Will schedule',
+        )
+        if not_proceed:
+            return  # too busy
+
+        random.shuffle(self.potential_tasks)
+        max_tasks = min(self.max_tasks_num - current_tasks, len(self.potential_tasks))
+
+        # Read all periodic-task last-run timestamps once for this pass so the should_run checks
+        # below hit this snapshot instead of each issuing its own key_value_cache query.
+        self._scheduler_task_timestamps = prefetch_scheduler_task_timestamps(self.database)
+        try:
+            spawned_new = 0
+            for scheduling_fn in self.potential_tasks:
+                if spawned_new >= max_tasks:
+                    break  # no more task slots left
+                if self._run_scheduler_check(scheduling_fn):
+                    spawned_new += 1
+        finally:
+            self._scheduler_task_timestamps = None
+
+    def schedule(self) -> None:
+        """Schedules background task while holding the scheduling lock
+
+        Only if should_schedule has been set to True, which happens after the first
+        time the user loads up the dashboard. This is to avoid any background tasks running
+        during user migrations, db upgrades and asset upgrades.
+        Tasks in the priority queue bypass the regular task capacity gate, but only after
+        should_schedule has been set.
+
+        Used during logout to make sure no task is being scheduled at the same time
+        as logging out
+        """
+        if self.should_schedule is False:
+            return
+
+        with self.schedule_lock:
+            if self.should_schedule:  # adding this check here to protect against going to schedule during logout/shutdown once task manager has been cleared and DB has been deleted  # noqa: E501
+                self._clear_finished_task_references()
+                self._drain_priority_tasks_queue()
+                self._schedule()
+
+    def clear(self) -> None:
+        """Ensure that no task is kept referenced. Used when removing the task manager.
+
+        Only requests cancellation without waiting: all these tasks are also
+        tracked by the task supervisor, whose clear() -- called right after
+        during logout -- waits out the single grace period for all of them."""
+        for task_list in self.running_tasks.values():
+            for task in task_list:
+                task.request_cancellation('Cancelled due to logout or shutdown')
+
+        self.running_tasks.clear()
+        self.priority_tasks_queue.clear()
+        self.should_schedule = False

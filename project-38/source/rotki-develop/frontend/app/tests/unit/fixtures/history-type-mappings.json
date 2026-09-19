@@ -1,0 +1,480 @@
+{
+  "result": {
+    "global_mappings": {
+      "informational": {
+        "none": "informational",
+        "governance": "governance",
+        "remove asset": "informational",
+        "place order": "place order",
+        "create": "create project",
+        "update": "update project",
+        "apply": "apply",
+        "approve": "approval"
+      },
+      "receive": {
+        "reward": "claim reward",
+        "receive wrapped": "receive",
+        "generate debt": "borrow",
+        "return wrapped": "receive",
+        "airdrop": "airdrop",
+        "donate": "receive donation",
+        "none": "receive",
+        "liquidate": "liquidation reward"
+      },
+      "deposit": {
+        "deposit asset": "deposit",
+        "bridge": "bridge deposit",
+        "place order": "deposit",
+        "fee": "fee"
+      },
+      "spend": {
+        "return wrapped": "send",
+        "liquidate": "liquidation loss",
+        "payback debt": "repay",
+        "fee": "fee",
+        "donate": "donate",
+        "none": "send"
+      },
+      "withdrawal": {
+        "remove asset": "withdraw",
+        "bridge": "bridge withdrawal",
+        "cancel order": "cancel order",
+        "refund": "refund",
+        "generate debt": "borrow",
+        "fee": "fee"
+      },
+      "trade": {
+        "spend": "swap out",
+        "receive": "swap in",
+        "none": "informational",
+        "fee": "fee"
+      },
+      "renew": {
+        "none": "renew"
+      },
+      "staking": {
+        "deposit asset": "stake deposit",
+        "reward": "staking reward",
+        "remove asset": "stake withdrawal",
+        "block production": "create block",
+        "mev reward": "mev reward",
+        "fee": "fee"
+      },
+      "transfer": {
+        "donate": "donate",
+        "none": "transfer"
+      },
+      "adjustment": {
+        "spend": "send",
+        "receive": "receive"
+      },
+      "deploy": {
+        "none": "deploy",
+        "spend": "deploy with spend",
+        "nft": "deploy"
+      },
+      "migrate": {
+        "spend": "migrate out",
+        "receive": "migrate in"
+      }
+    },
+    "event_category_details": {
+      "send": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "send",
+            "icon": "lu-arrow-up"
+          }
+        },
+        "direction": "out",
+        "group": "other"
+      },
+      "receive": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "receive",
+            "icon": "lu-arrow-down",
+            "color": "success"
+          }
+        },
+        "direction": "in",
+        "group": "other"
+      },
+      "swap out": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "swap",
+            "icon": "lu-redo-2"
+          }
+        },
+        "direction": "out",
+        "group": "other"
+      },
+      "swap in": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "swap",
+            "icon": "lu-undo-2",
+            "color": "success"
+          }
+        },
+        "direction": "in",
+        "group": "other"
+      },
+      "migrate out": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "migrate",
+            "icon": "lu-redo-2"
+          }
+        },
+        "direction": "out",
+        "group": "other"
+      },
+      "migrate in": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "migrate",
+            "icon": "lu-undo-2",
+            "color": "success"
+          }
+        },
+        "direction": "in",
+        "group": "other"
+      },
+      "approval": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "approval",
+            "icon": "lu-lock-keyhole-open"
+          }
+        },
+        "direction": "neutral",
+        "group": "other"
+      },
+      "deposit": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "deposit",
+            "icon": "lu-upload",
+            "color": "success"
+          }
+        },
+        "direction": "out",
+        "group": "other"
+      },
+      "withdraw": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "withdraw",
+            "icon": "lu-download"
+          }
+        },
+        "direction": "in",
+        "group": "other"
+      },
+      "airdrop": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "airdrop",
+            "icon": "lu-gift"
+          }
+        },
+        "direction": "in",
+        "group": "other"
+      },
+      "borrow": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "borrow",
+            "icon": "lu-hand-coins"
+          }
+        },
+        "direction": "in",
+        "group": "other"
+      },
+      "repay": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "repay",
+            "icon": "lu-history"
+          }
+        },
+        "direction": "out",
+        "group": "other"
+      },
+      "deploy": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "deploy",
+            "icon": "lu-rocket"
+          }
+        },
+        "direction": "neutral",
+        "group": "other"
+      },
+      "deploy with spend": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "deploy with spend",
+            "icon": "lu-rocket"
+          }
+        },
+        "direction": "out",
+        "group": "other"
+      },
+      "bridge deposit": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "bridge",
+            "icon": "lu-upload",
+            "color": "error"
+          }
+        },
+        "direction": "out",
+        "group": "other"
+      },
+      "bridge withdrawal": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "bridge",
+            "icon": "lu-download",
+            "color": "success"
+          }
+        },
+        "direction": "in",
+        "group": "other"
+      },
+      "governance": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "governance",
+            "icon": "lu-scale"
+          }
+        },
+        "direction": "neutral",
+        "group": "other"
+      },
+      "donate": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "donate",
+            "icon": "lu-donate-fill"
+          }
+        },
+        "direction": "out",
+        "group": "other"
+      },
+      "receive donation": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "receive donation",
+            "icon": "lu-receive-donation-fill"
+          }
+        },
+        "direction": "in",
+        "group": "other"
+      },
+      "renew": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "renew",
+            "icon": "lu-refresh-cw"
+          }
+        },
+        "direction": "out",
+        "group": "other"
+      },
+      "place order": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "place order",
+            "icon": "lu-briefcase"
+          }
+        },
+        "direction": "neutral",
+        "group": "other"
+      },
+      "transfer": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "transfer",
+            "icon": "lu-arrow-up-down"
+          }
+        },
+        "direction": "neutral",
+        "group": "other"
+      },
+      "staking reward": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "staking reward",
+            "icon": "lu-trophy"
+          }
+        },
+        "direction": "in",
+        "group": "other"
+      },
+      "claim reward": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "claim reward",
+            "icon": "lu-gift"
+          }
+        },
+        "direction": "in",
+        "group": "other"
+      },
+      "liquidation reward": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "liquidation reward",
+            "icon": "lu-droplet-fill"
+          }
+        },
+        "direction": "in",
+        "group": "other"
+      },
+      "liquidation loss": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "liquidation loss",
+            "icon": "lu-droplet-half-fill"
+          }
+        },
+        "direction": "out",
+        "group": "other"
+      },
+      "informational": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "informational",
+            "icon": "lu-info"
+          }
+        },
+        "direction": "neutral",
+        "group": "other"
+      },
+      "cancel order": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "cancel order",
+            "icon": "lu-file-x",
+            "color": "error"
+          }
+        },
+        "direction": "in",
+        "group": "other"
+      },
+      "refund": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "refund",
+            "icon": "lu-refund"
+          }
+        },
+        "direction": "in",
+        "group": "other"
+      },
+      "fee": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "fee",
+            "icon": "lu-banknote"
+          },
+          "gas": {
+            "label": "gas fee",
+            "icon": "lu-flame"
+          }
+        },
+        "direction": "out",
+        "group": "other"
+      },
+      "mev reward": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "mev",
+            "icon": "lu-medal"
+          }
+        },
+        "direction": "in",
+        "group": "other"
+      },
+      "create block": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "new block",
+            "icon": "lu-box"
+          }
+        },
+        "direction": "in",
+        "group": "other"
+      },
+      "create project": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "new project",
+            "icon": "lu-file-plus"
+          }
+        },
+        "direction": "neutral",
+        "group": "other"
+      },
+      "update project": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "update project",
+            "icon": "lu-square-pen"
+          }
+        },
+        "direction": "neutral",
+        "group": "other"
+      },
+      "apply": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "apply",
+            "icon": "lu-circle-arrow-out-up-right"
+          }
+        },
+        "direction": "neutral",
+        "group": "other"
+      },
+      "stake deposit": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "stake",
+            "icon": "lu-layers-in"
+          }
+        },
+        "direction": "out",
+        "group": "other"
+      },
+      "stake withdrawal": {
+        "counterparty_mappings": {
+          "default": {
+            "label": "unstake",
+            "icon": "lu-layers-out"
+          }
+        },
+        "direction": "in",
+        "group": "other"
+      }
+    },
+    "event_category_groups": {
+      "other": { "icon": "lu-circle-question-mark", "order": 999 }
+    },
+    "accounting_events_icons": {
+      "trade": "lu-send-to-back",
+      "fee": "lu-banknote",
+      "asset movement": "lu-coins-exchange",
+      "margin position": "lu-percent",
+      "loan": "lu-handshake",
+      "prefork acquisition": "lu-git-branch",
+      "staking": "lu-layers",
+      "history event": "lu-history-events-fill",
+      "transaction event": "lu-arrow-left-right"
+    }
+  },
+  "message": ""
+}

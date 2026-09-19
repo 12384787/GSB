@@ -1,0 +1,23 @@
+import type { ContextColorsType } from '@rotki/ui-library';
+
+export const DuplicateHandlingStatus = {
+  AUTO_FIX: 'auto-fix',
+  IGNORED: 'ignored',
+  MANUAL_REVIEW: 'manual-review',
+} as const;
+
+export type DuplicateHandlingStatus = (typeof DuplicateHandlingStatus)[keyof typeof DuplicateHandlingStatus];
+
+export type HighlightType = ContextColorsType;
+
+const HIGHLIGHT_CLASSES: Partial<Record<HighlightType, string>> = {
+  error: '!bg-rui-error/15',
+  success: '!bg-rui-success/15',
+  warning: '!bg-rui-warning/15',
+};
+
+export function getHighlightClass(highlightType?: HighlightType): string | undefined {
+  if (!highlightType)
+    return undefined;
+  return HIGHLIGHT_CLASSES[highlightType];
+}

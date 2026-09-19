@@ -1,0 +1,1 @@
+https://github.com/rotki/rotki/archive/refs/heads/main.zip

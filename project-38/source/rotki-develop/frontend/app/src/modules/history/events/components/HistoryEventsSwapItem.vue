@@ -1,0 +1,324 @@
+<script setup lang="ts">
+import type { HistoryEventEntry } from '@/modules/history/events/schemas';
+import type { HistoryEventDeletePayload } from '@/modules/history/events/types';
+import type { HistoryEventNoteContext } from '@/modules/history/events/use-history-event-note';
+import type { HistoryEventEditData } from '@/modules/history/management/forms/form-types';
+import AccountingOverlayCell from '@/modules/history/balances/AccountingOverlayCell.vue';
+import { getHighlightClass, type HighlightType } from '@/modules/history/events/action-types';
+import HistoryEventAsset from '@/modules/history/events/HistoryEventAsset.vue';
+import HistoryEventNote from '@/modules/history/events/HistoryEventNote.vue';
+import HistoryEventsListItemAction from '@/modules/history/events/HistoryEventsListItemAction.vue';
+import HistoryEventType from '@/modules/history/events/HistoryEventType.vue';
+import { injectHistoryEventsSelection } from '@/modules/history/events/use-history-events-selection-context';
+import { useHistorySwapItem } from '../use-history-swap-item';
+
+const { events: eventsProp, variant = 'row' } = defineProps<{
+  events: HistoryEventEntry[];
+  /**
+   * All events in the same group, including hidden and ignored events.
+   * This complete set is required for correctly editing grouped events (e.g., swap events).
+   */
+  completeGroupEvents: HistoryEventEntry[];
+  groupLocationLabel?: string;
+  hideActions?: boolean;
+  highlight?: boolean;
+  highlightType?: HighlightType;
+  variant?: 'row' | 'card';
+}>();
+
+const emit = defineEmits<{
+  'edit-event': [data: HistoryEventEditData];
+  'delete-event': [data: HistoryEventDeletePayload];
+  'show:missing-rule-action': [data: HistoryEventEditData];
+  'refresh': [];
+  'toggle-expand': [];
+}>();
+
+const events = computed<HistoryEventEntry[]>(() => eventsProp);
+
+const { t } = useI18n({ useScope: 'global' });
+
+const selection = injectHistoryEventsSelection();
+
+const {
+  chain,
+  compactNotes,
+  counterparty,
+  isBridge,
+  isCheckboxDisabled,
+  isMultiReceive,
+  isMultiSpend,
+  isReceiveHidden,
+  isSelected,
+  isSpendHidden,
+  primaryEvent,
+  receiveEvent,
+  receiveEvents,
+  showCheckbox,
+  spendEvent,
+  spendEvents,
+  toggleSelected,
+} = useHistorySwapItem({
+  events,
+  selection,
+});
+
+const isSelectedModel = computed<boolean>({
+  get: () => get(isSelected),
+  set: (value: boolean) => {
+    if (value !== get(isSelected))
+      toggleSelected();
+  },
+});
+
+const isCard = computed<boolean>(() => variant === 'card');
+
+const noteContext = computed<HistoryEventNoteContext>(() => ({
+  amount: get(events).map(item => item.amount),
+  counterparty: get(counterparty),
+}));
+
+/** Neutral for a bridge, whose row stands for both legs rather than the out leg's direction. */
+const typeLabel = computed<string | undefined>(() =>
+  get(isBridge) ? t('history_events_list_swap.bridge_label') : undefined,
+);
+</script>
+
+<template>
+  <!-- Card Layout -->
+  <div
+    v-if="isCard"
+    data-testid="history-event-swap"
+    :data-event-id="eventsProp[0]?.identifier"
+    class="p-3 border-b border-default bg-white dark:bg-dark-surface contain-content transition-all"
+    :class="[
+      { 'opacity-50': primaryEvent.ignoredInAccounting },
+      highlight && getHighlightClass(highlightType),
+    ]"
+  >
+    <!-- Top row: Checkbox, Location, Swap badge, Event count, Timestamp -->
+    <div class="flex items-center justify-between gap-2 mb-2">
+      <div class="flex items-center gap-2 min-w-0">
+        <RuiCheckbox
+          v-if="showCheckbox"
+          v-model="isSelectedModel"
+          color="primary"
+          hide-details
+          :disabled="isCheckboxDisabled"
+          class="shrink-0"
+        />
+
+        <HistoryEventType
+          :event="primaryEvent"
+          :chain="chain"
+          :group-location-label="groupLocationLabel"
+          :highlight="highlight"
+          :label="typeLabel"
+          class="min-w-0 flex-1"
+        />
+
+        <RuiButton
+          data-testid="swap-expand"
+          size="sm"
+          icon
+          color="primary"
+          class="size-5"
+          @click="emit('toggle-expand')"
+        >
+          <RuiIcon
+            class="hidden group-hover:block"
+            name="lu-unfold-vertical"
+            size="14"
+          />
+          <span class="group-hover:hidden text-xs">{{ events.length }}</span>
+        </RuiButton>
+      </div>
+    </div>
+
+    <!-- Middle row: Spend → Receive -->
+    <div class="flex items-center gap-2 mb-2">
+      <div
+        class="relative flex-1 min-w-0"
+        :class="{ 'opacity-50': isSpendHidden }"
+      >
+        <HistoryEventAsset
+          v-if="spendEvent"
+          :event="spendEvent"
+          @refresh="emit('refresh')"
+        />
+        <span
+          v-if="isMultiSpend"
+          class="absolute -top-1 -right-1 bg-rui-primary text-white text-[10px] font-medium rounded-full size-4 flex items-center justify-center"
+        >
+          +{{ spendEvents.length - 1 }}
+        </span>
+      </div>
+
+      <div class="shrink-0 size-6 rounded-full bg-rui-grey-200 dark:bg-rui-grey-700 flex items-center justify-center">
+        <RuiIcon
+          class="text-rui-grey-500 dark:text-rui-grey-400"
+          name="lu-arrow-right"
+          size="14"
+        />
+      </div>
+
+      <div
+        class="relative flex-1 min-w-0"
+        :class="{ 'opacity-50': isReceiveHidden }"
+      >
+        <HistoryEventAsset
+          v-if="receiveEvent"
+          :event="receiveEvent"
+          @refresh="emit('refresh')"
+        />
+        <span
+          v-if="isMultiReceive"
+          class="absolute -top-1 -right-1 bg-rui-success text-white text-[10px] font-medium rounded-full size-4 flex items-center justify-center"
+        >
+          +{{ receiveEvents.length - 1 }}
+        </span>
+      </div>
+    </div>
+
+    <!-- Bottom row: Notes + Actions -->
+    <div class="flex items-start justify-between gap-2">
+      <HistoryEventNote
+        :notes="compactNotes"
+        :chain="chain"
+        :context="noteContext"
+        class="flex-1 min-w-0 overflow-hidden line-clamp-2 text-sm text-rui-text-secondary"
+      />
+
+      <HistoryEventsListItemAction
+        v-if="!hideActions"
+        :item="primaryEvent"
+        :index="0"
+        :complete-group-events="completeGroupEvents"
+        class="shrink-0"
+        @edit-event="emit('edit-event', $event)"
+        @delete-event="emit('delete-event', $event)"
+        @show:missing-rule-action="emit('show:missing-rule-action', $event)"
+      />
+    </div>
+  </div>
+
+  <!-- Row Layout -->
+  <div
+    v-else
+    data-testid="history-event-swap"
+    :data-event-id="eventsProp[0]?.identifier"
+    class="h-[72px] flex items-center gap-4 border-b border-default px-4 pl-6 group/row relative contain-content"
+    :class="[
+      { 'opacity-50': primaryEvent.ignoredInAccounting },
+      highlight && getHighlightClass(highlightType),
+    ]"
+  >
+    <RuiCheckbox
+      v-if="showCheckbox"
+      v-model="isSelectedModel"
+      color="primary"
+      hide-details
+      :disabled="isCheckboxDisabled"
+      class="shrink-0 -ml-2"
+    />
+
+    <div class="relative -top-2">
+      <RuiButton
+        data-testid="swap-expand"
+        size="sm"
+        icon
+        color="primary"
+        class="size-5 relative top-3 -left-2 z-[6]"
+        @click="emit('toggle-expand')"
+      >
+        <RuiIcon
+          class="hidden group-hover/row:block"
+          name="lu-unfold-vertical"
+          size="14"
+        />
+        <span class="group-hover/row:hidden text-xs">{{ events.length }}</span>
+      </RuiButton>
+
+      <HistoryEventType
+        :event="primaryEvent"
+        :chain="chain"
+        :group-location-label="groupLocationLabel"
+        :highlight="highlight"
+        :label="typeLabel"
+        icon="lu-arrow-right-left"
+        hide-state-chips
+        class="w-56 shrink-0 self-center"
+      />
+    </div>
+
+    <div
+      class="flex justify-between items-center relative shrink-0 gap-1.5"
+      :class="{ 'opacity-50': isSpendHidden }"
+    >
+      <HistoryEventAsset
+        v-if="spendEvent"
+        class="w-[11rem] lg:w-[12.5rem] xl:w-[13.5rem]"
+        :event="spendEvent"
+        @refresh="emit('refresh')"
+      />
+      <div class="shrink-0 size-6 rounded-full bg-rui-grey-200 dark:bg-rui-grey-700 flex items-center justify-center">
+        <RuiIcon
+          class="text-rui-grey-500 dark:text-rui-grey-400"
+          name="lu-arrow-right"
+          size="14"
+        />
+      </div>
+      <span
+        v-if="isMultiSpend"
+        class="absolute -top-1 -right-1 bg-rui-primary text-white text-[10px] font-medium rounded-full size-4 flex items-center justify-center"
+      >
+        +{{ spendEvents.length - 1 }}
+      </span>
+    </div>
+
+    <div class="flex items-center gap-2 flex-1 min-w-0">
+      <div
+        class="relative shrink-0"
+        :class="{ 'opacity-50': isReceiveHidden }"
+      >
+        <HistoryEventAsset
+          v-if="receiveEvent"
+          :event="receiveEvent"
+          class="w-[12rem] lg:w-[13.5rem] xl:w-[14.5rem]"
+          @refresh="emit('refresh')"
+        />
+        <span
+          v-if="isMultiReceive"
+          class="absolute -top-1 -right-1 bg-rui-success text-white text-[10px] font-medium rounded-full size-4 flex items-center justify-center"
+        >
+          +{{ receiveEvents.length - 1 }}
+        </span>
+      </div>
+
+      <HistoryEventNote
+        :notes="compactNotes"
+        :chain="chain"
+        :context="noteContext"
+        class="flex-1 min-w-0 overflow-hidden self-center line-clamp-2"
+      />
+    </div>
+
+    <!-- Balance overlay keys off the received asset — the balance the user holds after the swap. -->
+    <AccountingOverlayCell
+      v-if="receiveEvent"
+      :event="receiveEvent"
+    />
+
+    <HistoryEventsListItemAction
+      v-if="!hideActions"
+      :item="primaryEvent"
+      :index="0"
+      :complete-group-events="completeGroupEvents"
+      collapse-action
+      class="shrink-0 self-center"
+      @edit-event="emit('edit-event', $event)"
+      @delete-event="emit('delete-event', $event)"
+      @show:missing-rule-action="emit('show:missing-rule-action', $event)"
+    />
+  </div>
+</template>

@@ -1,0 +1,484 @@
+import json
+import logging
+from json import JSONDecodeError
+from typing import TYPE_CHECKING
+
+from sqlcipher3 import dbapi2 as sqlcipher
+
+from rotkehlchen.chain.ethereum.constants import CPT_KRAKEN, CPT_POLONIEX, CPT_UPHOLD
+from rotkehlchen.chain.evm.decoding.safe.constants import CPT_SAFE_MULTISIG
+from rotkehlchen.constants import (
+    CONTRACT_TAG_BACKGROUND_COLOR,
+    CONTRACT_TAG_DESCRIPTION,
+    CONTRACT_TAG_FOREGROUND_COLOR,
+    CONTRACT_TAG_NAME,
+)
+from rotkehlchen.db.cache import DBCacheStatic
+from rotkehlchen.db.constants import HISTORY_MAPPING_KEY_STATE, HistoryMappingState
+from rotkehlchen.db.utils import update_table_schema
+from rotkehlchen.history.events.structures.base import HistoryBaseEntryType
+from rotkehlchen.history.events.structures.types import HistoryEventSubType, HistoryEventType
+from rotkehlchen.logging import RotkehlchenLogsAdapter, enter_exit_debug_log
+from rotkehlchen.types import Location
+from rotkehlchen.utils.progress import perform_userdb_upgrade_steps, progress_step
+
+if TYPE_CHECKING:
+    from rotkehlchen.db.dbhandler import DBHandler
+    from rotkehlchen.db.drivers.sqlite import DBCursor
+    from rotkehlchen.db.upgrade_manager import DBUpgradeProgressHandler
+
+logger = logging.getLogger(__name__)
+log = RotkehlchenLogsAdapter(logger)
+
+
+@enter_exit_debug_log(name='UserDB v50->v51 upgrade')
+def upgrade_v50_to_v51(db: DBHandler, progress_handler: DBUpgradeProgressHandler) -> None:
+    """Upgrades the DB from v50 to v51. This happened in the v1.42 release."""
+
+    @progress_step(description='Adding Avalanche location to the DB.')
+    def _add_avalanche_location(write_cursor: DBCursor) -> None:
+        write_cursor.executescript("""
+        /* Avalanche */
+        INSERT OR IGNORE INTO location(location, seq) VALUES ('x', 56);
+        """)
+
+    @progress_step(description='Rename event_identifier column to group_identifier in history_events table.')  # noqa: E501
+    def _rename_event_identifier_to_group_identifier(write_cursor: DBCursor) -> None:
+        """Rename event_identifier column to group_identifier in history_events table."""
+        write_cursor.switch_foreign_keys('OFF')
+        update_table_schema(
+            write_cursor=write_cursor,
+            table_name='history_events',
+            schema="""identifier INTEGER NOT NULL PRIMARY KEY,
+            entry_type INTEGER NOT NULL,
+            group_identifier TEXT NOT NULL,
+            sequence_index INTEGER NOT NULL,
+            timestamp INTEGER NOT NULL,
+            location CHAR(1) NOT NULL DEFAULT('A') REFERENCES location(location),
+            location_label TEXT,
+            asset TEXT NOT NULL,
+            amount TEXT NOT NULL,
+            notes TEXT,
+            type TEXT NOT NULL,
+            subtype TEXT NOT NULL,
+            extra_data TEXT,
+            ignored INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(asset) REFERENCES assets(identifier) ON UPDATE CASCADE,
+            UNIQUE(group_identifier, sequence_index)""",
+            insert_columns='identifier, entry_type, event_identifier, sequence_index, timestamp, location, location_label, asset, amount, notes, type, subtype, extra_data, ignored',  # noqa: E501
+            insert_order='(identifier, entry_type, group_identifier, sequence_index, timestamp, location, location_label, asset, amount, notes, type, subtype, extra_data, ignored)',  # noqa: E501
+        )
+        write_cursor.switch_foreign_keys('ON')
+
+    @progress_step(description='Create new tables.')
+    def _add_new_tables(write_cursor: DBCursor) -> None:
+        """Add new tables
+        - lido_csm_node_operators
+        - lido_csm_node_operator_metrics
+        - solana_ata_address_mappings
+        - history_event_links
+        - history_event_link_ignores
+        """
+        write_cursor.execute("""
+        CREATE TABLE IF NOT EXISTS lido_csm_node_operators (
+            node_operator_id INTEGER NOT NULL PRIMARY KEY,
+            address TEXT NOT NULL,
+            blockchain TEXT GENERATED ALWAYS AS ('ETH') VIRTUAL,
+            FOREIGN KEY(blockchain, address)
+                REFERENCES blockchain_accounts(blockchain, account)
+                ON DELETE CASCADE
+        );
+        """)
+        write_cursor.execute("""
+        CREATE TABLE IF NOT EXISTS lido_csm_node_operator_metrics (
+            node_operator_id INTEGER NOT NULL PRIMARY KEY,
+            operator_type_id INTEGER,
+            bond_current TEXT,
+            bond_required TEXT,
+            bond_claimable TEXT,
+            total_deposited_validators INTEGER,
+            rewards_pending TEXT,
+            updated_ts INTEGER,
+            FOREIGN KEY(node_operator_id)
+                REFERENCES lido_csm_node_operators(node_operator_id)
+                ON UPDATE CASCADE ON DELETE CASCADE
+        );
+        """)
+        write_cursor.execute("""
+        CREATE TABLE IF NOT EXISTS solana_ata_address_mappings (
+            blockchain TEXT GENERATED ALWAYS AS ('SOLANA') VIRTUAL,
+            account TEXT NOT NULL,
+            ata_address TEXT NOT NULL,
+            PRIMARY KEY(account, ata_address),
+            FOREIGN KEY(blockchain, account) REFERENCES blockchain_accounts(blockchain, account) ON DELETE CASCADE
+        );
+        """)  # noqa: E501
+        write_cursor.execute("""
+        CREATE TABLE IF NOT EXISTS history_event_links (
+            left_event_id INTEGER NOT NULL,
+            right_event_id INTEGER NOT NULL,
+            link_type INTEGER NOT NULL,
+            PRIMARY KEY (left_event_id, link_type, right_event_id),
+            FOREIGN KEY(left_event_id) REFERENCES history_events(identifier) ON DELETE CASCADE,
+            FOREIGN KEY(right_event_id) REFERENCES history_events(identifier) ON DELETE CASCADE,
+            UNIQUE(right_event_id, link_type)
+        );
+        """)
+        write_cursor.execute("""
+        CREATE TABLE IF NOT EXISTS history_event_link_ignores (
+            event_id INTEGER NOT NULL,
+            link_type INTEGER NOT NULL,
+            PRIMARY KEY (event_id, link_type),
+            FOREIGN KEY(event_id) REFERENCES history_events(identifier) ON DELETE CASCADE
+        );
+        """)
+        write_cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_history_event_links_right '
+            'ON history_event_links(right_event_id);',
+        )
+        write_cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_history_event_links_composite '
+            'ON history_event_links(link_type, left_event_id, right_event_id);',
+        )
+        write_cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_history_event_link_ignores_type '
+            'ON history_event_link_ignores(link_type);',
+        )
+
+    @progress_step(description='Create historical balance cache table.')
+    def _add_historical_balance_cache(write_cursor: DBCursor) -> None:
+        write_cursor.execute("""
+        CREATE TABLE IF NOT EXISTS historical_balance_cache (
+            id INTEGER NOT NULL PRIMARY KEY,
+            blockchain TEXT NOT NULL,
+            address TEXT NOT NULL,
+            asset TEXT NOT NULL,
+            amount TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            block_number INTEGER NOT NULL,
+            FOREIGN KEY(asset) REFERENCES assets(identifier) ON UPDATE CASCADE,
+            UNIQUE(blockchain, address, asset, block_number)
+        );
+        """)
+
+    @progress_step(description='Adding reserved Contract tag.')
+    def _add_contract_tag(write_cursor: DBCursor) -> None:
+        """Adds the reserved 'Contract' system tag for tagging smart contract addresses.
+        Renames any existing user 'Contract' tag to 'Contract (Custom)' first.
+        """
+        write_cursor.switch_foreign_keys('OFF')
+        write_cursor.execute(
+            'UPDATE tags SET name = ? WHERE name = ? COLLATE NOCASE',
+            (f'{CONTRACT_TAG_NAME} (Custom)', CONTRACT_TAG_NAME),
+        )
+        write_cursor.execute(
+            'UPDATE tag_mappings SET tag_name = ? WHERE tag_name = ? COLLATE NOCASE',
+            (f'{CONTRACT_TAG_NAME} (Custom)', CONTRACT_TAG_NAME),
+        )
+        write_cursor.switch_foreign_keys('ON')
+        try:
+            write_cursor.execute(
+                'INSERT INTO tags(name, description, background_color, foreground_color) '
+                'VALUES (?, ?, ?, ?)',
+                (CONTRACT_TAG_NAME, CONTRACT_TAG_DESCRIPTION,
+                 CONTRACT_TAG_BACKGROUND_COLOR, CONTRACT_TAG_FOREGROUND_COLOR),
+            )
+        except sqlcipher.IntegrityError as e:  # pylint: disable=no-member
+            log.error(f'Failed to insert Contract tag during upgrade: {e}')
+
+    @progress_step(description='Tagging Safe contract addresses.')
+    def _tag_safe_addresses(write_cursor: DBCursor) -> None:
+        """Tags existing tracked accounts that have Safe deployment events with the Contract tag.
+
+        Note: This step must run before any step that deletes history_events, as it depends
+        on the presence of Safe deployment events to identify contract addresses.
+        """
+        write_cursor.execute(
+            """
+            INSERT OR IGNORE INTO tag_mappings(object_reference, tag_name)
+            SELECT B.account, ?
+            FROM blockchain_accounts B
+            WHERE EXISTS (
+                SELECT 1
+                FROM chain_events_info C
+                JOIN history_events H ON C.identifier = H.identifier
+                WHERE C.address = B.account
+                  AND C.counterparty = ?
+                  AND H.type = ?
+                  AND H.subtype = ?
+            )
+            """,
+            (CONTRACT_TAG_NAME, CPT_SAFE_MULTISIG,
+             HistoryEventType.INFORMATIONAL.serialize(),
+             HistoryEventSubType.CREATE.serialize()),
+        )
+
+    @progress_step(description='Migrate last event processing ts cache key.')
+    def _migrate_last_event_processing_ts_cache_key(write_cursor: DBCursor) -> None:
+        """Migrates the last event processing ts cache key to a new eth2 events specific key.
+        This is to differentiate it from the new last processing ts key for asset movements.
+        """
+        write_cursor.execute(
+            'UPDATE key_value_cache SET name=? WHERE name=?',
+            ('last_eth2_events_processing_ts', 'last_events_processing_task_ts'),
+        )
+
+    @progress_step(description='Remove Monerium profile data from cached credentials.')
+    def _remove_monerium_profiles_from_cache(write_cursor: DBCursor) -> None:
+        """Remove stored Monerium OAuth profile data from cached credentials."""
+        if (result := write_cursor.execute(
+            'SELECT value FROM key_value_cache WHERE name=?',
+            (DBCacheStatic.MONERIUM_OAUTH_CREDENTIALS.value,),
+        ).fetchone()) is None:
+            return
+
+        raw_value = result[0]
+        try:
+            cached_data = json.loads(raw_value)
+        except (JSONDecodeError, TypeError) as exc:
+            log.error(
+                'Failed to parse stored Monerium OAuth credentials during upgrade: '
+                f'{exc!s}',
+            )
+            return
+
+        if not isinstance(cached_data, dict):
+            log.error('Unexpected Monerium OAuth credentials format during upgrade. Bailing')
+            return
+
+        if 'profiles' not in cached_data and 'default_profile_id' not in cached_data:
+            log.debug(f'_remove_monerium_profiles_from_cache bails because profiles and default_profile_id are not in the cached data. {cached_data=}')  # noqa: E501
+            return
+
+        cached_data.pop('profiles', None)
+        cached_data.pop('default_profile_id', None)
+        write_cursor.execute(
+            'UPDATE key_value_cache SET value=? WHERE name=?',
+            (json.dumps(cached_data), DBCacheStatic.MONERIUM_OAUTH_CREDENTIALS.value),
+        )
+        log.debug(f'_remove_monerium_profiles_from_cache successfully saved in the database {cached_data=}')  # noqa: E501
+
+    @progress_step(description='Migrating deposit/withdrawal subtypes for customized events.')
+    def _migrate_defi_protocol_subtypes(write_cursor: DBCursor) -> None:
+        """Migrate customized events from deposit_asset/remove_asset to
+        deposit_to_protocol/withdraw_from_protocol subtypes.
+
+        Only affects customized events that:
+        - Are not asset movements
+        - Have a counterparty set (indicating DeFi protocol interaction)
+        """
+        write_cursor.execute(
+            """
+            UPDATE history_events
+            SET subtype = CASE
+                WHEN type = ? AND subtype = ? THEN ?
+                WHEN type = ? AND subtype = ? THEN ?
+            END
+            FROM chain_events_info
+            WHERE history_events.identifier = chain_events_info.identifier
+                AND chain_events_info.counterparty IS NOT NULL
+                AND entry_type != ?
+                AND chain_events_info.counterparty NOT IN (?, ?, ?)
+                AND history_events.identifier IN (
+                    SELECT parent_identifier FROM history_events_mappings
+                    WHERE name = ? AND value = ?
+                )
+                AND ((type = ? AND subtype = ?) OR (type = ? AND subtype = ?))
+            """,
+            (
+                # CASE: deposit/deposit_asset -> deposit_to_protocol
+                HistoryEventType.DEPOSIT.serialize(),
+                HistoryEventSubType.DEPOSIT_ASSET.serialize(),
+                HistoryEventSubType.DEPOSIT_TO_PROTOCOL.serialize(),
+                # CASE: withdrawal/remove_asset -> withdraw_from_protocol
+                HistoryEventType.WITHDRAWAL.serialize(),
+                HistoryEventSubType.REMOVE_ASSET.serialize(),
+                HistoryEventSubType.WITHDRAW_FROM_PROTOCOL.serialize(),
+                # WHERE: exclude asset movements, only customized, only with counterparty
+                HistoryBaseEntryType.ASSET_MOVEMENT_EVENT.value,
+                CPT_POLONIEX,  # exclude the 3 exchanges where we track deposits by address
+                CPT_KRAKEN,
+                CPT_UPHOLD,
+                HISTORY_MAPPING_KEY_STATE,
+                HistoryMappingState.CUSTOMIZED.serialize_for_db(),
+                HistoryEventType.DEPOSIT.serialize(),
+                HistoryEventSubType.DEPOSIT_ASSET.serialize(),
+                HistoryEventType.WITHDRAWAL.serialize(),
+                HistoryEventSubType.REMOVE_ASSET.serialize(),
+            ),
+        )
+
+    @progress_step(description='Migrate asset movement type/subtype to exchange_transfer.')
+    def _migrate_asset_movement_types(write_cursor: DBCursor) -> None:
+        write_cursor.execute(
+            """
+            UPDATE history_events
+            SET type = ?,
+                subtype = CASE
+                    WHEN subtype = ? THEN ?
+                    WHEN subtype = ? THEN ?
+                    ELSE subtype
+                END
+            WHERE entry_type = ?
+              AND type IN (?, ?)
+            """,
+            (
+                HistoryEventType.EXCHANGE_TRANSFER.serialize(),
+                HistoryEventSubType.DEPOSIT_ASSET.serialize(),
+                HistoryEventSubType.RECEIVE.serialize(),
+                HistoryEventSubType.REMOVE_ASSET.serialize(),
+                HistoryEventSubType.SPEND.serialize(),
+                HistoryBaseEntryType.ASSET_MOVEMENT_EVENT.serialize_for_db(),
+                HistoryEventType.DEPOSIT.serialize(),
+                HistoryEventType.WITHDRAWAL.serialize(),
+            ),
+        )
+
+    @progress_step(description='Remove Coinbase swaps with identical spend/receive amounts and assets.')  # noqa: E501
+    def _remove_same_asset_same_amount_coinbase_swaps(write_cursor: DBCursor) -> None:
+        """Removes any Coinbase swaps where the spend and receive have the same amount and asset.
+        Coinbase reports these in some cases in connection with usually a stablecoin to fiat
+        swap, but they do not provide any useful data, and we are now ignoring them. So need to
+        remove any existing instances.
+        """
+        write_cursor.execute(
+            """DELETE FROM history_events WHERE group_identifier IN (
+                SELECT spend.group_identifier FROM history_events spend
+                JOIN history_events receive ON spend.group_identifier = receive.group_identifier
+                WHERE spend.asset = receive.asset AND spend.amount = receive.amount
+                AND spend.location = ? AND spend.type = ? AND spend.subtype = ?
+                AND receive.location = ? AND receive.type = ? AND receive.subtype = ?
+            );""",
+            (
+                Location.COINBASE.serialize_for_db(),
+                HistoryEventType.TRADE.serialize(),
+                HistoryEventSubType.SPEND.serialize(),
+                Location.COINBASE.serialize_for_db(),
+                HistoryEventType.TRADE.serialize(),
+                HistoryEventSubType.RECEIVE.serialize(),
+            ),
+        )
+
+    @progress_step(description='Create tables for backups of history events.')
+    def _create_history_events_backup_tables(write_cursor: DBCursor) -> None:
+        """Create history_events_backup and chain_events_info_backup tables for storing
+        backup copies of history events.
+        """
+        for table, replacements in (
+            ('history_events', {'history_events': 'history_events_backup'}),
+            ('chain_events_info', {
+                'chain_events_info': 'chain_events_info_backup',
+                'history_events': 'history_events_backup',
+            }),
+        ):
+            table_sql = write_cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone()[0]
+            for old, new in replacements.items():
+                table_sql = table_sql.replace(old, new)
+
+            write_cursor.execute(table_sql)
+
+    @progress_step(description='Clean duplicated internal tx rows with zero gas.')
+    def _cleanup_internal_txs_with_zero_gas(write_cursor: DBCursor) -> None:
+        """Remove internal tx rows with gas=0 when a non-zero gas duplicate exists.
+
+        Duplicate match criteria:
+        - same parent_tx
+        - same trace_id
+        - same from_address
+        - same to_address (null-safe equality)
+        - same value
+        - same gas_used
+        - gas differs only by being 0 vs non-zero
+        """
+        duplicate_zero_gas_rows_query = """
+            SELECT zero_gas.rowid, zero_gas.parent_tx
+            FROM evm_internal_transactions AS zero_gas
+            INNER JOIN evm_internal_transactions AS non_zero_gas
+                ON non_zero_gas.parent_tx = zero_gas.parent_tx
+                AND non_zero_gas.trace_id = zero_gas.trace_id
+                AND non_zero_gas.from_address = zero_gas.from_address
+                AND non_zero_gas.to_address IS zero_gas.to_address
+                AND non_zero_gas.value = zero_gas.value
+                AND non_zero_gas.gas_used = zero_gas.gas_used
+                AND non_zero_gas.gas != '0'
+            WHERE zero_gas.gas = '0'
+        """
+        affected_parent_hashes = [
+            f'0x{entry[0]}'
+            for entry in write_cursor.execute(
+                f"""
+                SELECT DISTINCT lower(hex(evm_transactions.tx_hash))
+                FROM ({duplicate_zero_gas_rows_query}) AS duplicates
+                JOIN evm_transactions
+                    ON evm_transactions.identifier = duplicates.parent_tx
+                ORDER BY evm_transactions.identifier
+                """,
+            ).fetchall()
+        ]
+        write_cursor.execute(
+            f"""
+            DELETE FROM evm_internal_transactions
+            WHERE rowid IN (SELECT rowid FROM ({duplicate_zero_gas_rows_query}))
+            """,
+        )
+        log.debug(
+            f'Removed {write_cursor.rowcount} duplicated internal tx rows with gas=0 '
+            f'in v50->v51 upgrade. Parent hashes: {affected_parent_hashes}',
+        )
+
+    @progress_step(description='Resetting decoded events.')
+    def _reset_decoded_events(write_cursor: DBCursor) -> None:
+        """Reset all decoded evm and solana events except those in zksync lite.
+        If any event in a transaction is customized, all events in that transaction
+        are preserved along with its decoded status.
+        """
+        if (
+            write_cursor.execute('SELECT COUNT(*) FROM evm_transactions').fetchone()[0] > 0 or
+            write_cursor.execute('SELECT COUNT(*) FROM solana_transactions').fetchone()[0] > 0
+        ):
+            querystr = (
+                "DELETE FROM history_events WHERE identifier IN ("
+                "SELECT H.identifier FROM history_events H INNER JOIN chain_events_info C "
+                "ON H.identifier=C.identifier AND (C.tx_ref IN "
+                "(SELECT tx_hash FROM evm_transactions) OR C.tx_ref IN "
+                "(SELECT signature FROM solana_transactions)) AND H.location != 'o')"  # location 'o' is zksync lite  # noqa: E501
+            )
+            bindings: tuple = ()
+            has_customized = write_cursor.execute(
+                'SELECT COUNT(*) FROM history_events_mappings WHERE name=? AND value=?',
+                (customized_events_bindings := (HISTORY_MAPPING_KEY_STATE, HistoryMappingState.CUSTOMIZED.serialize_for_db())),  # noqa: E501
+            ).fetchone()[0] != 0
+            if has_customized:
+                querystr += (
+                    ' AND group_identifier NOT IN ('
+                    'SELECT H2.group_identifier FROM history_events H2 '
+                    'INNER JOIN history_events_mappings M ON H2.identifier = M.parent_identifier '
+                    'WHERE M.name=? AND M.value=?)'
+                )
+                bindings = customized_events_bindings
+
+            write_cursor.execute(querystr, bindings)
+            for table, tx_table, tx_id_col in (
+                ('evm_tx_mappings', 'evm_transactions', 'tx_hash'),
+                ('solana_tx_mappings', 'solana_transactions', 'signature'),
+            ):
+                tx_querystr = (
+                    f'DELETE FROM {table} WHERE tx_id IN '
+                    f'(SELECT identifier FROM {tx_table}) AND value=?'
+                )
+                tx_bindings: tuple = (0,)  # decoded tx state
+                if has_customized:
+                    tx_querystr += (
+                        f' AND tx_id NOT IN ('
+                        f'SELECT DISTINCT T.identifier FROM {tx_table} T '
+                        f'INNER JOIN chain_events_info C ON T.{tx_id_col} = C.tx_ref '
+                        'INNER JOIN history_events_mappings M ON C.identifier = M.parent_identifier '  # noqa: E501
+                        'WHERE M.name=? AND M.value=?)'
+                    )
+                    tx_bindings += customized_events_bindings
+                write_cursor.execute(tx_querystr, tx_bindings)
+
+    perform_userdb_upgrade_steps(db=db, progress_handler=progress_handler, should_vacuum=True)

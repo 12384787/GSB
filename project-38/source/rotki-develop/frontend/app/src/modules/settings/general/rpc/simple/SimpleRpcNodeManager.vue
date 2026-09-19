@@ -1,0 +1,177 @@
+<script setup lang="ts">
+import type { ValidationErrors } from '@/modules/core/api/types/errors';
+import { useConfirmStore } from '@/modules/core/common/use-confirm-store';
+import SimpleRpcNodeManagerForm from '@/modules/settings/general/rpc/simple/SimpleRpcNodeManagerForm.vue';
+import { useSettingsWriter } from '@/modules/settings/settings-writer';
+import { useSetting } from '@/modules/settings/use-setting';
+import BigDialog from '@/modules/shell/components/dialogs/BigDialog.vue';
+import RowActions from '@/modules/shell/components/RowActions.vue';
+import SimpleTable from '@/modules/shell/components/SimpleTable.vue';
+
+const { setting } = defineProps<{
+  setting: 'ksmRpcEndpoint' | 'dotRpcEndpoint' | 'beaconRpcEndpoint' | 'btcMempoolApi';
+}>();
+
+const { t } = useI18n({ useScope: 'global' });
+
+const openDialog = ref<boolean>(false);
+const submitting = ref<boolean>(false);
+const errorMessages = ref<ValidationErrors>({});
+const form = useTemplateRef<InstanceType<typeof SimpleRpcNodeManagerForm>>('form');
+const stateUpdated = ref(false);
+const inputUrl = ref<string>('');
+
+const value = useSetting(setting);
+const { write } = useSettingsWriter();
+
+function addNewRpcNode() {
+  set(errorMessages, {});
+  set(openDialog, true);
+  set(inputUrl, '');
+}
+
+function edit(item: string) {
+  set(errorMessages, {});
+  set(openDialog, true);
+  set(inputUrl, item);
+}
+
+async function save(force: boolean = false) {
+  if (!get(form)?.validate() && !force)
+    return;
+
+  const value = get(inputUrl);
+
+  set(submitting, true);
+
+  const result = await write(setting, value);
+
+  set(submitting, false);
+
+  if (result.success) {
+    set(openDialog, false);
+  }
+  else {
+    set(errorMessages, { modelValue: result.message ?? '' });
+  }
+}
+
+const { show } = useConfirmStore();
+
+async function deleteNode() {
+  set(inputUrl, '');
+  await save(true);
+}
+
+function showDeleteConfirmation() {
+  show(
+    {
+      message: t('general_settings.simple_node_setting.delete_confirmation.subtitle'),
+      title: t('general_settings.simple_node_setting.delete_confirmation.title'),
+    },
+    () => deleteNode(),
+  );
+}
+
+defineExpose({
+  addNewRpcNode,
+});
+</script>
+
+<template>
+  <SimpleTable class="bg-white dark:bg-transparent">
+    <thead>
+      <tr>
+        <th>{{ t('evm_rpc_node_manager.node') }}</th>
+        <th />
+      </tr>
+    </thead>
+    <tbody>
+      <tr v-if="value">
+        <td class="!py-4">
+          <div class="flex gap-3 items-center">
+            <RuiTooltip
+              v-if="!value.includes('localhost')"
+              :options="{ placement: 'top' }"
+              :open-delay="400"
+            >
+              <template #activator>
+                <RuiIcon
+                  name="lu-earth"
+                  class="text-rui-text-secondary"
+                />
+              </template>
+              <span>{{ t('evm_rpc_node_manager.public_node') }}</span>
+            </RuiTooltip>
+            <RuiTooltip
+              v-else
+              :options="{ placement: 'top' }"
+              :open-delay="400"
+            >
+              <template #activator>
+                <RuiIcon
+                  name="lu-user"
+                  class="text-rui-text-secondary"
+                />
+              </template>
+              <span>{{ t('evm_rpc_node_manager.private_node') }}</span>
+            </RuiTooltip>
+            <div>
+              {{ value }}
+            </div>
+          </div>
+        </td>
+        <td class="w-20">
+          <RowActions
+            :delete-tooltip="t('evm_rpc_node_manager.delete_tooltip')"
+            :edit-tooltip="t('evm_rpc_node_manager.edit_tooltip')"
+            @edit-click="edit(value)"
+            @delete-click="showDeleteConfirmation()"
+          />
+        </td>
+      </tr>
+      <tr v-else>
+        <td
+          colspan="2"
+          class="!py-4 text-rui-text-secondary text-center w-full"
+        >
+          <div class="flex flex-col gap-3 items-center">
+            {{ t('data_table.no_data') }}
+            <!-- The header "Add node" button is hidden for single-value
+                 endpoints, so this is the only way to set an empty one. -->
+            <RuiButton
+              color="primary"
+              data-testid="add-simple-node"
+              @click="addNewRpcNode()"
+            >
+              <template #prepend>
+                <RuiIcon
+                  name="lu-plus"
+                  size="16"
+                />
+              </template>
+              {{ t('evm_rpc_node_manager.add_button') }}
+            </RuiButton>
+          </div>
+        </td>
+      </tr>
+    </tbody>
+  </SimpleTable>
+  <BigDialog
+    :display="openDialog"
+    :title="t('evm_rpc_node_manager.add_dialog.title')"
+    :action="{ primary: t('common.actions.save') }"
+    :prompt-on-close="stateUpdated"
+    :loading="submitting"
+    @confirm="save()"
+    @cancel="openDialog = false"
+  >
+    <SimpleRpcNodeManagerForm
+      ref="form"
+      v-model="inputUrl"
+      v-model:state-updated="stateUpdated"
+      v-model:error-messages="errorMessages"
+      :disabled="submitting"
+    />
+  </BigDialog>
+</template>

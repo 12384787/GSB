@@ -1,0 +1,96 @@
+import type { RuiIcons } from '@rotki/ui-library';
+import type { ComputedRef } from 'vue';
+import type { RouteRecordNameGeneric, RouteRecordNormalized } from 'vue-router';
+import type { RouteName } from '@/types/router';
+import { ACCOUNTING_UPDATE_ROUTES, isAccountingUpdateEnabled } from '@/modules/core/common/feature-flags';
+
+export interface RouteSearchEntry {
+  /** Resolved path used as the navigation target. */
+  readonly path: string;
+  readonly icon?: RuiIcons;
+  /** i18n key of the entry label. */
+  readonly labelKey: string;
+  /** i18n key of the parent label, shown as a breadcrumb ahead of the label. */
+  readonly parentLabelKey?: string;
+  /** Extra i18n keys the entry can be matched by. */
+  readonly keywordKeys: readonly string[];
+}
+
+export interface RouteActionEntry {
+  /** Resolved path (with `?add=true`) that opens the route's add dialog. */
+  readonly path: string;
+  /** i18n key of the action label. */
+  readonly labelKey: string;
+}
+
+interface UseRouteSearchReturn {
+  searchEntries: ComputedRef<RouteSearchEntry[]>;
+  actionEntries: ComputedRef<RouteActionEntry[]>;
+}
+
+/**
+ * Derives the global-search palette from the router. Every route declaring `meta.nav` is searchable
+ * (the superset of the drawer) unless it opts out with `searchable: false`; the breadcrumb is the
+ * label of the route named by `nav.parent`.
+ */
+export function useRouteSearch(): UseRouteSearchReturn {
+  const router = useRouter();
+
+  /** The same gate the drawer applies in `useNavigationMenu`, so search hides what it hides. */
+  const dataIssuesEnabled = isAccountingUpdateEnabled();
+
+  const isRouteName = (name: RouteRecordNameGeneric): name is RouteName =>
+    name !== undefined && router.hasRoute(name);
+
+  /** nav.parent names a route, so its label has to be looked up to build a breadcrumb. */
+  function labelsByRouteName(routes: RouteRecordNormalized[]): Map<string, string> {
+    const labels = new Map<string, string>();
+    for (const route of routes) {
+      if (route.meta.nav && isRouteName(route.name))
+        labels.set(route.name, route.meta.nav.labelKey);
+    }
+    return labels;
+  }
+
+  function isSearchable(route: RouteRecordNormalized): route is RouteRecordNormalized & { name: RouteName } {
+    const nav = route.meta.nav;
+    if (!nav || nav.searchable === false || !isRouteName(route.name))
+      return false;
+
+    return !ACCOUNTING_UPDATE_ROUTES.has(route.name) || dataIssuesEnabled;
+  }
+
+  const searchEntries = computed<RouteSearchEntry[]>(() => {
+    const routes = router.getRoutes();
+    const labelByName = labelsByRouteName(routes);
+
+    return routes.filter(isSearchable).map((route) => {
+      const nav = route.meta.nav!;
+      return {
+        path: router.resolve({ name: route.name }).path,
+        icon: nav.icon,
+        labelKey: nav.labelKey,
+        parentLabelKey: nav.parent ? labelByName.get(nav.parent) : undefined,
+        keywordKeys: nav.keywords ?? [],
+      };
+    });
+  });
+
+  // "Quick add" actions: any route declaring nav.addAction, targeting the route with ?add=true.
+  const actionEntries = computed<RouteActionEntry[]>(() => {
+    const entries: RouteActionEntry[] = [];
+    for (const route of router.getRoutes()) {
+      const addAction = route.meta.nav?.addAction;
+      if (!addAction || !isRouteName(route.name))
+        continue;
+
+      entries.push({
+        path: router.resolve({ name: route.name, query: { add: 'true' } }).fullPath,
+        labelKey: addAction.labelKey,
+      });
+    }
+    return entries;
+  });
+
+  return { searchEntries, actionEntries };
+}

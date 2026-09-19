@@ -1,0 +1,1838 @@
+from contextlib import ExitStack
+from http import HTTPStatus
+from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
+from uuid import uuid4
+
+import pytest
+import requests
+from polyleven import levenshtein
+
+from rotkehlchen.accounting.structures.balance import Balance, BalanceType
+from rotkehlchen.assets.asset import Asset, CryptoAsset, CustomAsset, EvmToken, HyperliquidToken
+from rotkehlchen.assets.resolver import AssetResolver
+from rotkehlchen.assets.types import AssetFlag, AssetType
+from rotkehlchen.balances.manual import ManuallyTrackedBalance
+from rotkehlchen.constants.assets import A_BTC, A_DAI, A_EUR, A_OP, A_SAI, A_USD, A_USDC, A_WSOL
+from rotkehlchen.constants.misc import DEFAULT_BALANCE_LABEL, ONE
+from rotkehlchen.constants.resolver import (
+    hyperliquid_token_address_to_identifier,
+    solana_address_to_identifier,
+)
+from rotkehlchen.db.cache import DBCacheStatic
+from rotkehlchen.db.custom_assets import DBCustomAssets
+from rotkehlchen.db.history_events import DBHistoryEvents
+from rotkehlchen.db.settings import ModifiableDBSettings
+from rotkehlchen.fval import FVal
+from rotkehlchen.globaldb.cache import (
+    globaldb_get_general_cache_values,
+    globaldb_set_general_cache_values,
+)
+from rotkehlchen.globaldb.handler import GlobalDBHandler
+from rotkehlchen.globaldb.utils import set_token_spam_protocol
+from rotkehlchen.history.events.structures.base import HistoryEvent
+from rotkehlchen.history.events.structures.types import HistoryEventSubType, HistoryEventType
+from rotkehlchen.tests.utils.api import (
+    api_url_for,
+    assert_error_response,
+    assert_proper_response,
+    assert_proper_sync_response_with_result,
+)
+from rotkehlchen.tests.utils.checks import assert_asset_result_order
+from rotkehlchen.tests.utils.constants import A_GNO, A_RDN
+from rotkehlchen.tests.utils.database import clean_ignored_assets
+from rotkehlchen.tests.utils.factories import (
+    UNIT_BTC_ADDRESS1,
+    UNIT_BTC_ADDRESS2,
+    make_evm_address,
+)
+from rotkehlchen.tests.utils.rotkehlchen import setup_balances
+from rotkehlchen.types import (
+    SPAM_PROTOCOL,
+    BTCAddress,
+    CacheType,
+    ChainID,
+    ChecksumEvmAddress,
+    HyperliquidTokenAddress,
+    Location,
+    SolanaAddress,
+    Timestamp,
+    TimestampMS,
+    TokenKind,
+)
+
+if TYPE_CHECKING:
+    from rotkehlchen.api.server import APIServer
+
+
+def assert_substring_in_search_result(
+        data: list[dict[str, Any]],
+        substring: str,
+) -> None:
+    """Asserts that a given substring is present in the search result."""
+    for entry in data:
+        substr_in_name = substr_in_symbol = None
+        if entry['name'] is not None:
+            substr_in_name = substring.casefold() in entry['name'].casefold()
+        if entry['symbol'] is not None:
+            substr_in_symbol = substring.casefold() in entry['symbol'].casefold()
+        assert substr_in_name or substr_in_symbol, f'no match for {substring}'
+
+
+def assert_asset_at_top_position(
+        asset_id: str,
+        max_position_index: int,
+        result: list[dict[str, Any]],
+) -> None:
+    """Asserts that an asset appears at the top of the search results."""
+    assert any(asset_id == entry['identifier'] for entry in result)
+    for index, entry in enumerate(result):
+        if entry['identifier'] == asset_id:
+            assert index <= max_position_index
+
+
+def _min_levenshtein(entry: dict[str, Any], term: str) -> int:
+    """Mirror the backend's min-over-name/symbol levenshtein scoring for an asset entry."""
+    distances = [100]
+    if entry.get('name') is not None:
+        distances.append(levenshtein(term, entry['name'].casefold()))
+    if entry.get('symbol') is not None:
+        distances.append(levenshtein(term, entry['symbol'].casefold()))
+    return min(distances)
+
+
+@pytest.mark.freeze_time('2026-06-05 04:27:20 GMT', tick=True)
+@pytest.mark.vcr
+@pytest.mark.parametrize('number_of_eth_accounts', [2])
+@pytest.mark.parametrize('btc_accounts', [[UNIT_BTC_ADDRESS1, UNIT_BTC_ADDRESS2]])
+@pytest.mark.parametrize('added_exchanges', [(Location.BINANCE, Location.POLONIEX)])
+def test_query_owned_assets(
+        rotkehlchen_api_server_with_exchanges: APIServer,
+        ethereum_accounts: list[ChecksumEvmAddress],
+        btc_accounts: list[BTCAddress],
+) -> None:
+    """Test that using the query all owned assets endpoint works"""
+    # Disable caching of query results
+    rotki = rotkehlchen_api_server_with_exchanges.rest_api.rotkehlchen
+    rotki.chains_aggregator.cache_ttl_secs = 0
+    setup = setup_balances(
+        rotki=rotki,
+        ethereum_accounts=ethereum_accounts,
+        btc_accounts=btc_accounts,
+        manually_tracked_balances=[ManuallyTrackedBalance(
+            identifier=-1,
+            asset=A_EUR,
+            label='My EUR bank',
+            amount=FVal(1550),
+            location=Location.BANKS,
+            tags=None,
+            balance_type=BalanceType.ASSET,
+        )],
+    )
+
+    db = DBHistoryEvents(rotki.data.db)
+    with db.db.user_write() as write_cursor:
+        db.add_history_event(
+            write_cursor=write_cursor,
+            event=HistoryEvent(
+                group_identifier='1',
+                sequence_index=1,
+                timestamp=TimestampMS(1),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.TRADE,
+                event_subtype=HistoryEventSubType.RECEIVE,
+                asset=A_USDC,
+                amount=ONE,
+            ),
+        )
+
+    # Get all our mocked balances and save them in the DB
+    with ExitStack() as stack:
+        setup.enter_all_patches(stack)
+        response = requests.get(
+            api_url_for(
+                rotkehlchen_api_server_with_exchanges,
+                'allbalancesresource',
+            ), json={'save_data': True},
+        )
+    assert_proper_response(response)
+
+    # And now check that the query owned assets endpoint works
+    with ExitStack() as stack:
+        setup.enter_all_patches(stack)
+        response = requests.get(
+            api_url_for(
+                rotkehlchen_api_server_with_exchanges,
+                'ownedassetsresource',
+            ),
+        )
+    result = assert_proper_sync_response_with_result(response)
+    assert set(result) == {'ETH', 'BTC', 'EUR', A_RDN, A_USDC}
+
+
+@pytest.mark.parametrize('new_db_unlock_actions', [None])
+def test_ignored_assets_modification(rotkehlchen_api_server: APIServer) -> None:
+    """Test that using the ignored assets endpoint to modify the ignored assets list works fine"""
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    clean_ignored_assets(rotki.data.db)
+    # add three assets to ignored assets
+    ignored_assets = [A_GNO.identifier, A_RDN.identifier, 'XMR']
+    response = requests.put(
+        api_url_for(
+            rotkehlchen_api_server,
+            'ignoredassetsresource',
+        ), json={'assets': ignored_assets},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    expected_ignored_assets = set(ignored_assets)
+    assert expected_ignored_assets == set(result['successful'])
+
+    with rotki.data.db.conn.read_ctx() as cursor:
+        # check they are there
+        assert rotki.data.db.get_ignored_asset_ids(cursor) == expected_ignored_assets
+        # Query for ignored assets and check that the response returns them
+        response = requests.get(
+            api_url_for(
+                rotkehlchen_api_server,
+                'ignoredassetsresource',
+            ),
+        )
+        result = assert_proper_sync_response_with_result(response)
+        assert expected_ignored_assets == set(result)
+
+        # remove 2 assets from ignored assets
+        response = requests.delete(
+            api_url_for(
+                rotkehlchen_api_server,
+                'ignoredassetsresource',
+            ), json={'assets': [A_GNO.identifier, 'XMR']},
+        )
+        result = assert_proper_sync_response_with_result(response)
+        assert set(result['successful']) == {A_GNO.identifier, 'XMR'}
+        assert len(result['no_action']) == 0
+
+        # check that the changes are reflected
+        assets_after_deletion = {A_RDN.identifier}
+        assert rotki.data.db.get_ignored_asset_ids(cursor) == assets_after_deletion
+        # Query for ignored assets and check that the response returns them
+        response = requests.get(
+            api_url_for(
+                rotkehlchen_api_server,
+                'ignoredassetsresource',
+            ),
+        )
+        result = assert_proper_sync_response_with_result(response)
+        assert assets_after_deletion == set(result)
+
+
+@pytest.mark.parametrize('new_db_unlock_actions', [None])
+@pytest.mark.parametrize('method', ['put', 'delete'])
+@pytest.mark.parametrize('data_migration_version', [0])
+def test_ignored_assets_endpoint_errors(rotkehlchen_api_server: APIServer, method: str) -> None:
+    """Test errors are handled properly at the ignored assets endpoint"""
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+
+    # add three assets to ignored assets
+    ignored_assets = [A_GNO.identifier, A_RDN.identifier, 'XMR']
+    response = requests.put(
+        api_url_for(
+            rotkehlchen_api_server,
+            'ignoredassetsresource',
+        ), json={'assets': ignored_assets},
+    )
+    assert_proper_response(response)
+
+    # Test that omitting the assets argument is an error
+    response = getattr(requests, method)(
+        api_url_for(
+            rotkehlchen_api_server,
+            'ignoredassetsresource',
+        ),
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='"assets": ["Missing data for required field',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Test that invalid type for assets list is an error
+    response = getattr(requests, method)(
+        api_url_for(
+            rotkehlchen_api_server,
+            'ignoredassetsresource',
+        ), json={'assets': 'foo'},
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='"assets": ["Not a valid list."',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Test that list with invalid asset is an error
+    response = getattr(requests, method)(
+        api_url_for(
+            rotkehlchen_api_server,
+            'ignoredassetsresource',
+        ), json={'assets': ['notanasset']},
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='Unknown asset notanasset provided',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # Test that list with one valid and one invalid is rejected and not even the
+    # valid one is processed
+    asset = 'ETH' if method == 'put' else 'XMR'
+    response = getattr(requests, method)(
+        api_url_for(
+            rotkehlchen_api_server,
+            'ignoredassetsresource',
+        ), json={'assets': [asset, 'notanasset']},
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='Unknown asset notanasset provided',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+    # Check that assets did not get modified
+    with rotki.data.db.conn.read_ctx() as cursor:
+        assert rotki.data.db.get_ignored_asset_ids(cursor) >= set(ignored_assets)
+
+        # Test the adding an already existing asset or removing a non-existing asset is an error
+        asset = A_RDN.identifier if method == 'put' else 'ETH'
+        response = getattr(requests, method)(
+            api_url_for(
+                rotkehlchen_api_server,
+                'ignoredassetsresource',
+            ), json={'assets': [asset]},
+        )
+        result = assert_proper_sync_response_with_result(response)
+        assert result == {
+            'successful': [],
+            'no_action': [asset],
+        }
+        # Check that assets did not get modified
+        assert rotki.data.db.get_ignored_asset_ids(cursor) >= set(ignored_assets)
+
+
+def test_get_all_assets(rotkehlchen_api_server: APIServer) -> None:
+    """Test that fetching all assets returns a paginated result."""
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'allassetsresource',
+        ),
+        json={
+            'limit': 20,
+            'offset': 0,
+            'asset_type': 'fiat',
+            'order_by_attributes': ['name'],
+            'ascending': [True],
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert len(result['entries']) == 20
+    assert 'entries_found' in result
+    assert 'entries_total' in result
+    assert 'entries_limit' in result
+    for entry in result['entries']:
+        assert entry['asset_type'] == 'fiat'
+    assert_asset_result_order(data=result['entries'], is_ascending=True, order_field='name')
+
+    # use a different filter
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'allassetsresource',
+        ),
+        json={
+            'limit': 50,
+            'offset': 0,
+            'name': 'Uniswap',
+            'order_by_attributes': ['symbol'],
+            'ascending': [False],
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert len(result['entries']) == 50
+    assert 'entries_found' in result
+    assert 'entries_total' in result
+    assert 'entries_limit' in result
+    for entry in result['entries']:
+        assert 'uniswap' in entry['name'].lower()
+        if entry['asset_type'] == AssetType.EVM_TOKEN.serialize():
+            assert entry['evm_chain'] in [x.to_name() for x in ChainID]
+    # a name/symbol search is now relevance-ranked (levenshtein), so the page is ordered by
+    # non-decreasing distance to the term, with the requested symbol sort only as tiebreaker
+    distances = [_min_levenshtein(entry, 'uniswap') for entry in result['entries']]
+    assert distances == sorted(distances)
+
+    # test that ignored assets filter works
+    with rotkehlchen_api_server.rest_api.rotkehlchen.data.db.user_write() as write_cursor:
+        rotkehlchen_api_server.rest_api.rotkehlchen.data.db.add_to_ignored_assets(
+            write_cursor=write_cursor,
+            asset=A_USD,
+        )
+        rotkehlchen_api_server.rest_api.rotkehlchen.data.db.add_to_ignored_assets(
+            write_cursor=write_cursor,
+            asset=A_EUR,
+        )
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'allassetsresource',
+        ),
+        json={
+            'limit': 20,
+            'offset': 0,
+            'asset_type': 'fiat',
+            'order_by_attributes': ['name'],
+            'ascending': [True],
+            'ignored_assets_handling': 'exclude',
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert len(result['entries']) == 20
+    assert 'entries_found' in result
+    assert 'entries_total' in result
+    assert 'entries_limit' in result
+    for entry in result['entries']:
+        assert entry['asset_type'] == 'fiat'
+        assert entry['symbol'] not in (A_USD.resolve_to_asset_with_symbol().symbol, A_EUR.resolve_to_asset_with_symbol().symbol)  # noqa: E501
+    assert_asset_result_order(data=result['entries'], is_ascending=True, order_field='name')
+
+    # test that user owned assets filter works
+    GlobalDBHandler.add_user_owned_assets([A_BTC, A_DAI, A_SAI])
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'allassetsresource',
+        ),
+        json={
+            'limit': 2,
+            'offset': 0,
+            'order_by_attributes': ['name'],
+            'ascending': [True],
+            'show_user_owned_assets_only': True,
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assets_names = {r['name'] for r in result['entries']}
+    assets_chain = {r.get('evm_chain', None) for r in result['entries']}
+    assert result['entries_found'] == 3
+    assert assets_chain.issubset({*[x.to_name() for x in ChainID], None})
+    assert A_BTC.resolve_to_asset_with_name_and_type().name in assets_names
+    assert A_DAI.resolve_to_asset_with_name_and_type().name in assets_names
+    assert A_SAI.resolve_to_asset_with_name_and_type().name not in assets_names
+    assert_asset_result_order(data=result['entries'], is_ascending=True, order_field='name')
+
+    # add custom asset and filter results using `custom asset` type.
+    db_custom_assets = DBCustomAssets(
+        db_handler=rotkehlchen_api_server.rest_api.rotkehlchen.data.db,
+    )
+    custom_asset_id = str(uuid4())
+    db_custom_assets.add_custom_asset(CustomAsset.initialize(
+        identifier=custom_asset_id,
+        name='My Custom Prop',
+        custom_asset_type='random',
+    ))
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'allassetsresource',
+        ),
+        json={
+            'limit': 10,
+            'offset': 0,
+            'order_by_attributes': ['name'],
+            'asset_type': 'custom asset',
+            'ascending': [True],
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert len(result['entries']) == 1
+    assert result['entries'][0]['identifier'] == custom_asset_id
+    assert result['entries'][0]['asset_type'] == 'custom asset'
+
+    # filter by name & symbol
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'allassetsresource',
+        ),
+        json={
+            'limit': 50,
+            'offset': 0,
+            'name': 'Uniswap',
+            'symbol': 'UNI',
+            'order_by_attributes': ['symbol'],
+            'ascending': [False],
+            'ignored_assets_handling': 'exclude',
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert 50 == len(result['entries']) > 2
+    for entry in result['entries']:
+        assert 'uniswap' in entry['name'].casefold()
+        assert 'UNI' in entry['symbol']
+        if entry['asset_type'] == AssetType.EVM_TOKEN.serialize():
+            assert entry['evm_chain'] in [x.to_name() for x in ChainID]
+
+    # check that providing multiple order_by_attributes fails
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'allassetsresource',
+        ),
+        json={
+            'limit': 20,
+            'offset': 0,
+            'asset_type': 'fiat',
+            'order_by_attributes': ['name', 'symbol'],
+            'ascending': [True, False],
+        },
+    )
+    assert_error_response(response, contained_in_msg='Multiple fields ordering is not allowed.')
+
+    # test asking for a single evm token
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'allassetsresource',
+        ),
+        json={
+            'identifiers': [A_DAI.identifier],
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert result['entries'][0]['identifier'] == A_DAI
+    assert 'address' in result['entries'][0]
+    assert 'decimals' in result['entries'][0]
+    assert result['entries'][0]['evm_chain'] == 'ethereum'
+    assert result['entries'][0]['asset_type'] == AssetType.EVM_TOKEN.serialize()
+
+    # ask for a crypto asset and a fiat asset (test multiple asset query)
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'allassetsresource',
+        ),
+        json={
+            'identifiers': [A_BTC.identifier, A_USD.identifier, custom_asset_id],
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert result['entries'][0]['identifier'] == A_USD
+    assert result['entries'][1]['identifier'] == custom_asset_id
+    assert result['entries'][2]['identifier'] == A_BTC
+
+    # check that evm tokens with underlying tokens are shown
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'allassetsresource',
+        ),
+        json={'asset_type': 'evm token'},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    for entry in result['entries']:
+        assert 'underlying_tokens' in entry
+        assert entry['evm_chain'] in [x.to_name() for x in ChainID]
+
+    # test that wrong combination of evm_chain & asset_type fails.
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'allassetsresource',
+        ),
+        json={'asset_type': 'fiat', 'evm_chain': 'ethereum'},
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='Filtering by evm_chain is only supported for evm tokens',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # check that filtering by evm_chain & symbol works.
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'allassetsresource',
+        ),
+        json={'evm_chain': 'ethereum', 'symbol': 'UNI'},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert all(i['evm_chain'] == 'ethereum' and 'UNI' in i['symbol'].upper() for i in result['entries'])  # noqa: E501
+
+    # check that filtering by address and evm_chain works.
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'allassetsresource',
+        ),
+        json={
+            'evm_chain': 'ethereum',
+            'address': '0x6b175474e89094c44da98b954eedeac495271d0f',
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert len(result['entries']) == 1
+    assert result['entries'][0]['address'] == '0x6B175474E89094C44Da98b954EedeAC495271d0F'
+    assert result['entries'][0]['evm_chain'] == 'ethereum'
+    assert result['entries'][0]['name'] == 'Multi Collateral Dai'
+    assert result['entries'][0]['symbol'] == 'DAI'
+
+    # check that filtering by address for a solana token works.
+    result = assert_proper_sync_response_with_result(requests.post(
+        api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+        json={'address': '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R'},
+    ))
+    assert len(result['entries']) == 1
+    assert result['entries'][0]['address'] == '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R'
+    assert result['entries'][0]['asset_type'] == AssetType.SOLANA_TOKEN.serialize()
+    assert result['entries'][0]['name'] == 'Raydium'
+    assert result['entries'][0]['symbol'] == 'RAY'
+
+    # check error when filtering by an invalid address.
+    assert_error_response(
+        response=requests.post(
+            api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+            json={'address': 'xxxxxxxxx'},
+        ),
+        contained_in_msg=(
+            'Given value xxxxxxxxx is not a valid EVM, Solana, or Hyperliquid Core token address'
+        ),
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+
+def test_filter_assets_by_flag(
+        rotkehlchen_api_server: APIServer,
+        globaldb: GlobalDBHandler,
+) -> None:
+    with globaldb.conn.write_ctx() as write_cursor:
+        write_cursor.execute('DELETE FROM asset_flags')
+        write_cursor.executemany(
+            'INSERT INTO asset_flags(identifier, flag) VALUES (?, ?)',
+            (
+                (A_DAI.identifier, AssetFlag.REBASING),
+                (A_USD.identifier, AssetFlag.REBASING),
+            ),
+        )
+
+    result = assert_proper_sync_response_with_result(requests.post(
+        api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+        json={'asset_flag': AssetFlag.REBASING.value},
+    ))
+    assert result['entries_found'] == 2
+    entries = {entry['identifier']: entry for entry in result['entries']}
+    assert entries.keys() == {A_DAI.identifier, A_USD.identifier}
+    assert entries[A_DAI.identifier]['is_rebasing'] is True
+    assert entries[A_USD.identifier]['is_rebasing'] is True
+
+    assert_error_response(
+        response=requests.post(
+            api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+            json={'asset_flag': 'invalid'},
+        ),
+        contained_in_msg='Illegal value invalid for',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+
+def test_edit_rebasing_asset_flag(
+        rotkehlchen_api_server: APIServer,
+        globaldb: GlobalDBHandler,
+) -> None:
+    token = EvmToken.initialize(
+        address=make_evm_address(),
+        chain_id=ChainID.ETHEREUM,
+        token_kind=TokenKind.ERC20,
+        name=None,
+    )
+    globaldb.add_asset(token)
+    payload = {
+        'asset_type': token.asset_type.serialize(),
+        'identifier': token.identifier,
+        'name': None,
+        'address': token.evm_address,
+        'token_kind': str(token.token_kind.name),
+        'evm_chain': token.chain_id.to_name(),
+        'symbol': None,
+        'decimals': None,
+    }
+    database = rotkehlchen_api_server.rest_api.rotkehlchen.data.db
+    events_db = DBHistoryEvents(database)
+    with database.user_write() as write_cursor:
+        database.add_asset_identifiers(
+            write_cursor=write_cursor,
+            asset_identifiers=[token.identifier],
+        )
+        events_db.add_history_events(
+            write_cursor=write_cursor,
+            history=[HistoryEvent(
+                group_identifier='unrelated',
+                sequence_index=0,
+                timestamp=TimestampMS(1000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=A_DAI,
+                amount=ONE,
+            ), HistoryEvent(
+                group_identifier='rebasing',
+                sequence_index=0,
+                timestamp=TimestampMS(5000),
+                location=Location.ETHEREUM,
+                event_type=HistoryEventType.RECEIVE,
+                event_subtype=HistoryEventSubType.NONE,
+                asset=token,
+                amount=ONE,
+            )],
+        )
+        write_cursor.execute(
+            'DELETE FROM key_value_cache WHERE name IN (?, ?)',
+            (
+                DBCacheStatic.STALE_BALANCES_FROM_TS.value,
+                DBCacheStatic.STALE_BALANCES_MODIFICATION_TS.value,
+            ),
+        )
+
+    with patch(
+        'rotkehlchen.db.history_events.is_accounting_update_enabled',
+        return_value=True,
+    ):
+        assert_proper_response(requests.patch(
+            api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+            json=payload | {'is_rebasing': True},
+        ))
+    assert token.identifier in globaldb.get_asset_ids_with_flag(AssetFlag.REBASING)
+    with database.conn.read_ctx() as cursor:
+        assert database.get_static_cache(
+            cursor=cursor,
+            name=DBCacheStatic.STALE_BALANCES_FROM_TS,
+        ) == '5000'
+    result = assert_proper_sync_response_with_result(requests.post(
+        api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+        json={'identifiers': [token.identifier]},
+    ))
+    assert result['entries'][0]['is_rebasing'] is True
+
+    # Omitting the optional field must preserve the existing flag.
+    assert_proper_response(requests.patch(
+        api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+        json=payload,
+    ))
+    assert token.identifier in globaldb.get_asset_ids_with_flag(AssetFlag.REBASING)
+
+    assert_proper_response(requests.patch(
+        api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+        json=payload | {'is_rebasing': False},
+    ))
+    assert token.identifier not in globaldb.get_asset_ids_with_flag(AssetFlag.REBASING)
+
+
+def test_get_all_assets_levenshtein_ranking(rotkehlchen_api_server: APIServer) -> None:
+    """Test that the paginated assets endpoint ranks name/symbol searches by levenshtein
+    closeness (like the asset search dropdown) instead of an alphabetical LIKE match, while
+    keeping pagination correct. Regression test for https://github.com/rotki/rotki/issues/9316
+    """
+    globaldb = GlobalDBHandler()
+    # seed deterministic assets whose symbols all contain the search term `zztop` (so they pass
+    # the LIKE prefilter) but at increasing levenshtein distance. Names are kept far from the
+    # term so the symbol distance drives the ranking.
+    exact_id, coin_id, spam_id = str(uuid4()), str(uuid4()), str(uuid4())
+    globaldb.add_asset(CryptoAsset.initialize(
+        identifier=spam_id,
+        asset_type=AssetType.OWN_CHAIN,
+        name='Asset Gamma',
+        symbol='MYZZTOPSPAM',  # alphabetically first, but the furthest match
+    ))
+    globaldb.add_asset(CryptoAsset.initialize(
+        identifier=coin_id,
+        asset_type=AssetType.OWN_CHAIN,
+        name='Asset Beta',
+        symbol='ZZTOPCOIN',
+    ))
+    globaldb.add_asset(CryptoAsset.initialize(
+        identifier=exact_id,
+        asset_type=AssetType.OWN_CHAIN,
+        name='Asset Alpha',
+        symbol='ZZTOP',  # exact match, must rank first
+    ))
+
+    # search by symbol without an explicit sort -> results ranked by levenshtein closeness
+    result = assert_proper_sync_response_with_result(requests.post(
+        api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+        json={'limit': 50, 'offset': 0, 'symbol': 'zztop'},
+    ))
+    entries = result['entries']
+    assert {e['identifier'] for e in entries} == {exact_id, coin_id, spam_id}
+    # the exact symbol match must be first, despite being alphabetically last
+    assert entries[0]['identifier'] == exact_id
+    # the whole page is ordered by non-decreasing levenshtein distance
+    distances = [_min_levenshtein(e, 'zztop') for e in entries]
+    assert distances == sorted(distances)
+    assert distances[0] == 0
+
+    # pagination must stay correct (disjoint, contiguous) under the levenshtein ordering
+    page1 = assert_proper_sync_response_with_result(requests.post(
+        api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+        json={'limit': 2, 'offset': 0, 'symbol': 'zztop'},
+    ))
+    page2 = assert_proper_sync_response_with_result(requests.post(
+        api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+        json={'limit': 2, 'offset': 2, 'symbol': 'zztop'},
+    ))
+    assert page1['entries_found'] == 3
+    paged_ids = [e['identifier'] for e in page1['entries']] + [e['identifier'] for e in page2['entries']]  # noqa: E501
+    assert paged_ids == [e['identifier'] for e in entries]  # same order, no dupes/gaps
+    assert len(set(paged_ids)) == 3
+
+    # an explicit column sort does NOT opt out of relevance ranking: the closest match still
+    # leads, with the requested column only acting as the tiebreaker between equal distances
+    result = assert_proper_sync_response_with_result(requests.post(
+        api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+        json={
+            'limit': 50,
+            'offset': 0,
+            'symbol': 'zztop',
+            'order_by_attributes': ['symbol'],
+            'ascending': [False],
+        },
+    ))
+    # exact match still first despite the explicit symbol sort, and overall still by distance
+    assert result['entries'][0]['identifier'] == exact_id
+    distances = [_min_levenshtein(e, 'zztop') for e in result['entries']]
+    assert distances == sorted(distances)
+
+
+def test_get_assets_mappings(rotkehlchen_api_server: APIServer) -> None:
+    """Test that providing a list of asset identifiers, the appropriate assets mappings are returned."""  # noqa: E501
+    queried_assets = ('BTC', 'TRY', 'EUR', A_DAI.identifier, A_OP.identifier)
+    with GlobalDBHandler().conn.write_ctx() as write_cursor:
+        set_token_spam_protocol(
+            write_cursor=write_cursor,
+            token=A_DAI.resolve_to_evm_token(),
+            is_spam=True,
+        )
+
+    # add custom asset
+    db_custom_assets = DBCustomAssets(
+        db_handler=rotkehlchen_api_server.rest_api.rotkehlchen.data.db,
+    )
+    custom_asset_id = str(uuid4())
+    db_custom_assets.add_custom_asset(CustomAsset.initialize(
+        identifier=custom_asset_id,
+        name='My Custom Prop',
+        custom_asset_type='random',
+    ))
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'assetsmappingresource',
+        ),
+        json={'identifiers': queried_assets},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assets = result['assets']
+    assert len(assets) == len(queried_assets)
+    for identifier, details in assets.items():
+        assert identifier in queried_assets
+        if identifier == A_DAI.identifier:
+            assert details['evm_chain'] == 'ethereum'
+            assert 'custom_asset_type' not in details
+            assert details['asset_type'] != 'custom asset'
+            assert details['collection_id'] == '23'
+            assert details['is_spam'] is True
+            assert details['coingecko'] == 'dai'
+            assert details['cryptocompare'] == 'DAI'
+        elif identifier == A_OP.identifier:
+            assert details['evm_chain'] == 'optimism'
+            assert 'custom_asset_type' not in details
+            assert details['asset_type'] != 'custom asset'
+            assert details['coingecko'] == 'optimism'
+            assert details['cryptocompare'] == 'OP'
+        elif identifier == custom_asset_id:
+            assert details['custom_asset_type'] == 'random'
+            assert details['asset_type'] == 'custom asset'
+        else:
+            assert 'evm_chain' not in details
+            assert 'custom_asset_type' not in details
+            assert details['asset_type'] != 'custom asset'
+
+    assert result['asset_collections'] == {
+        '23': {
+            'name': 'Multi Collateral Dai',
+            'symbol': 'DAI',
+            'main_asset': 'eip155:1/erc20:0x6B175474E89094C44Da98b954EedeAC495271d0F',
+        },
+        '40': {
+            'name': 'Bitcoin',
+            'symbol': 'BTC',
+            'main_asset': 'BTC',
+        },
+    }
+
+    # check that providing an invalid identifier returns only valid ones if any.
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'assetsmappingresource',
+        ),
+        json={'identifiers': ['BTC', 'TRY', 'invalid']},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assets = result['assets']
+    assert len(assets) == 2
+    assert all(identifier in {'BTC', 'TRY'} for identifier in assets)
+
+
+def test_search_assets(rotkehlchen_api_server: APIServer) -> None:
+    """Test that searching for assets using a keyword works."""
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'assetssearchresource',
+        ),
+        json={
+            'value': 'Bitcoin',
+            'search_column': 'name',
+            'limit': 50,
+            'order_by_attributes': ['name'],
+            'ascending': [True],
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert len(result) <= 50
+    for entry in result:
+        assert 'bitcoin' in entry['name'].lower()
+    assert_asset_result_order(data=result, is_ascending=True, order_field='name')
+    assert all('custom_asset_type' not in entry and not entry['is_custom_asset'] for entry in result)  # noqa: E501
+
+    # use a different keyword
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'assetssearchresource',
+        ),
+        json={
+            'value': 'eth',
+            'search_column': 'symbol',
+            'limit': 10,
+            'order_by_attributes': ['symbol'],
+            'ascending': [False],
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert len(result) <= 10
+    for entry in result:
+        assert 'eth' in entry['symbol'].lower()
+    assert_asset_result_order(data=result, is_ascending=False, order_field='symbol')
+    assert all('custom_asset_type' not in entry and not entry['is_custom_asset'] for entry in result)  # noqa: E501
+
+    # check that searching for a non-existent asset returns nothing
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'assetssearchresource',
+        ),
+        json={
+            'value': 'idontexist',
+            'search_column': 'name',
+            'limit': 50,
+            'order_by_attributes': ['name'],
+            'ascending': [True],
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert len(result) == 0
+
+    # use the return_exact_matches flag
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'assetssearchresource',
+        ),
+        json={
+            'value': 'ETH',
+            'search_column': 'symbol',
+            'limit': 10,
+            'return_exact_matches': True,
+            'order_by_attributes': ['name'],
+            'ascending': [False],
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert len(result) == 6
+    assert any(entry['name'] == 'Ethereum' for entry in result)
+    for entry in result:
+        assert entry['symbol'] == 'ETH'
+    assert_asset_result_order(data=result, is_ascending=False, order_field='name')
+    assert all('custom_asset_type' not in entry and not entry['is_custom_asset'] for entry in result)  # noqa: E501
+
+    # check that treat_eth2_as_eth` setting is respected
+    # using the test above.
+    db = rotkehlchen_api_server.rest_api.rotkehlchen.data.db
+    with db.user_write() as cursor:
+        db.set_settings(cursor, ModifiableDBSettings(treat_eth2_as_eth=True))
+
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'assetssearchresource',
+        ),
+        json={
+            'value': 'ETH',
+            'search_column': 'symbol',
+            'limit': 10,
+            'return_exact_matches': True,
+            'order_by_attributes': ['name'],
+            'ascending': [True],
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert len(result) == 6
+    assert any(entry['name'] == 'Ethereum' for entry in result)
+    for entry in result:
+        assert entry['symbol'] == 'ETH'
+        assert entry['identifier'] != 'ETH2'
+        if entry['name'] == 'Binance-Peg Ethereum Token':
+            assert entry['evm_chain'] == 'binance_sc'
+        elif entry['name'] == 'Ether':
+            assert entry['evm_chain'] == 'optimism'
+        elif entry['identifier'].startswith('eip155:8453'):
+            assert entry['evm_chain'] == 'base'
+        elif entry['identifier'].startswith('eip155:137'):
+            assert entry['evm_chain'] == 'polygon_pos'
+        elif entry['identifier'].startswith('eip155:250'):
+            assert entry['evm_chain'] == 'fantom'
+        else:
+            assert 'evm_chain' not in entry
+    assert_asset_result_order(data=result, is_ascending=True, order_field='name')
+    assert all('custom_asset_type' not in entry and not entry['is_custom_asset'] for entry in result)  # noqa: E501
+
+    # search using a column that is not allowed
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'assetssearchresource',
+        ),
+        json={
+            'value': 'idontexist',
+            'search_column': 'identifier',
+            'limit': 50,
+            'order_by_attributes': ['name'],
+            'ascending': [True],
+        },
+    )
+    assert_error_response(response, contained_in_msg='Must be one of: name, symbol.')
+
+    # test that the evm_chain column is included
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'assetssearchresource',
+        ),
+        json={
+            'value': 'DAI',
+            'search_column': 'symbol',
+            'limit': 10,
+            'return_exact_matches': True,
+            'order_by_attributes': ['name'],
+            'ascending': [True],
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert {asset['evm_chain'] for asset in result} == {
+        'polygon_pos',
+        'optimism',
+        'ethereum',
+        'arbitrum_one',
+        'binance_sc',
+        'base',
+        'scroll',
+        'gnosis',
+        'fantom',
+    }
+
+    # check that using evm_chain filter works.
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'assetssearchresource',
+        ),
+        json={
+            'value': 'DAI',
+            'search_column': 'symbol',
+            'limit': 50,
+            'evm_chain': 'ethereum',
+            'order_by_attributes': ['name'],
+            'ascending': [True],
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert 50 >= len(result) > 10
+    assert all(entry['evm_chain'] == 'ethereum' and 'DAI' in entry['symbol'] for entry in result)
+    assert_asset_result_order(data=result, is_ascending=True, order_field='name')
+
+    # check that using an unsupported evm_chain fails
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'assetssearchresource',
+        ),
+        json={
+            'value': 'dai',
+            'search_column': 'symbol',
+            'limit': 50,
+            'evm_chain': 'prettychain',
+            'order_by_attributes': ['name'],
+            'ascending': [True],
+        },
+    )
+    assert_error_response(response, contained_in_msg='Failed to deserialize evm chain value prettychain')  # noqa: E501
+
+
+def test_search_assets_with_levenshtein(rotkehlchen_api_server: APIServer) -> None:
+    """Test that searching for assets using a keyword works(levenshtein approach)."""
+    globaldb = GlobalDBHandler()
+    # search by EVM address
+    response = requests.post(
+        api_url_for(rotkehlchen_api_server, 'assetssearchlevenshteinresource'),
+        json={'address': '0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83', 'limit': 10},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert len(result) == 1 and result[0]['identifier'] == 'eip155:100/erc20:0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83'  # noqa: E501  # USDC on gnosis
+
+    # search by Solana address
+    response = requests.post(
+        api_url_for(rotkehlchen_api_server, 'assetssearchlevenshteinresource'),
+        json={'address': '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R', 'limit': 10},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert len(result) == 1 and result[0]['identifier'] == 'solana/token:4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R'  # noqa: E501  # RAY token
+
+    response = requests.post(
+        api_url_for(rotkehlchen_api_server, 'assetssearchlevenshteinresource'),
+        json={'value': 'Bitcoin', 'limit': 50},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert len(result) <= 50
+    # check that Bitcoin(BTC) appears at the top of result.
+    assert_asset_at_top_position('BTC', max_position_index=1, result=result)
+    assert_substring_in_search_result(result, 'Bitcoin')
+    assert all('custom_asset_type' not in entry and entry['asset_type'] != 'custom asset' for entry in result)  # noqa: E501
+
+    # use a different keyword
+    # but add assets without name/symbol and see that nothing breaks
+    asset_without_name_id = str(uuid4())
+    asset_without_symbol_id = str(uuid4())
+    globaldb.add_asset(CryptoAsset.initialize(
+        identifier=asset_without_name_id,
+        asset_type=AssetType.OWN_CHAIN,
+        symbol='ETH',
+    ))
+    globaldb.add_asset(CryptoAsset.initialize(
+        identifier=asset_without_symbol_id,
+        asset_type=AssetType.OWN_CHAIN,
+        name='ETH',
+    ))
+    globaldb.add_asset(CryptoAsset.initialize(
+        identifier=str(uuid4()),
+        asset_type=AssetType.OWN_CHAIN,
+    ))
+    response = requests.post(
+        api_url_for(rotkehlchen_api_server, 'assetssearchlevenshteinresource'),
+        json={'value': 'ETH', 'limit': 50},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert len(result) <= 50
+    assert_substring_in_search_result(result, 'ETH')
+    # check that Ethereum(ETH) appear at the top of result.
+    assert_asset_at_top_position('ETH', max_position_index=1, result=result)
+    assert any(asset_without_name_id == entry['identifier'] for entry in result)
+    assert any(asset_without_symbol_id == entry['identifier'] for entry in result)
+    assert all('custom_asset_type' not in entry and entry['asset_type'] != 'custom asset' for entry in result)  # noqa: E501
+
+    # check that treat_eth2_as_eth` setting is respected
+    # using the test above.
+    db = rotkehlchen_api_server.rest_api.rotkehlchen.data.db
+    with db.user_write() as cursor:
+        db.set_settings(cursor, ModifiableDBSettings(treat_eth2_as_eth=True))
+
+    response = requests.post(
+        api_url_for(rotkehlchen_api_server, 'assetssearchlevenshteinresource'),
+        json={'value': 'ETH', 'limit': 50},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert len(result) <= 50
+    assert_substring_in_search_result(result, 'ETH')
+    # check that Ethereum(ETH) appears at the top of result.
+    assert_asset_at_top_position('ETH', max_position_index=1, result=result)
+    assert all(entry['identifier'] != 'ETH2' and entry['asset_type'] != 'custom asset' and 'custom_asset_type' not in entry for entry in result)  # noqa: E501
+
+    # check that searching for a non-existent asset returns nothing
+    response = requests.post(
+        api_url_for(rotkehlchen_api_server, 'assetssearchlevenshteinresource'),
+        json={'value': 'idontexist', 'limit': 50},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert len(result) == 0
+
+    # check that using evm_chain filter works.
+    response = requests.post(
+        api_url_for(rotkehlchen_api_server, 'assetssearchlevenshteinresource'),
+        json={'value': 'dai', 'limit': 50, 'evm_chain': 'ethereum'},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert 50 >= len(result) > 10
+    assert all(entry['evm_chain'] == 'ethereum' and entry['asset_type'] != 'custom asset' and 'custom_asset_type' not in entry for entry in result if 'evm_chain' in entry)  # noqa: E501
+
+    assert_substring_in_search_result(result, 'dai')
+    # check that Dai(DAI) appears at the top of result.
+    assert_asset_at_top_position(
+        asset_id=A_DAI.identifier,
+        max_position_index=0,
+        result=result,
+    )
+
+    # check that searching for assets with long name works
+    db_custom_assets = DBCustomAssets(
+        db_handler=rotkehlchen_api_server.rest_api.rotkehlchen.data.db,
+    )
+    custom_asset_id = str(uuid4())
+    db_custom_assets.add_custom_asset(CustomAsset.initialize(
+        identifier=custom_asset_id,
+        name='My Custom Prop that has a very long name haha',
+        custom_asset_type='random',
+    ))
+    response = requests.post(
+        api_url_for(rotkehlchen_api_server, 'assetssearchlevenshteinresource'),
+        json={'value': 'my custom', 'limit': 50},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert_substring_in_search_result(result, 'my custom')
+    assert all(custom_asset_id == entry['identifier'] and entry['asset_type'] == 'custom asset' and entry['custom_asset_type'] == 'random' for entry in result)  # noqa: E501
+
+    # check that using an unsupported evm_chain fails
+    response = requests.post(
+        api_url_for(rotkehlchen_api_server, 'assetssearchlevenshteinresource'),
+        json={'value': 'dai', 'limit': 50, 'evm_chain': 'charlesfarm'},
+    )
+    assert_error_response(response, contained_in_msg='Failed to deserialize evm chain value charlesfarm')  # noqa: E501
+
+    # check that filtering by chain does include assets without chain
+    response = requests.post(
+        api_url_for(rotkehlchen_api_server, 'assetssearchlevenshteinresource'),
+        json={'value': 'eth', 'limit': 50, 'evm_chain': 'optimism'},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert 'ETH' in {x['identifier'] for x in result}
+
+    # check that filtering by an evmlike chain (zksync lite) searches as if on ethereum
+    # since evmlike chains have no tokens of their own
+    response = requests.post(
+        api_url_for(rotkehlchen_api_server, 'assetssearchlevenshteinresource'),
+        json={'value': 'ETH', 'limit': 50, 'evm_chain': 'zksync_lite', 'asset_type': 'evm token'},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    identifiers = {x['identifier'] for x in result}
+    assert 'ETH' in identifiers  # native ETH is included despite the evm token type filter
+    assert 'eip155:1/erc20:0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2' in identifiers  # WETH
+    assert all(entry.get('evm_chain', 'ethereum') == 'ethereum' for entry in result)
+
+
+def test_search_nfts_with_levenshtein(rotkehlchen_api_server: APIServer) -> None:
+    with rotkehlchen_api_server.rest_api.rotkehlchen.data.db.user_write() as cursor:
+        cursor.execute('INSERT INTO assets VALUES (?)', ('my-nft-identifier',))
+        cursor.execute(
+            'INSERT INTO nfts(identifier, name, collection_name, manual_price, is_lp, '
+            'last_price, last_price_asset) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            ('my-nft-identifier', 'super-duper-nft', 'Bitcoin smth', False, False, 0, 'ETH'),
+        )
+
+    # check that searching by nft name works
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'assetssearchlevenshteinresource',
+        ),
+        json={
+            'value': 'super-duper',
+            'limit': 50,
+            'nft_handling': 'include',
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert result == [{
+        'identifier': 'my-nft-identifier',
+        'name': 'super-duper-nft',
+        'collection_name': 'Bitcoin smth',
+        'asset_type': 'nft',
+    }]
+
+    # Check that:
+    # 1. Searching by nft collection name works
+    # 2. Nfts are searched only when nft_handling asks for them
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'assetssearchlevenshteinresource',
+        ),
+        json={
+            'value': 'Bitcoin',
+            'limit': 50,
+        },
+    )
+    results_without_nfts = [x['identifier'] for x in assert_proper_sync_response_with_result(response)]  # noqa: E501
+
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'assetssearchlevenshteinresource',
+        ),
+        json={
+            'value': 'Bitcoin',
+            'limit': 50,
+            'nft_handling': 'include',
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    results_with_nfts = [x['identifier'] for x in result]
+    assert set(results_with_nfts) - set(results_without_nfts) == {'my-nft-identifier'}
+
+    # Check that show_only returns the nfts alone. This cannot be had by filtering the response
+    # of an 'include' search: both result sets are merged and truncated to limit together, so the
+    # nfts can be cut off entirely when enough assets sort ahead of them.
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'assetssearchlevenshteinresource',
+        ),
+        json={
+            'value': 'Bitcoin',
+            'limit': 50,
+            'nft_handling': 'show_only',
+        },
+    )
+    nfts_only = assert_proper_sync_response_with_result(response)
+    assert [x['identifier'] for x in nfts_only] == ['my-nft-identifier']
+    assert all(entry['asset_type'] == 'nft' for entry in nfts_only)
+
+    # Check that the order makes sense
+    previous_levenshtein_distance = 0
+    for entry in result:
+        if entry['asset_type'] == 'nft':
+            current_levenshtein_distance = min(
+                levenshtein('bitcoin', entry['name']),
+                levenshtein('bitcoin', entry['collection_name']),
+            )
+        else:
+            current_levenshtein_distance = min(
+                levenshtein('bitcoin', entry['name']),
+                levenshtein('bitcoin', entry['symbol']),
+            )
+        assert current_levenshtein_distance >= previous_levenshtein_distance
+
+
+def test_native_tokens_in_asset_search(rotkehlchen_api_server: APIServer) -> None:
+    """Test that native tokens are also included when searching for evm/solana tokens and
+    that the native token is prioritized (appears at the beginning of the results).
+    """
+    for chain in (ChainID.ETHEREUM, ChainID.OPTIMISM):
+        # Search for 'E' - should include ETH as native token along with other tokens
+        result = assert_proper_sync_response_with_result(requests.post(
+            api_url_for(rotkehlchen_api_server, 'assetssearchlevenshteinresource'),
+            json={'value': 'E', 'limit': 50, 'evm_chain': chain.to_name(), 'asset_type': 'evm token'},  # noqa: E501
+        ))
+        # ETH should be included and prioritized since it's the native token
+        assert_asset_at_top_position('ETH', max_position_index=1, result=result)
+        # but all other assets should be tokens with the correct chain
+        assert all(x['evm_chain'] == chain.to_name() for x in result if x['identifier'] != 'ETH')
+
+    # Search for S with asset_type of solana token, and native SOL should be included.
+    result = assert_proper_sync_response_with_result(requests.post(
+        api_url_for(rotkehlchen_api_server, 'assetssearchlevenshteinresource'),
+        json={'value': 'S', 'limit': 50, 'asset_type': 'solana token'},
+    ))
+    assert_asset_at_top_position('SOL', max_position_index=1, result=result)
+    assert all(x['asset_type'] == 'solana token' for x in result if x['identifier'] != 'SOL')
+
+    # Check that native BTC is also prioritized
+    result = assert_proper_sync_response_with_result(requests.post(
+        api_url_for(rotkehlchen_api_server, 'assetssearchlevenshteinresource'),
+        json={'value': 'BTC', 'limit': 50},
+    ))
+    assert_asset_at_top_position('BTC', max_position_index=1, result=result)
+
+
+def test_fiat_assets_prioritized_in_search(rotkehlchen_api_server: APIServer) -> None:
+    # When searching for USD, the USD fiat currency should appear first
+    result = assert_proper_sync_response_with_result(requests.post(
+        api_url_for(rotkehlchen_api_server, 'assetssearchlevenshteinresource'),
+        json={'value': 'USD', 'limit': 50},
+    ))
+    assert_asset_at_top_position('USD', max_position_index=0, result=result)
+    assert result[0]['asset_type'] == 'fiat'
+
+    # When searching for EUR, the EUR fiat currency should appear first
+    result = assert_proper_sync_response_with_result(requests.post(
+        api_url_for(rotkehlchen_api_server, 'assetssearchlevenshteinresource'),
+        json={'value': 'EUR', 'limit': 50},
+    ))
+    assert_asset_at_top_position('EUR', max_position_index=0, result=result)
+    assert result[0]['asset_type'] == 'fiat'
+
+    # For partial matches, fiat currencies should still have priority over native tokens
+    result = assert_proper_sync_response_with_result(requests.post(
+        api_url_for(rotkehlchen_api_server, 'assetssearchlevenshteinresource'),
+        json={'value': 'U', 'limit': 100},
+    ))
+    fiat_positions, native_positions = [], []
+    for i, entry in enumerate(result):
+        if entry.get('asset_type') == 'fiat':
+            fiat_positions.append(i)
+        elif entry['identifier'] in ('ETH', 'BTC', 'SOL', 'MATIC', 'AVAX'):
+            native_positions.append(i)
+
+    assert max(fiat_positions) < min(native_positions)
+
+
+def test_only_ignored_assets(rotkehlchen_api_server: APIServer) -> None:
+    """Test it's possible to ask to only see the ignored assets"""
+    clean_ignored_assets(rotkehlchen_api_server.rest_api.rotkehlchen.data.db)
+    ignored_assets = [A_GNO.identifier, A_RDN.identifier]
+    response = requests.put(
+        api_url_for(
+            rotkehlchen_api_server,
+            'ignoredassetsresource',
+        ), json={'assets': ignored_assets},
+    )
+    assert_proper_response(response)
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'allassetsresource',
+        ),
+        json={
+            'ignored_assets_handling': 'show_only',
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert {entry['identifier'] for entry in result['entries']} == set(ignored_assets)
+
+
+def test_false_positive(rotkehlchen_api_server: APIServer, globaldb: GlobalDBHandler) -> None:
+    """Test the endpoint to add/remove an asset from the whitelist of spam assets"""
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    db = rotki.data.db
+    with globaldb.conn.read_ctx() as cursor:
+        existing_whitelisted_count = cursor.execute(
+            'SELECT COUNT(*) from general_cache WHERE key=?',
+            ('SPAM_ASSET_FALSE_POSITIVE',),
+        ).fetchone()[0]
+
+    # setup as if DAI was in the spam assets
+    with db.user_write() as write_cursor:
+        db.add_to_ignored_assets(write_cursor=write_cursor, asset=A_DAI)
+
+    with globaldb.conn.write_ctx() as write_cursor:
+        write_cursor.execute(
+            'UPDATE evm_tokens SET protocol=? WHERE identifier=?',
+            (SPAM_PROTOCOL, A_DAI.identifier),
+        )
+    AssetResolver.clean_memory_cache(A_DAI.identifier)
+
+    dai = A_DAI.resolve_to_evm_token()
+    assert dai.protocol == SPAM_PROTOCOL
+
+    response = requests.post(  # mark it as false positive
+        api_url_for(
+            rotkehlchen_api_server,
+            'falsepositivespamtokenresource',
+        ), json={'token': A_DAI.identifier},
+    )
+    assert_proper_response(response)
+
+    # check that the asset is not ignored and has the right protocol value
+    dai = A_DAI.resolve_to_evm_token()
+    assert dai.protocol is None
+    with db.conn.read_ctx() as cursor:
+        assert A_DAI not in db.get_ignored_asset_ids(cursor=cursor)
+
+    with globaldb.conn.read_ctx() as cursor:
+        assert A_DAI.identifier in globaldb_get_general_cache_values(
+            cursor=cursor,
+            key_parts=(CacheType.SPAM_ASSET_FALSE_POSITIVE,),
+        )
+
+    # check that we can query it from the api
+    response = requests.get(api_url_for(rotkehlchen_api_server, 'falsepositivespamtokenresource'))
+    result = assert_proper_sync_response_with_result(response)
+    assert A_DAI in result
+
+    # test that the filter in the search for assets works
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'allassetsresource',
+        ), json={'show_whitelisted_assets_only': True},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    with globaldb.conn.read_ctx() as cursor:
+        assert result['entries_found'] == existing_whitelisted_count + 1
+    assert A_DAI.identifier in {entry['identifier'] for entry in result['entries']}
+
+    # remove it from the list of false positives
+    response = requests.delete(
+        api_url_for(
+            rotkehlchen_api_server,
+            'falsepositivespamtokenresource',
+        ), json={'token': A_DAI.identifier},
+    )
+    with globaldb.conn.read_ctx() as cursor:
+        assert len(globaldb_get_general_cache_values(
+            cursor=cursor,
+            key_parts=(CacheType.SPAM_ASSET_FALSE_POSITIVE,),
+        )) == existing_whitelisted_count
+
+    # test that a solana token can also be marked as false positive
+    with globaldb.conn.write_ctx() as write_cursor:
+        write_cursor.execute(
+            'UPDATE solana_tokens SET protocol=? WHERE identifier=?',
+            (SPAM_PROTOCOL, A_WSOL.identifier),
+        )
+    AssetResolver.clean_memory_cache(A_WSOL.identifier)
+    assert A_WSOL.resolve_to_solana_token().protocol == SPAM_PROTOCOL
+
+    assert_proper_response(requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'falsepositivespamtokenresource',
+        ), json={'token': A_WSOL.identifier},
+    ))
+    assert A_WSOL.resolve_to_solana_token().protocol is None
+
+    assert_proper_response(requests.delete(
+        api_url_for(
+            rotkehlchen_api_server,
+            'falsepositivespamtokenresource',
+        ), json={'token': A_WSOL.identifier},
+    ))
+
+
+def test_setting_tokens_as_spam(rotkehlchen_api_server: APIServer) -> None:
+    """Test the endpoints which set the spam protocol on tokens"""
+    rotki = rotkehlchen_api_server.rest_api.rotkehlchen
+    db = rotki.data.db
+    globaldb = GlobalDBHandler()
+
+    # add token to whitelist to see that it gets removed
+    with globaldb.conn.write_ctx() as write_cursor:
+        globaldb_set_general_cache_values(
+            write_cursor=write_cursor,
+            key_parts=(CacheType.SPAM_ASSET_FALSE_POSITIVE,),
+            values=(A_DAI.identifier,),
+        )
+
+    eth_address = make_evm_address()
+    rotki.chains_aggregator.balances.eth[eth_address].assets[A_DAI][DEFAULT_BALANCE_LABEL] = Balance(amount=FVal(30))  # noqa: E501
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'spamtokenresource',
+        ), json={'tokens': [A_DAI.identifier, A_OP.identifier]},
+    )
+    assert_proper_response(response)
+    assert A_DAI.resolve_to_evm_token().protocol == SPAM_PROTOCOL
+    assert A_OP.resolve_to_evm_token().protocol == SPAM_PROTOCOL
+    with db.conn.read_ctx() as cursor:
+        assert {A_DAI, A_OP}.issubset(rotki.data.db.get_ignored_asset_ids(cursor))
+
+    # check that we removed the asset from the balances
+    assert len(rotki.chains_aggregator.balances.eth[eth_address].assets) == 0
+
+    with globaldb.conn.read_ctx() as cursor:
+        assert A_DAI.identifier not in globaldb_get_general_cache_values(
+            cursor=cursor,
+            key_parts=(CacheType.SPAM_ASSET_FALSE_POSITIVE,),
+        )
+
+    # check that it fails if we try to add any other asset type
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'spamtokenresource',
+        ), json={'tokens': [A_BTC.identifier]},
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='is not one of',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+    # remove the spam protocol
+    response = requests.delete(
+        api_url_for(
+            rotkehlchen_api_server,
+            'spamtokenresource',
+        ), json={'token': A_DAI.identifier},
+    )
+    assert_proper_response(response)
+    assert A_DAI.resolve_to_evm_token().protocol is None
+
+    # test adding a solana token as spam
+    assert_proper_response(requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'spamtokenresource',
+        ), json={'tokens': [A_WSOL.identifier]},
+    ))
+    assert A_WSOL.resolve_to_solana_token().protocol == SPAM_PROTOCOL
+
+    # remove the spam protocol from the solana token
+    assert_proper_response(requests.delete(
+        api_url_for(
+            rotkehlchen_api_server,
+            'spamtokenresource',
+        ), json={'token': A_WSOL.identifier},
+    ))
+    assert A_WSOL.resolve_to_solana_token().protocol is None
+
+
+def test_edit_tokens_nullable(rotkehlchen_api_server: APIServer) -> None:
+    """Check that evm tokens can be edited with symbol and decimal being None"""
+    token = EvmToken.initialize(
+        address=make_evm_address(),
+        chain_id=ChainID.ETHEREUM,
+        token_kind=TokenKind.ERC20,
+        name='Custom 2',
+    )
+    GlobalDBHandler.add_asset(token)
+    response = requests.patch(
+        api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+        json={
+            'asset_type': token.asset_type.serialize(),
+            'identifier': token.identifier,
+            'name': 'A new name',
+            'address': token.evm_address,
+            'token_kind': str(token.token_kind.name),
+            'evm_chain': token.chain_id.to_name(),
+            'symbol': None,
+            'decimals': None,
+        },
+    )
+    assert_proper_response(response)
+    token = EvmToken(token.identifier)
+    assert token.name == 'A new name'
+    assert token.symbol == ''
+    assert token.decimals == 18
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('use_clean_caching_directory', [True])
+def test_add_solana_token(rotkehlchen_api_server: APIServer) -> None:
+    token_identifier = solana_address_to_identifier(
+        address=(token_address := SolanaAddress('BENGEso6uSrcCYyRsanYgmDwLi34QSpihU2FX2xvpump')),
+        token_type=TokenKind.SPL_TOKEN,
+    )
+    response = requests.put(
+        api_url_for(
+            rotkehlchen_api_server,
+            'allassetsresource',
+        ),
+        json=(payload := {
+            'asset_type': 'solana token',
+            'address': token_address,
+            'name': 'TrollBoss',
+            'symbol': 'TROLLBOSS',
+            'decimals': 6,
+            'coingecko': None,
+            'cryptocompare': None,
+            'token_kind': 'spl_token',
+            'protocol': '',
+            'started': 1754563797,
+        }),
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert result['identifier'] == token_identifier
+
+    response = requests.post(
+        api_url_for(
+            rotkehlchen_api_server,
+            'allassetsresource',
+        ),
+        json={
+            'identifiers': [token_identifier],
+        },
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert result['entries_found'] == 1
+    assert result['entries'] == [
+        {
+            'address': token_address,
+            'identifier': token_identifier,
+            'asset_type': payload['asset_type'],
+            'coingecko': None,
+            'cryptocompare': None,
+            'decimals': payload['decimals'],
+            'name': payload['name'],
+            'symbol': payload['symbol'],
+            'started': payload['started'],
+            'forked': None,
+            'is_rebasing': False,
+            'swapped_for': None,
+            'protocol': None,
+            'token_kind': ' '.join(payload['token_kind'].split('_')),  # type: ignore[attr-defined]  # it is a string
+        },
+    ]
+
+
+@pytest.mark.parametrize('use_clean_caching_directory', [True])
+@pytest.mark.parametrize('coingecko_cache_coinlist', [{'some-token': {}}])
+@pytest.mark.parametrize('cryptocompare_cache_coinlist', [{'WIF': {}}])
+def test_edit_solana_token(
+        rotkehlchen_api_server: APIServer,
+        cache_coinlist: list[dict[str, dict]],
+) -> None:
+    """Test that editing a solana token via the api works correctly.
+    Regression test for a problem where editing a token changed its asset type to EVM token and
+    resulted in unknown asset errors.
+    """
+    token_dict = (a_dogwifhat := Asset(
+        identifier='solana/token:EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm',
+    )).resolve_to_solana_token().to_dict()
+    del token_dict['identifier']
+    del token_dict['forked']
+    token_dict['name'] = 'Some Token'
+    token_dict['symbol'] = 'ST'
+    token_dict['coingecko'] = 'some-token'
+    assert_proper_response(requests.patch(
+        api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+        json=token_dict,
+    ))
+    # Reload the token from the db and check that only the edited attributes have changed.
+    token_after_edit = Asset(a_dogwifhat.identifier).resolve_to_solana_token()
+    assert token_after_edit.asset_type == AssetType.SOLANA_TOKEN
+    assert token_after_edit.cryptocompare == 'WIF'
+    assert token_after_edit.decimals == 6
+    assert token_after_edit.name == 'Some Token'
+    assert token_after_edit.symbol == 'ST'
+    assert token_after_edit.coingecko == 'some-token'
+
+
+@pytest.mark.parametrize('use_clean_caching_directory', [True])
+def test_add_and_retrieve_hyperliquid_token(rotkehlchen_api_server: APIServer) -> None:
+    token_address = '0x1234567890abcdef1234567890abcdef'
+    payload: dict[str, Any] = {
+        'asset_type': 'hyperliquid token',
+        'address': token_address,
+        'name': '$TEST',
+        'symbol': 'TEST',
+        'decimals': 6,
+        'coingecko': None,
+        'cryptocompare': None,
+        'started': 1749829092,
+        'forked': A_BTC.identifier,
+    }
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+        json=payload,
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert result['identifier'] == (
+        token_identifier := hyperliquid_token_address_to_identifier(token_address)
+    )
+
+    response = requests.post(
+        api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+        json={'address': token_address.upper().replace('0X', '0x')},
+    )
+    result = assert_proper_sync_response_with_result(response)
+    assert result['entries_found'] == 1
+    assert result['entries'] == [{
+        'address': token_address,
+        'identifier': token_identifier,
+        'is_rebasing': False,
+        'asset_type': payload['asset_type'],
+        'coingecko': None,
+        'cryptocompare': None,
+        'decimals': payload['decimals'],
+        'name': payload['name'],
+        'symbol': payload['symbol'],
+        'started': payload['started'],
+        'forked': payload['forked'],
+        'swapped_for': None,
+    }]
+    assert Asset(token_identifier).resolve_to_hyperliquid_token().forked == A_BTC
+    assert next(
+        asset for asset in GlobalDBHandler.get_assets_with_symbol(payload['symbol'])
+        if asset.identifier == token_identifier
+    ).resolve_to_hyperliquid_token().forked == A_BTC
+    assert next(
+        GlobalDBHandler.retrieve_assets_optimized([token_identifier]),
+    ).resolve_to_hyperliquid_token().forked == A_BTC
+
+    response = requests.put(
+        api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+        json=payload | {'address': 123},
+    )
+    assert_error_response(
+        response=response,
+        contained_in_msg='is not a Hyperliquid Core token address',
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+
+@pytest.mark.parametrize('use_clean_caching_directory', [True])
+@pytest.mark.parametrize('coingecko_cache_coinlist', [{'some-token': {}}])
+@pytest.mark.parametrize('cryptocompare_cache_coinlist', [{'TEST': {}}])
+def test_edit_hyperliquid_token(
+        rotkehlchen_api_server: APIServer,
+        cache_coinlist: list[dict[str, dict]],
+) -> None:
+    token = HyperliquidToken.initialize(
+        address=HyperliquidTokenAddress('0x1234567890abcdef1234567890abcdef'),
+        name='$TEST',
+        symbol='TEST',
+        decimals=6,
+        started=Timestamp(1749829092),
+        cryptocompare='TEST',
+    )
+    GlobalDBHandler.add_asset(token)
+
+    token_dict = Asset(token.identifier).resolve_to_hyperliquid_token().to_dict()
+    del token_dict['identifier']
+    del token_dict['forked']
+    token_dict['name'] = 'Some Token'
+    token_dict['symbol'] = 'ST'
+    token_dict['decimals'] = 8
+    token_dict['coingecko'] = 'some-token'
+    assert_proper_response(requests.patch(
+        api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+        json=token_dict,
+    ))
+
+    token_after_edit = Asset(token.identifier).resolve_to_hyperliquid_token()
+    assert token_after_edit.asset_type == AssetType.HYPERLIQUID_TOKEN
+    assert token_after_edit.address == token.address
+    assert token_after_edit.cryptocompare == 'TEST'
+    assert token_after_edit.decimals == 8
+    assert token_after_edit.name == 'Some Token'
+    assert token_after_edit.symbol == 'ST'
+    assert token_after_edit.coingecko == 'some-token'
+
+    GlobalDBHandler.add_asset(incomplete_token := HyperliquidToken.initialize(
+        address=HyperliquidTokenAddress('0x00000000000000000000000000000001'),
+    ))
+    incomplete_token_dict = Asset(
+        incomplete_token.identifier,
+    ).resolve_to_hyperliquid_token().to_dict()
+    del incomplete_token_dict['identifier']
+    del incomplete_token_dict['forked']
+    assert_proper_response(requests.patch(
+        api_url_for(rotkehlchen_api_server, 'allassetsresource'),
+        json=incomplete_token_dict,
+    ))

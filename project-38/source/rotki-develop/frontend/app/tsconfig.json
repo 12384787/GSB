@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "module": "NodeNext"
+  },
+  "references": [
+    {
+      "path": "./tsconfig.node.json"
+    },
+    {
+      "path": "./tsconfig.app.json"
+    },
+    {
+      "path": "./tsconfig.vitest.json"
+    },
+    {
+      "path": "./tests/e2e/specs/tsconfig.json"
+    },
+    {
+      "path": "./tests/e2e/rpc-mock/tsconfig.json"
+    }
+  ],
+  "files": []
+}

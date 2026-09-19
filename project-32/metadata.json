@@ -1,0 +1,10 @@
+{
+  "number": 32,
+  "repository": "kestra-io/kestra",
+  "url": "https://github.com/kestra-io/kestra",
+  "description": "Event Driven Orchestration & Scheduling Platform for Mission Critical Applications",
+  "language": "Java",
+  "stars": 28158,
+  "default_branch": "main",
+  "source_zip_url": "https://github.com/kestra-io/kestra/archive/refs/heads/main.zip"
+}

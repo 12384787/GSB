@@ -1,0 +1,80 @@
+import { expect, type Page } from '@playwright/test';
+import { TIMEOUT_DIALOG } from '../helpers/constants';
+import { RotkiApp } from './rotki-app';
+
+export class ApiKeysPage {
+  constructor(private readonly page: Page) {}
+
+  async visit(submenu: string): Promise<void> {
+    await RotkiApp.navigateTo(this.page, 'api-keys', submenu);
+  }
+
+  /**
+   * Adds an exchange through the form, against mocked endpoints.
+   *
+   * @remarks
+   * Every route is registered before the form is touched. Playwright applies a route only to
+   * requests made after it is installed, so a mock added later lets the real request through and
+   * the assertion on the captured payload then reads an empty object.
+   */
+  async addExchange(apiKey: string, apiSecret: string, exchange: string, name: string): Promise<void> {
+    let capturedRequest: { api_key?: string; api_secret?: string; name?: string; location?: string } = {};
+
+    await this.page.route('**/api/1/exchanges', async (route) => {
+      if (route.request().method() === 'PUT') {
+        const postData = route.request().postDataJSON();
+        capturedRequest = postData;
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ result: true, message: '' }),
+        });
+      }
+      else {
+        await route.continue();
+      }
+    });
+
+    // Mock the balance request
+    await this.page.route(`**/api/1/exchanges/balances/${exchange}**`, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          result: { task_id: 100001 },
+          message: '',
+        }),
+      });
+    });
+
+    // Now open the dialog and fill the form
+    await this.page.locator('[data-testid=exchanges]').locator('[data-testid=add-exchange]').click();
+    const keys = this.page.locator('[data-testid=exchange-keys]');
+    await this.page.locator('[data-testid=bottom-dialog]').waitFor({ state: 'visible', timeout: TIMEOUT_DIALOG });
+
+    await keys.locator('[data-testid=exchange] [data-id=activator]').click();
+    await keys.locator('[data-testid=exchange] input').fill(exchange);
+    await expect(this.page.locator('[role=menu] button')).toHaveCount(1);
+    await keys.locator('[data-testid=exchange] input').press('Enter');
+    await keys.locator('[data-testid=name] input').fill(name);
+    await keys.locator('[data-testid=api-key] input').fill(apiKey);
+    await keys.locator('[data-testid=api-secret] input').fill(apiSecret);
+
+    await this.page.locator('[data-testid=bottom-dialog]').locator('[data-testid=confirm]').click();
+    await this.page.locator('[data-testid=bottom-dialog]').waitFor({ state: 'detached', timeout: TIMEOUT_DIALOG });
+
+    // Verify the interceptor captured the correct values
+    expect(capturedRequest.api_key).toBe(apiKey);
+    expect(capturedRequest.api_secret).toBe(apiSecret);
+    expect(capturedRequest.name).toBe(name);
+    expect(capturedRequest.location).toBe(exchange);
+  }
+
+  async exchangeIsAdded(exchange: string, name: string): Promise<void> {
+    const table = this.page.locator('[data-testid=exchange-table]').locator('table');
+    const row = table.locator('tbody tr').first();
+    await row.waitFor({ state: 'visible' });
+    await expect(row.locator('td').first()).toContainText(exchange);
+    await expect(row.locator('td').nth(1)).toContainText(name);
+  }
+}

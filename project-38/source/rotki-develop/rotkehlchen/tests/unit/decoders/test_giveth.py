@@ -1,0 +1,719 @@
+from typing import Final
+
+import pytest
+
+from rotkehlchen.assets.asset import Asset, EvmToken
+from rotkehlchen.chain.arbitrum_one.modules.giveth.constants import (
+    GIVETH_DONATION_CONTRACT_ADDRESS as ARBITRUM_GIVETH_DONATION_CONTRACT_ADDRESS,
+)
+from rotkehlchen.chain.decoding.constants import CPT_GAS
+from rotkehlchen.chain.ethereum.modules.giveth.constants import (
+    GIVETH_DONATION_CONTRACT_ADDRESS as ETHEREUM_GIVETH_DONATION_CONTRACT_ADDRESS,
+)
+from rotkehlchen.chain.evm.constants import ZERO_ADDRESS
+from rotkehlchen.chain.evm.decoding.giveth.constants import CPT_GIVETH
+from rotkehlchen.chain.evm.types import (
+    string_to_evm_address,
+)
+from rotkehlchen.chain.gnosis.modules.giveth.constants import (
+    GIVETH_DONATION_CONTRACT_ADDRESS as GNOSIS_GIVETH_DONATION_CONTRACT_ADDRESS,
+    GNOSIS_GIVPOWERSTAKING_WRAPPER,
+)
+from rotkehlchen.chain.polygon_pos.modules.giveth.constants import GIVETH_DONATION_CONTRACT_ADDRESS
+from rotkehlchen.constants import ZERO
+from rotkehlchen.constants.assets import A_ETH, A_XDAI
+from rotkehlchen.fval import FVal
+from rotkehlchen.history.events.structures.evm_event import EvmEvent
+from rotkehlchen.history.events.structures.types import HistoryEventSubType, HistoryEventType
+from rotkehlchen.tests.unit.test_types import LEGACY_TESTS_INDEXER_ORDER
+from rotkehlchen.tests.utils.ethereum import get_decoded_events_of_transaction
+from rotkehlchen.types import Location, TimestampMS, deserialize_evm_tx_hash
+
+ROTKI_ADDRESS: Final = string_to_evm_address('0x9531C059098e3d194fF87FebB587aB07B30B1306')
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('db_settings', LEGACY_TESTS_INDEXER_ORDER)
+@pytest.mark.parametrize('optimism_accounts', [['0xB9573982875b83aaDc1296726E2ae77D13D9B98F']])
+def test_optimism_stake_deposit(optimism_inquirer, optimism_accounts):
+    tx_hash = deserialize_evm_tx_hash('0x875d69d471b2c31c5175848b11f68815e197fd609509cee420075685d21feccb')  # noqa: E501
+    events, decoder = get_decoded_events_of_transaction(evm_inquirer=optimism_inquirer, tx_hash=tx_hash)  # noqa: E501
+    user = optimism_accounts[0]
+    amount = '416.766115409070747461'
+    assert events == [
+        EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1733231821000)),
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.00000045219580173'),
+            location_label=optimism_accounts[0],
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=37,
+            timestamp=timestamp,
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.INFORMATIONAL,
+            event_subtype=HistoryEventSubType.APPROVE,
+            asset=EvmToken(decoder.decoders['Giveth'].giv_token_id),
+            amount=FVal(ZERO),
+            location_label=user,
+            address=decoder.decoders['Giveth'].givpower_staking_address,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=38,
+            timestamp=timestamp,
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.DEPOSIT_FOR_WRAPPED,
+            asset=EvmToken(decoder.decoders['Giveth'].giv_token_id),
+            amount=FVal(amount),
+            location_label=user,
+            notes=f'Deposit {amount} GIV for staking',
+            counterparty=CPT_GIVETH,
+            address=decoder.decoders['Giveth'].givpower_staking_address,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=39,
+            timestamp=timestamp,
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.RECEIVE,
+            event_subtype=HistoryEventSubType.RECEIVE_WRAPPED,
+            asset=EvmToken(decoder.decoders['Giveth'].pow_token_id),
+            amount=FVal(amount),
+            location_label=user,
+            notes=f'Receive {amount} POW after depositing GIV',
+            counterparty=CPT_GIVETH,
+            address=ZERO_ADDRESS,
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('db_settings', LEGACY_TESTS_INDEXER_ORDER)
+@pytest.mark.parametrize('optimism_accounts', [['0xB9573982875b83aaDc1296726E2ae77D13D9B98F']])
+def test_optimism_lock(optimism_inquirer, optimism_accounts):
+    tx_hash = deserialize_evm_tx_hash('0x160a78b4ce5001b407db9f5fca3e64fcc0619995d8888c66605f69525eed0270')  # noqa: E501
+    events, decoder = get_decoded_events_of_transaction(evm_inquirer=optimism_inquirer, tx_hash=tx_hash)  # noqa: E501
+    user = optimism_accounts[0]
+    assert events == [
+        EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1733231841000)),
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.000000453377609571'),
+            location_label=optimism_accounts[0],
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=1,
+            timestamp=timestamp,
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.INFORMATIONAL,
+            event_subtype=HistoryEventSubType.DEPOSIT_ASSET,
+            asset=EvmToken(decoder.decoders['Giveth'].giv_token_id),
+            amount=FVal(giv_amount := '416.766115409070747461'),
+            location_label=user,
+            notes=f'Lock {giv_amount} GIV for 1 round/s',
+            counterparty=CPT_GIVETH,
+            address=decoder.decoders['Giveth'].givpower_staking_address,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=2,
+            timestamp=timestamp,
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.RECEIVE,
+            event_subtype=HistoryEventSubType.RECEIVE_WRAPPED,
+            asset=EvmToken(decoder.decoders['Giveth'].pow_token_id),
+            amount=FVal(pow_amount := '172.630177184494281415'),
+            location_label=user,
+            notes=f'Receive {pow_amount} POW after locking GIV',
+            counterparty=CPT_GIVETH,
+            address=ZERO_ADDRESS,
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('db_settings', LEGACY_TESTS_INDEXER_ORDER)
+@pytest.mark.parametrize('optimism_accounts', [['0xAca2F322d69E07993E073C8730180FB139cA4446']])
+def test_optimism_withdraw(optimism_inquirer, optimism_accounts):
+    tx_hash = deserialize_evm_tx_hash('0xd687dcd65be8a2a9aea83123a9bdae775232af23e5846f01ade70f3f5280d392')  # noqa: E501
+    events, decoder = get_decoded_events_of_transaction(evm_inquirer=optimism_inquirer, tx_hash=tx_hash)  # noqa: E501
+    user = optimism_accounts[0]
+    amount = '798.24369413782804452'
+    assert events == [
+        EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1732744801000)),
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.000000258591448555'),
+            location_label=optimism_accounts[0],
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=1,
+            timestamp=timestamp,
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.RETURN_WRAPPED,
+            asset=EvmToken(decoder.decoders['Giveth'].pow_token_id),
+            amount=FVal(amount),
+            location_label=user,
+            notes=f'Return {amount} POW to Giveth staking',
+            counterparty=CPT_GIVETH,
+            address=ZERO_ADDRESS,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=2,
+            timestamp=timestamp,
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.WITHDRAWAL,
+            event_subtype=HistoryEventSubType.REDEEM_WRAPPED,
+            asset=EvmToken(decoder.decoders['Giveth'].giv_token_id),
+            amount=FVal(amount),
+            location_label=user,
+            notes=f'Withdraw {amount} GIV from staking',
+            counterparty=CPT_GIVETH,
+            address=decoder.decoders['Giveth'].givpower_staking_address,
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('db_settings', LEGACY_TESTS_INDEXER_ORDER)
+@pytest.mark.parametrize('optimism_accounts', [['0x8a0F0a09e622bc0677a404343129FB5dDA1E2d33']])
+def test_optimism_claim(optimism_inquirer, optimism_accounts):
+    tx_hash = deserialize_evm_tx_hash('0x2144b2417404977fe2b4b4064b58cdaafc90e416e68a5ad16c04989cc025f3b1')  # noqa: E501
+    events, decoder = get_decoded_events_of_transaction(evm_inquirer=optimism_inquirer, tx_hash=tx_hash)  # noqa: E501
+    user = optimism_accounts[0]
+    amount = '55.906071953178772758'
+    assert events == [
+        EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1732520935000)),
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_ETH,
+            amount=FVal('0.000001950934408636'),
+            location_label=optimism_accounts[0],
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=41,
+            timestamp=timestamp,
+            location=Location.OPTIMISM,
+            event_type=HistoryEventType.RECEIVE,
+            event_subtype=HistoryEventSubType.REWARD,
+            asset=EvmToken(decoder.decoders['Giveth'].giv_token_id),
+            amount=FVal(amount),
+            location_label=user,
+            notes=f'Claim {amount} GIV',
+            counterparty=CPT_GIVETH,
+            address=decoder.decoders['Giveth'].distro_address,
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('gnosis_accounts', [['0x2B888954421b424C5D3D9Ce9bB67c9bD47537d12']])
+def test_gnosis_claim(gnosis_inquirer, gnosis_accounts, allow_gnosis_etherscan):
+    tx_hash = deserialize_evm_tx_hash('0x8a7edd5f0008f8838664404a2b2aab593b705149044865cbdeb75d2126130949')  # noqa: E501
+    events, decoder = get_decoded_events_of_transaction(evm_inquirer=gnosis_inquirer, tx_hash=tx_hash)  # noqa: E501
+    user = gnosis_accounts[0]
+    amount = '66405.135269385928501434'
+    assert events == [
+        EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1733756450000)),
+            location=Location.GNOSIS,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_XDAI,
+            amount=FVal('0.000142777694803742'),
+            location_label=user,
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=16,
+            timestamp=timestamp,
+            location=Location.GNOSIS,
+            event_type=HistoryEventType.RECEIVE,
+            event_subtype=HistoryEventSubType.REWARD,
+            asset=EvmToken(decoder.decoders['Giveth'].giv_token_id),
+            amount=FVal(amount),
+            location_label=user,
+            notes=f'Claim {amount} GIV',
+            counterparty=CPT_GIVETH,
+            address=decoder.decoders['Giveth'].distro_address,
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('gnosis_accounts', [['0xBe784DB8CB6909a6ff24AAD9a39dAd7E87642902']])
+def test_gnosis_lock(gnosis_inquirer, gnosis_accounts, allow_gnosis_etherscan):
+    tx_hash = deserialize_evm_tx_hash('0x9a79d704dd637460a17bb3897df522c56deb4848d9d3b5630424c545e47172b5')  # noqa: E501
+    events, decoder = get_decoded_events_of_transaction(evm_inquirer=gnosis_inquirer, tx_hash=tx_hash)  # noqa: E501
+    user = gnosis_accounts[0]
+    assert events == [
+        EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1733685985000)),
+            location=Location.GNOSIS,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_XDAI,
+            amount=FVal('0.00026284575126455'),
+            location_label=user,
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=1,
+            timestamp=timestamp,
+            location=Location.GNOSIS,
+            event_type=HistoryEventType.INFORMATIONAL,
+            event_subtype=HistoryEventSubType.DEPOSIT_ASSET,
+            asset=EvmToken(decoder.decoders['Giveth'].giv_token_id),
+            amount=FVal(giv_amount := '2617.351674315678177796'),
+            location_label=user,
+            notes=f'Lock {giv_amount} GIV for 26 round/s',
+            counterparty=CPT_GIVETH,
+            address=decoder.decoders['Giveth'].givpower_staking_address,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=2,
+            timestamp=timestamp,
+            location=Location.GNOSIS,
+            event_type=HistoryEventType.RECEIVE,
+            event_subtype=HistoryEventSubType.RECEIVE_WRAPPED,
+            asset=EvmToken(decoder.decoders['Giveth'].pow_token_id),
+            amount=FVal(pow_amount := '10982.806567405488178331'),
+            location_label=user,
+            notes=f'Receive {pow_amount} POW after locking GIV',
+            counterparty=CPT_GIVETH,
+            address=ZERO_ADDRESS,
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('gnosis_accounts', [['0x5D28FE1e9F895464aab52287d85Ebff32B351674']])
+def test_gnosis_stake_deposit(gnosis_inquirer, gnosis_accounts, allow_gnosis_etherscan):
+    tx_hash = deserialize_evm_tx_hash('0xaee26eb3b311b318292d4c29c2ad9b050fc339bfaef6da2f329a43cdb89dcd9b')  # noqa: E501
+    events, decoder = get_decoded_events_of_transaction(evm_inquirer=gnosis_inquirer, tx_hash=tx_hash)  # noqa: E501
+    user = gnosis_accounts[0]
+    amount = '100913.342801097979277274'
+    expected_events = [
+        EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1733536070000)),
+            location=Location.GNOSIS,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_XDAI,
+            amount=FVal('0.000391221856613286'),
+            location_label=user,
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=27,
+            timestamp=timestamp,
+            location=Location.GNOSIS,
+            event_type=HistoryEventType.INFORMATIONAL,
+            event_subtype=HistoryEventSubType.APPROVE,
+            asset=EvmToken(decoder.decoders['Giveth'].giv_token_id),
+            amount=FVal(ZERO),
+            location_label=user,
+            address=GNOSIS_GIVPOWERSTAKING_WRAPPER,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=28,
+            timestamp=timestamp,
+            location=Location.GNOSIS,
+            event_type=HistoryEventType.DEPOSIT,
+            event_subtype=HistoryEventSubType.DEPOSIT_FOR_WRAPPED,
+            asset=EvmToken(decoder.decoders['Giveth'].giv_token_id),
+            amount=FVal(amount),
+            location_label=user,
+            notes=f'Deposit {amount} GIV for staking',
+            counterparty=CPT_GIVETH,
+            address=GNOSIS_GIVPOWERSTAKING_WRAPPER,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=29,
+            timestamp=timestamp,
+            location=Location.GNOSIS,
+            event_type=HistoryEventType.RECEIVE,
+            event_subtype=HistoryEventSubType.RECEIVE_WRAPPED,
+            asset=EvmToken(decoder.decoders['Giveth'].pow_token_id),
+            amount=FVal(amount),
+            location_label=user,
+            notes=f'Receive {amount} POW after depositing GIV',
+            counterparty=CPT_GIVETH,
+            address=decoder.decoders['Giveth'].givpower_staking_address,
+        ),
+    ]
+    assert events == expected_events  # ignore the last receival of gGiv in Gnosis
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('gnosis_accounts', [['0x5918D889E913c53288C17265280DAD439FEc8275']])
+def test_gnosis_withdraw(gnosis_inquirer, gnosis_accounts, allow_gnosis_etherscan):
+    tx_hash = deserialize_evm_tx_hash('0x277949402fb601446f5b8c7e751e72df0f4687b38612935211542b3f4b3f2cf4')  # noqa: E501
+    events, decoder = get_decoded_events_of_transaction(evm_inquirer=gnosis_inquirer, tx_hash=tx_hash)  # noqa: E501
+    user = gnosis_accounts[0]
+    amount = '4927.159556510935243873'
+    assert events == [
+        EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=0,
+            timestamp=(timestamp := TimestampMS(1733322280000)),
+            location=Location.GNOSIS,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.FEE,
+            asset=A_XDAI,
+            amount=FVal('0.00046583297133306'),
+            location_label=user,
+            counterparty=CPT_GAS,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=1,
+            timestamp=timestamp,
+            location=Location.GNOSIS,
+            event_type=HistoryEventType.SPEND,
+            event_subtype=HistoryEventSubType.RETURN_WRAPPED,
+            asset=EvmToken(decoder.decoders['Giveth'].pow_token_id),
+            amount=FVal(amount),
+            location_label=user,
+            notes=f'Return {amount} POW to Giveth staking',
+            counterparty=CPT_GIVETH,
+            address=decoder.decoders['Giveth'].givpower_staking_address,
+        ), EvmEvent(
+            tx_ref=tx_hash,
+            sequence_index=2,
+            timestamp=timestamp,
+            location=Location.GNOSIS,
+            event_type=HistoryEventType.WITHDRAWAL,
+            event_subtype=HistoryEventSubType.REDEEM_WRAPPED,
+            asset=EvmToken(decoder.decoders['Giveth'].giv_token_id),
+            amount=FVal(amount),
+            location_label=user,
+            notes=f'Withdraw {amount} GIV from staking',
+            counterparty=CPT_GIVETH,
+            address=GNOSIS_GIVPOWERSTAKING_WRAPPER,
+        ),
+    ]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('polygon_pos_accounts', [['0x2345678901234567890123456789012345678901']])
+def test_giveth_donation_pol(polygon_pos_inquirer, polygon_pos_accounts):
+    tx_hash = deserialize_evm_tx_hash('0x2f39809f4cab0e97ee12eb5a70fd76a28c2855ccc2b840f2030844c7e81b2e43')  # noqa: E501
+    events, _ = get_decoded_events_of_transaction(evm_inquirer=polygon_pos_inquirer, tx_hash=tx_hash)  # noqa: E501
+    assert events == [EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=0,
+        timestamp=TimestampMS(1754368465000),
+        location=Location.POLYGON_POS,
+        event_type=HistoryEventType.RECEIVE,
+        event_subtype=HistoryEventSubType.DONATE,
+        asset=Asset('eip155:137/erc20:0x0000000000000000000000000000000000001010'),
+        amount=(donation_amount := FVal('0.01')),
+        location_label=polygon_pos_accounts[0],
+        notes=f'Receive a giveth donation of {donation_amount} POL from 0x47498b788942a74DB601B117bd406a8C5369a32F',  # noqa: E501
+        counterparty=CPT_GIVETH,
+        address=GIVETH_DONATION_CONTRACT_ADDRESS,
+    )]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('polygon_pos_accounts', [['0x29EE09Bd0f7f41EcD083Ad2708Df17691065790B']])
+def test_giveth_donation_erc20(polygon_pos_inquirer, polygon_pos_accounts):
+    tx_hash = deserialize_evm_tx_hash('0x0b7bbafb80a494ab65eaf8b8f38f3afca1bd4f8979dc6c72b090bb609dd6d329')  # noqa: E501
+    events, _ = get_decoded_events_of_transaction(evm_inquirer=polygon_pos_inquirer, tx_hash=tx_hash)  # noqa: E501
+    assert events == [EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=1213,
+        timestamp=TimestampMS(1756375213000),
+        location=Location.POLYGON_POS,
+        event_type=HistoryEventType.RECEIVE,
+        event_subtype=HistoryEventSubType.DONATE,
+        asset=Asset('eip155:137/erc20:0xc20CAf8deE81059ec0c8E5971b2AF7347eC131f4'),
+        amount=(donation_amount := FVal('28.894081')),
+        location_label=polygon_pos_accounts[0],
+        notes=f'Receive a giveth donation of {donation_amount} TPOL from 0xEA2dB4736F6D8Cacb3532eDf37D15a29466Daaa7',  # noqa: E501
+        counterparty=CPT_GIVETH,
+        address=string_to_evm_address('0xEA2dB4736F6D8Cacb3532eDf37D15a29466Daaa7'),
+    )]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('polygon_pos_accounts', [['0xB5Ab1C37ac3d89A48f32307C4DfCc96F79BeAd27']])
+def test_giveth_donation_sender(polygon_pos_inquirer, polygon_pos_accounts):
+    tx_hash = deserialize_evm_tx_hash('0x9150c5c1dfc5a587b43f5dc39c585af2c6e16cd62396f6d2feb6bafd77e9edac')  # noqa: E501
+    events, _ = get_decoded_events_of_transaction(evm_inquirer=polygon_pos_inquirer, tx_hash=tx_hash)  # noqa: E501
+    assert events == [EvmEvent(
+        tx_ref=tx_hash,
+        timestamp=(timestamp := TimestampMS(1756386087000)),
+        sequence_index=0,
+        location=Location.POLYGON_POS,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.FEE,
+        asset=Asset('eip155:137/erc20:0x0000000000000000000000000000000000001010'),
+        amount=(FVal('0.002843750017390625')),
+        location_label=(user_address := polygon_pos_accounts[0]),
+        counterparty=CPT_GAS,
+    ), EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=363,
+        timestamp=timestamp,
+        location=Location.POLYGON_POS,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.DONATE,
+        asset=Asset('eip155:137/erc20:0xc20CAf8deE81059ec0c8E5971b2AF7347eC131f4'),
+        amount=(donation_amount := FVal('2.673594')),
+        location_label=user_address,
+        notes=f'Make a giveth donation of {donation_amount} TPOL to 0xcd192b61a8Dd586A97592555c1f5709e032F2505',  # noqa: E501
+        counterparty=CPT_GIVETH,
+        address=string_to_evm_address('0xcd192b61a8Dd586A97592555c1f5709e032F2505'),
+    ), EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=365,
+        timestamp=timestamp,
+        location=Location.POLYGON_POS,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.DONATE,
+        asset=Asset('eip155:137/erc20:0xc20CAf8deE81059ec0c8E5971b2AF7347eC131f4'),
+        amount=(donation_amount := FVal('4.455991')),
+        location_label=user_address,
+        notes=f'Make a giveth donation of {donation_amount} TPOL to 0xd10BAC02a02747cB293972f99981F4Faf78E1626',  # noqa: E501
+        counterparty=CPT_GIVETH,
+        address=string_to_evm_address('0xd10BAC02a02747cB293972f99981F4Faf78E1626'),
+    ), EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=367,
+        timestamp=timestamp,
+        location=Location.POLYGON_POS,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.DONATE,
+        asset=Asset('eip155:137/erc20:0xc20CAf8deE81059ec0c8E5971b2AF7347eC131f4'),
+        amount=(donation_amount := FVal('46.363509')),
+        location_label=user_address,
+        notes=f'Make a giveth donation of {donation_amount} TPOL to 0xBBdA03b2f234E57e0cf7eC85F493aa4162762A1a',  # noqa: E501
+        counterparty=CPT_GIVETH,
+        address=string_to_evm_address('0xBBdA03b2f234E57e0cf7eC85F493aa4162762A1a'),
+    ), EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=369,
+        timestamp=timestamp,
+        location=Location.POLYGON_POS,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.DONATE,
+        asset=Asset('eip155:137/erc20:0xc20CAf8deE81059ec0c8E5971b2AF7347eC131f4'),
+        amount=(donation_amount := FVal('24.401905')),
+        location_label=user_address,
+        notes=f'Make a giveth donation of {donation_amount} TPOL to 0xCd144358cC53c01909166A8412FcfaACa689e4c3',  # noqa: E501
+        counterparty=CPT_GIVETH,
+        address=string_to_evm_address('0xCd144358cC53c01909166A8412FcfaACa689e4c3'),
+    ), EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=371,
+        timestamp=timestamp,
+        location=Location.POLYGON_POS,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.DONATE,
+        asset=Asset('eip155:137/erc20:0xc20CAf8deE81059ec0c8E5971b2AF7347eC131f4'),
+        amount=(donation_amount := FVal('11.224832')),
+        location_label=user_address,
+        notes=f'Make a giveth donation of {donation_amount} TPOL to 0xc5319dbdcC2930778c1473Ddc8E8F1606252e675',  # noqa: E501
+        counterparty=CPT_GIVETH,
+        address=string_to_evm_address('0xc5319dbdcC2930778c1473Ddc8E8F1606252e675'),
+    )]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [[ROTKI_ADDRESS]])
+def test_giveth_donation_eth_receiver(ethereum_inquirer, ethereum_accounts):
+    tx_hash = deserialize_evm_tx_hash('0x98c47c3914f182ec1ef98d30a9f48b2724a0e7a81811b1b61cd281ed1fd93f1f')  # noqa: E501
+    events, _ = get_decoded_events_of_transaction(evm_inquirer=ethereum_inquirer, tx_hash=tx_hash)
+    assert events == [EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=0,
+        timestamp=TimestampMS(1776983315000),
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.RECEIVE,
+        event_subtype=HistoryEventSubType.DONATE,
+        asset=A_ETH,
+        amount=(donation_amount := FVal('0.004206971')),
+        location_label=ethereum_accounts[0],
+        notes=f'Receive a giveth donation of {donation_amount} ETH from 0x4b189EE51829E2628EBA63f024fbE7015f472576',  # noqa: E501
+        counterparty=CPT_GIVETH,
+        address=ETHEREUM_GIVETH_DONATION_CONTRACT_ADDRESS,
+    )]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('gnosis_accounts', [[ROTKI_ADDRESS]])
+def test_giveth_donation_gnosis_receiver(gnosis_inquirer, gnosis_accounts, allow_gnosis_etherscan):
+    tx_hash = deserialize_evm_tx_hash('0x293273ea9d2f3a6c22b02a59a2f675eeb1f218e6b4cd8bddda26f8859706f5c6')  # noqa: E501
+    events, _ = get_decoded_events_of_transaction(evm_inquirer=gnosis_inquirer, tx_hash=tx_hash)
+    assert events == [EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=0,
+        timestamp=TimestampMS(1777013445000),
+        location=Location.GNOSIS,
+        event_type=HistoryEventType.RECEIVE,
+        event_subtype=HistoryEventSubType.DONATE,
+        asset=A_XDAI,
+        amount=(donation_amount := FVal('5')),
+        location_label=gnosis_accounts[0],
+        notes=f'Receive a giveth donation of {donation_amount} XDAI from 0x0f48669B1681D41357EAc232F516B77D0c10F0F1',  # noqa: E501
+        counterparty=CPT_GIVETH,
+        address=GNOSIS_GIVETH_DONATION_CONTRACT_ADDRESS,
+    )]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('optimism_accounts', [[ROTKI_ADDRESS]])
+def test_giveth_donation_optimism_receiver(optimism_inquirer, optimism_accounts):
+    tx_hash = deserialize_evm_tx_hash('0xab954bb018e2f6f24ce6bc487c03919ba3f86d593723ed05958a15d6175b182a')  # noqa: E501
+    events, _ = get_decoded_events_of_transaction(evm_inquirer=optimism_inquirer, tx_hash=tx_hash)
+    assert events == [EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=0,
+        timestamp=TimestampMS(1777040611000),
+        location=Location.OPTIMISM,
+        event_type=HistoryEventType.RECEIVE,
+        event_subtype=HistoryEventSubType.DONATE,
+        asset=Asset('eip155:10/erc20:0x528CDc92eAB044E1E39FE43B9514bfdAB4412B98'),
+        amount=(donation_amount := FVal('3000')),
+        location_label=optimism_accounts[0],
+        notes=f'Receive a giveth donation of {donation_amount} GIV from 0x6eb78c56F639b3d161456e9f893c8e8aD9d754F0',  # noqa: E501
+        counterparty=CPT_GIVETH,
+        address='0x6eb78c56F639b3d161456e9f893c8e8aD9d754F0',
+    )]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('arbitrum_one_accounts', [[ROTKI_ADDRESS]])
+def test_giveth_donation_arbitrum_receiver(arbitrum_one_inquirer, arbitrum_one_accounts):
+    tx_hash = deserialize_evm_tx_hash('0x2b741f8ecec20a8842cc37bc1b8ae358cfed091f017e9a40a0763f1b17bd9caf')  # noqa: E501
+    events, _ = get_decoded_events_of_transaction(evm_inquirer=arbitrum_one_inquirer, tx_hash=tx_hash)  # noqa: E501
+    assert events == [EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=0,
+        timestamp=TimestampMS(1777046452000),
+        location=Location.ARBITRUM_ONE,
+        event_type=HistoryEventType.RECEIVE,
+        event_subtype=HistoryEventSubType.DONATE,
+        asset=A_ETH,
+        amount=(donation_amount := FVal('0.00861')),
+        location_label=arbitrum_one_accounts[0],
+        notes=f'Receive a giveth donation of {donation_amount} ETH from 0xE38d978e500242E5E6DF46BE5dc1Bd47cb06555f',  # noqa: E501
+        counterparty=CPT_GIVETH,
+        address=ARBITRUM_GIVETH_DONATION_CONTRACT_ADDRESS,
+    )]
+
+
+@pytest.mark.vcr(filter_query_parameters=['apikey'])
+@pytest.mark.parametrize('ethereum_accounts', [['0x19d42933AD90F8d75df06AaB6D7D0B6965F11dF3']])
+def test_giveth_donation_eth_multi_sender(ethereum_inquirer, ethereum_accounts):
+    events, _ = get_decoded_events_of_transaction(
+        evm_inquirer=ethereum_inquirer,
+        tx_hash=(tx_hash := deserialize_evm_tx_hash('0xcc0296f12367f88162f99e50bdb1ddd5b524e0ad0e335956c7f880d9bec09155')),  # noqa: E501
+    )
+    assert events == [EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=0,
+        timestamp=(timestamp := TimestampMS(1778755763000)),
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.FEE,
+        asset=A_ETH,
+        amount=FVal('0.00023611906081848'),
+        location_label=(user_address := ethereum_accounts[0]),
+        counterparty=CPT_GAS,
+    ), EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=88,
+        timestamp=timestamp,
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.DONATE,
+        asset=A_ETH,
+        amount=(donation_1 := FVal('0.023')),
+        location_label=user_address,
+        notes=f'Make a giveth donation of {donation_1} ETH to 0xa377771b126D29eE09df2D16dCA7abc0Cf33C64d',  # noqa: E501
+        counterparty=CPT_GIVETH,
+        address=string_to_evm_address('0xa377771b126D29eE09df2D16dCA7abc0Cf33C64d'),
+    ), EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=89,
+        timestamp=timestamp,
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.DONATE,
+        asset=A_ETH,
+        amount=(donation_2 := FVal('0.015')),
+        location_label=user_address,
+        notes=f'Make a giveth donation of {donation_2} ETH to 0xe44a1051Eb97861FE9d18F69ed5CA38DB1eCA4Ec',  # noqa: E501
+        counterparty=CPT_GIVETH,
+        address=string_to_evm_address('0xe44a1051Eb97861FE9d18F69ed5CA38DB1eCA4Ec'),
+    ), EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=90,
+        timestamp=timestamp,
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.DONATE,
+        asset=A_ETH,
+        amount=(donation_3 := FVal('0.0023')),
+        location_label=user_address,
+        notes=f'Make a giveth donation of {donation_3} ETH to 0xA743b5aC96F06DA66CA3921AaD06f2a2e040fb02',  # noqa: E501
+        counterparty=CPT_GIVETH,
+        address=string_to_evm_address('0xA743b5aC96F06DA66CA3921AaD06f2a2e040fb02'),
+    ), EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=91,
+        timestamp=timestamp,
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.DONATE,
+        asset=A_ETH,
+        amount=(donation_4 := FVal('0.0023')),
+        location_label=user_address,
+        notes=f'Make a giveth donation of {donation_4} ETH to 0x848e313d4b25bC0B48CaFdB6A72391E892E6A247',  # noqa: E501
+        counterparty=CPT_GIVETH,
+        address=string_to_evm_address('0x848e313d4b25bC0B48CaFdB6A72391E892E6A247'),
+    ), EvmEvent(
+        tx_ref=tx_hash,
+        sequence_index=93,
+        timestamp=timestamp,
+        location=Location.ETHEREUM,
+        event_type=HistoryEventType.SPEND,
+        event_subtype=HistoryEventSubType.DONATE,
+        asset=A_ETH,
+        amount=(donation_5 := FVal('0.0023')),
+        location_label=user_address,
+        notes=f'Make a giveth donation of {donation_5} ETH to 0xcC2ca22AaefE22A0144A0260731a40a725AFffF0',  # noqa: E501
+        counterparty=CPT_GIVETH,
+        address=string_to_evm_address('0xcC2ca22AaefE22A0144A0260731a40a725AFffF0'),
+    )]

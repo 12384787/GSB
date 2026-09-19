@@ -1,0 +1,480 @@
+use serde::{Deserialize, Serialize};
+
+pub trait SerializableDBEnum {
+    fn serialize_for_db(self) -> String;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u32)]
+pub enum AssetType {
+    Fiat = 1,
+    OwnChain = 2,
+    EvmToken = 3,
+    OmniToken = 4,
+    NeoToken = 5,
+    CounterpartyToken = 6,
+    BitSharesToken = 7,
+    ArdorToken = 8,
+    NxtToken = 9,
+    UbiqToken = 10,
+    NuBitsToken = 11,
+    BurstToken = 12,
+    WavesToken = 13,
+    QtumToken = 14,
+    StellarToken = 15,
+    TronToken = 16,
+    OntologyToken = 17,
+    VechainToken = 18,
+    // Note: 19 (Binance) was removed as it is EVM token
+    EosToken = 20,
+    FusionToken = 21,
+    LuniverseToken = 22,
+    Other = 23, // OTHER and OWN chain are probably the same thing -- needs checking
+    SolanaToken = 25,
+    Nft = 26,
+    CustomAsset = 27,
+    HyperliquidToken = 28,
+}
+
+impl SerializableDBEnum for AssetType {
+    fn serialize_for_db(self) -> String {
+        ((self as u32 + 64) as u8 as char).to_string()
+    }
+}
+
+impl AssetType {
+    pub fn from_name(name: &str) -> Option<Self> {
+        [
+            AssetType::Fiat,
+            AssetType::OwnChain,
+            AssetType::EvmToken,
+            AssetType::OmniToken,
+            AssetType::NeoToken,
+            AssetType::CounterpartyToken,
+            AssetType::BitSharesToken,
+            AssetType::ArdorToken,
+            AssetType::NxtToken,
+            AssetType::UbiqToken,
+            AssetType::NuBitsToken,
+            AssetType::BurstToken,
+            AssetType::WavesToken,
+            AssetType::QtumToken,
+            AssetType::StellarToken,
+            AssetType::TronToken,
+            AssetType::OntologyToken,
+            AssetType::VechainToken,
+            AssetType::EosToken,
+            AssetType::FusionToken,
+            AssetType::LuniverseToken,
+            AssetType::Other,
+            AssetType::SolanaToken,
+            AssetType::Nft,
+            AssetType::CustomAsset,
+            AssetType::HyperliquidToken,
+        ]
+        .into_iter()
+        .find(|asset_type| AssetType::serialize(*asset_type) == name)
+    }
+
+    pub fn serialize_for_db(self) -> String {
+        ((self as u32 + 64) as u8 as char).to_string()
+    }
+
+    pub fn deserialize_from_db(value: &str) -> Result<Self, String> {
+        if value.len() != 1 {
+            return Err(format!(
+                "Failed to deserialize AssetType DB value from multi-character value: {value}"
+            ));
+        }
+
+        let number = match value.chars().next() {
+            Some(c) => c as u32,
+            None => {
+                return Err("Failed to deserialize AssetType DB value from empty string".to_string())
+            }
+        };
+
+        if number < 65 {
+            return Err(format!("Failed to deserialize AssetType DB value {value}"));
+        }
+
+        match number - 64 {
+            1 => Ok(AssetType::Fiat),
+            2 => Ok(AssetType::OwnChain),
+            3 => Ok(AssetType::EvmToken),
+            4 => Ok(AssetType::OmniToken),
+            5 => Ok(AssetType::NeoToken),
+            6 => Ok(AssetType::CounterpartyToken),
+            7 => Ok(AssetType::BitSharesToken),
+            8 => Ok(AssetType::ArdorToken),
+            9 => Ok(AssetType::NxtToken),
+            10 => Ok(AssetType::UbiqToken),
+            11 => Ok(AssetType::NuBitsToken),
+            12 => Ok(AssetType::BurstToken),
+            13 => Ok(AssetType::WavesToken),
+            14 => Ok(AssetType::QtumToken),
+            15 => Ok(AssetType::StellarToken),
+            16 => Ok(AssetType::TronToken),
+            17 => Ok(AssetType::OntologyToken),
+            18 => Ok(AssetType::VechainToken),
+            // 19 (Binance) was removed as it is EVM token
+            20 => Ok(AssetType::EosToken),
+            21 => Ok(AssetType::FusionToken),
+            22 => Ok(AssetType::LuniverseToken),
+            23 => Ok(AssetType::Other),
+            25 => Ok(AssetType::SolanaToken),
+            26 => Ok(AssetType::Nft),
+            27 => Ok(AssetType::CustomAsset),
+            28 => Ok(AssetType::HyperliquidToken),
+            _ => Err(format!("Failed to deserialize AssetType DB value {value}")),
+        }
+    }
+
+    pub fn serialize(self) -> String {
+        match self {
+            AssetType::Fiat => "fiat".to_string(),
+            AssetType::OwnChain => "own chain".to_string(),
+            AssetType::EvmToken => "evm token".to_string(),
+            AssetType::OmniToken => "omni token".to_string(),
+            AssetType::NeoToken => "neo token".to_string(),
+            AssetType::CounterpartyToken => "counterparty token".to_string(),
+            AssetType::BitSharesToken => "bitshares token".to_string(),
+            AssetType::ArdorToken => "ardor token".to_string(),
+            AssetType::NxtToken => "nxt token".to_string(),
+            AssetType::UbiqToken => "ubiq token".to_string(),
+            AssetType::NuBitsToken => "nubits token".to_string(),
+            AssetType::BurstToken => "burst token".to_string(),
+            AssetType::WavesToken => "waves token".to_string(),
+            AssetType::QtumToken => "qtum token".to_string(),
+            AssetType::StellarToken => "stellar token".to_string(),
+            AssetType::TronToken => "tron token".to_string(),
+            AssetType::OntologyToken => "ontology token".to_string(),
+            AssetType::VechainToken => "vechain token".to_string(),
+            AssetType::EosToken => "eos token".to_string(),
+            AssetType::FusionToken => "fusion token".to_string(),
+            AssetType::LuniverseToken => "luniverse token".to_string(),
+            AssetType::Other => "other".to_string(),
+            AssetType::SolanaToken => "solana token".to_string(),
+            AssetType::Nft => "nft".to_string(),
+            AssetType::CustomAsset => "custom asset".to_string(),
+            AssetType::HyperliquidToken => "hyperliquid token".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u32)]
+pub enum PriceOracle {
+    Manual = 1,
+    Coingecko = 2,
+    Cryptocompare = 3,
+    Xratescom = 4,
+    ManualCurrent = 5,
+    Defillama = 6,
+    UniswapV2 = 7,
+    UniswapV3 = 8,
+    Alchemy = 9,
+}
+
+impl SerializableDBEnum for PriceOracle {
+    fn serialize_for_db(self) -> String {
+        ((self as u32 + 64) as u8 as char).to_string()
+    }
+}
+
+impl PriceOracle {
+    pub fn serialize(self) -> String {
+        match self {
+            PriceOracle::Manual => "manual".to_string(),
+            PriceOracle::Coingecko => "coingecko".to_string(),
+            PriceOracle::Cryptocompare => "cryptocompare".to_string(),
+            PriceOracle::Xratescom => "fiat".to_string(),
+            PriceOracle::ManualCurrent => "manualcurrent".to_string(),
+            PriceOracle::Defillama => "defillama".to_string(),
+            PriceOracle::UniswapV2 => "uniswapv2".to_string(),
+            PriceOracle::UniswapV3 => "uniswapv3".to_string(),
+            PriceOracle::Alchemy => "alchemy".to_string(),
+        }
+    }
+
+    pub fn deserialize(value: &str) -> Result<Self, String> {
+        let normalized = value.trim().to_lowercase();
+        if normalized.len() == 1 {
+            return Self::deserialize_from_db(&normalized.to_uppercase());
+        }
+
+        match normalized.as_str() {
+            "manual" => Ok(PriceOracle::Manual),
+            "coingecko" => Ok(PriceOracle::Coingecko),
+            "cryptocompare" => Ok(PriceOracle::Cryptocompare),
+            "fiat" | "xratescom" => Ok(PriceOracle::Xratescom),
+            "manualcurrent" | "manual_current" => Ok(PriceOracle::ManualCurrent),
+            "defillama" => Ok(PriceOracle::Defillama),
+            "uniswap2" | "uniswapv2" => Ok(PriceOracle::UniswapV2),
+            "uniswap3" | "uniswapv3" => Ok(PriceOracle::UniswapV3),
+            "alchemy" => Ok(PriceOracle::Alchemy),
+            "blockchain" => {
+                Err("source_type blockchain is not stored in price_history".to_string())
+            }
+            _ => Err(format!("Invalid source_type value: {value}")),
+        }
+    }
+
+    pub fn deserialize_from_db(value: &str) -> Result<Self, String> {
+        if value.len() != 1 {
+            return Err(format!(
+                "Failed to deserialize PriceOracle DB value from multi-character value: {value}"
+            ));
+        }
+
+        let code = value.chars().next().ok_or_else(|| {
+            "Failed to deserialize PriceOracle DB value from empty string".to_string()
+        })? as u32;
+
+        if code < 65 {
+            return Err(format!(
+                "Failed to deserialize PriceOracle DB value {value}"
+            ));
+        }
+
+        match code - 64 {
+            1 => Ok(PriceOracle::Manual),
+            2 => Ok(PriceOracle::Coingecko),
+            3 => Ok(PriceOracle::Cryptocompare),
+            4 => Ok(PriceOracle::Xratescom),
+            5 => Ok(PriceOracle::ManualCurrent),
+            6 => Ok(PriceOracle::Defillama),
+            7 => Ok(PriceOracle::UniswapV2),
+            8 => Ok(PriceOracle::UniswapV3),
+            9 => Ok(PriceOracle::Alchemy),
+            _ => Err(format!(
+                "Failed to deserialize PriceOracle DB value {value}"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u32)]
+pub enum ChainID {
+    Ethereum = 1,
+    Optimism = 10,
+    BinanceSc = 56,
+    Gnosis = 100,
+    PolygonPos = 137,
+    Fantom = 250,
+    Base = 8453,
+    ArbitrumOne = 42161,
+    Avalanche = 43114,
+    Celo = 42220,
+    ArbitrumNova = 42170,
+    Cronos = 25,
+    Boba = 288,
+    Evmos = 9001,
+    PolygonZkevm = 1101,
+    ZksyncEra = 324,
+    Pulsechain = 369,
+    Scroll = 534352,
+    Sonic = 146,
+    Linea = 59144,
+    Monad = 143,
+    Hyperliquid = 999,
+    Ink = 57073,
+    Megaeth = 4326,
+    Robinhood = 4663,
+}
+
+impl ChainID {
+    pub fn deserialize_from_db(value: u32) -> Result<Self, String> {
+        match value {
+            1 => Ok(ChainID::Ethereum),
+            10 => Ok(ChainID::Optimism),
+            56 => Ok(ChainID::BinanceSc),
+            100 => Ok(ChainID::Gnosis),
+            137 => Ok(ChainID::PolygonPos),
+            250 => Ok(ChainID::Fantom),
+            8453 => Ok(ChainID::Base),
+            42161 => Ok(ChainID::ArbitrumOne),
+            43114 => Ok(ChainID::Avalanche),
+            42220 => Ok(ChainID::Celo),
+            42170 => Ok(ChainID::ArbitrumNova),
+            25 => Ok(ChainID::Cronos),
+            288 => Ok(ChainID::Boba),
+            9001 => Ok(ChainID::Evmos),
+            1101 => Ok(ChainID::PolygonZkevm),
+            324 => Ok(ChainID::ZksyncEra),
+            369 => Ok(ChainID::Pulsechain),
+            534352 => Ok(ChainID::Scroll),
+            146 => Ok(ChainID::Sonic),
+            59144 => Ok(ChainID::Linea),
+            143 => Ok(ChainID::Monad),
+            999 => Ok(ChainID::Hyperliquid),
+            57073 => Ok(ChainID::Ink),
+            4326 => Ok(ChainID::Megaeth),
+            4663 => Ok(ChainID::Robinhood),
+            _ => Err(format!("Unknown chain ID: {value}")),
+        }
+    }
+
+    /// Deserializes from the lowercase name used by the API, matching Python's
+    /// `ChainID.to_name()` / `ChainID.name.lower()` format.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "ethereum" => Some(ChainID::Ethereum),
+            "optimism" => Some(ChainID::Optimism),
+            "binance_sc" => Some(ChainID::BinanceSc),
+            "gnosis" => Some(ChainID::Gnosis),
+            "polygon_pos" => Some(ChainID::PolygonPos),
+            "fantom" => Some(ChainID::Fantom),
+            "base" => Some(ChainID::Base),
+            "arbitrum_one" => Some(ChainID::ArbitrumOne),
+            "avalanche" => Some(ChainID::Avalanche),
+            "celo" => Some(ChainID::Celo),
+            "arbitrum_nova" => Some(ChainID::ArbitrumNova),
+            "cronos" => Some(ChainID::Cronos),
+            "boba" => Some(ChainID::Boba),
+            "evmos" => Some(ChainID::Evmos),
+            "polygon_zkevm" => Some(ChainID::PolygonZkevm),
+            "zksync_era" => Some(ChainID::ZksyncEra),
+            "pulsechain" => Some(ChainID::Pulsechain),
+            "scroll" => Some(ChainID::Scroll),
+            "sonic" => Some(ChainID::Sonic),
+            "linea" => Some(ChainID::Linea),
+            "monad" => Some(ChainID::Monad),
+            "hyperliquid" => Some(ChainID::Hyperliquid),
+            "ink" => Some(ChainID::Ink),
+            "megaeth" => Some(ChainID::Megaeth),
+            "robinhood" => Some(ChainID::Robinhood),
+            _ => None,
+        }
+    }
+
+    pub fn to_name(self) -> String {
+        match self {
+            ChainID::Ethereum => "ethereum".to_string(),
+            ChainID::Optimism => "optimism".to_string(),
+            ChainID::BinanceSc => "binance_sc".to_string(),
+            ChainID::Gnosis => "gnosis".to_string(),
+            ChainID::PolygonPos => "polygon_pos".to_string(),
+            ChainID::Fantom => "fantom".to_string(),
+            ChainID::Base => "base".to_string(),
+            ChainID::ArbitrumOne => "arbitrum_one".to_string(),
+            ChainID::Avalanche => "avalanche".to_string(),
+            ChainID::Celo => "celo".to_string(),
+            ChainID::ArbitrumNova => "arbitrum_nova".to_string(),
+            ChainID::Cronos => "cronos".to_string(),
+            ChainID::Boba => "boba".to_string(),
+            ChainID::Evmos => "evmos".to_string(),
+            ChainID::PolygonZkevm => "polygon_zkevm".to_string(),
+            ChainID::ZksyncEra => "zksync_era".to_string(),
+            ChainID::Pulsechain => "pulsechain".to_string(),
+            ChainID::Scroll => "scroll".to_string(),
+            ChainID::Sonic => "sonic".to_string(),
+            ChainID::Linea => "linea".to_string(),
+            ChainID::Monad => "monad".to_string(),
+            ChainID::Hyperliquid => "hyperliquid".to_string(),
+            ChainID::Ink => "ink".to_string(),
+            ChainID::Megaeth => "megaeth".to_string(),
+            ChainID::Robinhood => "robinhood".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_asset_type_deserialization() {
+        assert_eq!(
+            AssetType::deserialize_from_db("A").unwrap(),
+            AssetType::Fiat
+        ); // 'A' = 65, 65-64 = 1
+        assert_eq!(
+            AssetType::deserialize_from_db("B").unwrap(),
+            AssetType::OwnChain
+        ); // 'B' = 66, 66-64 = 2
+        assert_eq!(
+            AssetType::deserialize_from_db("C").unwrap(),
+            AssetType::EvmToken
+        ); // 'C' = 67, 67-64 = 3
+        assert_eq!(
+            AssetType::deserialize_from_db("\\").unwrap(),
+            AssetType::HyperliquidToken
+        );
+        assert!(AssetType::deserialize_from_db("abc").is_err()); // Multi-character
+        assert!(AssetType::deserialize_from_db("@").is_err()); // ASCII 64, too low
+    }
+
+    #[test]
+    fn test_asset_type_from_name() {
+        assert_eq!(AssetType::from_name("fiat"), Some(AssetType::Fiat));
+        assert_eq!(AssetType::from_name("evm token"), Some(AssetType::EvmToken));
+        assert_eq!(
+            AssetType::from_name("hyperliquid token"),
+            Some(AssetType::HyperliquidToken)
+        );
+        assert_eq!(AssetType::from_name("non-existent"), None);
+    }
+
+    #[test]
+    fn test_asset_type_serialize_for_db() {
+        assert_eq!(AssetType::Fiat.serialize_for_db(), "A");
+        assert_eq!(AssetType::OwnChain.serialize_for_db(), "B");
+        assert_eq!(AssetType::EvmToken.serialize_for_db(), "C");
+        assert_eq!(AssetType::HyperliquidToken.serialize_for_db(), "\\");
+    }
+
+    #[test]
+    fn test_chain_id_deserialization() {
+        assert_eq!(ChainID::deserialize_from_db(1).unwrap(), ChainID::Ethereum);
+        assert_eq!(ChainID::deserialize_from_db(10).unwrap(), ChainID::Optimism);
+        assert_eq!(
+            ChainID::deserialize_from_db(42161).unwrap(),
+            ChainID::ArbitrumOne
+        );
+        assert!(ChainID::deserialize_from_db(999999).is_err());
+    }
+
+    #[test]
+    fn test_chain_id_to_name() {
+        assert_eq!(ChainID::Ethereum.to_name(), "ethereum");
+        assert_eq!(ChainID::Optimism.to_name(), "optimism");
+        assert_eq!(ChainID::ArbitrumOne.to_name(), "arbitrum_one");
+        assert_eq!(ChainID::PolygonPos.to_name(), "polygon_pos");
+    }
+
+    #[test]
+    fn test_price_oracle_serializable_db_enum() {
+        assert_eq!(PriceOracle::Manual.serialize_for_db(), "A");
+        assert_eq!(PriceOracle::Coingecko.serialize_for_db(), "B");
+        assert_eq!(PriceOracle::Xratescom.serialize_for_db(), "D");
+        assert_eq!(PriceOracle::Defillama.serialize_for_db(), "F");
+        assert_eq!(PriceOracle::Xratescom.serialize(), "fiat");
+    }
+
+    #[test]
+    fn test_price_oracle_deserialize_from_frontend_value() {
+        assert_eq!(
+            PriceOracle::deserialize("defillama").unwrap(),
+            PriceOracle::Defillama
+        );
+        assert_eq!(
+            PriceOracle::deserialize("xratescom").unwrap(),
+            PriceOracle::Xratescom
+        );
+        assert_eq!(
+            PriceOracle::deserialize("fiat").unwrap(),
+            PriceOracle::Xratescom
+        );
+        assert_eq!(
+            PriceOracle::deserialize("F").unwrap(),
+            PriceOracle::Defillama
+        );
+        assert_eq!(
+            PriceOracle::deserialize("manualcurrent").unwrap(),
+            PriceOracle::ManualCurrent
+        );
+        assert!(PriceOracle::deserialize("blockchain").is_err());
+    }
+}

@@ -1,0 +1,46 @@
+<script setup lang="ts">
+import type { ButtonProps } from '@rotki/ui-library';
+
+defineOptions({
+  inheritAttrs: false,
+});
+
+const { tooltip, retainFocusOnClick = false, className = '', href, variant = 'text', size, customColor = false } = defineProps<{
+  tooltip: string;
+  retainFocusOnClick?: boolean;
+  className?: string;
+  href?: string;
+  variant?: ButtonProps['variant'];
+  size?: ButtonProps['size'];
+  customColor?: boolean;
+}>();
+
+defineSlots<{
+  default: () => any;
+}>();
+</script>
+
+<template>
+  <RuiTooltip
+    :options="{ placement: 'bottom' }"
+    :open-delay="250"
+    :close-delay="0"
+  >
+    <template #activator>
+      <RuiButton
+        :variant="variant"
+        icon
+        :href="href"
+        :tag="href ? 'a' : 'button'"
+        target="_blank"
+        :class="[className, !size && '!w-12 !h-12', !customColor && '!text-rui-text-secondary']"
+        :size="size"
+        :retain-focus-on-click="retainFocusOnClick"
+        v-bind="$attrs"
+      >
+        <slot />
+      </RuiButton>
+    </template>
+    {{ tooltip }}
+  </RuiTooltip>
+</template>

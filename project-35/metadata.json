@@ -1,0 +1,10 @@
+{
+  "number": 35,
+  "repository": "readest/readest",
+  "url": "https://github.com/readest/readest",
+  "description": "Readest is a modern, feature-rich ebook reader designed for avid readers offering seamless cross-platform access, powerful tools, and an intuitive interface to elevate your reading experience.",
+  "language": "TypeScript",
+  "stars": 24431,
+  "default_branch": "main",
+  "source_zip_url": "https://github.com/readest/readest/archive/refs/heads/main.zip"
+}

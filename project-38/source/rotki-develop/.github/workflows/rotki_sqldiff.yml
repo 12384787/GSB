@@ -1,0 +1,43 @@
+name: SQLDiff
+
+on:
+  pull_request_target:
+    branches:
+      - develop
+      - bugfixes
+      - master
+    types: [ synchronize, opened ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions: { }
+
+jobs:
+  sql-diff:
+    name: SQLDiff
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install required
+        timeout-minutes: 10
+        run: sudo apt-get update && sudo apt-get install -y sqlcipher sqlite3-tools
+
+      - name: SQLDiff action
+        id: sql-diff
+        uses: rotki/action-sqldiff@a4616187138a18b2c6787f30b3f24cd52d5b8193  # v3.0.1
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: '*.db'

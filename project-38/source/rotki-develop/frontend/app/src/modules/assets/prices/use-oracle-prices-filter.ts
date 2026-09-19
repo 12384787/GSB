@@ -1,0 +1,14 @@
+import type { MatchedKeyword } from '@/modules/core/table/filtering';
+
+/** The wire keys the oracle prices table filters on, which the URL carries too. */
+export const OraclePriceFilterKeys = {
+  END: 'toTimestamp',
+  FROM_ASSET: 'fromAsset',
+  SOURCE: 'sourceType',
+  START: 'fromTimestamp',
+  TO_ASSET: 'toAsset',
+} as const;
+
+type OraclePriceFilterKey = typeof OraclePriceFilterKeys[keyof typeof OraclePriceFilterKeys];
+
+export type Filters = MatchedKeyword<OraclePriceFilterKey>;
