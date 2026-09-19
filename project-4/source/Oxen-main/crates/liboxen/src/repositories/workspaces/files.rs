@@ -1,0 +1,295 @@
+use crate::core;
+use crate::error::OxenError;
+use crate::model::Workspace;
+
+use std::path::PathBuf;
+
+pub use crate::core::v_latest::workspaces::files::exists;
+
+pub use crate::core::v_latest::workspaces::files::add;
+
+pub use crate::core::v_latest::workspaces::files::rm;
+
+pub use crate::core::v_latest::workspaces::files::unstage;
+
+pub async fn import(
+    url: &str,
+    auth: &str,
+    directory: PathBuf,
+    filename: Option<String>,
+    workspace: &Workspace,
+    allow_loopback: bool,
+) -> Result<(), OxenError> {
+    core::v_latest::workspaces::files::import(
+        url,
+        auth,
+        directory,
+        filename,
+        workspace,
+        allow_loopback,
+    )
+    .await?;
+    Ok(())
+}
+
+pub use crate::core::v_latest::workspaces::files::upload_zip;
+
+pub use crate::core::v_latest::workspaces::files::mv;
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use crate::config::UserConfig;
+    use crate::error::OxenError;
+    use crate::model::NewCommitBody;
+    use crate::repositories::size;
+    use crate::repositories::{self, workspaces};
+    use crate::test;
+    use crate::util::fs;
+
+    #[tokio::test]
+    async fn test_mv_file_in_workspace() -> Result<(), OxenError> {
+        // Skip workspace ops on windows
+        if std::env::consts::OS == "windows" {
+            return Ok(());
+        }
+
+        test::run_bounding_box_csv_repo_test_fully_committed_async(|repo| async move {
+            let branch_name = "test-mv";
+            let branch = repositories::branches::create_checkout(&repo, branch_name)?;
+            let commit = repositories::commits::get_by_id(&repo, &branch.commit_id)?.unwrap();
+            let workspace_id = UserConfig::identifier()?;
+            let workspace = repositories::workspaces::create(&repo, &commit, workspace_id, true)?;
+
+            // Original file path that exists in the repo
+            let original_path = Path::new("annotations")
+                .join("train")
+                .join("bounding_box.csv");
+            let new_path = Path::new("renamed").join("data").join("bbox_renamed.csv");
+
+            // Move the file
+            workspaces::files::mv(&workspace, &original_path, &new_path)?;
+
+            // Check status - should show the original as removed and new as added
+            let status = workspaces::status::status(&workspace)?;
+            println!("Status after mv: {status:?}");
+
+            // The original path should be staged as removed in staged_files
+            let removed_entry = status.staged_files.get(&original_path);
+            assert!(
+                removed_entry.is_some(),
+                "Original path should be in staged_files"
+            );
+            assert_eq!(
+                removed_entry.unwrap().status,
+                crate::model::StagedEntryStatus::Removed,
+                "Original path should have Removed status"
+            );
+
+            // The new path should be in staged_files with Added status
+            let added_entry = status.staged_files.get(&new_path);
+            assert!(added_entry.is_some(), "New path should be staged");
+            assert_eq!(
+                added_entry.unwrap().status,
+                crate::model::StagedEntryStatus::Added,
+                "New path should have Added status"
+            );
+
+            // The move should be detected
+            assert!(
+                !status.moved_files.is_empty(),
+                "Move should be detected in moved_files"
+            );
+
+            assert!(
+                !size::repo_size_path(&repo).exists(),
+                "committing locally records no size, so there is none to start from"
+            );
+            let legacy_size = fs::oxen_hidden_dir(&repo.path).join("repo_size.toml");
+            fs::write_to_path(&legacy_size, r#"{"status":"done","size":1}"#)?;
+
+            // Commit the workspace and verify the file is at the new location
+            let user = UserConfig::get()?.to_user();
+            let new_commit = NewCommitBody {
+                author: user.name.clone(),
+                email: user.email.clone(),
+                message: "Moved file to new location".to_string(),
+            };
+            let commit =
+                workspaces::commit(&workspace, &new_commit, branch_name.to_string()).await?;
+
+            // Verify the file exists at the new path in the commit
+            let new_file = repositories::tree::get_file_by_path(&repo, &commit, &new_path)?;
+            assert!(
+                new_file.is_some(),
+                "File should exist at new path after commit"
+            );
+
+            // Verify the file no longer exists at the original path
+            let old_file = repositories::tree::get_file_by_path(&repo, &commit, &original_path)?;
+            assert!(
+                old_file.is_none(),
+                "File should not exist at original path after commit"
+            );
+
+            assert!(
+                size::repo_size_path(&repo).exists(),
+                "committing a workspace must leave a recorded size behind"
+            );
+            assert_eq!(
+                size::wait_for_recorded_size(&repo)?,
+                repo.version_bytes()?,
+                "the figure recorded is the bytes the tree references"
+            );
+            assert!(
+                !legacy_size.exists(),
+                "recording a size drops what an older format left under a .toml name"
+            );
+
+            Ok(())
+        })
+        .await
+    }
+
+    /// Workspace created with no files staged; exists() should return Ok(false).
+    #[tokio::test]
+    async fn test_exists_returns_false_when_no_files_staged() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            let file = repo.path.join("hello.txt");
+            crate::util::fs::write_to_path(&file, "hello")?;
+            repositories::add(&repo, &file).await?;
+            let commit = repositories::commit(&repo, "Add hello.txt")?;
+
+            let workspace =
+                repositories::workspaces::create(&repo, &commit, "test-workspace", false)?;
+
+            let result = workspaces::files::exists(&workspace, std::path::Path::new("hello.txt"))?;
+            assert!(!result);
+
+            Ok(())
+        })
+        .await
+    }
+
+    /// exists() returns Ok(false) for an unstaged path and Ok(true) after staging it.
+    #[tokio::test]
+    async fn test_exists_false_before_staging_true_after() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            let file = repo.path.join("hello.txt");
+            crate::util::fs::write_to_path(&file, "hello")?;
+            repositories::add(&repo, &file).await?;
+            let commit = repositories::commit(&repo, "Add hello.txt")?;
+
+            let workspace =
+                repositories::workspaces::create(&repo, &commit, "test-workspace", false)?;
+
+            // Write modified content so the file is detected as changed
+            let workspace_file = workspace.workspace_repo.path.join("hello.txt");
+            crate::util::fs::write_to_path(&workspace_file, "hello world")?;
+
+            let hello = Path::new("hello.txt");
+            let nonexistent = Path::new("does_not_exist.txt");
+
+            // Before staging: both should be false
+            assert!(!workspaces::files::exists(&workspace, hello)?);
+            assert!(!workspaces::files::exists(&workspace, nonexistent)?);
+
+            // Stage the file in the workspace
+            workspaces::files::add(&workspace, &workspace_file).await?;
+
+            // After staging: staged file is true, non-existent file is still false
+            assert!(workspaces::files::exists(&workspace, hello)?);
+            assert!(!workspaces::files::exists(&workspace, nonexistent)?);
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_import_rejects_private_ip() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            let file = repo.path.join("hello.txt");
+            crate::util::fs::write_to_path(&file, "hello")?;
+            repositories::add(&repo, &file).await?;
+            let commit = repositories::commit(&repo, "Add hello.txt")?;
+
+            let workspace = repositories::workspaces::create_temporary(&repo, &commit).await?;
+
+            let cases = [
+                ("http://127.0.0.1/secret", "loopback address"),
+                ("http://10.0.0.1/internal", "private address"),
+                (
+                    "http://169.254.169.254/latest/meta-data/",
+                    "link-local/metadata address",
+                ),
+                ("http://[::1]/secret", "IPv6 loopback"),
+                ("file:///etc/passwd", "non-HTTP scheme"),
+            ];
+
+            for (url, label) in cases {
+                // allow_loopback is false, so loopback targets are rejected like other private IPs.
+                let result = workspaces::files::import(
+                    url,
+                    "",
+                    std::path::PathBuf::from("data"),
+                    None,
+                    &workspace,
+                    false,
+                )
+                .await;
+                assert!(result.is_err(), "should reject {label}");
+            }
+
+            Ok(())
+        })
+        .await
+    }
+
+    // A chained rename: the second move's source is staged but absent from the base commit, so it
+    // is unstaged outright rather than staged for removal, and only the original committed path
+    // carries the `Removed` marker.
+    #[tokio::test]
+    async fn test_mv_twice_leaves_one_removed_marker() -> Result<(), OxenError> {
+        // Skip workspace ops on windows
+        if std::env::consts::OS == "windows" {
+            return Ok(());
+        }
+
+        test::run_empty_local_repo_test_async(|repo| async move {
+            let committed = repo.path.join("first.txt");
+            crate::util::fs::write_to_path(&committed, "hello")?;
+            repositories::add(&repo, &committed).await?;
+            let commit = repositories::commit(&repo, "Add first.txt")?;
+
+            let workspace = repositories::workspaces::create(&repo, &commit, "mv-twice", true)?;
+
+            let first = Path::new("first.txt");
+            let second = Path::new("second.txt");
+            let third = Path::new("third.txt");
+            workspaces::files::mv(&workspace, first, second)?;
+            workspaces::files::mv(&workspace, second, third)?;
+
+            let status = workspaces::status::status(&workspace)?;
+            assert_eq!(
+                status.staged_files.get(first).map(|entry| &entry.status),
+                Some(&crate::model::StagedEntryStatus::Removed),
+                "the committed source keeps its Removed marker across both moves"
+            );
+            assert_eq!(
+                status.staged_files.get(third).map(|entry| &entry.status),
+                Some(&crate::model::StagedEntryStatus::Added),
+                "the final destination is staged as Added"
+            );
+            assert!(
+                !status.staged_files.contains_key(second),
+                "the intermediate path was never committed, so it is unstaged rather than \
+                 staged for removal"
+            );
+
+            Ok(())
+        })
+        .await
+    }
+}

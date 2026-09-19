@@ -1,0 +1,45 @@
+[package]
+name = "oxen-py"
+version = { workspace = true }
+edition = { workspace = true }
+license = "Apache 2.0"  # Ideally, we'd use workspace = true, but oxen-python needs this file to be at its root.
+                        # We can restore this once oxen-python's contents have been moved to the repository root.
+homepage = { workspace = true }
+repository = { workspace = true }
+readme = { workspace = true }
+publish = false
+
+[lib]
+name = "oxen_py" # The native extension module. Users still `import oxen` via the Python package wrapper.
+crate-type = ["cdylib"] # PyO3 needs this crate to be a cdylib so it can link against it.
+# We don't add Rust tests here. This is a thin binding layer, so a Rust test would be testing PyO3's
+# interface more than our own logic. We test our logic through the Python suite.
+test = false
+
+[features]
+default = []
+metrics = ["liboxen/metrics"]
+otel = ["liboxen/otel"]
+production = ["metrics", "otel", "default"]
+
+[dependencies]
+liboxen = { workspace = true }
+log = { workspace = true }
+pyo3 = { workspace = true }
+pyo3-async-runtimes = { workspace = true }
+pyo3-polars = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[build-dependencies]
+bindgen = { version = "0.72.1", default-features = false, features = ["runtime"] }
+cc = { version = "1.0", features = ["parallel"] }
+glob = { workspace = true }
+pkg-config = { version = "0.3", optional = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,2447 @@
+//! Abstraction over DuckDB database to write and read dataframes from disk.
+//!
+//! # One instance per database file
+//!
+//! Opening a DuckDB file this process already has open yields a second, independent database
+//! rather than joining the first: DuckDB's single-writer protection is a file lock, and a file lock
+//! only excludes other processes. Two instances diverge, and whichever folds its state into the
+//! file last is the one that survives, so the other's writes are gone while both callers were told
+//! they succeeded. That is true of any write, a lone `INSERT` included, so making a write atomic in
+//! SQL does not remove the need for the rule below.
+//!
+//! The connection cache is what enforces it. Every access to a database file goes through
+//! [`with_df_db_manager`], whose cache entry is this process's one connection to that file behind a
+//! mutex, so callers that share the entry share the instance and take turns on it. For that to
+//! hold, an entry must never leave the cache while a caller holds it: the cache closes idle
+//! connections under LRU pressure but skips entries in use, running over its nominal size by the
+//! number of operations in flight instead. Filesystem work on a database's files goes through
+//! [`with_db_closed`], which closes the connection and holds the entry so nobody reopens the file
+//! underneath the work.
+//!
+//! The mutex on the connection is therefore also the lock on the data frame. An operation that must
+//! be atomic against other operations on the same data frame (a check followed by a rebuild, a read
+//! followed by a write back) runs inside one `with_conn` closure. The closure is synchronous, so the
+//! lock cannot be held across an `.await`, and it is not reentrant.
+//!
+//! shortcut: in-process only, so this serializes access within one oxen-server process. If the
+//! server is ever run as more than one process per repository, this needs a lock the processes
+//! share, such as a lock file next to the database.
+//!
+
+use crate::constants::{
+    DEFAULT_PAGE_SIZE, DUCKDB_DF_TABLE_NAME, INDEX_META_TABLE, OXEN_COLS, OXEN_ID_COL,
+    OXEN_ROW_ID_COL, OXEN_ROW_ID_SEQ, TABLE_NAME,
+};
+
+use crate::core::db::data_frames::{DataFrameError, rows};
+use crate::core::df::tabular;
+use crate::core::v_latest::workspaces::data_frames::{
+    is_valid_export_extension, wrap_sql_for_export,
+};
+use crate::error::OxenError;
+
+use crate::model::data_frame::schema::Field;
+use crate::model::data_frame::schema::Schema;
+use crate::opts::DFOpts;
+use crate::{model, util};
+use duckdb::arrow::record_batch::RecordBatch;
+use duckdb::{ToSql, params};
+use lru::LruCache;
+use parking_lot::{Mutex, RwLock};
+use polars::prelude::*;
+use sqlparser::ast::{self, Expr as SqlExpr, SelectItem, Statement, Value as SqlValue};
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
+
+use sql_query_builder as sql;
+
+/// Number of idle connections the cache keeps open. Entries in use do not count against it.
+pub(crate) const DF_DB_CACHE_SIZE: usize = 100;
+
+/// Total DuckDB threads per connection, including the caller: `external_threads`
+/// defaults to 1, so each connection runs `DUCKDB_THREADS - 1` workers.
+///
+/// Unset, DuckDB sizes every pool to the host's core count, so the thread count
+/// scales with the host times `DF_DB_CACHE_SIZE`. Scans below DuckDB's
+/// 122,880-row row group are single-threaded regardless, so the surplus parks.
+const DUCKDB_THREADS: i64 = 5;
+
+/// Memory ceiling per DuckDB connection. Unset, DuckDB allows each instance 80%
+/// of available memory, independently of every other cached connection.
+///
+/// A ceiling, not a reservation: these databases are file-backed, so a query over
+/// it spills to `<db path>.tmp` rather than failing. Byte sizes only, no percentages.
+const DUCKDB_MAX_MEMORY: &str = "512MiB";
+
+/// A cached DuckDB connection slot; `None` when no connection is currently open.
+type CachedConn = Arc<Mutex<Option<duckdb::Connection>>>;
+
+// Process-wide connection cache, one entry per database file. Unbounded at the `LruCache` level
+// because `evict_idle` enforces the size: the cache itself would evict whatever is least recently
+// used, including an entry a caller still holds.
+static DF_DB_INSTANCES: LazyLock<RwLock<LruCache<PathBuf, CachedConn>>> =
+    LazyLock::new(|| RwLock::new(LruCache::unbounded()));
+
+/// Close idle connections, least recently used first, until the cache is within
+/// `DF_DB_CACHE_SIZE`. An entry a caller holds is never removed: it is this process's one
+/// connection to that file, and removing it would let the next caller open a second one. The cache
+/// runs over its size by the number of operations in flight instead.
+///
+/// Runs under the cache's write lock, which is what makes the idle test sound: every clone of an
+/// entry is taken under the read or write lock, so a count of one (the cache's own) cannot grow
+/// before the pop.
+fn evict_idle(cache: &mut LruCache<PathBuf, CachedConn>) {
+    while cache.len() > DF_DB_CACHE_SIZE {
+        // `iter` runs from most to least recently used.
+        let victim = cache
+            .iter()
+            .rev()
+            .find(|(_, slot)| Arc::strong_count(slot) == 1)
+            .map(|(path, _)| path.clone());
+        let Some(victim) = victim else {
+            break;
+        };
+        // The last reference: dropping it closes the connection, which checkpoints its WAL.
+        cache.pop(&victim);
+    }
+}
+
+/// Run `work` with the database at `db_path` closed and held: any open connection is checkpointed
+/// and closed first, and no caller can open one until `work` returns. For filesystem operations on
+/// the database's files, such as copying or removing them. Opens nothing itself, so a `db_path`
+/// with no database on disk stays that way.
+///
+/// Not reentrant: `work` must not access `db_path` through this module.
+pub(crate) fn with_db_closed<T>(db_path: &Path, work: impl FnOnce() -> T) -> T {
+    let entry = {
+        let mut cache = DF_DB_INSTANCES.write();
+        let entry = cache
+            .get_or_insert(db_path.to_path_buf(), || Arc::new(Mutex::new(None)))
+            .clone();
+        evict_idle(&mut cache);
+        entry
+    };
+    let mut slot = entry.lock();
+    if let Some(conn) = slot.take() {
+        // Fold the WAL into the database file so the files on disk are the whole database.
+        // Dropping the connection checkpoints too, so a failure here only costs a warning.
+        if let Err(e) = conn.execute_batch("CHECKPOINT") {
+            log::warn!("with_db_closed: CHECKPOINT before close failed for {db_path:?}: {e}");
+        }
+    }
+    work()
+}
+
+/// Removes every cache entry under `db_path_prefix`, whether or not a caller holds it. For tearing
+/// down a directory tree that is being deleted (a workspace, a repository, a test's data), where an
+/// operation still in flight on it is the caller's race rather than the cache's.
+pub fn remove_df_db_from_cache_with_children(
+    db_path_prefix: impl AsRef<Path>,
+) -> Result<(), OxenError> {
+    let db_path_prefix = db_path_prefix.as_ref();
+
+    let mut dbs_to_remove: Vec<PathBuf> = vec![];
+    let mut instances = DF_DB_INSTANCES.write();
+    for (key, _) in instances.iter() {
+        if key.starts_with(db_path_prefix) {
+            dbs_to_remove.push(key.clone());
+        }
+    }
+
+    for db in dbs_to_remove {
+        let _ = instances.pop(&db); // drop immediately
+    }
+
+    Ok(())
+}
+
+/// Drain the connection cache, running CHECKPOINT on each connection before
+/// dropping it. Intended to be called once during graceful shutdown.
+///
+/// The cache is held in a `static LazyLock`. Rust does not drop statics at
+/// process exit, so without this call the cached connections never run their
+/// drop-time `close()` and DuckDB's default end-of-session CHECKPOINT never
+/// fires — uncheckpointed work stays in WAL files until the next open, where
+/// it must go through the WAL-recovery path in [`get_connection`].
+///
+/// Skips (with a warning) any connection whose mutex is currently held. The
+/// caller is expected to have stopped its own use of the cache before
+/// calling — anything still locked is a safety-net case, not the norm.
+pub fn flush_all_df_db_connections() {
+    let entries: Vec<(PathBuf, CachedConn)> = {
+        let mut instances = DF_DB_INSTANCES.write();
+        std::iter::from_fn(|| instances.pop_lru()).collect()
+    };
+
+    let total = entries.len();
+    if total == 0 {
+        log::info!("flush_all_df_db_connections: cache empty, nothing to flush");
+        return;
+    }
+    log::info!("flush_all_df_db_connections: flushing {total} cached DuckDB connection(s)");
+
+    let mut checkpointed = 0usize;
+    let mut failed = 0usize;
+    let mut skipped = 0usize;
+    for (path, conn_lock) in entries {
+        match conn_lock.try_lock() {
+            // An empty slot has no open connection to checkpoint (a hardened query
+            // closed it and left it for lazy reopen).
+            Some(guard) => {
+                if let Some(conn) = guard.as_ref() {
+                    match conn.execute_batch("CHECKPOINT") {
+                        Ok(()) => checkpointed += 1,
+                        Err(e) => {
+                            failed += 1;
+                            log::warn!(
+                                "flush_all_df_db_connections: CHECKPOINT failed for {path:?}: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+            None => {
+                skipped += 1;
+                log::warn!(
+                    "flush_all_df_db_connections: connection for {path:?} still in use — skipping CHECKPOINT"
+                );
+            }
+        }
+        // Connection drops here once the guard is released, releasing the
+        // file lock so subsequent processes can open the db cleanly.
+    }
+    log::info!(
+        "flush_all_df_db_connections: checkpointed={checkpointed} failed={failed} skipped={skipped}"
+    );
+}
+
+#[derive(Clone)]
+pub struct DfDBManager {
+    db_path: PathBuf,
+    df_db: CachedConn,
+}
+
+pub fn with_df_db_manager<F, T>(db_path: &Path, operation: F) -> Result<T, DataFrameError>
+where
+    F: FnOnce(&DfDBManager) -> Result<T, DataFrameError>,
+{
+    let db_path = db_path.to_path_buf();
+
+    let df_db = {
+        // 1. If df db exists in cache, return the existing connection
+        // Fast path: try to get a cloned handle under a short-lived read lock.
+        if let Some(db_lock) = {
+            let cache_r = DF_DB_INSTANCES.read();
+            cache_r.peek(&db_path).cloned()
+        } {
+            // Read lock has been dropped before executing user code.
+            return operation(&DfDBManager {
+                db_path: db_path.clone(),
+                df_db: db_lock,
+            });
+        }
+
+        // 2. If not exists, create the directory and open the db
+        let mut cache_w = DF_DB_INSTANCES.write();
+        if let Some(db_lock) = cache_w.get(&db_path) {
+            db_lock.clone()
+        } else {
+            // Cache miss: create directory and open DB
+            if let Some(parent) = db_path.parent()
+                && !parent.exists()
+            {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    log::error!("Failed to create df db directory: {e}");
+                    DataFrameError::FailCreateDfDbDir(e)
+                })?;
+            }
+
+            let conn = get_connection(&db_path).map_err(|e| {
+                log::error!("Failed to open df db: {e}");
+                DataFrameError::FailOpenDfDb(Box::new(e))
+            })?;
+
+            // Wrap the connection in a Mutex and store it in the cache
+            let db_lock = Arc::new(Mutex::new(Some(conn)));
+            cache_w.put(db_path.clone(), db_lock.clone());
+            // The new entry is held by `db_lock`, so it is never the one closed here.
+            evict_idle(&mut cache_w);
+            db_lock
+        }
+    };
+
+    let manager = DfDBManager { db_path, df_db };
+
+    // Execute the operation with our DfDBManager instance
+    operation(&manager)
+}
+
+impl DfDBManager {
+    /// Execute an operation with the database connection, opening it if it is not
+    /// currently open.
+    pub fn with_conn<F, T>(&self, operation: F) -> Result<T, DataFrameError>
+    where
+        F: FnOnce(&duckdb::Connection) -> Result<T, DataFrameError>,
+    {
+        let mut slot = self.df_db.lock();
+        if let Some(conn) = slot.as_ref() {
+            return operation(conn);
+        }
+        let conn =
+            get_connection(&self.db_path).map_err(|e| DataFrameError::FailOpenDfDb(Box::new(e)))?;
+        let result = operation(&conn);
+        *slot = Some(conn);
+        result
+    }
+
+    /// Execute an operation with mutable access to the database connection, opening
+    /// it if it is not currently open.
+    pub fn with_conn_mut<F, T>(&self, operation: F) -> Result<T, DataFrameError>
+    where
+        F: FnOnce(&mut duckdb::Connection) -> Result<T, DataFrameError>,
+    {
+        let mut slot = self.df_db.lock();
+        if let Some(conn) = slot.as_mut() {
+            return operation(conn);
+        }
+        let mut conn =
+            get_connection(&self.db_path).map_err(|e| DataFrameError::FailOpenDfDb(Box::new(e)))?;
+        let result = operation(&mut conn);
+        *slot = Some(conn);
+        result
+    }
+}
+
+/// Open a read-write DuckDB connection at `path` with external file access enabled.
+// The one sanctioned read-write `open_with_flags` call; disallowed elsewhere (see
+// clippy.toml).
+#[allow(clippy::disallowed_methods)]
+fn open_duckdb_connection(path: &Path) -> Result<duckdb::Connection, duckdb::Error> {
+    let config = duckdb::Config::default()
+        .threads(DUCKDB_THREADS)?
+        .max_memory(DUCKDB_MAX_MEMORY)?;
+    duckdb::Connection::open_with_flags(path, config)
+}
+
+/// Open a hardened, read-only DuckDB connection at `path`: external file access
+/// off, extension autoload/install off, configuration locked. Caller-supplied query
+/// text run on it can read the indexed tables but cannot read or write host files,
+/// attach other databases, or load extensions.
+// The one sanctioned `open_with_flags` call; disallowed elsewhere (see clippy.toml).
+#[allow(clippy::disallowed_methods)]
+fn open_hardened_query_connection(path: &Path) -> Result<duckdb::Connection, duckdb::Error> {
+    let config = duckdb::Config::default()
+        .threads(DUCKDB_THREADS)?
+        .max_memory(DUCKDB_MAX_MEMORY)?
+        .access_mode(duckdb::AccessMode::ReadOnly)?
+        .enable_external_access(false)?
+        .enable_autoload_extension(false)?
+        .with("lock_configuration", "true")?;
+    duckdb::Connection::open_with_flags(path, config)
+}
+
+/// Run `operation` against a hardened, read-only connection to the DuckDB file at
+/// `db_path` — for executing caller-supplied query text. Acquires the db's
+/// connection lock internally, so it must not be called while that lock is already
+/// held (it is not reentrant).
+pub fn with_hardened_query_conn<F, T>(db_path: &Path, operation: F) -> Result<T, DataFrameError>
+where
+    F: FnOnce(&duckdb::Connection) -> Result<T, DataFrameError>,
+{
+    with_df_db_manager(db_path, |manager| {
+        let mut slot = manager.df_db.lock();
+        // Checkpoint and close the read-write connection so the file has no open
+        // handle — some platforms won't open a second handle to it — then open the
+        // hardened read-only connection as the sole handle and query it while still
+        // holding the lock so a concurrent write can't open the file underneath us.
+        // Checkpointing first also spares the read-only connection a WAL replay,
+        // which can crash on sequence / default-column entries. The slot is left
+        // empty for the next caller to reopen.
+        if let Some(rw_conn) = slot.take() {
+            rw_conn.execute_batch("CHECKPOINT")?;
+        }
+        let conn = open_hardened_query_connection(db_path)?;
+        operation(&conn)
+    })
+}
+
+/// Get a connection to a duckdb database.
+///
+/// If the database has a stale or corrupt WAL file (e.g. from a prior crash or
+/// unclean LRU eviction), this function will attempt to recover by removing the
+/// WAL and retrying. If the retry still fails, the error is returned without
+/// touching the database file — open() can fail for reasons unrelated to the
+/// WAL (permissions, lock held by another process, etc.) and the caller is in
+/// a better position to decide whether re-indexing is appropriate.
+pub fn get_connection(path: &Path) -> Result<duckdb::Connection, DataFrameError> {
+    log::debug!("get_connection: Opening new DuckDB connection for path: {path:?}");
+
+    if let Some(parent) = path.parent() {
+        log::debug!("get_connection: Ensuring parent directory exists: {parent:?}");
+        util::fs::create_dir_all(parent).map_err(|e| DataFrameError::CreateParent(Box::new(e)))?;
+    }
+
+    let wal_path = wal_path_for(path);
+
+    // Happy path — open succeeds on the first try.
+    let initial_err = match open_duckdb_connection(path) {
+        Ok(conn) => return open_success(conn, path),
+        Err(e) => e,
+    };
+
+    // Only attempt destructive recovery when a WAL file is present on disk.
+    // A WAL file signals a prior unclean shutdown (killed container, OOM, etc.)
+    // where stale or corrupt WAL data is the likely cause of the open failure.
+    // Without a WAL file the failure is something else (permissions, lock held
+    // by another process, etc.) and deleting files would risk data loss.
+    if !wal_path.exists() {
+        log::error!(
+            "get_connection: Failed to open DuckDB at {path:?}: {initial_err}. \
+             No WAL file present — skipping recovery."
+        );
+        return Err(initial_err.into());
+    }
+
+    // First recovery: remove only the WAL file and retry. A stale or corrupt
+    // WAL (e.g. from a killed container) is the most common failure mode.
+    log::warn!(
+        "get_connection: Failed to open DuckDB at {path:?}: {initial_err}. \
+         WAL file present — attempting recovery by removing it."
+    );
+    remove_file_if_exists(&wal_path);
+
+    if let Ok(conn) = open_duckdb_connection(path) {
+        log::info!("get_connection: Recovery succeeded after WAL removal for {path:?}");
+        return open_success(conn, path);
+    }
+
+    // Retry after WAL removal still failed. Don't touch the db file — open()
+    // can fail for reasons unrelated to the WAL (permissions, lock held by
+    // another process, etc.), so leave it intact for the caller to decide.
+    log::error!("get_connection: Retry after WAL removal still failed for {path:?}: {initial_err}");
+
+    Err(initial_err.into())
+}
+
+/// Flush any leftover WAL from a prior session so it cannot cause replay
+/// issues later (e.g. after a crash or LRU eviction).
+fn open_success(
+    conn: duckdb::Connection,
+    path: &Path,
+) -> Result<duckdb::Connection, DataFrameError> {
+    if let Err(e) = conn.execute_batch("CHECKPOINT") {
+        log::warn!("get_connection: CHECKPOINT after open failed for {path:?}: {e}");
+    }
+    log::info!("get_connection: Successfully opened DuckDB connection for path: {path:?}");
+    Ok(conn)
+}
+
+/// Best-effort file removal with error logging.
+fn remove_file_if_exists(path: &Path) {
+    if path.exists()
+        && let Err(e) = std::fs::remove_file(path)
+    {
+        log::error!("get_connection: Failed to remove {path:?}: {e}");
+    }
+}
+
+/// Returns the WAL file path for a given DuckDB database path.
+fn wal_path_for(db_path: &Path) -> PathBuf {
+    let mut wal = db_path.as_os_str().to_owned();
+    wal.push(".wal");
+    PathBuf::from(wal)
+}
+
+/// Create a table in a duckdb database based on an oxen schema.
+pub fn create_table_if_not_exists(
+    conn: &duckdb::Connection,
+    name: &str,
+    schema: &Schema,
+) -> Result<String, duckdb::Error> {
+    p_create_table_if_not_exists(conn, name, &schema.fields)
+}
+
+/// Drop a table in a duckdb database.
+pub fn drop_table(conn: &duckdb::Connection, table_name: &str) -> Result<(), duckdb::Error> {
+    let sql = format!("DROP TABLE IF EXISTS {table_name}");
+    log::debug!("drop_table sql: {sql}");
+    conn.execute(&sql, [])?;
+    Ok(())
+}
+
+pub fn table_exists(conn: &duckdb::Connection, table_name: &str) -> Result<bool, duckdb::Error> {
+    log::debug!("checking exists in path {conn:?}");
+    let sql = "SELECT EXISTS (SELECT 1 FROM duckdb_tables WHERE table_name = ?) AS table_exists";
+    let exists: bool = {
+        let mut stmt = conn.prepare(sql)?;
+        stmt.query_row(params![table_name], |row| row.get(0))?
+    };
+    log::debug!("got exists: {exists}");
+    Ok(exists)
+}
+
+/// Returns true only if `table_name` exists and contains every Oxen tracking
+/// column (`OXEN_COLS`). A table missing any of them is only partially indexed:
+/// the workspace read path projects the tracking columns, so a query against
+/// such a table fails to bind. Callers use this to treat a partial table as not
+/// indexed and rebuild it rather than serving an unqueryable one.
+pub fn table_is_fully_indexed(
+    conn: &duckdb::Connection,
+    table_name: &str,
+) -> Result<bool, duckdb::Error> {
+    if !table_exists(conn, table_name)? {
+        return Ok(false);
+    }
+    // The marker table is written last by index_file_with_id, so its absence
+    // means the table was left by an older version (which may hold rows
+    // tombstoned as 'removed' by the old delete flow) or by an interrupted
+    // index. Report it as not indexed so callers rebuild it. Checking a
+    // separate table rather than column names means user data that happens to
+    // contain a column like _oxen_diff_status can never be misread as stale.
+    if !table_exists(conn, INDEX_META_TABLE)? {
+        return Ok(false);
+    }
+    let schema = get_schema(conn, table_name)?;
+    Ok(OXEN_COLS
+        .iter()
+        .all(|col| schema.fields.iter().any(|field| field.name == *col)))
+}
+
+/// Double-quote a SQL identifier (table/column name) for DuckDB, escaping any
+/// embedded double quotes, so user-supplied names with spaces or punctuation
+/// parse as a single identifier rather than altering the statement.
+pub fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Create a table from a set of oxen fields with data types.
+fn p_create_table_if_not_exists(
+    conn: &duckdb::Connection,
+    table_name: &str,
+    fields: &[Field],
+) -> Result<String, duckdb::Error> {
+    let columns: Vec<String> = fields.iter().map(|f| f.to_sql()).collect();
+    let columns = columns.join(" NOT NULL,\n");
+    let sql = format!("CREATE TABLE IF NOT EXISTS {table_name} (\n{columns});");
+    log::debug!("create_table sql: {sql}");
+    conn.execute(&sql, [])?;
+    Ok(table_name.to_owned())
+}
+
+/// Get the schema from the table.
+pub fn get_schema(conn: &duckdb::Connection, table_name: &str) -> Result<Schema, duckdb::Error> {
+    let sql = format!(
+        "SELECT column_name, data_type FROM information_schema.columns WHERE table_name == '{table_name}'"
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |row| {
+        let column_name: String = row.get(0)?;
+        let data_type: String = row.get(1)?;
+
+        Ok((column_name, data_type))
+    })?;
+
+    let fields = {
+        let mut fields = vec![];
+        for row in rows {
+            let (column_name, data_type) = row?;
+            fields.push(Field::new(
+                &column_name,
+                &model::data_frame::schema::DataType::from_sql(data_type).as_str(),
+            ));
+        }
+        fields
+    };
+
+    Ok(Schema::new(fields))
+}
+
+// Get the schema from the table excluding specified columns - useful for virtual cols like .oxen.diff.status
+pub fn get_schema_excluding_cols(
+    conn: &duckdb::Connection,
+    table_name: &str,
+    cols: &[&str],
+) -> Result<Schema, duckdb::Error> {
+    let sql = format!(
+        "SELECT column_name, data_type FROM information_schema.columns WHERE table_name == '{}' AND column_name NOT IN ({})",
+        table_name,
+        cols.iter()
+            .map(|col| format!("'{}'", col.replace('\'', "''")))
+            .collect::<Vec<String>>()
+            .join(", ")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |row| {
+        let column_name: String = row.get(0)?;
+        let data_type: String = row.get(1)?;
+
+        Ok((column_name, data_type))
+    })?;
+
+    let fields = {
+        let mut fields = vec![];
+        for row in rows {
+            let (column_name, data_type) = row?;
+            fields.push(Field::new(
+                &column_name,
+                &model::data_frame::schema::DataType::from_sql(data_type).as_str(),
+            ));
+        }
+        fields
+    };
+
+    Ok(Schema::new(fields))
+}
+
+/// Query number of rows in a table.
+pub fn count(conn: &duckdb::Connection, table_name: &str) -> Result<usize, DataFrameError> {
+    let sql = format!("SELECT count(*) FROM {table_name}");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    if let Some(row) = rows.next()? {
+        let size: usize = row.get(0)?;
+        Ok(size)
+    } else {
+        Err(DataFrameError::NoRowsInTable(table_name.to_string()))
+    }
+}
+
+/// Query number of rows `sql` selects, without materializing them.
+pub fn count_sql(conn: &duckdb::Connection, sql: &str) -> Result<usize, DataFrameError> {
+    let sql = composable(sql)?;
+    let count = conn.query_row(
+        &format!("SELECT count(*) FROM ({sql}) AS _oxen_count"),
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+/// Render `sql` as one statement that can be composed onto, dropping the trailing
+/// terminator and any comments a caller may have written.
+///
+/// Composition puts a statement somewhere other than the end of the text — before
+/// an appended `ORDER BY` or `LIMIT`, or inside a derived table — where a `;` and a
+/// line comment both change what follows them rather than being ignored. Text that
+/// does not parse as exactly one statement is returned as written, for the database
+/// to reject on its own terms.
+fn composable(sql: &str) -> Result<String, DataFrameError> {
+    match Parser::parse_sql(&DIALECT, sql)?.as_slice() {
+        [stmt] => Ok(stmt.to_string()),
+        _ => Ok(sql.to_string()),
+    }
+}
+
+/// Query number of rows in a table.
+pub fn count_where(
+    conn: &duckdb::Connection,
+    table_name: &str,
+    where_clause: &str,
+) -> Result<usize, DataFrameError> {
+    let sql = format!("SELECT count(*) FROM {table_name} WHERE {where_clause}");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    if let Some(row) = rows.next()? {
+        let size: usize = row.get(0)?;
+        Ok(size)
+    } else {
+        Err(DataFrameError::NoRowsInTable(table_name.to_string()))
+    }
+}
+
+// IMPORTANT: with_explicit_nulls=True is used to extract complete derived schemas
+// for situations (such as workspace_df_db) that use non-schema oxen virtual columns.
+// This should be set to false in any cases which may have null array / struct fields
+// (such as the commit metadata db queries, which it currently breaks.)
+
+pub fn select(
+    conn: &duckdb::Connection,
+    stmt: &sql::Select,
+    opts: Option<&DFOpts>,
+) -> Result<DataFrame, DataFrameError> {
+    let df = select_str(conn, &stmt.as_string(), opts)?;
+    Ok(df)
+}
+
+pub fn export(
+    conn: &duckdb::Connection,
+    sql: &str,
+    _opts: Option<&DFOpts>,
+    tmp_path: &Path,
+) -> Result<(), DataFrameError> {
+    // let sql = prepare_sql(sql, opts)?;
+    // Get the file extension from the tmp_path
+    if !is_valid_export_extension(tmp_path) {
+        return Err(DataFrameError::InvalidFileType);
+    }
+    let export_sql = wrap_sql_for_export(sql, tmp_path);
+    log::debug!("export_sql: {export_sql}");
+    conn.execute(&export_sql, [])?;
+    Ok(())
+}
+
+/// Compose `opts`' sort and pagination onto `stmt`.
+///
+/// `stmt` may be caller-supplied SQL that already sorts or bounds itself, so the
+/// two are composed rather than concatenated:
+///
+/// - A statement that bounds its own extent is a finished result set: the page
+///   is read out of it through a subquery, so the two bounds nest instead of
+///   colliding, and `opts`' sort is left off rather than reordering rows the
+///   statement already picked.
+/// - Otherwise the statement's own `ORDER BY` wins, and `opts.sort_by` applies
+///   only to a statement that does not sort itself.
+/// - A paginated statement left with no order at all is ordered by
+///   `_oxen_row_id` where that column resolves against it, so a page names the
+///   same rows on every read. See [`SqlShape`].
+pub fn prepare_sql(
+    conn: &duckdb::Connection,
+    stmt: &str,
+    opts: Option<&DFOpts>,
+) -> Result<String, DataFrameError> {
+    let empty_opts = DFOpts::empty();
+    let opts = opts.unwrap_or(&empty_opts);
+
+    // Normalize before composing: `add_special_columns` returns the statement as
+    // written whenever it has no `_oxen_id` to inject, so a terminator would
+    // otherwise survive into the middle of the composed statement.
+    let mut sql = add_special_columns(conn, &composable(stmt)?)?;
+
+    // Nothing to compose means nothing to inspect the statement for.
+    if opts.page.is_some() || opts.sort_by.is_some() {
+        let shape = sql_shape(&sql)?;
+
+        if !shape.bounds_itself && !shape.orders_itself {
+            if let Some(sort_by) = &opts.sort_by {
+                sql.push_str(&format!(" ORDER BY {}", quote_ident(sort_by)));
+            } else if opts.page.is_some() && shape.resolves_row_id {
+                sql.push_str(&format!(" ORDER BY {OXEN_ROW_ID_COL}"));
+            }
+        }
+
+        if let Some(page) = opts.page {
+            let page = if page == 0 { 1 } else { page };
+            let requested_size = opts.page_size.unwrap_or(DEFAULT_PAGE_SIZE);
+            // LIMIT and OFFSET are BIGINTs, so both have to land inside i64 as well
+            // as usize. Saturating there rather than overflowing means an absurd
+            // page number reads past the end and yields an empty page, the same
+            // outcome a non-indexed read gives it.
+            let page_size = bigint(requested_size);
+            let offset = bigint(requested_size.saturating_mul(page - 1));
+            sql = if shape.bounds_itself {
+                format!("SELECT * FROM ({sql}) AS _oxen_page LIMIT {page_size} OFFSET {offset}")
+            } else {
+                format!("{sql} LIMIT {page_size} OFFSET {offset}")
+            };
+        }
+    }
+
+    log::debug!("select_str() running sql: {sql}");
+    Ok(sql)
+}
+
+/// Clamp a row count to the range DuckDB's `BIGINT` accepts, so a value only
+/// `usize` can hold reads as the largest DuckDB can rather than failing to cast.
+fn bigint(rows: usize) -> u64 {
+    (rows as u64).min(i64::MAX as u64)
+}
+
+/// What a statement already says about its own ordering and extent, which
+/// decides how [`prepare_sql`] composes `opts` onto it. A statement whose shape
+/// this can't read is left alone: every field defaults to false.
+#[derive(Default)]
+struct SqlShape {
+    /// Carries its own `ORDER BY`.
+    orders_itself: bool,
+    /// Bounds its own extent, with `LIMIT`, `OFFSET`, or `FETCH`.
+    bounds_itself: bool,
+    /// `ORDER BY _oxen_row_id` is both valid against it and meaningful: it
+    /// selects rows of the staged table directly, rather than aggregating,
+    /// deduping, or reading a derived table that need not carry the column
+    /// through. DuckDB `UPDATE`s physically relocate rows, so a statement that
+    /// resolves the column can be given a page order that survives an edit.
+    resolves_row_id: bool,
+}
+
+fn sql_shape(sql: &str) -> Result<SqlShape, DataFrameError> {
+    let ast = Parser::parse_sql(&DIALECT, sql)?;
+    let Some(Statement::Query(query)) = ast.first() else {
+        return Ok(SqlShape::default());
+    };
+
+    let resolves_row_id = match &*query.body {
+        ast::SetExpr::Select(select) => {
+            let group_by_is_empty = matches!(
+                &select.group_by,
+                ast::GroupByExpr::Expressions(exprs, modifiers)
+                    if exprs.is_empty() && modifiers.is_empty()
+            );
+            let reads_table_directly = match select.from.as_slice() {
+                // Compare the parsed identifier rather than the rendered name so
+                // a quoted `"df"` reads as the same table.
+                [table] if table.joins.is_empty() => matches!(
+                    &table.relation,
+                    ast::TableFactor::Table { name, .. }
+                        if matches!(
+                            name.0.as_slice(),
+                            [ast::ObjectNamePart::Identifier(ident)] if ident.value == TABLE_NAME
+                        )
+                ),
+                _ => false,
+            };
+            let projects_columns_only = select.projection.iter().all(|item| {
+                matches!(
+                    item,
+                    SelectItem::Wildcard(_)
+                        | SelectItem::QualifiedWildcard(_, _)
+                        | SelectItem::UnnamedExpr(SqlExpr::Identifier(_))
+                        | SelectItem::UnnamedExpr(SqlExpr::CompoundIdentifier(_))
+                        | SelectItem::ExprWithAlias {
+                            expr: SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_),
+                            ..
+                        }
+                )
+            });
+            select.distinct.is_none()
+                && select.having.is_none()
+                && select.qualify.is_none()
+                && group_by_is_empty
+                && reads_table_directly
+                && projects_columns_only
+        }
+        _ => false,
+    };
+
+    Ok(SqlShape {
+        orders_itself: query.order_by.is_some(),
+        bounds_itself: query.limit_clause.is_some() || query.fetch.is_some(),
+        resolves_row_id,
+    })
+}
+
+/// Use this for DuckDB: the sqlparser dialect for all SQL destined for it.
+pub(crate) const DIALECT: PostgreSqlDialect = PostgreSqlDialect {};
+
+fn add_special_columns(conn: &duckdb::Connection, sql: &str) -> Result<String, DataFrameError> {
+    let original_schema = get_schema(conn, TABLE_NAME)?;
+
+    let ast = {
+        let mut ast = Parser::parse_sql(&DIALECT, sql)?;
+
+        if let Some(Statement::Query(query)) = ast.get_mut(0) {
+            // The probe only needs the result's column names, so cap it at one
+            // row and drop any ORDER BY — a sort would scan the whole table
+            // just to answer a schema question.
+            query.order_by = None;
+            let one = SqlExpr::Value(SqlValue::Number("1".into(), false).with_empty_span());
+            // DuckDB takes LIMIT or FETCH, never both: the cap goes on
+            // whichever clause the statement already carries.
+            match (&mut query.fetch, &mut query.limit_clause) {
+                (Some(fetch), _) => fetch.quantity = Some(one),
+                (None, Some(ast::LimitClause::LimitOffset { limit, .. })) => *limit = Some(one),
+                (None, Some(ast::LimitClause::OffsetCommaLimit { limit, .. })) => *limit = one,
+                (None, None) => {
+                    query.limit_clause = Some(ast::LimitClause::LimitOffset {
+                        limit: Some(one),
+                        offset: None,
+                        limit_by: Vec::new(),
+                    })
+                }
+            }
+        }
+        ast
+    };
+
+    // Convert the AST back to a SQL string
+    let query_with_limit = ast
+        .iter()
+        .map(|stmt| stmt.to_string())
+        .collect::<Vec<_>>()
+        .join(";");
+
+    let records: Vec<RecordBatch> = {
+        let mut stmt = conn.prepare(&query_with_limit)?;
+        stmt.query_arrow([])?.collect()
+    };
+
+    // Retrieve and print the schema (column names)
+    let result_fields = {
+        let mut result_fields = vec![];
+        if let Some(first_batch) = records.first() {
+            let schema = first_batch.schema();
+            for field in schema.fields() {
+                result_fields.push(Field::new(
+                    field.name(),
+                    field.data_type().to_string().as_str(),
+                ));
+            }
+        }
+        result_fields
+    };
+
+    let original_field_names: Vec<&str> = original_schema
+        .fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    let result_field_names: Vec<&str> = result_fields.iter().map(|f| f.name.as_str()).collect();
+
+    let is_subset = result_field_names
+        .iter()
+        .all(|name| original_field_names.contains(name));
+
+    // Only `_oxen_id` is injected: clients address rows by it, so every
+    // projection must carry it. The other internal columns (`_oxen_row_id`)
+    // are implementation details that stay out of results.
+    if is_subset && !result_field_names.contains(&OXEN_ID_COL) {
+        let ast = {
+            let mut ast = Parser::parse_sql(&DIALECT, sql)?;
+
+            if let Some(Statement::Query(query)) = ast.get_mut(0)
+                && let ast::SetExpr::Select(select) = &mut *query.body
+            {
+                // Don't inject special columns into DISTINCT queries —
+                // adding per-row unique cols like _oxen_id defeats deduplication.
+                if select.distinct.is_some() {
+                    return Ok(sql.to_string());
+                }
+
+                select
+                    .projection
+                    .push(SelectItem::UnnamedExpr(SqlExpr::Identifier(
+                        OXEN_ID_COL.into(),
+                    )));
+            }
+            ast
+        };
+
+        // Convert the AST back to a SQL string
+        return Ok(ast
+            .iter()
+            .map(|stmt| stmt.to_string())
+            .collect::<Vec<_>>()
+            .join(";"));
+    }
+
+    Ok(sql.to_string())
+}
+
+pub fn select_str(
+    conn: &duckdb::Connection,
+    sql: &str,
+    opts: Option<&DFOpts>,
+) -> Result<DataFrame, DataFrameError> {
+    let sql = prepare_sql(conn, sql, opts)?;
+    let df = select_raw(conn, &sql)?;
+    log::debug!("select_str() got raw df {df:?}");
+    Ok(df)
+}
+
+pub fn select_raw(conn: &duckdb::Connection, stmt: &str) -> Result<DataFrame, DataFrameError> {
+    select_raw_with_params(conn, stmt, [])
+}
+
+/// Like [`select_raw`] but binds `params` into the prepared statement. Use this
+/// (rather than interpolating) whenever a value in the predicate comes from a
+/// request, so a value containing a quote can't alter the query.
+pub fn select_raw_with_params<P: duckdb::Params>(
+    conn: &duckdb::Connection,
+    stmt: &str,
+    params: P,
+) -> Result<DataFrame, DataFrameError> {
+    let records: Vec<RecordBatch> = {
+        let mut stmt = conn.prepare(stmt)?;
+        stmt.query_arrow(params)?.collect()
+    };
+
+    if records.is_empty() {
+        return Ok(DataFrame::default());
+    }
+
+    let df = record_batches_to_polars_df(records)?;
+
+    Ok(df)
+}
+
+/// Like [`select_raw`], but returns `None` instead of a `DataFrame` when the
+/// result exceeds `max_rows`, and stops reading once it does.
+pub fn select_raw_capped(
+    conn: &duckdb::Connection,
+    stmt: &str,
+    max_rows: usize,
+) -> Result<Option<DataFrame>, DataFrameError> {
+    let mut records: Vec<RecordBatch> = Vec::new();
+    let mut total_rows: usize = 0;
+    let mut stmt = conn.prepare(stmt)?;
+    for batch in stmt.query_arrow([])? {
+        total_rows += batch.num_rows();
+        records.push(batch);
+        if total_rows > max_rows {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(record_batches_to_polars_df(records)?))
+}
+
+pub fn modify_row_with_polars_df(
+    conn: &duckdb::Connection,
+    table_name: &str,
+    id: &str,
+    df: &DataFrame,
+) -> Result<DataFrame, DataFrameError> {
+    if df.height() != 1 {
+        Err(DataFrameError::ModifyOnly1Row)?;
+    }
+
+    let schema = df.schema();
+    let field_names: Vec<&str> = schema.iter_names().map(|s| s.as_str()).collect();
+    let column_sql_types = rows::column_sql_types_by_name(conn, table_name)?;
+
+    let set_clauses: String = field_names
+        .iter()
+        .map(|name| {
+            let placeholder = rows::placeholder_for_column(&column_sql_types, name);
+            format!("{} = {}", quote_ident(name), placeholder)
+        })
+        .collect::<Vec<String>>()
+        .join(", ");
+
+    // The id is bound, not interpolated: a request-supplied id containing a
+    // quote must not be able to alter the predicate.
+    let sql =
+        format!("UPDATE {table_name} SET {set_clauses} WHERE \"{OXEN_ID_COL}\" = ? RETURNING *");
+
+    let values = df.get(0).unwrap(); // Checked above
+
+    let mut boxed_values: Vec<Box<dyn ToSql>> = values
+        .iter()
+        .map(|v| tabular::value_to_tosql(v.to_owned()))
+        .collect();
+    boxed_values.push(Box::new(id.to_string()));
+
+    let params: Vec<&dyn ToSql> = boxed_values
+        .iter()
+        .map(|boxed_value| &**boxed_value as &dyn ToSql)
+        .collect();
+
+    let result_set: Vec<RecordBatch> = {
+        let mut stmt = conn.prepare(&sql)?;
+        stmt.query_arrow(params.as_slice())?.collect()
+    };
+
+    let df = record_batches_to_polars_df(result_set)?;
+
+    Ok(df)
+}
+
+pub fn modify_rows_with_polars_df(
+    conn: &duckdb::Connection,
+    table_name: &str,
+    row_map: &HashMap<String, DataFrame>,
+) -> Result<DataFrame, DataFrameError> {
+    // Construct the SQL query with combined CASE statements
+    let column_names: Vec<String> = match row_map.iter().next() {
+        Some((_, df)) => df.schema().iter_names().map(|s| s.to_string()).collect(),
+        None => Vec::new(),
+    };
+
+    let column_sql_types = rows::column_sql_types_by_name(conn, table_name)?;
+
+    let (set_clauses, all_params) = {
+        let mut set_clauses = Vec::new();
+        let mut all_params: Vec<Box<dyn ToSql>> = Vec::new();
+
+        for col_name in &column_names {
+            // The CASE expression hides the target column's type from the
+            // binder, so every placeholder needs an explicit cast: a bare `?`
+            // inside `CASE WHEN .. THEN ? END` fails to resolve, and that bind
+            // failure aborts the process instead of surfacing as an error (see
+            // test_modify_rows_with_list_column_binds_cleanly).
+            let placeholder = match column_sql_types.get(col_name.as_str()) {
+                Some(sql_type) => format!("CAST(? AS {sql_type})"),
+                None => rows::placeholder_for_column(&column_sql_types, col_name),
+            };
+            let mut case_clauses = Vec::new();
+            for (id, df) in row_map.iter() {
+                let series = df.column(col_name)?;
+                let value = series.get(0)?;
+
+                // Bind the id as well as the value: an id from a request must
+                // not be interpolated into the predicate. row_map.iter() yields
+                // a stable order across columns (the map is not mutated), so the
+                // (id, value) params line up with the placeholders positionally.
+                case_clauses.push(format!("WHEN \"{OXEN_ID_COL}\" = ? THEN {placeholder}"));
+                all_params.push(Box::new(id.clone()));
+                all_params.push(Box::new(tabular::value_to_tosql(value)));
+            }
+            set_clauses.push(format!(
+                "{} = CASE {} END",
+                quote_ident(col_name),
+                case_clauses.join(" ")
+            ));
+        }
+
+        // Add all row IDs to the parameters for the WHERE clause
+        for id in row_map.keys() {
+            all_params.push(Box::new(id.clone()));
+        }
+
+        (set_clauses, all_params)
+    };
+
+    let sql = format!(
+        "UPDATE {} SET {} WHERE \"{}\" IN ({}) RETURNING *",
+        table_name,
+        set_clauses.join(", "),
+        OXEN_ID_COL,
+        row_map.keys().map(|_| "?").collect::<Vec<_>>().join(", ")
+    );
+
+    let params: Vec<&dyn ToSql> = all_params
+        .iter()
+        .map(|boxed_value| &**boxed_value as &dyn ToSql)
+        .collect();
+
+    let result_set: Vec<RecordBatch> = {
+        let mut stmt = conn.prepare(&sql)?;
+        stmt.query_arrow(params.as_slice())?.collect()
+    };
+
+    let df = record_batches_to_polars_df(result_set)?;
+
+    Ok(df)
+}
+
+pub fn index_file(path: &Path, conn: &duckdb::Connection) -> Result<(), DataFrameError> {
+    log::debug!("df_db:index_file() at path {path:?}");
+    let extension: &str = &util::fs::extension_from_path(path);
+    let path_str = path.to_string_lossy().to_string();
+    match extension {
+        "csv" => {
+            let query = format!(
+                "CREATE TABLE {DUCKDB_DF_TABLE_NAME} AS SELECT * FROM read_csv('{path_str}')"
+            );
+            conn.execute(&query, [])?;
+        }
+        "tsv" => {
+            let query = format!(
+                "CREATE TABLE {DUCKDB_DF_TABLE_NAME} AS SELECT * FROM read_csv('{path_str}')"
+            );
+            conn.execute(&query, [])?;
+        }
+        "parquet" => {
+            let query = format!(
+                "CREATE TABLE {DUCKDB_DF_TABLE_NAME} AS SELECT * FROM read_parquet('{path_str}')"
+            );
+            conn.execute(&query, [])?;
+        }
+        "jsonl" | "json" | "ndjson" => {
+            let query = format!(
+                "CREATE TABLE {DUCKDB_DF_TABLE_NAME} AS SELECT * FROM read_json('{path_str}')"
+            );
+            conn.execute(&query, [])?;
+        }
+        _ => {
+            return Err(DataFrameError::InvalidFileType);
+        }
+    }
+    Ok(())
+}
+
+// TODO: We will eventually want to parse the actual type, not just the extension.
+// For now, just treat the extension as law
+pub fn index_file_with_id(
+    path: &Path,
+    conn: &duckdb::Connection,
+    extension: &str,
+) -> Result<(), DataFrameError> {
+    log::debug!("df_db:index_file() at path {path:?} into path {conn:?}");
+    let path_str = path.to_string_lossy().to_string();
+
+    let read_clause = match extension {
+        "csv" | "tsv" => format!("read_csv('{path_str}', AUTO_DETECT=TRUE, header=True)"),
+        "parquet" => format!("read_parquet('{path_str}')"),
+        "jsonl" | "json" | "ndjson" => format!("read_json('{path_str}')"),
+        _ => {
+            return Err(DataFrameError::InvalidFileType);
+        }
+    };
+
+    // The system column names are reserved. DuckDB silently renames duplicate
+    // CTAS columns rather than erroring, so a file carrying one of them would
+    // otherwise index with the system column under a mangled name — reject it
+    // up front instead. Case-insensitive to match DuckDB's identifier
+    // resolution: `_OXEN_ID` collides with `_oxen_id` just the same.
+    let describe_sql = format!("DESCRIBE SELECT * FROM {read_clause}");
+    let file_cols: Vec<String> = {
+        let mut stmt = conn.prepare(&describe_sql)?;
+        stmt.query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?
+    };
+    if let Some(reserved) = file_cols.into_iter().find(|col| {
+        OXEN_COLS
+            .iter()
+            .any(|reserved| col.eq_ignore_ascii_case(reserved))
+    }) {
+        return Err(DataFrameError::ReservedColumnName(reserved));
+    }
+
+    // Both system columns are assigned in the CTAS itself: `_oxen_id` tags each
+    // row with a stable id, and `_oxen_row_id` persists the file's row order —
+    // DuckDB UPDATEs physically relocate rows, so an unordered SELECT reshuffles
+    // pages after any edit, and reads order by this column instead (see
+    // repositories::workspaces::data_frames::query). `row_number() OVER ()` is
+    // DuckDB's documented way to capture the incoming row order.
+    let query = format!(
+        "CREATE TABLE {DUCKDB_DF_TABLE_NAME} AS SELECT *, \
+         CAST(uuid() AS VARCHAR) AS {OXEN_ID_COL}, \
+         row_number() OVER () AS {OXEN_ROW_ID_COL} \
+         FROM {read_clause};"
+    );
+    conn.execute(&query, [])?;
+
+    match extension {
+        "jsonl" | "json" | "ndjson" => {
+            // Convert STRUCT columns to JSON to avoid binding issues
+            let alter_query = format!(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = '{DUCKDB_DF_TABLE_NAME}' AND data_type LIKE 'STRUCT%'"
+            );
+            let struct_cols: Vec<String> = {
+                let mut stmt = conn.prepare(&alter_query)?;
+                stmt.query_map([], |row| row.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect()
+            };
+
+            for col in struct_cols {
+                let alter = format!(
+                    "ALTER TABLE {DUCKDB_DF_TABLE_NAME} ALTER COLUMN {} TYPE JSON",
+                    quote_ident(&col)
+                );
+                conn.execute(&alter, [])?;
+            }
+
+            // Convert JSON[] columns to VARCHAR[]. `read_json` types a list as
+            // JSON[] when the element type can't be inferred (e.g. every row
+            // has `[]`, or elements are mixed scalars). JSON[] survives the
+            // write path but corrupts the read path: each element is stored
+            // as a JSON value (so a string element becomes the JSON string
+            // `"foo"` with literal quotes), and polars/arrow surface those
+            // quoted forms as plain VARCHARs, which `JsonWriter` then escapes
+            // again. The result is one extra layer of `\"` per round-trip,
+            // compounding for any flow that reads existing list elements and
+            // writes them back.
+            let alter_query = format!(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = '{DUCKDB_DF_TABLE_NAME}' AND data_type = 'JSON[]'"
+            );
+            let json_list_cols: Vec<String> = {
+                let mut stmt = conn.prepare(&alter_query)?;
+                stmt.query_map([], |row| row.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect()
+            };
+
+            for col in json_list_cols {
+                let ident = quote_ident(&col);
+                let alter = format!(
+                    "ALTER TABLE {DUCKDB_DF_TABLE_NAME} ALTER COLUMN {ident} TYPE VARCHAR[] \
+                     USING list_transform({ident}, lambda x: json_extract_string(x, '$'))"
+                );
+                conn.execute(&alter, [])?;
+            }
+        }
+        _ => {}
+    }
+
+    let add_default_query = format!(
+        "ALTER TABLE {DUCKDB_DF_TABLE_NAME} ALTER COLUMN {OXEN_ID_COL} SET DEFAULT CAST(uuid() AS VARCHAR);"
+    );
+
+    conn.execute(&add_default_query, [])?;
+
+    // Appended rows draw their `_oxen_row_id` from this sequence so they land
+    // after the file's rows in a stable order. CREATE OR REPLACE because DuckDB
+    // sequences are catalog objects that survive DROP TABLE — a re-index of the
+    // same db must reset the counter, not fail on the leftover sequence.
+    let next_row_id: i64 = conn.query_row(
+        &format!("SELECT count(*) + 1 FROM {DUCKDB_DF_TABLE_NAME}"),
+        [],
+        |row| row.get(0),
+    )?;
+    let seq_query = format!(
+        "CREATE OR REPLACE SEQUENCE \"{OXEN_ROW_ID_SEQ}\" START WITH {next_row_id}; \
+         ALTER TABLE {DUCKDB_DF_TABLE_NAME} ALTER COLUMN {OXEN_ROW_ID_COL} SET DEFAULT nextval('{OXEN_ROW_ID_SEQ}');"
+    );
+    conn.execute_batch(&seq_query)?;
+
+    // Written last: its presence certifies the table above was fully built by
+    // the current indexer (see table_is_fully_indexed).
+    let meta_query = format!(
+        "CREATE OR REPLACE TABLE \"{INDEX_META_TABLE}\" (schema_version INTEGER); \
+         INSERT INTO \"{INDEX_META_TABLE}\" VALUES (1);"
+    );
+    conn.execute_batch(&meta_query)?;
+
+    Ok(())
+}
+
+pub fn preview(conn: &duckdb::Connection, table_name: &str) -> Result<DataFrame, DataFrameError> {
+    let query = format!("SELECT * FROM {table_name} LIMIT 10");
+    let df = select_raw(conn, &query)?;
+    Ok(df)
+}
+
+pub fn record_batches_to_polars_df(records: Vec<RecordBatch>) -> Result<DataFrame, DataFrameError> {
+    if records.is_empty() {
+        return Ok(DataFrame::default());
+    }
+
+    let buf = {
+        let mut buf = Vec::new();
+        let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, &records[0].schema())?;
+
+        for batch in &records {
+            writer.write(batch)?;
+        }
+        writer.finish()?;
+        buf
+    };
+
+    let content = Cursor::new(buf);
+    let df = IpcReader::new(content).finish()?;
+
+    Ok(df)
+}
+
+#[cfg(test)]
+mod tests {
+    // Fixtures below open raw/foreign DuckDB databases (planting WALs, setting
+    // pragmas) to exercise `get_connection`, intentionally bypassing the managed
+    // `open_duckdb_connection` helper.
+    #![allow(clippy::disallowed_methods)]
+
+    use crate::test;
+
+    use super::*;
+
+    #[test]
+    fn test_connections_cap_the_duckdb_thread_pool() -> Result<(), OxenError> {
+        test::run_empty_dir_test(|dir| {
+            let db_file = dir.join("data.db");
+
+            let conn = get_connection(&db_file)?;
+            conn.execute_batch("CREATE TABLE df AS SELECT 42 AS x")?;
+            let rw_threads: i64 = conn.query_row(
+                "SELECT CAST(current_setting('threads') AS BIGINT)",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(
+                rw_threads, DUCKDB_THREADS,
+                "read-write connections must cap the thread pool"
+            );
+            // DuckDB echoes the limit in MiB with one decimal, so this literal tracks
+            // `DUCKDB_MAX_MEMORY` and must change with it.
+            let rw_memory: String =
+                conn.query_row("SELECT current_setting('memory_limit')", [], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(
+                rw_memory, "512.0 MiB",
+                "read-write connections must cap memory"
+            );
+            drop(conn);
+
+            // The hardened connection also sets `lock_configuration`, so this asserts
+            // the cap is applied rather than rejected as locked configuration.
+            let hardened = open_hardened_query_connection(&db_file)?;
+            let hardened_threads: i64 = hardened.query_row(
+                "SELECT CAST(current_setting('threads') AS BIGINT)",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(
+                hardened_threads, DUCKDB_THREADS,
+                "hardened connections must cap the thread pool"
+            );
+            let hardened_memory: String =
+                hardened.query_row("SELECT current_setting('memory_limit')", [], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(
+                hardened_memory, "512.0 MiB",
+                "hardened connections must cap memory"
+            );
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_hardened_query_conn_blocks_file_access_but_reads_tables() -> Result<(), OxenError> {
+        test::run_empty_dir_test(|dir| {
+            let db_file = dir.join("data.db");
+
+            // Populate via the cached read-write connection and leave it open, so the
+            // hardened connection is opened alongside it as it is in production.
+            with_df_db_manager(&db_file, |manager| {
+                manager.with_conn(|conn| {
+                    conn.execute_batch("CREATE TABLE df AS SELECT 42 AS x")?;
+                    Ok(())
+                })
+            })?;
+
+            // A host file that exists on disk — readable only if external access is on.
+            let secret = dir.join("secret.csv");
+            std::fs::write(&secret, "col\nvalue\n")?;
+            let secret_path = secret.to_string_lossy().to_string();
+            let out_path = dir.join("out.csv");
+            let out = out_path.to_string_lossy().to_string();
+
+            with_hardened_query_conn(&db_file, |conn| {
+                // Reads the indexed table (coexists with the cached read-write conn).
+                let x: i64 = conn.query_row("SELECT x FROM df", [], |r| r.get(0))?;
+                assert_eq!(x, 42);
+
+                // Refuses to read host files — and specifically because access is off,
+                // not because the file is missing (it exists).
+                match conn.execute_batch(&format!("SELECT * FROM read_csv('{secret_path}')")) {
+                    Ok(()) => panic!("read_csv on a hardened connection should be blocked"),
+                    Err(e) => assert!(
+                        format!("{e}").contains("disabled by configuration"),
+                        "expected an external-access error, got: {e}"
+                    ),
+                }
+
+                // Refuses to write host files.
+                assert!(
+                    conn.execute_batch(&format!("COPY (SELECT 1) TO '{out}'"))
+                        .is_err(),
+                    "COPY ... TO on a hardened connection should be blocked"
+                );
+                assert!(
+                    !out_path.exists(),
+                    "COPY ... TO must not have written a file"
+                );
+                Ok(())
+            })?;
+
+            // A fresh hardened connection sees rows committed after the previous one
+            // ran — each call opens a new connection and picks up the latest state.
+            with_df_db_manager(&db_file, |manager| {
+                manager.with_conn(|conn| {
+                    conn.execute_batch("INSERT INTO df VALUES (99)")?;
+                    Ok(())
+                })
+            })?;
+            with_hardened_query_conn(&db_file, |conn| {
+                let count: i64 = conn.query_row("SELECT COUNT(*) FROM df", [], |r| r.get(0))?;
+                assert_eq!(
+                    count, 2,
+                    "hardened connection must see the newly committed row"
+                );
+                Ok(())
+            })?;
+
+            with_db_closed(&db_file, || {});
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_select_raw_capped_refuses_results_over_the_cap() -> Result<(), OxenError> {
+        test::run_empty_dir_test(|dir| {
+            let db_file = dir.join("data.db");
+            let conn = get_connection(&db_file)?;
+            conn.execute_batch("CREATE TABLE df AS SELECT * FROM range(5) t(x)")?;
+
+            // Result fits under the cap: full DataFrame is returned.
+            let under = select_raw_capped(&conn, "SELECT x FROM df", 10)?;
+            assert_eq!(
+                under.expect("expected a DataFrame under the cap").height(),
+                5
+            );
+
+            // Result exactly at the cap is still returned.
+            let at = select_raw_capped(&conn, "SELECT x FROM df", 5)?;
+            assert_eq!(at.expect("expected a DataFrame at the cap").height(), 5);
+
+            // Result over the cap is refused rather than materialized.
+            let over = select_raw_capped(&conn, "SELECT x FROM df", 4)?;
+            assert!(over.is_none(), "result over the cap must return None");
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_df_db_create() -> Result<(), OxenError> {
+        test::run_empty_dir_test(|data_dir| {
+            let db_file = data_dir.join("data.db");
+            let conn = get_connection(&db_file)?;
+            // bounding_box -> min_x, min_y, width, height
+            let schema = test::schema_bounding_box();
+            let table_name = "bounding_box";
+            create_table_if_not_exists(&conn, table_name, &schema)?;
+
+            let num_entries = count(&conn, table_name)?;
+            assert_eq!(num_entries, 0);
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_select_distinct_not_defeated_by_special_columns() -> Result<(), OxenError> {
+        test::run_empty_dir_test(|data_dir| {
+            let db_file = data_dir.join("data.db");
+            let conn = get_connection(&db_file)?;
+
+            // Create the table with the standard name and an _oxen_id column
+            // so add_special_columns will attempt to inject it.
+            conn.execute(
+                &format!(
+                    "CREATE TABLE {TABLE_NAME} (
+                        color VARCHAR,
+                        {OXEN_ID_COL} VARCHAR DEFAULT (uuid()::VARCHAR),
+                        num INTEGER
+                    )"
+                ),
+                [],
+            )?;
+
+            // Insert rows with duplicate 'color' values
+            conn.execute(
+                &format!("INSERT INTO {TABLE_NAME} (color, num) VALUES ('red', 1), ('red', 2), ('blue', 3)"),
+                [],
+            )?;
+
+            let sql = format!("SELECT DISTINCT color FROM {TABLE_NAME}");
+            let df = select_str(&conn, &sql, None)?;
+
+            assert_eq!(df.height(), 2, "DISTINCT should deduplicate 'red': {df:?}");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_fetch_first_survives_special_column_injection() -> Result<(), OxenError> {
+        test::run_empty_dir_test(|data_dir| {
+            let db_file = data_dir.join("data.db");
+            let conn = get_connection(&db_file)?;
+
+            conn.execute(
+                &format!(
+                    "CREATE TABLE {TABLE_NAME} (
+                        color VARCHAR,
+                        {OXEN_ID_COL} VARCHAR DEFAULT (uuid()::VARCHAR),
+                        num INTEGER
+                    )"
+                ),
+                [],
+            )?;
+            conn.execute(
+                &format!(
+                    "INSERT INTO {TABLE_NAME} (color, num)
+                     VALUES ('red', 1), ('blue', 2), ('green', 3)"
+                ),
+                [],
+            )?;
+
+            // A statement that bounds itself with FETCH keeps that bound. Pairing it with a
+            // LIMIT is a DuckDB syntax error that fails the whole read.
+            let sql = format!("SELECT color FROM {TABLE_NAME} FETCH FIRST 2 ROWS ONLY");
+            let df = select_str(&conn, &sql, None)?;
+
+            assert_eq!(df.height(), 2, "FETCH FIRST 2 should read two rows: {df:?}");
+            assert!(
+                df.column(OXEN_ID_COL).is_ok(),
+                "{OXEN_ID_COL} should be injected into the projection: {df:?}"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_df_db_get_schema() -> Result<(), OxenError> {
+        test::run_empty_dir_test(|data_dir| {
+            let db_file = data_dir.join("data.db");
+            let conn = get_connection(&db_file)?;
+            // bounding_box -> min_x, min_y, width, height
+            let schema = test::schema_bounding_box();
+            let table_name = "bounding_box";
+            create_table_if_not_exists(&conn, table_name, &schema)?;
+
+            let found_schema = get_schema(&conn, table_name)?;
+            assert_eq!(found_schema, schema);
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_get_connection_wal_recovery_removes_wal_and_retries() -> Result<(), OxenError> {
+        // Directly tests the WAL recovery path: create a valid db, plant a WAL
+        // file that makes open() fail, and verify get_connection removes the WAL
+        // and returns a working connection to the original data.
+        test::run_empty_dir_test(|data_dir| {
+            let db_file = data_dir.join("data.db");
+            let wal_file = data_dir.join("data.db.wal");
+
+            // Create a valid database and checkpoint so data is in the main file.
+            {
+                let conn = duckdb::Connection::open(&db_file)?;
+                conn.execute("CREATE TABLE t (val INTEGER)", [])?;
+                conn.execute("INSERT INTO t VALUES (99)", [])?;
+                conn.execute_batch("CHECKPOINT")?;
+            }
+
+            // Disable auto-checkpoint-on-shutdown so DuckDB leaves a real WAL
+            // from database A that we can transplant onto B.
+            let donor_dir = data_dir.join("donor");
+            std::fs::create_dir_all(&donor_dir).expect("create donor dir");
+            let donor_db = donor_dir.join("donor.db");
+            {
+                let conn = duckdb::Connection::open(&donor_db)?;
+                conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown")?;
+                conn.execute("CREATE TABLE donor (x INT)", [])?;
+                conn.execute("INSERT INTO donor VALUES (1)", [])?;
+                // Drop — pragma ensures WAL persists on disk.
+            }
+
+            let donor_wal = donor_dir.join("donor.db.wal");
+            // Plant the donor's WAL onto our target database. This WAL
+            // references a different catalog, which can cause open() to fail
+            // with a WAL replay error. If DuckDB handles it gracefully instead,
+            // get_connection still succeeds — either way the contract holds.
+            if donor_wal.exists() {
+                std::fs::copy(&donor_wal, &wal_file).expect("plant donor WAL");
+                assert!(
+                    wal_file.exists(),
+                    "WAL should be planted before get_connection"
+                );
+            } else {
+                // DuckDB checkpointed despite the pragma — force the scenario
+                // by writing a WAL with enough structure to be attempted.
+                // A 64-byte header that doesn't match the db will cause failure.
+                let fake_wal = vec![0u8; 64];
+                std::fs::write(&wal_file, &fake_wal).expect("write synthetic WAL");
+            }
+
+            let conn = get_connection(&db_file)?;
+
+            // The checkpointed data should survive recovery.
+            let mut stmt = conn.prepare("SELECT val FROM t")?;
+            let val: i64 = stmt.query_row([], |row| row.get(0))?;
+            assert_eq!(val, 99, "checkpointed data should survive WAL recovery");
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_get_connection_preserves_db_when_both_corrupt() -> Result<(), OxenError> {
+        test::run_empty_dir_test(|data_dir| {
+            let db_file = data_dir.join("data.db");
+            let wal_file = data_dir.join("data.db.wal");
+
+            // Write garbage to both the db and WAL files.
+            std::fs::write(&db_file, b"not a duckdb file").expect("failed to write corrupt db");
+            std::fs::write(&wal_file, b"not a wal file").expect("failed to write corrupt WAL");
+
+            // get_connection should fail. The WAL is removed as part of the
+            // recovery attempt, but the db file itself must be preserved so
+            // the caller can decide whether to re-index.
+            let result = get_connection(&db_file);
+            assert!(
+                result.is_err(),
+                "should fail when both db and WAL are corrupt"
+            );
+
+            assert!(db_file.exists(), "corrupt db file should be preserved");
+            assert!(
+                !wal_file.exists(),
+                "WAL file should have been removed during recovery attempt"
+            );
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_get_connection_does_not_delete_db_without_wal() -> Result<(), OxenError> {
+        // P1 regression test: when open() fails for a non-WAL reason (e.g.
+        // corrupt db file with no WAL present), get_connection must NOT delete
+        // the database file. Destructive recovery is only appropriate when a
+        // WAL file is present, signaling a prior unclean shutdown.
+        test::run_empty_dir_test(|data_dir| {
+            let db_file = data_dir.join("data.db");
+            let wal_file = data_dir.join("data.db.wal");
+
+            // Create a corrupt db file with NO WAL.
+            std::fs::write(&db_file, b"not a duckdb file").expect("write corrupt db");
+            assert!(!wal_file.exists(), "no WAL should exist for this test");
+
+            let result = get_connection(&db_file);
+            assert!(result.is_err(), "should fail with corrupt db");
+
+            // The db file must NOT be deleted — without a WAL there's no
+            // evidence this is a recoverable WAL-replay failure.
+            assert!(
+                db_file.exists(),
+                "db file should be preserved when no WAL is present"
+            );
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_get_connection_checkpoints_existing_wal() -> Result<(), OxenError> {
+        // Verifies that get_connection runs CHECKPOINT on open, flushing WAL
+        // contents into the main db file. We use disable_checkpoint_on_shutdown
+        // to guarantee a WAL file exists before get_connection is called.
+        test::run_empty_dir_test(|data_dir| {
+            let db_file = data_dir.join("data.db");
+            let wal_file = data_dir.join("data.db.wal");
+
+            // Create a database with disable_checkpoint_on_shutdown so the WAL
+            // persists after close.
+            {
+                let conn = duckdb::Connection::open(&db_file)?;
+                conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown")?;
+                conn.execute("CREATE TABLE wal_test (val INTEGER)", [])?;
+                conn.execute("INSERT INTO wal_test VALUES (42)", [])?;
+                // Drop — WAL should persist due to the pragma.
+            }
+
+            // Record the db file size before get_connection. If a WAL exists,
+            // CHECKPOINT will flush it and grow the main file.
+            let size_before = std::fs::metadata(&db_file).map(|m| m.len()).unwrap_or(0);
+            let wal_existed = wal_file.exists();
+
+            // Open via get_connection, which runs CHECKPOINT on open.
+            let conn = get_connection(&db_file)?;
+
+            // The data must be accessible.
+            let mut stmt = conn.prepare("SELECT val FROM wal_test")?;
+            let val: i64 = stmt.query_row([], |row| row.get(0))?;
+            assert_eq!(
+                val, 42,
+                "WAL data should be preserved after checkpoint-on-open"
+            );
+
+            // If the WAL existed before get_connection, verify CHECKPOINT had
+            // an observable effect: the main db file should have grown because
+            // the WAL contents were flushed into it.
+            if wal_existed {
+                drop(conn);
+                let size_after = std::fs::metadata(&db_file).map(|m| m.len()).unwrap_or(0);
+                assert!(
+                    size_after > size_before,
+                    "db file should grow after CHECKPOINT flushes WAL \
+                     (before: {size_before}, after: {size_after})"
+                );
+            }
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_wal_path_for() {
+        let db_path = Path::new("/some/dir/db");
+        let wal = wal_path_for(db_path);
+        assert_eq!(wal, PathBuf::from("/some/dir/db.wal"));
+    }
+
+    #[test]
+    #[serial_test::serial(df_db_cache)]
+    fn test_flush_all_df_db_connections_drains_cache_and_checkpoints() -> Result<(), OxenError> {
+        // Simulates the server-shutdown path: cached connection has uncheckpointed
+        // work, we call flush_all_df_db_connections, and the data must be in the
+        // main db file (not just the WAL) by the time we reopen.
+        test::run_empty_dir_test(|data_dir| {
+            let db_file = data_dir.join("flush_test.db");
+            let wal_file = data_dir.join("flush_test.db.wal");
+
+            // Open through the cache so the connection lands in DF_DB_INSTANCES.
+            with_df_db_manager(&db_file, |manager| {
+                manager.with_conn(|conn| {
+                    // Disable DuckDB's drop-time CHECKPOINT so the only way the
+                    // WAL gets flushed in this test is via our explicit flush.
+                    conn.execute_batch("PRAGMA disable_checkpoint_on_shutdown")?;
+                    conn.execute(
+                        &format!("CREATE TABLE {TABLE_NAME} (id INTEGER, name VARCHAR)"),
+                        [],
+                    )?;
+                    conn.execute(&format!("INSERT INTO {TABLE_NAME} VALUES (1, 'test')"), [])?;
+                    Ok(())
+                })
+            })?;
+
+            assert!(
+                wal_file.exists(),
+                "WAL should exist before flush — disable_checkpoint_on_shutdown is set"
+            );
+            assert!(
+                DF_DB_INSTANCES.read().peek(&db_file).is_some(),
+                "cache should have the entry we just opened"
+            );
+
+            flush_all_df_db_connections();
+
+            // Assert on our key, not on the cache being empty: tests sharing the
+            // `DF_DB_INSTANCES` static run in parallel and repopulate it.
+            assert!(
+                DF_DB_INSTANCES.read().peek(&db_file).is_none(),
+                "flush should have removed the cached connection"
+            );
+
+            // Reopen WITHOUT going through recovery (no stale-WAL handling needed
+            // because flush already CHECKPOINTed): data must still be present.
+            let conn = duckdb::Connection::open(&db_file)?;
+            let count: i64 =
+                conn.query_row(&format!("SELECT COUNT(*) FROM {TABLE_NAME}"), [], |r| {
+                    r.get(0)
+                })?;
+            assert_eq!(
+                count, 1,
+                "row inserted before flush should still be readable"
+            );
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    #[serial_test::serial(df_db_cache)]
+    fn test_flush_all_df_db_connections_on_empty_cache_is_noop() {
+        // Empty cache should not panic, error, or log a warning loudly. Just
+        // exercises the early-return branch.
+        flush_all_df_db_connections();
+    }
+
+    // An entry a caller holds survives LRU pressure; the same entry, once idle, does not. Both the
+    // hold and the pressure go through `with_db_closed`, so the test opens no database file.
+    #[test]
+    #[serial_test::serial(df_db_cache)]
+    fn test_an_entry_in_use_is_never_evicted() {
+        let held = PathBuf::from("/df-db-cache-test/held");
+        let flood = |round: usize| {
+            for i in 0..=DF_DB_CACHE_SIZE {
+                let filler = PathBuf::from(format!("/df-db-cache-test/flood-{round}-{i}"));
+                with_db_closed(&filler, || {});
+            }
+        };
+
+        with_db_closed(&held, || {
+            flood(0);
+            assert!(
+                DF_DB_INSTANCES.read().contains(&held),
+                "LRU pressure evicted an entry a caller was holding"
+            );
+        });
+
+        flood(1);
+        assert!(
+            !DF_DB_INSTANCES.read().contains(&held),
+            "an idle entry survived LRU pressure"
+        );
+    }
+
+    // `with_db_closed` closes the cached connection, and the next use reopens it and sees the
+    // same database. A path with no database on disk gets none.
+    #[test]
+    fn test_with_db_closed_closes_and_the_next_use_reopens() -> Result<(), OxenError> {
+        test::run_empty_dir_test(|dir| {
+            let db_file = dir.join("closed.db");
+            with_df_db_manager(&db_file, |manager| {
+                manager.with_conn(|conn| {
+                    conn.execute_batch("CREATE TABLE t AS SELECT 1 AS x")?;
+                    Ok(())
+                })
+            })?;
+
+            with_db_closed(&db_file, || {});
+            // Evicted counts as closed too, so only an entry still present is inspected.
+            if let Some(entry) = DF_DB_INSTANCES.read().peek(&db_file) {
+                assert!(
+                    entry.lock().is_none(),
+                    "with_db_closed left the connection open"
+                );
+            }
+            let exists = with_df_db_manager(&db_file, |manager| {
+                manager.with_conn(|conn| Ok(table_exists(conn, "t")?))
+            })?;
+            assert!(exists, "the reopened connection does not see the table");
+
+            let missing = dir.join("missing.db");
+            with_db_closed(&missing, || {});
+            assert!(!missing.exists(), "with_db_closed created a database file");
+            Ok(())
+        })
+    }
+
+    #[test]
+    #[serial_test::serial(df_db_cache)]
+    fn test_with_df_db_manager_recovers_after_corrupt_wal() -> Result<(), OxenError> {
+        test::run_empty_dir_test(|data_dir| {
+            let db_file = data_dir.join("data.db");
+            let wal_file = data_dir.join("data.db.wal");
+
+            // Create a valid database with data and checkpoint it.
+            {
+                let conn = get_connection(&db_file)?;
+                conn.execute(
+                    &format!("CREATE TABLE {TABLE_NAME} (id INTEGER, name VARCHAR)"),
+                    [],
+                )?;
+                conn.execute(&format!("INSERT INTO {TABLE_NAME} VALUES (1, 'test')"), [])?;
+                conn.execute_batch("CHECKPOINT")?;
+            }
+
+            // Close any cached connection so the next access opens a fresh one.
+            with_db_closed(&db_file, || {});
+
+            // Write a corrupt WAL to simulate a container kill.
+            std::fs::write(&wal_file, b"corrupt WAL data").expect("failed to write corrupt WAL");
+
+            // with_df_db_manager should open a new connection (triggering
+            // recovery in get_connection) and the operation should succeed.
+            let exists = with_df_db_manager(&db_file, |manager| {
+                manager.with_conn(|conn| Ok(table_exists(conn, TABLE_NAME)?))
+            })?;
+
+            assert!(
+                exists,
+                "table should exist after WAL recovery through with_df_db_manager"
+            );
+
+            // Close the connection before the directory goes away.
+            with_db_closed(&db_file, || {});
+            Ok(())
+        })
+    }
+
+    /// Round-tripping a list of strings through `rows::modify_row` on a list
+    /// column inferred from a JSONL with empty arrays must not add a
+    /// JSON-string wrapper around each element. Without the fix in
+    /// `index_file_with_id`, every write adds one layer: `["a"]` is stored
+    /// as `["\"a\""]`, and any merge-and-write flow doubles it.
+    ///
+    /// `read_json` types `[]`-only columns as JSON[]. JSON[] survives the
+    /// write path but corrupts the read path (DuckDB stores each element as
+    /// a JSON value, polars surfaces that as a quoted VARCHAR, JsonWriter
+    /// escapes the quotes again). The fix rewrites JSON[] columns to
+    /// VARCHAR[] at index time. This test goes through that path end-to-end.
+    #[test]
+    #[serial_test::serial(df_db_cache)]
+    fn test_rows_modify_row_round_trip_preserves_json_array_strings() -> Result<(), OxenError> {
+        use crate::core::db::data_frames::rows;
+
+        test::run_empty_dir_test(|data_dir| {
+            let jsonl_path = data_dir.join("data.jsonl");
+            // Two rows, all empty lists — forces read_json to type the
+            // column as JSON[] (no element type to infer).
+            std::fs::write(
+                &jsonl_path,
+                "{\"name\":\"a\",\"items\":[]}\n{\"name\":\"b\",\"items\":[]}\n",
+            )
+            .map_err(|e| OxenError::basic_str(format!("write fixture: {e}")))?;
+
+            let db_file = data_dir.join("data.db");
+            let conn = get_connection(&db_file)?;
+
+            // Index via the real production path — `index_file_with_id` is
+            // what the workspace controller calls and is where the column
+            // type gets locked in.
+            index_file_with_id(&jsonl_path, &conn, "jsonl")?;
+
+            // Grab the auto-assigned _oxen_id for row 'a'.
+            let row_id: String = conn.query_row(
+                &format!("SELECT {OXEN_ID_COL} FROM {TABLE_NAME} WHERE name = 'a'"),
+                [],
+                |row| row.get(0),
+            )?;
+
+            // First write: items -> ["first"]. Build the polars DataFrame
+            // via `parse_json_to_df` so the path matches the `rows::update`
+            // controller (JSON body → polars via JsonLineReader) — different
+            // DataFrame construction routes produce different element-level
+            // dtypes that affect the subsequent ToSql binding.
+            let mut update_df = tabular::parse_json_to_df(&serde_json::json!({
+                "items": ["first"]
+            }))?;
+            rows::modify_row(&conn, &mut update_df, &row_id)?;
+
+            // Read each element back as a VARCHAR via UNNEST so we don't
+            // depend on the column's outer DuckDB serialization (which differs
+            // between JSON[] and VARCHAR[] on the way to text).
+            let read_items = || -> Result<Vec<String>, OxenError> {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT unnest(items) FROM {TABLE_NAME} WHERE name = 'a'"
+                ))?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r?);
+                }
+                Ok(out)
+            };
+
+            assert_eq!(
+                read_items()?,
+                vec!["first".to_string()],
+                "after one write, each element should be the bare string, not a JSON-encoded form"
+            );
+
+            // Second write: append a new element to the existing list and
+            // write back. Exercises the same JsonLineReader path that
+            // re-binds existing elements — the case that compounds the bug.
+            let mut update_df = tabular::parse_json_to_df(&serde_json::json!({
+                "items": ["first", "second"]
+            }))?;
+            rows::modify_row(&conn, &mut update_df, &row_id)?;
+
+            assert_eq!(
+                read_items()?,
+                vec!["first".to_string(), "second".to_string()],
+                "merge-and-write must not double-encode existing elements"
+            );
+
+            // The piece that surfaces in the API: when a row is read back as
+            // a polars DataFrame and serialised via
+            // `JsonDataFrameView::json_from_df`, each list element should
+            // appear as a bare JSON string — not a JSON-encoded JSON string.
+            // Polars reads JSON[] elements as VARCHAR-with-quotes, and the
+            // writer faithfully escapes the quotes, which is what users
+            // observe as `"\"first\""`.
+            let mut df = select_raw(
+                &conn,
+                &format!("SELECT items FROM {TABLE_NAME} WHERE name = 'a'"),
+            )?;
+            let api_json = crate::view::JsonDataFrameView::json_from_df(&mut df);
+            let elems = api_json[0]["items"]
+                .as_array()
+                .expect("items should be array");
+            let elem_strings: Vec<&str> = elems.iter().map(|v| v.as_str().unwrap()).collect();
+            assert_eq!(
+                elem_strings,
+                vec!["first", "second"],
+                "API serialization must not preserve JSON-string quoting on JSON[] elements"
+            );
+
+            with_db_closed(&db_file, || {});
+            Ok(())
+        })
+    }
+
+    /// Batch updates build one `UPDATE ... SET col = CASE WHEN "_oxen_id" = .. THEN ? END`
+    /// per column. The statement must bind cleanly on a table with a list
+    /// (embedding) column, including null list values: a bind failure on this
+    /// path (ParameterNotResolved) escapes DuckDB's C API as an uncaught C++
+    /// exception and aborts the whole process instead of returning an error.
+    #[test]
+    fn test_modify_rows_with_list_column_binds_cleanly() -> Result<(), OxenError> {
+        use crate::constants::OXEN_ID_COL;
+        use polars::prelude::NamedFrom;
+        use polars::series::Series;
+        use std::collections::HashMap;
+
+        test::run_empty_dir_test(|data_dir| {
+            let jsonl_path = data_dir.join("data.jsonl");
+            // One row with an embedding, one with a null embedding — mirrors a
+            // workspace data frame where only some rows have embeddings.
+            std::fs::write(
+                &jsonl_path,
+                "{\"file\":\"a\",\"embedding\":[0.1,0.2,0.3]}\n{\"file\":\"b\",\"embedding\":null}\n",
+            )
+            .map_err(|e| OxenError::basic_str(format!("write fixture: {e}")))?;
+
+            let db_file = data_dir.join("data.db");
+            let conn = get_connection(&db_file)?;
+            index_file_with_id(&jsonl_path, &conn, "jsonl")?;
+
+            // Build the row_map the way the batch-update flow does: the full
+            // row selected from the table, with the changed column replaced.
+            let mut row_map: HashMap<String, DataFrame> = HashMap::new();
+            for file in ["a", "b"] {
+                let row = select_raw(
+                    &conn,
+                    &format!("SELECT * FROM {TABLE_NAME} WHERE file = '{file}'"),
+                )?;
+                let id = row
+                    .column(OXEN_ID_COL)?
+                    .get(0)?
+                    .to_string()
+                    .trim_matches('\"')
+                    .to_string();
+                let mut new_row = row.clone();
+                new_row.with_column(Series::new("file".into(), vec![format!("{file}-updated")]))?;
+                row_map.insert(id, new_row);
+            }
+
+            // Must not abort the process, and must apply the updates.
+            let result = modify_rows_with_polars_df(&conn, TABLE_NAME, &row_map)?;
+            assert_eq!(result.height(), 2);
+
+            let updated = select_raw(
+                &conn,
+                &format!("SELECT file FROM {TABLE_NAME} ORDER BY file"),
+            )?;
+            let files: Vec<String> = (0..updated.height())
+                .map(|i| {
+                    updated
+                        .column("file")
+                        .expect("file column present")
+                        .get(i)
+                        .expect("row present")
+                        .to_string()
+                        .trim_matches('\"')
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(files, vec!["a-updated", "b-updated"]);
+            Ok(())
+        })
+    }
+
+    /// Read the `name` column of an ordered page through the same path the
+    /// workspace query uses: `SELECT * ORDER BY _oxen_row_id` via
+    /// `prepare_sql`'s pagination.
+    fn read_names_ordered(conn: &duckdb::Connection) -> Result<Vec<String>, OxenError> {
+        let sql = format!("SELECT * FROM {TABLE_NAME} ORDER BY {OXEN_ROW_ID_COL}");
+        let mut opts = DFOpts::empty();
+        opts.page = Some(1);
+        opts.page_size = Some(100);
+        let df = select_str(conn, &sql, Some(&opts))?;
+        let names = (0..df.height())
+            .map(|i| {
+                df.column("name")
+                    .expect("name column present")
+                    .get(i)
+                    .expect("row present")
+                    .to_string()
+                    .trim_matches('\"')
+                    .to_string()
+            })
+            .collect();
+        Ok(names)
+    }
+
+    /// Indexing must persist the file's row order in `_oxen_row_id` (1-based,
+    /// file order) so paginated reads have a stable sort key.
+    #[test]
+    fn test_index_file_with_id_assigns_row_order() -> Result<(), OxenError> {
+        test::run_empty_dir_test(|data_dir| {
+            let jsonl_path = data_dir.join("data.jsonl");
+            std::fs::write(
+                &jsonl_path,
+                "{\"name\":\"a\"}\n{\"name\":\"b\"}\n{\"name\":\"c\"}\n",
+            )
+            .map_err(|e| OxenError::basic_str(format!("write fixture: {e}")))?;
+
+            let conn = get_connection(&data_dir.join("data.db"))?;
+            index_file_with_id(&jsonl_path, &conn, "jsonl")?;
+
+            let mut stmt = conn.prepare(&format!(
+                "SELECT name, {OXEN_ROW_ID_COL} FROM {TABLE_NAME} ORDER BY {OXEN_ROW_ID_COL}"
+            ))?;
+            let rows: Vec<(String, i64)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            assert_eq!(
+                rows,
+                vec![
+                    ("a".to_string(), 1),
+                    ("b".to_string(), 2),
+                    ("c".to_string(), 3)
+                ],
+                "row ids should be 1-based in file order"
+            );
+            Ok(())
+        })
+    }
+
+    /// The regression this column exists for: a DuckDB UPDATE physically
+    /// relocates the row, so an unordered read reshuffles pages and the edit
+    /// looks lost. Ordering by `_oxen_row_id` must keep the edited row in
+    /// place.
+    #[test]
+    fn test_row_order_survives_modify_row() -> Result<(), OxenError> {
+        use crate::core::db::data_frames::rows;
+        use crate::core::df::tabular;
+
+        test::run_empty_dir_test(|data_dir| {
+            let jsonl_path = data_dir.join("data.jsonl");
+            std::fs::write(
+                &jsonl_path,
+                "{\"name\":\"a\"}\n{\"name\":\"b\"}\n{\"name\":\"c\"}\n",
+            )
+            .map_err(|e| OxenError::basic_str(format!("write fixture: {e}")))?;
+
+            let conn = get_connection(&data_dir.join("data.db"))?;
+            index_file_with_id(&jsonl_path, &conn, "jsonl")?;
+
+            let row_id: String = conn.query_row(
+                &format!("SELECT {OXEN_ID_COL} FROM {TABLE_NAME} WHERE name = 'a'"),
+                [],
+                |row| row.get(0),
+            )?;
+            let mut update_df = tabular::parse_json_to_df(&serde_json::json!({
+                "name": "a-edited"
+            }))?;
+            rows::modify_row(&conn, &mut update_df, &row_id)?;
+
+            assert_eq!(
+                read_names_ordered(&conn)?,
+                vec!["a-edited", "b", "c"],
+                "the edited row must stay first in the ordered read"
+            );
+            Ok(())
+        })
+    }
+
+    /// Appended rows draw their `_oxen_row_id` from the sequence, so they
+    /// land at the end of the ordered read instead of at an arbitrary spot.
+    #[test]
+    fn test_appended_row_lands_last() -> Result<(), OxenError> {
+        use crate::core::db::data_frames::rows;
+        use crate::core::df::tabular;
+
+        test::run_empty_dir_test(|data_dir| {
+            let jsonl_path = data_dir.join("data.jsonl");
+            std::fs::write(&jsonl_path, "{\"name\":\"a\"}\n{\"name\":\"b\"}\n")
+                .map_err(|e| OxenError::basic_str(format!("write fixture: {e}")))?;
+
+            let conn = get_connection(&data_dir.join("data.db"))?;
+            index_file_with_id(&jsonl_path, &conn, "jsonl")?;
+
+            let row_df = tabular::parse_json_to_df(&serde_json::json!({
+                "name": "c"
+            }))?;
+            rows::append_row(&conn, &row_df)?;
+            let row_df_2 = tabular::parse_json_to_df(&serde_json::json!({
+                "name": "d"
+            }))?;
+            rows::append_row(&conn, &row_df_2)?;
+
+            let ids: Vec<i64> = {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {OXEN_ROW_ID_COL} FROM {TABLE_NAME} ORDER BY {OXEN_ROW_ID_COL}"
+                ))?;
+                stmt.query_map([], |row| row.get(0))?
+                    .collect::<Result<_, _>>()?
+            };
+            assert_eq!(ids, vec![1, 2, 3, 4], "appended rows get the next ids");
+            assert_eq!(read_names_ordered(&conn)?, vec!["a", "b", "c", "d"]);
+            Ok(())
+        })
+    }
+
+    /// `_oxen_row_id` (like `_oxen_id`) is a reserved column name: a file
+    /// whose own schema carries it must fail to index rather than give one
+    /// column name two meanings.
+    #[test]
+    fn test_index_reserved_row_id_column_errors() -> Result<(), OxenError> {
+        test::run_empty_dir_test(|data_dir| {
+            let jsonl_path = data_dir.join("data.jsonl");
+            std::fs::write(
+                &jsonl_path,
+                "{\"name\":\"a\",\"_oxen_row_id\":42}\n{\"name\":\"b\",\"_oxen_row_id\":7}\n",
+            )
+            .map_err(|e| OxenError::basic_str(format!("write fixture: {e}")))?;
+
+            let conn = get_connection(&data_dir.join("data.db"))?;
+            assert!(
+                index_file_with_id(&jsonl_path, &conn, "jsonl").is_err(),
+                "a file with a reserved column name must not index"
+            );
+
+            // DuckDB resolves identifiers case-insensitively, so a case
+            // variant collides just the same and must also be rejected.
+            let upper_path = data_dir.join("upper.jsonl");
+            std::fs::write(&upper_path, "{\"name\":\"a\",\"_OXEN_ROW_ID\":42}\n")
+                .map_err(|e| OxenError::basic_str(format!("write fixture: {e}")))?;
+            let conn = get_connection(&data_dir.join("upper.db"))?;
+            assert!(
+                index_file_with_id(&upper_path, &conn, "jsonl").is_err(),
+                "a case variant of a reserved column name must not index"
+            );
+            Ok(())
+        })
+    }
+
+    /// Re-indexing into the same db (restore, or the server's is_indexed
+    /// toggle) drops the table but not the sequence, which is a catalog
+    /// object. The rebuild must replace the leftover sequence and reset its
+    /// counter rather than fail on it.
+    #[test]
+    fn test_reindex_resets_row_id_sequence() -> Result<(), OxenError> {
+        use crate::core::db::data_frames::rows;
+        use crate::core::df::tabular;
+
+        test::run_empty_dir_test(|data_dir| {
+            let jsonl_path = data_dir.join("data.jsonl");
+            std::fs::write(&jsonl_path, "{\"name\":\"a\"}\n{\"name\":\"b\"}\n")
+                .map_err(|e| OxenError::basic_str(format!("write fixture: {e}")))?;
+
+            let conn = get_connection(&data_dir.join("data.db"))?;
+            index_file_with_id(&jsonl_path, &conn, "jsonl")?;
+
+            // Advance the sequence past the file's rows, then rebuild the
+            // table the way unindex → index does.
+            let row_df = tabular::parse_json_to_df(&serde_json::json!({
+                "name": "c"
+            }))?;
+            rows::append_row(&conn, &row_df)?;
+            drop_table(&conn, TABLE_NAME)?;
+            index_file_with_id(&jsonl_path, &conn, "jsonl")?;
+
+            // The rebuilt table starts over: file rows get 1..n and an append
+            // continues right after them, not after the old counter.
+            let row_df = tabular::parse_json_to_df(&serde_json::json!({
+                "name": "c"
+            }))?;
+            rows::append_row(&conn, &row_df)?;
+            let ids: Vec<i64> = {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {OXEN_ROW_ID_COL} FROM {TABLE_NAME} ORDER BY {OXEN_ROW_ID_COL}"
+                ))?;
+                stmt.query_map([], |row| row.get(0))?
+                    .collect::<Result<_, _>>()?
+            };
+            assert_eq!(ids, vec![1, 2, 3], "the sequence must reset on re-index");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_self_bounded_select_keeps_its_own_limit() -> Result<(), OxenError> {
+        test::run_empty_dir_test(|data_dir| {
+            let db_file = data_dir.join("data.db");
+            let conn = get_connection(&db_file)?;
+
+            conn.execute(
+                &format!(
+                    "CREATE TABLE {TABLE_NAME} (
+                        color VARCHAR,
+                        {OXEN_ID_COL} VARCHAR DEFAULT (uuid()::VARCHAR)
+                    )"
+                ),
+                [],
+            )?;
+            conn.execute(
+                &format!(
+                    "INSERT INTO {TABLE_NAME} (color) VALUES ('red'), ('green'), ('blue'), ('grey')"
+                ),
+                [],
+            )?;
+
+            // The schema probe caps the statement at one row, so a statement that
+            // carries its own LIMIT still reports every column it projects.
+            let sql = format!("SELECT color FROM {TABLE_NAME} LIMIT 2");
+            let df = select_str(&conn, &sql, None)?;
+            assert_eq!(df.height(), 2, "the caller's LIMIT must survive: {df:?}");
+            assert!(
+                df.get_column_names().iter().any(|c| *c == OXEN_ID_COL),
+                "{OXEN_ID_COL} must be injected: {df:?}"
+            );
+
+            // A page over a self-bounded statement reads out of it rather than
+            // replacing its bound, so page two of the two rows it selects is empty.
+            let opts = DFOpts {
+                page: Some(2),
+                page_size: Some(2),
+                ..DFOpts::empty()
+            };
+            let paged = select_str(&conn, &sql, Some(&opts))?;
+            assert_eq!(paged.height(), 0, "the page nests inside: {paged:?}");
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_sql_shape_reads_own_order_and_bounds() -> Result<(), OxenError> {
+        // (statement, orders_itself, bounds_itself)
+        let cases = [
+            ("SELECT * FROM df", false, false),
+            ("SELECT * FROM df LIMIT 10", false, true),
+            ("SELECT * FROM df LIMIT 0", false, true),
+            // `LIMIT ALL` names no bound, so a page composes onto it directly.
+            ("SELECT * FROM df LIMIT ALL", false, false),
+            ("SELECT * FROM df OFFSET 5", false, true),
+            ("SELECT * FROM df OFFSET 5 ROWS", false, true),
+            ("SELECT * FROM df LIMIT 10 OFFSET 5", false, true),
+            ("SELECT * FROM df OFFSET 5 LIMIT 10", false, true),
+            ("SELECT * FROM df LIMIT ALL OFFSET 5", false, true),
+            ("SELECT * FROM df FETCH FIRST 10 ROWS ONLY", false, true),
+            (
+                "SELECT * FROM df OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY",
+                false,
+                true,
+            ),
+            ("SELECT * FROM df ORDER BY a", true, false),
+            ("SELECT * FROM df ORDER BY a LIMIT 10", true, true),
+            ("SELECT * FROM df ORDER BY a DESC OFFSET 3", true, true),
+        ];
+
+        for (sql, orders_itself, bounds_itself) in cases {
+            let shape = sql_shape(sql)?;
+            assert_eq!(shape.orders_itself, orders_itself, "orders_itself: {sql}");
+            assert_eq!(shape.bounds_itself, bounds_itself, "bounds_itself: {sql}");
+        }
+
+        // `LIMIT ... BY` and `LIMIT <offset>, <limit>` belong to other dialects
+        // and never reach the shape check.
+        for sql in [
+            "SELECT * FROM df LIMIT 10 BY a",
+            "SELECT * FROM df LIMIT 5, 10",
+        ] {
+            assert!(sql_shape(sql).is_err(), "expected a parse error: {sql}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sql_shape_resolves_row_id_for_direct_reads_only() -> Result<(), OxenError> {
+        let cases = [
+            ("SELECT * FROM df", true),
+            ("SELECT a, b FROM df", true),
+            ("SELECT a AS x FROM df", true),
+            // An unbounded statement still resolves the column a page orders by.
+            ("SELECT * FROM df LIMIT ALL", true),
+            // A quoted name reads as the same table.
+            (r#"SELECT "df".a FROM "df""#, true),
+            ("SELECT DISTINCT a FROM df", false),
+            ("SELECT count(*) FROM df", false),
+            ("SELECT a, count(*) FROM df GROUP BY a", false),
+            ("SELECT a FROM df GROUP BY a HAVING count(*) > 1", false),
+            ("SELECT a + 1 FROM df", false),
+            ("SELECT a FROM other", false),
+            ("SELECT a FROM df JOIN other ON df.a = other.a", false),
+            ("SELECT * FROM df, other", false),
+            ("SELECT * FROM (SELECT * FROM df) AS t", false),
+            ("SELECT * FROM df UNION SELECT * FROM df", false),
+            ("WITH t AS (SELECT * FROM df) SELECT * FROM t", false),
+            ("UPDATE df SET a = 1", false),
+        ];
+
+        for (sql, resolves_row_id) in cases {
+            let shape = sql_shape(sql)?;
+            assert_eq!(shape.resolves_row_id, resolves_row_id, "resolves: {sql}");
+        }
+
+        Ok(())
+    }
+}

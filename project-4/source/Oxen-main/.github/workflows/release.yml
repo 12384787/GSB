@@ -1,0 +1,218 @@
+name: 🚀 Release
+
+on:
+  push:
+    tags:
+      - v*
+
+# No token by default: every job below grants itself only what it uses, and a job added without a
+# permissions block gets nothing rather than silently inheriting write access. A called workflow can
+# only reduce what its calling job grants, so these are also the ceilings for the reusable workflows.
+permissions: {}
+
+env:
+  AWS_ROLE: arn:aws:iam::213020545630:role/github-runner-role
+  AWS_REGION: us-west-1
+  # The extension uses pyo3's stable abi3 ABI (abi3-py311), so we only need to build
+  # against the floor Python version — the resulting wheel works for 3.11+.
+  PYTHON_VERSIONS: "3.11"
+
+defaults:
+  run:
+    shell: bash -leo pipefail {0}
+
+jobs:
+  set_env:
+    name: Set env
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      release_version: ${{ steps.set-env.outputs.release_version }}
+      aws_role: ${{ steps.set-env.outputs.aws_role }}
+      aws_region: ${{ steps.set-env.outputs.aws_region }}
+      python_versions: ${{ steps.set-env.outputs.python_versions }}
+
+    steps:
+      - name: Set env
+        id: set-env
+        run: |
+          echo "AWS_REGION=${{ env.AWS_REGION }}" >> $GITHUB_OUTPUT
+          echo "AWS_ROLE=${{ env.AWS_ROLE }}" >> $GITHUB_OUTPUT
+          echo "PYTHON_VERSIONS=${{ env.PYTHON_VERSIONS }}" >> $GITHUB_OUTPUT
+          echo "RELEASE_VERSION=${GITHUB_REF#refs/*/v}" >> $GITHUB_OUTPUT
+
+  release_docker_arm64:
+    name: Docker arm64
+    needs: set_env
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/release_docker.yml
+    with:
+      ARCHITECTURE: arm64
+      AWS_ROLE: ${{ needs.set_env.outputs.aws_role }}
+      AWS_REGION: ${{ needs.set_env.outputs.aws_region }}
+      RELEASE_VERSION: ${{ needs.set_env.outputs.release_version }}
+    secrets:
+      GH_PERSONAL_ACCESS_TOKEN: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+
+  release_docker_x86_64:
+    name: Docker x86_64
+    needs: set_env
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/release_docker.yml
+    with:
+      ARCHITECTURE: amd64
+      AWS_ROLE: ${{ needs.set_env.outputs.aws_role }}
+      AWS_REGION: ${{ needs.set_env.outputs.aws_region }}
+      RELEASE_VERSION: ${{ needs.set_env.outputs.release_version }}
+    secrets:
+      GH_PERSONAL_ACCESS_TOKEN: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+
+  release_linux_arm64:
+    name: Linux arm64
+    needs: set_env
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/release_linux.yml
+    with:
+      ARCHITECTURE: arm64
+      AWS_ROLE: ${{ needs.set_env.outputs.aws_role }}
+      AWS_REGION: ${{ needs.set_env.outputs.aws_region }}
+      PYTHON_VERSIONS: ${{ needs.set_env.outputs.python_versions }}
+      RELEASE_VERSION: ${{ needs.set_env.outputs.release_version }}
+    secrets:
+      GH_PERSONAL_ACCESS_TOKEN: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+
+  release_linux_x86_64:
+    name: Linux x86_64
+    needs: set_env
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/release_linux.yml
+    with:
+      ARCHITECTURE: x86_64
+      AWS_ROLE: ${{ needs.set_env.outputs.aws_role }}
+      AWS_REGION: ${{ needs.set_env.outputs.aws_region }}
+      PYTHON_VERSIONS: ${{ needs.set_env.outputs.python_versions }}
+      RELEASE_VERSION: ${{ needs.set_env.outputs.release_version }}
+    secrets:
+      GH_PERSONAL_ACCESS_TOKEN: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+
+  release_macos_arm64_x86_64:
+    name: MacOS arm64 and x86_64
+    needs: set_env
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/release_macos.yml
+    with:
+      PYTHON_VERSIONS: ${{ needs.set_env.outputs.python_versions }}
+      AWS_ROLE: ${{ needs.set_env.outputs.aws_role }}
+      AWS_REGION: ${{ needs.set_env.outputs.aws_region }}
+
+  release_windows_x86_64:
+    name: Windows x86_64
+    needs: set_env
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/release_windows.yml
+    with:
+      ARCHITECTURE: x86_64
+      AWS_ROLE: ${{ needs.set_env.outputs.aws_role }}
+      AWS_REGION: ${{ needs.set_env.outputs.aws_region }}
+      PYTHON_VERSIONS: ${{ needs.set_env.outputs.python_versions }}
+    secrets:
+      GH_PERSONAL_ACCESS_TOKEN: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+
+  create_draft_release:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    # ncipollo/release-action creates the draft and uploads its assets.
+    permissions:
+      contents: write
+    needs:
+      - set_env
+      - release_docker_arm64
+      - release_docker_x86_64
+      - release_linux_arm64
+      - release_linux_x86_64
+      - release_macos_arm64_x86_64
+      - release_windows_x86_64
+    if: success() || failure()
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        id: download-artifacts
+        with:
+          merge-multiple: true
+
+      - name: Extract artifacts
+        run: |
+          mkdir -p ${{ steps.download-artifacts.outputs.download-path }}/release
+
+          mv ${{ steps.download-artifacts.outputs.download-path }}/*.tar ${{ steps.download-artifacts.outputs.download-path }}/release/
+
+          for file in ${{ steps.download-artifacts.outputs.download-path }}/*.tar.gz; do tar -xzvf "$file" -C ${{ steps.download-artifacts.outputs.download-path }}/release; done
+          for file in ${{ steps.download-artifacts.outputs.download-path }}/*.zip; do unzip "$file" -d ${{ steps.download-artifacts.outputs.download-path }}/release; done
+
+          ls -la ${{ steps.download-artifacts.outputs.download-path }}/release
+
+      - name: Create release draft
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
+        with:
+          allowUpdates: true
+          artifacts: ${{ steps.download-artifacts.outputs.download-path }}/release/*
+          draft: true
+          name: "🚀 Release ${{ needs.set_env.outputs.release_version }}"
+          replacesArtifacts: true
+          updateOnlyUnreleased: true
+          body: |
+            🚀 Release ${{ needs.set_env.outputs.release_version }}
+
+            Binaries are available for the following platforms:
+            - Docker arm64
+            - Docker x86_64
+            - Linux arm64
+            - Linux x86_64
+            - MacOS arm64 (Apple Silicon)
+            - MacOS x86_64 (Intel)
+            - Windows x86_64
+
+            🐧 Linux Binaries
+            The Linux binaries require a minimum glibc version of 2.34.
+
+            These are the minimum versions of common distributions with glibc 2.34 or later.
+
+            | Distribution | First version with glibc 2.34+ |
+            |--------------|--------------------------------|
+            | Amazon Linux | 2023                           |
+            | Arch         | 2021                           |
+            | CentOS       | Stream 9                       |
+            | Debian       | 12                             |
+            | Fedora       | 35                             |
+            | RHEL         | 9.0                            |
+            | Ubuntu       | 22.04                          |
+
+            🖥️ Windows Binaries
+            The Windows binaries require a minimum version of Visual C++ 2022.
+            You may need to install the latest Microsoft Visual C++ Redistributable.
+
+            🍏 MacOS Binaries
+            The MacOS arm64 (Apple Silicon) binaries require a minimum version of MacOS 11 Big Sur.
+            The MacOS x86_64 (Intel) binaries require a minimum version of MacOS 10.13 High Sierra.
+
+            🐍 Python Wheels
+            The Python wheels are abi3 wheels built against Python 3.11 and compatible with
+            Python 3.11+. They are available for the following platforms:
+            - Linux arm64
+            - Linux x86_64
+            - MacOS arm64 [Apple Silicon]
+            - MacOS x86_64 [Intel]
+            - Windows x86_64

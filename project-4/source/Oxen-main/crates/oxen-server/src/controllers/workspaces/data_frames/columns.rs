@@ -1,0 +1,331 @@
+use std::path::PathBuf;
+
+use crate::errors::OxenHttpError;
+use crate::helpers::get_repo;
+use crate::params::{app_data, path_param};
+
+use actix_web::{HttpRequest, HttpResponse};
+use liboxen::core::repo_locks;
+use liboxen::error::StringError;
+use liboxen::model::Schema;
+use liboxen::model::data_frame::DataFrameSchemaSize;
+use liboxen::opts::DFOpts;
+use liboxen::repositories;
+use liboxen::view::data_frames::columns::{ColumnToDelete, ColumnToUpdate, NewColumn};
+use liboxen::view::json_data_frame_view::JsonDataFrameColumnResponse;
+use liboxen::view::{
+    JsonDataFrameView, JsonDataFrameViews, StatusMessage, StatusMessageDescription,
+};
+use serde_json::{Value, json};
+
+pub async fn create(req: HttpRequest, body: String) -> Result<HttpResponse, OxenHttpError> {
+    let app_data = app_data(&req)?;
+
+    let namespace = path_param(&req, "namespace")?.to_string();
+    let repo_name = path_param(&req, "repo_name")?.to_string();
+    let workspace_id = path_param(&req, "workspace_id")?.to_string();
+    let repo = get_repo(app_data, namespace.clone(), repo_name.clone())?;
+    let _write = repo_locks::begin_write(&repo)?;
+    let file_path = PathBuf::from(path_param(&req, "path")?);
+
+    let mut body_json: Value = serde_json::from_str(&body).map_err(|_err| {
+        OxenHttpError::BadRequest("Failed to parse NewColumn from request body".into())
+    })?;
+
+    if let Some(obj) = body_json.as_object_mut() {
+        if obj.contains_key("dtype") {
+            let dtype_value = obj.remove("dtype").unwrap(); // Safe to unwrap because we just checked it exists
+            obj.insert("data_type".to_string(), dtype_value);
+        }
+    } else {
+        return Err(OxenHttpError::BadRequest(
+            "Request body is not a valid JSON object".into(),
+        ));
+    }
+
+    let new_column: NewColumn = serde_json::from_value(body_json)?;
+
+    log::info!(
+        "create column {namespace}/{repo_name} for file {file_path:?} on in workspace id {workspace_id}"
+    );
+    log::debug!("create column with data {new_column:?}");
+
+    // Get the workspace
+    let Some(workspace) = repositories::workspaces::get(&repo, &workspace_id)? else {
+        return Ok(HttpResponse::NotFound()
+            .json(StatusMessageDescription::workspace_not_found(workspace_id)));
+    };
+
+    // Make sure the data frame is indexed
+    let is_editable = repositories::workspaces::data_frames::is_indexed(&workspace, &file_path)?;
+
+    if !is_editable {
+        return Err(OxenHttpError::DatasetNotIndexed(file_path.into()));
+    }
+
+    let column_df = repositories::workspaces::data_frames::columns::add(
+        &repo,
+        &workspace,
+        &file_path,
+        &new_column,
+    )?;
+
+    let opts = DFOpts::empty();
+    let column_schema = Schema::from_polars(column_df.schema());
+    let column_df_source = DataFrameSchemaSize::from_df(&column_df, &column_schema);
+    let column_df_view = JsonDataFrameView::from_df_opts(column_df, column_schema, &opts).await?;
+    let df_views = JsonDataFrameViews {
+        source: column_df_source,
+        view: column_df_view,
+    };
+
+    let response = JsonDataFrameColumnResponse {
+        data_frame: df_views,
+        commit: None,
+        derived_resource: None,
+        status: StatusMessage::resource_found(),
+        resource: None,
+    };
+
+    Ok(HttpResponse::Ok().json(response))
+}
+
+pub async fn delete(req: HttpRequest) -> Result<HttpResponse, OxenHttpError> {
+    let app_data = app_data(&req)?;
+
+    let namespace = path_param(&req, "namespace")?.to_string();
+    let repo_name = path_param(&req, "repo_name")?.to_string();
+    let workspace_id = path_param(&req, "workspace_id")?.to_string();
+    let repo = get_repo(app_data, namespace.clone(), repo_name.clone())?;
+    let _write = repo_locks::begin_write(&repo)?;
+    let file_path = PathBuf::from(path_param(&req, "path")?);
+    let column_name = path_param(&req, "column_name")
+        .map_err(|_| OxenHttpError::BadRequest("Column name missing in path parameters".into()))?;
+
+    let column_to_delete = ColumnToDelete {
+        name: column_name.to_string(),
+    };
+
+    log::info!(
+        "Delete column {namespace}/{repo_name} for file {file_path:?} on in workspace id {workspace_id}"
+    );
+    log::debug!("create column with data {column_to_delete:?}");
+
+    // Get the workspace
+    let Some(workspace) = repositories::workspaces::get(&repo, &workspace_id)? else {
+        return Ok(HttpResponse::NotFound()
+            .json(StatusMessageDescription::workspace_not_found(workspace_id)));
+    };
+
+    // Make sure the data frame is indexed
+    let is_editable = repositories::workspaces::data_frames::is_indexed(&workspace, &file_path)?;
+
+    if !is_editable {
+        return Err(OxenHttpError::DatasetNotIndexed(file_path.into()));
+    }
+
+    let column_df = match repositories::workspaces::data_frames::columns::delete(
+        &repo,
+        &workspace,
+        &file_path,
+        &column_to_delete,
+    ) {
+        Ok(df) => df,
+        Err(e) => {
+            log::warn!("Error deleting column: {e:?}");
+            return Err(OxenHttpError::BasicError(StringError::from(e.to_string())));
+        }
+    };
+
+    let opts = DFOpts::empty();
+    let column_schema = Schema::from_polars(column_df.schema());
+    let column_df_source = DataFrameSchemaSize::from_df(&column_df, &column_schema);
+    let column_df_view = JsonDataFrameView::from_df_opts(column_df, column_schema, &opts).await?;
+
+    let df_views = JsonDataFrameViews {
+        source: column_df_source,
+        view: column_df_view,
+    };
+
+    let response = JsonDataFrameColumnResponse {
+        data_frame: df_views,
+        commit: None,
+        derived_resource: None,
+        status: StatusMessage::resource_found(),
+        resource: None,
+    };
+
+    Ok(HttpResponse::Ok().json(response))
+}
+
+pub async fn update(req: HttpRequest, body: String) -> Result<HttpResponse, OxenHttpError> {
+    let app_data = app_data(&req)?;
+
+    let namespace = path_param(&req, "namespace")?.to_string();
+    let repo_name = path_param(&req, "repo_name")?.to_string();
+    let workspace_id = path_param(&req, "workspace_id")?.to_string();
+    let repo = get_repo(app_data, namespace.clone(), repo_name.clone())?;
+    let _write = repo_locks::begin_write(&repo)?;
+    let file_path = PathBuf::from(path_param(&req, "path")?);
+    let column_name = path_param(&req, "column_name")
+        .map_err(|_| OxenHttpError::BadRequest("Column name missing in path parameters".into()))?;
+
+    let mut body_json: Value = serde_json::from_str(&body).map_err(|_err| {
+        OxenHttpError::BadRequest("Failed to parse request body into JSON".into())
+    })?;
+
+    let mut metadata_json: Option<serde_json::Value> = None;
+    if let Some(obj) = body_json.as_object_mut() {
+        if obj.contains_key("name") {
+            let name_value = obj.remove("name").unwrap(); // Safe to unwrap because we just checked it exists
+            obj.insert("new_name".to_string(), name_value);
+        }
+        if obj.contains_key("dtype") {
+            let dtype_value = obj.remove("dtype").unwrap(); // Safe to unwrap because we just checked it exists
+            obj.insert("new_data_type".to_string(), dtype_value);
+        }
+
+        obj.insert("name".to_string(), json!(column_name));
+        if obj.contains_key("metadata") {
+            metadata_json = Some(obj.remove("metadata").unwrap()); // Safe to unwrap because we just checked it exists
+        }
+    } else {
+        return Err(OxenHttpError::BadRequest(
+            "Request body is not a valid JSON object".into(),
+        ));
+    }
+
+    let column_to_update: ColumnToUpdate = serde_json::from_value(body_json).map_err(|_err| {
+        OxenHttpError::BadRequest(
+            "Failed to parse ColumnToUpdate from modified request body".into(),
+        )
+    })?;
+
+    log::info!(
+        "Update column {namespace}/{repo_name} for file {file_path:?} on in workspace id {workspace_id}"
+    );
+    log::debug!("update column with data {column_to_update:?}");
+
+    // Get the workspace
+    let Some(workspace) = repositories::workspaces::get(&repo, &workspace_id)? else {
+        return Ok(HttpResponse::NotFound()
+            .json(StatusMessageDescription::workspace_not_found(workspace_id)));
+    };
+
+    // Make sure the data frame is indexed
+    let is_editable = repositories::workspaces::data_frames::is_indexed(&workspace, &file_path)?;
+
+    if !is_editable {
+        return Err(OxenHttpError::DatasetNotIndexed(file_path.into()));
+    }
+
+    if let Some(metadata) = metadata_json {
+        repositories::workspaces::data_frames::columns::add_column_metadata(
+            &repo,
+            &workspace,
+            file_path.clone(),
+            column_name.to_string(),
+            &metadata,
+        )?;
+    }
+
+    let column_df = repositories::workspaces::data_frames::columns::update(
+        &repo,
+        &workspace,
+        &file_path,
+        &column_to_update,
+    )
+    .await?;
+
+    let opts = DFOpts::empty();
+    let column_schema = Schema::from_polars(column_df.schema());
+    let column_df_source = DataFrameSchemaSize::from_df(&column_df, &column_schema);
+    let column_df_view = JsonDataFrameView::from_df_opts(column_df, column_schema, &opts).await?;
+
+    let mut df_views = JsonDataFrameViews {
+        source: column_df_source,
+        view: column_df_view,
+    };
+
+    let new_schema = repositories::data_frames::schemas::get_staged_schema_with_staged_db_manager(
+        &workspace.workspace_repo,
+        &file_path,
+    )?;
+    repositories::workspaces::data_frames::columns::update_column_schemas(
+        new_schema,
+        &mut df_views,
+    );
+
+    let response = JsonDataFrameColumnResponse {
+        data_frame: df_views,
+        commit: None,
+        derived_resource: None,
+        status: StatusMessage::resource_found(),
+        resource: None,
+    };
+
+    Ok(HttpResponse::Ok().json(response))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/repos/{namespace}/{repo_name}/workspaces/{workspace_id}/data_frames/columns/schema/metadata/{path}",
+    description = "Set the metadata on a single column of a data frame, the HTTP equivalent of `oxen schemas add <path> -c <column> -m '{...}'`. Staged into the workspace, so no commit is required. Replaces that column's existing metadata wholesale.",
+    tag = "Workspace Data Frames",
+    params(
+        ("namespace" = String, Path, description = "Namespace of the repository", example = "ox"),
+        ("repo_name" = String, Path, description = "Name of the repository", example = "ImageNet-1k"),
+        ("workspace_id" = String, Path, description = "ID or name of the workspace", example = "b3f27f05-0955-4076-805f-39575853b27b"),
+        ("path" = String, Path, description = "Path to the data frame within the repository", example = "annotations/train.csv"),
+    ),
+    request_body(
+        content = String,
+        description = "The column to annotate and the metadata to store on it. `_oxen.render.func` controls how oxen renders the column's values.",
+        example = json!({
+            "column_name": "file",
+            "metadata": { "_oxen": { "render": { "func": "image" } } }
+        })
+    ),
+    responses(
+        (status = 200, description = "Column metadata updated", body = StatusMessage),
+        (status = 400, description = "Invalid request body, missing `column_name`, the path is not a tabular data frame, or the column does not exist in the schema"),
+        (status = 404, description = "Repository, workspace, or data frame not found"),
+        (status = 409, description = "The data frame is staged for removal in this workspace")
+    )
+)]
+pub async fn add_column_metadata(
+    req: HttpRequest,
+    body: String,
+) -> Result<HttpResponse, OxenHttpError> {
+    let app_data = app_data(&req)?;
+
+    let namespace = path_param(&req, "namespace")?.to_string();
+    let repo_name = path_param(&req, "repo_name")?.to_string();
+    let workspace_id = path_param(&req, "workspace_id")?.to_string();
+    let path = path_param(&req, "path")?.to_string();
+    let repo = get_repo(app_data, namespace, repo_name)?;
+    let _write = repo_locks::begin_write(&repo)?;
+
+    let Some(workspace) = repositories::workspaces::get(&repo, &workspace_id)? else {
+        return Ok(HttpResponse::NotFound()
+            .json(StatusMessageDescription::workspace_not_found(workspace_id)));
+    };
+
+    let parsed_json: serde_json::Value = serde_json::from_str(&body)?;
+
+    // Extract the column_name and metadata from the parsed JSON
+    let column_name = parsed_json["column_name"]
+        .as_str()
+        .ok_or_else(|| OxenHttpError::BasicError("column_name is required".into()))?;
+    let column_metadata = &parsed_json["metadata"];
+
+    repositories::workspaces::data_frames::columns::add_column_metadata(
+        &repo,
+        &workspace,
+        path.into(),
+        column_name.to_string(),
+        column_metadata,
+    )?;
+
+    Ok(HttpResponse::Ok().json(StatusMessage::resource_updated()))
+}

@@ -1,0 +1,958 @@
+use duckdb::Connection;
+
+use crate::constants::{
+    EVAL_DURATION_COL, EVAL_ERROR_COL, EVAL_STATUS_COL, EXCLUDE_OXEN_COLS, OXEN_ID_COL,
+    OXEN_ROW_ID_COL, TABLE_NAME,
+};
+use crate::core::db::data_frames::DataFrameError;
+use crate::core::db::data_frames::df_db;
+use crate::core::db::data_frames::df_db::{with_db_closed, with_df_db_manager};
+use crate::core::db::data_frames::workspace_df_db::schema_without_oxen_cols;
+use crate::core::staged::get_staged_db_manager;
+use crate::core::v_latest::workspaces::files::{add, track_modified_data_frame};
+use crate::repositories::workspaces::data_frames::duckdb_path_in_dir;
+use crate::repositories::workspaces::{
+    list_dirs as list_workspace_dirs, read_config as read_workspace_config,
+};
+use parking_lot::Mutex;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use crate::model::merkle_tree::node::{
+    EMerkleTreeNode, FileNode, MerkleTreeNode, StagedMerkleTreeNode,
+};
+use crate::model::metadata::generic_metadata::GenericMetadata;
+use crate::model::{
+    Commit, EntryDataType, LocalRepository, MerkleHash, Schema, StagedEntryStatus, Workspace,
+};
+use crate::repositories;
+use crate::{error::OxenError, util};
+use std::path::{Path, PathBuf};
+
+pub mod columns;
+pub mod rows;
+pub mod schemas;
+
+/// Stage an edit to a data frame's tabular schema, applying `mutate` to the
+/// schema on its staged file node. Returns the updated schema.
+pub(crate) fn stage_schema_metadata_update<F>(
+    repo: &LocalRepository,
+    workspace: &Workspace,
+    file_path: &Path,
+    mutate: F,
+) -> Result<Schema, OxenError>
+where
+    F: FnOnce(&mut Schema) -> Result<(), OxenError>,
+{
+    let path = util::fs::path_relative_to_dir(file_path, &workspace.workspace_repo.path)?;
+    // Read everything the edit needs before taking the staged-db write lock.
+    let committed_node = repositories::tree::get_file_by_path(repo, &workspace.commit, &path)?;
+    let table_schema = staged_table_schema(workspace, &path)?;
+
+    let staged_db_manager = get_staged_db_manager(&workspace.workspace_repo)?;
+    let staged = staged_db_manager.edit_staged_node(&path, |staged| {
+        let (mut file_node, status) = match staged {
+            Some(staged) => (staged.node.file()?, staged.status),
+            None => (
+                committed_node.ok_or_else(|| OxenError::path_does_not_exist(&path))?,
+                StagedEntryStatus::Modified,
+            ),
+        };
+
+        let Some(GenericMetadata::MetadataTabular(m)) = file_node.get_mut_metadata() else {
+            return Err(OxenError::NotADataFrame(path.clone().into()));
+        };
+        // The staged table is authoritative for columns a workspace edit
+        // added, removed, or retyped, and carries the metadata over by name.
+        if let Some(mut table_schema) = table_schema {
+            table_schema.update_metadata_from_schema(&m.tabular.schema);
+            m.tabular.schema = table_schema;
+        }
+        mutate(&mut m.tabular.schema)?;
+        m.tabular.width = m.tabular.schema.fields.len();
+        m.tabular.schema.recompute_hash();
+
+        file_node.set_name(path.to_string_lossy().as_ref());
+        file_node.recompute_metadata_hashes()?;
+        Ok(StagedMerkleTreeNode {
+            status,
+            node: MerkleTreeNode::from_file(file_node),
+        })
+    })?;
+
+    let Some(GenericMetadata::MetadataTabular(m)) = staged.node.file()?.metadata() else {
+        return Err(OxenError::InternalError(
+            format!("Staged node for {path:?} lost its tabular metadata").into(),
+        ));
+    };
+    Ok(m.tabular.schema)
+}
+
+/// Schema of the workspace's staged DuckDB table, or `None` if the data frame
+/// was never indexed. A db file without the staged table also yields `None`:
+/// its empty schema would wipe the committed metadata.
+fn staged_table_schema(workspace: &Workspace, path: &Path) -> Result<Option<Schema>, OxenError> {
+    let db_path = repositories::workspaces::data_frames::duckdb_path(workspace, path);
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let table_schema = with_df_db_manager(&db_path, |manager| {
+        manager.with_conn(|conn| {
+            if !df_db::table_exists(conn, TABLE_NAME)? {
+                return Ok(None);
+            }
+            Ok(Some(schema_without_oxen_cols(conn, TABLE_NAME)?))
+        })
+    })?;
+    Ok(table_schema)
+}
+
+pub fn is_queryable_data_frame_indexed(
+    repo: &LocalRepository,
+    commit: &Commit,
+    path: impl AsRef<Path>,
+) -> Result<bool, OxenError> {
+    match get_queryable_data_frame_workspace(repo, path, commit) {
+        Ok(_workspace) => Ok(true),
+        Err(e) => match e {
+            OxenError::QueryableWorkspaceNotFound => Ok(false),
+            _ => Err(e),
+        },
+    }
+}
+
+// Annoying that we have to pass in the path and the file node here
+pub fn is_queryable_data_frame_indexed_from_file_node(
+    repo: &LocalRepository,
+    file_node: &FileNode,
+    path: &Path,
+) -> Result<bool, OxenError> {
+    let dir = find_queryable_workspace_dir(repo, file_node.last_commit_id(), path)?;
+    Ok(dir.is_some())
+}
+
+/// Directory of the non-editable workspace holding a fully-indexed queryable table for `path` at
+/// `commit_id`, or `None` when no workspace holds one. Costs one config read per workspace in the
+/// repo, and loads no workspace.
+fn find_queryable_workspace_dir(
+    repo: &LocalRepository,
+    commit_id: &MerkleHash,
+    path: &Path,
+) -> Result<Option<PathBuf>, OxenError> {
+    log::debug!("Looking for workspace with commit id {commit_id:?}");
+
+    for workspace_dir in list_workspace_dirs(repo)? {
+        let Some(config) = read_workspace_config(&workspace_dir)? else {
+            // A workspace dir with no config is one being created or torn down.
+            log::debug!("No workspace config in {workspace_dir:?}, skipping");
+            continue;
+        };
+        // Matching on parsed hashes, not strings: an unparseable id names no commit at all.
+        let Ok(workspace_commit_id) = config.workspace_commit_id.parse::<MerkleHash>() else {
+            log::warn!(
+                "Workspace {workspace_dir:?} is pinned to an unreadable commit id {:?}, skipping",
+                config.workspace_commit_id
+            );
+            continue;
+        };
+        if config.is_editable || workspace_commit_id != *commit_id {
+            continue;
+        }
+
+        let db_path = duckdb_path_in_dir(&workspace_dir, path);
+        if !db_path.exists() {
+            continue;
+        }
+
+        // Only treat this as the queryable workspace if its DuckDB table is
+        // fully indexed (all OXEN_COLS present). A missing file, or a partial
+        // table left by an interrupted index, is treated as not indexed so the
+        // caller rebuilds rather than serving a table the read path can't bind.
+        match with_df_db_manager(&db_path, |manager| {
+            manager.with_conn(|conn| Ok(df_db::table_is_fully_indexed(conn, TABLE_NAME)?))
+        }) {
+            Ok(true) => return Ok(Some(workspace_dir)),
+            Ok(false) => {}
+            Err(e) => log::warn!("Failed to check index completeness for {db_path:?}: {e}"),
+        }
+    }
+
+    Ok(None)
+}
+
+pub fn get_queryable_data_frame_workspace_from_file_node(
+    repo: &LocalRepository,
+    commit_id: &MerkleHash,
+    path: &Path,
+) -> Result<Workspace, OxenError> {
+    let Some(workspace_dir) = find_queryable_workspace_dir(repo, commit_id, path)? else {
+        return Err(OxenError::QueryableWorkspaceNotFound);
+    };
+
+    repositories::workspaces::get_by_dir(repo, &workspace_dir)?
+        .ok_or(OxenError::QueryableWorkspaceNotFound)
+}
+
+pub fn get_queryable_data_frame_workspace(
+    repo: &LocalRepository,
+    path: impl AsRef<Path>,
+    commit: &Commit,
+) -> Result<Workspace, OxenError> {
+    let path = path.as_ref();
+    log::debug!("get_queryable_data_frame_workspace path: {path:?}");
+    let file_node = repositories::tree::get_file_by_path(repo, commit, path)?
+        .ok_or_else(|| OxenError::path_does_not_exist(path))?;
+    if *file_node.data_type() != EntryDataType::Tabular {
+        return Err(OxenError::basic_str(
+            "File format not supported, must be tabular.",
+        ));
+    }
+    get_queryable_data_frame_workspace_from_file_node(repo, &commit.id.parse()?, path)
+}
+
+pub async fn index(workspace: &Workspace, path: &Path) -> Result<(), OxenError> {
+    // Is tabular just looks at the file extensions
+    let file_node =
+        repositories::tree::get_file_by_path(&workspace.base_repo, &workspace.commit, path)?
+            .ok_or_else(|| OxenError::path_does_not_exist(path))?;
+    if *file_node.data_type() != EntryDataType::Tabular {
+        return Err(OxenError::basic_str(
+            "File format not supported, must be tabular.",
+        ));
+    }
+
+    log::debug!("core::v_latest::workspaces::data_frames::index({path:?})");
+
+    let repo = &workspace.base_repo;
+    let commit = &workspace.commit;
+
+    log::debug!("core::v_latest::workspaces::data_frames::index({path:?}) got commit {commit:?}");
+
+    let Ok(Some(commit_merkle_tree)) =
+        repositories::tree::get_node_by_path_with_children(repo, commit, path)
+    else {
+        return Err(OxenError::basic_str(format!(
+            "Merkle tree for commit {commit} not found"
+        )));
+    };
+
+    let file_hash = commit_merkle_tree.hash;
+
+    log::debug!(
+        "core::v_latest::workspaces::data_frames::index({path:?}) got file hash {file_hash:?}"
+    );
+
+    let db_path = repositories::workspaces::data_frames::duckdb_path(workspace, path);
+
+    let Some(parent) = db_path.parent() else {
+        return Err(OxenError::basic_str(format!(
+            "Failed to get parent directory for {db_path:?}"
+        )));
+    };
+    util::fs::create_dir_all(parent)?;
+
+    let version_store = repo.version_store();
+    let hash_str = file_hash.to_string();
+
+    // DuckDB's `read_*()` can only ingest a local filesystem path, so materialize the version file.
+    // The guard `version_file` is held on the async side (its drop runs after the blocking index
+    // below) so a materialized S3 temp outlives the read; the closure takes a plain path copy.
+    let version_file = version_store.materialize(&hash_str, parent).await?;
+    let version_path = version_file.to_pathbuf();
+
+    log::debug!(
+        "core::v_latest::index::workspaces::data_frames::index({path:?}) got version path: {version_path:?}"
+    );
+
+    let extension = match &commit_merkle_tree.node {
+        EMerkleTreeNode::File(file_node) => file_node.extension().to_string(),
+        _ => {
+            return Err(OxenError::basic_str("File node is not a file node"));
+        }
+    };
+
+    // DuckDB indexing is blocking file IO plus a full parse, so run it off the async runtime per
+    // the sync-core / async-edge policy. The DuckDB connection lives entirely inside the closure
+    // (it never crosses an `.await`), and `version_file` is held on the async side until the
+    // blocking work finishes, so a materialized S3 temp file outlives the read.
+    tokio::task::spawn_blocking(move || {
+        with_df_db_manager(&db_path, |manager| {
+            manager.with_conn(|conn| {
+                // Drop any prior table (possibly partial or stale) and commit that
+                // drop before the rebuild, so a failed rebuild leaves no table at
+                // all rather than rolling back to a partial one.
+                if df_db::table_exists(conn, TABLE_NAME)? {
+                    df_db::drop_table(conn, TABLE_NAME)?;
+                }
+
+                // A workspace data frame is only queryable once the hidden
+                // `_oxen_id` column is present, so build the table inside a
+                // transaction and publish it only on success. On any failure, roll
+                // back (and drop defensively) so the read path never sees a
+                // half-built table.
+                conn.execute_batch("BEGIN TRANSACTION")?;
+                let build = (|| -> Result<(), DataFrameError> {
+                    df_db::index_file_with_id(&version_path, conn, &extension)?;
+                    Ok(())
+                })();
+                match build {
+                    Ok(()) => {
+                        conn.execute_batch("COMMIT")?;
+                        // Fold the WAL into the db file right away. The
+                        // indexing DDL includes function defaults (uuid(),
+                        // nextval()) whose WAL entries the bundled DuckDB
+                        // cannot replay after an unclean shutdown; once
+                        // checkpointed they are out of the WAL entirely.
+                        // Best-effort: a concurrent transaction can block a
+                        // checkpoint, and the next clean open checkpoints too.
+                        if let Err(e) = conn.execute_batch("CHECKPOINT") {
+                            log::warn!("index: CHECKPOINT after build failed for {db_path:?}: {e}");
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        let _ = df_db::drop_table(conn, TABLE_NAME);
+                        Err(e)
+                    }
+                }
+            })
+        })
+    })
+    .await??;
+
+    log::debug!("core::v_latest::index::workspaces::data_frames::index({path:?}) finished!");
+
+    Ok(())
+}
+
+/// Legacy per-row tracking columns older versions of oxen wrote into the staged
+/// table and the current staged format dropped. Frozen here as literals rather
+/// than references to the diff-feature's live constants: they name columns that
+/// exist only in tables already written to disk, so their spelling must not
+/// change even if a same-named live constant is later renamed or removed —
+/// `_oxen_diff_hash` already lost its constant entirely.
+const LEGACY_DIFF_STATUS_COL: &str = "_oxen_diff_status";
+const LEGACY_DIFF_HASH_COL: &str = "_oxen_diff_hash";
+
+/// Every column name Oxen has written internally to a staged DuckDB table, past
+/// or present. When recovering a table left by an older version (or an
+/// interrupted current index), a column matching one of these is Oxen-internal
+/// and is dropped — never treated as user data — while rebuilding. Superset of
+/// [`EXCLUDE_OXEN_COLS`], which lists only what the current indexer emits.
+///
+/// Columns the current format still writes reference their live constants, so
+/// this list follows whatever today's indexer emits. Columns only older versions
+/// wrote are frozen literals ([`LEGACY_DIFF_STATUS_COL`]/[`LEGACY_DIFF_HASH_COL`]):
+/// they must keep their exact on-disk spelling regardless of what any current
+/// constant is later renamed to. Treat the list as append-only — add names,
+/// never repurpose one.
+///
+/// Matching is exact — a not-fully-indexed table was written by an indexer that
+/// reserved all of these names, so a column named like one of them is never user
+/// data in this context.
+const LEGACY_AND_CURRENT_INTERNAL_COLS: [&str; 7] = [
+    // Current staged-table columns (see index_file_with_id).
+    OXEN_ID_COL,
+    OXEN_ROW_ID_COL,
+    // Auxiliary columns the eval flow may add.
+    EVAL_STATUS_COL,
+    EVAL_ERROR_COL,
+    EVAL_DURATION_COL,
+    // Present only in tables older versions wrote.
+    LEGACY_DIFF_STATUS_COL,
+    LEGACY_DIFF_HASH_COL,
+];
+
+/// Rebuild a staged DuckDB table left by an older version of oxen (or an
+/// interrupted index) from its OWN current rows, preserving the staged edits —
+/// unlike [`index`], which rebuilds from the committed base version file and so
+/// discards anything staged but not yet committed.
+///
+/// Older versions tracked edits with extra internal columns and soft-deleted
+/// rows by tombstoning them (`_oxen_diff_status = 'removed'`) instead of removing
+/// them. This drops every historical internal column and omits tombstoned rows,
+/// so the rebuilt table holds exactly the data the staged edits intended —
+/// appended and modified rows kept, deleted rows gone — re-keyed in the current
+/// index format (fresh `_oxen_id`/`_oxen_row_id` and the index marker).
+///
+/// Call only for a table that exists but fails
+/// [`is_indexed`](crate::repositories::workspaces::data_frames::is_indexed);
+/// afterward it passes that gate and exports/commits like any freshly indexed
+/// table. Returns [`OxenError::WorkspaceStaleStagedIndex`] when the table has no
+/// user columns to recover.
+pub async fn reindex_preserving_rows(workspace: &Workspace, path: &Path) -> Result<(), OxenError> {
+    let db_path = repositories::workspaces::data_frames::duckdb_path(workspace, path);
+    let extension = util::fs::extension_from_path(path);
+
+    let Some(parent) = db_path.parent().map(Path::to_path_buf) else {
+        return Err(OxenError::basic_str(format!(
+            "Failed to get parent directory for {db_path:?}"
+        )));
+    };
+
+    // Export to a sibling temp file, then re-index it through the current
+    // indexer. The intermediate carries the data frame's own extension so the
+    // rebuilt table matches what committing and then re-indexing would produce.
+    let recover_path = parent.join(format!(".oxen-recover.{}.{extension}", std::process::id()));
+    if !is_valid_export_extension(&recover_path) {
+        return Err(OxenError::WorkspaceStaleStagedIndex(
+            format!("Cannot recover staged data frame {path:?}: unsupported format {extension:?}.")
+                .into(),
+        ));
+    }
+
+    let recovered = tokio::task::spawn_blocking(move || -> Result<bool, OxenError> {
+        let outcome = with_df_db_manager(&db_path, |manager| {
+            manager.with_conn(|conn| -> Result<bool, DataFrameError> {
+                let schema = df_db::get_schema(conn, TABLE_NAME)?;
+                let has_col = |name: &str| schema.fields.iter().any(|f| f.name == name);
+                let has_user_col = schema
+                    .fields
+                    .iter()
+                    .any(|f| !LEGACY_AND_CURRENT_INTERNAL_COLS.contains(&f.name.as_str()));
+                if !has_user_col {
+                    // Nothing but internal columns — no user data to preserve.
+                    return Ok(false);
+                }
+
+                let projection = build_export_projection_excluding(
+                    conn,
+                    TABLE_NAME,
+                    &LEGACY_AND_CURRENT_INTERNAL_COLS,
+                )?;
+
+                // Keep row order: prefer the persisted ordering column, falling
+                // back to DuckDB's physical rowid (insertion order) for older
+                // tables that predate it.
+                let order_by = if has_col(OXEN_ROW_ID_COL) {
+                    format!("ORDER BY {OXEN_ROW_ID_COL}")
+                } else {
+                    "ORDER BY rowid".to_string()
+                };
+
+                // Honor the old soft-delete semantics: a row tombstoned as
+                // 'removed' is a pending deletion and must not be resurrected.
+                let where_clause = if has_col(LEGACY_DIFF_STATUS_COL) {
+                    format!("WHERE \"{LEGACY_DIFF_STATUS_COL}\" IS DISTINCT FROM 'removed'")
+                } else {
+                    String::new()
+                };
+
+                // Quote the table name as an identifier so it binds as a table
+                // reference rather than relying on DuckDB's string-literal
+                // replacement-scan fallback.
+                let select = format!(
+                    "SELECT {projection} FROM {} {where_clause} {order_by}",
+                    df_db::quote_ident(TABLE_NAME)
+                );
+                let copy = wrap_sql_for_export(&select, &recover_path);
+                conn.execute(&copy, [])?;
+
+                // Rebuild inside a transaction: drop the stale table, then index
+                // the exported rows in the current format. On failure roll back
+                // so the original stale table is left intact.
+                conn.execute_batch("BEGIN TRANSACTION")?;
+                let build = (|| -> Result<(), DataFrameError> {
+                    df_db::drop_table(conn, TABLE_NAME)?;
+                    df_db::index_file_with_id(&recover_path, conn, &extension)?;
+                    Ok(())
+                })();
+                match build {
+                    Ok(()) => {
+                        conn.execute_batch("COMMIT")?;
+                        if let Err(e) = conn.execute_batch("CHECKPOINT") {
+                            log::warn!(
+                                "reindex_preserving_rows: CHECKPOINT failed for {db_path:?}: {e}"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return Err(e);
+                    }
+                }
+                Ok(true)
+            })
+        });
+        // Clean up the intermediate export regardless of the rebuild's result.
+        let _ = std::fs::remove_file(&recover_path);
+        Ok(outcome?)
+    })
+    .await??;
+
+    if !recovered {
+        return Err(OxenError::WorkspaceStaleStagedIndex(
+            format!(
+                "Cannot recover staged data frame {path:?}: the staged table has no user \
+                 columns. Re-index the data frame or unstage it, then commit again."
+            )
+            .into(),
+        ));
+    }
+
+    Ok(())
+}
+
+pub async fn rename(
+    workspace: &Workspace,
+    path: impl AsRef<Path>,
+    new_path: impl AsRef<Path>,
+) -> Result<PathBuf, OxenError> {
+    let path = path.as_ref();
+    let new_path = new_path.as_ref();
+    let workspace_repo = &workspace.workspace_repo;
+
+    // Handle duckdb file operations first
+    let og_db_path = repositories::workspaces::data_frames::duckdb_path(workspace, path);
+    let og_db_path_parent = og_db_path.parent().unwrap();
+    let new_db_path = repositories::workspaces::data_frames::duckdb_path(workspace, new_path);
+    let new_db_path_parent = new_db_path.parent().unwrap();
+
+    // The source database is closed and held while its files are copied and removed, so nothing
+    // can write into a database that is about to be deleted. Closing checkpoints the WAL into the
+    // database file first, so the copy carries a whole database and no WAL file that would be
+    // replayed against the copy.
+    with_db_closed(&og_db_path, || -> Result<(), OxenError> {
+        if !new_db_path_parent.exists() {
+            util::fs::create_dir_all(new_db_path_parent)?;
+        }
+        util::fs::copy_dir_all(og_db_path_parent, new_db_path_parent)?;
+        util::fs::remove_dir_all(og_db_path_parent)?;
+        Ok(())
+    })?;
+
+    // Use staged_db_manager
+    let staged_db_manager = get_staged_db_manager(workspace_repo)?;
+    let mut staged_entry = staged_db_manager.read_from_staged_db(path)?;
+
+    if staged_entry.is_none() {
+        let workspace_file_path = workspace.workspace_repo.path.join(new_path);
+
+        // Export the file from the version path to the new path, setting mtime from merkle record
+        if let Some(existing_file_node) =
+            repositories::tree::get_file_by_path(&workspace.base_repo, &workspace.commit, path)?
+        {
+            let version_store = workspace.base_repo.version_store();
+            let hash = existing_file_node.hash().to_string();
+            let mtime = SystemTime::UNIX_EPOCH
+                + Duration::from_secs(existing_file_node.last_modified_seconds() as u64)
+                + Duration::from_nanos(existing_file_node.last_modified_nanoseconds() as u64);
+            version_store
+                .copy_version_to_path(&hash, &workspace_file_path, mtime)
+                .await?;
+        }
+
+        // Check if the new path exists in the merkle tree, if it does, it is modified
+        let is_modified = repositories::tree::get_file_by_path(
+            &workspace.base_repo,
+            &workspace.commit,
+            new_path,
+        )?
+        .is_some();
+        log::debug!(
+            "rename is_modified: {is_modified:?} workspace_file_path: {workspace_file_path:?}"
+        );
+
+        if is_modified {
+            track_modified_data_frame(workspace, new_path)?;
+        } else {
+            add(workspace, &workspace_file_path).await?;
+        }
+
+        // Read the staged entry again after adding
+        staged_entry = get_staged_db_manager(workspace_repo)?.read_from_staged_db(new_path)?;
+        log::debug!("rename: staged_entry after add: {staged_entry:?}");
+    }
+
+    let mut new_staged_entry = staged_entry
+        .ok_or_else(|| OxenError::basic_str(format!("rename: staged entry not found: {path:?}")))?;
+
+    // Update the file name in the staged entry
+    if let EMerkleTreeNode::File(file) = &mut new_staged_entry.node.node {
+        file.set_name(new_path.to_str().unwrap());
+    }
+
+    // Set status to Added since we're moving to a new location
+    new_staged_entry.status = StagedEntryStatus::Added;
+
+    // Get the file node from the staged entry
+    let file_node = new_staged_entry.node.file()?;
+
+    let staged_db_manager = get_staged_db_manager(workspace_repo)?;
+    // Add the file node at the new path using staged_db_manager
+    staged_db_manager.upsert_file_node(new_path, new_staged_entry.status, &file_node)?;
+
+    // Delete the old path entry
+    staged_db_manager.delete_entry(path)?;
+
+    // Add parent directories for the new path
+    let seen_dirs = Arc::new(Mutex::new(HashSet::new()));
+    staged_db_manager.add_parent_directories(new_path, &seen_dirs)?;
+
+    let relative_path = util::fs::path_relative_to_dir(new_path, &workspace_repo.path)?;
+    Ok(relative_path)
+}
+
+pub fn extract_file_node_to_working_dir(
+    workspace: &Workspace,
+    dir_path: &Path,
+    file_node: &FileNode,
+) -> Result<PathBuf, OxenError> {
+    log::debug!("extract_file_node_to_working_dir dir_path: {dir_path:?} file_node: {file_node}");
+    let workspace_repo = &workspace.workspace_repo;
+    let path = PathBuf::from(file_node.name());
+
+    let working_path = workspace_repo.path.join(&path);
+    log::debug!("extracting file node to working dir: {working_path:?}");
+    let db_path = repositories::workspaces::data_frames::duckdb_path(workspace, &path);
+
+    // Match on the extension
+    if !working_path.exists() {
+        util::fs::create_dir_all(
+            working_path
+                .parent()
+                .expect("Failed to get parent directory"),
+        )?;
+    }
+
+    // Export to a sibling temp file, then rename into place so a concurrent
+    // reader of the working path never sees a torn or partial export. The
+    // `.oxentmp.` infix lets fsck reclaim an orphan from a killed export; the
+    // real extension stays last so wrap_sql_for_export picks the right format.
+    let file_name = working_path
+        .file_name()
+        .ok_or_else(|| OxenError::internal_error(format!("Invalid export path: {working_path:?}")))?
+        .to_string_lossy()
+        .to_string();
+    let export_path = working_path.with_file_name(format!(
+        ".oxentmp.{}.export-{}",
+        std::process::id(),
+        file_name
+    ));
+
+    with_df_db_manager(&db_path, |manager| {
+        manager.with_conn(|conn| {
+            let projection = build_export_projection(conn, TABLE_NAME)?;
+            // Ordered so the committed file keeps the stable row order —
+            // DuckDB UPDATEs physically relocate rows, so an unordered COPY
+            // would reshuffle the file after any edit.
+            let sql = format!("SELECT {projection} FROM '{TABLE_NAME}' ORDER BY {OXEN_ROW_ID_COL}");
+            let query = wrap_sql_for_export(&sql, &export_path);
+            log::debug!("extracting file node to working dir query: {query:?}");
+            conn.execute(&query, [])?;
+            Ok(())
+        })
+    })?;
+
+    // wrap_sql_for_export falls back to a bare SELECT (no COPY, no file) for
+    // extensions it doesn't know how to export; only publish when the COPY
+    // actually produced the temp file.
+    if export_path.exists() {
+        // fsync before the rename so a crash can't leave the published file
+        // pointing at unflushed bytes. Open writable: sync_all maps to
+        // FlushFileBuffers on Windows, which rejects a read-only handle.
+        let exported = std::fs::OpenOptions::new().write(true).open(&export_path)?;
+        exported.sync_all()?;
+        drop(exported);
+        util::fs::rename(&export_path, &working_path)?;
+    }
+
+    Ok(working_path)
+}
+
+pub const VALID_EXPORT_EXTENSIONS: [&str; 6] = ["csv", "tsv", "parquet", "jsonl", "json", "ndjson"];
+
+pub fn is_valid_export_extension(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .unwrap_or_default()
+        .to_str()
+        .unwrap_or_default();
+    VALID_EXPORT_EXTENSIONS.contains(&extension)
+}
+
+pub fn wrap_sql_for_export(sql: &str, path: &Path) -> String {
+    let extension = path
+        .extension()
+        .unwrap_or_default()
+        .to_str()
+        .unwrap_or_default();
+    match extension {
+        "csv" => format!(
+            "COPY ({}) TO '{}' (HEADER, DELIMITER ',');",
+            sql,
+            path.to_string_lossy()
+        ),
+        "tsv" => format!(
+            "COPY ({}) TO '{}' (HEADER, DELIMITER '\t');",
+            sql,
+            path.to_string_lossy()
+        ),
+        "parquet" => format!(
+            "COPY ({}) TO '{}' (FORMAT PARQUET);",
+            sql,
+            path.to_string_lossy()
+        ),
+        "jsonl" | "ndjson" => format!(
+            "COPY ({}) TO '{}' (FORMAT JSON);",
+            sql,
+            path.to_string_lossy()
+        ),
+        "json" => format!(
+            "COPY ({}) TO '{}' (FORMAT JSON, ARRAY true);",
+            sql,
+            path.to_string_lossy()
+        ),
+        _ => sql.to_string(),
+    }
+}
+
+/// Build the explicit `SELECT` projection used when exporting the staged DuckDB
+/// table to the working tree, omitting the oxen-internal columns
+/// ([`EXCLUDE_OXEN_COLS`]).
+///
+/// Columns whose DuckDB `data_type` is `JSON` or `JSON[]` are wrapped so that a
+/// stored value which isn't valid JSON is preserved as a JSON string rather than
+/// aborting the export:
+///
+/// ```sql
+/// CASE WHEN "col" IS NULL OR json_valid(CAST("col" AS VARCHAR))
+///      THEN "col"
+///      ELSE to_json(CAST("col" AS VARCHAR)) END AS "col"
+/// ```
+///
+/// Rows written before insert-time JSON validation was added can hold raw
+/// non-JSON text in JSON-typed columns. `COPY ... (FORMAT JSON)` re-parses each
+/// value and throws a "Malformed JSON" error on those, failing the whole
+/// data-frame export. `json_valid` returns false (it does not throw) on invalid
+/// input, so the wrap is a no-op for valid data and only rewrites
+/// genuinely-corrupt values. Only the JSON writer (jsonl/ndjson/json) re-parses
+/// these values; the csv/tsv/parquet export paths are unaffected, and this
+/// projection is a safe identity for them.
+///
+/// Columns are emitted in `ordinal_position` order so the exported schema matches
+/// the table.
+fn build_export_projection(conn: &Connection, table_name: &str) -> Result<String, duckdb::Error> {
+    build_export_projection_excluding(conn, table_name, &EXCLUDE_OXEN_COLS)
+}
+
+/// As [`build_export_projection`], but omits exactly the columns in `exclude`
+/// rather than the current [`EXCLUDE_OXEN_COLS`]. Recovering a table left by an
+/// older version passes the full historical internal-column set
+/// ([`LEGACY_AND_CURRENT_INTERNAL_COLS`]) so legacy tracking columns
+/// (`_oxen_diff_status`, `_oxen_diff_hash`) don't leak into the export as user
+/// data.
+fn build_export_projection_excluding(
+    conn: &Connection,
+    table_name: &str,
+    exclude: &[&str],
+) -> Result<String, duckdb::Error> {
+    let cols_query = format!(
+        "SELECT column_name, data_type FROM information_schema.columns \
+         WHERE table_name = '{table_name}' ORDER BY ordinal_position"
+    );
+
+    let cols: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(&cols_query)?;
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(Result::ok)
+        .collect()
+    };
+
+    let projection: Vec<String> = cols
+        .into_iter()
+        .filter(|(name, _)| !exclude.contains(&name.as_str()))
+        .map(|(name, data_type)| {
+            if data_type == "JSON" || data_type == "JSON[]" {
+                json_tolerant_export_expr(&name)
+            } else {
+                df_db::quote_ident(&name)
+            }
+        })
+        .collect();
+
+    Ok(projection.join(", "))
+}
+
+/// Projection expression for a single `JSON`/`JSON[]` column that tolerates a
+/// stored value which isn't valid JSON. `json_valid` returns false (never throws)
+/// on invalid input, so valid values pass through unchanged (the `THEN` branch)
+/// and only genuinely-corrupt values are rewritten into a valid JSON string (the
+/// `ELSE` branch). See [`build_export_projection`] for why corrupt values exist.
+fn json_tolerant_export_expr(name: &str) -> String {
+    let ident = df_db::quote_ident(name);
+    format!(
+        "CASE WHEN {ident} IS NULL OR json_valid(CAST({ident} AS VARCHAR)) \
+         THEN {ident} ELSE to_json(CAST({ident} AS VARCHAR)) END AS {ident}"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::db::data_frames::df_db;
+    use crate::test;
+
+    /// The export projection must wrap `JSON` and `JSON[]` columns in the
+    /// invalid-JSON-tolerant `CASE` expression, project everything else as-is,
+    /// drop the oxen-internal columns, and preserve `ordinal_position` order.
+    #[test]
+    fn test_build_export_projection_wraps_json_columns() -> Result<(), OxenError> {
+        if std::env::consts::OS == "windows" {
+            return Ok(());
+        }
+        test::run_empty_dir_test(|dir| {
+            let conn = df_db::get_connection(&dir.join("db"))?;
+            // Column order here is the order information_schema reports.
+            conn.execute(
+                &format!(
+                    "CREATE TABLE {TABLE_NAME} (\
+                       \"name\" VARCHAR, \
+                       \"meta\" JSON, \
+                       \"count\" BIGINT, \
+                       \"tags\" JSON[], \
+                       \"{oxen_id}\" VARCHAR, \
+                       \"{eval_status}\" VARCHAR)",
+                    oxen_id = crate::constants::OXEN_ID_COL,
+                    eval_status = crate::constants::EVAL_STATUS_COL,
+                ),
+                [],
+            )?;
+
+            let projection = build_export_projection(&conn, TABLE_NAME)?;
+
+            let expected = format!(
+                "\"name\", {}, \"count\", {}",
+                json_tolerant_export_expr("meta"),
+                json_tolerant_export_expr("tags"),
+            );
+            assert_eq!(projection, expected);
+
+            // The wrap must reference json_valid / to_json so a corrupt value
+            // can't abort the COPY ... (FORMAT JSON) re-serialization.
+            assert!(projection.contains("json_valid"));
+            assert!(projection.contains("to_json"));
+            // Oxen-internal columns are dropped, never emitted.
+            assert!(!projection.contains(crate::constants::OXEN_ID_COL));
+            assert!(!projection.contains(crate::constants::EVAL_STATUS_COL));
+            Ok(())
+        })
+    }
+
+    /// The tolerant `CASE` wrap must turn a value that isn't valid JSON into a
+    /// JSON string that survives `COPY ... (FORMAT JSON)`, while valid values
+    /// pass through untouched. DuckDB 1.5.2 validates JSON on every ingestion
+    /// path (insert, cast, `read_json`, `read_parquet`), so the corrupt
+    /// JSON-column state this guards against can only originate from data
+    /// written by older engines and can't be synthesized here. We instead
+    /// exercise the exact projection SQL: `CAST(json_col AS VARCHAR)` yields the
+    /// raw stored bytes, so feeding the wrap a `VARCHAR` reproduces the runtime
+    /// behavior on those bytes.
+    #[test]
+    fn test_json_tolerant_export_neutralizes_invalid_json() -> Result<(), OxenError> {
+        if std::env::consts::OS == "windows" {
+            return Ok(());
+        }
+        test::run_empty_dir_test(|dir| {
+            let conn = df_db::get_connection(&dir.join("db"))?;
+            // 'Insufficient credits' mimics a legacy value: a plain string
+            // stored in a JSON-typed column; '{"a":1}' is genuinely valid
+            // JSON; NULL takes the IS NULL guard.
+            conn.execute("CREATE TABLE t (v VARCHAR, ord INTEGER)", [])?;
+            conn.execute(
+                "INSERT INTO t VALUES ('Insufficient credits', 1), ('{\"a\":1}', 2), (NULL, 3)",
+                [],
+            )?;
+
+            let expr = json_tolerant_export_expr("v");
+            let out = dir.join("out.jsonl");
+            let query = wrap_sql_for_export(&format!("SELECT {expr} FROM t ORDER BY ord"), &out);
+
+            // Must NOT raise "Malformed JSON" the way a bare `SELECT v` would on
+            // a corrupt JSON column.
+            conn.execute(&query, [])?;
+
+            // Bad value is emitted as a valid JSON string, not raw text.
+            let content = std::fs::read_to_string(&out)?;
+            assert!(
+                content.contains("{\"v\":\"Insufficient credits\"}"),
+                "expected the invalid value to be wrapped as a JSON string, got:\n{content}"
+            );
+            assert!(
+                content.contains("{\"v\":{\"a\":1}}"),
+                "expected valid JSON to pass through unchanged, got:\n{content}"
+            );
+
+            // Output round-trips: read_json re-parses it without error.
+            let count: i64 = conn.query_row(
+                &format!(
+                    "SELECT count(*) FROM read_json('{}')",
+                    out.to_string_lossy()
+                ),
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 3);
+            Ok(())
+        })
+    }
+
+    /// Runs the export projection against a real `JSON[]` column to confirm the
+    /// array round-trips — its CASE unifies a `JSON[]` (`THEN`) with a scalar
+    /// `JSON` (`ELSE`), which only surfaces when the projection actually executes.
+    #[test]
+    fn test_export_executes_on_json_array_column() -> Result<(), OxenError> {
+        if std::env::consts::OS == "windows" {
+            return Ok(());
+        }
+        test::run_empty_dir_test(|dir| {
+            let conn = df_db::get_connection(&dir.join("db"))?;
+            conn.execute(
+                &format!("CREATE TABLE {TABLE_NAME} (name VARCHAR, tags JSON[])"),
+                [],
+            )?;
+            conn.execute(
+                &format!(
+                    "INSERT INTO {TABLE_NAME} VALUES ('a', ['{{\"k\":1}}', '[2,3]']), ('b', NULL)"
+                ),
+                [],
+            )?;
+
+            let projection = build_export_projection(&conn, TABLE_NAME)?;
+            assert_eq!(
+                projection,
+                format!("\"name\", {}", json_tolerant_export_expr("tags"))
+            );
+
+            let out = dir.join("out.jsonl");
+            let query = wrap_sql_for_export(
+                &format!("SELECT {projection} FROM {TABLE_NAME} ORDER BY name"),
+                &out,
+            );
+            // Must type-unify (JSON[] THEN vs scalar JSON ELSE) and execute.
+            conn.execute(&query, [])?;
+
+            // The valid array round-trips as a JSON array, not a stringified blob.
+            let content = std::fs::read_to_string(&out)?;
+            assert!(
+                content.contains("{\"name\":\"a\",\"tags\":[{\"k\":1},[2,3]]}"),
+                "expected the JSON[] value to round-trip as an array, got:\n{content}"
+            );
+
+            let count: i64 = conn.query_row(
+                &format!(
+                    "SELECT count(*) FROM read_json('{}')",
+                    out.to_string_lossy()
+                ),
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 2);
+            Ok(())
+        })
+    }
+}

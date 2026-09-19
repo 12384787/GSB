@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en" data-color-scheme>
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<!-- Anchor for every relative URL in this document. The server rewrites
+		     the value to OXICLOUD_BASE_PATH when it serves the shell, so one
+		     build runs under any deployment prefix. Must precede the tags
+		     below: <base> only affects URLs that come after it. -->
+		<base href="/" />
+		<!-- Icon set — mirrors the legacy static/index.html head. SVG is
+		     the primary (modern browsers use it, scales at every DPI); the
+		     .ico fallback covers old browsers + Windows taskbar shortcuts.
+		     Apple touch icon: iOS home-screen. Safari mask icon: pinned
+		     tabs. Manifest wires the PWA install flow. -->
+		<link rel="icon" type="image/svg+xml" href="%sveltekit.assets%/logo/logo-plain.svg" />
+		<link rel="icon" href="%sveltekit.assets%/favicon.ico" sizes="32x32" />
+		<link rel="apple-touch-icon" href="%sveltekit.assets%/logo/apple-touch-icon.png" />
+		<link rel="mask-icon" href="%sveltekit.assets%/logo/logo-plain.svg" color="#ff5e3a" />
+		<link rel="manifest" href="%sveltekit.assets%/manifest.webmanifest" />
+		<meta name="color-scheme" content="light dark" />
+		%sveltekit.head%
+		<!--
+			Anti-FOUC theme init — runs synchronously before first paint.
+			Reads the `oxi-theme` localStorage key (part of the normalised
+			`oxi-*` prefs namespace, see $lib/utils/localStoragePrefs) and
+			reflects it on `<html data-color-scheme>`.
+
+			KEEP IN SYNC: the 'oxi-theme' string below MUST match
+			`THEME_STORAGE_KEY` exported from
+			$lib/stores/theme.svelte.ts. The inline script runs before
+			any JS bundle loads, so it can't `import` the constant. A
+			drift check in $lib/stores/theme.test.ts reads this file
+			and fails CI if the two get out of sync.
+
+			Placed AFTER %sveltekit.head% so it follows the CSP <meta> SvelteKit
+			injects there, hence it IS governed by that policy. svelte.config.js
+			parses this file, finds this <script> by id="theme-init", and adds its
+			SHA-256 to script-src automatically — so it's allowed inline (zero extra
+			request, no 'unsafe-inline') and the hash stays in sync if you edit it.
+		-->
+		<script id="theme-init">
+			(function () {
+				try {
+					var s = localStorage.getItem('oxi-theme');
+					var h = document.documentElement;
+					if (s === 'light' || s === 'dark') h.setAttribute('data-color-scheme', s);
+					else h.removeAttribute('data-color-scheme');
+				} catch (e) {
+					/* localStorage unavailable — fall back to OS preference */
+				}
+			})();
+		</script>
+		<!--
+			Instant boot splash. Paints on HTML parse (before the app bundle and its
+			CSS load), covering the otherwise-blank gap during JS download/parse for a
+			faster perceived first paint. The root layout removes `#app-splash` as soon
+			as it mounts. `light-dark()` + the early `color-scheme` rules match the
+			resolved theme so there's no colour flash when the app CSS arrives.
+		-->
+		<style>
+			html[data-color-scheme='dark'] {
+				color-scheme: dark;
+			}
+			html[data-color-scheme='light'] {
+				color-scheme: light;
+			}
+			#app-splash {
+				position: fixed;
+				inset: 0;
+				z-index: 9999;
+				display: grid;
+				place-items: center;
+				background: light-dark(#f5f7fa, #0f172a);
+			}
+			#app-splash__spinner {
+				width: 38px;
+				height: 38px;
+				border-radius: 50%;
+				border: 3px solid light-dark(#e2e8f0, #334155);
+				border-top-color: #ff5e3a;
+				animation: app-splash-spin 0.7s linear infinite;
+			}
+			@keyframes app-splash-spin {
+				to {
+					transform: rotate(360deg);
+				}
+			}
+			@media (prefers-reduced-motion: reduce) {
+				#app-splash__spinner {
+					animation: none;
+				}
+			}
+		</style>
+	</head>
+	<body data-sveltekit-preload-data="hover">
+		<div id="app-splash" role="status" aria-label="Loading">
+			<div id="app-splash__spinner"></div>
+		</div>
+		<div style="display: contents">%sveltekit.body%</div>
+	</body>
+</html>

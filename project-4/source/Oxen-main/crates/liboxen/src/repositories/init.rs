@@ -1,0 +1,85 @@
+//! # oxen init
+//!
+//! Initialize a local oxen repository
+//!
+
+use std::path::Path;
+
+use crate::core;
+use crate::core::db::merkle_node::MerkleNodeBackend;
+use crate::error::OxenError;
+use crate::model::LocalRepository;
+use crate::storage::StorageConfig;
+
+/// # Initialize an Empty Oxen Repository
+/// ```
+/// use liboxen::repositories;
+/// use liboxen::test;
+///
+/// test::run_empty_dir_test(|dir| {
+///     let repo = repositories::init(dir)?;
+///     assert!(repo.path.join(".oxen").exists());
+///     Ok(())
+/// })?;
+/// # Ok::<(), liboxen::error::OxenError>(())
+/// ```
+pub fn init(path: impl AsRef<Path>) -> Result<LocalRepository, OxenError> {
+    init_with_version(path)
+}
+
+pub fn init_with_version(path: impl AsRef<Path>) -> Result<LocalRepository, OxenError> {
+    let path = path.as_ref();
+    core::v_latest::init_with_version_default(path)
+}
+
+pub async fn init_with_storage_config(
+    path: impl AsRef<Path>,
+    storage_config: Option<StorageConfig>,
+) -> Result<LocalRepository, OxenError> {
+    init_with_version_and_storage_config(path, storage_config, None).await
+}
+
+pub async fn init_with_version_and_storage_config(
+    path: impl AsRef<Path>,
+    storage_config: Option<StorageConfig>,
+    merkle_backend: Option<MerkleNodeBackend>,
+) -> Result<LocalRepository, OxenError> {
+    let path = path.as_ref();
+    core::v_latest::init_with_version_and_storage_config(path, storage_config, merkle_backend).await
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::error::OxenError;
+    use crate::repositories;
+    use crate::test;
+
+    use crate::util;
+
+    #[tokio::test]
+    async fn test_command_init() -> Result<(), OxenError> {
+        test::run_empty_dir_test(|repo_dir| {
+            // Init repo
+            repositories::init(repo_dir)?;
+
+            // Init should create the .oxen directory
+            let hidden_dir = util::fs::oxen_hidden_dir(repo_dir);
+            let config_file = util::fs::config_filepath(repo_dir);
+            assert!(hidden_dir.exists());
+            assert!(config_file.exists());
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_repositories_not_set_as_remote_mode_by_default() -> Result<(), OxenError> {
+        test::run_empty_dir_test(|repo_dir| {
+            // Init repo
+            let repo = repositories::init(repo_dir)?;
+            assert!(!repo.is_remote_mode());
+
+            Ok(())
+        })
+    }
+}

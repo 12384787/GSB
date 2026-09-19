@@ -1,0 +1,384 @@
+name: 🚀🪟 Release Windows
+
+on:
+  workflow_call:
+    inputs:
+      ARCHITECTURE:
+        description: "The architecture to build for"
+        required: true
+        default: "x86_64"
+        type: string
+      AWS_ROLE:
+        description: "AWS role to assume"
+        required: true
+        type: string
+      AWS_REGION:
+        description: "AWS region"
+        required: true
+        type: string
+      PYTHON_VERSIONS:
+        description: "Python versions to build"
+        required: true
+        type: string
+    secrets:
+      GH_PERSONAL_ACCESS_TOKEN:
+        description: "GitHub personal access token"
+        required: true
+
+env:
+  EC2_IMAGE_ID: ami-0cfb2e47dd591ebdb
+  EC2_INSTANCE_TYPE: m7i.4xlarge
+
+jobs:
+  start-self-hosted-runner:
+    name: Start self-hosted EC2 runner
+    runs-on: ubuntu-latest
+    # id-token is for the AWS OIDC assume-role; runner registration uses a PAT, not the job token.
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      label: ${{ steps.start-ec2-runner.outputs.label }}
+      ec2-instance-id: ${{ steps.start-ec2-runner.outputs.ec2-instance-id }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ inputs.AWS_ROLE }}
+          role-duration-seconds: 900
+          aws-region: ${{ inputs.AWS_REGION }}
+
+      - name: Start EC2 runner
+        id: start-ec2-runner
+        uses: Oxen-AI/ec2-github-runner-windows@v2.1.0
+        with:
+          mode: start
+          github-token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+          ec2-image-id: ${{ env.EC2_IMAGE_ID }}
+          ec2-instance-type: ${{ env.EC2_INSTANCE_TYPE }}
+          ec2-os: windows
+          startup-timeout-minutes: 10
+          subnet-id: subnet-0e28805edbdad482f
+          security-group-id: sg-09c8aa5830122d671
+          iam-role-name: github-runner-instance-profile
+          aws-resource-tags: >
+            [
+              {"Key": "Name", "Value": "ec2-github-runner"}
+            ]
+
+  release_windows:
+    name: Build Oxen CLI and Python wheels
+    needs: start-self-hosted-runner
+    runs-on: ${{ needs.start-self-hosted-runner.outputs.label }}
+    # Checkout is the only step here that uses the token, and it reads. S3 access comes from the
+    # runner's instance profile, so this job needs no AWS OIDC.
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: powershell
+
+    env:
+      CARGO_INCREMENTAL: "0"
+      # Read as an environment variable by the zip steps rather than expanded into their source, so
+      # its contents can never be parsed as PowerShell.
+      ARCHITECTURE: ${{ inputs.ARCHITECTURE }}
+      # Override Cargo.toml's LTO setting to save on build time in Windows
+      CARGO_PROFILE_RELEASE_LTO: thin
+      DEPTREE_BUCKET: oxen-release-build-cache
+      # Generation prefix. Bump it when the archive's layout or the prune's rules change: the
+      # fallback restore only ever lists trees under the current prefix, so a bump starts clean.
+      DEPTREE_PREFIX: deptree/v5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Create release directory
+        run: mkdir ${{ github.workspace }}\release
+
+      - name: Exclude build paths from Windows Defender
+        run: |
+          try {
+            Set-MpPreference -ExclusionPath @("C:\actions-runner", "C:\Users\Administrator\.cargo", "C:\Users\Administrator\.rustup", "C:\ProgramData\chocolatey", "$env:TEMP") -ErrorAction Stop
+            Set-MpPreference -ExclusionProcess @("rustc.exe", "cargo.exe", "cl.exe", "link.exe", "cmake.exe", "python.exe", "git.exe") -ErrorAction Stop
+            Write-Host "Defender exclusions applied"
+          } catch {
+            Write-Host "Defender configuration unavailable: $_"
+          }
+          try {
+            $prefs = Get-MpPreference -ErrorAction Stop
+            Write-Host "Defender ExclusionPath: $($prefs.ExclusionPath -join ', ')"
+            Write-Host "Defender ExclusionProcess: $($prefs.ExclusionProcess -join ', ')"
+            $status = Get-MpComputerStatus -ErrorAction Stop
+            Write-Host "Defender real-time protection: $($status.RealTimeProtectionEnabled)"
+            Write-Host "Defender on-access protection: $($status.OnAccessProtectionEnabled)"
+            Write-Host "Defender tamper protection: $($status.IsTamperProtected)"
+          } catch {
+            Write-Host "Defender status unavailable: $_"
+          }
+
+      - name: Install dependencies
+        run: |
+          # PowerShell doesn't stop on a failed native command, so a failed
+          # install would be masked by the next command and only surface later
+          # as a confusing build error. Check each critical command. choco
+          # returns 3010 to mean "installed, reboot pending", which is success.
+          $uvVersion = (Select-String -Path tool-versions.env -Pattern '^UV_VERSION=(.+)$').Matches.Groups[1].Value
+          if (-not $uvVersion) { throw "UV_VERSION missing from tool-versions.env" }
+          choco install -y cmake llvm rustup.install nasm
+          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) { exit $LASTEXITCODE }
+          choco install -y uv --version $uvVersion
+          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) { exit $LASTEXITCODE }
+          if (-not (Get-Command aws -ErrorAction SilentlyContinue)) {
+            choco install -y awscli
+            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) { exit $LASTEXITCODE }
+            # choco appends to the machine PATH, so this process needs it added now for the s3 caches
+            $env:Path = "C:\Program Files\Amazon\AWSCLIV2;$env:Path"
+          }
+          aws --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Restore dependency build tree
+        run: |
+          refreshenv
+          # Windows proc-macro dlls never link byte-identically across runs, and
+          # a version bump rewrites every downstream crate's fingerprint, so a
+          # from-scratch build recompiles the whole graph every release. Restore
+          # the previous run's compiled dependencies (and the registry, mtimes
+          # intact) so cargo marks them Fresh and only workspace crates rebuild.
+          # The key hashes the third-party lockfile entries plus toolchain, so a
+          # workspace version bump alone keeps the same key. DEPTREE_PREFIX carries the generation.
+          $depText = ((Get-Content Cargo.lock -Raw) -split '\[\[package\]\]' | Where-Object { $_ -match 'source = ' }) -join ''
+          $rv = (cmd /c "rustc -V 2>nul") -join ''
+          $sha = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes("$rv|$depText"))).Replace("-","").Substring(0,32)
+          echo "DEPTREE_KEY=$sha" >> $env:GITHUB_ENV
+          # Listing lines are "<date> <time> <bytes> <key>.tar", so a plain sort is oldest-first.
+          $names = aws s3 ls "s3://${env:DEPTREE_BUCKET}/${env:DEPTREE_PREFIX}/" | Where-Object { $_ -match '\.tar$' } | Sort-Object | ForEach-Object { (-split $_)[3] }
+          $exactHit = $names -contains "$sha.tar"
+          # On a miss a third-party dependency changed, so the most recent tree is restored instead:
+          # cargo reuses the unchanged deps and rebuilds only what the bump touched, and the save
+          # step writes a fresh tree under this key.
+          $pick = if ($exactHit) { "$sha.tar" } else { $names | Select-Object -Last 1 }
+          if (-not $pick) {
+            Write-Host "DEPTREE restore miss ($sha), no tree to fall back to"
+            exit 0
+          }
+          # cmd (not PowerShell) runs the pipe so the bytes pass through raw, and reports only tar's
+          # exit; tar exits 0 on an empty stream, so aws flags its own failure with a marker.
+          Remove-Item C:\deptree-dl-failed -ErrorAction SilentlyContinue
+          cmd /c "(aws s3 cp s3://${env:DEPTREE_BUCKET}/${env:DEPTREE_PREFIX}/$pick - || echo fail>C:\deptree-dl-failed) | tar -C C:\ -xf -"
+          if ($LASTEXITCODE -ne 0 -or (Test-Path C:\deptree-dl-failed)) {
+            # Every restored root goes, not just target: cargo trusts an artifact whose fingerprint
+            # arrived intact, and a crate whose .cargo-ok arrived without its sources. The registry
+            # unpacks last, so a truncated stream lands there.
+            Write-Host "DEPTREE restore of $pick failed, discarding the partial tree"
+            Remove-Item -Recurse -Force "${{ github.workspace }}\target", "C:\Users\Administrator\.cargo\registry" -ErrorAction SilentlyContinue
+            exit 0
+          }
+          if ($exactHit) {
+            echo "DEPTREE_EXACT_HIT=1" >> $env:GITHUB_ENV
+            Write-Host "DEPTREE restore hit ($sha)"
+          } else {
+            Write-Host "DEPTREE restore miss ($sha), fell back to $pick"
+          }
+          Write-Host "Free space after restore: $([math]::Round((Get-PSDrive C).Free / 1GB, 1)) GiB"
+          exit 0
+
+      - name: Build oxen binaries
+        run: |
+          refreshenv
+          # Stamps the start of this run's compilation; the save step keeps every artifact newer
+          # than it, including whatever the wheel build compiles.
+          New-Item C:\deptree-build-start -ItemType File -Force | Out-Null
+          # oxen-server is not supported on Windows; build the CLI only. The JSON stream names every
+          # live unit's artifacts, fresh ones included, for the save step's prune.
+          # Windows sporadically denies a write to a freshly created build artifact.
+          $attempts = 3
+          for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+            Write-Host "cargo build attempt $attempt of $attempts"
+            cargo build --workspace --exclude oxen-py --exclude oxen-server --release --message-format=json-render-diagnostics | Set-Content C:\deptree-live.json
+            $code = $LASTEXITCODE
+            if ($code -eq 0) { break }
+            if ($attempt -eq $attempts) { exit $code }
+            Write-Host "::warning::cargo build failed (exit $code), retrying"
+          }
+
+      - name: Build Python wheels
+        # Reaches the script as an environment variable rather than an expression expanded into the
+        # source, so its contents can never be parsed as PowerShell.
+        env:
+          PYTHON_VERSIONS: ${{ inputs.PYTHON_VERSIONS }}
+        run: |
+          refreshenv
+          # Splatted, so each version is its own argument; the variable holds them space-separated.
+          $versions = $env:PYTHON_VERSIONS -split ' '
+          uv python install @versions
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          cd ${{ github.workspace }}\oxen-python
+
+          # The glob reaches maturin literally, never expanded: it resolves to nothing, so maturin
+          # builds the abi3 wheel from bundled sysconfig (the v0.52.4 and v0.52.6 logs show the abi3
+          # binding line and no interpreter line). Keep the flag even though it selects nothing --
+          # with no interpreter given, maturin falls back to PYO3_PYTHON or whatever python is on
+          # PATH, which is a less predictable input than a glob it ignores.
+          foreach ($version in $versions) {
+              uvx maturin build --release --interpreter "C:\Users\Administrator\AppData\Roaming\uv\python\cpython-$version.*\python.exe"
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+          # Only a fallback restore re-archives the tree, so only it needs the wheel graph named.
+          if ($env:DEPTREE_EXACT_HIT -eq "1") { exit 0 }
+          # Names the wheel build's units for the prune, fresh ones included, since maturin reports
+          # no artifact list of its own. Mirrors the invocation maturin wraps, taking the manifest
+          # and features from oxen-python/pyproject.toml, so every unit is already fresh and nothing
+          # recompiles here; v0.52.6 measured it at 0.76s.
+          cargo build --release --manifest-path ${{ github.workspace }}\crates\oxen-py\Cargo.toml --features pyo3/extension-module --message-format=json-render-diagnostics | Add-Content C:\deptree-live.json
+          # Best-effort: without this list the wheel's units are pruned and recompile next release.
+          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::DEPTREE could not enumerate the wheel graph" }
+          exit 0
+
+      - name: Prune dead build artifacts
+        # Runs before the artifacts are zipped, so the freed space is available to them, and
+        # separately from the save so that one failing cannot take the other down with it.
+        if: success()
+        continue-on-error: true
+        run: |
+          # Only a fallback restore re-archives the tree, so only it needs pruning.
+          if ($env:DEPTREE_EXACT_HIT -eq "1") { Write-Host "DEPTREE exact hit, cache is current"; exit 0 }
+          refreshenv
+          # An artifact is live if this build still references it or this run compiled it; the rest
+          # are orphans earlier releases left behind. Over-pruning only costs a recompile.
+          $target = "${{ github.workspace }}\target\release"
+          $unitHash = [regex]::new('-([0-9a-f]{16})(?![0-9a-f])', 'Compiled')
+          $live = [System.Collections.Generic.HashSet[string]]::new()
+          foreach ($line in Get-Content C:\deptree-live.json -ErrorAction SilentlyContinue) {
+            try { $msg = ConvertFrom-Json $line } catch { continue }
+            # filenames covers compiled units and build-script executables; out_dir covers each
+            # build script's output directory, which is named by a hash of its own and reported
+            # even when fresh.
+            foreach ($p in @($msg.filenames) + @($msg.out_dir)) {
+              if (-not $p) { continue }
+              foreach ($m in $unitHash.Matches($p)) { $live.Add($m.Groups[1].Value) | Out-Null }
+            }
+          }
+          # Only deps is pruned; .fingerprint and build/ entries stay.
+          $deps = @(Get-ChildItem "$target\deps" -File -ErrorAction SilentlyContinue)
+          $before = [math]::Round(($deps | Measure-Object -Sum Length).Sum / 1GB, 2)
+          if ($live.Count -eq 0) {
+            Write-Host "::warning::DEPTREE has no live artifact list, archiving $before GiB unpruned"
+          } else {
+            $stamp = (Get-Item C:\deptree-build-start).LastWriteTime
+            $dead = foreach ($f in $deps) {
+              if ($f.LastWriteTime -ge $stamp) { continue }
+              # Names carrying no unit hash are not generational. The workspace's own bin and cdylib
+              # intermediates are reported under their unhashed final output, so they read as dead
+              # and get dropped; a version bump recompiles those crates every release anyway.
+              $hashes = $unitHash.Matches($f.Name)
+              if ($hashes.Count -eq 0) { continue }
+              $isLive = $false
+              foreach ($m in $hashes) { if ($live.Contains($m.Groups[1].Value)) { $isLive = $true; break } }
+              if (-not $isLive) { $f }
+            }
+            $dead | Remove-Item -Force -ErrorAction SilentlyContinue
+            # Measured after the fact, since a locked file fails to delete silently.
+            $after = [math]::Round((Get-ChildItem "$target\deps" -File -ErrorAction SilentlyContinue | Measure-Object -Sum Length).Sum / 1GB, 2)
+            Write-Host "DEPTREE pruned $($dead.Count) dead artifacts; deps $before -> $after GiB"
+          }
+
+      - name: Create zip with oxen binary
+        run: |
+          Compress-Archive -Path "${{ github.workspace }}\target\release\oxen.exe" -DestinationPath "${{ github.workspace }}\release\oxen-windows-${env:ARCHITECTURE}.exe.zip"
+
+      - name: Create zip with Python wheels
+        run: |
+          Compress-Archive -Path ${{ github.workspace }}\target\wheels\* -DestinationPath "${{ github.workspace }}\release\oxen-wheels-windows-${env:ARCHITECTURE}.zip"
+
+      - name: Create zip with all artifacts
+        run: |
+          Compress-Archive -Path "${{ github.workspace }}\release\*" -DestinationPath "${{ github.workspace }}\release\oxen-windows-${env:ARCHITECTURE}-release.zip"
+
+      - name: Upload all artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: oxen-windows-release-${{ inputs.ARCHITECTURE }}.zip
+          path: ${{ github.workspace }}\release\oxen-windows-${{ inputs.ARCHITECTURE }}-release.zip
+          retention-days: 1
+
+      - name: Save dependency build tree
+        # Only cache a tree from a fully successful build. A failed build can
+        # leave the tree incomplete, and saving it under the exact key would make
+        # later runs restore that partial tree and rebuild every time.
+        if: success()
+        # Caching is best-effort: a save failure must not fail a release whose
+        # binaries and wheels already built.
+        continue-on-error: true
+        run: |
+          # Skip only on an exact-key hit. A fallback restore still has to write
+          # the tree under the current key so the next release hits exactly.
+          if ($env:DEPTREE_EXACT_HIT -eq "1") {
+            # A hit re-archives nothing, so the object's age would keep growing while the tree is
+            # still in active use, and an expiry rule would eventually delete it out from under a
+            # working cache. Copying the key onto itself restarts that clock; a same-key copy needs
+            # --metadata-directive REPLACE to be accepted.
+            cmd /c "aws s3 cp s3://%DEPTREE_BUCKET%/%DEPTREE_PREFIX%/%DEPTREE_KEY%.tar s3://%DEPTREE_BUCKET%/%DEPTREE_PREFIX%/%DEPTREE_KEY%.tar --metadata-directive REPLACE --storage-class INTELLIGENT_TIERING"
+            if ($LASTEXITCODE -ne 0) { Write-Host "::warning::DEPTREE could not refresh the cached tree's age" }
+            else { Write-Host "DEPTREE exact hit, refreshed the tree's age" }
+            exit 0
+          }
+          refreshenv
+          $target = "${{ github.workspace }}\target\release"
+          $rel = $target.Substring(3) -replace '\\','/'
+          $list = @("$rel/.fingerprint", "$rel/deps", "$rel/build", "Users/Administrator/.cargo/registry/src", "Users/Administrator/.cargo/registry/cache")
+          $list | Set-Content C:\deptree-list.txt
+          # cmd (not PowerShell) runs the pipe so the bytes pass through raw; a
+          # PowerShell pipe re-encodes the stream and corrupts the tar. Streaming
+          # to S3 keeps the multi-GiB archive off the runner's disk. A cmd pipe
+          # reports only aws's exit, so tar flags its own failure via a marker.
+          Remove-Item C:\deptree-tar-failed -ErrorAction SilentlyContinue
+          cmd /c "(tar -cf - -C C:\ -T C:\deptree-list.txt || echo fail>C:\deptree-tar-failed) | aws s3 cp - s3://%DEPTREE_BUCKET%/%DEPTREE_PREFIX%/%DEPTREE_KEY%.tar"
+          $awsExit = $LASTEXITCODE
+          # aws finishes the upload even when tar dies mid-stream, so delete the
+          # object on any failure; restore treats an exact-key object as a
+          # permanent hit and would otherwise serve the truncated tree forever.
+          if ($awsExit -ne 0 -or (Test-Path C:\deptree-tar-failed)) {
+            Write-Host "DEPTREE save failed"
+            cmd /c "aws s3 rm s3://%DEPTREE_BUCKET%/%DEPTREE_PREFIX%/%DEPTREE_KEY%.tar"
+            if ($awsExit -ne 0) { exit $awsExit } else { exit 1 }
+          }
+          $bytes = (cmd /c "aws s3api head-object --bucket %DEPTREE_BUCKET% --key %DEPTREE_PREFIX%/%DEPTREE_KEY%.tar --query ContentLength --output text 2>nul") -join ''
+          $size = if ($bytes -match '^\d+$') { "$([math]::Round([int64]$bytes / 1GB, 1)) GiB" } else { "size unknown" }
+          Write-Host "DEPTREE saved ($env:DEPTREE_KEY, $size)"
+          # head-object is the last native command, so its exit must not redden a successful save.
+          exit 0
+
+  stop-self-hosted-runner:
+    name: Stop self-hosted EC2 runner
+    needs:
+      - start-self-hosted-runner
+      - release_windows
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    # id-token is for the AWS OIDC assume-role; runner deregistration uses a PAT, not the job token.
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ inputs.AWS_ROLE }}
+          role-duration-seconds: 900
+          aws-region: ${{ inputs.AWS_REGION }}
+
+      - name: Stop EC2 runner
+        uses: Oxen-AI/ec2-github-runner-windows@v2.1.0
+        with:
+          mode: stop
+          github-token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+          label: ${{ needs.start-self-hosted-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.start-self-hosted-runner.outputs.ec2-instance-id }}

@@ -1,0 +1,32 @@
+use serde::{Deserialize, Serialize};
+use std::hash::{Hash, Hasher};
+use utoipa::ToSchema;
+
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone, ToSchema)]
+pub enum StagedEntryStatus {
+    Added,
+    Modified,
+    Removed,
+    Unmodified,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct StagedEntry {
+    pub hash: String,
+    pub status: StagedEntryStatus,
+}
+
+impl StagedEntry {
+    pub fn empty_status(status: StagedEntryStatus) -> StagedEntry {
+        StagedEntry {
+            hash: String::from(""),
+            status,
+        }
+    }
+}
+
+impl Hash for StagedEntry {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.hash.hash(state);
+    }
+}

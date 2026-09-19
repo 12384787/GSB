@@ -1,0 +1,5 @@
+任务类型：Bug 修复
+任务难度：困难
+语言/框架：Python
+
+请在已有的 langbot-app/LangBot 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：Production-grade platform for building agentic IM bots - 生产级多平台智能机器人开发平台/ Agent、知识库编排、插件系统 / Bots for Discord / Slack / LINE / Telegram / WeChat(企业微信, 企微智能机器人, 公众号) / 飞书 / 钉钉 / QQ / Matrix e.g. Integrated with ChatGPT(GPT), DeepSeek, Dify, n8n, Langflow, Coze, Claude, Gemini, GLM, Ollama, SiliconFlow, Moonshot, openclaw / hermes agent, deerflow。围绕真实入口（.dockerignore,.github .gitignore,.mcp.json .pre-commit-config.yaml,AGENTS.md ARCHITECTURE.md,CLA.md CLAUDE.md,CONTRIBUTING.md Dockerfile,LICENSE Makefile,README.md README_CN.md,README_ES.md README_FR.md,README_JP.md README_KO.md,README_RU.md README_TW.md,README_VI.md codecov.yml,docker docs,examples main.py,packaging pyproject.toml,pytest.ini res,run_tests.sh scripts,skills src,tests uv.lock,web）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。

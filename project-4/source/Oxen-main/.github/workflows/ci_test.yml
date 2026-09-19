@@ -1,0 +1,346 @@
+name: 🐂📝 Continuous integration - Test Suite
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-test:
+    name: Rust Tests
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-x64-8cpu-32ram-300ssd]
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            shell: bash -leo pipefail {0}
+          - os: macos-latest
+            platform: macos
+            # Non-login shell (no `-l`) on macOS. A login shell sources /etc/profile
+            # and ~/.profile, which on macOS runs /usr/libexec/path_helper and
+            # Homebrew's shellenv hooks. Those can reorder PATH so that `cargo`
+            # resolves to the Homebrew `rustup` formula's keg, where `cargo` is a
+            # symlink to an env-script wrapper that does
+            # `exec "/path/to/libexec/bin/rustup-init" "$@"`. The wrapper makes
+            # argv[0] end in "rustup-init", so rustup's argv[0]-based dispatcher
+            # picks setup_mode (the installer) instead of proxy_mode and rejects
+            # `build` as an "unexpected argument". Linux is left as a login shell
+            # because it isn't affected (no path_helper) and changing it would
+            # broaden the blast radius unnecessarily.
+            shell: bash -eo pipefail {0}
+          - os: windows-x64-8cpu-32ram-300ssd
+            platform: windows
+            shell: powershell
+      fail-fast: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Free up disk space
+        if: matrix.platform == 'linux'
+        uses: ./.github/actions/free-disk-space
+
+      - name: Setup Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          rustflags: ${{ matrix.platform == 'windows' && '-D warnings -C link-arg=/DEBUG:NONE' || '-D warnings' }}
+          cache: false # We use Swatinem/rust-cache directly below for save-if control.
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          prefix-key: rust-test
+          save-if: ${{ github.ref == 'refs/heads/main' }} # Only save cache on main; always restore.
+          cache-all-crates: true
+          cache-on-failure: true
+          # Don't cache ~/.cargo/bin. rustup ≥1.28 installs the proxy binaries
+          # (cargo, rustc, …) as symlinks to the `rustup` regular file. The
+          # action's cleanBin step skips symlinks via dirent.isFile() but can
+          # delete the `rustup` target (it isn't tracked in .crates2.json), which
+          # leaves the proxies pointing at nothing. With save-if restricted to
+          # main, a poisoned cache from one main run persists across PR runs
+          # until something changes the cache key — that's the proximal cause of
+          # the intermittent rustup-init failure described on the shell setting
+          # above. Nothing else in ~/.cargo/bin is worth caching, so the cost is
+          # nil.
+          cache-bin: false
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11" # Test against the earliest supported Python version
+
+      - name: Install dependencies (macOS)
+        if: matrix.platform == 'macos'
+        run: |
+          brew update
+          brew install pkg-config
+
+      # Ramdisk for test data
+      - name: Setup ramdisk (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          RAMDISK_PATH=$(mktemp -d /dev/shm/oxen_test_XXXXXX)
+          echo "OXEN_TEST_RUN_DIR=$RAMDISK_PATH/test" >> "$GITHUB_ENV"
+          echo "SYNC_DIR=$RAMDISK_PATH/sync" >> "$GITHUB_ENV"
+          mkdir -p "$RAMDISK_PATH/test" "$RAMDISK_PATH/sync"
+
+      - name: Setup ramdisk (macOS)
+        if: matrix.platform == 'macos'
+        run: |
+          RAMDISK_DEV=$(hdiutil attach -nomount ram://8388608 | xargs)  # 4 GB
+          diskutil eraseDisk APFS OxenTest "$RAMDISK_DEV"
+          echo "OXEN_TEST_RUN_DIR=/Volumes/OxenTest/test" >> "$GITHUB_ENV"
+          echo "SYNC_DIR=/Volumes/OxenTest/sync" >> "$GITHUB_ENV"
+          mkdir -p /Volumes/OxenTest/test /Volumes/OxenTest/sync
+
+      # No ramdisk on Windows: ImDisk RAM disks don't support the memory-mapped
+      # file operations LMDB requires, so opening an LMDB env on the ramdisk
+      # fails with "Incorrect function" (ERROR_INVALID_FUNCTION / os error 1).
+      # Run on the runner's real SSD (NTFS), which supports mmap + sparse files.
+      - name: Setup test data dir (Windows)
+        if: matrix.platform == 'windows'
+        run: |
+          echo "OXEN_TEST_RUN_DIR=$env:RUNNER_TEMP\oxen_test\test" >> $env:GITHUB_ENV
+          mkdir $env:RUNNER_TEMP\oxen_test\test
+
+      # Oxen Rust Tests
+      - name: Setup test directories (Linux/macOS)
+        if: matrix.platform != 'windows'
+        run: |
+          mkdir -p data/test/runs
+          mkdir -p /tmp/oxen_sync/
+
+      - name: Setup test directories (Windows)
+        if: matrix.platform == 'windows'
+        run: |
+          mkdir .\data\test\runs
+
+      - name: Build oxen rust project (Linux/macOS)
+        if: matrix.platform != 'windows'
+        run: cargo build --workspace
+
+      - name: Setup oxen-server user (Linux/macOS)
+        if: matrix.platform != 'windows'
+        run: |
+          ./target/debug/oxen-server add-user --email ox@oxen.ai --name Ox --output user_config.toml
+          cp user_config.toml data/test/config/user_config.toml
+
+      - name: Run oxen rust tests (Linux/macOS)
+        if: matrix.platform != 'windows'
+        run: |
+          RUST_LOG=warn,liboxen=debug,oxen_server=debug ./target/debug/oxen-server start --test > oxen-server.log 2>&1 &
+          # Wait for the server to be ready before running tests (mirrors bin/test-rust).
+          for i in $(seq 1 100); do
+            if curl -sf http://localhost:3000/api/health >/dev/null 2>&1; then break; fi
+            if [ "$i" -eq 100 ]; then echo "oxen-server did not become healthy"; exit 1; fi
+            sleep 0.1
+          done
+          cargo test --workspace --no-fail-fast
+
+      # oxen-server is unsupported on Windows: exclude its crate; the
+      # server-dependent tests are marked #[cfg_attr(windows, ignore)].
+      - name: Run oxen rust tests (Windows)
+        if: matrix.platform == 'windows'
+        run: cargo test --workspace --exclude oxen-server --no-fail-fast
+
+      - name: Upload oxen-server log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: oxen-server-log-${{ matrix.platform }}
+          path: |
+            oxen-server.log
+            oxen-server.out.log
+            oxen-server.err.log
+          if-no-files-found: ignore
+
+  python-test:
+    name: Python Tests
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-x64-8cpu-32ram-300ssd]
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            shell: bash -leo pipefail {0}
+          - os: macos-latest
+            platform: macos
+            # Non-login shell on macOS; see rust-test job for the rustup-init
+            # dispatch bug this avoids.
+            shell: bash -eo pipefail {0}
+          - os: windows-x64-8cpu-32ram-300ssd
+            platform: windows
+            shell: powershell
+      fail-fast: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Free up disk space
+        if: matrix.platform == 'linux'
+        uses: ./.github/actions/free-disk-space
+
+      - name: Setup Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          rustflags: ${{ matrix.platform == 'windows' && '-D warnings -C link-arg=/DEBUG:NONE' || '-D warnings' }}
+          cache: false # We use Swatinem/rust-cache directly below for save-if control.
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          prefix-key: python-test
+          save-if: ${{ github.ref == 'refs/heads/main' }} # Only save cache on main; always restore.
+          cache-all-crates: true
+          cache-on-failure: true
+          cache-bin: false # See rust-test job for rationale.
+
+      - name: Load tool versions
+        if: matrix.platform != 'windows'
+        run: grep -E '^[A-Z0-9_]+=' tool-versions.env >> "$GITHUB_ENV"
+
+      - name: Load tool versions
+        if: matrix.platform == 'windows'
+        run: |
+          Get-Content tool-versions.env |
+            Where-Object { $_ -match '^[A-Z0-9_]+=' } |
+            ForEach-Object { Add-Content -Path $env:GITHUB_ENV -Value $_ -Encoding utf8 }
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.11" # Test against the earliest supported Python version
+
+      - name: Install dependencies (macOS)
+        if: matrix.platform == 'macos'
+        run: |
+          brew update
+          brew install pkg-config
+
+      - name: Setup test directories (Linux/macOS)
+        if: matrix.platform != 'windows'
+        run: |
+          mkdir -p data/test/runs
+          mkdir -p /tmp/oxen_sync/
+
+      - name: Setup test directories (Windows)
+        if: matrix.platform == 'windows'
+        run: |
+          mkdir .\data\test\runs
+
+      - name: Build oxen rust project (Linux/macOS)
+        if: matrix.platform != 'windows'
+        run: cargo build --workspace
+
+      # oxen-server is unsupported on Windows: build only the client crates
+      # (the oxen CLI backs the CLI tests). Server tests skip via each conftest.
+      - name: Build oxen rust project (Windows)
+        if: matrix.platform == 'windows'
+        run: cargo build --workspace --exclude oxen-server
+
+      - name: Setup oxen-server user (Linux/macOS)
+        if: matrix.platform != 'windows'
+        run: |
+          ./target/debug/oxen-server add-user --email ox@oxen.ai --name Ox --output user_config.toml
+          cp user_config.toml data/test/config/user_config.toml
+
+      - name: Start oxen-server (Linux/macOS)
+        if: matrix.platform != 'windows'
+        run: |
+          ./target/debug/oxen-server start > oxen-server.log 2>&1 &
+          # Wait for the server to accept connections before any test needs one. Without this the
+          # CLI tests race startup, and the loser reports a connection error that reads like a
+          # product bug rather than a server that was not up yet.
+          for i in $(seq 1 100); do
+            if curl -sf http://localhost:3000/api/health >/dev/null 2>&1; then break; fi
+            if [ "$i" -eq 100 ]; then
+              echo "oxen-server did not become healthy"
+              cat oxen-server.log
+              exit 1
+            fi
+            sleep 0.1
+          done
+
+      # CLI Tests
+      - name: Run CLI tests (Linux/macOS)
+        if: matrix.platform != 'windows'
+        env:
+          PATH: ${{ env.PATH }}:${{ github.workspace }}/target/debug
+        run: |
+          cd ${{ github.workspace }}/cli-test
+          uv sync
+          uv run pytest tests -v
+
+      - name: Run CLI tests (Windows)
+        if: matrix.platform == 'windows'
+        env:
+          PATH: ${{ env.PATH }};${{ github.workspace }}\target\debug
+        run: |
+          cd ${{ github.workspace }}\cli-test
+          uv sync
+          uv run pytest tests -v
+
+      # Oxen Python Tests
+      - name: Setup Python venv
+        run: |
+          cd ${{ github.workspace }}/oxen-python
+          uv sync --no-install-project
+
+      - name: Build Python extension (Linux/macOS)
+        if: matrix.platform != 'windows'
+        run: |
+          cd ${{ github.workspace }}/oxen-python
+          source .venv/bin/activate
+          maturin develop
+
+      - name: Build Python extension (Windows)
+        if: matrix.platform == 'windows'
+        run: |
+          cd ${{ github.workspace }}\oxen-python
+          .venv\Scripts\Activate.ps1
+          maturin develop
+
+      - name: Configure oxen user (Linux/macOS)
+        if: matrix.platform != 'windows'
+        run: |
+          cp ${{ github.workspace }}/target/debug/oxen ~/oxen
+          chmod +x ~/oxen
+          ~/oxen config --name "Bessie Testington" --email "bessie@yourcompany.com"
+
+      - name: Configure oxen user (Windows)
+        if: matrix.platform == 'windows'
+        run: |
+          copy target\debug\oxen.exe ${{ github.workspace }}\oxen.exe
+          ${{ github.workspace }}\oxen.exe config --name "Bessie Testington" --email "bessie@yourcompany.com"
+
+      - name: Run oxen-python tests (Linux/macOS)
+        if: matrix.platform != 'windows'
+        run: |
+          cd ${{ github.workspace }}/oxen-python
+          source .venv/bin/activate
+          pytest -s tests
+
+      - name: Run oxen-python tests (Windows)
+        if: matrix.platform == 'windows'
+        run: |
+          cd ${{ github.workspace }}\oxen-python
+          .venv\Scripts\Activate.ps1
+          pytest -s tests --ignore=tests/test_data_frame.py --ignore=tests/test_embeddings.py --ignore=tests/test_fsspec_backend.py

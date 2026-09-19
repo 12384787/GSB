@@ -1,0 +1,1 @@
+.gitattributes,.github .gitignore,.husky .idea,CODE_OF_CONDUCT.md CONTRIBUTING.md,LICENSE.txt NOTICE.txt,README.md build-logic,build-settings-logic build.gradle.kts,docs-developer docs,dokka-integration-tests dokka-runners,dokka-subprojects examples,gradle.properties gradle,gradlew gradlew.bat,qodana.sarif.json scripts,settings.gradle.kts

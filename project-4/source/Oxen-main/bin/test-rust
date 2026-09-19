@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+#
+# Build, configure, and run the Oxen test suite.
+#
+# Usage: test-rust [--ffmpeg] [--keep] [--install-deps] [--no-ramdisk] [--timings] [-p|--python] [extra args...]
+#
+#   --ffmpeg        Enable the "ffmpeg" cargo feature for build and test commands.
+#   --keep          Do not remove test data (in data/ox and data/test/runs) on cleanup — useful for
+#                   debugging failed tests.
+#   --install-deps  Check and install prerequisites (install-prereqs) before running tests.
+#                   By default, prereqs are not checked.
+#   --no-ramdisk    Skip ramdisk setup and run tests against the regular filesystem.
+#   --timings       Print each test's duration next to its result. Rust runs only; doctests are
+#                   skipped.
+#   -p|--python     Run the oxen-python test suite (via pytest) instead of the Rust test suite.
+#                   Builds the native extension with maturin.
+#   All remaining arguments are forwarded after `--` to the libtest binaries (or `pytest` under -p).
+#
+# Examples:
+#   test-rust                       # Run all Rust tests
+#   test-rust test_name             # Run Rust tests matching test_name
+#   test-rust --timings test_name   # Report each matching test's duration
+#   test-rust -p                    # Run all Python tests
+#   test-rust -p -k test_init      # Run Python tests matching test_init
+#
+# Logs (Rust runs — overwritten each invocation):
+#   ./data/test/oxen-server.log     # oxen-server subprocess stdout+stderr
+#   ./data/test/cargo-test.log      # cargo test's stderr (indicatif progress bars, any
+#                                     tracing that leaks around libtest's per-thread capture)
+
+# Check for flags
+FEATURE_ARGS=""
+KEEP_DATA=false
+INSTALL_DEPS=false
+RUN_PYTHON=false
+USE_RAMDISK=true
+TIMINGS=false
+while true; do
+    case "${1:-}" in
+        --ffmpeg)        FEATURE_ARGS="-F ffmpeg"; shift ;;
+        --keep)          KEEP_DATA=true; shift ;;
+        --install-deps)  INSTALL_DEPS=true; shift ;;
+        --no-ramdisk)    USE_RAMDISK=false; shift ;;
+        --timings)       TIMINGS=true; shift ;;
+        -p|--python)     RUN_PYTHON=true; shift ;;
+        *) break ;;
+    esac
+done
+
+set -euo pipefail
+
+# On Linux the `ffmpeg` feature links FFmpeg 8 from /opt/ffmpeg (installed by bin/install-prereqs);
+# point pkg-config at it. macOS gets FFmpeg 8 from Homebrew, already on the default pkg-config path.
+if [ -n "$FEATURE_ARGS" ] && [ "$(uname)" = "Linux" ]; then
+    if [ -d /opt/ffmpeg/lib/pkgconfig ]; then
+        export PKG_CONFIG_PATH="/opt/ffmpeg/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+    elif ! pkg-config --atleast-version=60 libavutil 2>/dev/null; then
+        echo "ERROR: --ffmpeg needs FFmpeg 8 dev libraries (libavutil >= 60), not found."
+        echo "       Run bin/install-prereqs to install them under /opt/ffmpeg"
+        echo "       (apt's FFmpeg is too old for ffmpeg-sys-next 8)."
+        exit 1
+    fi
+fi
+
+# we don't need oxen-server collecting metrics during tests
+export OXEN_METRICS_PORT='off'
+
+# Lower the streamed-transfer segment size (default 10 MiB) so test fixtures can be small
+# while still exercising the streamed-transfer code path. Must be set before launching
+# oxen-server so both processes agree on the threshold. See `stream_segment_size()` in
+# crates/liboxen/src/constants.rs.
+export OXEN_STREAM_SEGMENT_SIZE=131072  # 128 KiB
+
+# On macOS, SIP strips DYLD_LIBRARY_PATH from processes launched by system binaries (like
+# /usr/bin/env bash), so cargo can't find libpython. Re-derive the path from the active Python
+# install if needed.
+if [ "$(uname)" = "Darwin" ] && [ -z "${DYLD_LIBRARY_PATH:-}" ] && command -v python3 &>/dev/null; then
+    _pylib="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))' 2>/dev/null)"
+    if [ -n "$_pylib" ] && [ -d "$_pylib" ]; then
+        export DYLD_LIBRARY_PATH="$_pylib"
+    fi
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
+
+SERVER_PID=""
+RAMDISK_DEV=""
+PYTHON_CONFIG_DIR=""
+
+# Create a ramdisk for test data. On macOS this creates an APFS RAM disk via hdiutil; on Linux it
+# uses /dev/shm (tmpfs). Falls back to the regular filesystem if ramdisk creation fails.
+setup_ramdisk() {
+    local size_mb=4096
+    if [ "$(uname)" = "Darwin" ]; then
+        local sectors=$(( size_mb * 2048 ))  # 512-byte sectors
+        local vol_name="OxenTest_$$"
+        RAMDISK_DEV=$(hdiutil attach -nomount "ram://$sectors" 2>/dev/null | xargs) || return 1
+        diskutil eraseDisk APFS "$vol_name" "$RAMDISK_DEV" >/dev/null 2>&1 || {
+            hdiutil detach "$RAMDISK_DEV" 2>/dev/null
+            RAMDISK_DEV=""
+            return 1
+        }
+        RAMDISK_PATH="/Volumes/$vol_name"
+    else
+        RAMDISK_PATH=$(mktemp -d /dev/shm/oxen_test_XXXXXX 2>/dev/null) || return 1
+    fi
+
+    export OXEN_TEST_RUN_DIR="$RAMDISK_PATH/test"
+    export SYNC_DIR="$RAMDISK_PATH/sync"
+    mkdir -p "$OXEN_TEST_RUN_DIR" "$SYNC_DIR"
+    echo "==> Ramdisk at $RAMDISK_PATH"
+}
+
+cleanup_ramdisk() {
+    if [ "$(uname)" = "Darwin" ] && [ -n "$RAMDISK_DEV" ]; then
+        echo "==> Detaching ramdisk $RAMDISK_DEV..."
+        hdiutil detach "$RAMDISK_DEV" -force 2>/dev/null || true
+    elif [ -n "${RAMDISK_PATH:-}" ] && [[ "${RAMDISK_PATH:-}" == /dev/shm/* ]]; then
+        rm -rf "$RAMDISK_PATH"
+    fi
+}
+
+cleanup() {
+    if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "Stopping oxen-server (pid $SERVER_PID)..."
+        kill "$SERVER_PID"
+        # Set a background process to force-kill after 20s if server still hasn't exited
+        (sleep 20 && kill -9 "$SERVER_PID" 2>/dev/null) &
+        WATCHDOG=$!
+        # Wait for server to exit
+        wait "$SERVER_PID" 2>/dev/null || true
+        # Ensure the watchdog is killed, so it doesn't hang around when the server exits normally
+        kill "$WATCHDOG" 2>/dev/null || true
+    fi
+    if [ -n "$PYTHON_CONFIG_DIR" ]; then
+        rm -rf "$PYTHON_CONFIG_DIR"
+    fi
+    if [ "$KEEP_DATA" = false ]; then
+        echo "==> Removing test data..."
+        rm -rf ./data/ox
+        rm -rf ./data/test/runs
+        cleanup_ramdisk
+    else
+        echo "==> Keeping test data in data/ox and data/test/runs"
+    fi
+}
+
+trap cleanup EXIT INT TERM
+
+# Set up ramdisk for test data
+if [ "$USE_RAMDISK" = true ]; then
+    if ! setup_ramdisk; then
+        echo "==> Ramdisk setup failed, using regular filesystem."
+    fi
+else
+    echo "==> Skipping ramdisk setup (--no-ramdisk), using regular filesystem."
+fi
+
+# Ensure all prerequisites are installed (opt-in via --install-deps)
+if [ "$INSTALL_DEPS" = true ]; then
+    "$SCRIPT_DIR/install-prereqs"
+fi
+
+# Build
+echo "==> Building oxen (cargo build $FEATURE_ARGS)..."
+# shellcheck disable=SC2086
+cargo build $FEATURE_ARGS
+
+# Verify ulimit
+CURRENT_ULIMIT=$(ulimit -n)
+DESIRED_ULIMIT=10240
+if [ "$CURRENT_ULIMIT" -lt "$DESIRED_ULIMIT" ]; then
+    echo "==> ulimit -n is $CURRENT_ULIMIT (< $DESIRED_ULIMIT). Attempting to raise..."
+    ulimit -n "$DESIRED_ULIMIT" 2>/dev/null || {
+        echo "Warning: Could not raise ulimit -n to $DESIRED_ULIMIT. You may need to limit"
+        echo "the number of test threads (RUST_TEST_THREADS=N) to avoid running out of file descriptors."
+    }
+fi
+
+# Configure test user
+if [ ! -d ./data/test/runs ] || [ ! -d ./data/test/config ]; then
+    echo "==> Configuring test user..."
+    mkdir -p ./data/test/runs
+    mkdir -p ./data/test/config
+
+    ./target/debug/oxen-server add-user \
+        --email ox@oxen.ai \
+        --name ox \
+        --output data/test/config/user_config.toml
+else
+    echo "==> Test user already configured, skipping."
+fi
+
+# Select port and start oxen-server
+port_is_free() {
+  ! lsof -i :"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+if [ -n "${OXEN_PORT:-}" ]; then
+    if ! port_is_free "$OXEN_PORT"; then
+        echo "ERROR: Something is already listening on port $OXEN_PORT. Stop it before running tests."
+        exit 1
+    fi
+else
+    OXEN_PORT=""
+    for _ in $(seq 1 10); do
+        CANDIDATE=$(( RANDOM % 3001 + 3100 ))
+        if port_is_free "$CANDIDATE"; then
+            OXEN_PORT="$CANDIDATE"
+            break
+        fi
+    done
+    if [ -z "$OXEN_PORT" ]; then
+        echo "ERROR: Could not find an open port in range 3000-6000 after 10 attempts."
+        echo "Please supply OXEN_PORT directly, e.g.: OXEN_PORT=4567 $0 $*"
+        exit 1
+    fi
+fi
+
+export OXEN_TEST_HOST="localhost:${OXEN_PORT}"
+
+# Route the server's stdout/stderr to a log file so its tracing output doesn't interleave
+# with libtest's per-test progress on the terminal. Tail the file to debug server-side failures.
+SERVER_LOG="./data/test/oxen-server.log"
+mkdir -p "$(dirname "$SERVER_LOG")"
+echo "==> Starting oxen-server on port ${OXEN_PORT} (logs at ${SERVER_LOG})..."
+./target/debug/oxen-server start -p "${OXEN_PORT}" --test >"$SERVER_LOG" 2>&1 &
+SERVER_PID=$!
+
+wait_for_server() {
+    while true ; do
+        if curl -s -o /dev/null --fail "http://localhost:${OXEN_PORT}/api/health" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+    done
+}
+
+echo "==> Waiting for oxen-server health check to pass..."
+wait_for_server
+
+if [ "$RUN_PYTHON" = true ]; then
+    # Configure oxen CLI user for the Python tests. The Python extension resolves the
+    # config dir through `oxen_config_dir()` with no override installed, so both the write
+    # below and the extension's reads follow $OXEN_CONFIG_DIR. Point it at a throwaway dir:
+    # without it, `oxen config` replaces the name and email in the developer's real
+    # ~/.config/oxen/user_config.toml.
+    PYTHON_CONFIG_DIR=$(mktemp -d)
+    export OXEN_CONFIG_DIR="$PYTHON_CONFIG_DIR"
+    echo "==> Configuring oxen CLI user (config dir ${PYTHON_CONFIG_DIR})..."
+    ./target/debug/oxen config --name "Bessie Testington" --email "bessie@yourcompany.com"
+
+    # Set up Python environment and build the extension (in a subshell to avoid
+    # changing the working directory, so cleanup's relative paths still work)
+    echo "==> Setting up Python environment..."
+    (
+        cd oxen-python
+        uv sync --no-install-project
+        # shellcheck disable=SC1091
+        source .venv/bin/activate
+        echo "==> Building Python extension with maturin..."
+        maturin develop
+
+        # Run tests
+        echo "==> Running pytest $* ..."
+        pytest -s tests "$@"
+    )
+else
+    # Run Rust tests. Redirect stderr to a log file: libtest's per-test progress and summary
+    # write to stdout, so the terminal still shows those. The noisy things that libtest can't
+    # capture — `indicatif` progress bars (direct TTY drawing), any `tracing` output emitted on
+    # tokio worker threads that don't inherit libtest's per-thread capture, C-library writes to
+    # stderr — go to the log file. `indicatif` also auto-hides itself once it detects the
+    # redirected non-TTY stderr, so most progress-bar output goes away entirely rather than being
+    # written to the log at all. Tail the log to debug what would have shown on stderr.
+    CARGO_TEST_LOG="./data/test/cargo-test.log"
+    mkdir -p "$(dirname "$CARGO_TEST_LOG")"
+    TARGET_ARGS=""
+    if [ "$TIMINGS" = true ]; then
+        # --report-time needs RUSTC_BOOTSTRAP; the runner sets it for the test binaries only,
+        # leaving the build untouched. Doctests reject the flag, so they are left out.
+        HOST_TRIPLE=$(rustc -vV | awk '/^host:/{print $2}')
+        export "CARGO_TARGET_$(echo "$HOST_TRIPLE" | tr 'a-z-' 'A-Z_')_RUNNER=env RUSTC_BOOTSTRAP=1"
+        TARGET_ARGS="--lib --bins --tests"
+        set -- "$@" -Z unstable-options --report-time
+    fi
+    echo "==> Running tests with 'cargo test --workspace --no-fail-fast $FEATURE_ARGS $TARGET_ARGS -- $*' (stderr at ${CARGO_TEST_LOG}) ..."
+    # shellcheck disable=SC2086
+    cargo test --workspace --no-fail-fast $FEATURE_ARGS $TARGET_ARGS -- "$@" 2>"$CARGO_TEST_LOG"
+fi
+
+# cleanup handled via the trapped cleanup function

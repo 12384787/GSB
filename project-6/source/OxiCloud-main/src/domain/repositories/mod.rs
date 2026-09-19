@@ -1,0 +1,16 @@
+pub mod address_book_repository;
+pub mod calendar_event_repository;
+pub mod calendar_repository;
+pub mod contact_repository;
+pub mod drive_repository;
+pub mod file_repository;
+pub mod folder_repository;
+pub mod magic_link_token_repository;
+pub mod notification_repository;
+pub mod playlist_repository;
+pub mod session_repository;
+pub mod settings_repository;
+pub mod share_repository;
+pub mod subject_group_repository;
+pub mod trash_repository;
+pub mod user_repository;

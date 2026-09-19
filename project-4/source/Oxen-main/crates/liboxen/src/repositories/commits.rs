@@ -1,0 +1,2113 @@
+//! # Commits
+//!
+//! Create, read, and list commits
+//!
+
+use crate::core;
+use crate::error::OxenError;
+use crate::model::User;
+use crate::model::{Commit, LocalRepository};
+use crate::opts::PaginateOpts;
+use crate::util;
+use crate::view::{PaginatedCommits, StatusMessage};
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+pub mod commit_writer;
+
+/// # Commit the staged files in the repo
+///
+/// ```
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), liboxen::error::OxenError> {
+/// use liboxen::repositories;
+/// use liboxen::{test, util};
+///
+/// test::run_empty_dir_test_async(|dir| async move {
+///     // Initialize the repository
+///     let repo = repositories::init(&dir)?;
+///
+///     // Write file to disk
+///     let hello_file = dir.join("hello.txt");
+///     util::fs::write_to_path(&hello_file, "Hello World")?;
+///
+///     // Stage the file
+///     repositories::add(&repo, &hello_file).await?;
+///
+///     // Commit staged
+///     repositories::commit(&repo, "My commit message")?;
+///     Ok(())
+/// })
+/// .await?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn commit(repo: &LocalRepository, message: &str) -> Result<Commit, OxenError> {
+    core::v_latest::commits::commit(repo, message)
+}
+
+pub fn commit_with_user(
+    repo: &LocalRepository,
+    message: &str,
+    user: &User,
+) -> Result<Commit, OxenError> {
+    core::v_latest::commits::commit_with_user(repo, message, user)
+}
+
+/// # Commit with --allow-empty flag
+///
+/// Allows creating a commit even when there are no staged changes.
+/// This reuses the existing create_empty_commit infrastructure.
+pub async fn commit_allow_empty(
+    repo: &LocalRepository,
+    message: &str,
+) -> Result<Commit, OxenError> {
+    core::v_latest::commits::commit_allow_empty(repo, message).await
+}
+
+/// Iterate over all commits and get the one with the latest timestamp
+pub use crate::core::v_latest::commits::latest_commit;
+
+/// The current HEAD commit of the branch you currently have checked out
+pub use crate::core::v_latest::commits::head_commit;
+
+/// Maybe get the head commit if it exists
+/// Returns None if the head commit does not exist (empty repo)
+pub use crate::core::v_latest::commits::head_commit_maybe;
+
+/// Get the root commit of a repository
+pub use crate::core::v_latest::commits::root_commit_maybe;
+
+/// Get a commit by it's MerkleHash
+pub use crate::core::v_latest::commits::get_by_hash;
+
+/// Get a commit by it's string hash
+pub fn get_by_id(
+    repo: &LocalRepository,
+    commit_id: impl AsRef<str>,
+) -> Result<Option<Commit>, OxenError> {
+    let commit_id = commit_id.as_ref();
+    core::v_latest::commits::get_by_id(repo, commit_id)
+}
+
+/// Commit id exists
+pub fn commit_id_exists(
+    repo: &LocalRepository,
+    commit_id: impl AsRef<str>,
+) -> Result<bool, OxenError> {
+    get_by_id(repo, commit_id.as_ref()).map(|commit| commit.is_some())
+}
+
+/// Create an empty commit off of the head commit of a branch
+pub fn create_empty_commit(
+    repo: &LocalRepository,
+    branch_name: impl AsRef<str>,
+    commit: &Commit,
+) -> Result<Commit, OxenError> {
+    let branch_name = branch_name.as_ref();
+    core::v_latest::commits::create_empty_commit(repo, branch_name, commit)
+}
+
+/// Create an initial empty commit for an empty repository.
+/// This creates the first commit with an empty tree and sets up the branch.
+/// Returns an error if the repository already has commits.
+pub fn create_initial_commit(
+    repo: &LocalRepository,
+    branch_name: impl AsRef<str>,
+    user: &User,
+    message: impl AsRef<str>,
+) -> Result<Commit, OxenError> {
+    let branch_name = branch_name.as_ref();
+    let message = message.as_ref();
+    core::v_latest::commits::create_initial_commit(repo, branch_name, user, message)
+}
+
+/// List commits on the current branch from HEAD
+pub use crate::core::v_latest::commits::list;
+
+/// List commits for the repository in no particular order
+pub use crate::core::v_latest::commits::list_all;
+
+// Source
+pub use crate::core::v_latest::commits::get_commit_or_head;
+
+pub fn list_all_paginated(
+    repo: &LocalRepository,
+    pagination: PaginateOpts,
+) -> Result<PaginatedCommits, OxenError> {
+    log::info!("list_all_paginated: {:?} {:?}", repo.path, pagination);
+    let commits = list_all(repo)?;
+    let commits: Vec<Commit> = commits.into_iter().collect();
+    let (commits, pagination) = util::paginate(commits, pagination.page_num, pagination.page_size);
+    Ok(PaginatedCommits {
+        status: StatusMessage::resource_found(),
+        commits,
+        pagination,
+    })
+}
+
+/// List the history for a specific branch or commit (revision)
+pub fn list_from(repo: &LocalRepository, revision: &str) -> Result<Vec<Commit>, OxenError> {
+    core::v_latest::commits::list_from(repo, revision)
+}
+
+pub fn list_from_with_depth(
+    repo: &LocalRepository,
+    revision: &str,
+) -> Result<HashMap<Commit, usize>, OxenError> {
+    core::v_latest::commits::list_from_with_depth(repo, revision)
+}
+
+/// List the history between two commits
+pub use crate::core::v_latest::commits::list_between;
+
+/// List commits reachable from head but not base (git `base..head`)
+pub use crate::core::v_latest::commits::list_between_exclusive;
+
+/// Commits reachable from exactly one of two revisions, as `(base_only, head_only)`
+pub use crate::core::v_latest::commits::list_symmetric_difference;
+
+/// Get a list of commits by the commit message
+pub fn get_by_message(
+    repo: &LocalRepository,
+    msg: impl AsRef<str>,
+) -> Result<Vec<Commit>, OxenError> {
+    let commits = list_all(repo)?;
+    let filtered: Vec<Commit> = commits
+        .into_iter()
+        .filter(|commit| commit.message == msg.as_ref())
+        .collect();
+    Ok(filtered)
+}
+
+/// Get the most recent commit by the commit message, starting at the HEAD commit
+pub fn first_by_message(
+    repo: &LocalRepository,
+    msg: impl AsRef<str>,
+) -> Result<Option<Commit>, OxenError> {
+    let commits = list(repo)?;
+    Ok(commits
+        .into_iter()
+        .find(|commit| commit.message == msg.as_ref()))
+}
+
+/// Retrieve entries with filepaths matching a provided glob pattern
+pub fn search_entries(
+    repo: &LocalRepository,
+    commit: &Commit,
+    pattern: &str,
+) -> Result<HashSet<PathBuf>, OxenError> {
+    core::v_latest::commits::search_entries(repo, commit, pattern)
+}
+
+/// List paginated commits starting from the given revision
+pub async fn list_from_paginated(
+    repo: &LocalRepository,
+    revision: &str,
+    pagination: PaginateOpts,
+) -> Result<PaginatedCommits, OxenError> {
+    let repo = repo.clone();
+    let revision = revision.to_string();
+    tokio::task::spawn_blocking(move || {
+        let _perf = crate::perf_guard!("commits::list_from_paginated");
+
+        // Calculate skip and limit based on pagination parameters
+        let skip = if pagination.page_num == 0 {
+            0
+        } else {
+            (pagination.page_num - 1) * pagination.page_size
+        };
+        let limit = pagination.page_size;
+
+        let _perf_list = crate::perf_guard!("commits::list_from_paginated_optimized");
+        let (commits, total_entries, cached) =
+            core::v_latest::commits::list_from_paginated_impl(&repo, &revision, skip, limit)?;
+        log::info!(
+            "list_from_paginated {} got {} commits out of {} total (cached: {})",
+            revision,
+            commits.len(),
+            total_entries,
+            cached
+        );
+        drop(_perf_list);
+
+        // Calculate pagination metadata
+        let total_pages = if pagination.page_size > 0 {
+            (total_entries as f64 / pagination.page_size as f64).ceil() as usize
+        } else {
+            0
+        };
+
+        let pagination = crate::view::Pagination {
+            page_size: pagination.page_size,
+            page_number: pagination.page_num,
+            total_pages,
+            total_entries,
+        };
+
+        Ok(PaginatedCommits {
+            status: StatusMessage::resource_found(),
+            commits,
+            pagination,
+        })
+    })
+    .await?
+}
+
+/// List paginated commits by resource
+pub async fn list_by_path_from_paginated(
+    repo: &LocalRepository,
+    commit: &Commit,
+    path: &Path,
+    pagination: PaginateOpts,
+) -> Result<PaginatedCommits, OxenError> {
+    let repo = repo.clone();
+    let commit = commit.clone();
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let _perf = crate::perf_guard!("commits::list_by_path_from_paginated");
+
+        log::info!("list_by_path_from_paginated: {commit:?} {path:?}");
+        core::v_latest::commits::list_by_path_from_paginated(&repo, &commit, &path, pagination)
+    })
+    .await?
+}
+
+pub use crate::core::v_latest::commits::count_from;
+
+#[cfg(test)]
+mod tests {
+    use crate::test;
+    use std::path::Path;
+    use std::sync::Barrier;
+
+    use crate::constants::DEFAULT_BRANCH_NAME;
+    use crate::error::OxenError;
+    use crate::model::EntryDataType;
+    use crate::model::MerkleHash;
+    use crate::model::StagedEntryStatus;
+    use crate::opts::CloneOpts;
+    use crate::opts::RmOpts;
+    use crate::repositories;
+
+    use crate::util;
+
+    use super::*;
+
+    // Repair paths must be handed the commit being pushed rather than an end of this list: two
+    // push paths reverse it before use and one does not. Pinned so a swap between these two
+    // functions fails loudly instead of quietly retargeting a repair.
+    #[tokio::test]
+    async fn test_commit_list_ordering_is_newest_first() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            let mut commits = Vec::new();
+            for name in ["one", "two", "three"] {
+                util::fs::write_to_path(repo.path.join(format!("{name}.txt")), name)?;
+                repositories::add(&repo, &repo.path).await?;
+                commits.push(repositories::commit(&repo, &format!("add {name}"))?);
+            }
+            let (first, last) = (&commits[0], &commits[2]);
+
+            let from = repositories::commits::list_from(&repo, &last.id)?;
+            assert_eq!(
+                from.first().map(|c| c.id.as_str()),
+                Some(last.id.as_str()),
+                "list_from must yield the head commit first"
+            );
+            assert_eq!(
+                from.last().map(|c| c.id.as_str()),
+                Some(first.id.as_str()),
+                "list_from must yield the oldest commit last"
+            );
+
+            let between = repositories::commits::list_between(&repo, first, last)?;
+            assert_eq!(
+                between.first().map(|c| c.id.as_str()),
+                Some(last.id.as_str()),
+                "list_between must yield the head commit first, before any caller reverses it"
+            );
+
+            Ok(())
+        })
+        .await
+    }
+
+    // A directory's stored entry count has to agree with what the directory actually holds,
+    // including after a subdirectory is removed. Both counts are asserted so neither can drift
+    // past the other unnoticed.
+    #[tokio::test]
+    async fn test_removing_a_subdirectory_updates_parent_num_entries() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            util::fs::write_to_path(repo.path.join("top.txt"), "top")?;
+            test::populate_dir_with_txt_files(repo.path.join("d"), "f", 2)?;
+
+            repositories::add(&repo, &repo.path).await?;
+            let commit = repositories::commit(&repo, "add top.txt and d/")?;
+
+            let root = repositories::tree::get_root_with_children(&repo, &commit)?
+                .expect("commit should have a tree");
+            let root_dir = repositories::tree::get_root_dir(&root)?;
+            assert_eq!(repositories::tree::count_dir_entries(root_dir)?, 2);
+            assert_eq!(root_dir.dir()?.num_entries(), 2);
+
+            let rm_opts = RmOpts {
+                path: PathBuf::from("d"),
+                recursive: true,
+                ..Default::default()
+            };
+            repositories::rm(&repo, &rm_opts).await?;
+            let commit = repositories::commit(&repo, "remove d/")?;
+
+            let root = repositories::tree::get_root_with_children(&repo, &commit)?
+                .expect("commit should have a tree");
+            let root_dir = repositories::tree::get_root_dir(&root)?;
+            assert_eq!(repositories::tree::count_dir_entries(root_dir)?, 1);
+            assert_eq!(root_dir.dir()?.num_entries(), 1);
+
+            Ok(())
+        })
+        .await
+    }
+
+    // Entry counts are held across a sequence that exercises every staged status a directory's
+    // children can carry: added, modified, unmodified, and removed, at the root and nested.
+    #[tokio::test]
+    async fn test_dir_num_entries_matches_contents_across_commits() -> Result<(), OxenError> {
+        // Assert the directory's stored count and the count its vnodes actually hold, so a wrong
+        // stored value can't hide behind a correct tree or the reverse.
+        fn assert_entries(
+            repo: &LocalRepository,
+            commit: &Commit,
+            dir: impl AsRef<Path>,
+            expected: u64,
+        ) -> Result<(), OxenError> {
+            let dir = dir.as_ref();
+            let node = repositories::tree::get_dir_with_children(repo, commit, dir, None)?
+                .unwrap_or_else(|| panic!("dir {dir:?} should exist in commit {}", commit.id));
+            assert_eq!(
+                repositories::tree::count_dir_entries(&node)?,
+                expected,
+                "true entry count for {dir:?} at commit {:?}",
+                commit.message
+            );
+            assert_eq!(
+                node.dir()?.num_entries(),
+                expected,
+                "stored num_entries for {dir:?} at commit {:?}",
+                commit.message
+            );
+            Ok(())
+        }
+
+        test::run_empty_local_repo_test_async(|repo| async move {
+            util::fs::write_to_path(repo.path.join("top.txt"), "top")?;
+            util::fs::create_dir_all(repo.path.join("a/b"))?;
+            util::fs::write_to_path(repo.path.join("a/1.txt"), "one")?;
+            util::fs::write_to_path(repo.path.join("a/b/2.txt"), "two")?;
+            util::fs::write_to_path(repo.path.join("a/b/3.txt"), "three")?;
+            repositories::add(&repo, &repo.path).await?;
+            let commit = repositories::commit(&repo, "initial tree")?;
+
+            assert_entries(&repo, &commit, "", 2)?; // top.txt, a
+            assert_entries(&repo, &commit, "a", 2)?; // 1.txt, b
+            assert_entries(&repo, &commit, "a/b", 2)?; // 2.txt, 3.txt
+
+            // Add a file and modify another, leaving the rest unmodified
+            util::fs::write_to_path(repo.path.join("a/4.txt"), "four")?;
+            util::fs::write_to_path(repo.path.join("top.txt"), "top, revised")?;
+            repositories::add(&repo, &repo.path).await?;
+            let commit = repositories::commit(&repo, "add a/4.txt, modify top.txt")?;
+
+            assert_entries(&repo, &commit, "", 2)?;
+            assert_entries(&repo, &commit, "a", 3)?; // 1.txt, b, 4.txt
+            assert_entries(&repo, &commit, "a/b", 2)?;
+
+            // Remove a single file from the nested directory
+            let rm_opts = RmOpts {
+                path: PathBuf::from("a/b/2.txt"),
+                ..Default::default()
+            };
+            repositories::rm(&repo, &rm_opts).await?;
+            let commit = repositories::commit(&repo, "remove a/b/2.txt")?;
+
+            assert_entries(&repo, &commit, "", 2)?;
+            assert_entries(&repo, &commit, "a", 3)?;
+            assert_entries(&repo, &commit, "a/b", 1)?; // 3.txt
+
+            // Remove the nested directory outright
+            let rm_opts = RmOpts {
+                path: PathBuf::from("a/b"),
+                recursive: true,
+                ..Default::default()
+            };
+            repositories::rm(&repo, &rm_opts).await?;
+            let commit = repositories::commit(&repo, "remove a/b")?;
+
+            assert_entries(&repo, &commit, "", 2)?;
+            assert_entries(&repo, &commit, "a", 2)?; // 1.txt, 4.txt
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_command_commit_file() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            // Write to file
+            let hello_file = repo.path.join("hello.txt");
+            util::fs::write_to_path(&hello_file, "Hello World")?;
+
+            // Track the file
+            repositories::add(&repo, &hello_file).await?;
+            // Commit the file
+            let commit = repositories::commit(&repo, "My message")?;
+            assert_eq!(commit.message, "My message");
+
+            // Get status and make sure it is removed from the untracked and added
+            let repo_status = repositories::status(&repo).await?;
+            assert_eq!(repo_status.staged_dirs.len(), 0);
+            assert_eq!(repo_status.staged_files.len(), 0);
+            assert_eq!(repo_status.untracked_files.len(), 0);
+            assert_eq!(repo_status.untracked_dirs.len(), 0);
+
+            let commits = repositories::commits::list(&repo)?;
+            assert_eq!(commits.len(), 1);
+
+            Ok(())
+        })
+        .await
+    }
+
+    /// A real add/commit and read-back works end-to-end when the repo's Merkle nodes are backed by
+    /// the LMDB store instead of the filesystem — proving the backend is interchangeable for the
+    /// commit and tree-read paths, and that nodes land in the LMDB env (not the FS node tree).
+    #[tokio::test]
+    async fn test_commit_through_lmdb_backend() -> Result<(), OxenError> {
+        use crate::core::db::merkle_node::lmdb_merkle_node_store::LmdbMerkleNodeStore;
+        use std::sync::Arc;
+
+        test::run_empty_local_repo_test_async(|repo| async move {
+            // Back this repo's tree nodes with the LMDB store on its own path.
+            let lmdb = Arc::new(LmdbMerkleNodeStore::new(&repo.path)?);
+            let repo = LocalRepository::new_with_merkle_node_store_for_testing(&repo, lmdb);
+
+            let hello_file = repo.path.join("hello.txt");
+            util::fs::write_to_path(&hello_file, "Hello LMDB")?;
+            repositories::add(&repo, &hello_file).await?;
+            let commit = repositories::commit(&repo, "commit through lmdb")?;
+
+            // The commit/dir/vnode/file nodes round-trip through the LMDB backend.
+            let root = repositories::tree::get_root_with_children(&repo, &commit)?
+                .expect("root node readable from lmdb");
+            assert!(!root.children.is_empty());
+            let file_node = repositories::tree::get_file_by_path(&repo, &commit, "hello.txt")?
+                .expect("file node readable from lmdb");
+            assert_eq!(file_node.name(), "hello.txt");
+
+            // Nodes went to the LMDB env, not the filesystem node tree.
+            assert!(
+                repo.path
+                    .join(".oxen")
+                    .join("tree")
+                    .join("nodes_lmdb")
+                    .exists()
+            );
+            assert!(!repo.path.join(".oxen").join("tree").join("nodes").exists());
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_commit_removed_file() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            // Write to file
+            let hello_file = repo.path.join("hello.txt");
+            util::fs::write_to_path(&hello_file, "Hello World")?;
+
+            // Track the file
+            repositories::add(&repo, &hello_file).await?;
+
+            // Remove the file
+            util::fs::remove_file(&hello_file)?;
+
+            // Can still commit the file, since it is in the versions directory
+            repositories::commit(&repo, "My message")?;
+
+            // Get status and make sure the file was not committed
+            let head = repositories::commits::head_commit(&repo)?;
+            let commit_list = repositories::entries::list_for_commit(&repo, &head)?;
+            assert_eq!(commit_list.len(), 1);
+
+            // Add the removed file and commit
+            repositories::add(&repo, &hello_file).await?;
+            repositories::commit(&repo, "Second Message")?;
+
+            // We should now have no entries
+            let head = repositories::commits::head_commit(&repo)?;
+            let commit_list = repositories::entries::list_for_commit(&repo, &head)?;
+            assert_eq!(commit_list.len(), 0);
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_command_commit_train_data_dir() -> Result<(), OxenError> {
+        test::run_training_data_repo_test_no_commits_async(|repo| async move {
+            // Track the file
+            let train_dir = repo.path.join("train");
+            repositories::add(&repo, train_dir).await?;
+            // Commit the file
+            let commit = repositories::commit(&repo, "Adding training data")?;
+
+            let repo_status = repositories::status(&repo).await?;
+            repo_status.print();
+            assert_eq!(repo_status.staged_dirs.len(), 0);
+            assert_eq!(repo_status.staged_files.len(), 0);
+            assert_eq!(repo_status.untracked_files.len(), 4);
+            assert_eq!(repo_status.untracked_dirs.len(), 4);
+
+            repositories::tree::print_tree(&repo, &commit)?;
+
+            let dir_node =
+                repositories::tree::get_node_by_path(&repo, &commit, PathBuf::from("train"))?;
+            assert!(dir_node.is_some());
+
+            let commits = repositories::commits::list(&repo)?;
+            assert_eq!(commits.len(), 1);
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_command_commit_dir_recursive() -> Result<(), OxenError> {
+        test::run_training_data_repo_test_no_commits_async(|repo| async move {
+            // Track the annotations dir, which has sub dirs
+            let annotations_dir = repo.path.join("annotations");
+            repositories::add(&repo, annotations_dir).await?;
+            repositories::commit(&repo, "Adding annotations data dir, which has two levels")?;
+
+            let repo_status = repositories::status(&repo).await?;
+            repo_status.print();
+
+            assert_eq!(repo_status.staged_dirs.len(), 0);
+            assert_eq!(repo_status.staged_files.len(), 0);
+            assert_eq!(repo_status.untracked_files.len(), 4);
+            assert_eq!(repo_status.untracked_dirs.len(), 4);
+
+            let commits = repositories::commits::list(&repo)?;
+            assert_eq!(commits.len(), 1);
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_command_commit_second_level_dir_then_revert() -> Result<(), OxenError> {
+        test::run_select_data_repo_test_no_commits_async("annotations", |repo| async move {
+            // Track & commit (dir already created in helper)
+            let new_dir_path = repo.path.join("annotations").join("train");
+            repositories::add(&repo, &new_dir_path).await?;
+            repositories::commit(&repo, "Adding train dir")?;
+
+            // Get the original branch name
+            let orig_branch = repositories::branches::current_branch(&repo)?.unwrap();
+
+            // Create a branch to make the changes
+            let branch_name = "feature/adding-annotations";
+            repositories::branches::create_checkout(&repo, branch_name)?;
+
+            // Track & commit (dir already created in helper)
+            let test_dir_path = repo.path.join("annotations").join("test");
+            let og_num_files = util::fs::rcount_files_in_dir(&test_dir_path);
+
+            repositories::add(&repo, &test_dir_path).await?;
+            repositories::commit(&repo, "Adding test dir")?;
+
+            // checkout OG and make sure it removes the train dir
+            repositories::checkout(&repo, orig_branch.name).await?;
+            assert!(!test_dir_path.exists());
+
+            // checkout branch again and make sure it reverts
+            repositories::checkout(&repo, branch_name).await?;
+            assert!(test_dir_path.exists());
+            assert_eq!(util::fs::rcount_files_in_dir(&test_dir_path), og_num_files);
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_command_commit_removed_dir() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            let dir_to_remove =
+                test::populate_dir_with_txt_files(repo.path.join("train"), "file", 3)?;
+            let og_file_count = util::fs::rcount_files_in_dir(&dir_to_remove);
+
+            repositories::add(&repo, &dir_to_remove).await?;
+            repositories::commit(&repo, "Adding train directory")?;
+
+            // Delete the directory
+            util::fs::remove_dir_all(&dir_to_remove)?;
+
+            // Add the deleted dir, so that we can commit the deletion
+            repositories::add(&repo, &dir_to_remove).await?;
+
+            // Make sure we have the correct amount of files tagged as removed
+            let status = repositories::status(&repo).await?;
+            assert_eq!(status.staged_files.len(), og_file_count);
+            assert_eq!(
+                status.staged_files.iter().next().unwrap().1.status,
+                StagedEntryStatus::Removed
+            );
+
+            status.print();
+
+            // Make sure they don't show up in the status
+            assert_eq!(status.removed_files.len(), 0);
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_commit_after_merge_conflict() -> Result<(), OxenError> {
+        test::run_select_data_repo_test_no_commits_async("labels", |repo| async move {
+            let labels_path = repo.path.join("labels.txt");
+            repositories::add(&repo, &labels_path).await?;
+            repositories::commit(&repo, "adding initial labels file")?;
+
+            let og_branch = repositories::branches::current_branch(&repo)?.unwrap();
+
+            // Add a "none" category on a branch
+            let branch_name = "change-labels";
+            repositories::branches::create_checkout(&repo, branch_name)?;
+
+            test::modify_txt_file(&labels_path, "cat\ndog\nnone")?;
+            repositories::add(&repo, &labels_path).await?;
+            repositories::commit(&repo, "adding none category")?;
+
+            // Add a "person" category on a the main branch
+            repositories::checkout(&repo, og_branch.name).await?;
+
+            test::modify_txt_file(&labels_path, "cat\ndog\nperson")?;
+            repositories::add(&repo, &labels_path).await?;
+            repositories::commit(&repo, "adding person category")?;
+
+            // Try to merge in the changes
+            repositories::merge::merge(&repo, branch_name).await?;
+
+            // We should have a conflict
+            let status = repositories::status(&repo).await?;
+            assert_eq!(status.merge_conflicts.len(), 1);
+
+            // Assume that we fixed the conflict and added the file
+            let path = status.merge_conflicts[0].base_entry.path.clone();
+            let fullpath = repo.path.join(path);
+            repositories::add(&repo, fullpath).await?;
+
+            // Should commit, and then see full commit history
+            repositories::commit(&repo, "merging into main")?;
+
+            // Should have commits:
+            //  1) add labels
+            //  2) change-labels branch modification
+            //  3) main branch modification
+            //  4) merge commit
+            let history = repositories::commits::list(&repo)?;
+            assert_eq!(history.len(), 4);
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_commit_with_no_staged_changes() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            // Add a text file
+            let text_path = repo.path.join("text.txt");
+            util::fs::write_to_path(&text_path, "Hello World")?;
+
+            // Get the hash of the file at this timestamp
+            repositories::add(&repo, &text_path).await?;
+            repositories::commit(&repo, "Committing hello world")?;
+
+            // Modify the text file
+            util::fs::write_to_path(&text_path, "Goodbye, world!")?;
+
+            let status = repositories::status(&repo).await?;
+            status.print();
+
+            // There should be nothing to commit since the file is untracked
+            let commit_result = repositories::commit(&repo, "Committing goodbye world");
+            assert!(commit_result.is_err());
+
+            // Make sure the entry is still there
+            let head = repositories::commits::head_commit(&repo)?;
+            let tree = repositories::tree::get_root_with_children(&repo, &head)?.unwrap();
+            let text_entry = tree.get_by_path(Path::new("text.txt"))?;
+            assert!(text_entry.is_some());
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_commit_hash_on_modified_file() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            // Add a text file
+            let text_path = repo.path.join("text.txt");
+            util::fs::write_to_path(&text_path, "Hello World")?;
+
+            // Get the hash of the file at this timestamp
+            let hash_when_add =
+                util::hasher::hash_file_contents(&text_path)?.parse::<MerkleHash>()?;
+            repositories::add(&repo, &text_path).await?;
+
+            let status = repositories::status(&repo).await?;
+            status.print();
+
+            // Note v10 did not have this line, and we didn't copy to the versions dir on add
+            repositories::commit(&repo, "Committing hello world")?;
+
+            // Modify the text file
+            util::fs::write_to_path(&text_path, "Goodbye, world!")?;
+
+            // Get the new hash
+            let hash_after_modification = util::hasher::hash_file_contents(&text_path)?.parse()?;
+
+            // Add and commit the file
+            repositories::add(&repo, &text_path).await?;
+            repositories::commit(&repo, "Committing goodbye world")?;
+
+            // Get the most recent commit - the new head commit
+            let head = repositories::commits::head_commit(&repo)?;
+
+            // get the merkle tree for the commit
+            let tree = repositories::tree::get_root_with_children(&repo, &head)?.unwrap();
+
+            // Get the commit entry for the text file
+            let text_entry = tree.get_by_path(Path::new("text.txt"))?.unwrap();
+
+            // Hashes should be different
+            assert_ne!(hash_when_add, hash_after_modification);
+
+            // Hash should match new hash
+            assert_eq!(text_entry.hash, hash_after_modification);
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_commit_file_and_dir() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            // Create committer with no commits
+            let repo_path = &repo.path;
+            let train_dir = repo_path.join("training_data");
+            util::fs::create_dir_all(&train_dir)?;
+            let _ = test::add_txt_file_to_dir(&train_dir, "Train Ex 1")?;
+            let _ = test::add_txt_file_to_dir(&train_dir, "Train Ex 2")?;
+            let _ = test::add_txt_file_to_dir(&train_dir, "Train Ex 3")?;
+            let annotation_file = test::add_txt_file_to_dir(repo_path, "some annotations...")?;
+
+            let test_dir = repo_path.join("test_data");
+            util::fs::create_dir_all(&test_dir)?;
+            let _ = test::add_txt_file_to_dir(&test_dir, "Test Ex 1")?;
+            let _ = test::add_txt_file_to_dir(&test_dir, "Test Ex 2")?;
+
+            // Add a file and a directory
+            repositories::add(&repo, &annotation_file).await?;
+            repositories::add(&repo, &train_dir).await?;
+
+            let message = "Adding training data to 🐂";
+            repositories::commit(&repo, message)?;
+
+            // should be one commit now
+            let commit_history = repositories::commits::list(&repo)?;
+            assert_eq!(commit_history.len(), 1);
+
+            // Check that the files are no longer staged
+            let status = repositories::status(&repo).await?;
+            let files = status.staged_files;
+            let dirs = status.staged_dirs;
+            assert_eq!(files.len(), 0);
+            assert_eq!(dirs.len(), 0);
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_commit_history_order() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            let train_dir = test::populate_dir_with_txt_files(repo.path.join("train"), "train", 2)?;
+            repositories::add(&repo, &train_dir).await?;
+            let initial_commit_message = "adding train dir";
+            repositories::commit(&repo, initial_commit_message)?;
+
+            let text_path = repo.path.join("newnewnew.txt");
+            util::fs::write_to_path(&text_path, "Hello World")?;
+            repositories::add(&repo, &text_path).await?;
+            repositories::commit(&repo, "adding text file")?;
+
+            let test_dir = test::populate_dir_with_txt_files(repo.path.join("test"), "test", 2)?;
+            repositories::add(&repo, &test_dir).await?;
+            let most_recent_message = "adding test dir";
+            repositories::commit(&repo, most_recent_message)?;
+
+            let history = repositories::commits::list(&repo)?;
+            assert_eq!(history.len(), 3);
+
+            assert_eq!(history.first().unwrap().message, most_recent_message);
+            assert_eq!(history.last().unwrap().message, initial_commit_message);
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_get_commit_history_list_between() -> Result<(), OxenError> {
+        test::run_one_commit_local_repo_test_async(|repo| async move {
+            let new_file = repo.path.join("new_1.txt");
+            test::write_txt_file_to_path(&new_file, "new 1")?;
+            repositories::add(&repo, new_file).await?;
+            let base_commit = repositories::commit(&repo, "commit 1")?;
+
+            let new_file = repo.path.join("new_2.txt");
+            test::write_txt_file_to_path(&new_file, "new 2")?;
+            repositories::add(&repo, new_file).await?;
+            repositories::commit(&repo, "commit 2")?;
+
+            let new_file = repo.path.join("new_3.txt");
+            test::write_txt_file_to_path(&new_file, "new 3")?;
+            repositories::add(&repo, new_file).await?;
+            let head_commit = repositories::commit(&repo, "commit 3")?;
+
+            let new_file = repo.path.join("new_4.txt");
+            test::write_txt_file_to_path(&new_file, "new 4")?;
+            repositories::add(&repo, new_file).await?;
+            repositories::commit(&repo, "commit 4")?;
+
+            let history = repositories::commits::list_between(&repo, &base_commit, &head_commit)?;
+            assert_eq!(history.len(), 3);
+
+            assert_eq!(history.first().unwrap().message, head_commit.message);
+            assert_eq!(history.last().unwrap().message, base_commit.message);
+
+            Ok(())
+        })
+        .await
+    }
+
+    // ----- list_between_exclusive: helpers -----
+    //
+    // Octopus merges (>2 parents) aren't exercised because Oxen never produces them:
+    // `merge` is pairwise, so commits have at most two parents. Disjoint histories can
+    // occur (`pull` merges unrelated histories) but are awkward to build with the test
+    // helpers; the algorithm handles them structurally, as a pure set difference
+    // between the two tips' reachable sets.
+
+    async fn add_commit(repo: &LocalRepository, name: &str) -> Result<Commit, OxenError> {
+        let path = repo.path.join(format!("{name}.txt"));
+        util::fs::write_to_path(&path, name)?;
+        repositories::add(repo, &path).await?;
+        repositories::commit(repo, name)
+    }
+
+    // Brute-force reference: every commit reachable from `id`, via the plain walk.
+    fn reachable_ids(repo: &LocalRepository, id: &str) -> HashSet<String> {
+        repositories::commits::list_from(repo, id)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect()
+    }
+
+    // The defining property of base..head: reachable(head) minus reachable(base). `reachable`
+    // holds one walk per commit, keyed by commit id.
+    fn reference_range_ids(
+        reachable: &HashMap<String, HashSet<String>>,
+        base: &Commit,
+        head: &Commit,
+    ) -> HashSet<String> {
+        reachable[&head.id]
+            .difference(&reachable[&base.id])
+            .cloned()
+            .collect()
+    }
+
+    // Differential check: list_between_exclusive must equal the reference set, list
+    // no commit twice, and never place a commit before one of its children.
+    async fn assert_range_matches_reference(
+        repo: &LocalRepository,
+        reachable: &HashMap<String, HashSet<String>>,
+        base: &Commit,
+        head: &Commit,
+    ) {
+        let got = repositories::commits::list_between_exclusive(repo, base, head)
+            .await
+            .unwrap();
+        let order: HashMap<String, usize> = got
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.id.clone(), i))
+            .collect();
+
+        assert_eq!(
+            order.len(),
+            got.len(),
+            "duplicate commits in {}..{}",
+            base.id,
+            head.id
+        );
+        let got_set: HashSet<String> = order.keys().cloned().collect();
+        assert_eq!(
+            got_set,
+            reference_range_ids(reachable, base, head),
+            "wrong set for {}..{}",
+            base.id,
+            head.id
+        );
+        for commit in &got {
+            for parent_id in &commit.parent_ids {
+                if let Some(&parent_pos) = order.get(parent_id) {
+                    assert!(
+                        order[&commit.id] < parent_pos,
+                        "{} listed before its child in {}..{}",
+                        parent_id,
+                        base.id,
+                        head.id
+                    );
+                }
+            }
+        }
+    }
+
+    // Every ordered pair drawn from `commits` must satisfy the reference, including
+    // self-pairs (empty) and reversed pairs (head behind base). Each commit's reachable set is
+    // walked once here and shared by every pair that needs it.
+    async fn assert_all_pairs(repo: &LocalRepository, commits: &[&Commit]) {
+        let reachable: HashMap<String, HashSet<String>> = commits
+            .iter()
+            .map(|c| (c.id.clone(), reachable_ids(repo, &c.id)))
+            .collect();
+        for base in commits {
+            for head in commits {
+                assert_range_matches_reference(repo, &reachable, base, head).await;
+            }
+        }
+    }
+
+    /// Mirrors `git log base...head`: the commits on either side of the fork but not both. A
+    /// merge-base substitution would instead yield only head's side, which is the two-dot answer.
+    #[tokio::test]
+    async fn test_list_symmetric_difference_returns_both_sides() -> Result<(), OxenError> {
+        test::run_one_commit_local_repo_test_async(|repo| async move {
+            let main = repositories::branches::current_branch(&repo)?.unwrap();
+            let fork = add_commit(&repo, "fork").await?;
+
+            repositories::branches::create_checkout(&repo, "feature")?;
+            let d1 = add_commit(&repo, "d1").await?;
+            let head = add_commit(&repo, "d2").await?;
+
+            repositories::checkout(&repo, &main.name).await?;
+            let base = add_commit(&repo, "c1").await?;
+
+            let (base_only, head_only) =
+                repositories::commits::list_symmetric_difference(&repo, &base, &head).await?;
+
+            let base_ids: Vec<&str> = base_only.iter().map(|c| c.id.as_str()).collect();
+            let head_ids: Vec<&str> = head_only.iter().map(|c| c.id.as_str()).collect();
+            assert_eq!(base_ids, vec![base.id.as_str()], "base side is c1 only");
+            assert_eq!(
+                head_ids.len(),
+                2,
+                "head side is d1 and d2, got {head_ids:?}"
+            );
+            assert!(head_ids.contains(&d1.id.as_str()));
+            assert!(head_ids.contains(&head.id.as_str()));
+            assert!(
+                !base_ids.contains(&fork.id.as_str()) && !head_ids.contains(&fork.id.as_str()),
+                "the shared fork point belongs to neither side"
+            );
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_list_between_exclusive_linear() -> Result<(), OxenError> {
+        test::run_one_commit_local_repo_test_async(|repo| async move {
+            let root = repositories::commits::head_commit(&repo)?;
+            let a = add_commit(&repo, "a").await?;
+            let b = add_commit(&repo, "b").await?;
+            let c = add_commit(&repo, "c").await?;
+
+            let range = repositories::commits::list_between_exclusive(&repo, &a, &c).await?;
+            let ids: HashSet<String> = range.iter().map(|x| x.id.clone()).collect();
+            assert_eq!(ids, HashSet::from([b.id.clone(), c.id.clone()]));
+
+            // Empty when head == base, and when head is behind base.
+            assert!(
+                repositories::commits::list_between_exclusive(&repo, &c, &c)
+                    .await?
+                    .is_empty()
+            );
+            assert!(
+                repositories::commits::list_between_exclusive(&repo, &c, &a)
+                    .await?
+                    .is_empty()
+            );
+
+            assert_all_pairs(&repo, &[&root, &a, &b, &c]).await;
+            Ok(())
+        })
+        .await
+    }
+
+    // Diamond: head is a merge of two branches that both fork from the base.
+    #[tokio::test]
+    async fn test_list_between_exclusive_diamond() -> Result<(), OxenError> {
+        test::run_one_commit_local_repo_test_async(|repo| async move {
+            let main_branch = repositories::branches::current_branch(&repo)?.unwrap();
+            let a = add_commit(&repo, "a").await?;
+
+            let feature = repositories::branches::create_checkout(&repo, "feature")?;
+            let f1 = add_commit(&repo, "f1").await?;
+
+            repositories::checkout(&repo, &main_branch.name).await?;
+            let b = add_commit(&repo, "b").await?;
+            let m = repositories::merge::merge(&repo, &feature.name)
+                .await?
+                .unwrap();
+
+            let ids: HashSet<String> = repositories::commits::list_between_exclusive(&repo, &a, &m)
+                .await?
+                .into_iter()
+                .map(|x| x.id)
+                .collect();
+            assert_eq!(
+                ids,
+                HashSet::from([b.id.clone(), f1.id.clone(), m.id.clone()])
+            );
+
+            assert_all_pairs(&repo, &[&a, &b, &f1, &m]).await;
+            Ok(())
+        })
+        .await
+    }
+
+    // Reproduces the merge-request bug: head merges the base branch back into
+    // itself, so head reaches base commits along the merge's second parent.
+    #[tokio::test]
+    async fn test_list_between_exclusive_skips_merged_base_history() -> Result<(), OxenError> {
+        test::run_one_commit_local_repo_test_async(|repo| async move {
+            let main_branch = repositories::branches::current_branch(&repo)?.unwrap();
+            let c1 = add_commit(&repo, "c1").await?;
+
+            let feature = repositories::branches::create_checkout(&repo, "feature")?;
+            let f1 = add_commit(&repo, "f1").await?;
+
+            repositories::checkout(&repo, &main_branch.name).await?;
+            let c2 = add_commit(&repo, "c2").await?;
+            let c3 = add_commit(&repo, "c3").await?;
+
+            repositories::checkout(&repo, &feature.name).await?;
+            let merge = repositories::merge::merge(&repo, &main_branch.name)
+                .await?
+                .unwrap();
+            let f2 = add_commit(&repo, "f2").await?;
+
+            // base = main tip (c3), head = feature tip (f2): only feature's own work.
+            let ids: HashSet<String> =
+                repositories::commits::list_between_exclusive(&repo, &c3, &f2)
+                    .await?
+                    .into_iter()
+                    .map(|x| x.id)
+                    .collect();
+            assert_eq!(
+                ids,
+                HashSet::from([f1.id.clone(), merge.id.clone(), f2.id.clone()])
+            );
+
+            // The old walk over-includes base history reached past the merge commit.
+            let buggy = repositories::commits::list_between(&repo, &c3, &f2)?;
+            assert!(
+                buggy.iter().any(|c| c.id == c1.id),
+                "list_between is expected to over-include base history here"
+            );
+
+            assert_all_pairs(&repo, &[&c1, &c2, &c3, &f1, &merge, &f2]).await;
+            Ok(())
+        })
+        .await
+    }
+
+    // Criss-cross: two merge commits that each have the same pair of parents, so
+    // there are two merge bases and no single lowest common ancestor. The set
+    // difference is still exact where any single-LCA shortcut would not be.
+    #[tokio::test]
+    async fn test_list_between_exclusive_criss_cross() -> Result<(), OxenError> {
+        test::run_one_commit_local_repo_test_async(|repo| async move {
+            let main_branch = repositories::branches::current_branch(&repo)?.unwrap();
+
+            let branch_a = repositories::branches::create_checkout(&repo, "branch-a")?;
+            let a1 = add_commit(&repo, "a1").await?;
+            // Snapshot a1 so its pre-merge tip stays mergeable by name later.
+            repositories::branches::create_checkout(&repo, "a-snap")?;
+
+            repositories::checkout(&repo, &main_branch.name).await?;
+            let branch_b = repositories::branches::create_checkout(&repo, "branch-b")?;
+            let b1 = add_commit(&repo, "b1").await?;
+            repositories::branches::create_checkout(&repo, "b-snap")?;
+
+            // branch-a (at a1) merges b1; branch-b (at b1) merges a1.
+            repositories::checkout(&repo, &branch_a.name).await?;
+            let ma = repositories::merge::merge(&repo, "b-snap").await?.unwrap();
+            repositories::checkout(&repo, &branch_b.name).await?;
+            let mb = repositories::merge::merge(&repo, "a-snap").await?.unwrap();
+
+            // reachable(ma) and reachable(mb) share {a1, b1, root}; each range is
+            // exactly the other merge node.
+            let ma_to_mb: Vec<Commit> =
+                repositories::commits::list_between_exclusive(&repo, &ma, &mb).await?;
+            assert_eq!(ma_to_mb.len(), 1);
+            assert_eq!(ma_to_mb[0].id, mb.id);
+
+            assert_all_pairs(&repo, &[&a1, &b1, &ma, &mb]).await;
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_commit_subdir_then_root_file() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            // Make a dir
+            let dir_path = Path::new("test_dir");
+            let dir_repo_path = repo.path.join(dir_path);
+            util::fs::create_dir_all(dir_repo_path)?;
+
+            // File in the dir
+            let file_path = dir_path.join(Path::new("test_file.txt"));
+            let file_repo_path = repo.path.join(&file_path);
+            util::fs::write_to_path(&file_repo_path, "test")?;
+
+            // Add the dir
+            repositories::add(&repo, &repo.path).await?;
+            let commit_1 = repositories::commit(&repo, "adding test dir")?;
+
+            // New file in root
+            let file_path_2 = Path::new("test_file_2.txt");
+            let file_repo_path_2 = repo.path.join(file_path_2);
+            util::fs::write_to_path(&file_repo_path_2, "test")?;
+
+            // Add the file
+            repositories::add(&repo, &file_repo_path_2).await?;
+            let commit_2 = repositories::commit(&repo, "adding test file")?;
+
+            let tree_1 = repositories::tree::get_root_with_children(&repo, &commit_1)?.unwrap();
+            let tree_2 = repositories::tree::get_root_with_children(&repo, &commit_2)?.unwrap();
+
+            // Make sure the file is not in the first commit
+            // This was biting us in an initial implementation
+            // BECAUSE the file contents was the same, the hash was not updated
+            let node_from_tree_1 = tree_1.get_by_path(file_path_2)?;
+            assert!(node_from_tree_1.is_none());
+
+            // Make sure the file is in the second commit
+            let node_from_tree_2 = tree_2.get_by_path(file_path_2)?;
+            assert!(node_from_tree_2.is_some());
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_commit_allow_empty() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            // Create and commit an initial file
+            let hello_file = repo.path.join("hello.txt");
+            util::fs::write_to_path(&hello_file, "Hello World")?;
+            repositories::add(&repo, &hello_file).await?;
+            let first_commit = repositories::commit(&repo, "Initial commit")?;
+
+            // Try to create an empty commit without --allow-empty (should fail)
+            let result = repositories::commit(&repo, "Empty commit");
+            assert!(result.is_err());
+
+            // Create an empty commit with --allow-empty (should succeed)
+            let empty_commit = commit_allow_empty(&repo, "Empty commit").await?;
+            assert_eq!(empty_commit.message, "Empty commit");
+            assert_eq!(empty_commit.parent_ids, vec![first_commit.id.clone()]);
+
+            // Verify the tree is the same as the parent
+            let first_tree =
+                repositories::tree::get_root_with_children(&repo, &first_commit)?.unwrap();
+            let empty_tree =
+                repositories::tree::get_root_with_children(&repo, &empty_commit)?.unwrap();
+
+            // Both trees should have the same file
+            let first_file = first_tree.get_by_path(Path::new("hello.txt"))?;
+            let empty_file = empty_tree.get_by_path(Path::new("hello.txt"))?;
+            assert!(first_file.is_some());
+            assert!(empty_file.is_some());
+            assert_eq!(first_file.unwrap().hash, empty_file.unwrap().hash);
+
+            // Verify commit history
+            let history = repositories::commits::list(&repo)?;
+            assert_eq!(history.len(), 2);
+            assert_eq!(history[0].message, "Empty commit");
+            assert_eq!(history[1].message, "Initial commit");
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_commit_allow_empty_with_changes() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            // Create and commit an initial file
+            let hello_file = repo.path.join("hello.txt");
+            util::fs::write_to_path(&hello_file, "Hello World")?;
+            repositories::add(&repo, &hello_file).await?;
+            repositories::commit(&repo, "Initial commit")?;
+
+            // Stage a new file
+            let goodbye_file = repo.path.join("goodbye.txt");
+            util::fs::write_to_path(&goodbye_file, "Goodbye World")?;
+            repositories::add(&repo, &goodbye_file).await?;
+
+            // commit_allow_empty should commit the staged changes normally
+            let commit = commit_allow_empty(&repo, "Add goodbye").await?;
+            assert_eq!(commit.message, "Add goodbye");
+
+            // Verify both files are in the tree
+            let tree = repositories::tree::get_root_with_children(&repo, &commit)?.unwrap();
+            assert!(tree.get_by_path(Path::new("hello.txt"))?.is_some());
+            assert!(tree.get_by_path(Path::new("goodbye.txt"))?.is_some());
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_commit_files_at_vnode_size_boundary() -> Result<(), OxenError> {
+        // Regression coverage: committing exactly `vnode_size` files in one directory must
+        // not interfere with path lookups for sibling files. Originally written with the
+        // production default (10k files at vnode_size=10k); rewritten to set a small
+        // vnode_size so the same boundary case runs in a fraction of the time.
+        const N: usize = 10;
+        test::run_empty_local_repo_test_async(|repo| async move {
+            let mut repo = repo;
+            repo.set_vnode_size(N as u64);
+
+            let dir_path = Path::new("test_dir");
+            let dir_repo_path = repo.path.join(dir_path);
+            util::fs::create_dir_all(&dir_repo_path)?;
+
+            for i in 0..N {
+                let file_path = dir_path.join(format!("file_{i}.txt"));
+                let file_repo_path = repo.path.join(&file_path);
+                util::fs::write_to_path(&file_repo_path, "test")?;
+            }
+
+            // Add a file called "images.csv" at the root of the repo
+            let images_csv_path = Path::new("images.csv");
+            let images_csv_repo_path = repo.path.join(images_csv_path);
+            util::fs::write_to_path(&images_csv_repo_path, "images,path\n1,test.jpg\n2,test.png")?;
+
+            repositories::add(&repo, &dir_repo_path).await?;
+            repositories::add(&repo, &images_csv_repo_path).await?;
+            let commit = repositories::commit(&repo, &format!("adding {N} files"))?;
+
+            repositories::tree::print_tree(&repo, &commit)?;
+
+            let file_node = repositories::tree::get_file_by_path(&repo, &commit, images_csv_path)?;
+            assert!(file_node.is_some());
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_add_and_rm_empty_dir() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            // Make an empty dir
+            let empty_dir = repo.path.join("empty_dir");
+            util::fs::create_dir_all(&empty_dir)?;
+
+            let status = repositories::status(&repo).await?;
+            status.print();
+
+            // Should find the untracked dir
+            assert!(
+                status
+                    .untracked_dirs
+                    .iter()
+                    .any(|(path, _)| *path == Path::new("empty_dir"))
+            );
+
+            // Add the empty dir
+            repositories::add(&repo, &empty_dir).await?;
+
+            let status = repositories::status(&repo).await?;
+            status.print();
+
+            let commit = repositories::commit(&repo, "adding empty dir")?;
+
+            let tree = repositories::tree::get_root_with_children(&repo, &commit)?.unwrap();
+
+            assert!(tree.get_by_path(PathBuf::from("empty_dir"))?.is_some());
+
+            // Remove the empty dir
+            let rm_opts = RmOpts {
+                path: PathBuf::from("empty_dir"),
+                recursive: true,
+                ..Default::default()
+            };
+
+            repositories::rm(&repo, &rm_opts).await?;
+            let commit_2 = repositories::commit(&repo, "removing empty dir")?;
+
+            let tree_2 = repositories::tree::get_root_with_children(&repo, &commit_2)?.unwrap();
+            assert!(tree_2.get_by_path(PathBuf::from("empty_dir"))?.is_none());
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_commit_invalid_parquet_file() -> Result<(), OxenError> {
+        test::run_empty_data_repo_test_no_commits_async(|repo| async move {
+            let invalid_parquet_file = test::test_invalid_parquet_file();
+            let full_path = repo.path.join("invalid.parquet");
+            util::fs::copy(&invalid_parquet_file, &full_path)?;
+
+            repositories::add(&repo, &full_path).await?;
+            let commit = repositories::commit(&repo, "Adding invalid parquet file")?;
+
+            let tree = repositories::tree::get_root_with_children(&repo, &commit)?.unwrap();
+            let file_node = tree.get_by_path(PathBuf::from("invalid.parquet"))?;
+            assert!(file_node.is_some());
+
+            let file_entry = file_node.unwrap();
+            let file_node = file_entry.file()?;
+            assert_eq!(*file_node.data_type(), EntryDataType::Binary);
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[cfg_attr(windows, ignore = "oxen-server is not supported on Windows")]
+    #[tokio::test]
+    async fn test_clone_annotations_test_subtree_commit_file() -> Result<(), OxenError> {
+        test::run_training_data_fully_sync_remote(|_local_repo, remote_repo| async move {
+            let cloned_remote = remote_repo.clone();
+            test::run_empty_dir_test_async(|dir| async move {
+                let mut opts = CloneOpts::new(&remote_repo.remote.url, dir.join("new_repo"));
+                opts.fetch_opts.subtree_paths =
+                    Some(vec![PathBuf::from("annotations").join("test")]);
+                let local_repo = repositories::clone::clone(&opts).await?;
+
+                let annotations_test_dir = local_repo.path.join("annotations").join("test");
+
+                // Add a new file
+                let readme_file = annotations_test_dir.join("README.md");
+                util::fs::write_to_path(
+                    &readme_file,
+                    r"
+Q: What is a good alternative to git LFS?
+A: Oxen.ai
+",
+                )?;
+                repositories::add(&local_repo, &readme_file).await?;
+                let _commit =
+                    repositories::commit(&local_repo, "adding README.md to the test dir")?;
+
+                Ok(())
+            })
+            .await?;
+            Ok(cloned_remote)
+        })
+        .await
+    }
+
+    // Test for updating file size after cloning subtree
+    // I cloned subtree, added an empty file, committed, pushed, then edited the file and committed again
+    // The file size should be updated in the index
+    #[cfg_attr(windows, ignore = "oxen-server is not supported on Windows")]
+    #[tokio::test]
+    async fn test_clone_subtree_commit_file_update_size() -> Result<(), OxenError> {
+        test::run_one_commit_sync_repo_test(|_local_repo, remote_repo| async move {
+            let cloned_remote = remote_repo.clone();
+            test::run_empty_dir_test_async(|dir| async move {
+                let mut opts = CloneOpts::new(&remote_repo.remote.url, dir.join("new_repo"));
+                opts.fetch_opts.subtree_paths = Some(vec![PathBuf::from(".")]);
+                let local_repo = repositories::clone::clone(&opts).await?;
+
+                // Add a new file
+                let empty_file = local_repo.path.join("empty.txt");
+                util::fs::write_to_path(&empty_file, "")?;
+                repositories::add(&local_repo, &empty_file).await?;
+                let commit = repositories::commit(&local_repo, "adding empty file")?;
+
+                let tree =
+                    repositories::tree::get_root_with_children(&local_repo, &commit)?.unwrap();
+
+                let file_node = tree.get_by_path(PathBuf::from("empty.txt"))?;
+                assert!(file_node.is_some());
+                let file_node = file_node.unwrap().file()?;
+                assert_eq!(file_node.num_bytes(), 0);
+
+                // Edit the file
+                let raw_str = r"
+Q: What should I use to store massive machine learning datasets?
+A: Oxen.ai
+";
+                util::fs::write_to_path(&empty_file, raw_str)?;
+
+                repositories::add(&local_repo, &empty_file).await?;
+                let commit = repositories::commit(&local_repo, "adding README.md to the test dir")?;
+
+                let tree =
+                    repositories::tree::get_root_with_children(&local_repo, &commit)?.unwrap();
+
+                let file_node = tree.get_by_path(PathBuf::from("empty.txt"))?;
+                assert!(file_node.is_some());
+                let file_node = file_node.unwrap().file()?;
+                assert_eq!(file_node.num_bytes(), raw_str.len() as u64);
+
+                Ok(())
+            })
+            .await?;
+            Ok(cloned_remote)
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_list_by_path_from_paginated_names_a_path_the_revision_lacks()
+    -> Result<(), OxenError> {
+        test::run_one_commit_local_repo_test_async(|repo| async move {
+            let commit = repositories::commits::head_commit(&repo)?;
+
+            let err = repositories::commits::list_by_path_from_paginated(
+                &repo,
+                &commit,
+                &PathBuf::from("no/such/path.txt"),
+                PaginateOpts::default(),
+            )
+            .await
+            .expect_err("a path the revision does not contain has no history");
+
+            // Names the revision alongside the path, which is what separates a mistyped path
+            // from asking the right path of the wrong revision.
+            let OxenError::PathNotFoundInRevision { path, revision } = &err else {
+                panic!("expected PathNotFoundInRevision, got {err:?}");
+            };
+            assert_eq!(path.to_string(), "no/such/path.txt");
+            assert_eq!(*revision, commit.id);
+            assert!(err.is_not_found());
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_list_by_path_from_paginated() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            let target_file_path = PathBuf::from("target_file.txt");
+            let other_file_path_1 = PathBuf::from("other_file_1.txt");
+            let dummy_dir_path = PathBuf::from("dummy_dir");
+
+            // Commit a: Add target_file
+            let full_target_path = repo.path.join(&target_file_path);
+            util::fs::write_to_path(&full_target_path, "Initial content")?;
+            repositories::add(&repo, &full_target_path).await?;
+            let commit_a = repositories::commit(&repo, "Add target_file.txt")?;
+
+            // Commit b: without impacting target_file
+            let full_other_path_1 = repo.path.join(&other_file_path_1);
+            util::fs::write_to_path(&full_other_path_1, "Some other content")?;
+            repositories::add(&repo, &full_other_path_1).await?;
+            let _commit_b = repositories::commit(&repo, "Add other_file_1.txt")?;
+
+            // Commit c: Modify target_file
+            util::fs::write_to_path(&full_target_path, "Modified content 1")?;
+            repositories::add(&repo, &full_target_path).await?;
+            let commit_c = repositories::commit(&repo, "Modify target_file.txt first time")?;
+
+            // Commit d: without impacting target_file
+            let full_dummy_dir_path = repo.path.join(&dummy_dir_path);
+            util::fs::create_dir_all(&full_dummy_dir_path)?;
+            repositories::add(&repo, &full_dummy_dir_path).await?;
+            let _commit_d = repositories::commit(&repo, "Add dummy dir")?;
+
+            // Commit e: modify target_file.txt
+            util::fs::write_to_path(&full_target_path, "Modified content 2")?;
+            repositories::add(&repo, &full_target_path).await?;
+            let commit_e = repositories::commit(&repo, "Modify target_file.txt second time")?;
+
+            // Get the HEAD commit (should be commit_e)
+            let head_commit = repositories::commits::head_commit(&repo)?;
+            assert_eq!(head_commit.id, commit_e.id);
+
+            let expected_commits = [commit_e.clone(), commit_c.clone(), commit_a.clone()];
+
+            let pagination_opts = PaginateOpts::default();
+            let paginated_result = repositories::commits::list_by_path_from_paginated(
+                &repo,
+                &head_commit,
+                &target_file_path,
+                pagination_opts,
+            )
+            .await?;
+
+            assert_eq!(paginated_result.commits.len(), expected_commits.len());
+
+            for (i, commit) in paginated_result.commits.iter().enumerate() {
+                assert_eq!(
+                    commit.id, expected_commits[i].id,
+                    "Commits should match expected list at index {i}"
+                );
+            }
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_create_initial_commit_on_empty_repo() -> Result<(), OxenError> {
+        test::run_empty_data_repo_test_no_commits_async(|repo| async move {
+            // Verify repo is empty (no commits)
+            assert!(head_commit_maybe(&repo)?.is_none());
+            assert!(repositories::branches::list(&repo).await?.is_empty());
+
+            // Create initial commit
+            let user = crate::model::User {
+                name: "Test User".to_string(),
+                email: "test@example.com".to_string(),
+            };
+            let commit = create_initial_commit(&repo, "main", &user, "Initial commit")?;
+
+            // Verify commit was created correctly
+            assert_eq!(commit.message, "Initial commit");
+            assert_eq!(commit.author, "Test User");
+            assert_eq!(commit.email, "test@example.com");
+            assert!(commit.parent_ids.is_empty()); // No parents for initial commit
+
+            // Verify HEAD now points to the commit
+            let head = head_commit_maybe(&repo)?;
+            assert!(head.is_some());
+            assert_eq!(head.unwrap().id, commit.id);
+
+            // Verify branch was created
+            let branches = repositories::branches::list(&repo).await?;
+            assert_eq!(branches.len(), 1);
+            assert_eq!(branches[0].name, "main");
+            assert_eq!(branches[0].commit_id, commit.id);
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_create_initial_commit_fails_on_non_empty_repo() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            // First create a file and commit it to make the repo non-empty
+            let hello_file = repo.path.join("hello.txt");
+            util::fs::write_to_path(&hello_file, "Hello World")?;
+            repositories::add(&repo, &hello_file).await?;
+            repositories::commit(&repo, "First commit")?;
+
+            // Now create_initial_commit should fail
+            let user = crate::model::User {
+                name: "Test User".to_string(),
+                email: "test@example.com".to_string(),
+            };
+            let result = create_initial_commit(&repo, "another-branch", &user, "Should fail");
+
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("already has commits"));
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_create_initial_commit_with_custom_branch_name() -> Result<(), OxenError> {
+        test::run_empty_data_repo_test_no_commits_async(|repo| async move {
+            // Create initial commit on a custom branch name
+            let user = crate::model::User {
+                name: "Test User".to_string(),
+                email: "test@example.com".to_string(),
+            };
+            let commit = create_initial_commit(&repo, "develop", &user, "Initial commit")?;
+
+            // Verify branch was created with custom name
+            let branches = repositories::branches::list(&repo).await?;
+            assert_eq!(branches.len(), 1);
+            assert_eq!(branches[0].name, "develop");
+            assert_eq!(branches[0].commit_id, commit.id);
+
+            // Verify HEAD points to the custom branch
+            let current_branch = repositories::branches::current_branch(&repo)?;
+            assert!(current_branch.is_some());
+            assert_eq!(current_branch.unwrap().name, "develop");
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_create_initial_commit_then_second_commit() -> Result<(), OxenError> {
+        test::run_empty_data_repo_test_no_commits_async(|repo| async move {
+            // Create initial commit on empty repo
+            let user = crate::model::User {
+                name: "Test User".to_string(),
+                email: "test@example.com".to_string(),
+            };
+            let initial_commit = create_initial_commit(&repo, "main", &user, "Initial commit")?;
+            assert_eq!(initial_commit.message, "Initial commit");
+
+            // Now add a file and try to commit again
+            let hello_file = repo.path.join("hello.txt");
+            util::fs::write_to_path(&hello_file, "Hello World")?;
+            repositories::add(&repo, &hello_file).await?;
+
+            // This second commit should succeed
+            let second_commit = repositories::commit(&repo, "Add hello.txt")?;
+            assert_eq!(second_commit.message, "Add hello.txt");
+
+            // Verify the file is in the commit
+            let status = repositories::status(&repo).await?;
+            assert!(status.is_clean());
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_list_by_path_commit_count_with_edge_cases() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            // Commit 1: Create data/a.txt and src/b.txt
+            let data_a = repo.path.join("data").join("a.txt");
+            let src_b = repo.path.join("src").join("b.txt");
+            util::fs::write_to_path(&data_a, "a-v1")?;
+            util::fs::write_to_path(&src_b, "b-v1")?;
+            repositories::add(&repo, &repo.path.join("data")).await?;
+            repositories::add(&repo, &repo.path.join("src")).await?;
+            let _c1 = repositories::commit(&repo, "c1: add data/a.txt and src/b.txt")?;
+
+            // Commit 2: Modify data/a.txt
+            util::fs::write_to_path(&data_a, "a-v2")?;
+            repositories::add(&repo, &data_a).await?;
+            let _c2 = repositories::commit(&repo, "c2: modify data/a.txt")?;
+
+            // Commit 3: Empty commit (no changes)
+            let _c3 = commit_allow_empty(&repo, "c3: empty commit").await?;
+
+            // Commit 4: Add src/c.txt
+            let src_c = repo.path.join("src").join("c.txt");
+            util::fs::write_to_path(&src_c, "c-v1")?;
+            repositories::add(&repo, &src_c).await?;
+            let _c4 = repositories::commit(&repo, "c4: add src/c.txt")?;
+
+            // Commit 5: Empty commit (no tree changes, should not appear in any path history)
+            let _c5 = commit_allow_empty(&repo, "c5: another empty commit").await?;
+
+            // Commit 6: Add root-level other.txt
+            let other = repo.path.join("other.txt");
+            util::fs::write_to_path(&other, "other-v1")?;
+            repositories::add(&repo, &other).await?;
+            let _c6 = repositories::commit(&repo, "c6: add other.txt")?;
+
+            // Commit 7: Modify src/b.txt
+            util::fs::write_to_path(&src_b, "b-v2")?;
+            repositories::add(&repo, &src_b).await?;
+            let _c7 = repositories::commit(&repo, "c7: modify src/b.txt")?;
+
+            // Commit 8: Modify data/a.txt
+            util::fs::write_to_path(&data_a, "a-v3")?;
+            repositories::add(&repo, &data_a).await?;
+            let _c8 = repositories::commit(&repo, "c8: modify data/a.txt again")?;
+
+            // Commit 9: Revert data/a.txt back to its c1 content ("a-v1").
+            // The content matches c1, but the tree hash differs from parent c8,
+            // so this should count as a real commit for data/a.txt.
+            util::fs::write_to_path(&data_a, "a-v1")?;
+            repositories::add(&repo, &data_a).await?;
+            let _c9 = repositories::commit(&repo, "c9: revert data/a.txt to v1")?;
+
+            let head = repositories::commits::head_commit(&repo)?;
+            let opts = PaginateOpts::default();
+
+            // data/a.txt: should have 4 commits (c9, c8, c2, c1)
+            // c9 reverts to c1 content, but it differs from parent c8 so it counts
+            let result = repositories::commits::list_by_path_from_paginated(
+                &repo,
+                &head,
+                &PathBuf::from("data/a.txt"),
+                opts.clone(),
+            )
+            .await?;
+            assert_eq!(
+                result.commits.len(),
+                4,
+                "data/a.txt expected 4 commits, got {}",
+                result.commits.len()
+            );
+
+            // src/b.txt: should have 2 commits (c7, c1)
+            let result = repositories::commits::list_by_path_from_paginated(
+                &repo,
+                &head,
+                &PathBuf::from("src/b.txt"),
+                opts.clone(),
+            )
+            .await?;
+            assert_eq!(
+                result.commits.len(),
+                2,
+                "src/b.txt expected 2 commits, got {}",
+                result.commits.len()
+            );
+
+            // src/c.txt: should have 1 commit (c4)
+            let result = repositories::commits::list_by_path_from_paginated(
+                &repo,
+                &head,
+                &PathBuf::from("src/c.txt"),
+                opts.clone(),
+            )
+            .await?;
+            assert_eq!(
+                result.commits.len(),
+                1,
+                "src/c.txt expected 1 commit, got {}",
+                result.commits.len()
+            );
+
+            // other.txt: should have 1 commit (c6)
+            let result = repositories::commits::list_by_path_from_paginated(
+                &repo,
+                &head,
+                &PathBuf::from("other.txt"),
+                opts.clone(),
+            )
+            .await?;
+            assert_eq!(
+                result.commits.len(),
+                1,
+                "other.txt expected 1 commit, got {}",
+                result.commits.len()
+            );
+
+            // data/ directory: should have 4 commits (c9, c8, c2, c1)
+            let result = repositories::commits::list_by_path_from_paginated(
+                &repo,
+                &head,
+                &PathBuf::from("data"),
+                opts.clone(),
+            )
+            .await?;
+            assert_eq!(
+                result.commits.len(),
+                4,
+                "data/ expected 4 commits, got {}",
+                result.commits.len()
+            );
+
+            // src/ directory: should have 3 commits (c7, c4, c1)
+            let result = repositories::commits::list_by_path_from_paginated(
+                &repo,
+                &head,
+                &PathBuf::from("src"),
+                opts.clone(),
+            )
+            .await?;
+            assert_eq!(
+                result.commits.len(),
+                3,
+                "src/ expected 3 commits, got {}",
+                result.commits.len()
+            );
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_count_from_after_three_way_merge() -> Result<(), OxenError> {
+        // Verifies that count_from returns the correct number of unique commits
+        // after a three-way merge (no double-counting shared ancestors).
+        //
+        // Graph:
+        //   init - A - C - D - M (merge)
+        //             \       /
+        //              B --- E
+        //
+        // init = 1 (from run_one_commit_local_repo_test_async)
+        // A, B, C, D, E = 5 commits on branches
+        // M = merge commit
+        // Total unique commits = 7
+
+        test::run_one_commit_local_repo_test_async(|repo| async move {
+            let main_branch = repositories::branches::current_branch(&repo)?.unwrap();
+
+            // Commit A on main (shared ancestor)
+            let a_path = repo.path.join("a.txt");
+            util::fs::write_to_path(&a_path, "a")?;
+            repositories::add(&repo, &a_path).await?;
+            repositories::commit(&repo, "Commit A")?;
+
+            // Branch off and create commits B, E
+            let merge_branch_name = "feature";
+            repositories::branches::create_checkout(&repo, merge_branch_name)?;
+            let b_path = repo.path.join("b.txt");
+            util::fs::write_to_path(&b_path, "b")?;
+            repositories::add(&repo, &b_path).await?;
+            repositories::commit(&repo, "Commit B")?;
+
+            let e_path = repo.path.join("e.txt");
+            util::fs::write_to_path(&e_path, "e")?;
+            repositories::add(&repo, &e_path).await?;
+            repositories::commit(&repo, "Commit E")?;
+
+            // Back to main, create commits C, D
+            repositories::checkout(&repo, &main_branch.name).await?;
+            let c_path = repo.path.join("c.txt");
+            util::fs::write_to_path(&c_path, "c")?;
+            repositories::add(&repo, &c_path).await?;
+            repositories::commit(&repo, "Commit C")?;
+
+            let d_path = repo.path.join("d.txt");
+            util::fs::write_to_path(&d_path, "d")?;
+            repositories::add(&repo, &d_path).await?;
+            repositories::commit(&repo, "Commit D")?;
+
+            // Warm the cache for both branch tips before merging
+            let (main_count, _) = repositories::commits::count_from(&repo, &main_branch.name)?;
+            let (feature_count, _) = repositories::commits::count_from(&repo, merge_branch_name)?;
+
+            // main: init -> A -> C -> D = 4 commits
+            assert_eq!(main_count, 4, "main branch should have 4 commits");
+            // feature: init -> A -> B -> E = 4 commits
+            assert_eq!(feature_count, 4, "feature branch should have 4 commits");
+
+            // Merge feature into main
+            let merge_commit = repositories::merge::merge(&repo, merge_branch_name)
+                .await?
+                .expect("merge should produce a commit");
+            assert_eq!(merge_commit.parent_ids.len(), 2);
+
+            // Verify count_from on merge commit
+            let (merge_count, _) = repositories::commits::count_from(&repo, &merge_commit.id)?;
+
+            // Total unique commits: init, A, B, C, D, E, M = 7
+            assert_eq!(
+                merge_count, 7,
+                "merge commit count should be 7 (unique commits), got {merge_count}"
+            );
+
+            // Also verify that list_from returns the same number
+            let all_commits = repositories::commits::list_from(&repo, &merge_commit.id)?;
+            assert_eq!(
+                all_commits.len(),
+                7,
+                "list_from should return 7 commits, got {}",
+                all_commits.len()
+            );
+
+            // count_from should agree with list_from
+            assert_eq!(
+                merge_count,
+                all_commits.len(),
+                "count_from ({merge_count}) should match list_from ({})",
+                all_commits.len()
+            );
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_count_from_serves_simultaneous_callers() -> Result<(), OxenError> {
+        // Two commit-history requests for one repo can be in flight at once, and both reach
+        // count_from. Every caller has to get an answer instead of one of them failing on the
+        // commit-count cache's RocksDB lock.
+        test::run_one_commit_local_repo_test_async(|repo| async move {
+            const CALLERS: usize = 8;
+            // Every caller enters count_from at the same moment.
+            let barrier = Barrier::new(CALLERS);
+            let results = std::thread::scope(|scope| {
+                let threads: Vec<_> = (0..CALLERS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            repositories::commits::count_from(&repo, DEFAULT_BRANCH_NAME)
+                        })
+                    })
+                    .collect();
+                threads
+                    .into_iter()
+                    .map(|thread| thread.join().expect("counting thread panicked"))
+                    .collect::<Vec<_>>()
+            });
+
+            for result in results {
+                let (count, _) = result?;
+                assert_eq!(count, 1, "the one-commit repo should always count 1");
+            }
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_count_from_after_merge_with_deep_shared_history() -> Result<(), OxenError> {
+        // Verifies correct counting when branches share a long history.
+        // The bug would cause near-doubling in this scenario.
+        //
+        // Graph:
+        //   init - H1 - H2 - H3 - H4 - H5 - main_commit - M (merge)
+        //                                    \             /
+        //                                     feat_commit
+        //
+        // Total unique commits = 9
+
+        test::run_one_commit_local_repo_test_async(|repo| async move {
+            let main_branch = repositories::branches::current_branch(&repo)?.unwrap();
+
+            // Create 5 commits of shared history
+            for i in 1..=5 {
+                let path = repo.path.join(format!("shared_{i}.txt"));
+                util::fs::write_to_path(&path, format!("shared {i}"))?;
+                repositories::add(&repo, &path).await?;
+                repositories::commit(&repo, &format!("Shared commit {i}"))?;
+            }
+
+            // Branch off for feature
+            let merge_branch_name = "feature";
+            repositories::branches::create_checkout(&repo, merge_branch_name)?;
+            let feat_path = repo.path.join("feature.txt");
+            util::fs::write_to_path(&feat_path, "feature")?;
+            repositories::add(&repo, &feat_path).await?;
+            repositories::commit(&repo, "Feature commit")?;
+
+            // Back to main, add one more commit
+            repositories::checkout(&repo, &main_branch.name).await?;
+            let main_path = repo.path.join("main_only.txt");
+            util::fs::write_to_path(&main_path, "main only")?;
+            repositories::add(&repo, &main_path).await?;
+            repositories::commit(&repo, "Main-only commit")?;
+
+            // Warm cache for both branches
+            let (main_count, _) = repositories::commits::count_from(&repo, &main_branch.name)?;
+            let (feature_count, _) = repositories::commits::count_from(&repo, merge_branch_name)?;
+            assert_eq!(main_count, 7, "main: init + 5 shared + 1 main-only = 7");
+            assert_eq!(feature_count, 7, "feature: init + 5 shared + 1 feature = 7");
+
+            // Merge
+            let merge_commit = repositories::merge::merge(&repo, merge_branch_name)
+                .await?
+                .expect("merge should produce a commit");
+
+            let (merge_count, _) = repositories::commits::count_from(&repo, &merge_commit.id)?;
+
+            // Unique: init + 5 shared + main_only + feat + merge = 9
+            let all_commits = repositories::commits::list_from(&repo, &merge_commit.id)?;
+            assert_eq!(
+                merge_count,
+                all_commits.len(),
+                "count_from ({merge_count}) should match list_from ({})",
+                all_commits.len()
+            );
+            assert_eq!(merge_count, 9, "should be 9, got {merge_count}");
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_count_from_after_merge_no_prior_cache() -> Result<(), OxenError> {
+        // Verifies correct count when parent branch counts are NOT cached
+        // before the merge (no warm-up step).
+
+        test::run_one_commit_local_repo_test_async(|repo| async move {
+            let main_branch = repositories::branches::current_branch(&repo)?.unwrap();
+
+            let a_path = repo.path.join("a.txt");
+            util::fs::write_to_path(&a_path, "a")?;
+            repositories::add(&repo, &a_path).await?;
+            repositories::commit(&repo, "Commit A")?;
+
+            // Branch and commit
+            repositories::branches::create_checkout(&repo, "feature")?;
+            let b_path = repo.path.join("b.txt");
+            util::fs::write_to_path(&b_path, "b")?;
+            repositories::add(&repo, &b_path).await?;
+            repositories::commit(&repo, "Commit B")?;
+
+            // Back to main and commit
+            repositories::checkout(&repo, &main_branch.name).await?;
+            let c_path = repo.path.join("c.txt");
+            util::fs::write_to_path(&c_path, "c")?;
+            repositories::add(&repo, &c_path).await?;
+            repositories::commit(&repo, "Commit C")?;
+
+            // Merge WITHOUT warming cache first
+            let merge_commit = repositories::merge::merge(&repo, "feature")
+                .await?
+                .expect("merge should produce a commit");
+
+            let (merge_count, _) = repositories::commits::count_from(&repo, &merge_commit.id)?;
+            let all_commits = repositories::commits::list_from(&repo, &merge_commit.id)?;
+
+            // init, A, B, C, M = 5
+            assert_eq!(
+                merge_count,
+                all_commits.len(),
+                "count_from ({merge_count}) should match list_from ({})",
+                all_commits.len()
+            );
+            assert_eq!(merge_count, 5, "should be 5, got {merge_count}");
+
+            Ok(())
+        })
+        .await
+    }
+}

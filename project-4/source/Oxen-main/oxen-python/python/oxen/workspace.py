@@ -1,0 +1,355 @@
+import tempfile
+from pathlib import Path
+from typing import TYPE_CHECKING, Iterable, Iterator, Optional
+
+from .oxen_py import PyCommit, PyErrorFileInfo, PyWorkspace
+
+# Use TYPE_CHECKING for type hints to avoid runtime circular imports
+if TYPE_CHECKING:
+    from .remote_repo import RemoteRepo
+
+
+class Workspace:
+    """
+    The Workspace class allows you to interact with an Oxen workspace
+    without downloading the data locally.
+
+    Workspaces can be created off a branch and is tied to the commit id of the branch
+    at the time of creation.
+
+    You can commit a Workspace back to the same branch if the branch has not
+    advanced, otherwise you will have to commit to a new branch and merge.
+
+    ## Examples
+
+    ### Adding Files to a Workspace
+
+    Create a workspace from a branch.
+
+    ```python
+    from oxen import RemoteRepo
+    from oxen import Workspace
+
+    # Connect to the remote repo
+    repo = RemoteRepo("ox/CatDogBBox")
+
+    # Create the workspace
+    workspace = Workspace(repo, "my-branch")
+
+    # Add a file to the workspace
+    failed_to_upload = workspace.add("my-image.png", raise_on_failure=False)
+    assert len(failed_to_upload) == 0
+
+    # Or raise an exception if any files fail to upload
+    workspace.add("my-image-final-final.png")
+
+    # Print the status of the workspace
+    status = workspace.status()
+    print(status.added_files())
+
+    # Commit the workspace
+    workspace.commit("Adding my images to the workspace.")
+    ```
+    """
+
+    def __init__(
+        self,
+        repo: "RemoteRepo",
+        branch: str,
+        workspace_id: Optional[str] = None,
+        workspace_name: Optional[str] = None,
+        path: Optional[str] = None,
+    ) -> None:
+        """
+        Create a new Workspace.
+
+        Args:
+            repo: `PyRemoteRepo`
+                The remote repo to create the workspace from.
+            branch: `str`
+                The branch name to create the workspace from. The workspace
+                will be tied to the commit id of the branch at the time of creation.
+            workspace_id: `Optional[str]`
+                The workspace id to create the workspace from.
+                If left empty, will create a unique workspace id.
+            workspace_name: `Optional[str]`
+                The name of the workspace. If left empty, the workspace will have no name.
+            path: `Optional[str]`
+                The path to the workspace. If left empty, the workspace will be created in the root of the remote repo.
+        """
+        self._repo = repo
+        if not self._repo.revision == branch:
+            self._repo.create_checkout_branch(branch)
+        try:
+            self._workspace = PyWorkspace(
+                repo._repo, branch, workspace_id, workspace_name, path
+            )
+        except ValueError as e:
+            print(e)
+            # Print this error in red
+            print(
+                f"\033[91mMake sure that you have write access to `{repo.namespace}/{repo.name}`\033[0m\n"
+            )
+            raise
+
+    def __repr__(self) -> str:
+        return f"Workspace(id={self._workspace.id()}, branch={self._workspace.branch()}, commit_id={self._workspace.commit_id()})"
+
+    @property
+    def id(self):
+        """
+        Get the id of the workspace.
+        """
+        return self._workspace.id()
+
+    @property
+    def name(self):
+        """
+        Get the name of the workspace.
+        """
+        return self._workspace.name()
+
+    @property
+    def branch(self):
+        """
+        Get the branch that the workspace is tied to.
+        """
+        return self._workspace.branch()
+
+    @property
+    def commit_id(self) -> str:
+        """
+        Get the commit id of the workspace.
+        """
+        return self._workspace.commit_id()
+
+    @property
+    def created_at(self) -> Optional[str]:
+        """
+        Get the RFC 3339 time the workspace was created, or None for a workspace
+        created before the server recorded it.
+        """
+        return self._workspace.created_at()
+
+    @property
+    def repo(self) -> "RemoteRepo":
+        """
+        Get the remote repo that the workspace is tied to.
+        """
+        return self._repo
+
+    def status(self, path: str = ""):
+        """
+        Get the status of the workspace.
+
+        Args:
+            path: `str`
+                The path to check the status of.
+        """
+        return self._workspace.status(path)
+
+    def add(
+        self,
+        src: str | Iterable[str] | Path | Iterable[Path],
+        dst: str = "",
+        raise_on_failure: bool = True,
+    ) -> list[PyErrorFileInfo]:
+        """
+        Add files to the workspace.
+
+        Accepts a single file, a single directory, or multiple of either.
+
+        Recursively walks directories to add all accessible files. Preserves
+        relative path to destination when adding multiple files from a directory.
+
+        Args:
+            src: `str` | Iterable[str] | Path | Iterable[Path]
+                The path(s) to the local file(s) to be staged.
+            dst: `str`
+                The path in the remote repo where the file(s) will be added.
+            raise_on_failure: `bool`
+                Whether to raise an exception if any files fail to upload.
+                By default, raises an exception. Set to `False` to return
+                a list of failed file paths instead.
+
+        Returns:
+            A list of `PyErrorFileInfo` for files that failed to upload.
+            An empty list means all files were uploaded successfully.
+            Each entry has `.hash`, `.path`, and `.error` attributes.
+
+        Raises:
+            ValueError if the provided input is not a valid filepath, an invalid
+            directory, or it points to an empty directory, or is a collection
+            of empty directories.
+        """
+
+        if isinstance(src, str) or isinstance(src, Path):
+            p_src = Path(src)
+            if not p_src.exists():
+                raise ValueError(f"Provided single path that does not exist: {src}")
+            paths: list[str] = list(map(str, _filepaths_from(p_src)))
+        else:
+
+            def stringify_ok(fpath: str | Path) -> str:
+                if not Path(fpath).exists():
+                    raise ValueError(
+                        f"Provided an input path that does not exist: {fpath}"
+                    )
+                return str(fpath)
+
+            paths = [
+                stringify_ok(fpath)
+                for path in src
+                for fpath in _filepaths_from(Path(path))
+            ]
+
+        if len(paths) == 0:
+            if isinstance(src, str) or isinstance(src, Path):
+                raise ValueError(f"{src} is not a valid filepath nor directory.")
+            else:
+                raise ValueError(
+                    "No valid filepaths provided: adding nothing to a workspace is invalid."
+                )
+
+        failed_to_upload = self._workspace.add(paths, dst)
+
+        if raise_on_failure and len(failed_to_upload) > 0:
+            raise ValueError(f"Failed to upload {len(failed_to_upload)} files.")
+        return failed_to_upload
+
+    def add_files(
+        self,
+        base_dir: str | Path,
+        paths: Iterable[str] | Iterable[Path],
+        raise_on_failure: bool = True,
+    ) -> list[PyErrorFileInfo]:
+        """
+        A workspace add that preserves relative paths of files that share a common base.
+
+        Unlike `add`, which places files into a flat destination directory,
+        this method uses each file's path relative to the supplied base directory as
+        its staging path on the server.
+
+        The `base_dir` serves as a stand-in for the root of the remote repository. The key
+        use of `add_files` is to import a large file tree into an existing repository.
+
+        For example, a file at
+        ``repo/data/images/cat.jpg`` will be staged as ``data/images/cat.jpg``.
+
+        Args:
+            base_dir: `str` | `Path`
+                The base directory: all added files share this as an ancestor.
+            paths: `Iterable[str]` | `Iterable[Path]`
+                The file paths to add. Can be absolute or relative to the
+                base directory. Each path must point to an existing file.
+            raise_on_failure: `bool`
+                Whether to raise an exception if any files fail to upload.
+                By default, raises an exception. Set to `False` to return
+                a list of failed file paths instead.
+
+        Returns:
+            A list of `PyErrorFileInfo` for files that failed to upload.
+            An empty list means all files were uploaded successfully.
+            Each entry has `.hash`, `.path`, and `.error` attributes.
+
+        Raises:
+            PyOxenError: If no valid file paths are provided.
+        """
+        base_dir = Path(base_dir).absolute()
+        resolved: list[str] = []
+        for p in paths:
+            p = Path(p)
+            abs_path = p if p.is_absolute() else (base_dir / p).absolute()
+            resolved.append(str(abs_path))
+
+        failed_to_upload = self._workspace.add_files(str(base_dir), resolved)
+
+        if raise_on_failure and len(failed_to_upload) > 0:
+            raise ValueError(f"Failed to upload {len(failed_to_upload)} files.")
+        return failed_to_upload
+
+    def add_bytes(self, src: str, buf: bytes, dst: str = "") -> None:
+        """
+        Adds from a memory buffer to the workspace
+
+        Args:
+            src: `str`
+                The relative path to be used as the entry's name in the workspace
+            buf: `bytes`
+                The memory buffer to be read from for this entry
+            dst: `str`
+                The path in the remote repo where the file will be added
+        """
+
+        # An in-memory buffer has no file on disk, so write it to a client-side temp file
+        # (named so the entry keeps its intended name) and route through the on-disk add path.
+        name = Path(src).name
+        if not name:
+            raise ValueError(f"src has no file name: {src!r}")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir) / name
+            tmp_path.write_bytes(buf)
+            self.add(tmp_path, dst)
+
+    def rm(self, path: str) -> None:
+        """
+        Unstage a file that was previously added to the workspace.
+        Despite the name, this does not stage a deletion of a file in
+        the base repo. Prefer `unstage`, which does the same thing
+        through the non-deprecated endpoint.
+
+        Args:
+            path: `str`
+                The path to the staged file to unstage
+        """
+        self._workspace.rm(path)
+
+    def unstage(self, path: str) -> None:
+        """
+        Unstage a file that was previously added to the workspace,
+        without touching the base repo.
+
+        Args:
+            path: `str`
+                The path to the staged file to unstage
+        """
+        self._workspace.unstage(path)
+
+    def commit(
+        self,
+        message: str,
+        branch_name: Optional[str] = None,
+    ) -> PyCommit:
+        """
+        Commit the workspace to a branch
+
+        Args:
+            message: `str`
+                The message to commit with
+            branch_name: `Optional[str]`
+                The name of the branch to commit to. If left empty, will commit to the branch
+                the workspace was created from.
+        """
+        if branch_name is None:
+            branch_name = self._workspace.branch()
+        return self._workspace.commit(message, branch_name)
+
+    def delete(self) -> None:
+        """
+        Delete the workspace
+        """
+        self._workspace.delete()
+
+
+def _filepaths_from(path: Path) -> Iterator[Path]:
+    """Yields all files from the given path.
+
+    Yield the input if its a valid filepath.
+    If its a directory, yields all files from the directory and and sub-directories.
+    """
+    if path.is_file():
+        yield path
+    elif path.is_dir():
+        for something_under in path.rglob("*"):
+            if something_under.is_file():
+                yield something_under

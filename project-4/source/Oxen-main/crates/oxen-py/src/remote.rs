@@ -1,0 +1,134 @@
+use liboxen::model::file::FileContents;
+use pyo3::prelude::*;
+use std::path::PathBuf;
+
+use crate::error::PyOxenError;
+use crate::py_remote_repo::PyRemoteRepo;
+use liboxen::api::requests::RepoNew;
+use liboxen::config::UserConfig;
+use liboxen::constants::DEFAULT_BRANCH_NAME;
+use liboxen::error::OxenError;
+use liboxen::model::file::FileNew;
+use liboxen::storage::StorageKind;
+use std::str::FromStr;
+
+#[pyfunction]
+#[pyo3(signature = (name, host, scheme="https"))]
+pub fn get_repo(
+    name: String,
+    host: String,
+    scheme: &str,
+) -> Result<Option<PyRemoteRepo>, PyOxenError> {
+    let remote_repo = match pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+        liboxen::api::client::repositories::get_by_name_host_and_scheme(name, &host, &scheme).await
+    }) {
+        Ok(repo) => repo,
+        Err(liboxen::error::OxenError::RemoteRepoNotFound(_)) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+
+    let branch_name = DEFAULT_BRANCH_NAME.to_string();
+    let Some(revision) = pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+        liboxen::api::client::revisions::get(&remote_repo, &branch_name).await
+    })?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(PyRemoteRepo {
+        namespace: remote_repo.namespace.clone(),
+        name: remote_repo.name.clone(),
+        url: remote_repo.url().to_string(),
+        host: host.clone(),
+        scheme: scheme.to_string(),
+        repo: Some(remote_repo),
+        revision: Some(branch_name.to_string()),
+        commit_id: revision.commit.map(|r| r.id),
+    }))
+}
+
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (
+    name, description, is_public, host,
+    scheme, files, storage_backend=None
+))]
+pub fn create_repo(
+    name: String,
+    description: String,
+    is_public: bool,
+    host: String,
+    scheme: String,
+    files: Vec<(String, String)>,
+    storage_backend: Option<String>,
+) -> Result<PyRemoteRepo, PyOxenError> {
+    // Check that name is valid ex: :namespace/:repo_name
+    if !name.contains("/") {
+        return Err(OxenError::basic_str(format!("Invalid repository name: {name}")).into());
+    }
+
+    let namespace = name.split("/").collect::<Vec<&str>>()[0].to_string();
+    let repo_name = name.split("/").collect::<Vec<&str>>()[1].to_string();
+
+    let storage_kind = storage_backend
+        .map(|s| StorageKind::from_str(&s))
+        .transpose()?;
+
+    pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+        let config = UserConfig::get()?;
+        let user = config.to_user();
+        if files.is_empty() {
+            let mut repo =
+                RepoNew::from_namespace_name_host(namespace, repo_name, host.clone(), storage_kind);
+            if !description.is_empty() {
+                repo.description = Some(description);
+            }
+            repo.is_public = Some(is_public);
+            repo.scheme = Some(scheme.clone());
+
+            let repo = liboxen::api::client::repositories::create_empty(repo).await?;
+            Ok(PyRemoteRepo {
+                namespace: repo.namespace.clone(),
+                name: repo.name.clone(),
+                url: repo.url().to_string(),
+                host: host.clone(),
+                scheme: scheme.to_string(),
+                repo: Some(repo),
+                // Empty repo does not have a revision or commit_id
+                revision: None,
+                commit_id: None,
+            })
+        } else {
+            let files: Vec<FileNew> = files
+                .iter()
+                .map(|(path, contents)| FileNew {
+                    path: PathBuf::from(path),
+                    contents: FileContents::Text(contents.to_string()),
+                    user: user.clone(),
+                })
+                .collect();
+            let mut repo = RepoNew::from_files(&namespace, &repo_name, files, storage_kind);
+            if !description.is_empty() {
+                repo.description = Some(description);
+            }
+            repo.is_public = Some(is_public);
+            repo.scheme = Some(scheme.clone());
+
+            let repo = liboxen::api::client::repositories::create(repo).await?;
+            let branch = liboxen::api::client::branches::get_by_name(&repo, &DEFAULT_BRANCH_NAME)
+                .await?
+                .unwrap();
+
+            Ok(PyRemoteRepo {
+                namespace: repo.namespace.clone(),
+                name: repo.name.clone(),
+                url: repo.url().to_string(),
+                host: host.clone(),
+                scheme: scheme.to_string(),
+                repo: Some(repo),
+                revision: Some(DEFAULT_BRANCH_NAME.to_string()),
+                commit_id: Some(branch.commit_id),
+            })
+        }
+    })
+}

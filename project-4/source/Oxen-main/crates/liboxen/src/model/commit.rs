@@ -1,0 +1,151 @@
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::hash::{Hash, Hasher};
+use time::OffsetDateTime;
+use utoipa::ToSchema;
+
+use super::MerkleHash;
+use crate::config::UserConfig;
+use crate::error::OxenError;
+
+/// NewCommitBody is used to parse the json into a Commit from the API
+#[derive(Deserialize, Serialize, Debug, Clone, ToSchema)]
+pub struct NewCommitBody {
+    pub message: String,
+    pub author: String,
+    pub email: String,
+}
+
+/// NewCommit is to be used when creating a new Commit, but we don't know the id yet because we need to hash the contents
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NewCommit {
+    pub parent_ids: Vec<String>,
+    pub message: String,
+    pub author: String,
+    pub email: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub timestamp: OffsetDateTime,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, ToSchema)]
+#[schema(
+    example = json!({
+        "id": "a1b2c3d4e5f67890abcdef1234567890",
+        "parent_ids": [
+            "f1e2d3c4b5a67890fedcba9876543210"
+        ],
+        "message": "Refactor data loading pipeline.",
+        "author": "ox",
+        "email": "ox@example.com",
+        "timestamp": "2025-01-01T10:00:00Z"
+    })
+)]
+pub struct Commit {
+    pub id: String,
+    pub parent_ids: Vec<String>,
+    pub message: String,
+    pub author: String,
+    pub email: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub timestamp: OffsetDateTime,
+}
+
+impl fmt::Display for Commit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} -> '{}'", self.id, self.message)
+    }
+}
+
+// TODO: is there a way to derive all these values...and just add one new?
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CommitWithBranchName {
+    pub id: String,
+    pub parent_ids: Vec<String>,
+    pub message: String,
+    pub author: String,
+    pub email: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub timestamp: OffsetDateTime,
+    pub size: u64,
+    pub branch_name: String,
+}
+
+// Hash on the id field so we can quickly look up
+impl PartialEq for Commit {
+    fn eq(&self, other: &Commit) -> bool {
+        self.id == other.id
+    }
+}
+impl Eq for Commit {}
+impl Hash for Commit {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+impl std::error::Error for Commit {}
+
+impl Commit {
+    pub fn from_new_and_id(new_commit: &NewCommit, id: String) -> Commit {
+        Commit {
+            id,
+            parent_ids: new_commit.parent_ids.to_owned(),
+            message: new_commit.message.to_owned(),
+            author: new_commit.author.to_owned(),
+            email: new_commit.email.to_owned(),
+            timestamp: new_commit.timestamp.to_owned(),
+        }
+    }
+
+    pub fn hash(&self) -> Result<MerkleHash, OxenError> {
+        self.id.parse()
+    }
+}
+
+impl CommitWithBranchName {
+    pub fn from_commit(commit: &Commit, size: u64, branch_name: String) -> CommitWithBranchName {
+        CommitWithBranchName {
+            id: commit.id.to_owned(),
+            parent_ids: commit.parent_ids.to_owned(),
+            message: commit.message.to_owned(),
+            author: commit.author.to_owned(),
+            email: commit.email.to_owned(),
+            timestamp: commit.timestamp.to_owned(),
+            size,
+            branch_name,
+        }
+    }
+}
+
+impl NewCommitBody {
+    pub fn from_config(cfg: &UserConfig, message: &str) -> NewCommitBody {
+        NewCommitBody {
+            message: message.to_string(),
+            author: cfg.name.clone(),
+            email: cfg.email.clone(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, ToSchema)]
+#[schema(
+    example = json!({
+        "commit": {
+            "id": "a1b2c3d4e5f67890abcdef1234567890",
+            "parent_ids": [
+                "f1e2d3c4b5a67890fedcba9876543210"
+            ],
+            "message": "Refactor data loading pipeline.",
+            "author": "ox",
+            "email": "ox@example.com",
+            "timestamp": "2025-01-01T10:00:00Z"
+        },
+        "num_entries": 12000,
+        "num_synced_files": 11950,
+    })
+)]
+pub struct CommitStats {
+    pub commit: Commit,
+    pub num_entries: usize, // this is how many entries are in our commit db
+    pub num_synced_files: usize, // this is how many files are actually synced (in case we killed)
+}

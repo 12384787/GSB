@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+#
+# Test 3: OTel telemetry (Jaeger + full push/pull workflow) + Prometheus metrics
+#
+# Starts Jaeger via Docker, launches oxen-server with OTel export and Prometheus
+# metrics enabled, runs a full push/clone/modify/push/pull workflow with both the
+# Rust CLI and oxen-python, then verifies traces in Jaeger and metrics at /metrics.
+#
+# Prerequisites:
+#   cargo build --workspace --features production
+#   docker (running)
+#   uv, maturin (for oxen-python). The bindings must be built with production features, or the
+#     oxen-python trace assertion fails while every other one passes.
+#   jq
+#
+# Environment:
+#   OXEN_SERVER_PORT   port for the oxen-server this starts (default 3000)
+#   OXEN_METRICS_PORT  port for its Prometheus endpoint (default 9090)
+#
+# SYNC_DIR is not read. This always uses a temp data directory of its own, removed on exit.
+#
+# Set the ports to run alongside a development server holding the defaults:
+#   OXEN_SERVER_PORT=3010 OXEN_METRICS_PORT=9091 bin/otel-metrics-test
+#
+# Jaeger's ports (16686, 4317, 4318, 5778, 9411) are still fixed, so stop any container
+# already publishing them first.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$SCRIPT_DIR/.."
+
+OXEN="$REPO_ROOT/target/debug/oxen"
+SERVER="$REPO_ROOT/target/debug/oxen-server"
+SERVER_PID=""
+JAEGER_NAME=""
+
+# Overridable so a run can step around a development server already on these ports. A server
+# holding 3000 answers the readiness probe below, and the workflow then runs against it with no
+# telemetry configured, failing every assertion for a reason unrelated to telemetry.
+OXEN_SERVER_PORT="${OXEN_SERVER_PORT:-3000}"
+OXEN_METRICS_PORT="${OXEN_METRICS_PORT:-9090}"
+SERVER_URL="http://localhost:$OXEN_SERVER_PORT"
+
+# Overrides any SYNC_DIR in the environment, which a developer's shell commonly exports for their
+# own server. The workflow below creates a remote repository that nothing deletes, so inheriting
+# that value writes into data this must not touch and leaves the next run to fail on leftovers.
+SYNC_DIR="$(mktemp -d)"
+export SYNC_DIR
+
+# Track which config files we modified so cleanup can restore/remove them
+MODIFIED_HOME_CONFIG=false
+HOME_CONFIG_BACKUP=""
+MODIFIED_AUTH_CONFIG=false
+AUTH_CONFIG_BACKUP=""
+MODIFIED_DATA_CONFIG=false
+DATA_CONFIG_BACKUP=""
+
+HOME_CONFIG="$HOME/.oxen/user_config.toml"
+AUTH_CONFIG="$HOME/.oxen/auth_config.toml"
+
+# Unique temp paths so concurrent runs don't collide and we never touch
+# unrelated /tmp entries. REPO_B_PARENT exists because `oxen clone`
+# rejects absolute paths, so we cd into a parent dir and clone with a
+# relative name.
+REPO_A_DIR="$(mktemp -d)"
+REPO_B_PARENT="$(mktemp -d)"
+REPO_B_DIR="$REPO_B_PARENT/repo-b"
+CI_USER_TOML="$(mktemp -u)"
+
+# Check if a user_config.toml has non-empty "name" and "email" keys
+has_valid_user_config() {
+    local file="$1"
+    [ -f "$file" ] || return 1
+    grep -qE '^name\s*=\s*".+"' "$file" && grep -qE '^email\s*=\s*".+"' "$file"
+}
+
+cleanup() {
+    # Stop oxen-server, escalating to SIGKILL if it hasn't exited within 10s.
+    if [ -n "$SERVER_PID" ]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        for _i in $(seq 1 10); do
+            kill -0 "$SERVER_PID" 2>/dev/null || break
+            sleep 1
+        done
+        kill -9 "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+    if [ -n "$JAEGER_NAME" ]; then
+        docker stop "$JAEGER_NAME" 2>/dev/null || true
+        docker rm "$JAEGER_NAME" 2>/dev/null || true
+    fi
+    # Restore/remove ~/.oxen/user_config.toml
+    if [ "$MODIFIED_HOME_CONFIG" = true ]; then
+        if [ -n "$HOME_CONFIG_BACKUP" ]; then
+            mv "$HOME_CONFIG_BACKUP" "$HOME_CONFIG"
+        else
+            rm -f "$HOME_CONFIG"
+        fi
+    fi
+    # Restore/remove ~/.oxen/auth_config.toml
+    if [ "$MODIFIED_AUTH_CONFIG" = true ]; then
+        if [ -n "$AUTH_CONFIG_BACKUP" ]; then
+            mv "$AUTH_CONFIG_BACKUP" "$AUTH_CONFIG"
+        else
+            rm -f "$AUTH_CONFIG"
+        fi
+    fi
+    # Restore/remove data/test/config/user_config.toml
+    if [ "$MODIFIED_DATA_CONFIG" = true ]; then
+        if [ -n "$DATA_CONFIG_BACKUP" ]; then
+            mv "$DATA_CONFIG_BACKUP" "$REPO_ROOT/data/test/config/user_config.toml"
+        else
+            rm -f "$REPO_ROOT/data/test/config/user_config.toml"
+        fi
+    fi
+    # Remove only the temp paths this run created.
+    rm -rf "$REPO_A_DIR" "$REPO_B_PARENT" "$CI_USER_TOML" "$SYNC_DIR"
+}
+trap cleanup EXIT INT TERM
+
+# ── Start Jaeger all-in-one ──
+JAEGER_NAME="jaeger-$$-$(date +%s)"
+docker run -d --rm --name "$JAEGER_NAME" \
+  -p 16686:16686 \
+  -p 4317:4317 \
+  -p 4318:4318 \
+  -p 5778:5778 \
+  -p 9411:9411 \
+  cr.jaegertracing.io/jaegertracing/jaeger:2.17.0
+
+# Wait for Jaeger query API to be ready (bounded: 60 attempts, 1s apart)
+echo "Waiting for Jaeger..."
+jaeger_ready=false
+for _i in $(seq 1 60); do
+  if curl -sf --max-time 2 http://localhost:16686/api/services > /dev/null 2>&1; then
+    echo "Jaeger is ready"
+    jaeger_ready=true
+    break
+  fi
+  sleep 1
+done
+if [ "$jaeger_ready" != true ]; then
+  echo "FAIL: Jaeger did not become ready within 60s"
+  exit 1
+fi
+
+# ── Setup oxen-server ──
+cd "$REPO_ROOT"
+mkdir -p data/test/config ~/.oxen
+DATA_CONFIG="$REPO_ROOT/data/test/config/user_config.toml"
+
+# Always run add-user to register the user and obtain a token
+ADD_USER_OUTPUT=$("$SERVER" add-user \
+  --email ci@test.com --name CI --output "$CI_USER_TOML")
+
+# Token is on the 3rd line of the add-user output
+# (the toml file only contains name/email, not the token)
+TOKEN=$(echo "$ADD_USER_OUTPUT" | sed -n '3p' | tr -d '[:space:]')
+
+# Only overwrite config files if they're missing or invalid.
+# If we do overwrite, mark them for restore/removal in cleanup.
+if ! has_valid_user_config "$HOME_CONFIG"; then
+    if [ -f "$HOME_CONFIG" ]; then
+        HOME_CONFIG_BACKUP=$(mktemp)
+        cp "$HOME_CONFIG" "$HOME_CONFIG_BACKUP"
+    fi
+    cp "$CI_USER_TOML" "$HOME_CONFIG"
+    MODIFIED_HOME_CONFIG=true
+fi
+
+if ! has_valid_user_config "$DATA_CONFIG"; then
+    if [ -f "$DATA_CONFIG" ]; then
+        DATA_CONFIG_BACKUP=$(mktemp)
+        cp "$DATA_CONFIG" "$DATA_CONFIG_BACKUP"
+    fi
+    cp "$CI_USER_TOML" "$DATA_CONFIG"
+    MODIFIED_DATA_CONFIG=true
+fi
+
+# Configure CLI identity (mutates HOME_CONFIG — already backed up above
+# if we needed to modify it; skip if the existing config was valid)
+if [ "$MODIFIED_HOME_CONFIG" = true ]; then
+    "$OXEN" config --name "CI Test" --email "ci@test.com"
+fi
+
+# Configure CLI auth token (mutates AUTH_CONFIG — back up first)
+if [ -f "$AUTH_CONFIG" ]; then
+    AUTH_CONFIG_BACKUP=$(mktemp)
+    cp "$AUTH_CONFIG" "$AUTH_CONFIG_BACKUP"
+fi
+"$OXEN" config --auth "localhost:$OXEN_SERVER_PORT" "$TOKEN"
+MODIFIED_AUTH_CONFIG=true
+
+# ── Start oxen-server with OTel export and Prometheus metrics ──
+# Deliberately no RUST_LOG anywhere in this script. Span export is filtered independently of the
+# log destinations, so every trace asserted below arrives at the stock log level — which for the
+# CLI and the Python bindings is "off". Setting RUST_LOG=info here would hide a regression that
+# re-couples the two.
+#
+# The server exports over OTLP/HTTP while the CLI and the Python bindings below stay on gRPC, so
+# one run covers both transports against a real collector. The server is the one on HTTP because
+# that is what a deployment uses: it is the binary built with the otel feature, and hosted
+# collectors commonly accept OTLP/HTTP with binary protobuf and nothing else. The trace
+# assertions below read the server's spans, so a break in HTTP export shows up there as missing
+# or unparented spans rather than as an obvious export failure. The server names no transport, so
+# this also covers the default resolving to HTTP.
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
+OXEN_METRICS_PORT="$OXEN_METRICS_PORT" \
+"$SERVER" start -p "$OXEN_SERVER_PORT" &
+SERVER_PID=$!
+
+# Wait for server to be ready (bounded: 30 attempts, 1s apart)
+echo "Waiting for oxen-server..."
+server_ready=false
+for _i in $(seq 1 30); do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "FAIL: oxen-server exited before becoming ready"
+        exit 1
+    fi
+    if curl -sf --max-time 2 "$SERVER_URL/api/health" > /dev/null 2>&1; then
+        echo "oxen-server is ready"
+        server_ready=true
+        break
+    fi
+    sleep 1
+done
+if [ "$server_ready" != true ]; then
+    echo "FAIL: oxen-server did not become ready within 30s"
+    exit 1
+fi
+
+# ── Inbound W3C trace context ──
+# A caller that already has a trace sends `traceparent`; the server span must join that trace as a
+# child of the caller's span rather than starting a new one. Unique per run so the assertion below
+# reads this run's request and not a leftover.
+TRACEPARENT_TRACE_ID=$(printf '%016x%016x' "$$" "$(date +%s)")
+TRACEPARENT_SPAN_ID="00f067aa0ba902b7"
+curl -sf --max-time 10 \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "traceparent: 00-$TRACEPARENT_TRACE_ID-$TRACEPARENT_SPAN_ID-01" \
+  "$SERVER_URL/api/version" > /dev/null
+
+# ── oxen client: Full push / clone / modify / push / pull workflow ──
+
+# Create remote repository (namespace "ox", name "otel-metrics-test")
+curl -sf --max-time 30 -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -X POST -d '{"namespace":"ox","name":"otel-metrics-test"}' \
+  "$SERVER_URL/api/repos"
+
+# Repo A: init, commit, push (REPO_A_DIR already created by mktemp -d)
+cd "$REPO_A_DIR"
+"$OXEN" init
+"$OXEN" config --set-remote origin "$SERVER_URL/ox/otel-metrics-test"
+echo "hello from CI" > test-file.txt
+"$OXEN" add test-file.txt
+"$OXEN" commit -m "initial commit"
+"$OXEN" push origin main
+
+# Clone to Repo B (oxen clone rejects absolute paths, so cd into a parent
+# tmpdir and clone using the relative "repo-b" name)
+cd "$REPO_B_PARENT"
+"$OXEN" clone "$SERVER_URL/ox/otel-metrics-test" repo-b
+
+# Repo B: modify, commit, push
+cd "$REPO_B_DIR"
+echo "modified in repo-b" >> test-file.txt
+"$OXEN" add test-file.txt
+"$OXEN" commit -m "modify from repo-b"
+"$OXEN" push origin main
+
+# Repo A: pull (with client-side OTel too)
+cd "$REPO_A_DIR"
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc \
+"$OXEN" pull
+
+# ── oxen-python OTel check ──
+# Assumes oxen-python is already built with production features.
+
+# Push a new change from repo-b so repo-a has something to pull
+cd "$REPO_B_DIR"
+echo "another change for python test" >> test-file.txt
+"$OXEN" add test-file.txt
+"$OXEN" commit -m "change for python pull test"
+"$OXEN" push origin main
+
+# Pull from repo-a using Python with OTel enabled
+cd "$REPO_A_DIR"
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc \
+"$REPO_ROOT/oxen-python/.venv/bin/python" -c "
+import oxen
+repo = oxen.Repo('.')
+repo.pull()
+"
+
+# ── Verify traces in Jaeger ──
+
+# Wait for OTel batch exporter to flush
+sleep 10
+
+SERVICES=$(curl -sf --max-time 5 http://localhost:16686/api/services)
+echo "Jaeger services: $SERVICES"
+
+did_fail=false
+
+if ! echo "$SERVICES" | jq -e '.data | index("oxen-server")' > /dev/null 2>&1; then
+  echo "FAIL: 'oxen-server' not found in Jaeger services"
+  did_fail=true
+else
+  echo "PASS: oxen-server service registered in Jaeger"
+fi
+
+# A limit well above the handful of traces a push/clone/pull produces, so the blocking-pool
+# assertion further down samples the whole workflow rather than only its last few requests.
+TRACES=$(curl -sf --max-time 5 "http://localhost:16686/api/traces?service=oxen-server&limit=50")
+TRACE_COUNT=$(echo "$TRACES" | jq '.data | length')
+
+if [ "$TRACE_COUNT" -gt 0 ]; then
+  echo "PASS: OTel traces exported to Jaeger ($TRACE_COUNT traces)"
+else
+  echo "FAIL: No traces found for oxen-server"
+  did_fail=true
+fi
+
+# Check for client traces too
+if echo "$SERVICES" | jq -e '.data | index("oxen")' > /dev/null 2>&1; then
+  echo "PASS: oxen client traces also found in Jaeger"
+else
+  echo "FAIL: oxen client traces not found (client OTel export may not have flushed)"
+  did_fail=true
+fi
+
+# Verify oxen-py traces in Jaeger
+if echo "$SERVICES" | jq -e '.data | index("oxen-py")' > /dev/null 2>&1; then
+  echo "PASS: oxen-py traces found in Jaeger"
+else
+  echo "FAIL: oxen-py traces not found in Jaeger"
+  did_fail=true
+fi
+
+# ── Verify inbound trace context was continued, not discarded ──
+# The server span for the `traceparent` request above must land in the caller's trace as a child of
+# the caller's span. A root span here means extraction is off and hub-to-server traces cannot be
+# stitched together.
+PROPAGATED=$(curl -s --max-time 5 "http://localhost:16686/api/traces/$TRACEPARENT_TRACE_ID" || true)
+CHILD_SPANS=$(echo "$PROPAGATED" | jq --arg parent "$TRACEPARENT_SPAN_ID" \
+  '[.data[]?.spans[]? | select(.references[]? | .refType == "CHILD_OF" and .spanID == $parent)] | length' 2>/dev/null || echo 0)
+if [ "${CHILD_SPANS:-0}" -gt 0 ]; then
+  echo "PASS: inbound traceparent produced a child span ($CHILD_SPANS) in trace $TRACEPARENT_TRACE_ID"
+else
+  echo "FAIL: no span in trace $TRACEPARENT_TRACE_ID is a child of $TRACEPARENT_SPAN_ID"
+  echo "$PROPAGATED"
+  did_fail=true
+fi
+
+# ── Verify work moved onto the blocking pool stays in the request's trace ──
+# `tasks::spawn_blocking` opens a span named "blocking task" under its caller. Almost every
+# sizeable server operation runs there, so if these come back unparented (or missing) a request's
+# trace is a lone HTTP span with none of its work under it.
+PARENTED_BLOCKING=$(echo "$TRACES" | jq \
+  '[.data[]?.spans[]? | select(.operationName == "blocking task") | select([.references[]? | select(.refType == "CHILD_OF")] | length > 0)] | length' 2>/dev/null || echo 0)
+if [ "${PARENTED_BLOCKING:-0}" -gt 0 ]; then
+  echo "PASS: blocking-pool work reported $PARENTED_BLOCKING span(s) under their caller"
+else
+  echo "FAIL: no parented 'blocking task' spans found — span context is not crossing spawn_blocking"
+  did_fail=true
+fi
+
+# ── Verify Prometheus metrics ──
+
+METRICS_OUTPUT=$(curl -sf --max-time 5 "http://localhost:$OXEN_METRICS_PORT/metrics" 2>/dev/null || true)
+if [ -z "$METRICS_OUTPUT" ]; then
+  echo "FAIL: Could not fetch /metrics from Prometheus endpoint on port $OXEN_METRICS_PORT"
+  did_fail=true
+else
+  echo "--- Prometheus /metrics sample ---"
+  # Use a here-string so `head` closing after 30 lines doesn't SIGPIPE `echo` and
+  # trip `set -euo pipefail`, which was killing this test on long metrics output.
+  head -30 <<< "$METRICS_OUTPUT"
+
+  # Check for HTTP request counters with non-zero values
+  # Lines look like: http_requests_total{method="GET",path="...",status="200"} 5
+  HTTP_COUNTER_LINES=$(echo "$METRICS_OUTPUT" | awk '/^http_requests_total\{/ { if ($NF+0 != 0) print }' || true)
+  if [ -z "$HTTP_COUNTER_LINES" ]; then
+    echo "FAIL: No non-zero http_requests_total counters found in /metrics"
+    did_fail=true
+  else
+    COUNTER_LINE_COUNT=$(echo "$HTTP_COUNTER_LINES" | wc -l | tr -d ' ')
+    echo "PASS: Found $COUNTER_LINE_COUNT non-zero http_requests_total counter(s)"
+  fi
+
+  # Check for HTTP duration histogram data (bucket, sum, or count lines)
+  HISTOGRAM_LINES=$(echo "$METRICS_OUTPUT" | grep -E '^http_request_duration_ms_(bucket|sum|count)\{' || true)
+  if [ -z "$HISTOGRAM_LINES" ]; then
+    echo "FAIL: No http_request_duration_ms histogram data found in /metrics"
+    did_fail=true
+  else
+    HISTOGRAM_LINE_COUNT=$(echo "$HISTOGRAM_LINES" | wc -l | tr -d ' ')
+    # At least some _sum values should be > 0 (requests were served)
+    NONZERO_SUMS=$(echo "$METRICS_OUTPUT" | awk '/^http_request_duration_ms_sum\{/ { if ($NF+0 > 0) print }' || true)
+    if [ -z "$NONZERO_SUMS" ]; then
+      echo "FAIL: http_request_duration_ms histogram sums are all zero"
+      did_fail=true
+    else
+      NONZERO_SUM_COUNT=$(echo "$NONZERO_SUMS" | wc -l | tr -d ' ')
+      echo "PASS: Found $HISTOGRAM_LINE_COUNT histogram lines, $NONZERO_SUM_COUNT with non-zero duration sums"
+    fi
+  fi
+fi
+
+if [ "$did_fail" = true ]; then
+  exit 1
+fi

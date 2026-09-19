@@ -1,0 +1,14 @@
+@import 'tailwindcss' reference;
+@import '../../assets/css/theme.css' reference;
+@import '../../assets/css/utilities.css' reference;
+
+.form-input,
+.form-textarea {
+  @apply box-border w-full rounded-lg border border-border bg-bg-tertiary px-4 py-3.5 text-sm text-main transition-all duration-200 ease-apple;
+  @apply hover:border-border-secondary;
+  @apply focus:border-accent focus:bg-surface-elevated focus:shadow-sm focus:outline-none;
+}
+
+.form-textarea {
+  @apply min-h-[90px] resize-y font-[ui-monospace,SFMono-Regular,'SF_Mono',Menlo,Consolas,'Liberation_Mono',monospace];
+}

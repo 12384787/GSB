@@ -1,0 +1,130 @@
+# =============================================================
+# OxiCloud — Multi-entry storage: GET /admin/settings/storage
+# =============================================================
+# Pins the multi-entry projection on the admin storage endpoint
+# (`docs/plan/storage-multi-entry.md` slice 6).
+#
+# Test env (tests/common/server.env) declares two entries:
+#   * local_main — active (first in _ENTRIES, no DB pointer yet)
+#   * s3_stub    — declared, never activated (bucket doesn't exist,
+#                  its Test button would fail — we don't click it)
+#
+# Coverage:
+#   * `entries[]` returned with both names in declared order.
+#   * `is_active=true` on `local_main` (boot fallback picks first
+#     when active_backend_name is unset).
+#   * `is_active=false` on `s3_stub`.
+#   * `active_entry_name` mirrors the active entry.
+#   * `migration_readonly=false` on a fresh boot.
+#   * `location_hint` populated per backend type (root_dir for
+#     Local, bucket for S3).
+#   * `encryption_enabled=false` on both (no `_ENCRYPTION_KEY`
+#     declared).
+# =============================================================
+
+
+# ─────────────────────────────────────────────────────────────
+# Setup — admin login
+# ─────────────────────────────────────────────────────────────
+POST {{base_url}}/api/auth/login
+Content-Type: application/json
+{ "username": "{{username}}", "password": "{{password}}" }
+
+HTTP 200
+[Captures]
+admin_token: jsonpath "$.access_token"
+
+
+# ─────────────────────────────────────────────────────────────
+# Step 1 — GET /api/admin/settings/storage returns the entries
+# ─────────────────────────────────────────────────────────────
+GET {{base_url}}/api/admin/settings/storage
+Authorization: Bearer {{admin_token}}
+
+HTTP 200
+[Asserts]
+# Membership, asserted per entry rather than by counting them.
+#
+# A `count ==` here breaks every time anyone declares a new entry in
+# server.env, and the failure says "expected 3, got 4" — which names
+# neither the entry that appeared nor whether it was supposed to. This
+# is a registry; it grows. `s3_blackhole` was the fourth and broke it
+# exactly this way.
+jsonpath "$.entries[*].name" contains "local_main"
+jsonpath "$.entries[*].name" contains "s3_stub"
+jsonpath "$.entries[*].name" contains "azurite"
+jsonpath "$.entries[*].name" contains "s3_blackhole"
+
+# Position, which is a SEPARATE property from membership and is
+# deliberately still pinned: entries come back in _ENTRIES order, and
+# the boot fallback below depends on `[0]` being the first declared.
+jsonpath "$.entries[0].name" == "local_main"
+jsonpath "$.entries[1].name" == "s3_stub"
+jsonpath "$.entries[2].name" == "azurite"
+
+# Backend types match the declarations.
+jsonpath "$.entries[0].backend" == "local"
+jsonpath "$.entries[1].backend" == "s3"
+jsonpath "$.entries[2].backend" == "azure"
+
+# Active pointer: fresh DB has no `active_backend_name` row, so the
+# boot fallback picks the FIRST entry in _ENTRIES.
+jsonpath "$.active_entry_name" == "local_main"
+jsonpath "$.entries[0].is_active" == true
+jsonpath "$.entries[1].is_active" == false
+jsonpath "$.entries[2].is_active" == false
+
+# Read-only mode off on a fresh boot (no in-flight migration, no
+# stale flag in DB).
+jsonpath "$.migration_readonly" == false
+
+# Location hints — Local uses OXICLOUD_STORAGE_PATH fallback (path
+# is per-test-suite; assert the endpoint+bucket string on the S3
+# side which is stable, per the test env config).
+jsonpath "$.entries[1].location_hint" == "http://127.0.0.1:9999/oxicloud-test-stub"
+
+# Neither entry declared an encryption key.
+jsonpath "$.entries[0].encryption_enabled" == false
+jsonpath "$.entries[1].encryption_enabled" == false
+
+
+# ─────────────────────────────────────────────────────────────
+# Step 2 — POST /admin/settings/storage/test with entry_name
+# ─────────────────────────────────────────────────────────────
+# Tests the multi-entry test-DTO path (slice-6 rework). local_main
+# points at the real test storage dir, so health-check + round-trip
+# should pass. Passing entry_name makes the server ignore the legacy
+# `backend` / `s3_*` fields.
+POST {{base_url}}/api/admin/settings/storage/test
+Authorization: Bearer {{admin_token}}
+Content-Type: application/json
+{ "entry_name": "local_main", "backend": "" }
+
+HTTP 200
+[Asserts]
+jsonpath "$.connected" == true
+# Post-K2 (storage-key-rotation): every entry is wrapped in the v1
+# blob-format decorator, so `backend_type` reports the WRAPPER's kind
+# in `"<wrapper>(<inner>)"` form. `local_main` is unencrypted → wrapper
+# is `v1-plaintext`. Match on the inner name via `contains` so the
+# assertion survives future wrapper renames.
+jsonpath "$.backend_type" contains "local"
+jsonpath "$.backend_type" contains "v1-plaintext"
+jsonpath "$.roundtrip_passed" == true
+jsonpath "$.phase_reached" == "cleanup_ok"
+
+
+# ─────────────────────────────────────────────────────────────
+# Step 3 — Unknown entry_name returns connected=false with a
+#          diagnostic message (inline error — never 4xx).
+# ─────────────────────────────────────────────────────────────
+POST {{base_url}}/api/admin/settings/storage/test
+Authorization: Bearer {{admin_token}}
+Content-Type: application/json
+{ "entry_name": "does_not_exist", "backend": "" }
+
+HTTP 200
+[Asserts]
+jsonpath "$.connected" == false
+jsonpath "$.message" contains "does_not_exist"
+jsonpath "$.message" contains "OXICLOUD_STORAGE_ENTRIES"

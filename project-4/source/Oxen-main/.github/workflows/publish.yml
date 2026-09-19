@@ -1,0 +1,191 @@
+name: 📢 Publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+
+defaults:
+  run:
+    shell: bash -leo pipefail {0}
+
+jobs:
+  publish_wheels:
+    name: 🐍 Publish wheels to PyPI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: robinraju/release-downloader@28fc21f50d76778e7023361aa1f863e717d3d56f # v1.13
+        id: download-release
+        with:
+          tag: ${{ github.ref_name }}
+          fileName: oxen-wheels-*
+          out-file-path: oxen-wheels
+
+      - name: Extract wheels
+        run: |
+          cd ${{ github.workspace }}/oxen-wheels
+
+          for file in ${{ github.workspace }}/oxen-wheels/*.tar.gz; do tar -xzvf "$file" -C ${{ github.workspace }}/oxen-wheels; done
+          for file in ${{ github.workspace }}/oxen-wheels/*.zip; do unzip "$file" -d ${{ github.workspace }}/oxen-wheels; done
+
+      - name: Publish wheels to PyPI
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        env:
+          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        with:
+          command: upload
+          args: --skip-existing ${{ github.workspace }}/oxen-wheels/*.whl
+          maturin-version: v1.8.5
+
+  publish_crates:
+    # Publishes every workspace crate with `publish = true` (the default) to crates.io:
+    #   - liboxen        → library crate
+    #   - oxen-cli       → installs the `oxen` binary via `cargo install oxen-cli`
+    #   - oxen-server    → installs the `oxen-server` binary via `cargo install oxen-server`
+    # `oxen-py` is skipped automatically because its Cargo.toml sets `publish = false`.
+    # cargo publishes in topological dep order (liboxen first) and waits for index propagation
+    # between crates, so no separate jobs / explicit ordering are needed.
+    # See https://crates.io/docs/trusted-publishing for details on the OIDC auth.
+    name: 🦀 Publish workspace crates to crates.io
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # Required for OIDC token exchange
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Free up disk space
+        uses: ./.github/actions/free-disk-space
+      - name: Package and verify crates
+        run: |
+          # Package and verify the workspace before getting the temporary API key.
+          #
+          # `cargo package` does what `cargo publish` does minus the upload: for each publishable
+          # crate it produces a .crate tarball, extracts it to target/package/<crate>-<version>/,
+          # and runs a verify build in that isolated directory. This catches packaging-level
+          # failures that a plain `cargo build --workspace` silently misses — files referenced
+          # in code but not included in the package, path-only dependencies that lack a version
+          # required for crates.io, files outside the crate dir that wouldn't make it into the
+          # tarball, etc.
+          #
+          # We do this BEFORE acquiring the temporary API key because the verify builds take
+          # longer than the 30 minute token expiration. Each crate's verify runs in its own
+          # extracted source tree with a different target dir, so cargo can't share fingerprints
+          # across them — every dependency gets rebuilt once per publishable crate. By doing the
+          # verification here and then using `cargo publish --no-verify` below, the actual upload
+          # step is fast enough to fit comfortably within the token's lifetime.
+          #
+          # ************************************************************************************************
+          # **WARNING** YOU MUST MAKE SURE THAT THE EXACT SAME PACKAGES THAT ARE PUBLISHED IN THE UPCOMING *
+          #             PUBLISH STEP ARE PACKAGED HERE!!! OTHERWISE THIS PUBLISH WORKFLOW IS NOT PROPERLY  *
+          #             VERIFYING THAT ALL OF THE CRATES PACKAGE AND LINK CORRECTLY!!!! THIS CAN LEAD TO A *
+          #             BROKEN crates.io PUBLISH IN THE WORST CASE!!!!!                                    *
+          #                                                                                                *
+          #             IF YOU EDIT THIS LINE'S --exclude YOU MUST UPDATE IT IN THE cargo publish STEP!!!  *
+          # ************************************************************************************************
+          cargo package --workspace --exclude oxen-py
+
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+      - name: Upload to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          cd ${{ github.workspace }}
+          # NOTE: KEEP --no-verify HERE !
+          #   --no-verify: skip cargo's per-crate post-package compile check. The "Package and
+          #   verify crates" step above already packaged and verified each publishable crate
+          #   the same way cargo publish would. The verification process that cargo publish
+          #   does takes longer than the API token lasts, so we do it before acquiring the token.
+          # ************************************************************************************************
+          # **WARNING** ENSURE THE --exclude LINE HERE MATCHES EXACTLY IN THE PACKAGE STEP ABOVE!!!!!!     *
+          # ************************************************************************************************
+          cargo publish --workspace --exclude oxen-py --no-verify
+
+  publish_homebrew_oxen:
+    name: 🍺 Update oxen formula on homebrew-core
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update oxen formula on homebrew-core
+        uses: dawidd6/action-homebrew-bump-formula@1446dca236b0440c6f02723a3f14f13be2c04ab0 # v7
+        with:
+          # Personal access token with fork + PR scopes; the action forks
+          # homebrew-core, runs `brew bump-formula-pr`, and opens the PR.
+          token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+          formula: oxen
+          tag: ${{ github.ref }}
+
+  publish_homebrew_oxen_server:
+    name: 🍺 Update oxen-server formula on Oxen-AI/homebrew-oxen-server
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          repository: Oxen-AI/homebrew-oxen-server
+          path: homebrew-oxen-server
+          token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+
+      - name: Set release version
+        run: |
+          echo "RELEASE_VERSION=${GITHUB_REF#refs/*/v}" >> $GITHUB_ENV
+
+      - name: Set download URLs
+        run: |
+          echo "ARM64_URL=https://github.com/Oxen-AI/Oxen/releases/download/${{ github.ref_name }}/oxen-server-macos-arm64.tar.gz" >> $GITHUB_ENV
+          echo "X86_64_URL=https://github.com/Oxen-AI/Oxen/releases/download/${{ github.ref_name }}/oxen-server-macos-x86_64.tar.gz" >> $GITHUB_ENV
+
+      - name: Download release files
+        run: |
+          curl -L -o oxen-server-macos-arm64.tar.gz "$ARM64_URL"
+          curl -L -o oxen-server-macos-x86_64.tar.gz "$X86_64_URL"
+
+      - name: Calculate SHA256
+        run: |
+          ARM64_SHA256=$(sha256sum oxen-server-macos-arm64.tar.gz | cut -d' ' -f1)
+          X86_64_SHA256=$(sha256sum oxen-server-macos-x86_64.tar.gz | cut -d' ' -f1)
+          echo "ARM64_SHA256=$ARM64_SHA256" >> $GITHUB_ENV
+          echo "X86_64_SHA256=$X86_64_SHA256" >> $GITHUB_ENV
+
+      - name: Update formula
+        run: |
+          cat << EOF > ${{ github.workspace }}/homebrew-oxen-server/Formula/oxen-server.rb
+          class OxenServer < Formula
+            desc "Lightning fast data version control system for structured and unstructured machine learning datasets. We aim to make versioning datasets as easy as versioning code."
+            homepage "https://oxen.ai"
+            license "Apache-2.0"
+            version "${{ env.RELEASE_VERSION }}"
+
+            on_macos do
+              depends_on macos: :big_sur
+
+              on_arm do
+                url "${{ env.ARM64_URL }}"
+                sha256 "${{ env.ARM64_SHA256 }}"
+              end
+
+              on_intel do
+                url "${{ env.X86_64_URL }}"
+                sha256 "${{ env.X86_64_SHA256 }}"
+              end
+            end
+
+            def install
+              bin.install "oxen-server"
+            end
+          end
+          EOF
+
+      - name: Commit and push changes
+        run: |
+          cd ${{ github.workspace }}/homebrew-oxen-server
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/oxen-server.rb
+          git commit -m "chore: update oxen-server to ${{ github.ref_name }}"
+          git push origin main

@@ -1,0 +1,107 @@
+use async_trait::async_trait;
+use clap::{Arg, Command};
+use liboxen::error::OxenError;
+use liboxen::model::LocalRepository;
+use liboxen::repositories;
+
+use std::path::Path;
+
+use crate::cmd::RunCmd;
+pub const NAME: &str = "node";
+pub struct NodeCmd;
+
+#[async_trait]
+impl RunCmd for NodeCmd {
+    fn name(&self) -> &str {
+        NAME
+    }
+
+    fn args(&self) -> Command {
+        // Setups the CLI args for the command
+        Command::new(NAME)
+            .about("Inspect an oxen merkle tree node")
+            // add --verbose flag
+            .arg(
+                Arg::new("verbose")
+                    .long("verbose")
+                    .short('v')
+                    .help("Verbose output")
+                    .action(clap::ArgAction::SetTrue),
+            )
+            // add --node flag
+            .arg(
+                Arg::new("node")
+                    .long("node")
+                    .short('n')
+                    .conflicts_with("path")
+                    .required_unless_present("path")
+                    .help("Node hash to inspect"),
+            )
+            // add --path flag
+            .arg(
+                Arg::new("path")
+                    .long("path")
+                    .short('p')
+                    .conflicts_with("node")
+                    .required_unless_present("node")
+                    .help("Path to the node to inspect"),
+            )
+            // add --revision flag
+            .arg(
+                Arg::new("revision")
+                    .long("revision")
+                    .short('r')
+                    .help("Which revision to start at"),
+            )
+    }
+
+    async fn run(&self, args: &clap::ArgMatches) -> Result<(), anyhow::Error> {
+        // Find the repository
+        let repository = LocalRepository::from_current_dir()?;
+
+        // if the --path flag is set, get the node by path in the specified revision
+        if let Some(path) = args.get_one::<String>("path") {
+            let commit = if let Some(revision) = args.get_one::<String>("revision") {
+                repositories::revisions::get(&repository, revision)?
+                    .ok_or_else(|| OxenError::local_revision_not_found(revision))?
+            } else {
+                repositories::commits::head_commit(&repository)?
+            };
+            let path = Path::new(path);
+            let Some(node) = repositories::tree::get_node_by_path(&repository, &commit, path)?
+            else {
+                return Err(OxenError::entry_does_not_exist_in_commit(path, &commit.id))?;
+            };
+
+            println!("{node:?}");
+            if args.get_flag("verbose") {
+                println!("{} children", node.children.len());
+                for child in node.children {
+                    println!("{child:?}");
+                }
+            }
+            return Ok(());
+
+        // otherwise, get the node based on the node hash
+        } else if let Some(node_hash) = args.get_one::<String>("node") {
+            let node_hash = node_hash.parse()?;
+            let Some(node) = repositories::tree::get_node_by_id(&repository, &node_hash)? else {
+                return Err(OxenError::resource_not_found(format!(
+                    "Node {node_hash} not found in repo"
+                )))?;
+            };
+
+            println!("{node:?}");
+            if args.get_flag("verbose") {
+                println!("{} children", node.children.len());
+                for child in node.children {
+                    println!("{child:?}");
+                }
+            }
+        } else {
+            return Err(anyhow::anyhow!("Must supply file path or node hash"));
+        }
+
+        Ok(())
+    }
+}

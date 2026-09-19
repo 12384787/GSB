@@ -1,0 +1,92 @@
+name: 🐂🏭 Continuous integration - Production Build & Telemetry
+
+on:
+  workflow_call:
+
+defaults:
+  run:
+    shell: bash -leo pipefail {0}
+
+jobs:
+  build-production:
+    name: Build & verify production features
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Free up disk space
+        uses: ./.github/actions/free-disk-space
+
+      - name: Setup Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          components: clippy
+          cache: false # We use Swatinem/rust-cache directly below for save-if control.
+
+      # Must precede the tool versions load: rust-cache hashes every CARGO*/RUST* environment
+      # variable into its key, so the cargo-tool pins in tool-versions.env would otherwise bust
+      # the whole build cache every time one of them is bumped.
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          prefix-key: rust-production
+          cache-all-crates: true
+          cache-on-failure: true
+          cache-bin: false # See the rust-test job in ci_test.yml for rationale.
+
+      - name: Load tool versions
+        run: grep -E '^[A-Z0-9_]+=' tool-versions.env >> "$GITHUB_ENV"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.11"
+
+      - name: Install FFmpeg 8
+        # Install FFmpeg 8 (the `production` feature enables `ffmpeg`) and point pkg-config
+        # at it for the build and clippy steps below.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang pkg-config
+          bash bin/install-ffmpeg
+          echo "PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Build with production features
+        run: cargo build --workspace --features production
+
+      - name: Clippy (production features)
+        run: cargo clippy --workspace --all-targets --features production --no-deps -- -D warnings
+
+      # The Test Suite workflow builds with default features, so tests behind a production-only
+      # gate like `#[cfg(feature = "otel")]` never run there. This job is the only one that
+      # enables them. The filter limits the step to lib unit tests needing no server, so a
+      # feature-gated test whose path does not match it stays uncovered: widen the filter when
+      # adding one elsewhere. oxen-py is excluded because its test binary needs the Python
+      # runtime installed by the maturin step below.
+      - name: Test (production features)
+        run: cargo test --workspace --exclude oxen-py --features production --lib telemetry
+
+      - name: Build oxen-python with production features
+        run: |
+          cd oxen-python
+          uv sync --no-install-project
+          source .venv/bin/activate
+          maturin develop --features "oxen-py/production"
+
+      # ── Test 1: Log file writing (OXEN_LOG_DIR + NDJSON) ──────────────
+      - name: Test log file writing
+        run: bin/logfile-test
+
+      # ── Test 2: FmtSpan events (OXEN_FMT_SPAN=CLOSE) ─────────────────
+      - name: Test FmtSpan span events
+        run: bin/fmt-span-test
+
+      # ── Test 3: OTel telemetry (Jaeger + full push/pull workflow) ─────
+      - name: Test OTel telemetry with Jaeger
+        run: bin/otel-metrics-test

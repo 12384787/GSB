@@ -1,0 +1,22 @@
+[package]
+name = "dedup"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# keep this empty so that it is not included in the workspace
+[workspace]
+
+[[bin]]
+name = "dedup"
+path = "src/main.rs"
+
+[dependencies]
+bincode = "1.3"
+clap = { version = "4.5.38", features = ["derive"] }
+fastcdc = "3.2.1"
+liboxen  = { path = "../../crates/liboxen" }
+rayon = "1.10.0"
+serde = { version = "1.0.219", features = ["derive"] }
+thiserror = "2.0.12"
+xxhash-rust = { version = "0.8.7", features = ["xxh3"] }

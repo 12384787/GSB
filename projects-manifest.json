@@ -1,0 +1,505 @@
+{
+  "total": 50,
+  "projects": [
+    {
+      "number": 1,
+      "repository": "grafana/loki",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 2,
+      "repository": "langbot-app/LangBot",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 3,
+      "repository": "Expensify/App",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 4,
+      "repository": "Oxen-AI/Oxen",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 5,
+      "repository": "Kuingsmile/PicList",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 6,
+      "repository": "AtalayaLabs/OxiCloud",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 7,
+      "repository": "twentyhq/twenty",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 8,
+      "repository": "embassy-rs/embassy",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 9,
+      "repository": "Kotlin/dokka",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 10,
+      "repository": "metabase/metabase",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 11,
+      "repository": "nammayatri/nammayatri",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 12,
+      "repository": "PDFCraftTool/pdfcraft",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 13,
+      "repository": "archestra-ai/archestra",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 14,
+      "repository": "openobserve/openobserve",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 15,
+      "repository": "meshery/meshery",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 16,
+      "repository": "xberg-io/xberg",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 17,
+      "repository": "itchyny/gojq",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 18,
+      "repository": "getsentry/sentry-javascript",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 19,
+      "repository": "ActivityWatch/activitywatch",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": true
+    },
+    {
+      "number": 20,
+      "repository": "mui/mui-x",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 21,
+      "repository": "handsontable/handsontable",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 22,
+      "repository": "Checkmk/checkmk",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 23,
+      "repository": "pallets/flask",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 24,
+      "repository": "encode/httpx",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 25,
+      "repository": "sanity-io/sanity",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 26,
+      "repository": "ankidroid/Anki-Android",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 27,
+      "repository": "ultralytics/ultralytics",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 28,
+      "repository": "KittyCAD/modeling-app",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 29,
+      "repository": "psf/requests",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 30,
+      "repository": "expressjs/express",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 31,
+      "repository": "OpenPrinting/cups",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 32,
+      "repository": "kestra-io/kestra",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 33,
+      "repository": "Stremio/stremio-web",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 34,
+      "repository": "koajs/koa",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 35,
+      "repository": "readest/readest",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 36,
+      "repository": "strapi/strapi",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 37,
+      "repository": "nautechsystems/nautilus_trader",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 38,
+      "repository": "rotki/rotki",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 39,
+      "repository": "coder/coder",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 40,
+      "repository": "firecrawl/firecrawl",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 41,
+      "repository": "ollama/ollama",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 42,
+      "repository": "microsoft/markitdown",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 43,
+      "repository": "langgenius/dify",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 44,
+      "repository": "langflow-ai/langflow",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 45,
+      "repository": "open-webui/open-webui",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 46,
+      "repository": "react/react",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 47,
+      "repository": "vuejs/vue",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 48,
+      "repository": "iamkun/dayjs",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 49,
+      "repository": "openxla/xla",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    },
+    {
+      "number": 50,
+      "repository": "github/spec-kit",
+      "metadata": true,
+      "bug_prompt": true,
+      "feature_prompt": true,
+      "source_zip": true,
+      "source_download_url": true,
+      "code_context": false
+    }
+  ]
+}

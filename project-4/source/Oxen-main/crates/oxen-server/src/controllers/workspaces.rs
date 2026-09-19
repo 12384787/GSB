@@ -1,0 +1,465 @@
+use crate::errors::{OxenHttpError, WorkspaceBranch};
+use crate::helpers::get_repo;
+use crate::params::{NameParam, app_data, path_param};
+use crate::tasks;
+
+use liboxen::constants::INITIAL_COMMIT_MSG;
+use liboxen::core::repo_locks;
+use liboxen::error::OxenError;
+use liboxen::model::{NewCommitBody, User};
+use liboxen::repositories;
+use liboxen::view::merge::MergeableResponse;
+use liboxen::view::workspaces::{ListWorkspaceResponseView, NewWorkspace, WorkspaceResponse};
+use liboxen::view::{
+    CommitResponse, StatusMessage, StatusMessageDescription, WorkspaceResponseView,
+};
+
+use actix_web::{HttpRequest, HttpResponse, web};
+use utoipa;
+
+pub mod changes;
+pub mod data_frames;
+pub mod files;
+
+/// Get or create workspace
+#[utoipa::path(
+    put,
+    path = "/api/repos/{namespace}/{repo_name}/workspaces/get_or_create",
+    description = "Create a workspace. If the workspace exists, return it",
+    tag = "Workspaces",
+    params(
+        ("namespace" = String, Path, description = "Namespace of the repository", example = "ox"),
+        ("repo_name" = String, Path, description = "Name of the repository", example = "ImageNet-1k"),
+    ),
+    request_body(
+        content = NewWorkspace,
+        description = "Workspace creation details, including base branch and optional name/ID.",
+        example = json!({
+            "branch_name": "main",
+            "name": "bessie_workspace",
+            "workspace_id": "b3f27f05-0955-4076-805f-39575853b27b"
+        })
+    ),
+    responses(
+        (status = 200, description = "Workspace found or created", body = WorkspaceResponseView),
+        (status = 400, description = "Invalid payload or branch not found"),
+        (status = 404, description = "Repository not found")
+    )
+)]
+pub async fn get_or_create(
+    req: HttpRequest,
+    body: String,
+) -> actix_web::Result<HttpResponse, OxenHttpError> {
+    let app_data = app_data(&req)?;
+    let namespace = path_param(&req, "namespace")?.to_string();
+    let repo_name = path_param(&req, "repo_name")?.to_string();
+    let repo = get_repo(app_data, namespace, repo_name)?;
+    let _write = repo_locks::begin_write(&repo)?;
+
+    let data: Result<NewWorkspace, serde_json::Error> = serde_json::from_str(&body);
+    let data = match data {
+        Ok(data) => data,
+        Err(err) => {
+            log::warn!("Unable to parse body. Err: {err}\n{body}");
+            return Ok(HttpResponse::BadRequest().json(StatusMessage::error(err.to_string())));
+        }
+    };
+
+    // Try to get the branch, or create it if the repo is empty
+    let branch = match repositories::branches::get_by_name(&repo, &data.branch_name) {
+        Ok(branch) => branch,
+        Err(OxenError::BranchNotFound(_)) => {
+            // Branch doesn't exist - check if repo is empty
+            if repositories::commits::head_commit_maybe(&repo)?.is_some() {
+                // Repo has commits but branch doesn't exist - this is an error
+                return Ok(
+                    HttpResponse::BadRequest().json(StatusMessage::error(format!(
+                        "Branch not found: {}. For non-empty repositories, create the branch first.",
+                        data.branch_name
+                    ))),
+                );
+            }
+
+            // Repo is empty - create initial commit with the requested branch
+            log::debug!(
+                "get_or_create: empty repo, creating initial commit on branch {}",
+                data.branch_name
+            );
+            let user = User {
+                name: "Oxen".to_string(),
+                email: "oxen@oxen.ai".to_string(),
+            };
+            repositories::commits::create_initial_commit(
+                &repo,
+                &data.branch_name,
+                &user,
+                INITIAL_COMMIT_MSG,
+            )?;
+
+            // Now get the newly created branch
+            repositories::branches::get_by_name(&repo, &data.branch_name)?
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    // Return workspace if it already exists
+    let workspace_id = data.workspace_id.clone();
+    let workspace_name = data.name.clone();
+    let workspace_identifier;
+    if let Some(workspace_name) = workspace_name {
+        workspace_identifier = workspace_name;
+    } else {
+        workspace_identifier = workspace_id.clone();
+    }
+    log::debug!("get_or_create workspace_id {workspace_id:?}");
+    if let Ok(Some(workspace)) = repositories::workspaces::get(&repo, &workspace_identifier) {
+        return Ok(HttpResponse::Ok().json(WorkspaceResponseView {
+            status: StatusMessage::resource_found(),
+            workspace: WorkspaceResponse {
+                id: workspace_id,
+                name: workspace.name.clone(),
+                commit: workspace.commit,
+                created_at: workspace.created_at,
+            },
+        }));
+    }
+
+    let commit = repositories::commits::get_by_id(&repo, &branch.commit_id)?.unwrap();
+
+    // Create the workspace
+    let workspace = repositories::workspaces::create_with_name(
+        &repo,
+        &commit,
+        &workspace_id,
+        data.name.clone(),
+        true,
+    )
+    .await?;
+
+    Ok(HttpResponse::Ok().json(WorkspaceResponseView {
+        status: StatusMessage::resource_created(),
+        workspace: WorkspaceResponse {
+            id: workspace_id,
+            name: data.name.clone(),
+            commit,
+            created_at: workspace.created_at,
+        },
+    }))
+}
+
+/// Get workspace
+#[utoipa::path(
+    get,
+    path = "/api/repos/{namespace}/{repo_name}/workspaces/{workspace_id}",
+    description = "Get an existing workspace by ID",
+    tag = "Workspaces",
+    params(
+        ("namespace" = String, Path, description = "Namespace of the repository", example = "ox"),
+        ("repo_name" = String, Path, description = "Name of the repository", example = "ImageNet-1k"),
+        ("workspace_id" = String, Path, description = "ID of the workspace", example = "b3f27f05-0955-4076-805f-39575853b27b"),
+    ),
+    responses(
+        (status = 200, description = "Workspace found", body = WorkspaceResponseView),
+        (status = 404, description = "Workspace not found")
+    )
+)]
+pub async fn get(req: HttpRequest) -> actix_web::Result<HttpResponse, OxenHttpError> {
+    let app_data = app_data(&req)?;
+    let namespace = path_param(&req, "namespace")?.to_string();
+    let repo_name = path_param(&req, "repo_name")?.to_string();
+    let workspace_id = path_param(&req, "workspace_id")?.to_string();
+
+    let repo = get_repo(app_data, namespace, repo_name)?;
+    let Some(workspace) = repositories::workspaces::get(&repo, &workspace_id)? else {
+        return Ok(HttpResponse::NotFound()
+            .json(StatusMessageDescription::workspace_not_found(workspace_id)));
+    };
+
+    Ok(HttpResponse::Ok().json(WorkspaceResponseView {
+        status: StatusMessage::resource_found(),
+        workspace: WorkspaceResponse {
+            id: workspace.id,
+            name: workspace.name,
+            commit: workspace.commit,
+            created_at: workspace.created_at,
+        },
+    }))
+}
+
+/// Create a new workspace
+///
+/// **DEPRECATED**: Use PUT (get_or_create) instead. This endpoint now delegates to get_or_create
+/// for consistent idempotent behavior. The POST method is retained for backward compatibility.
+#[deprecated(note = "Use PUT /workspaces (get_or_create) instead")]
+pub async fn create(
+    req: HttpRequest,
+    body: String,
+) -> actix_web::Result<HttpResponse, OxenHttpError> {
+    // Delegate to get_or_create for consistent behavior
+    get_or_create(req, body).await
+}
+
+/// List workspaces
+#[utoipa::path(
+    get,
+    path = "/api/repos/{namespace}/{repo_name}/workspaces",
+    description = "List workspaces in the repository",
+    tag = "Workspaces",
+    params(
+        ("namespace" = String, Path, description = "Namespace of the repository", example = "ox"),
+        ("repo_name" = String, Path, description = "Name of the repository", example = "ImageNet-1k"),
+        NameParam // Query parameter for optional name filtering
+    ),
+    responses(
+        (status = 200, description = "List of workspaces", body = ListWorkspaceResponseView),
+        (status = 404, description = "Repository not found")
+    )
+)]
+pub async fn list(
+    req: HttpRequest,
+    params: web::Query<NameParam>,
+) -> actix_web::Result<HttpResponse, OxenHttpError> {
+    let app_data = app_data(&req)?;
+    let namespace = path_param(&req, "namespace")?.to_string();
+    let repo_name = path_param(&req, "repo_name")?.to_string();
+
+    let repo = get_repo(app_data, namespace, repo_name)?;
+    log::debug!("workspaces::list got repo: {:?}", repo.path);
+
+    // When filtering by name, use the indexed O(1) lookup instead of loading all workspaces
+    let workspace_views: Vec<WorkspaceResponse> = if let Some(name) = &params.name {
+        match repositories::workspaces::get_by_name(&repo, name)? {
+            Some(workspace) => vec![WorkspaceResponse {
+                id: workspace.id,
+                name: workspace.name,
+                commit: workspace.commit,
+                created_at: workspace.created_at,
+            }],
+            None => vec![],
+        }
+    } else {
+        repositories::workspaces::list(&repo)?
+            .into_iter()
+            .map(|workspace| WorkspaceResponse {
+                id: workspace.id,
+                name: workspace.name,
+                commit: workspace.commit,
+                created_at: workspace.created_at,
+            })
+            .collect()
+    };
+
+    Ok(HttpResponse::Ok().json(ListWorkspaceResponseView {
+        status: StatusMessage::resource_created(),
+        workspaces: workspace_views,
+    }))
+}
+
+/// Clear workspaces for repo
+#[utoipa::path(
+    delete,
+    path = "/api/repos/{namespace}/{repo_name}/workspaces/clear",
+    description = "Deletes all workspaces for the repo",
+    tag = "Workspaces",
+    params(
+        ("namespace" = String, Path, description = "Namespace for the repository", example = "ox"),
+        ("repo_name" = String, Path, description = "Name of the repository", example = "ImageNet-1k"),
+    ),
+    responses(
+        (status = 200, description = "Workspaces cleared", body = StatusMessage),
+        (status = 404, description = "Repository not found")
+    )
+)]
+pub async fn clear(req: HttpRequest) -> actix_web::Result<HttpResponse, OxenHttpError> {
+    let app_data = app_data(&req)?;
+    let namespace = path_param(&req, "namespace")?.to_string();
+    let repo_name = path_param(&req, "repo_name")?.to_string();
+    let repo = get_repo(app_data, namespace, repo_name)?;
+    // Clearing all workspaces is a destructive write; hold the whole-repo exclusive lock so no
+    // write lands mid-clear. The sweep is synchronous IO, so it runs off the actix worker thread.
+    let clear_repo = repo.clone();
+    repo_locks::with_repo_exclusive(&repo, async move {
+        tasks::spawn_blocking(move || repositories::workspaces::clear(&clear_repo))
+            .await
+            .map_err(OxenError::from)?
+    })
+    .await?;
+    Ok(HttpResponse::Ok().json(StatusMessage::resource_created()))
+}
+
+/// Delete workspace
+#[utoipa::path(
+    delete,
+    path = "/api/repos/{namespace}/{repo_name}/workspaces/{workspace_id}",
+    description = "Delete a workspace by ID",
+    tag = "Workspaces",
+    params(
+        ("namespace" = String, Path, description = "Namespace of the repository", example = "ox"),
+        ("repo_name" = String, Path, description = "Name of the repository", example = "ImageNet-1k"),
+        ("workspace_id" = String, Path, description = "ID of the workspace", example = "b3f27f05-0955-4076-805f-39575853b27b"),
+    ),
+    responses(
+        (status = 200, description = "Workspace deleted", body = WorkspaceResponseView),
+        (status = 404, description = "Workspace or Repository not found")
+    )
+)]
+pub async fn delete(req: HttpRequest) -> actix_web::Result<HttpResponse, OxenHttpError> {
+    let app_data = app_data(&req)?;
+    let namespace = path_param(&req, "namespace")?.to_string();
+    let repo_name = path_param(&req, "repo_name")?.to_string();
+    let workspace_id = path_param(&req, "workspace_id")?.to_string();
+
+    let repo = get_repo(app_data, namespace, repo_name)?;
+    let _write = repo_locks::begin_write(&repo)?;
+    let Some(workspace) = repositories::workspaces::get(&repo, &workspace_id)? else {
+        return Ok(HttpResponse::NotFound()
+            .json(StatusMessageDescription::workspace_not_found(workspace_id)));
+    };
+
+    repositories::workspaces::delete(&workspace)?;
+
+    Ok(HttpResponse::Ok().json(WorkspaceResponseView {
+        status: StatusMessage::resource_created(),
+        workspace: WorkspaceResponse {
+            id: workspace_id,
+            name: workspace.name,
+            commit: workspace.commit,
+            created_at: workspace.created_at,
+        },
+    }))
+}
+
+/// Check workspace mergeability
+#[utoipa::path(
+    get,
+    path = "/api/repos/{namespace}/{repo_name}/workspaces/{workspace_id}/merge/{branch}",
+    description = "Checks if a workspace can be committed and merged onto a branch",
+    tag = "Workspaces",
+    params(
+        ("namespace" = String, Path, description = "Namespace of the repository", example = "ox"),
+        ("repo_name" = String, Path, description = "Name of the repository", example = "ImageNet-1k"),
+        ("workspace_id" = String, Path, description = "ID of the workspace", example = "b3f27f05-0955-4076-805f-39575853b27b"),
+        ("branch" = String, Path, description = "Target branch name to merge into", example = "main"),
+    ),
+    responses(
+        (status = 200, description = "Mergeability status found", body = MergeableResponse),
+        (status = 404, description = "Workspace or target branch not found")
+    )
+)]
+pub async fn mergeability(req: HttpRequest) -> Result<HttpResponse, OxenHttpError> {
+    let app_data = app_data(&req)?;
+    let namespace = path_param(&req, "namespace")?.to_string();
+    let repo_name = path_param(&req, "repo_name")?.to_string();
+    let workspace_id = path_param(&req, "workspace_id")?.to_string();
+    let repo = get_repo(app_data, &namespace, &repo_name)?;
+    let branch_name = path_param(&req, "branch")?.to_string();
+
+    let Some(workspace) = repositories::workspaces::get(&repo, &workspace_id)? else {
+        return Ok(HttpResponse::NotFound()
+            .json(StatusMessageDescription::workspace_not_found(workspace_id)));
+    };
+    // The mergeability check does synchronous Merkle-store reads, so run it on the blocking pool
+    // rather than stalling an async worker for the duration.
+    let mergeable = tasks::spawn_blocking(move || {
+        repositories::workspaces::mergeability(&workspace, &branch_name)
+    })
+    .await
+    .map_err(|e| OxenError::internal_error(format!("mergeability task panicked: {e}")))??;
+
+    let response = MergeableResponse {
+        status: StatusMessage::resource_found(),
+        mergeable,
+    };
+    Ok(HttpResponse::Ok().json(response))
+}
+
+/// Merge workspace into branch
+#[utoipa::path(
+    post,
+    path = "/api/repos/{namespace}/{repo_name}/workspaces/{workspace_id}/merge/{branch}",
+    description = "Commit and merge workspace into the specified branch",
+    tag = "Workspaces",
+    params(
+        ("namespace" = String, Path, description = "Namespace of the repository", example = "ox"),
+        ("repo_name" = String, Path, description = "Name of the repository", example = "ImageNet-1k"),
+        ("workspace_id" = String, Path, description = "ID of the workspace", example = "b3f27f05-0955-4076-805f-39575853b27b"),
+        ("branch" = String, Path, description = "Target branch name to commit to", example = "main"),
+    ),
+    request_body(
+        content = NewCommitBody,
+        description = "Commit details for the workspace merge.",
+        example = json!({
+            "author": "bessie",
+            "email": "bessie@oxen.ai",
+            "message": "Commit changes from bessie_workspace"
+        })
+    ),
+    responses(
+        (status = 200, description = "Workspace committed successfully", body = CommitResponse),
+        (status = 400, description = "Invalid request body"),
+        (status = 404, description = "Workspace or branch not found"),
+        (status = 409, description = "Conflict — a staged file also changed on the target branch since the workspace's base commit"),
+        (status = 422, description = "Unprocessable Entity — the commit failed for another reason")
+    )
+)]
+pub async fn commit(req: HttpRequest, body: String) -> Result<HttpResponse, OxenHttpError> {
+    let app_data = app_data(&req)?;
+
+    let namespace = path_param(&req, "namespace")?.to_string();
+    let repo_name = path_param(&req, "repo_name")?.to_string();
+    let workspace_id = path_param(&req, "workspace_id")?.to_string();
+    let repo = get_repo(app_data, &namespace, &repo_name)?;
+    let _write = repo_locks::begin_write(&repo)?;
+    let branch_name = path_param(&req, "branch")?.to_string();
+
+    log::debug!(
+        "workspace::commit {namespace}/{repo_name} workspace id {workspace_id} to branch {branch_name} got body: {body}"
+    );
+
+    let data: Result<NewCommitBody, serde_json::Error> = serde_json::from_str(&body);
+
+    let data = match data {
+        Ok(data) => data,
+        Err(err) => {
+            log::warn!("unable to parse commit data. Err: {err}\n{body}");
+            return Ok(HttpResponse::BadRequest().json(StatusMessage::error(err.to_string())));
+        }
+    };
+
+    let Some(workspace) = repositories::workspaces::get(&repo, &workspace_id)? else {
+        return Ok(HttpResponse::NotFound()
+            .json(StatusMessageDescription::workspace_not_found(workspace_id)));
+    };
+
+    let branch = match repositories::branches::get_by_name(&repo, &branch_name) {
+        Ok(branch) => branch,
+        Err(OxenError::BranchNotFound(_)) => {
+            return Ok(
+                HttpResponse::NotFound().json(StatusMessageDescription::not_found(branch_name))
+            );
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    match repositories::workspaces::commit(&workspace, &data, &branch_name).await {
+        Ok(commit) => {
+            log::debug!("workspace::commit ✅ success! commit {commit:?}");
+            Ok(HttpResponse::Ok().json(CommitResponse {
+                status: StatusMessage::resource_created(),
+                commit,
+            }))
+        }
+        Err(OxenError::WorkspaceBehind(workspace)) => {
+            Err(OxenHttpError::WorkspaceBehind(Box::new(WorkspaceBranch {
+                workspace: *workspace.clone(),
+                branch,
+            })))
+        }
+        Err(err) => {
+            // The 422 below already tells the caller they got this wrong, so `warn!` rather than
+            // `error!` — an `error!` here reports every rejected commit as a server fault.
+            log::warn!("unable to commit branch {branch_name:?}. Err: {err}");
+            Ok(HttpResponse::UnprocessableEntity().json(StatusMessage::error(format!("{err:?}"))))
+        }
+    }
+}

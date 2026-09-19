@@ -1,0 +1,82 @@
+use crate::api;
+use crate::core::db::merkle_node::MerkleNodeBackend;
+use crate::storage::StorageKind;
+use crate::view::RepositoryView;
+use crate::view::repository::RepositoryCreationView;
+use crate::{error::OxenError, model::Remote};
+use http::Uri;
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct RemoteRepository {
+    pub namespace: String,
+    pub name: String,
+    pub remote: Remote,
+    pub min_version: Option<String>,
+    pub is_empty: bool,
+    /// The server's version-store backend for this repo (local filesystem or S3).
+    pub storage_kind: StorageKind,
+    /// The remote repo's Merkle node backend (filesystem / lmdb), reported for display. A clone
+    /// does not adopt it: the local repo defaults to LMDB unless the caller passes an explicit
+    /// backend. `None` from a server that predates the field.
+    pub merkle_node_backend: Option<MerkleNodeBackend>,
+}
+
+impl RemoteRepository {
+    pub fn from_view(repository: &RepositoryView, remote: &Remote) -> RemoteRepository {
+        RemoteRepository {
+            namespace: repository.namespace.clone(),
+            name: repository.name.clone(),
+            remote: remote
+                .clone()
+                .with_repo_uuid_if_absent(repository.repo_uuid),
+            min_version: repository.min_version.clone(),
+            is_empty: repository.is_empty,
+            storage_kind: repository.storage_kind,
+            merkle_node_backend: repository.merkle_node_backend,
+        }
+    }
+
+    pub fn from_creation_view(
+        repository: &RepositoryCreationView,
+        remote: &Remote,
+    ) -> RemoteRepository {
+        RemoteRepository {
+            namespace: repository.namespace.clone(),
+            name: repository.name.clone(),
+            remote: remote
+                .clone()
+                .with_repo_uuid_if_absent(repository.repo_uuid),
+            min_version: repository.min_version.clone(),
+            is_empty: true,
+            storage_kind: repository.storage_kind,
+            merkle_node_backend: repository.merkle_node_backend,
+        }
+    }
+
+    /// User friendly url for the remote repository
+    /// Ex) http://localhost:3000/namespace/name
+    pub fn url(&self) -> &str {
+        &self.remote.url
+    }
+
+    /// Host of the remote repository
+    pub fn host(&self) -> String {
+        // parse it from the url
+        let uri = self.remote.url.parse::<Uri>().unwrap();
+        uri.host().unwrap().to_string()
+    }
+
+    /// Scheme of the remote repository
+    pub fn scheme(&self) -> String {
+        // parse it from the url
+        let uri = self.remote.url.parse::<Uri>().unwrap();
+        uri.scheme().unwrap().to_string()
+    }
+
+    /// Underlying api url for the remote repository
+    /// Ex) http://localhost:3000/api/repos/namespace/name
+    pub fn api_url(&self) -> Result<String, OxenError> {
+        api::endpoint::url_from_repo(self, "")
+    }
+}

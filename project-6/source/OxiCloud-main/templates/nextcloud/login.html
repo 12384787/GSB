@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Grant Access - OxiCloud</title>
+    <script>
+        const url = new URL(window.location.href);
+        const user = url.searchParams.get('user');
+        const pathSegments = url.pathname.split('/');
+        const token = pathSegments[pathSegments.length - 1];
+        const validToken = token ? /^[0-9a-fA-F]+$/.test(token) : false;
+
+        if (validToken && username) {
+            const destinationUri = `/nextcloud/login?token=${token}&user=${user}`;
+            window.location.replace(destinationUri);
+        } else {
+            document.getElementById("wrap").innerText = "Redirect failed";
+        }
+    </script>
+    <style>
+        #wrap {
+            height: 100dvh;
+            width: 100vw;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-size: 20pt;
+            font-weight: 500;
+            color: #000000;
+            background-color: #ffffff;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="wrap">Redirecting, please wait...</div>
+</body>
+
+</html>

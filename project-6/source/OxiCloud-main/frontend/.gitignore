@@ -1,0 +1,12 @@
+node_modules/
+/bench/
+/build/
+/.svelte-kit/
+/package-lock.json.bak
+.DS_Store
+*.local
+vite.config.ts.timestamp-*
+vite.config.js.timestamp-*
+
+# Vitest/istanbul coverage output
+/coverage/

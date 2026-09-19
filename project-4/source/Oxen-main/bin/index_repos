@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ulimit -n 10240
+
+IN_FILE=${1:-}
+SYNC_SERVER=${2:-}
+
+if [ -z "$IN_FILE" ]
+then
+  echo "No input file specified."
+  exit 1
+fi
+
+if [ -z "$SYNC_SERVER" ]
+then
+  echo "No sync server specified."
+  exit 1
+fi
+
+while IFS= read -r repo || [ -n "$repo" ]; do
+  [ -z "$repo" ] && continue
+  if [ -d "$repo" ]
+  then
+    echo "Repo $repo already exists."
+
+  else
+    echo "Cloning $repo...."
+    oxen clone "https://staging.hub.oxen.ai/ox/$repo" --all
+
+    pushd "$repo" >/dev/null
+    oxen config --set-remote origin "https://$SYNC_SERVER/ox/$repo"
+    oxen push origin main
+    popd >/dev/null
+  fi
+done < "$IN_FILE"

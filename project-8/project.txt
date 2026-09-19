@@ -1,0 +1,2 @@
+embassy-rs/embassy
+Modern embedded framework, using Rust and async.

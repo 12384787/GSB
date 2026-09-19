@@ -1,0 +1,33 @@
+# build artifacts, testing, etc.
+target/
+.DS_Store
+.oxen
+release/
+logs/
+crates/oxen-server/.env.local
+*.py[cdo]
+*.swp
+# Nix outputs
+result
+# Oxen test files
+data/test/ox
+data/test/runs
+data/test/config/user_config.toml
+
+# rspec failure tracking
+cli-test/.rspec_status
+
+# Ignore data in fixtures, retain script to generate fixtures through cloning
+cli-test/spec/fixtures/*
+!cli-test/spec/fixtures/create_fixtures.sh
+cli-test/vendor/
+
+# Local config
+.vscode
+.cursor
+.cargo/config.toml
+.claude/settings.local.json
+.claude/*.lock
+.superset
+
+data/

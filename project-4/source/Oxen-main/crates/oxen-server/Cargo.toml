@@ -1,0 +1,109 @@
+[package]
+name = "oxen-server"
+version = { workspace = true }
+edition = { workspace = true }
+license-file = { workspace = true }
+description = "Oxen server is a fast data version control backend, supporting local disk and S3. Self host your repositories on your own storage, or use the hosted platform on Oxen.ai. Stores, syncs, and serves versioned datasets, model checkpoints, game assets, studio media, and any large data. Use the oxen CLI to push and pull from the oxen server."
+homepage = { workspace = true }
+repository = { workspace = true }
+readme = { workspace = true }
+keywords = ["self-hosted", "dataset", "hub", "version-control", "git-lfs"]
+categories = [
+    "artificial-intelligence",
+    "science",
+    "web-programming::http-server",
+    "network-programming",
+    "development-tools",
+]
+
+[package.metadata.cargo-machete]
+ignored = ["astral-tokio-tar"]
+
+[[bin]]
+name = "oxen-server"
+path = "src/main.rs"
+
+[features]
+default = []
+metrics = ["liboxen/metrics", "dep:metrics", "dep:metrics-exporter-prometheus"]
+# `tracing-actix-web/opentelemetry_0_32` is what extracts an inbound `traceparent` and parents the
+# HTTP root span to it. It must name the same `opentelemetry` minor the rest of the workspace
+# resolves — bump the two together. A mismatch compiles and exports spans, but the propagator
+# registered by one minor is invisible to the other, so inbound traces stop being continued.
+otel = [
+    "liboxen/otel",
+    "dep:tracing-opentelemetry",
+    "tracing-actix-web/opentelemetry_0_32",
+]
+production = ["metrics", "otel", "liboxen/production", "default"]
+
+[dependencies]
+actix-http = { workspace = true }
+actix-multipart = { workspace = true }
+actix-web = { workspace = true }
+actix-web-httpauth = { workspace = true }
+astral-tokio-tar = { workspace = true }
+async-compression = { workspace = true }
+async_zip = { workspace = true }
+bytes = { workspace = true }
+bytesize = { workspace = true }
+clap = { workspace = true }
+derive_more = { workspace = true }
+dotenvy = { workspace = true }
+dunce = { workspace = true }
+flate2 = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
+jsonwebtoken = { workspace = true }
+liboxen = { workspace = true }
+log = { workspace = true }
+lru = { workspace = true }
+metrics = { workspace = true, optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
+mime = { workspace = true }
+os_path = { workspace = true }
+percent-encoding = { workspace = true }
+regex = { workspace = true }
+rocksdb = { workspace = true }
+sanitize-filename = { workspace = true }
+sentry = { workspace = true }
+sentry-actix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-actix-web = { workspace = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+url = { workspace = true }
+utoipa = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+signal-hook = { workspace = true }
+
+[dev-dependencies]
+actix-multipart-test = { workspace = true }
+# Only so the error-mapping tests can construct an `image::ImageError`; the crate itself reaches
+# image handling through liboxen.
+image = { workspace = true }
+liboxen = { workspace = true, features = ["test-utils"] }
+mockito = { workspace = true }
+# Only so the error-mapping tests can construct a `PolarsError`; the crate itself reaches data
+# frame handling through liboxen.
+polars = { workspace = true }
+# "test" swaps in a capturing transport, so the `tasks` tests can assert what reaches Sentry. Kept a
+# dev-dependency feature so the resolver leaves it out of the shipped binary.
+sentry = { workspace = true, features = ["test"] }
+# Lets the fingerprint test drive error_response through the same tracing -> Sentry layer main
+# installs, and assert what the reporting backend would actually receive.
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

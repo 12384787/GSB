@@ -1,0 +1,757 @@
+name: CI
+
+on:
+  push:
+    branches:
+        - main
+        - dev
+        - "feat/**"
+        - "fix/**"
+  pull_request:
+    branches: [ "main", "dev" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+  DATABASE_URL: "postgres://postgres:postgres@localhost/oxicloud_test"
+
+jobs:
+
+  # Detect which parts of the codebase changed
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      frontend: ${{ steps.filter.outputs.frontend }}
+      backend: ${{ steps.filter.outputs.backend }}
+      wasm: ${{ steps.filter.outputs.wasm }}
+      plugins: ${{ steps.filter.outputs.plugins }}
+      migrations: ${{ steps.filter.outputs.migrations }}
+      message_bus_spec: ${{ steps.filter.outputs.message_bus_spec }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            frontend:
+              - 'frontend/**'
+            backend:
+              - 'src/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'tests/**'
+            wasm:
+              - 'wasm/**'
+              - 'scripts/build-wasm.sh'
+            plugins:
+              - 'wasm/oxicloud-plugin-hello/**'
+              - 'scripts/build-plugin-hello.sh'
+              - 'tests/fixtures/plugins/**'
+              - 'src/infrastructure/services/plugins/**'
+              - 'src/application/ports/plugin_ports.rs'
+              - 'src/application/adapters/plugin_lifecycle_hook.rs'
+              - 'src/application/adapters/plugin_user_lifecycle_hook.rs'
+            migrations:
+              - 'migrations/**'
+            message_bus_spec:
+              - 'src/application/ports/message_bus_ports.rs'
+              - 'src/bin/generate-asyncapi.rs'
+              - 'resources/gen/asyncapi.json'
+              - 'frontend/scripts/gen-message-bus-types.mjs'
+              - 'frontend/src/lib/generated/message-bus/**'
+              - 'frontend/package.json'
+
+  frontend-check:
+    name: Frontend — svelte-check, ESLint, Stylelint, Prettier
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 26.3.0
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check (svelte-check + eslint + stylelint + prettier)
+        run: npm run check
+
+      - name: Unit tests
+        run: npm run test:unit
+
+  # Regenerates the AsyncAPI spec and its TypeScript projection from
+  # scratch, then fails the PR if either output drifts from what was
+  # committed. Same discipline as the OpenAPI + wasm-fixture approach
+  # elsewhere in this file — the wire spec is a compile-time artefact
+  # of the Rust source (`message_bus_ports.rs`), and the TS DTOs are
+  # a compile-time artefact of the spec, so both must be reproducible.
+  #
+  # Scoped by the `message_bus_spec` path filter so a PR that doesn't
+  # touch the wire (or its generator scripts, or the Modelina version)
+  # skips this job entirely. Needs BOTH Rust and Node toolchains, so
+  # it's slightly heavier than a single-toolchain job — the filter
+  # keeps it off the hot path.
+  message-bus-spec-drift:
+    name: Message-bus spec — AsyncAPI + TypeScript DTO drift
+    needs: changes
+    if: needs.changes.outputs.message_bus_spec == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Rust for `just asyncapi` — the JSON spec is built by
+      # `cargo run --features dev_tools --bin generate-asyncapi`.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Node for `just asyncapi-ts` — Modelina projects the spec into
+      # the FE `src/lib/generated/message-bus/` folder.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 26.3.0
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci
+      - name: Regenerate AsyncAPI spec
+        # `just asyncapi` = `cargo run --features dev_tools --bin generate-asyncapi`
+        run: cargo run --features dev_tools --bin generate-asyncapi
+      - name: Regenerate TS DTOs (Modelina)
+        working-directory: frontend
+        run: npm run gen:message-bus
+      - name: Fail if committed files drifted
+        # A non-empty diff means a contributor edited the Rust wire
+        # source (or Modelina config) without regenerating, or hand-
+        # edited the generated files. Either is a bug; the message
+        # below points at the fix.
+        run: |
+          if ! git diff --exit-code \
+                 resources/gen/asyncapi.json \
+                 frontend/src/lib/generated/message-bus/; then
+            echo ""
+            echo "::error::Message-bus spec drift: the committed files differ from what the"
+            echo "::error::generator produces from source. Run \`just asyncapi-ts\` locally"
+            echo "::error::and commit the result — that recipe re-runs both stages."
+            exit 1
+          fi
+
+  # Fails the PR if a new sqlx migration file has a timestamp NOT strictly
+  # greater than every migration already on the target branch. Guards
+  # against the "two branches in flight, whoever merges second breaks
+  # every deployment" case: sqlx's default strict mode rejects an
+  # `_sqlx_migrations` row inserted with a timestamp older than one
+  # already applied. Same logic as `just check-migrations`.
+  migration-ordering:
+    name: Migration ordering (new migrations postdate target branch)
+    needs: changes
+    # `github.base_ref` is only populated on `pull_request` events —
+    # on `push` triggers it collapses to an empty string, which makes
+    # every `origin/${BASE_REF}` ref resolve to literal `origin/` and
+    # the job fails with `fatal: Not a valid object name origin/`.
+    # The ordering check is a PR-diff check by construction (compare
+    # a proposed migration against the TARGET branch's tip), so
+    # scoping it to pull_request events is both correct and cheaper —
+    # push-only events don't need the double-fire either.
+    if: github.event_name == 'pull_request' && needs.changes.outputs.migrations == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch target branch
+        run: git fetch --quiet origin "$BASE_REF"
+        env:
+          BASE_REF: ${{ github.base_ref }}
+      - name: Verify ordering
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          base_max=$(git ls-tree -r "origin/${BASE_REF}" --name-only -- migrations/ \
+            | grep -oE 'migrations/[0-9]{14}_' \
+            | sed 's|migrations/||; s|_$||' \
+            | sort | tail -1)
+          if [[ -z "$base_max" ]]; then
+            echo "No migrations on origin/${BASE_REF} — skipping ordering check."
+            exit 0
+          fi
+          new=$(git diff --name-only --diff-filter=A "origin/${BASE_REF}...HEAD" -- migrations/ \
+            | grep -E 'migrations/[0-9]{14}_' || true)
+          if [[ -z "$new" ]]; then
+            echo "No new migrations on this branch — nothing to check."
+            exit 0
+          fi
+          fail=0
+          for m in $new; do
+            ts=$(basename "$m" | grep -oE '^[0-9]{14}')
+            if [[ "$ts" -le "$base_max" ]]; then
+              # `::error` surfaces on the file in the PR diff view.
+              echo "::error file=$m::Migration timestamp $ts is not strictly > origin/${BASE_REF}'s latest ($base_max). Rename to > $base_max to avoid sqlx strict-mode errors on deploy."
+              fail=1
+            fi
+          done
+          if [[ $fail == 0 ]]; then
+            echo "OK — all new migrations post-date origin/${BASE_REF}'s latest ($base_max)."
+          fi
+          exit $fail
+
+  rust-fmt:
+    name: Rustfmt
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  rust-clippy:
+    name: Clippy
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Same scope as the `tests` job below — `--all-targets
+      # --all-features` builds examples + benches across the full
+      # feature matrix and runs into the same disk ceiling. See the
+      # rationale on the `tests` job's free-disk-space step.
+      - uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # `--all-features` includes `bundled-assets`, whose build.rs guard
+      # requires `static-dist/index.html` at compile time (rust-embed
+      # scans the folder). Build the SPA first so the lint pass covers
+      # the embed code paths without needing to enumerate features
+      # around it. ~90 s once, cached by npm-cache on repeats.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.3.0
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build SPA (needed for --all-features / bundled-assets)
+        working-directory: frontend
+        run: npm ci && npm run build
+
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # Mirrors the `wasm-check` justfile recipe. The wasm crate is a
+  # standalone workspace under `wasm/oxicloud-hash/` and is NOT
+  # built by the server's `cargo build` — these checks have to run
+  # explicitly from inside the sub-workspace. clippy + tests run
+  # against the HOST target (no wasm32 target needed in CI) which
+  # is enough to cover the algorithmic logic; the wasm32 build is
+  # exercised by `scripts/build-wasm.sh` and the frontend tests.
+  wasm-check:
+    name: Wasm — fmt + clippy
+    needs: changes
+    if: needs.changes.outputs.wasm == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: wasm/oxicloud-hash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wasm/oxicloud-hash
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-features --release -- -D warnings
+
+  # Mirrors the `wasm-test` justfile recipe. Tests run in release
+  # mode because the FastCDC + BLAKE3 workload takes minutes in
+  # the default debug profile (no inlining / no SIMD).
+  wasm-test:
+    name: Wasm — release tests
+    needs: changes
+    if: needs.changes.outputs.wasm == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: wasm/oxicloud-hash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wasm/oxicloud-hash
+      - run: cargo test --release
+
+  # Plugin runtime (Extism). Rebuilds the committed .wasm fixtures from
+  # wasm/oxicloud-plugin-hello/ and fails if they drift from what is
+  # committed (staleness guard), then runs the plugin-runtime tests with
+  # the `plugins` feature. The wasm32 target is needed only to rebuild the
+  # fixtures; the host tests themselves do not need it.
+  plugins:
+    name: Plugins — fixtures + runtime tests
+    needs: changes
+    if: needs.changes.outputs.plugins == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned to match wasm/oxicloud-plugin-hello/rust-toolchain.toml.
+      # Reproducibility of the committed .wasm fixtures depends on both
+      # sides using the same rustc — even a patch bump shifts codegen.
+      # Bump both together.
+      - uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Rebuild committed wasm fixtures
+        run: bash scripts/build-plugin-hello.sh
+      # NOTE: no `git diff --exit-code` staleness check.
+      #
+      # Cross-host wasm builds (contributor aarch64-macOS vs CI
+      # x86_64-linux, same rustc 1.96.1, same `--remap-path-prefix`,
+      # same `CARGO_INCREMENTAL=0`, same profile) still produce
+      # byte-different .wasm — plain `cargo build` doesn't guarantee
+      # bit-reproducible cross-host wasm output. The proper fixes
+      # (containerised builds, or dropping the committed fixtures and
+      # rebuilding from source everywhere) are deferred; the frontend
+      # wasm crate (`wasm/oxicloud-hash`) will hit the same wall when
+      # we add a similar check for it, so we'll tackle both together.
+      # For now: CI rebuilds the fixtures fresh above and uses those
+      # for the plugin runtime tests below. The versions committed at
+      # HEAD are a convenience for local dev without the wasm32
+      # toolchain — they may drift from what CI produces, which is
+      # fine as long as the runtime tests pass.
+      - name: Run plugin runtime tests
+        # Quote: the trailing `::` confuses GitHub's YAML parser (mapping
+        # values not allowed) and aborts the whole workflow at load time.
+        run: 'cargo test --features plugins plugins::'
+
+  rust-test:
+    name: Server Unit and Functionnal Tests
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: oxicloud_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      # Free ~26 GB of preinstalled tools the runner image ships with
+      # (Android SDK ~12 GB, Haskell/GHC ~5 GB, .NET ~2 GB, swap +
+      # docker images by the action's defaults). `cargo test
+      # --all-features --workspace` on this repo blows past the
+      # ubuntu-latest ~14 GB free budget otherwise (PR #520 died on
+      # the `bench_owner_cache` example link step with ENOSPC).
+      # `tool-cache: false` is load-bearing — wiping it breaks
+      # `setup-rust`/`setup-node`/etc.
+      - uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # `--all-features` enables `bundled-assets`, whose build.rs guard
+      # requires `static-dist/index.html` at compile time. Build the SPA
+      # first so tests can compile the embed code paths. ~90 s, cached.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.3.0
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build SPA (needed for --all-features / bundled-assets)
+        working-directory: frontend
+        run: npm ci && npm run build
+
+      - name: Initialize test database
+        # Applies every migration + seeds the integration-test admin row.
+        # Same script used by `just test-integration` locally.
+        run: bash tests/common/init-test-schema.sh
+        env:
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: oxicloud_test
+
+      - name: Run tests
+        run: cargo test --all-features --workspace
+        env:
+          DATABASE_URL: "postgres://postgres:postgres@localhost/oxicloud_test"
+
+      - name: Run integration tests
+        run: cargo test --all-features --workspace --tests
+        env:
+          DATABASE_URL: "postgres://postgres:postgres@localhost/oxicloud_test"
+          RUSTFLAGS: "-Dwarnings --cfg integration_tests"
+
+  rust-audit:
+    name: Security Audit
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      # `cargo build --release --features plugins` is the heaviest
+      # link step in the workflow — release-profile linking emits
+      # large intermediate objects + plugins drags Wasmtime in.
+      # Preemptive cleanup keeps it well inside the runner disk
+      # budget; same rationale as the tests/clippy jobs above.
+      - uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 26.3.0
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build SPA (Vite -> static-dist/)
+        working-directory: frontend
+        run: npm ci && npm run build
+      # --features plugins so the e2e Playwright job (which sets
+      # OXICLOUD_ENABLE_PLUGINS) can exercise the admin Plugins tab. The api/webdav
+      # and unit jobs reuse this binary but leave plugins disabled at runtime.
+      - run: cargo build --release --features plugins
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oxicloud-release
+          path: target/release/oxicloud
+          retention-days: 1
+
+  api-test:
+    name: API, WebDAV & OIDC tests
+    needs: build
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: oxicloud-release
+          path: target/release/
+
+      - name: Set execute bit on pre-built binary
+        run: chmod +x target/release/oxicloud
+
+      - name: Install Hurl, b3sum, and xq
+        env:
+          HURL_MAJOR: "8"
+          # sibprogrammer/xq — standalone Go binary, real XPath via libxml2.
+          # Pinned to match the dev-box version so the test scripts can rely
+          # on syntax stability. Bump in lockstep with the dev install.
+          XQ_VERSION: "1.3.0"
+        run: |
+          HURL_VERSION=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
+            https://api.github.com/repos/Orange-OpenSource/hurl/releases \
+            | jq -r "map(select(.tag_name | startswith(\"${HURL_MAJOR}.\"))) | first | .tag_name")
+          curl -fLO "https://github.com/Orange-OpenSource/hurl/releases/download/${HURL_VERSION}/hurl_${HURL_VERSION}_amd64.deb"
+          sudo apt-get install -y "./hurl_${HURL_VERSION}_amd64.deb" b3sum
+          curl -fLO "https://github.com/sibprogrammer/xq/releases/download/v${XQ_VERSION}/xq_${XQ_VERSION}_linux_amd64.tar.gz"
+          tar -xzf "xq_${XQ_VERSION}_linux_amd64.tar.gz" xq
+          sudo install -m 0755 xq /usr/local/bin/xq
+
+      # Node for the OIDC fake IdP (tests/oidc/fake_idp/server.js — a
+      # panva/node-oidc-provider wrapper). Pinned to match the version
+      # used elsewhere in this workflow (frontend Playwright job uses
+      # 26.3.0 too).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.3.0
+          cache: npm
+          cache-dependency-path: tests/oidc/fake_idp/package-lock.json
+
+      - name: Run Hurl API tests
+        run: bash tests/api/run.sh
+        env:
+          BUILD_TARGET: release
+
+      - name: Run WebDAV tests
+        run: bash tests/webdav/run.sh
+        env:
+          BUILD_TARGET: release
+
+      # WebDAV URL-scheme variant: `OXICLOUD_WEBDAV_DRIVE_PATH=""`
+      # (drive listing at `/webdav/`, no `@drive` sigil). Runs a
+      # separately-configured server on its own port so the default
+      # WebDAV suite above stays on the `"@drive"` back-compat config.
+      - name: Run WebDAV drive-root variant tests
+        run: bash tests/webdav-drive-root/run.sh
+        env:
+          BUILD_TARGET: release
+
+      # OIDC integration: drives the SPA's SSO flow end-to-end against
+      # the fake IdP (auto-approve login + consent, real PKCE/JWT
+      # round-trip) and asserts the d1bbe8ba contract — OIDC callback
+      # MUST redirect to `/login?oidc_code=…`, not `/?oidc_code=…`.
+      # That bug shipped to users in production once already; the
+      # assertion at tests/oidc/oidc.hurl:Step 4 is its guard.
+      - name: Run OIDC tests
+        run: bash tests/oidc/run.sh
+        env:
+          BUILD_TARGET: release
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: hurl-report
+          path: tests/api/storage/
+          retention-days: 7
+
+  bundled-binary-test:
+    # `--features bundled-assets` end-to-end integration test.
+    #
+    # Builds oxicloud with the SPA baked in via rust-embed, boots it
+    # against a nonexistent OXICLOUD_STATIC_PATH so the embed path is
+    # forced, and asserts SPA + locales + immutable-cache headers +
+    # CSP all serve correctly from the embedded corpus. Guards against
+    # three failure classes that don't surface in filesystem-served CI:
+    #
+    #   1. rust-embed configuration (glob patterns silently producing a
+    #      0-file embed — hit 2026-08-28).
+    #   2. Debug-vs-release drift (rust-embed's dynamic-read mode in
+    #      debug builds masks embed bugs; `debug-embed` feature bakes
+    #      files in for both profiles).
+    #   3. Axum `Path` extractor on fallback routes returning 500 (the
+    #      `serve_root` handler needs `Request` extraction — hit 2026-08-28).
+    #
+    # See tests/bundled-binary/run.sh + docs/plan/bundled-binary.md § 2.
+    #
+    # Doesn't reuse the `build` job's artifact because that binary is
+    # compiled with `--features plugins`, not `--features bundled-assets`
+    # — different feature set = different target. `Swatinem/rust-cache`
+    # still shares dependency compilation between the two jobs.
+    name: Bundled-assets binary — embed + SPA-serve integration
+    needs: changes
+    if: |
+      github.event_name == 'pull_request' &&
+      (needs.changes.outputs.backend == 'true' || needs.changes.outputs.frontend == 'true')
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      # Same disk-hygiene pattern as the `build` job — cargo release
+      # link + full node_modules install would otherwise squeeze the
+      # runner disk budget under peak concurrency.
+      - uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.3.0
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # Build the SPA up front so the test script can run with
+      # `SKIP_FRONTEND_BUILD=1` — makes the test-runner log clean
+      # (no duplicated npm ci noise) and puts the SPA build's cost
+      # in its own step for CI-side timing visibility.
+      - name: Build SPA (Vite → static-dist/)
+        working-directory: frontend
+        run: npm ci && npm run build
+
+      - name: Run bundled-binary integration test
+        run: bash tests/bundled-binary/run.sh
+        env:
+          SKIP_FRONTEND_BUILD: "1"
+
+      # Preserve the server log even on failure so a red run doesn't
+      # require re-running locally to see what happened at boot.
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: bundled-binary-server-log
+          path: tests/bundled-binary/server.log
+          retention-days: 7
+
+  litmus:
+    name: WebDAV RFC 4918 — litmus (59/59)
+    needs: build
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: oxicloud-release
+          path: target/release/
+
+      - name: Set execute bit on pre-built binary
+        run: chmod +x target/release/oxicloud
+
+      - name: Install litmus and jq
+        run: sudo apt-get update -q && sudo apt-get install -y litmus jq
+
+      - name: Run litmus WebDAV compliance tests
+        run: bash tests/webdav/run-litmus.sh
+        env:
+          BUILD_TARGET: release
+          LITMUS_TESTS: "basic copymove props locks"
+
+  caldav-test:
+    # CalDAV + CardDAV client-driven suite via python-caldav — the
+    # same library Thunderbird / DAVx⁵ / Radicale / xandikos / davical
+    # test against. Complements the raw-HTTP Hurl coverage in
+    # api-test by proving a real client library round-trips through
+    # OxiCloud's CalDAV/CardDAV surface.
+    #
+    # Runs AFTER litmus so both DAV-family compliance surfaces
+    # (RFC 4918 WebDAV via litmus, RFC 4791 CalDAV + RFC 6352
+    # CardDAV via python-caldav) execute in sequence on the same
+    # pre-built binary. Sharing `needs: build` + `needs: litmus`
+    # means one binary download is enough; running after litmus
+    # rather than in parallel keeps CI runner load predictable.
+    name: CalDAV + CardDAV — python-caldav
+    needs: litmus
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: oxicloud-release
+          path: target/release/
+
+      - name: Set execute bit on pre-built binary
+        run: chmod +x target/release/oxicloud
+
+      - name: Install jq + python3 venv
+        # jq for the /api/setup + /api/auth/login parsing inside
+        # run-pycaldav.sh. python3 ships on ubuntu-latest but
+        # python3-venv is a separate package on Debian-family images.
+        run: sudo apt-get update -q && sudo apt-get install -y jq python3 python3-venv
+
+      - name: Run python-caldav suite
+        run: bash tests/caldav/run-pycaldav.sh
+        env:
+          BUILD_TARGET: release
+
+      - name: Upload server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: caldav-server-log
+          path: tests/caldav/server.log
+          retention-days: 7
+
+  front-test:
+    name: Frontend end-to-end tests (via Playwright)
+    # ensure that api tests are ok before
+    needs: api-test
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: oxicloud-release
+          path: target/release/
+
+      - name: Set execute bit on pre-built binary
+        run: chmod +x target/release/oxicloud
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.3.0
+
+      - name: Install Node dependencies
+        working-directory: tests/e2e
+        run: npm ci
+
+      # The release binary serves the SPA from ./static-dist on disk (not
+      # embedded). Build the instrumented SPA here with COVERAGE=1 (Istanbul, for
+      # the coverage report) and VITE_E2E=1 (keeps the `data-testid` hooks the
+      # specs target). start-server-spa.sh points OXICLOUD_STATIC_PATH here.
+      - name: Build instrumented SPA for e2e (COVERAGE + VITE_E2E)
+        working-directory: frontend
+        run: npm ci && COVERAGE=1 VITE_E2E=1 npm run build
+
+      - name: Install Playwright browsers
+        working-directory: tests/e2e
+        run: npx playwright install --with-deps
+
+      # Drives this PR's SvelteKit SPA specs (tests/e2e/spa) via the coverage
+      # config + start-server-spa.sh. (The legacy `npm test` scenarios targeted
+      # the removed vanilla `static/` frontend and are no longer exercised.)
+      - name: Run SPA e2e coverage suite
+        working-directory: tests/e2e
+        run: npm run test:coverage
+        env:
+          BUILD_TARGET: release
+
+      - name: Print server startup log
+        if: always()
+        run: cat tests/e2e/server-startup.log || echo "no server-startup.log produced"
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report
+          path: tests/e2e/playwright-report/
+          retention-days: 30

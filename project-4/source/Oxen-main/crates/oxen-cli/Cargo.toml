@@ -1,0 +1,61 @@
+[package]
+name = "oxen-cli"
+version = { workspace = true }
+edition = { workspace = true }
+license-file = { workspace = true }
+description = "The oxen CLI lets you add, commit, push, and diff terabytes of data with a git style interface. Version machine learning training data, model weights, game assets, and studio media. Diff CSV and Parquet files row by row. Self host the oxen server, or push data to Oxen.ai to collaborate on datasets, fine tune models, and run inference. Installs the oxen binary."
+homepage = { workspace = true }
+repository = { workspace = true }
+readme = { workspace = true }
+keywords = [
+    "data-versioning",
+    "datasets",
+    "training-data",
+    "data-management",
+    "reproducibility",
+]
+categories = [
+    "artificial-intelligence",
+    "command-line-utilities",
+    "science",
+    "development-tools",
+    "filesystem",
+]
+
+[[bin]]
+name = "oxen"
+path = "src/main.rs"
+
+[features]
+default = []
+metrics = ["liboxen/metrics"]
+otel = ["liboxen/otel"]
+production = ["metrics", "otel", "default"]
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytesize = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+colored = { workspace = true }
+dialoguer = { workspace = true }
+glob = { workspace = true }
+liboxen = { workspace = true }
+log = { workspace = true }
+minus = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+liboxen = { workspace = true, features = ["test-utils"] }
+
+[lints]
+workspace = true

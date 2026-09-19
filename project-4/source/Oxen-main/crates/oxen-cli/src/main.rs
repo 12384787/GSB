@@ -1,0 +1,230 @@
+use std::collections::HashMap;
+use std::env;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use crate::cmd::RemoteModeCmd;
+use crate::cmd::Runners;
+use crate::cmd::WorkspaceCmd;
+use clap::{Arg, Command};
+use colored::Colorize;
+use liboxen::error::OxenError;
+use liboxen::model::LocalRepository;
+use liboxen::util;
+use tracing::level_filters::LevelFilter;
+
+// NOTE: ALL INTERNAL MODULES OF oxen-cli MUST BE EXTERNALLY PRIVATE
+mod cli_error;
+mod cmd;
+mod helpers;
+// THE **ONLY** PUBLIC THING IN oxen-cli IS THE BINARY !!!
+
+const SHORT_ABOUT: &str = "🐂 is the AI and machine learning data management toolchain";
+
+const LONG_ABOUT: &str = "
+🐂 is the AI and machine learning data management toolchain
+
+    📖 If this is your first time using Oxen, check out the CLI docs at:
+            https://docs.oxen.ai/getting-started/cli
+
+    💬 For more support, or to chat with the Oxen team, join our Discord:
+            https://discord.gg/s3tBEn7Ptg
+";
+
+/// Runs [`async_main`] with the [`OXEN_STACK_SIZE`].
+fn main() -> ExitCode {
+    let oxen_stack_size = env::var("OXEN_STACK_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(liboxen::constants::OXEN_STACK_SIZE);
+    log::debug!("Using stack size in async runtime: {oxen_stack_size} bytes");
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(oxen_stack_size)
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("Failed to create multi-threaded Tokio runtime.");
+
+    runtime.block_on(async_main())
+}
+
+/// Actual oxen CLI logic.
+async fn async_main() -> ExitCode {
+    // NOTE: if we fail to initialze logging, we do not crash here
+    let _tracing_guard = match util::telemetry::init_tracing("oxen", LevelFilter::OFF) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            eprintln!("[ERROR] Failed to initialize tracing for oxen:\n{e}");
+            None
+        }
+    };
+
+    let (command, runners) = main_oxen_command();
+
+    // Parse the command line args and run the appropriate command
+    let matches = command.get_matches();
+
+    handle_args(&matches);
+
+    let is_remote_repo = match LocalRepository::from_current_dir() {
+        Ok(repo) => repo.is_remote_mode(),
+        Err(_) => false,
+    };
+
+    match matches.subcommand() {
+        // TODO: Get these in the help command instead of just falling back
+        Some((command, args)) => {
+            // Lookup command in runners and run on args
+            if let Some(runner) = runners.get(command) {
+                // If in a remote-mode repo, re-route to correct command
+                if is_remote_repo {
+                    match command {
+                        // Workspace commands
+                        "add" | "df" | "diff" | "rm" => {
+                            match WorkspaceCmd::run_subcommands(command, args).await {
+                                Ok(_) => {}
+                                Err(err) => {
+                                    print_error(&err);
+                                    return ExitCode::FAILURE;
+                                }
+                            }
+
+                            return ExitCode::SUCCESS;
+                        }
+                        // Remote-mode specific commands
+                        "commit" | "checkout" | "pull" | "restore" | "status" => {
+                            match RemoteModeCmd::run_subcommands(command, args).await {
+                                Ok(_) => {}
+                                Err(err) => {
+                                    print_error(&err);
+                                    return ExitCode::FAILURE;
+                                }
+                            }
+                            return ExitCode::SUCCESS;
+                        }
+                        // Disallowed commands
+                        "embeddings" | "merge" | "push" | "workspace" => {
+                            eprintln!(
+                                "Command `oxen {command}` not implemented for remote-mode repositories"
+                            );
+                            return ExitCode::FAILURE;
+                        }
+                        _ => {} // All other commands behave as normal
+                    }
+                }
+
+                match runner.run(args).await {
+                    Ok(_) => {}
+                    Err(err) => {
+                        print_error(&err);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                eprintln!("Unknown command `oxen {command}`");
+                return ExitCode::FAILURE;
+            }
+        }
+        _ => unreachable!(
+            "[ERROR] Failed to parse command. CLI arguments:\n{:?}",
+            matches
+        ), // If all subcommands are defined above, anything else is unreachable!()
+    }
+
+    ExitCode::SUCCESS
+}
+
+fn main_oxen_command() -> (Command, Runners) {
+    let mut command = Command::new("oxen")
+        .version(liboxen::constants::OXEN_VERSION)
+        .about(SHORT_ABOUT)
+        .long_about(LONG_ABOUT)
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .allow_external_subcommands(true)
+        .arg(
+            Arg::new("config-dir")
+                .long("config-dir")
+                .value_parser(clap::value_parser!(PathBuf))
+                .global(true)
+                .help(
+                    "Directory for oxen's user and auth config files \
+                     (overrides $OXEN_CONFIG_DIR; defaults to ~/.config/oxen/)",
+                ),
+        );
+
+    // Add all the commands to the command line
+    let mut runners = HashMap::new();
+    for cmd in all_commands() {
+        command = command.subcommand(cmd.args());
+        runners.insert(cmd.name().to_string(), cmd);
+    }
+    (command, runners)
+}
+
+/// Every command that is used by the `oxen` CLI **MUST** be listed here!
+fn all_commands() -> [Box<dyn cmd::RunCmd>; 39] {
+    [
+        Box::new(cmd::AddCmd),
+        Box::new(cmd::BranchCmd),
+        Box::new(cmd::CatCmd),
+        Box::new(cmd::CheckoutCmd),
+        Box::new(cmd::CleanCmd),
+        Box::new(cmd::CloneCmd),
+        Box::new(cmd::CommitCmd),
+        Box::new(cmd::ConfigCmd),
+        Box::new(cmd::CreateRemoteCmd),
+        Box::new(cmd::DbCmd),
+        Box::new(cmd::DeleteRemoteCmd),
+        Box::new(cmd::DFCmd),
+        Box::new(cmd::DiffCmd),
+        Box::new(cmd::DownloadCmd),
+        Box::new(cmd::FetchCmd),
+        Box::new(cmd::EmbeddingsCmd),
+        Box::new(cmd::InfoCmd),
+        Box::new(cmd::InitCmd),
+        Box::new(cmd::LoadCmd),
+        Box::new(cmd::LogCmd),
+        Box::new(cmd::LsCmd),
+        Box::new(cmd::MergeCmd),
+        Box::new(cmd::MigrateCmd),
+        Box::new(cmd::MooCmd),
+        Box::new(cmd::NodeCmd),
+        Box::new(cmd::PruneCmd),
+        Box::new(cmd::FsckCmd),
+        Box::new(cmd::VerifyCmd),
+        Box::new(cmd::PullCmd),
+        Box::new(cmd::PushCmd),
+        Box::new(cmd::RestoreCmd),
+        Box::new(cmd::RemoteCmd),
+        Box::new(cmd::RmCmd),
+        Box::new(cmd::SaveCmd),
+        Box::new(cmd::SchemasCmd),
+        Box::new(cmd::StatusCmd),
+        Box::new(cmd::TreeCmd),
+        Box::new(cmd::UploadCmd),
+        Box::new(cmd::WorkspaceCmd),
+    ]
+}
+
+fn handle_args(matches: &clap::ArgMatches) {
+    // Install the --config-dir override before any work that might consult user/auth
+    // config via util::fs::oxen_config_dir(). `from_current_dir()` below currently reads
+    // only the per-repo .oxen/config.toml, but keeping this first preserves the invariant
+    // as that code path evolves.
+    if let Some(dir) = matches.get_one::<PathBuf>("config-dir") {
+        util::fs::set_oxen_config_dir(dir.clone());
+    }
+}
+
+/// Print an error to STDERR with colored prefix. If it's an [`OxenError`], then also optionally print its hint.
+fn print_error(err: &anyhow::Error) {
+    eprintln!("{} {}", "Error:".red().bold(), err);
+
+    if let Some(oxen_error) = err.downcast_ref::<OxenError>()
+        && let Some(hint) = oxen_error.hint()
+    {
+        eprintln!("  {} {}", "hint:".cyan().bold(), hint);
+    }
+}

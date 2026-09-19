@@ -1,0 +1,236 @@
+name: 🐳 Build branch for docker
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: "Branch to build. Also accepts commit sha and tag name."
+        required: true
+        type: string
+      ARCHITECTURE:
+        description: "The architecture to build for. Either amd64 (for x86_64) or arm64."
+        required: false
+        default: "arm64"
+        type: string
+    secrets:
+      GH_PERSONAL_ACCESS_TOKEN:
+        description: "GitHub personal access token"
+        required: true
+    outputs:
+      image:
+        description: "Digest-pinned reference to the image this built"
+        value: ${{ jobs.release_docker.outputs.image }}
+
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to build. Also accepts commit sha and tag name."
+        required: true
+      ARCHITECTURE:
+        description: "The architecture to build for. Either amd64 (for x86_64) or arm64."
+        required: true
+        default: "arm64"
+        type: choice
+        options:
+          - arm64
+          - amd64
+
+env:
+  AWS_REGION: us-west-1
+  AWS_ROLE: ${{ vars.EC2_GITHUB_RUNNER_ROLE }}
+  # Lowercase: registry paths are case-sensitive and the owner name is not.
+  REGISTRY_IMAGE: ghcr.io/oxen-ai/oxen-server
+  # Its own package: prune_server_images.yml keeps the newest 20 versions of
+  # oxen-server, and a cache manifest per build would spend that budget on entries no
+  # deployment can roll back to.
+  CACHE_IMAGE: ghcr.io/oxen-ai/oxen-server-buildcache
+
+# Each job below states what it needs; a job's own block replaces this one rather
+# than adding to it, so nothing inherits a write it has no use for.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash -leo pipefail {0}
+
+jobs:
+  start-self-hosted-runner:
+    name: Start self-hosted EC2 runner
+    runs-on: ubuntu-latest
+    # Assumes an AWS role by OIDC. Checks nothing out.
+    permissions:
+      id-token: write
+    outputs:
+      label: ${{ steps.start-ec2-runner.outputs.label }}
+      ec2-instance-id: ${{ steps.start-ec2-runner.outputs.ec2-instance-id }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.AWS_ROLE }}
+          role-duration-seconds: 900
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Start EC2 runner
+        id: start-ec2-runner
+        uses: machulav/ec2-github-runner@343a1b2ae682e681c3cec9a235d882da17ff04ef # v2.6.1
+        with:
+          mode: start
+          github-token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+          ec2-image-id: ${{ vars.EC2_IMAGE_ID }}
+          ec2-instance-type: m7g.4xlarge
+          subnet-id: ${{ vars.SUBNET_ID }}
+          security-group-id: ${{ vars.SECURITY_GROUP_ID }}
+          aws-resource-tags: >
+            [
+              {"Key": "Name", "Value": "ec2-github-runner"}
+            ]
+
+  release_docker:
+    needs: start-self-hosted-runner
+    runs-on: ${{ needs.start-self-hosted-runner.outputs.label }}
+    # Reads the source it builds, and publishes the image it produces.
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.branch }}
+
+      - name: Set release version
+        run: |
+          echo "RELEASE_VERSION=nightly-$(date +'%Y-%m-%d-%H_%M_%S')" >> $GITHUB_ENV
+
+      - name: Get build metadata
+        id: metadata
+        run: |
+          VERSION=$(grep -m1 '^version = ' ${{ github.workspace }}/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "COMMIT=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "BUILD_DATE_UTC=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+
+      # Ahead of the build because the cache below reads and writes the registry.
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The runner is destroyed after the job, so the cache has to live in the
+      # registry. The default docker driver refuses --cache-to type=registry.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+
+      # Thin LTO in place of the release profile's fat LTO, a serial link-time pass
+      # that reruns whenever this repository's own crates change, so no layer cache
+      # can avoid it. `release_docker.yml` selects it too, so both server images this
+      # repository publishes are built the same way. `codegen-units` stays at 1,
+      # since raising it trades binary size for less time than this saves.
+      - name: Build oxen-server Docker Image (${{ inputs.ARCHITECTURE }})
+        env:
+          # Per architecture: a shared ref would have each build overwrite the other.
+          CACHE_REF: ${{ env.CACHE_IMAGE }}:${{ inputs.ARCHITECTURE }}
+          # Branches read the cache, only main writes it, so a branch cannot replace
+          # what main and the release builds read. `github.ref` alone would not do it:
+          # a manual run takes that from the workflow-selection dropdown, not from the
+          # `branch` input it actually builds.
+          WRITE_CACHE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: |
+          cache_to=()
+          if [[ "$WRITE_CACHE" == "true" ]]; then
+            # mode=max: the dependency build is not in the final stage, and the
+            # default records only the final stage.
+            cache_to=(--cache-to "type=registry,ref=$CACHE_REF,mode=max")
+          fi
+
+          # --load: a docker-container builder does not populate the daemon, which the
+          # save, tag, and push steps below read from.
+          docker buildx build \
+            --load \
+            --cache-from "type=registry,ref=$CACHE_REF" \
+            "${cache_to[@]}" \
+            --build-arg CARGO_PROFILE_RELEASE_LTO=thin \
+            --label "org.opencontainers.image.revision=${{ steps.metadata.outputs.COMMIT }}" \
+            --label "org.opencontainers.image.version=${{ steps.metadata.outputs.VERSION }}" \
+            --label "org.opencontainers.image.created=${{ steps.metadata.outputs.BUILD_DATE_UTC }}" \
+            --label "org.opencontainers.image.architecture=${{ inputs.ARCHITECTURE }}" \
+            --label "org.opencontainers.image.title=oxen-server" \
+            -t oxen/oxen-server \
+            --platform linux/${{ inputs.ARCHITECTURE }} .
+
+      - name: Save Docker
+        run: docker save oxen/oxen-server -o oxen-server-docker-${{ inputs.ARCHITECTURE }}-${{ env.RELEASE_VERSION }}.tar
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: oxen-server-docker-${{ inputs.ARCHITECTURE }}-${{ env.RELEASE_VERSION }}.tar
+          path: oxen-server-docker-${{ inputs.ARCHITECTURE }}-${{ env.RELEASE_VERSION }}.tar
+          retention-days: 1
+
+      # Published so a deployment can consume the image by digest rather than by
+      # unpacking a workflow artifact, which expires and can only be fetched
+      # through the Actions API. The tag is for browsing; the digest this outputs
+      # is what identifies the image, and it is the only thing a caller should
+      # deploy from.
+      - name: Push image to GitHub Container Registry
+        id: push
+        env:
+          COMMIT: ${{ steps.metadata.outputs.COMMIT }}
+        run: |
+          tag="$REGISTRY_IMAGE:sha-${COMMIT:0:12}"
+
+          docker tag oxen/oxen-server "$tag"
+          docker image push "$tag"
+
+          # Selected by repository rather than by position: the daemon records a
+          # digest per repository the image has been pushed to, and which one
+          # comes first is not something to depend on.
+          image=$(docker image inspect "$tag" \
+            --format '{{ range .RepoDigests }}{{ println . }}{{ end }}' \
+            | grep -F -- "$REGISTRY_IMAGE@" | head -1 || true)
+
+          if [[ -z "$image" ]]; then
+            echo "::error::the push recorded no digest for $REGISTRY_IMAGE"
+            exit 1
+          fi
+
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "Published $image" >> "$GITHUB_STEP_SUMMARY"
+
+  stop-self-hosted-runner:
+    name: Stop self-hosted EC2 runner
+    needs:
+      - start-self-hosted-runner
+      - release_docker
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    # Assumes an AWS role by OIDC. Checks nothing out.
+    permissions:
+      id-token: write
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.AWS_ROLE }}
+          role-duration-seconds: 900
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Stop EC2 runner
+        uses: machulav/ec2-github-runner@343a1b2ae682e681c3cec9a235d882da17ff04ef # v2.6.1
+        with:
+          mode: stop
+          github-token: ${{ secrets.GH_PERSONAL_ACCESS_TOKEN }}
+          label: ${{ needs.start-self-hosted-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.start-self-hosted-runner.outputs.ec2-instance-id }}

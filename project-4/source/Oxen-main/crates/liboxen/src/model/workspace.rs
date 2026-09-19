@@ -1,0 +1,122 @@
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use time::OffsetDateTime;
+
+use crate::constants::{
+    OXEN_HIDDEN_DIR, WORKSPACE_CONFIG, WORKSPACE_CONFIG_LEGACY, WORKSPACES_DIR,
+};
+use crate::model::{Commit, LocalRepository};
+use crate::util;
+
+use utoipa::ToSchema;
+
+// Define a struct for the workspace config to make it easier to serialize
+#[derive(Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    pub workspace_commit_id: String,
+    pub is_editable: bool,
+    pub workspace_name: Option<String>,
+    pub workspace_id: Option<String>,
+    /// `None` for a workspace whose config predates the server recording creation time.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub created_at: Option<OffsetDateTime>,
+}
+
+/// In-process model for workspace state. Not part of any API wire shape — use `WorkspaceView` to
+/// send workspace state across the wire.
+#[derive(Debug, Clone)]
+pub struct Workspace {
+    pub id: String,
+    pub name: Option<String>,
+    // Workspaces have a base repository that they are created in .oxen/
+    pub base_repo: LocalRepository,
+    // And a sub repository that is just to make changes in
+    // .oxen/workspaces/<workspace_id>/.oxen/
+    pub workspace_repo: LocalRepository,
+    // .oxen/workspaces/<workspace_id>/.oxen/workspace.toml
+    pub is_editable: bool,
+    pub commit: Commit,
+    /// `None` for a workspace created before the server recorded creation time.
+    pub created_at: Option<OffsetDateTime>,
+}
+
+impl Workspace {
+    pub fn workspaces_dir(repo: &LocalRepository) -> PathBuf {
+        repo.path.join(OXEN_HIDDEN_DIR).join(WORKSPACES_DIR)
+    }
+
+    pub fn workspace_dir(repo: &LocalRepository, workspace_id_hash: &str) -> PathBuf {
+        Self::workspaces_dir(repo).join(workspace_id_hash)
+    }
+
+    /// Returns the path to the workspace directory
+    pub fn dir(&self) -> PathBuf {
+        let workspace_id_hash = util::hasher::hash_str_sha256(&self.id);
+        Self::workspace_dir(&self.base_repo, &workspace_id_hash)
+    }
+
+    /// Where a workspace's config is written.
+    pub fn config_path_from_dir(dir: impl AsRef<Path>) -> PathBuf {
+        dir.as_ref().join(OXEN_HIDDEN_DIR).join(WORKSPACE_CONFIG)
+    }
+
+    /// Where a workspace's config sits when it was written under the former name.
+    pub(crate) fn legacy_config_path_from_dir(dir: impl AsRef<Path>) -> PathBuf {
+        dir.as_ref()
+            .join(OXEN_HIDDEN_DIR)
+            .join(WORKSPACE_CONFIG_LEGACY)
+    }
+
+    /// The config `dir` actually holds, preferring the current name over the former one, or
+    /// `None` when it holds neither.
+    pub(crate) fn existing_config_path_from_dir(dir: impl AsRef<Path>) -> Option<PathBuf> {
+        let dir = dir.as_ref();
+        let config_path = Self::config_path_from_dir(dir);
+        if config_path.exists() {
+            return Some(config_path);
+        }
+
+        let legacy_path = Self::legacy_config_path_from_dir(dir);
+        legacy_path.exists().then_some(legacy_path)
+    }
+
+    pub fn config_path(&self) -> PathBuf {
+        Self::config_path_from_dir(self.dir())
+    }
+}
+
+impl std::fmt::Display for Workspace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Workspace(name={:?}, commit_id={})",
+            self.name, self.commit.id
+        )
+    }
+}
+
+impl std::error::Error for Workspace {}
+
+/// Conversion from the internal `Workspace` to a `WorkspaceView`
+impl From<Workspace> for WorkspaceView {
+    fn from(workspace: Workspace) -> Self {
+        Self {
+            name: workspace.name,
+            id: workspace.id,
+            commit: workspace.commit,
+            created_at: workspace.created_at,
+        }
+    }
+}
+
+/// Used to send workspace state across the wire. The `Workspace`'s other fields (like
+/// `LocalRepository`) would bloat the response and leak internal state.
+#[derive(Deserialize, Serialize, Debug, Clone, ToSchema)]
+pub struct WorkspaceView {
+    pub name: Option<String>,
+    pub id: String,
+    pub commit: Commit,
+    /// `None` for a workspace created before the server recorded creation time.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub created_at: Option<OffsetDateTime>,
+}

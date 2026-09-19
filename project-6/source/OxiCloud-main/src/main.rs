@@ -1,0 +1,1663 @@
+#![allow(async_fn_in_trait)]
+
+// mimalloc returns freed pages to the OS only when `MIMALLOC_PURGE_DELAY` is
+// low/zero. With the default it retains them, so process RSS clamps at the peak
+// even after the in-memory caches (file content, thumbnails, transcode) expire
+// by TTL. The Dockerfile and docker-compose set `MIMALLOC_PURGE_DELAY=0` so RSS
+// tracks the live working set — benchmarked on musl/aarch64 at ~400 MB
+// reclaimed after a 400 MB alloc→free spike, vs 0 MB by default, at no
+// throughput cost. (jemalloc with `muzzy_decay_ms:0` is an equivalent
+// alternative; mimalloc+env is preferred on the musl/Alpine target — its
+// `background_thread` is unsupported there.)
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
+
+use axum::Router;
+use axum::extract::DefaultBodyLimit;
+use oxicloud::access_log;
+use oxicloud::interfaces::middleware::trace_span::{ClientIpMakeSpan, UuidRequestId};
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::request_id::{PropagateRequestIdLayer, SetRequestIdLayer};
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// OxiCloud - Cloud Storage Platform
+///
+/// OxiCloud is a NextCloud-like file storage system built in Rust with a focus on
+/// performance, security, and clean architecture. The system provides:
+///
+/// - File and folder management with rich metadata
+/// - User authentication and authorization
+/// - File trash system with automatic cleanup
+/// - Efficient handling of large files through parallel processing
+/// - Compression capabilities for bandwidth optimization
+/// - RESTful API and web interface
+///
+/// The architecture follows the Clean/Hexagonal Architecture pattern with:
+///
+/// - Domain Layer: Core business entities and repository interfaces (domain/*)
+/// - Application Layer: Use cases and service orchestration (application/*)
+/// - Infrastructure Layer: Technical implementations of repositories (infrastructure/*)
+/// - Interface Layer: API endpoints and web controllers (interfaces/*)
+///
+/// Dependencies are managed through dependency inversion, with high-level modules
+/// defining interfaces (ports) that low-level modules implement (adapters).
+///
+/// @author OxiCloud Development Team
+use oxicloud::common;
+use oxicloud::infrastructure;
+use oxicloud::interfaces;
+
+use common::di::AppServiceFactory;
+use infrastructure::db::create_database_pools;
+use interfaces::{
+    create_api_routes, create_health_routes, create_public_api_routes,
+    web::{StaticSource, create_web_routes, resolve_static_source},
+};
+
+fn parse_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
+    // Strip surrounding brackets from IPv6: [::1] -> ::1
+    let host = host.trim();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    // Try parsing as IPv6 first, then IPv4
+    // and format the address string accordingly
+    //   - IPv6: "[::1]:8080"
+    //   - IPv4: "127.0.0.1:8080"
+    let addr_str = if host.contains(':') {
+        format!("[{host}]:{port}") // IPv6
+    } else {
+        format!("{host}:{port}") // IPv4
+    };
+
+    addr_str
+        .parse::<SocketAddr>()
+        .map_err(|e| format!("Invalid address '{}': {}", addr_str, e))
+}
+
+fn make_socket(addr: &SocketAddr, reuse_port: bool) -> std::io::Result<Socket> {
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    // SO_REUSEPORT: opt-in only — must be explicitly enabled via
+    // OXICLOUD_REUSE_PORT=true.  Disabled by default so that accidentally
+    // starting a second instance fails fast with "address already in use"
+    // rather than silently sharing the port.
+    #[cfg(not(windows))]
+    if reuse_port {
+        socket.set_reuse_port(true)?;
+    }
+    // Disable Nagle's algorithm — send small responses (JSON, PROPFIND)
+    // immediately instead of waiting up to 40ms for coalescing.
+    socket.set_tcp_nodelay(true)?;
+    // Detect dead connections within 60s instead of hours
+    socket.set_keepalive(true)?;
+    socket.set_tcp_keepalive(
+        &TcpKeepalive::new()
+            .with_time(Duration::from_secs(60))
+            .with_interval(Duration::from_secs(10)),
+    )?;
+    socket.set_nonblocking(true)?;
+
+    // For IPv6: disable dual-stack to be explicit about what you're binding
+    // (set true to restrict to IPv6-only, false to also accept IPv4-mapped)
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?; // explicit: one socket = one protocol
+    }
+
+    socket.bind(&(*addr).into())?;
+    // High backlog for connection bursts (WebDAV clients open many parallel connections)
+    socket.listen(2048)?;
+
+    Ok(socket)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ── Operator subcommand dispatch ─────────────────────────────────
+    //
+    // If argv[1] matches a known subcommand domain, hand off to the
+    // clap-driven CLI tree in `src/cli/` and exit with its ExitCode.
+    // Bare `oxicloud` (or oxicloud with legacy top-level flags below)
+    // falls through to the server startup path — backwards compat with
+    // every existing Docker CMD line, systemd unit, and docker-compose
+    // entry that just runs `oxicloud` with no args.
+    //
+    // Absorbed here from the standalone `oxicloud-cli` +
+    // `migrate-nfc-filenames` binaries in v0.9.0 so the release tarball
+    // ships one executable. See docs/plan/bundled-binary.md § 1b.
+    if let Some(first) = std::env::args().nth(1)
+        && matches!(first.as_str(), "opaque" | "migrate" | "storage" | "user")
+    {
+        // Load `.env` from CWD before dispatching so subcommands see the
+        // same `DATABASE_URL` / `OXICLOUD_*` variables the server-startup
+        // path does. Without this, `oxicloud migrate nfc-filenames`
+        // errors out with `DATABASE_URL not set` for any operator who
+        // keeps their config in `.env` (i.e. every self-host on a
+        // homelab, per the standard project layout).
+        //
+        // A live shell export still wins over either source, as on the
+        // server path. `--config <path>` is not available here — the flag
+        // is parsed after this dispatch — so a subcommand takes its pinned
+        // config from `OXICLOUD_CONFIG`, which needs no argv parsing.
+        match std::env::var("OXICLOUD_CONFIG")
+            .ok()
+            .filter(|p| !p.is_empty())
+        {
+            Some(path) => {
+                if let Err(e) = load_config_file(&path) {
+                    eprintln!("failed to load config {path}: {e}");
+                    std::process::exit(2);
+                }
+            }
+            None => {
+                dotenvy::dotenv().ok();
+            }
+        }
+
+        // `oxicloud::cli::run()` returns a plain `u8` exit-code, which
+        // widens exactly into `i32` for `std::process::exit`. Values are
+        // 0/1/2 today; the widening is loss-free by construction.
+        std::process::exit(i32::from(oxicloud::cli::run()));
+    }
+
+    // ── Legacy top-level flags (server-startup path) ─────────────────
+    //
+    // Minimal CLI:
+    //   --version                   Print version + branch + commit hash and exit.
+    //   --config <path>             Load env from this file. When given, the default
+    //                               `./.env` probe is INTENTIONALLY skipped — tests
+    //                               use this to isolate from a developer's repo-root
+    //                               `.env`, and operators get a reproducible "this
+    //                               file and nothing else" boot.
+    //
+    // NB: `--select-storage <name>` and `--fingerprint <key>` moved to
+    // subcommands in v0.9.0 as `oxicloud storage select <name>` and
+    // `oxicloud storage fingerprint <key>` respectively — dispatched
+    // above via the `matches!` guard. See docs/plan/bundled-binary.md § 1c.
+    let mut args = std::env::args().skip(1);
+    let mut config_path: Option<String> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--version" | "-V" => {
+                println!(
+                    "OxiCloud v{} (branch={} commit={})",
+                    env!("CARGO_PKG_VERSION"),
+                    env!("GIT_BRANCH"),
+                    env!("GIT_HASH"),
+                );
+                return Ok(());
+            }
+            "--config" => {
+                let Some(p) = args.next() else {
+                    eprintln!("--config requires a path argument");
+                    std::process::exit(2);
+                };
+                config_path = Some(p);
+            }
+            "--help" | "-h" => {
+                print_help();
+                return Ok(());
+            }
+            other => {
+                eprintln!("Unknown argument: {other}");
+                eprintln!("Try `oxicloud --help`.");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // `OXICLOUD_CONFIG` is the flag's environment equivalent — systemd units
+    // and container images set variables far more easily than argv.
+    let config_path = config_path.or_else(|| {
+        std::env::var("OXICLOUD_CONFIG")
+            .ok()
+            .filter(|p| !p.is_empty())
+    });
+
+    match config_path {
+        Some(ref path) => {
+            // Explicit file → hard error on a missing/unreadable path.
+            // Silent fallback would defeat the purpose of pinning the
+            // config source.
+            if let Err(e) = load_config_file(path) {
+                eprintln!("failed to load config {path}: {e}");
+                std::process::exit(2);
+            }
+        }
+        None => {
+            // Default dev-convenience probe at CWD/.env.
+            dotenvy::dotenv().ok();
+        }
+    }
+
+    // Tracing first: `AppConfig::from_env()` warns about several
+    // misconfigurations, and those lines are only emitted once a
+    // subscriber is installed.
+    init_tracing();
+
+    // The config is loaded here, before the runtime exists, because the
+    // runtime is sized from it.
+    let config = common::config::AppConfig::from_env();
+    let runtime = build_runtime(&config.runtime)?;
+
+    runtime.block_on(run(config))
+}
+
+/// Load a pinned config file: TOML by extension, otherwise a `.env`.
+///
+/// Neither overrides the surrounding environment — defaults < file <
+/// environment, the order operators expect from a mounted config file plus
+/// `-e` overrides. This is a change for `--config <file>.env`, which used to
+/// win over the process environment; the default `./.env` probe already
+/// yielded to it.
+fn load_config_file(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::path::Path::new(path);
+    if common::config_file::is_toml_path(path) {
+        let applied = common::config_file::apply(path)?;
+        // Too early for tracing — the subscriber is installed a few lines
+        // later, once the config it might configure has been read.
+        eprintln!(
+            "loaded {} settings from {}{}",
+            applied.set,
+            path.display(),
+            match applied.overridden {
+                0 => String::new(),
+                n => format!(" ({n} overridden by the environment)"),
+            }
+        );
+    } else {
+        dotenvy::from_filename(path)?;
+    }
+    Ok(())
+}
+
+/// Print the `--help` output. Kept as a fn (not an inline string) so
+/// the layout is easy to eyeball + doesn't clutter the argv match arm.
+///
+/// One `println!` per output line — source layout matches what the
+/// user sees. Longer than one big raw string but grep-friendly (a
+/// specific flag description shows up as its own hit) and diffs stay
+/// line-local.
+///
+/// Sections: USAGE (invocation shapes) → OPTIONS (per-flag
+/// explanations) → ENVIRONMENT (the small set of env vars an operator
+/// checks at first boot). Everything else lives in `example.env` —
+/// listing all 80+ env knobs here would rot every release.
+fn print_help() {
+    println!(
+        "OxiCloud v{} (branch={} commit={})",
+        env!("CARGO_PKG_VERSION"),
+        env!("GIT_BRANCH"),
+        env!("GIT_HASH"),
+    );
+    println!();
+    println!("USAGE:");
+    println!("  oxicloud [--config <path>]              Boot the server. This is the normal");
+    println!("                                          invocation for a docker/systemd unit.");
+    println!("                                          <path> is a TOML config file (.toml) or");
+    println!("                                          a .env file; OXICLOUD_CONFIG=<path> does");
+    println!("                                          the same and is honoured by subcommands.");
+    println!();
+    println!("  oxicloud <subcommand> [args...]         Operator toolbox — one-shot tools that");
+    println!("                                          exit after completing (see SUBCOMMANDS).");
+    println!();
+    println!("  oxicloud --version                      Print version + commit and exit.");
+    println!();
+    println!("  oxicloud --help                         Print this help and exit.");
+    println!();
+    println!();
+    println!("SUBCOMMANDS:");
+    println!("  opaque <action>       OPAQUE aPAKE substrate management.");
+    println!("      setup             Print a fresh ServerSetup (persist as");
+    println!("                        OXICLOUD_AUTH_OPAQUE_SERVER_SETUP). Runs once per");
+    println!("                        deployment. Rotating invalidates every user's envelope.");
+    println!("      reset             Clear envelope(s) so silent-migration re-mints under");
+    println!("                        the current KSF. Use after KSF rotation. Flags:");
+    println!("                        --user <email|username> | --all, plus --dry-run.");
+    println!();
+    println!("  migrate <action>      One-time data migrations (historical schema/data fixes).");
+    println!("      nfc-filenames     NFC-normalize storage.files.name across the instance.");
+    println!("                        Cleanup for databases populated before the June 2026");
+    println!("                        write-time fix; new installs never need it. Flag:");
+    println!("                        --dry-run to preview without writing.");
+    println!();
+    println!("  storage <action>      Storage-config repair + crypto helpers.");
+    println!("      select <name>     Set the active storage-entry backend and exit. Use to");
+    println!("                        unblock boot after renaming/removing an entry in `.env`");
+    println!("                        while the DB still points at the old name. Was");
+    println!("                        `--select-storage <name>` before v0.9.0.");
+    println!("      fingerprint <k|-> Print the SSH-style colon-hex fingerprint of a base64");
+    println!("                        AES-256 key. Same shape as the v1 blob header's");
+    println!("                        <key_fp> field and the `backend_rotate` completion");
+    println!("                        summary. Read stdin with `-` to keep keys out of shell");
+    println!("                        history. Was `--fingerprint <k|->` before v0.9.0.");
+    println!();
+    println!("  user <action>         Account administration (no running server needed).");
+    println!("      promote-to-owner  Designate the server owner — the account other admins");
+    println!("                        cannot demote, deactivate, delete, or take over via a");
+    println!("                        password reset. For installs UPGRADED from before the");
+    println!("                        Owner role; fresh installs get one at setup. Refuses if");
+    println!("                        an owner already exists (transfer instead). Args:");
+    println!("                        <email|username>, plus --dry-run.");
+    println!();
+    println!("  Each subcommand has its own `--help`, e.g. `oxicloud opaque reset --help`.");
+    println!("  Subcommands require the same env vars as the server (DATABASE_URL etc.).");
+    println!();
+    println!();
+    println!("OPTIONS:");
+    println!("  --config <path>");
+    println!("      Load environment variables from <path> instead of the default `./.env`.");
+    println!("      When set, the file WINS over any pre-existing shell exports (the");
+    println!("      overriding variant of dotenvy). Use for reproducible CI / systemd");
+    println!("      unit boots where a leaked shell export must not silently corrupt");
+    println!("      config. Without this flag, the default `./.env` probe is");
+    println!("      non-overriding — shell exports win — matching dev convenience.");
+    println!();
+    println!("  --version, -V");
+    println!("      Print the version, git branch, and commit hash. Exits 0.");
+    println!();
+    println!("  --help, -h");
+    println!("      Print this help. Exits 0.");
+    println!();
+    println!();
+    println!("ENVIRONMENT:");
+    println!("  DATABASE_URL          PostgreSQL connection string (required for boot and");
+    println!("                        for `storage select`).");
+    println!();
+    println!("  OXICLOUD_SERVER_HOST  Bind host (default: 127.0.0.1).");
+    println!("  OXICLOUD_SERVER_PORT  Bind port (default: 8086).");
+    println!();
+    println!("  OXICLOUD_STORAGE_ENTRIES=<n1>,<n2>,...");
+    println!("                        Comma-separated list of named storage entries. Each");
+    println!("                        entry N declared here reads its config from");
+    println!("                        `OXICLOUD_STORAGE_<N>_BACKEND`,");
+    println!("                        `OXICLOUD_STORAGE_<N>_S3_BUCKET`, etc. See");
+    println!("                        `docs/plan/storage-multi-entry.md` for the full");
+    println!("                        contract. When unset (with legacy flat storage");
+    println!("                        vars present) one entry named `default` is");
+    println!("                        synthesised.");
+    println!();
+    println!("The full env-var surface is documented in `example.env` at the repo root.");
+}
+
+/// Install the tracing subscriber.
+fn init_tracing() {
+    // Initialize tracing.
+    //
+    // Default access-log policy — two independent directives are
+    // injected unless the operator has already named them:
+    //
+    //   `http=warn`         (4xx + 5xx for every access-log target)
+    //   `http::web=error`   (5xx only for static / ServeDir / catch-all)
+    //
+    // `http::web` is pulled down to ERROR because it's the noisiest
+    // surface (every CSS/JS/img/favicon request hits it) and its
+    // 4xx are almost always "browser asked for a file we don't ship",
+    // not a real signal. Operators investigating a 404 storm can
+    // promote it back: `RUST_LOG=info,http::web=warn`.
+    //
+    // The detection is substring-based:
+    //   - `http=` in RUST_LOG  → operator owns the http baseline.
+    //   - `http::web=` in RUST_LOG → operator owns the web subtarget.
+    // The two are independent — supplying `http=info` still gets a
+    // free `http::web=error` unless the operator named that too.
+    //
+    // Empty / unset / no http directives → both defaults applied.
+    // Note that `http::web=…` does NOT contain `http=` as a substring
+    // (different characters around the `:`), so the two checks don't
+    // alias each other.
+    let rust_log = match std::env::var("RUST_LOG").ok().filter(|s| !s.is_empty()) {
+        None => "info,http=warn,http::web=error".to_string(),
+        Some(mut s) => {
+            if !s.contains("http=") {
+                s.push_str(",http=warn");
+            }
+            if !s.contains("http::web=") {
+                s.push_str(",http::web=error");
+            }
+            s
+        }
+    };
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new(rust_log))
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+}
+
+/// Construct the multi-threaded Tokio runtime with explicit, CFS-quota-aware
+/// pool sizes.
+///
+/// `#[tokio::main]` hides two defaults that misbehave under container limits:
+///   • worker threads default to `available_parallelism()`, which honours CPU
+///     affinity but **ignores the CFS quota** (`--cpus` / `cpu.max`) — so on a
+///     2-core-quota container on a 64-core host it spawns 64 workers that
+///     time-slice across 2 cores.
+///   • the blocking pool defaults to a flat **512** threads — a multi-GB RSS
+///     blast radius for this heavy `spawn_blocking` user.
+///
+/// Both come from [`common::runtime::pool_sizes`], filled from the config
+/// (env-overridable via
+/// `OXICLOUD_WORKER_THREADS` / `OXICLOUD_MAX_BLOCKING_THREADS`). Unset env on an
+/// uncontended host reproduces the previous behaviour.
+fn build_runtime(cfg: &common::config::RuntimeConfig) -> std::io::Result<tokio::runtime::Runtime> {
+    let (workers, max_blocking) = common::runtime::pool_sizes(cfg);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .max_blocking_threads(max_blocking)
+        .thread_name("oxicloud-worker")
+        .enable_all()
+        .build()
+}
+
+/// Resolve where locale JSON files are read from at boot time.
+///
+/// Under the default (filesystem) build: return the same path the
+/// filesystem `ServeDir` serves from, with a fallback to
+/// `frontend/static/locales` for `just dev` checkouts where the SPA
+/// build hasn't run.
+///
+/// Under `--features bundled-assets`, when `resolve_static_source`
+/// returns `Embedded` (i.e. no filesystem override is present), extract
+/// the embedded `locales/*.json` files to a boot-time tempdir and
+/// return that path. Runtime code (`LocaleRegistry::discover`,
+/// `FileSystemI18nService`) is unchanged: it still reads locale JSON
+/// from a directory. The tempdir is process-scoped; `LocaleRegistry`
+/// caches everything in-memory at boot, so the extracted files are
+/// unused after the initial scan and can leak on abrupt process death
+/// without affecting subsequent boots.
+fn resolve_locales_path(source: &StaticSource) -> std::path::PathBuf {
+    match source {
+        StaticSource::Filesystem(path) => {
+            let served = path.join("locales");
+            if served.is_dir() {
+                served
+            } else {
+                std::path::PathBuf::from("frontend/static/locales")
+            }
+        }
+        #[cfg(feature = "bundled-assets")]
+        StaticSource::Embedded => extract_embedded_locales(),
+    }
+}
+
+/// Extract the embedded `locales/*.json` corpus to a boot-time tempdir
+/// so the existing filesystem-based locale loader can consume it
+/// unchanged. Called once at boot in the embedded-assets path.
+///
+/// Cost: ~50 ms for 16 JSON files totalling ~2.2 MB. The tempdir lives
+/// under `std::env::temp_dir()` (respects `$TMPDIR`); no cleanup is
+/// registered because `LocaleRegistry::discover` reads every file into
+/// memory at boot, so the extracted copy is dead weight once boot
+/// completes. On a graceful shutdown the tempdir persists until the
+/// OS's tmpfs / cron reaper collects it; on abrupt kill likewise. Safe:
+/// no secrets touch these files.
+#[cfg(feature = "bundled-assets")]
+fn extract_embedded_locales() -> std::path::PathBuf {
+    use interfaces::web::embedded::EmbeddedAssets;
+    let dir = std::env::temp_dir().join(format!("oxicloud-locales-{}", std::process::id()));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        panic!(
+            "FATAL: failed to create embedded-locales staging dir at {}: {e}",
+            dir.display()
+        );
+    }
+    let mut count = 0usize;
+    for path in EmbeddedAssets::iter() {
+        let s: &str = path.as_ref();
+        // Root-level `locales/*.json` only. SvelteKit copies
+        // `frontend/static/locales/*.json` here at build time.
+        if !s.starts_with("locales/") || !s.ends_with(".json") {
+            continue;
+        }
+        let name = &s["locales/".len()..];
+        if name.contains('/') {
+            continue; // no nested subdirs today
+        }
+        let Some(file) = EmbeddedAssets::get(s) else {
+            continue;
+        };
+        let out = dir.join(name);
+        if let Err(e) = std::fs::write(&out, file.data.as_ref()) {
+            panic!(
+                "FATAL: failed to stage embedded locale {} at {}: {e}",
+                s,
+                out.display()
+            );
+        }
+        count += 1;
+    }
+    tracing::info!(
+        staging_dir = %dir.display(),
+        count,
+        "static-assets: staged {count} embedded locale file(s) for the boot-time \
+         LocaleRegistry scan (bundled-assets feature)."
+    );
+    dir
+}
+
+/// Async entrypoint, driven by the runtime built in [`main`].
+async fn run(config: common::config::AppConfig) -> Result<(), Box<dyn std::error::Error>> {
+    oxicloud::interfaces::middleware::trusted_proxy::log_config();
+
+    tracing::info!(
+        "OxiCloud v{} | branch={} commit={}",
+        env!("CARGO_PKG_VERSION"),
+        env!("GIT_BRANCH"),
+        env!("GIT_HASH")
+    );
+
+    // Surface the runtime pool sizing `build_runtime` chose. It resolves the
+    // same `RuntimeConfig` from the environment before the runtime exists;
+    // reading it back off `config` here keeps one source of truth. `available`
+    // is what tokio's default would have used; `cgroup_cpu_quota` is the CFS
+    // limit it ignores. When the two diverge, the worker count tracks the
+    // smaller (effective) value — the whole point of the explicit builder.
+    let (rt_workers, rt_max_blocking) = common::runtime::pool_sizes(&config.runtime);
+    tracing::info!(
+        worker_threads = rt_workers,
+        max_blocking_threads = rt_max_blocking,
+        available_parallelism =
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        cgroup_cpu_quota = ?common::runtime::cgroup_cpu_quota(),
+        "Tokio runtime pools sized"
+    );
+
+    // SECURITY: fail-closed on incoherent auth-method configuration. A
+    // magic-link-only policy without a working SMTP sender locks every
+    // user out — nothing can mint tokens, so nobody can log in. Refuse
+    // to start rather than boot into a bricked auth surface.
+    //
+    // The SMTP-mock (`OXICLOUD_SMTP_MOCK=true` in `tests/common/server.env`)
+    // sets `OXICLOUD_SMTP_HOST=localhost`, so `is_enabled()` returns
+    // true and the Hurl test harness satisfies this gate without a real
+    // mail server.
+    if config
+        .auth
+        .allowed_auth_methods
+        .contains(&common::config::AuthMethod::MagicLink)
+        && !config
+            .auth
+            .allowed_auth_methods
+            .contains(&common::config::AuthMethod::Password)
+        && !config
+            .auth
+            .allowed_auth_methods
+            .contains(&common::config::AuthMethod::Oidc)
+        && !config.smtp.is_enabled()
+    {
+        panic!(
+            "FATAL: OXICLOUD_AUTH_METHODS enables `magic_link` as the ONLY \
+             self-service auth method, but no SMTP transport is configured. \
+             Set OXICLOUD_SMTP_HOST (and matching OXICLOUD_SMTP_* settings), \
+             add `password` or `oidc` to OXICLOUD_AUTH_METHODS, or drop \
+             `magic_link` from the list. Refusing to start."
+        );
+    }
+
+    // Surface the upload-size limits at startup. Operators (and the
+    // CI runner) need to see what's actually in effect — a silent
+    // fallback to the 100 MB default when `OXICLOUD_CHUNK_MAX_BYTES`
+    // is mistyped or missing is the exact failure mode that's
+    // hardest to spot from chunked-upload tests.
+    tracing::info!(
+        max_upload_size_mb = config.storage.max_upload_size / (1024 * 1024),
+        direct_put_max_bytes_mb = config.storage.direct_put_max_bytes / (1024 * 1024),
+        chunk_max_bytes_mb = config.storage.chunk_max_bytes / (1024 * 1024),
+        "Upload limits loaded from config"
+    );
+
+    // Ensure storage and locales directories exist
+    let storage_path = config.storage_path.clone();
+    if !storage_path.exists() {
+        std::fs::create_dir_all(&storage_path).expect("Failed to create storage directory");
+    }
+    // Initialize database pools if auth is enabled
+    let db_pools = if config.features.enable_auth {
+        match create_database_pools(&config).await {
+            Ok(pools) => {
+                tracing::info!("PostgreSQL database pools initialized successfully");
+                Some(pools)
+            }
+            Err(e) => {
+                // SECURITY: fail-closed. If auth is required but the database
+                // is unreachable, the server MUST NOT start in public mode.
+                panic!(
+                    "FATAL: enable_auth=true but database connection failed: {}. \
+                     Refusing to start without authentication.",
+                    e
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    // Locales directory for i18n. Resolved from wherever the SPA is actually
+    // served (the Vite `static-dist/` build, or the configured static path in
+    // the container) so deployments find their locale files correctly. A source
+    // checkout without a built SPA still has the canonical locales under the
+    // frontend static assets, so fall back to those for `just dev`.
+    //
+    // Read-only at runtime: locales ship as static assets (Vite copies
+    // `frontend/static/locales` into the build, the Dockerfile copies that into
+    // /app/static). Fail-fast if the path is missing rather than silently
+    // creating an empty directory and limping along with a "translation missing"
+    // error on every request later.
+    // Resolve the static-assets source ONCE at boot — the resolution
+    // logs a single line describing which path was chosen. Reused
+    // downstream for both the locale loader (below) and the web router
+    // (`create_web_routes`), so neither has to re-parse env or re-log.
+    let static_source = resolve_static_source(&config);
+
+    // Prepare the SPA shell once: the deployment prefix goes into its
+    // `<base href>`, which is the only place the frontend build leaves
+    // open. Errors here mean a frontend too old to carry the placeholder.
+    let app_shell =
+        oxicloud::interfaces::web::AppShell::prepare(&static_source, &config.base_path)?
+            .map(std::sync::Arc::new);
+
+    let locales_path = resolve_locales_path(&static_source);
+    if !locales_path.is_dir() {
+        panic!(
+            "FATAL: locales directory not found at {}. \
+             Check OXICLOUD_STATIC_PATH (currently {}) and ensure the \
+             static asset bundle includes a `locales/` subdirectory.",
+            locales_path.display(),
+            config.static_path.display()
+        );
+    }
+
+    // Build all services via the factory
+    let factory = AppServiceFactory::with_config(storage_path, locales_path, config.clone());
+
+    let app_state = factory.build_app_state(db_pools).await
+        .expect("Failed to build application state. If running in Docker, ensure the storage volume is writable by the oxicloud user (UID 1001)");
+
+    // Wrap in Arc so that Axum clones a single refcount per request
+    // instead of deep-copying ~42 Arc fields + 16 String/PathBuf allocations.
+    let app_state = Arc::new(app_state);
+
+    // Build application router
+    let api_routes = create_api_routes(&app_state);
+    let public_api_routes = create_public_api_routes(&app_state);
+    let health_routes = create_health_routes(&app_state);
+    let web_routes = create_web_routes(app_state.clone(), static_source, app_shell);
+
+    let mut app;
+
+    // Build CalDAV / CardDAV / WebDAV protocol routers (merged at top-level, not under /api)
+    use oxicloud::interfaces::api::handlers::caldav_handler;
+    use oxicloud::interfaces::api::handlers::carddav_handler;
+    use oxicloud::interfaces::api::handlers::webdav_handler;
+    let caldav_router = caldav_handler::caldav_routes();
+    // RFC 6764 discovery for both CalDAV and CardDAV (public redirects).
+    let well_known_router =
+        caldav_handler::well_known_routes().merge(carddav_handler::well_known_routes());
+    let carddav_router = carddav_handler::carddav_routes();
+    let webdav_router = webdav_handler::webdav_routes();
+
+    // CalDAV/CardDAV only carry XML payloads — cap at 1 MB at the transport
+    // level so `body::to_bytes()` cannot be abused to OOM the server.
+    // WebDAV is excluded: its streaming PUT handler enforces its own per-upload
+    // limit from StorageConfig::max_upload_size.
+    let caldav_router = caldav_router.layer(RequestBodyLimitLayer::new(1_048_576));
+    let carddav_router = carddav_router.layer(RequestBodyLimitLayer::new(1_048_576));
+
+    // Build WOPI routes if enabled
+    use oxicloud::interfaces::api::handlers::wopi_handler;
+    let wopi_routes = if config.wopi.enabled {
+        if let (Some(token_svc), Some(lock_svc), Some(discovery_svc)) = (
+            &app_state.wopi_token_service,
+            &app_state.wopi_lock_service,
+            &app_state.wopi_discovery_service,
+        ) {
+            // WOPI_BASE_URL: the URL OnlyOffice/Collabora uses to call back into OxiCloud
+            // WOPI_PUBLIC_BASE_URL: the URL the browser uses to reach OxiCloud
+            // Both must be set for Docker/multi-host deployments. WOPI_BASE_URL takes
+            // precedence if both are set (supports the legacy single-URL pattern).
+            let wopi_base_url = config
+                .wopi
+                .base_url
+                .clone()
+                .or_else(|| config.wopi.public_base_url.clone())
+                .unwrap_or_else(|| config.base_url());
+
+            let public_base_url = config
+                .wopi
+                .public_base_url
+                .clone()
+                .or_else(|| config.wopi.base_url.clone())
+                .unwrap_or_else(|| config.base_url());
+
+            // The single-URL fallback above means an OXICLOUD_WOPI_BASE_URL
+            // set to an internal callback address (docker/cluster/loopback)
+            // silently becomes the BROWSER-facing host-page URL too. That
+            // is the documented legacy pattern when the value is public,
+            // and a broken editor when it is not — surface the resolution
+            // so the misconfiguration is one log line instead of a blank
+            // editor iframe.
+            if wopi_base_url == public_base_url {
+                tracing::info!(
+                    url = %wopi_base_url,
+                    "WOPI URLs resolved (editor callback and browser host page share one URL)"
+                );
+            } else {
+                tracing::info!(
+                    callback = %wopi_base_url,
+                    public = %public_base_url,
+                    "WOPI URLs resolved"
+                );
+            }
+            if config.wopi.public_base_url.is_none() && config.wopi.base_url.is_some() {
+                tracing::warn!(
+                    "OXICLOUD_WOPI_BASE_URL is set without OXICLOUD_WOPI_PUBLIC_BASE_URL — \
+                     the browser will open the WOPI host page on the callback URL ({wopi_base_url}). \
+                     If that address is internal, set OXICLOUD_WOPI_PUBLIC_BASE_URL to OxiCloud's \
+                     public URL."
+                );
+            }
+
+            let wopi_state = wopi_handler::WopiState {
+                token_service: token_svc.clone(),
+                lock_service: lock_svc.clone(),
+                discovery_service: discovery_svc.clone(),
+                app_state: app_state.clone(),
+                public_base_url,
+                wopi_base_url,
+            };
+
+            let (protocol, api) = wopi_handler::wopi_routes(wopi_state);
+            Some((protocol, api))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Build Nextcloud routes if enabled
+    let nextcloud_router = if config.nextcloud.enabled {
+        use oxicloud::interfaces::nextcloud::routes::nextcloud_routes_with_state;
+        Some(nextcloud_routes_with_state(app_state.clone()))
+    } else {
+        None
+    };
+
+    // Apply auth middleware to protected API routes when auth is enabled
+    if config.features.enable_auth {
+        // SECURITY: if auth is required, auth_service MUST be present at this
+        // point.  The earlier guards in di.rs and main.rs guarantee this, but
+        // add a defensive check so a future refactor cannot silently degrade.
+        assert!(
+            app_state.auth_service.is_some(),
+            "FATAL: enable_auth=true but auth_service is None. \
+             This should have been caught during initialization."
+        );
+    }
+    if config.features.enable_auth {
+        use interfaces::api::handlers::auth_handler::{
+            auth_protected_routes, auth_public_routes, login_route, refresh_route, register_route,
+            setup_route,
+        };
+        use oxicloud::interfaces::api::handlers::app_password_handler;
+        use oxicloud::interfaces::api::handlers::device_auth_handler;
+        use oxicloud::interfaces::middleware::auth::auth_middleware;
+        use oxicloud::interfaces::middleware::csrf::csrf_middleware;
+        use oxicloud::interfaces::middleware::rate_limit::{
+            RateLimiter, rate_limit_login, rate_limit_refresh, rate_limit_register,
+        };
+
+        // ── Rate limiters (IP-based, in-memory via moka) ────────────────
+        let rl = &config.auth.rate_limit;
+        let login_limiter = Arc::new(RateLimiter::new(
+            rl.login_max_requests,
+            rl.login_window_secs,
+            100_000,
+        ));
+        let register_limiter = Arc::new(RateLimiter::new(
+            rl.register_max_requests,
+            rl.register_window_secs,
+            100_000,
+        ));
+        let refresh_limiter = Arc::new(RateLimiter::new(
+            rl.refresh_max_requests,
+            rl.refresh_window_secs,
+            100_000,
+        ));
+        tracing::info!(
+            "Rate limiting enabled — login: {}/{} s, register: {}/{} s, refresh: {}/{} s",
+            rl.login_max_requests,
+            rl.login_window_secs,
+            rl.register_max_requests,
+            rl.register_window_secs,
+            rl.refresh_max_requests,
+            rl.refresh_window_secs,
+        );
+
+        // Auth routes split by rate-limit policy
+        let auth_login = login_route()
+            .layer(axum::middleware::from_fn_with_state(
+                login_limiter.clone(),
+                rate_limit_login,
+            ))
+            .with_state(app_state.clone());
+        let auth_register = register_route()
+            .layer(axum::middleware::from_fn_with_state(
+                register_limiter.clone(),
+                rate_limit_register,
+            ))
+            .with_state(app_state.clone());
+        let auth_refresh = refresh_route()
+            .layer(axum::middleware::from_fn_with_state(
+                refresh_limiter.clone(),
+                rate_limit_refresh,
+            ))
+            .with_state(app_state.clone());
+        // Public auth routes (status, OIDC)
+        let auth_public = auth_public_routes().with_state(app_state.clone());
+        // Protected auth routes (/me, /change-password, /logout) — require auth + CSRF
+        let auth_protected = auth_protected_routes()
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                require_no_password_change_pending_layer,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                require_dpop_layer,
+            ))
+            .layer(axum::middleware::from_fn(csrf_middleware))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                auth_middleware,
+            ))
+            .with_state(app_state.clone());
+        // App password management routes — require auth + CSRF
+        let app_pw_protected = app_password_handler::app_password_routes()
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                require_no_password_change_pending_layer,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                require_dpop_layer,
+            ))
+            .layer(axum::middleware::from_fn(csrf_middleware))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                auth_middleware,
+            ))
+            .with_state(app_state.clone());
+        // OPAQUE aPAKE routes — nested under DISTINCT sub-prefixes
+        // so axum doesn't cross-apply middleware between the two
+        // branches (`.nest("/api/auth", A).nest("/api/auth", B)`
+        // composes their layers on shared prefixes; distinct
+        // prefixes avoid that entirely).
+        //
+        // Handlers return 503 `OpaqueDisabled` when the substrate
+        // isn't wired (mode=off / password auth disabled); the mode
+        // gate lives in the DI factory, so mounting unconditionally
+        // is safe.
+        let opaque_register_protected =
+            oxicloud::interfaces::api::handlers::opaque_auth_handler::opaque_register_routes()
+                .layer(axum::middleware::from_fn_with_state(
+                    app_state.clone(),
+                    require_no_password_change_pending_layer,
+                ))
+                .layer(axum::middleware::from_fn_with_state(
+                    app_state.clone(),
+                    require_dpop_layer,
+                ))
+                .layer(axum::middleware::from_fn(csrf_middleware))
+                .layer(axum::middleware::from_fn_with_state(
+                    app_state.clone(),
+                    auth_middleware,
+                ))
+                .with_state(app_state.clone());
+        let opaque_login_public =
+            oxicloud::interfaces::api::handlers::opaque_auth_handler::opaque_login_routes()
+                .layer(axum::middleware::from_fn_with_state(
+                    login_limiter.clone(),
+                    rate_limit_login,
+                ))
+                .with_state(app_state.clone());
+        // OPAQUE aPAKE — public params (KSF + ciphersuite) — GET,
+        // no rate limit, SPA fetches once at page load. Distinct
+        // mount so no login limiter attaches to a non-login read.
+        let opaque_params_public =
+            oxicloud::interfaces::api::handlers::opaque_auth_handler::opaque_params_routes()
+                .with_state(app_state.clone());
+        // One-time setup route — public, rate-limited like register
+        let setup_router = setup_route()
+            .layer(axum::middleware::from_fn_with_state(
+                register_limiter.clone(),
+                rate_limit_register,
+            ))
+            .with_state(app_state.clone());
+
+        // Device Authorization Grant (RFC 8628)
+        // Public endpoints: /api/auth/device/authorize + /api/auth/device/token
+        let device_public =
+            device_auth_handler::device_auth_public_routes().with_state(app_state.clone());
+        // Protected endpoints: /api/auth/device/verify, /api/auth/device/devices
+        let device_protected = device_auth_handler::device_auth_protected_routes()
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                require_no_password_change_pending_layer,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                require_dpop_layer,
+            ))
+            .layer(axum::middleware::from_fn(csrf_middleware))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                auth_middleware,
+            ))
+            .with_state(app_state.clone());
+
+        // Protected API routes — require valid JWT token
+        let protected_api = api_routes
+            // `route_layer`, NOT `layer` — this must run AFTER routing so
+            // `MatchedPath` is populated. It confines anonymous public-share
+            // sessions to an explicit allowlist and is independent of the
+            // extractor guards: neither relies on the other. See
+            // `middleware/anonymous_allowlist.rs`.
+            .route_layer(axum::middleware::from_fn(
+                oxicloud::interfaces::middleware::anonymous_allowlist::anonymous_allowlist_layer,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                require_no_password_change_pending_layer,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                require_dpop_layer,
+            ))
+            .layer(axum::middleware::from_fn(csrf_middleware))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                auth_middleware,
+            ));
+
+        // CalDAV/CardDAV/WebDAV with auth + internal-only middleware
+        // (merged, not nested). External users have no calendar, no
+        // address book, and no home folder — locking them out of these
+        // protocol subtrees in one place avoids leaking the protocol
+        // surface to a principal kind that can do nothing with it. The
+        // `require_internal_user_layer` runs AFTER auth (tower order:
+        // later .layer() = outermost = runs first).
+        //
+        // `require_no_password_change_pending_layer` is layered on
+        // every authenticated /api/* subtree so an admin-set temp
+        // password cannot be used against files / WebDAV / CalDAV /
+        // admin from any non-SPA client. The layer allowlists /me,
+        // change-password, and logout internally so the SPA can
+        // complete the reset flow — see the middleware doc for the
+        // allowlist and its rationale.
+        use oxicloud::interfaces::middleware::dpop::require_dpop_layer;
+        use oxicloud::interfaces::middleware::user::{
+            require_internal_user_layer, require_no_password_change_pending_layer,
+        };
+        let caldav_protected = caldav_router
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                require_no_password_change_pending_layer,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                require_dpop_layer,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                require_internal_user_layer,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                auth_middleware,
+            ));
+        let carddav_protected = carddav_router
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                require_no_password_change_pending_layer,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                require_dpop_layer,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                require_internal_user_layer,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                auth_middleware,
+            ));
+        let webdav_protected = webdav_router
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                require_no_password_change_pending_layer,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                require_dpop_layer,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                require_internal_user_layer,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                auth_middleware,
+            ));
+
+        // Magic-link redemption — public, no CSRF, no rate limit (the token IS
+        // the credential and `mark_used` is single-use). PR 12 will add a
+        // per-IP limiter on top.
+        let magic_link_router = interfaces::api::handlers::magic_link_handler::magic_link_routes()
+            .with_state(app_state.clone());
+
+        // Access-log targets are declared per-mount via `access_log!(…)`
+        // — see `interfaces/middleware/trace_span.rs` for the catalogue.
+        app = Router::new()
+            // Health / readiness probes — no auth, mounted at root
+            .merge(health_routes.layer(access_log!("http::probe")))
+            // Magic-link redemption — top-level, no `/api/` prefix
+            .merge(magic_link_router.layer(access_log!("http::web")))
+            // Rate-limited auth endpoints (login, register, refresh)
+            .nest(
+                "/api/auth",
+                auth_login.layer(access_log!("http::api::auth")),
+            )
+            .nest(
+                "/api/auth",
+                auth_register.layer(access_log!("http::api::auth")),
+            )
+            .nest(
+                "/api/auth",
+                auth_refresh.layer(access_log!("http::api::auth")),
+            )
+            // Public auth endpoints (status, OIDC)
+            .nest(
+                "/api/auth",
+                auth_public.layer(access_log!("http::api::auth")),
+            )
+            // Protected auth endpoints (/me, /change-password, /logout)
+            .nest(
+                "/api/auth",
+                auth_protected.layer(access_log!("http::api::auth")),
+            )
+            // App password management (create, list, revoke)
+            .nest(
+                "/api/auth",
+                app_pw_protected.layer(access_log!("http::api::auth")),
+            )
+            // OPAQUE aPAKE — session-required register endpoints
+            // (mounted under a distinct sub-prefix so auth+CSRF
+            // don't bleed into the sibling login mount).
+            .nest(
+                "/api/auth/opaque/register",
+                opaque_register_protected.layer(access_log!("http::api::auth")),
+            )
+            // OPAQUE aPAKE — public login endpoints (KE1 + KE3).
+            // Rate-limit shared with legacy login above.
+            .nest(
+                "/api/auth/opaque/login",
+                opaque_login_public.layer(access_log!("http::api::auth")),
+            )
+            // OPAQUE aPAKE — public params publish. No rate limit
+            // (static config read); distinct sub-prefix from login
+            // for the same middleware-composition reason.
+            .nest(
+                "/api/auth/opaque",
+                opaque_params_public.layer(access_log!("http::api::auth")),
+            )
+            // One-time setup endpoint — public, rate-limited
+            .nest("/api", setup_router.layer(access_log!("http::api")))
+            // Device Auth Grant public endpoints (authorize + token polling)
+            .nest(
+                "/api/auth/device",
+                device_public.layer(access_log!("http::api::auth")),
+            )
+            // Device Auth Grant protected endpoints (verify + device management)
+            .nest(
+                "/api/auth/device",
+                device_protected.layer(access_log!("http::api::auth")),
+            )
+            // Public API routes (share access, i18n) — no auth required
+            .nest("/api", public_api_routes.layer(access_log!("http::api")))
+            // All other API routes are protected by auth middleware
+            .nest("/api", protected_api.layer(access_log!("http::api")))
+            // RFC 6764 well-known discovery (public, no auth — just redirects)
+            .merge(well_known_router.clone().layer(access_log!("http::dav")))
+            // CalDAV/CardDAV/WebDAV protocols merged at top-level for client compatibility
+            .merge(caldav_protected.layer(access_log!("http::dav")))
+            .merge(carddav_protected.layer(access_log!("http::dav")))
+            .merge(webdav_protected.layer(access_log!("http::dav")))
+            // Web (HTML pages) — also the ServeDir fallback root, so
+            // static asset hits land here. We keep them on the `web`
+            // target for simplicity; switch to `http::static` when
+            // the static surface is split into its own router.
+            .merge(web_routes.layer(access_log!("http::web")));
+
+        // Message-bus WebSocket. Registered OUTSIDE `protected_api`
+        // because a browser cannot attach a `DPoP:` header to
+        // `new WebSocket()` (RFC 6455 only lets us set
+        // `Sec-WebSocket-Protocol`), so the standard auth + DPoP
+        // stack would 401 every DPoP-bound session. The handler
+        // self-authenticates from either a ticket subprotocol
+        // (minted by `POST /api/rt/ticket` under the full chain)
+        // or a bearer token (`rt-hurl-helper` test path).
+        // See `handlers/rt_ws.rs` module doc and
+        // `docs/architecture/message-bus-and-notifications.md § F`.
+        //
+        // Guarded by `enable_message_bus`: when false, the route is
+        // NOT registered → Axum returns 404 for `/api/rt/ws` and the
+        // ticket endpoint (already gated inside `create_api_routes`).
+        // Clients discover this via `/api/config` and skip WS setup.
+        if app_state.core.config.features.enable_message_bus {
+            app = app.route(
+                "/api/rt/ws",
+                axum::routing::get(oxicloud::interfaces::api::handlers::rt_ws::rt_ws_handler)
+                    .with_state(app_state.clone())
+                    .layer(access_log!("http::api")),
+            );
+        } else {
+            tracing::info!(
+                target: "audit",
+                event = "config.feature_disabled",
+                feature = "message_bus",
+                "message bus disabled — /api/rt/ws and /api/rt/ticket not registered (404)",
+            );
+        }
+
+        // Mount Nextcloud routes (uses its own Basic Auth middleware).
+        // **Merged BEFORE the trace + request-id layers** so NC requests
+        // get the same `request_id` / `user_id` / `client_ip` span
+        // fields as every other surface — see
+        // `interfaces/middleware/trace_span.rs::ClientIpMakeSpan`.
+        if let Some(nc_router) = nextcloud_router {
+            app = app.merge(
+                nc_router
+                    .with_state(app_state.clone())
+                    .layer(access_log!("http::nextcloud")),
+            );
+        }
+
+        // Mount WOPI routes (protocol routes use own token auth, API routes behind auth middleware).
+        // Same reasoning as NC above: merge before the trace layer so
+        // WOPI requests appear in the structured log channel.
+        if let Some((wopi_protocol, wopi_api)) = wopi_routes {
+            let wopi_api_protected = wopi_api
+                .layer(axum::middleware::from_fn(csrf_middleware))
+                .layer(axum::middleware::from_fn_with_state(
+                    app_state.clone(),
+                    auth_middleware,
+                ));
+            app = app
+                .nest("/wopi", wopi_protocol.layer(access_log!("http::wopi")))
+                .nest(
+                    "/api/wopi",
+                    wopi_api_protected.layer(access_log!("http::api")),
+                );
+        }
+
+        // ── Trace + request-id layers applied LAST so every route
+        //    merged above (including the conditional NC and WOPI
+        //    surfaces) is wrapped. New protocol routers added later
+        //    only have to be merged before this point to get tracing
+        //    for free — no second site to remember to update.
+        app = app
+            .layer(TraceLayer::new_for_http().make_span_with(ClientIpMakeSpan))
+            .layer(PropagateRequestIdLayer::x_request_id())
+            .layer(SetRequestIdLayer::x_request_id(UuidRequestId));
+    } else {
+        // Auth disabled — no middleware applied
+        tracing::warn!("Authentication is DISABLED — all API routes are publicly accessible");
+        app = Router::new()
+            // Health / readiness probes — no auth, mounted at root
+            .merge(health_routes.layer(access_log!("http::probe")))
+            .nest("/api", public_api_routes.layer(access_log!("http::api")))
+            .nest("/api", api_routes.layer(access_log!("http::api")))
+            // RFC 6764 well-known discovery (just redirects)
+            .merge(well_known_router.layer(access_log!("http::dav")))
+            // CalDAV/CardDAV/WebDAV protocols merged at top-level
+            .merge(caldav_router.layer(access_log!("http::dav")))
+            .merge(carddav_router.layer(access_log!("http::dav")))
+            .merge(webdav_router.layer(access_log!("http::dav")))
+            .merge(web_routes.layer(access_log!("http::web")));
+
+        // Mount Nextcloud routes — merged BEFORE the trace + request-id
+        // layers so NC requests get the same span fields as every
+        // other surface (matches the auth-enabled branch above).
+        if let Some(nc_router) = nextcloud_router {
+            app = app.merge(
+                nc_router
+                    .with_state(app_state.clone())
+                    .layer(access_log!("http::nextcloud")),
+            );
+        }
+
+        // Mount WOPI routes (no auth middleware when auth is disabled).
+        // Same reasoning: merge before the trace layer.
+        if let Some((wopi_protocol, wopi_api)) = wopi_routes {
+            app = app
+                .nest("/wopi", wopi_protocol.layer(access_log!("http::wopi")))
+                .nest("/api/wopi", wopi_api.layer(access_log!("http::api")));
+        }
+
+        // ── Trace + request-id layers applied LAST. See the
+        //    auth-enabled branch above for the rationale.
+        app = app
+            .layer(TraceLayer::new_for_http().make_span_with(ClientIpMakeSpan))
+            .layer(PropagateRequestIdLayer::x_request_id())
+            .layer(SetRequestIdLayer::x_request_id(UuidRequestId));
+    }
+
+    // Increase the default body limit to allow large file uploads.
+    // Uses architecture-appropriate limit: 10 GB on 64-bit, 1 GB on 32-bit.
+    // Without this Axum caps Multipart bodies at 2 MB.
+    #[cfg(target_pointer_width = "64")]
+    const BODY_LIMIT: usize = 10 * 1024 * 1024 * 1024; // 10 GB
+    #[cfg(target_pointer_width = "32")]
+    const BODY_LIMIT: usize = 1024 * 1024 * 1024; // 1 GB
+    app = app.layer(DefaultBodyLimit::max(BODY_LIMIT));
+
+    // ── HTTP compression (gzip + Brotli) ─────────────────────────────────
+    // Negotiates the best encoding via Accept-Encoding. Policy: compress
+    // everything by default so no shrinkable response is ever missed (text,
+    // JSON, JS/CSS, XML, SVG, fonts ttf/otf, WASM…), and skip ONLY content
+    // that is already compressed — where a second pass burns CPU and adds
+    // latency for ~0 bytes saved.
+    //
+    // We deliberately do NOT blanket-exclude `image/*`: `image/svg+xml` is
+    // plain text and compresses ~70%, so the genuinely-compressed raster
+    // formats are listed individually instead, leaving SVG compressible.
+    //
+    // This is the single, global compression layer (the `/api` router used to
+    // add its own predicate-less one, which silently compressed media). It is
+    // reverse-proxy friendly: a proxy that sees `Content-Encoding` passes
+    // the response through untouched.
+    {
+        use tower_http::compression::CompressionLayer;
+        use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
+
+        // Never compress file-body responses (downloads, inline previews, ZIP
+        // exports). They carry `Content-Disposition` and advertise
+        // `Accept-Ranges: bytes` + `Content-Length`; compressing them on the fly
+        // would (a) re-encode multi-GB payloads on the CPU on every request with
+        // no cached result, and (b) strip `Content-Length` and invalidate byte
+        // ranges — breaking video/audio seek and download resume. API JSON and
+        // static assets never set `Content-Disposition`, so they stay compressed.
+        #[derive(Clone, Copy)]
+        struct NotForDownloads;
+        impl Predicate for NotForDownloads {
+            fn should_compress<B>(&self, response: &axum::http::Response<B>) -> bool
+            where
+                B: http_body::Body,
+            {
+                !response
+                    .headers()
+                    .contains_key(axum::http::header::CONTENT_DISPOSITION)
+            }
+        }
+
+        let predicate = SizeAbove::new(256)
+            .and(NotForContentType::GRPC)
+            .and(NotForContentType::SSE)
+            // ── already-compressed raster images (SVG intentionally absent) ──
+            .and(NotForContentType::const_new("image/jpeg"))
+            .and(NotForContentType::const_new("image/png"))
+            .and(NotForContentType::const_new("image/gif"))
+            .and(NotForContentType::const_new("image/webp"))
+            .and(NotForContentType::const_new("image/avif"))
+            .and(NotForContentType::const_new("image/heic"))
+            .and(NotForContentType::const_new("image/heif"))
+            .and(NotForContentType::const_new("image/jp2"))
+            .and(NotForContentType::const_new("image/x-icon"))
+            .and(NotForContentType::const_new("image/vnd.microsoft.icon"))
+            // ── audio / video families (already compressed) ──
+            .and(NotForContentType::const_new("video/"))
+            .and(NotForContentType::const_new("audio/"))
+            // ── already-compressed web fonts; ttf/otf left compressible ──
+            .and(NotForContentType::const_new("font/woff"))
+            .and(NotForContentType::const_new("application/font-woff"))
+            // ── archives & compressed containers ──
+            .and(NotForContentType::const_new("application/zip"))
+            .and(NotForContentType::const_new("application/gzip"))
+            .and(NotForContentType::const_new("application/x-gzip"))
+            .and(NotForContentType::const_new("application/x-tar"))
+            .and(NotForContentType::const_new("application/x-7z-compressed"))
+            .and(NotForContentType::const_new("application/x-rar-compressed"))
+            .and(NotForContentType::const_new("application/x-bzip2"))
+            .and(NotForContentType::const_new("application/zstd"))
+            .and(NotForContentType::const_new("application/x-xz"))
+            // ── zip-based document / app bundles (docx/xlsx/pptx, odf, epub…) ──
+            .and(NotForContentType::const_new(
+                "application/vnd.openxmlformats-officedocument",
+            ))
+            .and(NotForContentType::const_new(
+                "application/vnd.oasis.opendocument",
+            ))
+            .and(NotForContentType::const_new("application/epub+zip"))
+            .and(NotForContentType::const_new("application/java-archive"))
+            .and(NotForContentType::const_new(
+                "application/vnd.android.package-archive",
+            ))
+            // ── PDF: streams are usually already deflated; often large ──
+            .and(NotForContentType::const_new("application/pdf"))
+            // ── opaque binary we couldn't identify ──
+            .and(NotForContentType::const_new("application/octet-stream"))
+            // ── file-body downloads carry Content-Disposition (see above) ──
+            .and(NotForDownloads);
+
+        // Explicit quality: the layer's default maps to Brotli QUALITY 11
+        // (async-compression Level::Default → BrotliEncoderParams::default(),
+        // brotli-8.0.2 encode.rs:323) — a deploy-grade setting that cost
+        // ~90 ms of CPU per 64 KiB JSON response. Level 4 emits ~15 % more
+        // bytes at ~1 % of the CPU (0.9 ms) — measured in
+        // benches/STATIC-PRECOMPRESSED.md. Applies to gzip too (level 4,
+        // the classic dynamic-content setting).
+        app = app.layer(
+            CompressionLayer::new()
+                .quality(tower_http::CompressionLevel::Precise(4))
+                .compress_when(predicate),
+        );
+    }
+
+    // ── Security headers ─────────────────────────────────────────────────
+    // Applied globally so every response (API, static, DAV) carries them.
+    use axum::http::HeaderValue;
+    use axum::http::header::HeaderName;
+
+    // Content-Security-Policy is content-type-aware.
+    //
+    // HTML documents are served by the SvelteKit SPA, which emits its OWN
+    // strict, hash-based CSP via a <meta> tag (see `kit.csp` in
+    // frontend/svelte.config.js). SvelteKit's inline bootstrap script is
+    // hashed per build, so a static `script-src 'self'` header here would
+    // block it and blank the app. We therefore do NOT send a CSP header on
+    // text/html responses and let the SPA's meta policy govern them.
+    //
+    // Every other response (API JSON, DAV XML, static JS/CSS/img) gets the
+    // strict header below. Notes:
+    //   • style-src 'unsafe-inline': the frontend sets inline styles at
+    //     runtime (e.g. element.style.display); hashes can't cover those.
+    //   • frame-src '*': only matches network schemes, so 'blob:' is listed
+    //     explicitly for inline PDF/document viewers.
+    //   • media-src 'blob:': needed for blob: video/audio playback.
+    //   • form-action 'https:': the WOPI office editor is launched by POSTing a
+    //     token form to a cross-origin, admin-configured Collabora/OnlyOffice
+    //     host. Mirrors the SPA meta policy in frontend/svelte.config.js.
+    // The four static security headers ride in the same response pass —
+    // they used to be four separate `SetResponseHeaderLayer`s stacked on
+    // top of this middleware (5 tower layers per response). Folding them
+    // here measured 1.43x per request / −26 allocs with a byte-identical
+    // header set, including on 304s (benches/ROUND12.md §M3). They are
+    // inserted BEFORE the 304 early-return below because the standalone
+    // layers stamped 304s too.
+    async fn content_security_policy(
+        req: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        let mut res = next.run(req).await;
+        {
+            let h = res.headers_mut();
+            h.insert(
+                HeaderName::from_static("x-content-type-options"),
+                HeaderValue::from_static("nosniff"),
+            );
+            h.insert(
+                HeaderName::from_static("x-frame-options"),
+                HeaderValue::from_static("DENY"),
+            );
+            h.insert(
+                HeaderName::from_static("referrer-policy"),
+                HeaderValue::from_static("strict-origin-when-cross-origin"),
+            );
+            h.insert(
+                HeaderName::from_static("permissions-policy"),
+                HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+            );
+        }
+        // A 304 Not Modified carries no entity headers (no Content-Type) since
+        // there's no body — `is_html` would read `None` and misclassify it as
+        // "not html", attaching the strict headerless CSP below. Browsers merge
+        // a 304's headers into the cached document's effective response, so
+        // that stray header would then stack with (and defeat) the SPA's own
+        // hash-based `<meta>` CSP on every revalidated repeat visit — this was
+        // a real bug (see git blame): a browser tab reopened at `/login` after
+        // the first, freshly-fetched visit got permanently stuck behind the
+        // boot spinner because its now-conditionally-cached `200` picked up an
+        // extra hash-less `script-src 'self'` header from the 304 that
+        // revalidated it, blocking the app's own inline hydration script.
+        // Nothing to add on a 304 regardless — its headers must only carry
+        // caching metadata, never a fresh policy decision.
+        if res.status() == axum::http::StatusCode::NOT_MODIFIED {
+            return res;
+        }
+        let is_html = res
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/html"));
+        if is_html {
+            // `no-store` (not just `no-cache`) on the SPA shell: Chrome/Firefox/
+            // Safari all treat `no-store` as an explicit opt-out of the
+            // back-forward cache (bfcache), which is a full in-memory snapshot
+            // of the page that bypasses HTTP revalidation entirely — `no-cache`
+            // alone does NOT prevent it. Without this, a shell instance loaded
+            // before a deploy can be resurrected byte-for-byte (old inline
+            // hydration script + old CSP hash) after navigating away and back —
+            // e.g. the OIDC login round-trip's two full-page navigations — and
+            // the resurrected page's old CSP `<meta>` no longer matches assets
+            // referenced by the current build, leaving the app permanently
+            // stuck behind the boot spinner until a hard reload.
+            res.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store"),
+            );
+        } else {
+            res.headers_mut().insert(
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_static(
+                    "default-src 'self'; \
+                     script-src 'self'; \
+                     worker-src 'self'; \
+                     style-src 'self' 'unsafe-inline'; \
+                     img-src 'self' data: blob: https:; \
+                     media-src 'self' blob:; \
+                     connect-src 'self'; \
+                     font-src 'self' data:; \
+                     frame-src * blob:; \
+                     frame-ancestors 'none'; \
+                     base-uri 'self'; \
+                     form-action 'self' https:",
+                ),
+            );
+        }
+        res
+    }
+
+    app = app.layer(axum::middleware::from_fn(content_security_policy));
+
+    // Warn once at startup if auth cookies are not Secure.
+    // HttpOnly + SameSite protection is nullified over plain HTTP because tokens
+    // travel in cleartext and can be intercepted by a network observer.
+    if !crate::interfaces::api::cookie_auth::is_cookie_secure() {
+        tracing::warn!(
+            "⚠️  SECURITY: auth cookies are NOT marked Secure. \
+             Tokens will be transmitted in plaintext over HTTP. \
+             Set OXICLOUD_COOKIE_SECURE=true for any HTTPS deployment."
+        );
+    }
+
+    // Start server — tuned socket for low-latency responses
+    // TODO: suport multiple addresses ?
+    let addr = parse_addr(&config.server_host, config.server_port)?;
+
+    // SO_REUSEPORT: disabled by default — a second instance on the same port
+    // fails loudly instead of silently sharing the socket.  Set
+    // OXICLOUD_REUSE_PORT=true only when you deliberately run multiple
+    // workers (e.g. behind a process supervisor or during a rolling restart).
+    let reuse_port = config.reuse_port;
+
+    if reuse_port {
+        tracing::warn!(
+            "OXICLOUD_REUSE_PORT is enabled — multiple processes may bind to port {}",
+            config.server_port
+        );
+    }
+
+    tracing::info!("Starting OxiCloud server on http://{}", addr);
+
+    // Opt-in Prometheus `/metrics` exporter on a separate listener.
+    // Installs the recorder BEFORE the main listener starts serving so
+    // the first request's counter increments are captured (recorder
+    // install is racy vs first emit — order matters).
+    if let Some(metrics_addr) = config.metrics_listen
+        && let Err(err) = oxicloud::interfaces::metrics::spawn(metrics_addr).await
+    {
+        // Fail loudly: operators asked for metrics; not surfacing
+        // this would hide a misconfigured scrape endpoint.
+        tracing::error!("Prometheus /metrics setup failed: {err}");
+        return Err(err);
+    }
+
+    let socket = make_socket(&addr, reuse_port)?;
+
+    let listener = tokio::net::TcpListener::from_std(socket.into())?;
+
+    // Grab shutdown-hook handles BEFORE the router consumes
+    // app_state below. Currently: only the session `LastSeenTracker`
+    // needs a final synchronous flush on graceful shutdown so
+    // rolling restarts don't lose the last flush interval of
+    // liveness stamps. Future services with shutdown obligations
+    // add their handles here and chain their flushes into
+    // [`shutdown_signal`] alongside this one.
+    let last_seen_tracker = app_state.last_seen_tracker.clone();
+
+    // Provide the fully-built state to the router
+    let app = app.with_state(app_state);
+
+    // Serve the entire surface under OXICLOUD_BASE_PATH when configured
+    // (subpath deployments, e.g. https://host/oxicloud behind a reverse
+    // proxy that forwards the prefix unstripped). A single `nest` here
+    // prefixes every route merged above at once — API, DAV, WOPI,
+    // Nextcloud, WebSocket and the SPA fallback included. Requests
+    // outside the prefix 404 at this outer router, which is correct:
+    // the origin root belongs to whatever else the proxy serves there.
+    let app = if config.base_path.is_empty() {
+        app
+    } else {
+        tracing::info!(
+            base_path = %config.base_path,
+            "serving the application under a URL base path"
+        );
+        // `nest` matches `{base}` and `{base}/…` but NOT the bare
+        // `{base}/` (axum 0.8 treats the prefix-with-trailing-slash as
+        // outside the nest), so register that one path explicitly as a
+        // 308 to `{base}`, preserving any query string.
+        let base = config.base_path.clone();
+        let trailing_slash = format!("{base}/");
+        let redirect_to_base = move |req: axum::extract::Request| {
+            let base = base.clone();
+            async move {
+                let target = match req.uri().query() {
+                    Some(q) => format!("{base}?{q}"),
+                    None => base,
+                };
+                axum::response::Redirect::permanent(&target)
+            }
+        };
+        Router::new()
+            .route(&trailing_slash, axum::routing::get(redirect_to_base))
+            .nest(&config.base_path, app)
+    };
+
+    // TCP_NODELAY is inherited from the listening socket on Linux,
+    // so every accepted connection already has Nagle disabled.
+    //
+    // `with_graceful_shutdown` waits for SIGTERM / SIGINT, then
+    // stops accepting new connections, drains in-flight requests,
+    // and runs the async block below. The session tracker flush
+    // fires AFTER draining so it captures any last-second requests
+    // that landed while shutdown propagates.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        if let Some(tracker) = last_seen_tracker {
+            match tracker.flush_now().await {
+                Ok(n) => tracing::info!(
+                    target: "oxicloud::sessions",
+                    flushed = n,
+                    "last-seen final flush before shutdown",
+                ),
+                Err(err) => tracing::warn!(
+                    target: "oxicloud::sessions",
+                    error = %err,
+                    "last-seen final flush failed; up to one flush interval of \
+                     liveness data may have been lost",
+                ),
+            }
+        }
+    })
+    .await?;
+    tracing::info!("Server shutdown completed");
+
+    Ok(())
+}
+
+/// Block until the process receives SIGINT (Ctrl-C) or SIGTERM
+/// (systemd / docker stop / K8s pod eviction). Returns once EITHER
+/// arrives — no distinction between them at the caller: a signal
+/// is a signal, drain and exit.
+///
+/// On non-Unix (Windows), the `terminate` arm is a never-resolving
+/// future so only Ctrl-C works — which matches how Windows expects
+/// service shutdown to be signalled anyway.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::warn!("failed to install Ctrl-C handler: {err}");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(err) => {
+                tracing::warn!("failed to install SIGTERM handler: {err}");
+                // Fall through to a pending future so tokio::select! doesn't
+                // spin — Ctrl-C is still armed.
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("SIGINT received, initiating graceful shutdown"),
+        _ = terminate => tracing::info!("SIGTERM received, initiating graceful shutdown"),
+    }
+}

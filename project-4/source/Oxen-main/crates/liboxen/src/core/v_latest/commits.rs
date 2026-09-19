@@ -1,0 +1,1400 @@
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::str;
+use std::sync::{Arc, LazyLock, Weak};
+use std::thread::sleep;
+
+use glob::Pattern;
+use parking_lot::Mutex;
+use rocksdb::{DBWithThreadMode, MultiThreaded, SingleThreaded};
+use time::OffsetDateTime;
+
+use crate::config::UserConfig;
+use crate::constants::COMMIT_COUNT_DIR;
+use crate::core::db;
+use crate::core::db::key_val::{opts, str_val_db};
+use crate::core::db::merkle_node::MerkleNodeDB;
+use crate::core::refs::with_ref_manager;
+use crate::core::v_latest::index::CommitMerkleTree;
+use crate::error::OxenError;
+use crate::model::merkle_tree::node::commit_node::CommitNodeOpts;
+use crate::model::merkle_tree::node::dir_node::DirNodeOpts;
+use crate::model::merkle_tree::node::{CommitNode, DirNode, EMerkleTreeNode};
+use crate::model::{Commit, LocalRepository, MerkleHash, User};
+use crate::opts::PaginateOpts;
+use crate::repositories::commits::commit_writer;
+use crate::view::{PaginatedCommits, StatusMessage};
+use crate::{repositories, util};
+
+/// Configuration for commit traversal operations
+struct CommitTraversalConfig<'a> {
+    /// Repository to traverse
+    repo: &'a LocalRepository,
+    /// Starting commit for traversal
+    head_commit: Commit,
+    /// Optional base commit to stop at (exclusive)
+    stop_at_base: Option<&'a Commit>,
+    /// Set of visited commit IDs to avoid cycles
+    visited: &'a mut HashSet<String>,
+    /// Number of commits to skip (for pagination)
+    skip: usize,
+    /// Maximum number of commits to collect (for pagination)
+    limit: usize,
+    /// Optional cache database for count lookups
+    cache_db: Option<&'a DBWithThreadMode<MultiThreaded>>,
+    /// Known total count for early exit optimization
+    known_total_count: Option<usize>,
+}
+
+pub fn commit(repo: &LocalRepository, message: impl AsRef<str>) -> Result<Commit, OxenError> {
+    commit_writer::commit(repo, message)
+}
+
+pub fn commit_with_user(
+    repo: &LocalRepository,
+    message: impl AsRef<str>,
+    user: &User,
+) -> Result<Commit, OxenError> {
+    commit_writer::commit_with_cfg(
+        repo,
+        message,
+        &UserConfig {
+            name: user.name.clone(),
+            email: user.email.clone(),
+            editor: None,
+        },
+        None,
+        &commit_writer::default_commit_progress_bar(),
+    )
+}
+
+pub async fn commit_allow_empty(
+    repo: &LocalRepository,
+    message: impl AsRef<str>,
+) -> Result<Commit, OxenError> {
+    let message = message.as_ref();
+
+    // Check if there are staged changes
+    let status = crate::core::v_latest::status::status(repo).await?;
+    let has_changes = !status.staged_files.is_empty() || !status.staged_dirs.is_empty();
+
+    if has_changes {
+        // If there are changes, commit normally
+        commit_writer::commit(repo, message)
+    } else {
+        // No changes, create an empty commit
+        let cfg = crate::config::UserConfig::get()?;
+        let branch = repositories::branches::current_branch(repo)?
+            .ok_or_else(|| OxenError::basic_str("No current branch found"))?;
+
+        let head_commit = head_commit(repo)?;
+
+        // Create a new commit with the same tree as parent
+        let timestamp = OffsetDateTime::now_utc();
+        let new_commit_data = crate::model::NewCommit {
+            parent_ids: vec![head_commit.id.clone()],
+            message: message.to_string(),
+            author: cfg.name.clone(),
+            email: cfg.email.clone(),
+            timestamp,
+        };
+
+        // Compute the commit hash
+        let commit_hash = commit_writer::compute_commit_id(&new_commit_data)?;
+
+        let new_commit = Commit::from_new_and_id(&new_commit_data, commit_hash.to_string());
+
+        // Use the existing create_empty_commit function
+        let result = create_empty_commit(repo, &branch.name, &new_commit)?;
+
+        println!("🐂 commit {result} (empty)");
+
+        Ok(result)
+    }
+}
+
+pub fn get_commit_or_head<S: AsRef<str> + Clone>(
+    repo: &LocalRepository,
+    commit_id_or_branch_name: Option<S>,
+) -> Result<Commit, OxenError> {
+    match commit_id_or_branch_name {
+        Some(ref_name) => {
+            log::debug!("get_commit_or_head: ref_name: {:?}", ref_name.as_ref());
+            get_commit_by_ref(repo, ref_name)
+        }
+        None => {
+            log::debug!("get_commit_or_head: calling head_commit");
+            head_commit(repo)
+        }
+    }
+}
+
+fn get_commit_by_ref<S: AsRef<str> + Clone>(
+    repo: &LocalRepository,
+    ref_name: S,
+) -> Result<Commit, OxenError> {
+    get_by_id(repo, ref_name.clone())?
+        .or_else(|| get_commit_by_branch(repo, ref_name.as_ref()))
+        .ok_or_else(|| OxenError::basic_str("Commit not found"))
+}
+
+fn get_commit_by_branch(repo: &LocalRepository, branch_name: &str) -> Option<Commit> {
+    repositories::branches::get_by_name(repo, branch_name)
+        .ok()
+        .and_then(|branch| get_by_id(repo, &branch.commit_id).ok().flatten())
+}
+
+pub fn latest_commit(repo: &LocalRepository) -> Result<Commit, OxenError> {
+    let branches = with_ref_manager(repo, |manager| manager.list_branches())?;
+    let mut latest_commit: Option<Commit> = None;
+    for branch in branches {
+        let commit = get_by_id(repo, &branch.commit_id)?;
+        if let Some(commit) = commit
+            && (latest_commit.is_none()
+                || commit.timestamp < latest_commit.as_ref().unwrap().timestamp)
+        {
+            latest_commit = Some(commit);
+        }
+    }
+    latest_commit.ok_or(OxenError::NoCommitsFound)
+}
+
+fn head_commit_id(repo: &LocalRepository) -> Result<MerkleHash, OxenError> {
+    let commit_id = with_ref_manager(repo, |manager| manager.head_commit_id())?;
+    match commit_id {
+        Some(commit_id) => Ok(commit_id.parse()?),
+        None => Err(OxenError::HeadNotFound),
+    }
+}
+
+pub fn head_commit_maybe(repo: &LocalRepository) -> Result<Option<Commit>, OxenError> {
+    let commit_id = with_ref_manager(repo, |manager| manager.head_commit_id())?;
+    match commit_id {
+        Some(commit_id) => {
+            let commit_id = commit_id.parse()?;
+            get_by_hash(repo, &commit_id)
+        }
+        None => Ok(None),
+    }
+}
+
+pub fn head_commit(repo: &LocalRepository) -> Result<Commit, OxenError> {
+    let head_commit_id = head_commit_id(repo)?;
+    log::debug!("head_commit: head_commit_id: {head_commit_id:?}");
+
+    let node = repositories::tree::get_node_by_id(repo, &head_commit_id)?.ok_or_else(|| {
+        OxenError::basic_str(format!(
+            "Merkle tree node not found for head commit: '{head_commit_id}'"
+        ))
+    })?;
+    let commit = node.commit()?;
+    Ok(commit.to_commit())
+}
+
+/// Get the root commit of the repository or None
+pub fn root_commit_maybe(repo: &LocalRepository) -> Result<Option<Commit>, OxenError> {
+    // Try to get a branch ref and follow it to the root
+    // We only need to look at one ref as all branches will have the same root
+    let branches = with_ref_manager(repo, |manager| manager.list_branches())?;
+
+    if let Some(branch) = branches.first()
+        && let Some(commit) = get_by_id(repo, &branch.commit_id)?
+    {
+        let mut seen = HashSet::new();
+        let root_commit = root_commit_recursive(repo, commit.id.parse()?, &mut seen)?;
+        return Ok(Some(root_commit));
+    }
+    log::debug!("root_commit_maybe: no root commit found");
+    Ok(None)
+}
+
+fn root_commit_recursive(
+    repo: &LocalRepository,
+    commit_id: MerkleHash,
+    seen: &mut HashSet<String>,
+) -> Result<Commit, OxenError> {
+    let mut current_id = commit_id;
+
+    loop {
+        // Check if we've already seen this commit
+        if !seen.insert(current_id.to_string()) {
+            return Err(OxenError::basic_str("Cycle detected in commit history"));
+        }
+
+        if let Some(commit) = get_by_hash(repo, &current_id)? {
+            if commit.parent_ids.is_empty() {
+                return Ok(commit);
+            }
+
+            // Only need to check the first parent, as all paths lead to the root
+            if let Some(parent_id) = commit.parent_ids.first() {
+                current_id = parent_id.parse()?;
+                continue;
+            }
+        }
+
+        return Err(OxenError::basic_str("No root commit found"));
+    }
+}
+
+pub fn get_by_id(
+    repo: &LocalRepository,
+    commit_id_str: impl AsRef<str>,
+) -> Result<Option<Commit>, OxenError> {
+    let commit_id_str = commit_id_str.as_ref();
+    let Ok(commit_id) = commit_id_str.parse() else {
+        // log::debug!(
+        //     "get_by_id could not create commit_id from [{}]",
+        //     commit_id_str
+        // );
+        return Ok(None);
+    };
+    get_by_hash(repo, &commit_id)
+}
+
+pub fn get_by_hash(repo: &LocalRepository, hash: &MerkleHash) -> Result<Option<Commit>, OxenError> {
+    let Some(node) = repositories::tree::get_node_by_id(repo, hash)? else {
+        return Ok(None);
+    };
+    let commit = node.commit()?;
+    Ok(Some(commit.to_commit()))
+}
+
+pub fn create_empty_commit(
+    repo: &LocalRepository,
+    branch_name: impl AsRef<str>,
+    new_commit: &Commit,
+) -> Result<Commit, OxenError> {
+    let branch_name = branch_name.as_ref();
+    let Some(existing_commit) = repositories::revisions::get(repo, branch_name)? else {
+        return Err(OxenError::RevisionNotFound(branch_name.into()));
+    };
+    let existing_commit_id = existing_commit.id.parse()?;
+    let existing_node =
+        repositories::tree::get_node_by_id_with_children(repo, &existing_commit_id)?.ok_or_else(
+            || {
+                OxenError::basic_str(format!(
+                    "Merkle tree node not found for commit: '{}'",
+                    existing_commit.id
+                ))
+            },
+        )?;
+    let timestamp = OffsetDateTime::now_utc();
+    let commit_node = CommitNode::new(CommitNodeOpts {
+        hash: new_commit.id.parse()?,
+        parent_ids: vec![existing_commit_id],
+        email: new_commit.email.clone(),
+        author: new_commit.author.clone(),
+        message: new_commit.message.clone(),
+        timestamp,
+    })?;
+
+    let parent_id = Some(existing_node.hash);
+    let mut commit_db =
+        MerkleNodeDB::open_read_write(repo.merkle_node_store(), &commit_node, parent_id)?;
+    // There should always be one child, the root directory
+    let dir_node = existing_node.children.first().unwrap().dir()?;
+    commit_db.add_child(&dir_node)?;
+    commit_db.close()?;
+
+    // Copy the dir hashes db to the new commit
+    repositories::tree::cp_dir_hashes_to(repo, &existing_commit_id, commit_node.hash())?;
+
+    // Update the ref
+    with_ref_manager(repo, |manager| {
+        manager.set_branch_commit_id(branch_name, commit_node.hash().to_string())
+    })?;
+
+    Ok(commit_node.to_commit())
+}
+
+/// Create an initial empty commit for an empty repository.
+/// This creates the first commit with an empty tree and sets up the branch.
+/// Returns an error if the repository already has commits.
+pub fn create_initial_commit(
+    repo: &LocalRepository,
+    branch_name: impl AsRef<str>,
+    user: &User,
+    message: impl AsRef<str>,
+) -> Result<Commit, OxenError> {
+    let branch_name = branch_name.as_ref();
+    let message = message.as_ref();
+
+    // Ensure the repository is actually empty
+    if head_commit_maybe(repo)?.is_some() {
+        return Err(OxenError::basic_str(
+            "Cannot create initial commit: repository already has commits",
+        ));
+    }
+
+    let timestamp = OffsetDateTime::now_utc();
+
+    // Create commit data with no parents
+    let new_commit = crate::model::NewCommit {
+        parent_ids: vec![],
+        message: message.to_string(),
+        author: user.name.clone(),
+        email: user.email.clone(),
+        timestamp,
+    };
+
+    // Compute the commit hash
+    let commit_id = commit_writer::compute_commit_id(&new_commit)?;
+
+    // Create the commit node
+    let commit_node = CommitNode::new(CommitNodeOpts {
+        hash: commit_id,
+        parent_ids: vec![],
+        email: user.email.clone(),
+        author: user.name.clone(),
+        message: message.to_string(),
+        timestamp,
+    })?;
+
+    // Create an empty root directory node
+    let empty_dir_hash = MerkleHash::new(0); // Empty hash for empty directory
+    let dir_node = DirNode::new(DirNodeOpts {
+        name: String::new(), // Root directory has empty name
+        hash: empty_dir_hash,
+        num_entries: 0,
+        num_bytes: 0,
+        last_commit_id: commit_id,
+        last_modified_seconds: timestamp.unix_timestamp(),
+        last_modified_nanoseconds: timestamp.nanosecond(),
+        data_type_counts: HashMap::new(),
+        data_type_sizes: HashMap::new(),
+    })?;
+
+    // Open the commit database and add the root directory
+    let mut commit_db =
+        MerkleNodeDB::open_read_write(repo.merkle_node_store(), &commit_node, None)?;
+    commit_db.add_child(&dir_node)?;
+    commit_db.close()?;
+
+    // Initialize the dir_hash_db with the root directory hash
+    let commit_id_string = commit_id.to_string();
+    let dir_hash_db_path =
+        CommitMerkleTree::dir_hash_db_path_from_commit_id(repo, &commit_id_string);
+    let dir_hash_db: DBWithThreadMode<SingleThreaded> =
+        DBWithThreadMode::open(&opts::default(), dunce::simplified(&dir_hash_db_path))?;
+    str_val_db::put(&dir_hash_db, "", &dir_node.hash().to_string())?;
+
+    // Create the branch pointing to this commit
+    with_ref_manager(repo, |manager| {
+        manager.create_branch(branch_name, commit_id.to_string())
+    })?;
+
+    // Set HEAD to the new branch
+    with_ref_manager(repo, |manager| {
+        manager.set_head(branch_name)?;
+        Ok(())
+    })?;
+
+    Ok(commit_node.to_commit())
+}
+
+/// List commits on the current branch from HEAD
+pub fn list(repo: &LocalRepository) -> Result<Vec<Commit>, OxenError> {
+    if let Some(commit) = head_commit_maybe(repo)? {
+        let (results, _) = list_recursive_paginated(repo, commit, 0, usize::MAX, None, None)?;
+        Ok(results)
+    } else {
+        Ok(vec![])
+    }
+}
+
+fn list_forward_paginated(
+    repo: &LocalRepository,
+    head_commit: Commit,
+    skip: usize,
+    limit: usize,
+) -> Result<Vec<Commit>, OxenError> {
+    let mut results = Vec::new();
+    let mut current = Some(head_commit);
+    let mut count = 0;
+    let end_idx = skip + limit;
+
+    while let Some(commit) = current {
+        if count >= skip && count < end_idx {
+            results.push(commit.clone());
+        }
+        count += 1;
+
+        if count >= end_idx {
+            break;
+        }
+
+        current = if let Some(parent_id) = commit.parent_ids.first() {
+            let parent_id: MerkleHash = parent_id.parse()?;
+            get_by_hash(repo, &parent_id)?
+        } else {
+            None
+        };
+    }
+
+    Ok(results)
+}
+
+pub fn list_recursive_paginated(
+    repo: &LocalRepository,
+    head_commit: Commit,
+    skip: usize,
+    limit: usize,
+    stop_at_base: Option<&Commit>,
+    known_total_count: Option<usize>,
+) -> Result<(Vec<Commit>, usize), OxenError> {
+    let mut results = vec![];
+    let mut visited = HashSet::new();
+
+    let config = CommitTraversalConfig {
+        repo,
+        head_commit,
+        stop_at_base,
+        visited: &mut visited,
+        skip,
+        limit,
+        cache_db: None,
+        known_total_count,
+    };
+
+    let total_count = traverse_commits(config, Some(&mut results))?;
+    Ok((results, total_count))
+}
+
+/// Mark all ancestors of `commit` as visited and return the number of
+/// newly-visited ancestors.  The commit itself is assumed to already be in the
+/// visited set (the caller inserts it), so we start from its parents.
+fn mark_ancestors_visited(
+    repo: &LocalRepository,
+    commit: &Commit,
+    visited: &mut HashSet<String>,
+) -> Result<usize, OxenError> {
+    let mut newly_visited: usize = 0;
+    let mut stack: Vec<Commit> = Vec::new();
+
+    // Seed the stack with the commit's parents (not the commit itself,
+    // which is already in `visited`).
+    for parent_id in &commit.parent_ids {
+        let parent_id: MerkleHash = parent_id.parse()?;
+        if let Some(parent) = get_by_hash(repo, &parent_id)?
+            && !visited.contains(&parent.id)
+        {
+            stack.push(parent);
+        }
+    }
+
+    while let Some(current) = stack.pop() {
+        if visited.contains(&current.id) {
+            continue;
+        }
+        visited.insert(current.id.clone());
+        newly_visited += 1;
+
+        for parent_id in current.parent_ids.clone() {
+            let parent_id: MerkleHash = parent_id.parse()?;
+            if let Some(parent) = get_by_hash(repo, &parent_id)?
+                && !visited.contains(&parent.id)
+            {
+                stack.push(parent);
+            }
+        }
+    }
+
+    Ok(newly_visited)
+}
+
+/// Wrapper to order commits by timestamp descending in a BinaryHeap (max-heap).
+/// Ties are broken by commit id for deterministic ordering.
+struct TimestampedCommit(Commit);
+
+impl PartialEq for TimestampedCommit {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.timestamp == other.0.timestamp && self.0.id == other.0.id
+    }
+}
+
+impl Eq for TimestampedCommit {}
+
+impl PartialOrd for TimestampedCommit {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TimestampedCommit {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0
+            .timestamp
+            .cmp(&other.0.timestamp)
+            .then_with(|| self.0.id.cmp(&other.0.id))
+    }
+}
+
+fn traverse_commits(
+    config: CommitTraversalConfig,
+    mut results: Option<&mut Vec<Commit>>,
+) -> Result<usize, OxenError> {
+    let mut count = 0;
+    let mut heap = BinaryHeap::new();
+    heap.push(TimestampedCommit(config.head_commit));
+    let end_idx = config.skip + config.limit;
+    let can_early_exit = config.known_total_count.is_some();
+    let collect_results = results.is_some();
+
+    while let Some(TimestampedCommit(commit)) = heap.pop() {
+        if config.visited.contains(&commit.id) {
+            continue;
+        }
+
+        config.visited.insert(commit.id.clone());
+
+        // Check for base case
+        if let Some(base) = config.stop_at_base
+            && commit.id == base.id
+        {
+            if count >= config.skip
+                && count < end_idx
+                && let Some(ref mut res) = results
+            {
+                res.push(commit);
+            }
+            count += 1;
+            continue;
+        }
+
+        // Check cache — use 1 (this commit) + newly-visited ancestors so that
+        // shared ancestors between merge parents are not double-counted.
+        if let Some(db) = config.cache_db
+            && let Some(_cached_count) = get_cached_count(db, &commit.id)?
+        {
+            let newly_visited = mark_ancestors_visited(config.repo, &commit, config.visited)?;
+            log::debug!(
+                "Cache hit for commit {}: cached={}, newly_visited={}",
+                &commit.id[..8],
+                _cached_count,
+                newly_visited
+            );
+            count += 1 + newly_visited;
+            continue;
+        }
+
+        // Process commit (globally newest-first via max-heap)
+        if count >= config.skip
+            && count < end_idx
+            && let Some(ref mut res) = results
+        {
+            res.push(commit.clone());
+        }
+        count += 1;
+
+        if can_early_exit && collect_results && count >= end_idx {
+            log::debug!(
+                "Early exit: collected {} commits (skip={}, limit={})",
+                results.as_ref().map(|r| r.len()).unwrap_or(0),
+                config.skip,
+                config.limit
+            );
+            break;
+        }
+
+        // Add parents to the heap
+        for parent_id in commit.parent_ids.clone() {
+            let parent_id = parent_id.parse()?;
+            if let Some(c) = get_by_hash(config.repo, &parent_id)?
+                && !config.visited.contains(&c.id)
+            {
+                heap.push(TimestampedCommit(c));
+            }
+        }
+    }
+
+    Ok(config.known_total_count.unwrap_or(count))
+}
+
+/// List commits for the repository in no particular order
+pub fn list_all(repo: &LocalRepository) -> Result<HashSet<Commit>, OxenError> {
+    let branches = with_ref_manager(repo, |manager| manager.list_branches())?;
+    let mut commits = HashSet::new();
+    for branch in branches {
+        let commit = get_by_id(repo, &branch.commit_id)?;
+        if let Some(commit) = commit {
+            list_all_recursive(repo, commit, &mut commits)?;
+        }
+    }
+    Ok(commits)
+}
+
+fn list_all_recursive(
+    repo: &LocalRepository,
+    commit: Commit,
+    commits: &mut HashSet<Commit>,
+) -> Result<(), OxenError> {
+    // Create a temporary Vec to collect results, then add to HashSet
+    let mut visited_ids = HashSet::new();
+    let mut results = Vec::new();
+
+    let config = CommitTraversalConfig {
+        repo,
+        head_commit: commit,
+        stop_at_base: None,
+        visited: &mut visited_ids,
+        skip: 0,
+        limit: usize::MAX,
+        cache_db: None,
+        known_total_count: None,
+    };
+
+    traverse_commits(config, Some(&mut results))?;
+    commits.extend(results);
+    Ok(())
+}
+
+/// Get commit history given a revision (branch name or commit id)
+pub fn list_from(
+    repo: &LocalRepository,
+    revision: impl AsRef<str>,
+) -> Result<Vec<Commit>, OxenError> {
+    let (commits, _, _) = list_from_paginated_impl(repo, revision, 0, usize::MAX)?;
+    Ok(commits)
+}
+
+pub fn list_from_paginated_impl(
+    repo: &LocalRepository,
+    revision: impl AsRef<str>,
+    skip: usize,
+    limit: usize,
+) -> Result<(Vec<Commit>, usize, bool), OxenError> {
+    let _perf = crate::perf_guard!("core::commits::list_from_paginated_impl");
+
+    let revision = revision.as_ref();
+    if revision.contains("..") {
+        let _perf_between = crate::perf_guard!("core::commits::list_between_range");
+        let split: Vec<&str> = revision.split("..").collect();
+        let base = split[0];
+        let head = split[1];
+        let base_commit = repositories::commits::get_by_id(repo, base)?
+            .ok_or_else(|| OxenError::RevisionNotFound(base.into()))?;
+        let head_commit = repositories::commits::get_by_id(repo, head)?
+            .ok_or_else(|| OxenError::RevisionNotFound(head.into()))?;
+
+        let (commits, total_count) =
+            list_recursive_paginated(repo, head_commit, skip, limit, Some(&base_commit), None)?;
+        return Ok((commits, total_count, false));
+    }
+
+    let _perf_get = crate::perf_guard!("core::commits::get_revision");
+    let commit = repositories::revisions::get(repo, revision)?;
+    drop(_perf_get);
+
+    if let Some(commit) = commit {
+        let _perf_count = crate::perf_guard!("core::commits::get_cached_count");
+        let (total_count, cached) = count_from(repo, &commit.id)?;
+        drop(_perf_count);
+
+        log::info!(
+            "list_from_paginated_impl: total_count={total_count}, cached={cached}, skip={skip}, limit={limit}"
+        );
+
+        if skip + limit <= 10 {
+            let _perf_fast = crate::perf_guard!("core::commits::list_forward_paginated");
+            let commits = list_forward_paginated(repo, commit, skip, limit)?;
+            drop(_perf_fast);
+            return Ok((commits, total_count, cached));
+        }
+
+        let _perf_recursive = crate::perf_guard!("core::commits::list_recursive_paginated");
+        let (commits, _) =
+            list_recursive_paginated(repo, commit, skip, limit, None, Some(total_count))?;
+        drop(_perf_recursive);
+
+        return Ok((commits, total_count, cached));
+    }
+
+    Ok((vec![], 0, false))
+}
+
+/// Get commit history given a revision (branch name or commit id)
+pub fn list_from_with_depth(
+    repo: &LocalRepository,
+    revision: impl AsRef<str>,
+) -> Result<HashMap<Commit, usize>, OxenError> {
+    let mut results = HashMap::new();
+    let commit = repositories::revisions::get(repo, revision)?;
+    if let Some(commit) = commit {
+        list_recursive_with_depth(repo, commit, &mut results, 0)?;
+    }
+    Ok(results)
+}
+
+fn list_recursive_with_depth(
+    repo: &LocalRepository,
+    commit: Commit,
+    results: &mut HashMap<Commit, usize>,
+    depth: usize,
+) -> Result<(), OxenError> {
+    let mut stack = vec![(commit, depth)];
+
+    while let Some((current_commit, current_depth)) = stack.pop() {
+        // Check if we've already visited this commit at a shallower or equal depth
+        if let Some(&existing_depth) = results.get(&current_commit)
+            && existing_depth <= current_depth
+        {
+            // We've already processed this commit, skip it
+            continue;
+        }
+
+        // Insert or update with the current (shallower) depth
+        results.insert(current_commit.clone(), current_depth);
+
+        for parent_id in current_commit.parent_ids {
+            let parent_id = parent_id.parse()?;
+            if let Some(parent_commit) = get_by_hash(repo, &parent_id)? {
+                stack.push((parent_commit, current_depth + 1));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Open `commit_count` DB handles, keyed by DB path. Concurrent callers share one handle, which
+/// RocksDB requires — it takes an exclusive lock per path. Entries are `Weak`, so the DB closes
+/// when the last caller drops it and no repo directory stays pinned open between requests.
+/// A brief LOCK collision is still possible when an open races the tail of a concurrent close
+/// (RocksDB releases the OS lock in its `Drop`, after `strong_count` already hit zero); see
+/// [`open_commit_count_db`] for the bounded retry that waits it out.
+static COMMIT_COUNT_DBS: LazyLock<Mutex<HashMap<PathBuf, Weak<DBWithThreadMode<MultiThreaded>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Return the shared commit-count cache DB for `repo`, opening it on first access.
+/// Retries briefly on a LOCK-collision race with a concurrent close (see static docs).
+fn open_commit_count_db(
+    repo: &LocalRepository,
+) -> Result<Arc<DBWithThreadMode<MultiThreaded>>, OxenError> {
+    let db_path = util::fs::oxen_hidden_dir(&repo.path).join(COMMIT_COUNT_DIR);
+
+    // Fast path: a cache hit does no filesystem work.
+    if let Some(db) = lookup_live_commit_count_db(&db_path) {
+        return Ok(db);
+    }
+
+    util::fs::create_dir_all(&db_path)?;
+    let mut attempts = 0;
+    loop {
+        let mut handles = COMMIT_COUNT_DBS.lock();
+        if let Some(db) = handles.get(&db_path).and_then(Weak::upgrade) {
+            return Ok(db);
+        }
+        match DBWithThreadMode::open(&opts::default(), dunce::simplified(&db_path)) {
+            Ok(db) => {
+                let db = Arc::new(db);
+                handles.insert(db_path, Arc::downgrade(&db));
+                // Drop tombstones left by handles whose last caller has already finished.
+                handles.retain(|_, weak| weak.strong_count() > 0);
+                return Ok(db);
+            }
+            Err(err) if db::is_lock_collision(&err) => {
+                drop(handles);
+                attempts += 1;
+                if attempts >= db::OPEN_RETRIES {
+                    return Err(OxenError::from(err));
+                }
+                sleep(db::OPEN_RETRY_INTERVAL);
+            }
+            Err(err) => return Err(OxenError::from(err)),
+        }
+    }
+}
+
+fn lookup_live_commit_count_db(db_path: &Path) -> Option<Arc<DBWithThreadMode<MultiThreaded>>> {
+    let handles = COMMIT_COUNT_DBS.lock();
+    handles.get(db_path)?.upgrade()
+}
+
+fn get_cached_count(
+    db: &DBWithThreadMode<MultiThreaded>,
+    commit_id: &str,
+) -> Result<Option<usize>, OxenError> {
+    str_val_db::get(db, commit_id)
+}
+
+fn cache_count(
+    db: &DBWithThreadMode<MultiThreaded>,
+    commit_id: &str,
+    count: usize,
+) -> Result<(), OxenError> {
+    str_val_db::put(db, commit_id, &count)
+}
+
+pub fn count_from(
+    repo: &LocalRepository,
+    revision: impl AsRef<str>,
+) -> Result<(usize, bool), OxenError> {
+    let revision = revision.as_ref();
+
+    let commit = repositories::revisions::get(repo, revision)?
+        .ok_or_else(|| OxenError::RevisionNotFound(revision.into()))?;
+
+    let db = open_commit_count_db(repo)?;
+
+    if let Some(cached_count) = get_cached_count(&db, &commit.id)? {
+        return Ok((cached_count, true));
+    }
+
+    let config = CommitTraversalConfig {
+        repo,
+        head_commit: commit.clone(),
+        stop_at_base: None,
+        visited: &mut HashSet::new(),
+        skip: 0,
+        limit: usize::MAX,
+        cache_db: Some(&db),
+        known_total_count: None,
+    };
+    let count = traverse_commits(config, None)?;
+
+    cache_count(&db, &commit.id, count)?;
+
+    Ok((count, false))
+}
+
+/// List the history between two commits
+pub fn list_between(
+    repo: &LocalRepository,
+    base: &Commit,
+    head: &Commit,
+) -> Result<Vec<Commit>, OxenError> {
+    log::debug!("list_between()\nbase: {base}\nhead: {head}");
+    let (results, _) =
+        list_recursive_paginated(repo, head.clone(), 0, usize::MAX, Some(base), None)?;
+    Ok(results)
+}
+
+/// List commits reachable from `head` but not from `base` (equivalent to git's
+/// `base..head`), ordered newest-first by commit timestamp.
+///
+/// [`list_between`] stops only when it reaches the single `base` commit, so a
+/// merge commit in `head`'s history drags in every ancestor along its other
+/// parent, including commits that already live on `base`. This computes the exact
+/// set `reachable(head) \ reachable(base)` in two graph passes, so membership
+/// depends only on reachability, never on commit timestamps (which can be skewed
+/// or tied across machines):
+///
+///   1. Walk all of `reachable(base)` into `on_base`.
+///   2. Walk `head`'s ancestry, emitting every commit not in `on_base` and
+///      pruning at the first `on_base` commit reached, since all of its ancestors
+///      are on base too.
+///
+/// The second walk pops by timestamp only to order the output newest first; a
+/// commit still always precedes its parents because a parent is pushed to the
+/// heap only after its child has been popped.
+/// The commits reachable from exactly one of `base` and `head`, as `(base_only, head_only)`.
+/// Git's `log base...head` shows this set, marking which side each commit came from.
+pub async fn list_symmetric_difference(
+    repo: &LocalRepository,
+    base: &Commit,
+    head: &Commit,
+) -> Result<(Vec<Commit>, Vec<Commit>), OxenError> {
+    let (head_only, base_only) = tokio::try_join!(
+        list_between_exclusive(repo, base, head),
+        list_between_exclusive(repo, head, base),
+    )?;
+    Ok((base_only, head_only))
+}
+
+pub async fn list_between_exclusive(
+    repo: &LocalRepository,
+    base: &Commit,
+    head: &Commit,
+) -> Result<Vec<Commit>, OxenError> {
+    // Sync core: both passes are sync RocksDB reads over the commit graph — one blocking unit.
+    let repo = repo.clone();
+    let base = base.clone();
+    let head = head.clone();
+    tokio::task::spawn_blocking(move || -> Result<Vec<Commit>, OxenError> {
+        // Pass 1: mark everything reachable from base. Purely graph-based, so the
+        // outcome can't hinge on the order commits happen to sort in.
+        let mut on_base: HashSet<String> = HashSet::new();
+        let mut stack = vec![base.clone()];
+        on_base.insert(base.id.clone());
+        while let Some(commit) = stack.pop() {
+            for parent_id in &commit.parent_ids {
+                let Some(parent) = get_by_hash(&repo, &parent_id.parse()?)? else {
+                    continue;
+                };
+                if on_base.insert(parent.id.clone()) {
+                    stack.push(parent);
+                }
+            }
+        }
+
+        // Pass 2: emit head's ancestry that isn't on base, newest first.
+        let mut heap: BinaryHeap<TimestampedCommit> = BinaryHeap::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut results = vec![];
+
+        if !on_base.contains(&head.id) {
+            seen.insert(head.id.clone());
+            heap.push(TimestampedCommit(head.clone()));
+        }
+
+        while let Some(TimestampedCommit(commit)) = heap.pop() {
+            for parent_id in &commit.parent_ids {
+                let Some(parent) = get_by_hash(&repo, &parent_id.parse()?)? else {
+                    continue;
+                };
+                // An on_base parent (and everything above it) already lives on base.
+                if !on_base.contains(&parent.id) && seen.insert(parent.id.clone()) {
+                    heap.push(TimestampedCommit(parent));
+                }
+            }
+            results.push(commit);
+        }
+
+        Ok(results)
+    })
+    .await?
+}
+
+/// Retrieve entries with filepaths matching a provided glob pattern
+pub fn search_entries(
+    repo: &LocalRepository,
+    commit: &Commit,
+    pattern: impl AsRef<str>,
+) -> Result<HashSet<PathBuf>, OxenError> {
+    let pattern = pattern.as_ref();
+    let pattern = Pattern::new(pattern)?;
+
+    let mut results = HashSet::new();
+    let tree = repositories::tree::get_root_with_children(repo, commit)?
+        .ok_or_else(|| OxenError::basic_str("Root not found"))?;
+    let (files, _) = repositories::tree::list_files_and_dirs(&tree)?;
+    for file in files {
+        let path = file.dir.join(file.file_node.name());
+        if pattern.matches_path(&path) {
+            results.insert(path);
+        }
+    }
+    Ok(results)
+}
+
+/// List commits by path (directory or file) recursively
+pub fn list_by_path_recursive(
+    repo: &LocalRepository,
+    path: &Path,
+    commit: &Commit,
+    commits: &mut Vec<Commit>,
+) -> Result<(), OxenError> {
+    let mut visited = HashSet::new();
+    list_by_path_recursive_impl(repo, path, commit, commits, &mut visited)
+}
+
+fn list_by_path_recursive_impl(
+    repo: &LocalRepository,
+    path: &Path,
+    commit: &Commit,
+    commits: &mut Vec<Commit>,
+    visited: &mut HashSet<String>,
+) -> Result<(), OxenError> {
+    let mut stack = vec![commit.clone()];
+
+    while let Some(current_commit) = stack.pop() {
+        if !visited.insert(current_commit.id.clone()) {
+            continue;
+        }
+
+        let Some(node) = repositories::tree::get_node_by_path(repo, &current_commit, path)? else {
+            continue;
+        };
+
+        let current_node_hash = node.hash;
+        let last_commit_id = node.latest_commit_id()?;
+
+        // Check if current_commit modified the file by comparing the node hash
+        // with each parent's.
+        let file_modified = current_commit.parent_ids.iter().try_fold(
+            // No parents means the file was added in this commit.
+            current_commit.parent_ids.is_empty(),
+            |modified, parent_id| -> Result<bool, OxenError> {
+                if modified {
+                    return Ok(true);
+                }
+                let parent_hash = match repositories::revisions::get(repo, parent_id.clone())? {
+                    Some(pc) => {
+                        repositories::tree::get_node_by_path(repo, &pc, path)?.map(|n| n.hash)
+                    }
+                    None => None,
+                };
+                Ok(parent_hash != Some(current_node_hash))
+            },
+        )?;
+
+        if file_modified {
+            // This commit modified the file — add it and explore parents.
+            commits.push(current_commit.clone());
+            push_unvisited_parents(repo, &current_commit, visited, &mut stack)?;
+        } else {
+            // File not modified here. Use last_commit_id to jump ahead to the
+            // next commit that did, skipping intermediate unmodified commits.
+            match repositories::revisions::get(repo, last_commit_id.to_string())? {
+                Some(jump_commit) if !visited.contains(&jump_commit.id) => {
+                    stack.push(jump_commit);
+                }
+                _ => push_unvisited_parents(repo, &current_commit, visited, &mut stack)?,
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn push_unvisited_parents(
+    repo: &LocalRepository,
+    commit: &Commit,
+    visited: &HashSet<String>,
+    stack: &mut Vec<Commit>,
+) -> Result<(), OxenError> {
+    for parent_id in &commit.parent_ids {
+        if let Some(parent) = repositories::revisions::get(repo, parent_id.clone())?
+            && !visited.contains(&parent.id)
+        {
+            stack.push(parent);
+        }
+    }
+    Ok(())
+}
+
+/// Get paginated list of commits by path (directory or file)
+pub fn list_by_path_from_paginated(
+    repo: &LocalRepository,
+    commit: &Commit,
+    path: &Path,
+    pagination: PaginateOpts,
+) -> Result<PaginatedCommits, OxenError> {
+    let _perf = crate::perf_guard!("core::commits::list_by_path_from_paginated");
+
+    // Check if the path is a directory or file
+    let _perf_node = crate::perf_guard!("core::commits::get_node_by_path");
+    let node = repositories::tree::get_node_by_path(repo, commit, path)?.ok_or_else(|| {
+        OxenError::PathNotFoundInRevision {
+            path: path.to_path_buf().into(),
+            revision: commit.id.clone(),
+        }
+    })?;
+    let last_commit_id = match &node.node {
+        EMerkleTreeNode::File(file_node) => file_node.last_commit_id(),
+        EMerkleTreeNode::Directory(dir_node) => dir_node.last_commit_id(),
+        // A path resolves through `dir_hashes` to a directory or through `read_file` to a file,
+        // so any other kind here means the tree disagrees with itself rather than that the caller
+        // named something absent.
+        node => {
+            return Err(OxenError::InternalError(
+                format!(
+                    "Path {path:?} in commit {} resolved to a {:?} node, expected a file or directory",
+                    commit.id,
+                    node.node_type()
+                )
+                .into(),
+            ));
+        }
+    };
+    let last_commit_id = last_commit_id.to_string();
+    drop(_perf_node);
+
+    let _perf_recursive = crate::perf_guard!("core::commits::list_by_path_recursive");
+    let mut commits: Vec<Commit> = Vec::new();
+    list_by_path_recursive(repo, path, commit, &mut commits)?;
+    log::info!(
+        "list_by_path_from_paginated {} got {} commits before pagination",
+        last_commit_id,
+        commits.len()
+    );
+    drop(_perf_recursive);
+
+    let _perf_paginate = crate::perf_guard!("core::commits::paginate_path_commits");
+    let (commits, pagination) = util::paginate(commits, pagination.page_num, pagination.page_size);
+    drop(_perf_paginate);
+
+    Ok(PaginatedCommits {
+        status: StatusMessage::resource_found(),
+        commits,
+        pagination,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repositories;
+    use crate::test;
+
+    // Writes a commit with an explicit parent and timestamp. The normal commit
+    // path stamps `now()`, so this is the only way to reproduce cross-machine
+    // clock skew: a parent whose timestamp is newer than its own child's.
+    fn commit_at(
+        repo: &LocalRepository,
+        parent: &Commit,
+        message: &str,
+        timestamp: OffsetDateTime,
+    ) -> Result<Commit, OxenError> {
+        let new_commit = crate::model::NewCommit {
+            parent_ids: vec![parent.id.clone()],
+            message: message.to_string(),
+            author: "Ox".to_string(),
+            email: "ox@oxen.ai".to_string(),
+            timestamp,
+        };
+        let hash = commit_writer::compute_commit_id(&new_commit)?;
+        let parent_hash: MerkleHash = parent.id.parse()?;
+        let parent_node = repositories::tree::get_node_by_id_with_children(repo, &parent_hash)?
+            .ok_or_else(|| OxenError::basic_str("parent node not found"))?;
+        let commit_node = CommitNode::new(CommitNodeOpts {
+            hash,
+            parent_ids: vec![parent_hash],
+            email: new_commit.email.clone(),
+            author: new_commit.author.clone(),
+            message: new_commit.message.clone(),
+            timestamp,
+        })?;
+        let mut commit_db = MerkleNodeDB::open_read_write(
+            repo.merkle_node_store(),
+            &commit_node,
+            Some(parent_node.hash),
+        )?;
+        let dir_node = parent_node.children.first().unwrap().dir()?;
+        commit_db.add_child(&dir_node)?;
+        commit_db.close()?;
+        repositories::tree::cp_dir_hashes_to(repo, &parent_hash, commit_node.hash())?;
+        Ok(commit_node.to_commit())
+    }
+
+    // Regression for the base..head skew bug: a shared ancestor must be excluded
+    // even when it sorts ahead of the base tip by timestamp. `base` here is older
+    // than its own parent `shared`, which only happens with clock skew across
+    // machines, exactly the case an order-dependent walk gets wrong.
+    #[tokio::test]
+    async fn test_list_between_exclusive_skewed_timestamps() -> Result<(), OxenError> {
+        test::run_one_commit_local_repo_test_async(|repo| async move {
+            let shared = head_commit(&repo)?;
+            let head = commit_at(
+                &repo,
+                &shared,
+                "head",
+                shared.timestamp + time::Duration::seconds(100),
+            )?;
+            let base = commit_at(
+                &repo,
+                &shared,
+                "base",
+                shared.timestamp - time::Duration::seconds(100),
+            )?;
+
+            let range = list_between_exclusive(&repo, &base, &head).await?;
+            let ids: HashSet<String> = range.iter().map(|c| c.id.clone()).collect();
+            assert_eq!(ids, HashSet::from([head.id.clone()]), "got {range:?}");
+            assert!(
+                !ids.contains(&shared.id),
+                "shared ancestor must be excluded"
+            );
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_pagination_order_with_more_than_10_commits() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            // Create 15 commits to trigger the slow path (skip + limit > 10)
+            let mut commit_ids = Vec::new();
+
+            for i in 0..15 {
+                let filename = format!("file_{i}.txt");
+                let file_path = repo.path.join(&filename);
+                test::write_txt_file_to_path(&file_path, format!("Content {i}"))?;
+
+                repositories::add(&repo, &file_path).await?;
+                let commit = repositories::commit(&repo, &format!("Commit {i}"))?;
+                commit_ids.push(commit.id.clone());
+            }
+
+            // Commits should be ordered newest-first (C14, C13, C12, ...)
+            // Test: skip=9, limit=2 (total 11 > 10) to trigger the slow path
+            // This should return [C5, C4] (skip 9 newest, then take 2)
+            let (paginated_commits, _total, _cached) =
+                list_from_paginated_impl(&repo, "main", 9, 2)?;
+
+            assert_eq!(
+                paginated_commits.len(),
+                2,
+                "Should return exactly 2 commits"
+            );
+
+            // Expected: skip 9 newest (C14 down to C6), then take [C5, C4]
+            let expected_first = &commit_ids[5]; // C5 (0-indexed)
+            let expected_second = &commit_ids[4]; // C4
+
+            println!("Total commits: {}", commit_ids.len());
+            println!("Expected first: {expected_first} (C5 - Commit 5)");
+            println!("Expected second: {expected_second} (C4 - Commit 4)");
+            println!(
+                "Actual first: {} ({})",
+                paginated_commits[0].id, paginated_commits[0].message
+            );
+            println!(
+                "Actual second: {} ({})",
+                paginated_commits[1].id, paginated_commits[1].message
+            );
+
+            assert_eq!(
+                &paginated_commits[0].id, expected_first,
+                "First result should be C5 (Commit 5), but got {}",
+                paginated_commits[0].message
+            );
+            assert_eq!(
+                &paginated_commits[1].id, expected_second,
+                "Second result should be C4 (Commit 4), but got {}",
+                paginated_commits[1].message
+            );
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_pagination_with_forward_path() -> Result<(), OxenError> {
+        test::run_empty_local_repo_test_async(|repo| async move {
+            // Create exactly 10 commits - this should use forward pagination (fast path)
+            let mut commit_ids = Vec::new();
+
+            for i in 0..10 {
+                let filename = format!("file_{i}.txt");
+                let file_path = repo.path.join(&filename);
+                test::write_txt_file_to_path(&file_path, format!("Content {i}"))?;
+
+                repositories::add(&repo, &file_path).await?;
+                let commit = repositories::commit(&repo, &format!("Commit {i}"))?;
+                commit_ids.push(commit.id.clone());
+            }
+
+            // With skip=1, limit=2, and total commits <= 10, should use forward path
+            let (paginated_commits, _total, _cached) =
+                list_from_paginated_impl(&repo, "main", 1, 2)?;
+
+            assert_eq!(
+                paginated_commits.len(),
+                2,
+                "Should return exactly 2 commits"
+            );
+
+            // Forward path should work correctly: skip C9, return [C8, C7]
+            let expected_first = &commit_ids[8]; // C8
+            let expected_second = &commit_ids[7]; // C7
+
+            println!("Forward path test:");
+            println!("Expected first: {expected_first} (C8)");
+            println!("Expected second: {expected_second} (C7)");
+            println!(
+                "Actual first: {} ({})",
+                paginated_commits[0].id, paginated_commits[0].message
+            );
+            println!(
+                "Actual second: {} ({})",
+                paginated_commits[1].id, paginated_commits[1].message
+            );
+
+            assert_eq!(
+                &paginated_commits[0].id, expected_first,
+                "First result should be C8, got {}",
+                paginated_commits[0].message
+            );
+            assert_eq!(
+                &paginated_commits[1].id, expected_second,
+                "Second result should be C7, got {}",
+                paginated_commits[1].message
+            );
+
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_open_commit_count_db_shares_one_handle() -> Result<(), OxenError> {
+        // RocksDB holds an exclusive lock per DB path, so a second open taken while the first is
+        // still live fails outright. Overlapping callers have to be handed the same handle.
+        test::run_one_commit_local_repo_test_async(|repo| async move {
+            let first = open_commit_count_db(&repo)?;
+            let second = open_commit_count_db(&repo)?;
+
+            assert!(
+                Arc::ptr_eq(&first, &second),
+                "overlapping callers should share one commit_count handle"
+            );
+
+            // After the last caller drops it the cached entry is dangling, so the next open has
+            // to build a fresh handle rather than hand back the dead one.
+            drop(first);
+            drop(second);
+            let reopened = open_commit_count_db(&repo)?;
+            assert_eq!(
+                Arc::strong_count(&reopened),
+                1,
+                "a reopen after full release should yield a fresh handle"
+            );
+
+            Ok(())
+        })
+        .await
+    }
+
+    /// A LOCK collision is waited out rather than surfaced: the open retries while another
+    /// handle holds the path LOCK, and goes through once that handle is released.
+    #[tokio::test]
+    async fn test_open_commit_count_db_retries_lock_collision() -> Result<(), OxenError> {
+        test::run_one_commit_local_repo_test_async(|repo| async move {
+            let db_path = util::fs::oxen_hidden_dir(&repo.path).join(COMMIT_COUNT_DIR);
+            util::fs::create_dir_all(&db_path)?;
+
+            // Held outside COMMIT_COUNT_DBS so the cache cannot hand this handle back and every
+            // open below has to survive a real LOCK collision.
+            let blocker: DBWithThreadMode<MultiThreaded> =
+                DBWithThreadMode::open(&opts::default(), dunce::simplified(&db_path))?;
+            let collision = DBWithThreadMode::<MultiThreaded>::open(
+                &opts::default(),
+                dunce::simplified(&db_path),
+            )
+            .expect_err("a second open of a locked path must fail");
+            assert!(
+                db::is_lock_collision(&collision),
+                "expected a LOCK collision, got: {collision}"
+            );
+
+            // The LOCK is never released here, so the open exhausts its retries. Spending the
+            // whole retry window proves it waited instead of surfacing the first collision.
+            let start = std::time::Instant::now();
+            let err = open_commit_count_db(&repo).expect_err("open under a held LOCK must fail");
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed >= db::OPEN_RETRY_INTERVAL * (db::OPEN_RETRIES - 1),
+                "open gave up after {elapsed:?}, before exhausting its retries"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("LOCK") || msg.contains("lock file"),
+                "expected a LOCK error, got: {msg}"
+            );
+
+            // Releasing the LOCK part way through the retry window lets the open through.
+            let releaser = std::thread::spawn(move || {
+                sleep(db::OPEN_RETRY_INTERVAL * 10);
+                drop(blocker);
+            });
+            open_commit_count_db(&repo)?;
+            releaser.join().expect("join releaser");
+
+            Ok(())
+        })
+        .await
+    }
+}

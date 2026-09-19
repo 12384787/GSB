@@ -1,0 +1,1 @@
+.claude,.dockerignore .gitattributes,.github .gitignore,.mcp.json .nvmrc,.oxfmtrc.jsonc .vscode,.yarn .yarnrc.yml,AGENTS.md CLAUDE.md,LICENSE README.md,SKILLS.md jest.preset.js,nx.json package.json,packages tsconfig.base.json,yarn.config.cjs yarn.lock

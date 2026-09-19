@@ -1,0 +1,134 @@
+use async_trait::async_trait;
+use clap::{Arg, Command};
+use liboxen::core::v_latest::index::CommitMerkleTree;
+use liboxen::error::OxenError;
+use liboxen::model::{Commit, LocalRepository};
+use liboxen::repositories;
+use std::time::Instant;
+
+use crate::cmd::RunCmd;
+pub const NAME: &str = "tree";
+pub struct TreeCmd;
+
+#[async_trait]
+impl RunCmd for TreeCmd {
+    fn name(&self) -> &str {
+        NAME
+    }
+
+    fn args(&self) -> Command {
+        // Setups the CLI args for the command
+        Command::new(NAME)
+            .about("Print the merkle tree 🌲 of a commit.")
+            .arg(
+                Arg::new("commit")
+                    .long("commit")
+                    .short('c')
+                    .help("The commit to print the tree of.")
+                    .default_value("HEAD")
+                    .action(clap::ArgAction::Set),
+            )
+            .arg(
+                Arg::new("node")
+                    .long("node")
+                    .short('n')
+                    .help("The node to print the tree of.")
+                    .action(clap::ArgAction::Set),
+            )
+            .arg(
+                Arg::new("path")
+                    .long("path")
+                    .short('p')
+                    .help("The path to print the tree of.")
+                    .action(clap::ArgAction::Set),
+            )
+            .arg(
+                Arg::new("depth")
+                    .long("depth")
+                    .short('d')
+                    .help("How many levels deep to traverse the tree. -1 for all.")
+                    .default_value("-1")
+                    .action(clap::ArgAction::Set),
+            )
+            .arg(
+                Arg::new("legacy")
+                    .long("legacy")
+                    .help("To use the legacy lookup method")
+                    .action(clap::ArgAction::SetTrue),
+            )
+    }
+
+    async fn run(&self, args: &clap::ArgMatches) -> Result<(), anyhow::Error> {
+        // Parse Args
+        let depth = args
+            .get_one::<String>("depth")
+            .expect("depth has a default value")
+            .parse::<i32>()
+            .map_err(OxenError::ParseIntError)?;
+        let commit_id = args
+            .get_one::<String>("commit")
+            .expect("commit has a default value");
+        let repo = LocalRepository::from_current_dir()?;
+
+        let commit = if commit_id == "HEAD" {
+            repositories::commits::head_commit(&repo)?
+        } else {
+            let Some(commit) = repositories::commits::get_by_id(&repo, commit_id)? else {
+                return Err(OxenError::commit_id_does_not_exist(commit_id))?;
+            };
+            commit
+        };
+
+        let path = args.get_one::<String>("path");
+        if let Some(node) = args.get_one::<String>("node") {
+            self.print_node(&repo, node, depth)?;
+        } else {
+            self.print_tree(&repo, &commit, path, depth)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl TreeCmd {
+    fn print_node(&self, repo: &LocalRepository, node: &str, depth: i32) -> Result<(), OxenError> {
+        let node_hash = node.parse()?;
+        // REFACTOR: Get through repositories::tree
+        let tree = CommitMerkleTree::read_node(repo, &node_hash, true)?
+            .ok_or_else(|| OxenError::resource_not_found(format!("Node {node_hash} not found")))?;
+        CommitMerkleTree::print_node_depth(&tree, depth);
+
+        Ok(())
+    }
+
+    fn print_tree(
+        &self,
+        repo: &LocalRepository,
+        commit: &Commit,
+        path: Option<&String>,
+        depth: i32,
+    ) -> Result<(), anyhow::Error> {
+        let load_start = Instant::now(); // Start timing
+        match (repo.subtree_paths(), repo.depth()) {
+            (Some(subtrees), Some(depth)) => {
+                println!("Working with subtrees: {subtrees:?}");
+                println!("Depth: {depth}");
+                println!("Loading first tree...");
+                let first = subtrees
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("No subtree paths configured"))?;
+                repositories::tree::print_tree_depth_subtree(repo, commit, depth, first)?;
+            }
+            (_, _) => {
+                if let Some(path) = path {
+                    repositories::tree::print_tree_path(repo, commit, path)?;
+                } else {
+                    repositories::tree::print_tree_depth(repo, commit, depth)?;
+                }
+            }
+        };
+        let load_duration = load_start.elapsed(); // Calculate duration
+        println!("Time to load tree: {load_duration:?}");
+        Ok(())
+    }
+}

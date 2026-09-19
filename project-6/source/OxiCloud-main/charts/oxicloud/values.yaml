@@ -1,0 +1,70 @@
+---
+replicaCount: 1
+
+image:
+  repository: diocrafts/oxicloud
+  pullPolicy: IfNotPresent
+  tag: "0.9.0"
+
+# cf : https://github.com/AtalayaLabs/OxiCloud/blob/main/example.env
+envs:
+  - name: OXICLOUD_DB_CONNECTION_STRING
+    value: "postgres://postgres:postgres@postgres/oxicloud"
+  - name: OXICLOUD_STORAGE_PATH
+    value: /app/storage
+  - name: OXICLOUD_STATIC_PATH
+    value: /app/static
+
+
+config:
+  server:
+    port: 8086
+    host: "0.0.0.0"
+    baseUrl: "http://cloud.example.com"
+  features:
+    enableAuth: "true"
+    enableSharing: "true"
+  mimalloc:
+    purgeDelay: "0"
+    allowLargeOsPages: "0"
+
+persistence:
+  enabled: true
+  storageClass: ""
+  accessMode: ReadWriteOnce
+  size: 50Gi
+  # or use existing pvc
+  # existingClaim: claim-name
+
+wopi:
+  enabled: true
+  collabora:
+    url: "cloud.example.com"
+    image:
+      repository: collabora/code
+      tag: latest
+      pullPolicy: IfNotPresent
+    service:
+      port: 9980
+    admin:
+      username: admin
+    # In production behind an ingress, you'd likely enable SSL termination.
+    extraParams: "--o:ssl.enable=false --o:ssl.termination=false --o:net.frame_ancestors=http://* https://*"
+
+service:
+  type: ClusterIP
+  port: 8086
+
+ingress:
+  enabled: true
+  className: "traefik" # Adjust to your ingress controller (e.g., traefik)
+  annotations: {}
+  hosts:
+    - host: cloud.example.com
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls: []
+  #  - secretName: oxicloud-tls
+  #    hosts:
+  #      - cloud.example.com

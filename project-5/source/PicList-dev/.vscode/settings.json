@@ -1,0 +1,102 @@
+{
+  "[css]": {
+    "editor.codeActionsOnSave": {
+      "source.fixAll.stylelint": "always"
+    },
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.formatOnSave": true
+  },
+  "[javascript][javascriptreact][typescript][typescriptreact][json][jsonc][json5]": {
+    "editor.codeActionsOnSave": {
+      "source.fixAll.eslint": "always"
+    },
+    "editor.defaultFormatter": "dbaeumer.vscode-eslint",
+    "editor.formatOnSave": false
+  },
+  "[markdown]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.formatOnSave": true,
+    "files.trimTrailingWhitespace": false
+  },
+  "[vue]": {
+    "editor.codeActionsOnSave": {
+      "source.fixAll.eslint": "always",
+      "source.fixAll.stylelint": "always"
+    },
+    "editor.defaultFormatter": "dbaeumer.vscode-eslint",
+    "editor.formatOnSave": false
+  },
+  "[yaml]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.formatOnSave": true
+  },
+  "css.validate": false,
+  "editor.codeActionsOnSave": {
+    "source.organizeImports": "never"
+  },
+  "editor.detectIndentation": false,
+  "editor.insertSpaces": true,
+  "editor.rulers": [120],
+  "editor.tabSize": 2,
+  "emmet.includeLanguages": {
+    "vue": "html",
+    "vue-html": "html"
+  },
+  "eslint.format.enable": true,
+  "eslint.run": "onSave",
+  "eslint.validate": [
+    "javascript",
+    "javascriptreact",
+    "typescript",
+    "typescriptreact",
+    "vue",
+    "json",
+    "jsonc",
+    "json5"
+  ],
+  "files.encoding": "utf8",
+  "files.eol": "\n",
+  "files.insertFinalNewline": true,
+  "files.trimFinalNewlines": true,
+  "files.trimTrailingWhitespace": true,
+  "files.watcherExclude": {
+    "**/.git/objects/**": true,
+    "**/.git/subtree-cache/**": true,
+    "**/coverage/**": true,
+    "**/dist_electron/**": true,
+    "**/dist/**": true,
+    "**/node_modules/**": true,
+    "**/out/**": true,
+    "**/release/**": true
+  },
+  "githubPullRequests.ignoredPullRequestBranches": ["dev"],
+  "i18n-ally.displayLanguage": "zh-CN",
+  "i18n-ally.editor.preferEditor": true,
+  "i18n-ally.enabledFrameworks": ["vue"],
+  "i18n-ally.enabledParsers": ["json", "yaml"],
+  "i18n-ally.keystyle": "nested",
+  "i18n-ally.localesPaths": ["src/renderer/i18n/locales", "src/main/i18n/locales"],
+  "i18n-ally.namespace": true,
+  "i18n-ally.sortKeys": true,
+  "i18n-ally.sourceLanguage": "en",
+  "js/ts.preferences.quoteStyle": "single",
+  "js/ts.tsdk.path": "node_modules/typescript/lib",
+  "js/ts.tsdk.promptToUseWorkspaceVersion": true,
+  "js/ts.updateImportsOnFileMove.enabled": "always",
+  "npm.packageManager": "yarn",
+  "prettier.requireConfig": true,
+  "prettier.useEditorConfig": true,
+  "search.exclude": {
+    "**/coverage": true,
+    "**/dist": true,
+    "**/dist_electron": true,
+    "**/node_modules": true,
+    "**/out": true,
+    "**/release": true
+  },
+  "stylelint.run": "onSave",
+  "stylelint.validate": ["css", "vue"],
+  "tailwindCSS.includeLanguages": {
+    "vue": "html"
+  }
+}

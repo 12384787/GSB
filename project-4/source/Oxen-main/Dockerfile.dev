@@ -1,0 +1,68 @@
+FROM rust:1.94-bookworm AS base
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang \
+    lld \
+    cmake \
+    pkg-config \
+    libssl-dev \
+    curl \
+    ca-certificates \
+    xz-utils \
+    libjpeg-turbo-progs \
+    libpng-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# FFmpeg 8 for the `ffmpeg` video-thumbnail feature, installed via the shared helper. Pins live in
+# tool-versions.env, the single source of truth shared with Linux dev (bin/install-prereqs) and CI.
+ARG TARGETARCH
+COPY bin/install-ffmpeg tool-versions.env /tmp/ffmpeg-install/
+RUN FFMPEG_ARCH="$TARGETARCH" TOOL_VERSIONS_FILE=/tmp/ffmpeg-install/tool-versions.env \
+    bash /tmp/ffmpeg-install/install-ffmpeg \
+    && rm -rf /tmp/ffmpeg-install
+ENV PKG_CONFIG_PATH="/opt/ffmpeg/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+RUN cargo install cargo-chef
+
+FROM base AS planner
+WORKDIR /usr/src/oxen-server
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM base AS builder
+WORKDIR /usr/src/oxen-server
+
+COPY --from=planner /usr/src/oxen-server/recipe.json recipe.json
+
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=lld"
+
+RUN cargo chef cook -p oxen-server --features liboxen/ffmpeg,liboxen/perf-logging --recipe-path recipe.json
+
+COPY . .
+RUN cargo build -p oxen-server --features liboxen/ffmpeg,liboxen/perf-logging
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+    openssl \
+    ca-certificates \
+    && rm -rfv /var/lib/apt/lists/*
+
+# FFmpeg 8 shared libraries for the `ffmpeg` video-thumbnail feature (see base stage).
+COPY --from=builder /opt/ffmpeg/lib /opt/ffmpeg/lib
+RUN echo /opt/ffmpeg/lib > /etc/ld.so.conf.d/ffmpeg.conf && ldconfig
+
+WORKDIR /oxen-server
+
+COPY --from=builder /usr/src/oxen-server/target/debug/oxen-server /usr/local/bin
+
+# 50MB stack size (should be more than enough...)
+ENV RUST_MIN_STACK=50000000
+# Set the log level to info for the server
+ENV RUST_LOG=info
+ENV SYNC_DIR=/var/oxen/data
+ENV OXEN_PERF_LOGGING=1
+
+EXPOSE 3000
+CMD ["oxen-server", "start", "-p", "3000"]

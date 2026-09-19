@@ -1,0 +1,63 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: bash -c 'cargo fmt --all'
+        language: system
+        files: \.rs$
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: bash -c 'cargo clippy --workspace --all-targets --no-deps -- -D warnings'
+        language: system
+        files: \.rs$
+        pass_filenames: false
+
+      - id: cargo-sort
+        name: cargo sort
+        entry: bash -c 'for f in "$@"; do cargo sort "$(dirname "$f")" || exit 1; done' --
+        language: system
+        files: Cargo\.toml$
+        pass_filenames: true
+
+      - id: ruff-check
+        name: ruff check (oxen-python)
+        entry: bash -c '. ./tool-versions.env && uvx ruff@"$RUFF_VERSION" check oxen-python/'
+        language: system
+        files: ^oxen-python/.*\.py$
+        pass_filenames: false
+
+      - id: ruff-format
+        name: ruff format (oxen-python)
+        entry: bash -c '. ./tool-versions.env && uvx ruff@"$RUFF_VERSION" format oxen-python/'
+        language: system
+        files: ^oxen-python/.*\.py$
+        pass_filenames: false
+
+      - id: ruff-check-python-scripts
+        name: ruff check (python scripts)
+        entry: bash -c '. ./tool-versions.env && uvx ruff@"$RUFF_VERSION" check bin/'
+        language: system
+        files: ^bin/.*\.py$
+        pass_filenames: false
+
+      - id: ruff-format-python-scripts
+        name: ruff format (python scripts)
+        entry: bash -c '. ./tool-versions.env && uvx ruff@"$RUFF_VERSION" format bin/'
+        language: system
+        files: ^bin/.*\.py$
+        pass_filenames: false
+
+      - id: shellcheck
+        name: shellcheck
+        entry: shellcheck -x
+        language: system
+        types: [shell]
+        files: ^bin/

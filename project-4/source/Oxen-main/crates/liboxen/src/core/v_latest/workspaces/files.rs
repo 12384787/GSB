@@ -1,0 +1,1163 @@
+use bytes::BytesMut;
+use futures::StreamExt;
+use parking_lot::Mutex;
+use reqwest::Client;
+use reqwest::header::HeaderValue;
+use reqwest::redirect;
+use std::collections::HashSet;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::net::IpAddr;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use url::Url;
+use zip::ZipArchive;
+
+use crate::core;
+use crate::core::staged::staged_db_manager::get_staged_db_manager;
+use crate::core::v_latest::add::{
+    get_file_node, process_add_file_with_staged_db_manager, stage_file_with_hash,
+};
+use crate::error::OxenError;
+use crate::model::file::TempFilePathNew;
+use crate::model::merkle_tree::node::EMerkleTreeNode;
+use crate::model::merkle_tree::node::{MerkleTreeNode, StagedMerkleTreeNode};
+use crate::model::user::User;
+use crate::model::workspace::Workspace;
+use crate::model::{Branch, Commit, StagedEntryStatus};
+use crate::model::{LocalRepository, NewCommitBody};
+use crate::repositories;
+use crate::util;
+use crate::view::ErrorFileInfo;
+
+const BUFFER_SIZE_THRESHOLD: usize = 262144; // 256kb
+const MAX_CONTENT_LENGTH: u64 = 1024 * 1024 * 1024; // 1GB limit
+const MAX_DECOMPRESSED_SIZE: u64 = 1024 * 1024 * 1024; // 1GB limit
+const MAX_COMPRESSION_RATIO: u64 = 100; // Maximum allowed
+
+// TODO: Do we depreciate this, if we always upload to version store?
+pub async fn add(workspace: &Workspace, filepath: impl AsRef<Path>) -> Result<PathBuf, OxenError> {
+    let filepath = filepath.as_ref();
+    let workspace_repo = &workspace.workspace_repo;
+    let base_repo = &workspace.base_repo;
+
+    // Stage the file using the repositories::add method
+    let commit = workspace.commit.clone();
+    p_add_file(base_repo, workspace_repo, &Some(commit), filepath).await?;
+
+    // Return the relative path of the file in the workspace
+    let relative_path = util::fs::path_relative_to_dir(filepath, &workspace_repo.path)?;
+    Ok(relative_path)
+}
+
+pub async fn rm(
+    workspace: &Workspace,
+    filepath: impl AsRef<Path>,
+) -> Result<Vec<ErrorFileInfo>, OxenError> {
+    let filepath = filepath.as_ref();
+
+    // Stage the file using the repositories::rm method
+    let err_files = p_rm(workspace, filepath).await?;
+
+    // Return the Err files
+    Ok(err_files)
+}
+
+pub async fn add_version_file(
+    workspace: &Workspace,
+    dst_path: impl AsRef<Path>,
+    file_hash: &str,
+) -> Result<PathBuf, OxenError> {
+    let dst_path = dst_path.as_ref();
+
+    // Materialize the version blob so the staging metadata computation has a local file to read.
+    // The returned guard cleans up any temp file once staging has read it.
+    let version_path = workspace
+        .base_repo
+        .version_store()
+        .materialize(file_hash, &workspace.dir())
+        .await?;
+
+    let staged_db_manager = get_staged_db_manager(&workspace.workspace_repo)?;
+    stage_file_with_hash(
+        workspace,
+        &version_path,
+        dst_path,
+        file_hash,
+        &staged_db_manager,
+        &Arc::new(Mutex::new(HashSet::new())),
+    )
+    .await?;
+
+    Ok(dst_path.to_path_buf())
+}
+
+/// Stage a batch of version files into the workspace. Each entry is a destination path (already
+/// resolved and validated) paired with the hash of its content, which must already be in the
+/// version store.
+///
+/// Returns the destination paths that staged successfully, plus a per-file error for each that did
+/// not (content missing from the version store, or a staging failure).
+pub async fn add_version_files_at_paths(
+    workspace: &Workspace,
+    files: Vec<(PathBuf, String)>,
+) -> Result<(Vec<PathBuf>, Vec<ErrorFileInfo>), OxenError> {
+    // Materialize files in a background task -- an S3 object download per file, or a zero-IO path
+    // return for the local store -- with bounded concurrency, while staging them serially here:
+    // staging shares one StagedDBManager write lock and one `seen_dirs` set, so it can't run in
+    // parallel. Results arrive in input order over a bounded channel that backpressures the
+    // producer, so materialization keeps running ahead during staging. At most 2 ×
+    // MATERIALIZE_CONCURRENCY temp files exist at once: up to MATERIALIZE_CONCURRENCY in-flight
+    // inside the buffered stream plus up to MATERIALIZE_CONCURRENCY queued in the channel.
+    const MATERIALIZE_CONCURRENCY: usize = 16;
+
+    let version_store = workspace.base_repo.version_store();
+    let dir = Arc::new(workspace.dir());
+    let seen_dirs = Arc::new(Mutex::new(HashSet::new()));
+    let staged_db_manager = get_staged_db_manager(&workspace.workspace_repo)?;
+
+    let num_files = files.len();
+    let (tx, mut rx) = mpsc::channel(MATERIALIZE_CONCURRENCY);
+    let producer = tokio::spawn(async move {
+        let mut materialized = futures::stream::iter(files)
+            .map(move |(dst_path, hash)| {
+                let version_store = version_store.clone();
+                let dir = dir.clone(); // Arc clone — refcount bump, not a heap allocation
+                async move {
+                    // The returned guard keeps any S3-materialized temp file alive until staging
+                    // reads it.
+                    let result = version_store.materialize(&hash, dir.as_path()).await;
+                    (dst_path, hash, result)
+                }
+            })
+            .buffered(MATERIALIZE_CONCURRENCY);
+        while let Some(item) = materialized.next().await {
+            if tx.send(item).await.is_err() {
+                break; // the staging side went away; stop materializing
+            }
+        }
+    });
+
+    let mut staged_paths = Vec::with_capacity(num_files);
+    let mut err_files = vec![];
+    while let Some((dst_path, hash, materialize_result)) = rx.recv().await {
+        let version_path = match materialize_result {
+            Ok(path) => path,
+            Err(e) => {
+                let error = format!("Failed to resolve version path: {e}");
+                log::error!("{error}");
+                err_files.push(ErrorFileInfo {
+                    hash,
+                    path: Some(dst_path),
+                    error,
+                });
+                continue;
+            }
+        };
+        match stage_file_with_hash(
+            workspace,
+            &version_path,
+            &dst_path,
+            &hash,
+            &staged_db_manager,
+            &seen_dirs,
+        )
+        .await
+        {
+            Ok(_) => staged_paths.push(dst_path),
+            Err(e) => {
+                let error = format!("Failed to add file to staged db: {e}");
+                log::error!("{error}");
+                err_files.push(ErrorFileInfo {
+                    hash,
+                    path: Some(dst_path),
+                    error,
+                });
+            }
+        }
+    }
+
+    // The producer drops `tx` once it has materialized every file, which ends the loop above;
+    // join it to surface a panic rather than leaving a detached task.
+    if let Err(e) = producer.await {
+        log::error!("version materialization task failed: {e}");
+    }
+
+    log::debug!(
+        "add_version_files_at_paths complete with {} staged, {} err_files",
+        staged_paths.len(),
+        err_files.len()
+    );
+    Ok((staged_paths, err_files))
+}
+
+pub fn track_modified_data_frame(
+    workspace: &Workspace,
+    filepath: impl AsRef<Path>,
+) -> Result<PathBuf, OxenError> {
+    let filepath = filepath.as_ref();
+    let workspace_repo = &workspace.workspace_repo;
+    let base_repo = &workspace.base_repo;
+
+    // Stage the file using the repositories::add method
+    let commit = workspace.commit.clone();
+    p_modify_file(base_repo, workspace_repo, &Some(commit), filepath)?;
+
+    // Return the relative path of the file in the workspace
+    let relative_path = util::fs::path_relative_to_dir(filepath, &workspace_repo.path)?;
+    Ok(relative_path)
+}
+
+pub async fn remove_files_from_staged_db(
+    workspace: &Workspace,
+    paths: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>, OxenError> {
+    let mut err_files = vec![];
+
+    for path in paths {
+        match unstage(workspace, &path) {
+            Ok(_) => {}
+            Err(e) => {
+                log::debug!("Error removing file path {path:?}: {e:?}");
+                err_files.push(path);
+            }
+        }
+    }
+
+    Ok(err_files)
+}
+
+/// Discard the workspace's staged changes for `path`, including the staged edits held in a data
+/// frame's DuckDB index. Editing the path again re-indexes it from the committed file.
+pub fn unstage(workspace: &Workspace, path: impl AsRef<Path>) -> Result<(), OxenError> {
+    let workspace_repo = &workspace.workspace_repo;
+    let path = util::fs::path_relative_to_dir(path.as_ref(), &workspace_repo.path)?;
+    // Drop the index first: a failure here leaves the path staged and indexed, which is coherent,
+    // where dropping the entry first would leave the discarded edits waiting to be re-staged.
+    unindex_if_staged_table(workspace, &path)?;
+    get_staged_db_manager(workspace_repo)?.delete_entry(&path)
+}
+
+pub fn exists(workspace: &Workspace, path: impl AsRef<Path>) -> Result<bool, OxenError> {
+    let workspace_repo = &workspace.workspace_repo;
+    let path = util::fs::path_relative_to_dir(path.as_ref(), &workspace_repo.path)?;
+    get_staged_db_manager(workspace_repo)?.exists(&path)
+}
+
+/// SSRF protection: checks whether an IP is non-globally-routable. Covers private,
+/// loopback, link-local, and cloud-internal ranges (e.g. CGN used by AWS). Also handles
+/// IPv6 encodings that embed IPv4 addresses (mapped, compatible, NAT64) to prevent
+/// bypassing the check by encoding a private IPv4 inside an IPv6 address.
+fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()           // 127.0.0.0/8
+                || v4.is_private()     // 10/8, 172.16/12, 192.168/16
+                || v4.is_link_local()  // 169.254/16
+                || v4.is_unspecified() // 0.0.0.0
+                || v4.is_broadcast()   // 255.255.255.255
+                || is_cgn_or_reserved_v4(v4.octets())
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
+            let segments = v6.segments();
+            // fc00::/7 (unique local)
+            if segments[0] & 0xfe00 == 0xfc00 {
+                return true;
+            }
+            // fe80::/10 (link-local)
+            if segments[0] & 0xffc0 == 0xfe80 {
+                return true;
+            }
+            // 2001:db8::/32 (documentation)
+            if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+                return true;
+            }
+            // 64:ff9b::/96 and 64:ff9b:1::/48 (NAT64 — may embed private IPv4)
+            if segments[0] == 0x0064 && segments[1] == 0xff9b {
+                // Extract embedded IPv4 and check it
+                let v4 = std::net::Ipv4Addr::new(
+                    (segments[6] >> 8) as u8,
+                    segments[6] as u8,
+                    (segments[7] >> 8) as u8,
+                    segments[7] as u8,
+                );
+                return is_private_ip(&IpAddr::V4(v4));
+            }
+            // IPv4-mapped (::ffff:x.x.x.x) and IPv4-compatible (::x.x.x.x)
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_ip(&IpAddr::V4(v4));
+            }
+            if let Some(v4) = v6.to_ipv4() {
+                return is_private_ip(&IpAddr::V4(v4));
+            }
+            false
+        }
+    }
+}
+
+/// Additional reserved IPv4 ranges not covered by std methods
+fn is_cgn_or_reserved_v4(octets: [u8; 4]) -> bool {
+    // 100.64.0.0/10 — Shared/CGN (RFC 6598), used internally by cloud providers
+    if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
+        return true;
+    }
+    // 192.0.0.0/24 — IETF protocol assignments (RFC 6890)
+    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
+        return true;
+    }
+    // 198.18.0.0/15 — Benchmarking (RFC 2544)
+    if octets[0] == 198 && (octets[1] & 0xFE) == 18 {
+        return true;
+    }
+    false
+}
+
+#[derive(Debug, thiserror::Error)]
+enum InvalidUrlError {
+    #[error("URL has no host")]
+    NoHost,
+
+    #[error("DNS resolution failed for {host}: {source}")]
+    DnsResolutionFailed {
+        host: String,
+        source: std::io::Error,
+    },
+
+    #[error("URL resolves to a private/reserved IP address: {0}")]
+    PrivateIp(std::net::IpAddr),
+}
+
+/// Resolves a URL's hostname via DNS and rejects it if any resolved address is
+/// private/reserved. This prevents SSRF attacks where a user-supplied URL could reach
+/// internal services (e.g. cloud metadata at 169.254.169.254, internal APIs, etc.).
+///
+/// When `allow_loopback` is true, loopback targets (127.0.0.0/8 and ::1) are permitted (for tests).
+async fn validate_url_target(url: &Url, allow_loopback: bool) -> Result<(), InvalidUrlError> {
+    let host = url.host_str().ok_or(InvalidUrlError::NoHost)?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addr = format!("{host}:{port}");
+
+    let resolved =
+        tokio::net::lookup_host(&addr)
+            .await
+            .map_err(|e| InvalidUrlError::DnsResolutionFailed {
+                host: host.to_string(),
+                source: e,
+            })?;
+
+    for socket_addr in resolved {
+        let ip = socket_addr.ip();
+        if allow_loopback && ip.is_loopback() {
+            continue;
+        }
+        if is_private_ip(&ip) {
+            return Err(InvalidUrlError::PrivateIp(ip));
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_content_disposition_filename(header: &str) -> Option<String> {
+    // Look for filename="..." or filename=...
+    let lower = header.to_lowercase();
+    if let Some(pos) = lower.find("filename=") {
+        let rest = &header[pos + 9..];
+        if let Some(rest) = rest.strip_prefix('"') {
+            // filename="..."
+            rest.find('"').map(|end| rest[..end].to_string())
+        } else {
+            // filename=... (unquoted, until semicolon or end)
+            let end = rest.find(';').unwrap_or(rest.len());
+            let name = rest[..end].trim();
+            if name.is_empty() {
+                None
+            } else {
+                Some(name.to_string())
+            }
+        }
+    } else {
+        None
+    }
+}
+
+fn filename_from_url(url: &Url) -> Option<String> {
+    url.path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| urlencoding::decode(s).ok())
+        .map(|s| s.into_owned())
+}
+
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_whitespace() { '_' } else { c })
+        .filter(|&c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
+        .collect()
+}
+
+/// Downloads a file from a user-supplied URL into a workspace directory.
+/// Validates the URL scheme and target IP before fetching to prevent SSRF.
+///
+/// `allow_loopback` relaxes the SSRF guard for loopback targets for tests.
+pub async fn import(
+    url: &str,
+    auth: &str,
+    directory: PathBuf,
+    filename: Option<String>,
+    workspace: &Workspace,
+    allow_loopback: bool,
+) -> Result<(), OxenError> {
+    let parsed_url =
+        Url::parse(url).map_err(|_| OxenError::file_import_error(format!("Invalid URL: {url}")))?;
+
+    let scheme = parsed_url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(OxenError::file_import_error(
+            "Only http and https URLs are allowed",
+        ));
+    }
+
+    validate_url_target(&parsed_url, allow_loopback)
+        .await
+        .map_err(|e| OxenError::ImportFileError(format!("{e}").into()))?;
+
+    let auth_header_value = HeaderValue::from_str(auth)
+        .map_err(|_e| OxenError::file_import_error(format!("Invalid header auth value {auth}")))?;
+
+    fetch_file(
+        &parsed_url,
+        auth_header_value,
+        directory,
+        filename,
+        workspace,
+        allow_loopback,
+    )
+    .await?;
+
+    Ok(())
+}
+
+pub async fn upload_zip(
+    commit_message: &str,
+    user: &User,
+    temp_files: Vec<TempFilePathNew>,
+    workspace: &Workspace,
+    branch: &Branch,
+) -> Result<Commit, OxenError> {
+    // Unzip the files and add
+    for temp_file in temp_files {
+        let files = decompress_zip(&temp_file.temp_file_path)?;
+
+        for file in files.iter() {
+            // Skip files in __MACOSX directories
+            if file
+                .components()
+                .any(|component| component.as_os_str().to_string_lossy() == "__MACOSX")
+            {
+                log::debug!("Skipping __MACOSX file: {file:?}");
+                continue;
+            }
+
+            repositories::workspaces::files::add(workspace, file).await?;
+        }
+    }
+
+    let data = NewCommitBody {
+        message: commit_message.to_string(),
+        author: user.name.clone(),
+        email: user.email.clone(),
+    };
+
+    let res = repositories::workspaces::commit(workspace, &data, &branch.name).await;
+    match res {
+        Ok(commit) => {
+            log::debug!("workspace::commit ✅ success! commit {commit:?}");
+            Ok(commit)
+        }
+        workspace_behind_error @ Err(OxenError::WorkspaceBehind(_)) => {
+            log::error!(
+                "unable to commit branch {:?}. Workspace behind",
+                branch.name
+            );
+            workspace_behind_error
+        }
+        Err(err) => {
+            log::error!("unable to commit branch {:?}. Err: {}", branch.name, err);
+            Err(err)
+        }
+    }
+}
+
+const MAX_REDIRECTS: usize = 10;
+
+/// Fetches a file from the given URL, handling redirects manually for two reasons:
+/// 1. Auth credentials are only sent on the first request, not leaked to redirect targets
+///    (e.g. HuggingFace redirects to a CDN — we shouldn't send the HF token there)
+/// 2. Each redirect target is validated against private/reserved IPs to prevent SSRF
+///    via open redirects (an attacker's server could 302 to http://169.254.169.254/)
+async fn fetch_file(
+    url: &Url,
+    auth_header_value: HeaderValue,
+    directory: PathBuf,
+    caller_filename: Option<String>,
+    workspace: &Workspace,
+    allow_loopback: bool,
+) -> Result<(), OxenError> {
+    let client = Client::builder()
+        .redirect(redirect::Policy::none())
+        .build()
+        .map_err(|e| OxenError::file_import_error(format!("Failed to build HTTP client: {e}")))?;
+
+    let mut current_url = url.clone();
+    let mut response = None;
+
+    for hop in 0..=MAX_REDIRECTS {
+        let mut req = client.get(current_url.as_str());
+        if hop == 0 {
+            req = req.header("Authorization", auth_header_value.clone());
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| OxenError::file_import_error(format!("Fetch file request failed: {e}")))?;
+
+        let status = resp.status();
+        if status.is_redirection() {
+            if hop == MAX_REDIRECTS {
+                return Err(OxenError::file_import_error("Too many redirects (max 10)"));
+            }
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| {
+                    OxenError::file_import_error("Redirect response missing Location header")
+                })?;
+
+            // Resolve relative redirects
+            let next_url = current_url
+                .join(location)
+                .map_err(|e| OxenError::file_import_error(format!("Invalid redirect URL: {e}")))?;
+
+            // Validate redirect target
+            let scheme = next_url.scheme();
+            if scheme != "http" && scheme != "https" {
+                return Err(OxenError::file_import_error(
+                    "Redirect to non-HTTP(S) URL is not allowed",
+                ));
+            }
+            validate_url_target(&next_url, allow_loopback)
+                .await
+                .map_err(|e| OxenError::ImportFileError(format!("{e}").into()))?;
+
+            current_url = next_url;
+            continue;
+        }
+
+        if !status.is_success() {
+            return Err(OxenError::file_import_error(format!(
+                "HTTP request failed with status {status}"
+            )));
+        }
+
+        response = Some(resp);
+        break;
+    }
+
+    let response = response
+        .ok_or_else(|| OxenError::file_import_error("Failed to get a successful response"))?;
+
+    let resp_headers = response.headers();
+
+    let content_type = resp_headers
+        .get("content-type")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("application/octet-stream");
+
+    let content_length = response.content_length();
+    if let Some(content_length) = content_length
+        && content_length > MAX_CONTENT_LENGTH
+    {
+        return Err(OxenError::file_import_error(format!(
+            "Content length {content_length} exceeds maximum allowed size of 1GB"
+        )));
+    }
+
+    // Resolve filename: caller-specified > Content-Disposition > URL path > UUID
+    let raw_filename = caller_filename.clone().unwrap_or_else(|| {
+        // caller specified
+        resp_headers
+            .get("content-disposition")
+            .and_then(|h| h.to_str().ok())
+            .and_then(parse_content_disposition_filename) // Content-Disposition
+            .or_else(|| filename_from_url(&current_url)) // URL path
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()) // UUID
+    });
+
+    let filename = sanitize_filename(&raw_filename);
+    if filename.is_empty() {
+        return Err(OxenError::file_import_error(format!(
+            "Could not determine a valid filename for {url}"
+        )));
+    }
+
+    let is_zip = content_type.contains("zip");
+
+    log::debug!("files::import_file Got filename : {filename:?}");
+
+    let filepath = directory.join(&filename);
+    log::debug!("files::import_file got download filepath: {filepath:?}");
+
+    // handle download stream
+    let mut stream = response.bytes_stream();
+    let mut buffer = BytesMut::new();
+    let mut save_path = PathBuf::new();
+    let mut bytes_downloaded: u64 = 0;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| OxenError::file_import_error("Error reading file stream"))?;
+        let processed_chunk = chunk.to_vec();
+        buffer.extend_from_slice(&processed_chunk);
+        bytes_downloaded += processed_chunk.len() as u64;
+
+        if bytes_downloaded > MAX_CONTENT_LENGTH {
+            delete_file(workspace, &filepath)?;
+            return Err(OxenError::file_import_error(
+                "Content length exceeds maximum allowed size of 1GB",
+            ));
+        }
+        if buffer.len() > BUFFER_SIZE_THRESHOLD {
+            save_path = save_stream(workspace, &filepath, buffer.split().freeze().to_vec())
+                .await
+                .map_err(|e| {
+                    OxenError::file_import_error(format!(
+                        "Error occurred when saving file stream: {e}"
+                    ))
+                })?;
+        }
+    }
+
+    if !buffer.is_empty() {
+        save_path = save_stream(workspace, &filepath, buffer.freeze().to_vec())
+            .await
+            .map_err(|e| {
+                OxenError::file_import_error(format!("Error occurred when saving file stream: {e}"))
+            })?;
+    }
+    log::debug!("workspace::files::import_file save_path is {save_path:?}");
+
+    // check if the file size matches
+    if let Some(content_length) = content_length {
+        let bytes_written = if save_path.exists() {
+            util::fs::metadata(&save_path)?.len()
+        } else {
+            0
+        };
+
+        log::debug!(
+            "workspace::files::import_file has written {bytes_written:?} bytes. It's expecting {content_length:?} bytes"
+        );
+
+        if bytes_written != content_length {
+            return Err(OxenError::file_import_error(
+                "Content length does not match. File incomplete.",
+            ));
+        }
+    }
+
+    // decompress and stage file
+    if is_zip {
+        let files = decompress_zip(&save_path)?;
+        log::debug!("workspace::files::import_file unzipped file");
+
+        for file in files.iter() {
+            log::debug!("file::import add file {file:?}");
+            let path = repositories::workspaces::files::add(workspace, file).await?;
+            log::debug!("file::import add file ✅ success! staged file {path:?}");
+        }
+    } else {
+        log::debug!("file::import add file {:?}", filepath);
+        let path = repositories::workspaces::files::add(workspace, &save_path).await?;
+        log::debug!("file::import add file ✅ success! staged file {path:?}");
+    }
+
+    Ok(())
+}
+
+fn delete_file(workspace: &Workspace, path: impl AsRef<Path>) -> Result<(), OxenError> {
+    let path = path.as_ref();
+    let workspace_repo = &workspace.workspace_repo;
+    let relative_path = util::fs::path_relative_to_dir(path, &workspace_repo.path)?;
+    let full_path = workspace_repo.path.join(&relative_path);
+
+    if full_path.exists() {
+        std::fs::remove_file(&full_path).map_err(|e| {
+            OxenError::file_import_error(format!(
+                "Failed to remove file {}: {}",
+                full_path.display(),
+                e
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+pub async fn save_stream(
+    workspace: &Workspace,
+    filepath: &PathBuf,
+    chunk: Vec<u8>,
+) -> Result<PathBuf, OxenError> {
+    // This function append and save file chunk
+    log::debug!(
+        "liboxen::workspace::files::save_stream writing {} bytes to file",
+        chunk.len()
+    );
+
+    let workspace_dir = workspace.dir();
+
+    log::debug!("liboxen::workspace::files::save_stream Got workspace dir: {workspace_dir:?}");
+
+    let full_dir = workspace_dir.join(filepath);
+
+    log::debug!("liboxen::workspace::files::save_stream Got full dir: {full_dir:?}");
+
+    if let Some(parent) = full_dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    log::debug!(
+        "liboxen::workspace::files::save_stream successfully created full dir: {full_dir:?}"
+    );
+
+    let full_dir_cpy = full_dir.clone();
+
+    let mut file = tokio::task::spawn_blocking(move || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(full_dir_cpy)
+    })
+    .await
+    .map_err(|e| OxenError::basic_str(format!("spawn_blocking join error: {e}")))??;
+
+    log::debug!("liboxen::workspace::files::save_stream is writing to file: {file:?}");
+
+    tokio::task::spawn_blocking(move || file.write_all(&chunk).map(|_| file))
+        .await
+        .map_err(|e| OxenError::basic_str(format!("spawn_blocking join error: {e}")))??;
+
+    Ok(full_dir)
+}
+
+pub fn decompress_zip(zip_filepath: &PathBuf) -> Result<Vec<PathBuf>, OxenError> {
+    // File unzipped into the same directory
+    let mut files: Vec<PathBuf> = vec![];
+    let file = File::open(zip_filepath)?;
+    let mut archive = ZipArchive::new(file)
+        .map_err(|e| OxenError::basic_str(format!("Failed to access zip file: {e}")))?;
+
+    // Calculate total uncompressed size
+    let mut total_size: u64 = 0;
+    for i in 0..archive.len() {
+        let zip_file = archive.by_index(i).map_err(|e| {
+            OxenError::basic_str(format!("Failed to access zip file at index {i}: {e}"))
+        })?;
+
+        let uncompressed_size = zip_file.size();
+        let compressed_size = zip_file.compressed_size();
+
+        // Check individual file compression ratio
+        if let Some(compression_ratio) = uncompressed_size.checked_div(compressed_size) {
+            if compression_ratio > MAX_COMPRESSION_RATIO {
+                return Err(OxenError::basic_str(format!(
+                    "Suspicious zip compression ratio: {compression_ratio} detected"
+                )));
+            }
+        } else if uncompressed_size > 0 {
+            // If compressed size is 0 but uncompressed isn't, that's suspicious
+            return Err(OxenError::basic_str(
+                "Suspicious zip file: compressed size is 0 but uncompressed size is not",
+            ));
+        }
+        // If both are 0, it's likely a directory entry, which is fine
+
+        total_size += uncompressed_size;
+
+        // Check total size limit
+        if total_size > MAX_DECOMPRESSED_SIZE {
+            return Err(OxenError::file_import_error(
+                "Decompressed size exceeds size limit of 1GB",
+            ));
+        }
+    }
+
+    log::debug!("liboxen::files::decompress_zip zip filepath is {zip_filepath:?}");
+
+    // Get the canonical (absolute) path of the parent directory
+    let parent = match zip_filepath.parent() {
+        Some(p) => crate::util::fs::canonicalize(p)?,
+        None => std::env::current_dir()?,
+    };
+
+    // iterate thru zip archive and save the decompressed file
+    for i in 0..archive.len() {
+        let mut zip_file = archive.by_index(i).map_err(|e| {
+            OxenError::basic_str(format!("Failed to access zip file at index {i}: {e}"))
+        })?;
+
+        let mut zipfile_name = zip_file.mangled_name();
+
+        // Sanitize filename
+        if let Some(zipfile_name_str) = zipfile_name.to_str()
+            && zipfile_name_str.chars().any(|c| c.is_whitespace())
+        {
+            let new_name = zipfile_name_str
+                .chars()
+                .map(|c| if c.is_whitespace() { '_' } else { c })
+                .collect::<String>();
+            zipfile_name = PathBuf::from(new_name);
+        }
+
+        // Validate path components to prevent directory traversal
+        let safe_path = sanitize_path(&zipfile_name)?;
+        let outpath = parent.join(&safe_path);
+
+        // Verify the final path is within the parent directory
+        if !outpath.starts_with(&parent) {
+            return Err(OxenError::basic_str(format!(
+                "Attempted path traversal detected: {outpath:?}"
+            )));
+        }
+
+        log::debug!("files::decompress_zip unzipping file to: {outpath:?}");
+
+        if let Some(outdir) = outpath.parent() {
+            util::fs::create_dir_all(outdir)?;
+        }
+
+        if zip_file.is_dir() {
+            util::fs::create_dir_all(&outpath)?;
+        } else {
+            let mut outfile = File::create(&outpath)?;
+            let mut buffer = vec![0; BUFFER_SIZE_THRESHOLD];
+
+            loop {
+                let n = zip_file.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                outfile.write_all(&buffer[..n])?;
+            }
+        }
+
+        files.push(outpath.clone());
+    }
+
+    log::debug!("files::decompress_zip removing zip file: {zip_filepath:?}");
+
+    // remove the zip file after decompress
+    std::fs::remove_file(zip_filepath)?;
+
+    Ok(files)
+}
+
+// Helper function to sanitize path and prevent directory traversal
+fn sanitize_path(path: &PathBuf) -> Result<PathBuf, OxenError> {
+    let mut components = Vec::new();
+
+    for component in path.components() {
+        match component {
+            Component::Normal(c) => components.push(c),
+            Component::CurDir => {} // Skip current directory components (.)
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
+                return Err(OxenError::basic_str(format!(
+                    "Invalid path component in zip file: {path:?}"
+                )));
+            }
+        }
+    }
+
+    let safe_path = components.iter().collect::<PathBuf>();
+    Ok(safe_path)
+}
+
+async fn p_add_file(
+    base_repo: &LocalRepository,
+    workspace_repo: &LocalRepository,
+    maybe_head_commit: &Option<Commit>,
+    path: &Path,
+) -> Result<(), OxenError> {
+    let version_store = base_repo.version_store();
+    let mut maybe_dir_node = None;
+    if let Some(head_commit) = maybe_head_commit {
+        let path = util::fs::path_relative_to_dir(path, &workspace_repo.path)?;
+        let parent_path = path.parent().unwrap_or(Path::new(""));
+        maybe_dir_node =
+            repositories::tree::get_dir_with_children(base_repo, head_commit, parent_path, None)?;
+    }
+
+    // Skip if it's not a file
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let relative_path = util::fs::path_relative_to_dir(path, &workspace_repo.path)?;
+    let full_path = workspace_repo.path.join(&relative_path);
+    if !full_path.is_file() {
+        log::debug!("is not a file - skipping add on {full_path:?}");
+        return Ok(());
+    }
+
+    // See if this is a new file or a modified file
+    let mut file_status = core::v_latest::add::determine_file_status(
+        base_repo,
+        &maybe_dir_node,
+        &file_name,
+        &full_path,
+    )
+    .await?;
+
+    // Store the file in the version store using the hash as the key
+    let hash_str = file_status.hash.to_string();
+    let file = tokio::fs::File::open(&full_path).await?;
+    let size = file.metadata().await?.len();
+    let reader = tokio::io::BufReader::new(file);
+    version_store
+        .store_version_from_reader(&hash_str, Box::new(reader), size)
+        .await?;
+    let conflicts: HashSet<PathBuf> = repositories::merge::list_conflicts(workspace_repo)?
+        .into_iter()
+        .map(|conflict| conflict.merge_entry.path)
+        .collect();
+
+    let seen_dirs = Arc::new(Mutex::new(HashSet::new()));
+
+    // One handle for the read and the write below, so the staged db isn't reopened per file.
+    let staged_db_manager = get_staged_db_manager(workspace_repo)?;
+    if let Some(metadata) =
+        core::v_latest::add::staged_file_metadata(&staged_db_manager, &relative_path)?
+    {
+        file_status.previous_metadata = Some(metadata);
+    }
+
+    process_add_file_with_staged_db_manager(
+        workspace_repo,
+        &workspace_repo.path,
+        &file_status,
+        path,
+        &seen_dirs,
+        &conflicts,
+    )
+}
+
+async fn p_rm(workspace: &Workspace, path: &Path) -> Result<Vec<ErrorFileInfo>, OxenError> {
+    log::debug!("p_rm: deleting file {path:?}");
+    let base_repo = &workspace.base_repo;
+    let workspace_repo = &workspace.workspace_repo;
+    let commit = &workspace.commit;
+    let relative_path = util::fs::path_relative_to_dir(path, &workspace_repo.path)?;
+
+    let parent_path = path.parent().unwrap_or(Path::new(""));
+    let maybe_dir_node =
+        repositories::tree::get_dir_with_children(base_repo, commit, parent_path, None)?;
+
+    let file_name = util::fs::path_relative_to_dir(path, parent_path)?;
+    let seen_dirs = Arc::new(Mutex::new(HashSet::new()));
+    let mut err_files: Vec<ErrorFileInfo> = vec![];
+    if let Some(mut file_node) = get_file_node(&maybe_dir_node, &file_name)? {
+        file_node.set_name(&path.to_string_lossy());
+        err_files.extend(core::v_latest::rm::remove_file_with_db_manager(
+            workspace_repo,
+            &relative_path,
+            &file_node,
+            &seen_dirs,
+        )?);
+        unindex_if_staged_table(workspace, &relative_path)?;
+    } else if has_dir_node(&maybe_dir_node, &file_name)? {
+        if let Some(dir_node) = repositories::tree::get_dir_with_children_recursive(
+            base_repo,
+            commit,
+            &relative_path,
+            None,
+        )? {
+            core::v_latest::rm::remove_dir_with_db_manager(
+                workspace_repo,
+                &dir_node,
+                &relative_path,
+                &seen_dirs,
+            )?;
+            // remove_dir_with_db_manager stages every file under the dir for removal, so each of
+            // them needs its index dropped too.
+            let parent_path = relative_path.parent().unwrap_or(Path::new(""));
+            for (child_path, node) in dir_node.list_files_and_dirs()? {
+                if let EMerkleTreeNode::File(_) = &node.node {
+                    unindex_if_staged_table(workspace, &parent_path.join(child_path))?;
+                }
+            }
+        };
+    } else {
+        // If the path has neither a file node or dir node in the tree, it cannot be staged for removal
+        // Return as err_file
+        err_files.push(ErrorFileInfo {
+            hash: "".to_string(),
+            path: Some(path.to_path_buf()),
+            error: "Cannot call `oxen rm` on uncommitted files".to_string(),
+        });
+    }
+
+    Ok(err_files)
+}
+
+/// Drop the staged DuckDB table of the data frame at `path`, if it has one. A path staged for
+/// removal must not keep an editable index: a later row or column edit would re-stage the file as
+/// `Modified`, which would undo the removal.
+fn unindex_if_staged_table(workspace: &Workspace, path: &Path) -> Result<(), OxenError> {
+    if repositories::workspaces::data_frames::has_staged_table(workspace, path)? {
+        log::debug!("p_rm: dropping staged data frame index for {path:?}");
+        repositories::workspaces::data_frames::unindex(workspace, path)?;
+    }
+    Ok(())
+}
+
+fn p_modify_file(
+    base_repo: &LocalRepository,
+    workspace_repo: &LocalRepository,
+    maybe_head_commit: &Option<Commit>,
+    path: &Path,
+) -> Result<(), OxenError> {
+    let mut maybe_file_node = None;
+    if let Some(head_commit) = maybe_head_commit {
+        maybe_file_node = repositories::tree::get_file_by_path(base_repo, head_commit, path)?;
+    }
+    let Some(mut file_node) = maybe_file_node else {
+        return Err(OxenError::basic_str("file not found in head commit"));
+    };
+    file_node.set_name(path.to_str().unwrap());
+    log::debug!("p_modify_file file_node: {file_node}");
+
+    let staged_db_manager = get_staged_db_manager(workspace_repo)?;
+    staged_db_manager.edit_staged_node(path, |staged| {
+        // The committed node knows nothing of workspace metadata edits. When
+        // the staged node holds the same content with different metadata,
+        // carry that metadata over so re-staging doesn't discard it.
+        if let Some(staged) = staged
+            && let Ok(staged_file) = staged.node.file()
+            && staged_file.hash() == file_node.hash()
+            && let Some(metadata) = staged_file.metadata()
+        {
+            file_node.set_metadata(Some(metadata));
+            file_node.recompute_metadata_hashes()?;
+        }
+        Ok(StagedMerkleTreeNode {
+            status: StagedEntryStatus::Modified,
+            node: MerkleTreeNode::from_file(file_node),
+        })
+    })?;
+    Ok(())
+}
+
+fn has_dir_node(
+    dir_node: &Option<MerkleTreeNode>,
+    path: impl AsRef<Path>,
+) -> Result<bool, OxenError> {
+    if let Some(node) = dir_node {
+        if let Some(node) = node.get_by_path(path)? {
+            if let EMerkleTreeNode::Directory(_dir_node) = &node.node {
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        } else {
+            Ok(false)
+        }
+    } else {
+        Ok(false)
+    }
+}
+
+/// Move or rename a file within a workspace.
+/// This stages the old path as "Removed" and the new path as "Added".
+pub fn mv(
+    workspace: &Workspace,
+    path: impl AsRef<Path>,
+    new_path: impl AsRef<Path>,
+) -> Result<(), OxenError> {
+    let path = path.as_ref();
+    let new_path = new_path.as_ref();
+
+    if path == new_path {
+        return Err(OxenError::basic_str(format!(
+            "Source and destination are the same: {path:?}"
+        )));
+    }
+
+    let workspace_repo = &workspace.workspace_repo;
+
+    let staged_db_manager = get_staged_db_manager(workspace_repo)?;
+
+    // First, try to read existing staged entry for the source path
+    let staged_entry = staged_db_manager.read_from_staged_db(path)?;
+
+    // The committed node at the source path, read once: it is both the fallback for an unstaged
+    // source and what decides whether the source has to be staged for removal below.
+    let source_in_base =
+        repositories::tree::get_file_by_path(&workspace.base_repo, &workspace.commit, path)?;
+    let source_exists_in_base = source_in_base.is_some();
+
+    // Get the file node - either from staged_db or from the base repo
+    let file_node = if let Some(entry) = staged_entry {
+        entry.node.file()?
+    } else {
+        // File not staged, get it from the base repo
+        source_in_base.ok_or_else(|| OxenError::path_does_not_exist(path))?
+    };
+
+    // Create the new file node with updated name (full path for the new location)
+    let mut new_file_node = file_node.clone();
+    new_file_node.set_name(new_path.to_str().unwrap());
+
+    // Check if a file exists at the new path in the base repo (determines if it's modified or added)
+    let dest_exists_in_base =
+        repositories::tree::get_file_by_path(&workspace.base_repo, &workspace.commit, new_path)?
+            .is_some();
+
+    let new_status = if dest_exists_in_base {
+        StagedEntryStatus::Modified
+    } else {
+        StagedEntryStatus::Added
+    };
+
+    let seen_dirs = Arc::new(Mutex::new(HashSet::new()));
+
+    if staged_db_manager.read_from_staged_db(new_path)?.is_some() {
+        return Err(OxenError::DestinationAlreadyStaged(
+            new_path.to_path_buf().into(),
+        ));
+    }
+    // Add the file node at the new path
+    staged_db_manager.upsert_file_node(new_path, new_status, &new_file_node)?;
+
+    // A source that exists in the base repo has to be staged for removal
+    if source_exists_in_base {
+        // Create a file node for the removed entry with the full original path as name
+        let mut removed_file_node = file_node.clone();
+        removed_file_node.set_name(path.to_str().unwrap());
+
+        // Stage the original path as removed
+        staged_db_manager.upsert_file_node(path, StagedEntryStatus::Removed, &removed_file_node)?;
+
+        // Add parent directories for the removed path
+        staged_db_manager.add_parent_directories(path, &seen_dirs)?;
+    } else {
+        // Just delete the staged entry if file wasn't in base repo
+        staged_db_manager.delete_entry(path)?;
+    }
+
+    // Add parent directories for the new path
+    staged_db_manager.add_parent_directories(new_path, &seen_dirs)?;
+
+    Ok(())
+}

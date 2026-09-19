@@ -1,0 +1,62 @@
+name: "✨ Feature Request"
+description: 功能请求 / Feature request
+title: "[Feature]: "
+labels: ["feature request"]
+assignees:
+  - Kuingsmile
+body:
+  - type: markdown
+    attributes:
+      value: |+
+        ## PicList Issue 模板
+
+        请依照该模板来提交，否则将会被关闭。
+        **提问之前请注意你看过 FAQ、文档以及那些被关闭的 issues。否则同样的提问也会被关闭！**
+
+        Please submit according to this template, otherwise it will be closed.
+        **Before asking a question, please note that you have read the FAQ, Doc, and those closed issues. Otherwise the same question will also be closed! **
+
+  - type: checkboxes
+    id: read
+    attributes:
+      label: 前置阅读 | Pre-reading
+      description: 我已经自行查找、阅读以下内容（阅读了请打勾） | I have searched and read the following on my own (Please tick after reading)
+      options:
+        - label: "[文档/Doc](https://piclist.cn/)"
+          required: true
+        - label: "[Issues](https://github.com/Kuingsmile/PicList/issues?q=is%3Aissue+sort%3Aupdated-desc+is%3Aclosed)"
+          required: true
+        - label: "[FAQ](https://github.com/Kuingsmile/PicList/blob/dev/FAQ.md)"
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: PicList的版本 | PicList Version
+      placeholder: 例如 v0.0.1
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 系统信息 | System Information
+      options:
+        - Windows
+        - Win(arm64)
+        - Mac
+        - Mac(arm64)
+        - Linux
+        - Linux(arm64)
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 功能请求 | Feature request
+      description: 详细描述你所预想的功能或者是现有功能的改进 | Describe in detail the features you envision or improvements to existing features
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        最后，喜欢 PicList 的话不妨给它点个 star~
+        Finally, if you like PicList, give it a star~
