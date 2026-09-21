@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：TypeScript
 
-请在已有的 Expensify/App 项目上迭代核心能力，不要重写项目。项目定位为：Welcome to New Expensify: a complete re-imagination of financial collaboration, centered around chat. Help us build the next generation of Expensify by sharing feedback and contributing to the code.。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+帮我直接按现有代码查这件事，先别急着改实现：
+仓库：Expensify/App（TypeScript）。项目原本是：Welcome to New Expensify: a complete re-imagination of financial collaboration, centered around chat. Help us build the next generation of Expensify by sharing feedback and contributing to the code.。当前源码入口可从 .buckconfig, .bun-version, .bundle, .claude, .env.example, .env.production, .env.staging, .gitattributes, .github, .gitignore, .gitmodules, .imgbotconfig 进入。
+为 Expensify 的聊天报销流程增加可审计的冲突解决中心：用户能看到服务端版本、本地修改和附件状态，并选择合并或回滚。实现必须贯通状态管理、同步队列、server 接口和移动端/网页端展示，处理离线、重复提交、权限撤销及旧数据迁移；需要稳定的回归测试和可观测事件，不能破坏现有 chat-first 交互。
+这项迭代必须能在真实部署里收敛。请明确状态机、失败重试和幂等边界，补上接口/类型/文档变更以及至少一条端到端路径；不能通过复制一套平行实现、硬编码样例或牺牲旧 API 来完成。

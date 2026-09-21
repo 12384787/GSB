@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：Kotlin
 
-请在已有的 Kotlin/dokka 项目上迭代核心能力，不要重写项目。项目定位为：API documentation engine for Kotlin。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+请接着当前仓库的实现往下排查，不要另起一套架构：
+仓库：Kotlin/dokka（Kotlin）。项目原本是：API documentation engine for Kotlin。当前源码入口可从 .gitattributes, .github, .gitignore, .husky, .idea, CODE_OF_CONDUCT.md, CONTRIBUTING.md, LICENSE.txt, NOTICE.txt, README.md, build-logic, build-settings-logic 进入。
+给 Dokka 增加跨模块版本化 API 链接报告：在生成文档时标出缺失、过期和冲突的 external link，并允许 CI 以稳定机器可读格式消费。实现要贯通插件配置、解析器、缓存和 HTML/JSON 输出，处理多平台 source set、别名、私有符号和旧配置迁移，补齐 Gradle/Maven 示例和回归测试。
+先画出现有调用链和数据边界，再按项目惯用方式落地；新能力必须有失败回滚、重复执行、权限/兼容性和可观测性设计，不能用全局开关掩盖错误。补齐单元、集成或端到端测试、文档与迁移说明，并证明旧用例、新用例和异常恢复都能稳定通过。

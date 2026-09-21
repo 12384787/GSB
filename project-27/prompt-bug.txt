@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：Python
+任务难度：地狱
 
-请在已有的 ultralytics/ultralytics 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：Ultralytics YOLO27, YOLO26, YOLO11, YOLOv8 — object detection, instance segmentation, semantic segmentation, image classification, pose estimation, object tracking。围绕真实入口（.dockerignore,.github .gitignore,AGENTS.md CITATION.cff,CLAUDE.md CONTRIBUTING.md,LICENSE README.md,README.zh-CN.md docker,docs examples,mkdocs.yml pyproject.toml,tests ultralytics）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+请接着当前仓库的实现往下排查，不要另起一套架构：
+仓库：ultralytics/ultralytics（Python）。项目原本是：Ultralytics YOLO27, YOLO26, YOLO11, YOLOv8 — object detection, instance segmentation, semantic segmentation, image classification, pose estimation, object tracking。当前源码入口可从 .dockerignore, .github, .gitignore, AGENTS.md, CITATION.cff, CLAUDE.md, CONTRIBUTING.md, LICENSE, README.md, README.zh-CN.md, docker, docs 进入。
+Ultralytics 的训练/推理流水线在多 GPU、断点恢复和验证集自动下载同时启用时，checkpoint 可能记录错误的 epoch 或设备，恢复后指标与日志错位。请从 engine、datasets、nn 和 tests 构造中断/重试场景，修复设备映射、随机种子、文件原子写入和 CLI 兼容；不能用删除旧 checkpoint 规避。
+请把修复前后的行为差异写进回归用例，尤其是乱序、重复、取消和旧输入；禁止删除断言、改掉公共契约或把并发问题粗暴改成全局串行。提交说明要给出根因和未覆盖风险。

@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：Kotlin
+任务难度：地狱
 
-请在已有的 Kotlin/dokka 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：API documentation engine for Kotlin。围绕真实入口（.gitattributes,.github .gitignore,.husky .idea,CODE_OF_CONDUCT.md CONTRIBUTING.md,LICENSE.txt NOTICE.txt,README.md build-logic,build-settings-logic build.gradle.kts,docs-developer docs,dokka-integration-tests dokka-runners,dokka-subprojects examples,gradle.properties gradle,gradlew gradlew.bat,qodana.sarif.json scripts,settings.gradle.kts）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+帮我直接按现有代码查这件事，先别急着改实现：
+仓库：Kotlin/dokka（Kotlin）。项目原本是：API documentation engine for Kotlin。当前源码入口可从 .gitattributes, .github, .gitignore, .husky, .idea, CODE_OF_CONDUCT.md, CONTRIBUTING.md, LICENSE.txt, NOTICE.txt, README.md, build-logic, build-settings-logic 进入。
+Dokka 在多模块 Kotlin 项目中生成文档时，跨模块类型别名和 source set 重名会让链接指向错误页面，增量构建又可能复用旧索引。请在 core、plugins、gradle 示例和测试中构造包含 common/jvm/native 的项目，定位签名解析、缓存失效或路径归一化问题；修复需保持旧格式兼容并验证 clean/incremental 两条路径。
+先补一个修复前会失败的测试，再定位根因并做最小改动；不要删测试、放宽断言、硬编码结果或顺手重构无关模块。验收时同时跑原有回归、异常路径、并发/取消边界和兼容性检查，并在说明里写清触发条件、根因、修复影响面。

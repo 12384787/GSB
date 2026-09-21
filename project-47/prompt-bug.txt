@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：多语言
+任务难度：地狱
 
-请在已有的 vuejs/vue 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：。围绕真实入口（.editorconfig,.git-blame-ignore-revs .github,.gitignore .prettierrc,BACKERS.md CHANGELOG.md,LICENSE README.md,api-extractor.json api-extractor.tsconfig.json,benchmarks compiler-sfc,dist examples,package.json packages,pnpm-lock.yaml pnpm-workspace.yaml,scripts src,test tsconfig.json,types vitest.config.ts）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+请接着当前仓库的实现往下排查，不要另起一套架构：
+仓库：vuejs/vue（多语言）。项目原本是：。当前源码入口可从 .editorconfig, .git-blame-ignore-revs, .github, .gitignore, .prettierrc, BACKERS.md, CHANGELOG.md, LICENSE, README.md, api-extractor.json, api-extractor.tsconfig.json, benchmarks 进入。
+Vue 在 keep-alive、异步组件和 SSR hydration 同时更新时，旧 vnode 的 effect scope 没有正确停止，导致重复 watch 或客户端 DOM 错配。请从 runtime-core、runtime-dom、server-renderer 和测试构造嵌套条件，修复生命周期/缓存失效顺序；验收 dev/prod、teleport 和旧组件选项 API。
+请把修复前后的行为差异写进回归用例，尤其是乱序、重复、取消和旧输入；禁止删除断言、改掉公共契约或把并发问题粗暴改成全局串行。提交说明要给出根因和未覆盖风险。

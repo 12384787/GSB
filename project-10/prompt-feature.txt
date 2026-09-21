@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：Clojure
 
-请在已有的 metabase/metabase 项目上迭代核心能力，不要重写项目。项目定位为：The easy-to-use open source Business Intelligence and Embedded Analytics tool that lets everyone work with data :bar_chart:。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+我需要的是能合并进项目的修复/迭代，不是泛泛的方案说明：
+仓库：metabase/metabase（Clojure）。项目原本是：The easy-to-use open source Business Intelligence and Embedded Analytics tool that lets everyone work with data :bar_chart:。当前源码入口可从 .babel_cache, .claude, .clj-kondo, .clj-surgeon.edn, .cljfmt.edn, .coderabbit.yaml, .codespellignore, .codespellrc, .dependency-cruiser.cjs, .devcontainer, .dir-locals.el, .dockerignore 进入。
+给 Metabase 的异步查询增加可恢复的执行检查点，支持长查询在 worker 重启后续跑或明确终止。需要协调队列、数据库连接、缓存、权限快照、审计和前端进度展示，定义幂等提交、取消语义、租户配额和旧任务迁移；用多数据库和失败注入测试验证不会重复写入结果。
+不要只交一个 happy path：把旧配置、升级中断、并发调用、部分成功和重复触发都纳入设计。实现要落在现有模块边界内，给出可检查的测试、日志/指标和回滚方式，并说明新增存储或协议如何兼容历史数据。

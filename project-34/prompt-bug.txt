@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：JavaScript
+任务难度：地狱
 
-请在已有的 koajs/koa 项目上修复一个真实的跨模块缺陷。项目定位：Expressive middleware for node.js using ES2017 async functions。源码根目录为 koa-master，真实入口包括：.codecov.yml, .editorconfig, .github, .gitignore, .mailmap, AUTHORS, CODE_OF_CONDUCT.md, History.md, LICENSE, Readme.md, __tests__, docs, lib, package-lock.json, package.json, test-helpers。请围绕请求/响应处理、连接生命周期、错误传播、取消/超时、状态边界或兼容性链路，先构造可重复的失败用例并定位触发步骤和根因，再做最小范围修复。补充正常、失败、边界和回归测试；不能删除测试、放宽断言、改变无关公共 API 或引入无关依赖。验收要求：原有测试保持通过，新增测试稳定复现修复前问题并证明修复后的行为，错误信息和资源释放可验证。
+这个问题在真实运行里很难抓，但我希望你把它当线上故障处理：
+仓库：koajs/koa（JavaScript）。项目原本是：Expressive middleware for node.js using ES2017 async functions。当前源码入口可从 .codecov.yml, .editorconfig, .github, .gitignore, .mailmap, AUTHORS, CODE_OF_CONDUCT.md, History.md, LICENSE, Readme.md, __tests__, docs 进入。
+Koa 的 middleware 在 response 已经 commit 后又抛出异常，onerror、流关闭和上下文状态更新顺序不一致，某些请求会挂住。请从 lib/application、compose、context 和 __tests__ 构造异步嵌套、客户端断开、流式响应和超时场景，修复错误边界与资源释放；不能破坏 koa-compose 语义。
+先把失败压缩成一个稳定夹具，再改实现；不要用重试、睡眠或禁用校验把问题藏起来。最终要能从测试输出看出状态、资源和错误传播都恢复正常，并说明为什么不会回归到相邻模块。

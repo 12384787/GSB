@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：多语言
+任务难度：地狱
 
-请在已有的 microsoft/markitdown 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：。围绕真实入口（.devcontainer,.dockerignore .gitattributes,.github .gitignore,.pre-commit-config.yaml CODE_OF_CONDUCT.md,Dockerfile LICENSE,README.md SECURITY.md,SUPPORT.md packages）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+这个问题在真实运行里很难抓，但我希望你把它当线上故障处理：
+仓库：microsoft/markitdown（多语言）。项目原本是：。当前源码入口可从 .devcontainer, .dockerignore, .gitattributes, .github, .gitignore, .pre-commit-config.yaml, CODE_OF_CONDUCT.md, Dockerfile, LICENSE, README.md, SECURITY.md, SUPPORT.md 进入。
+MarkItDown 在 Office/PDF/HTML 混合输入中遇到损坏附件或编码异常时，转换器会吞掉单个文件错误并把后续内容拼错。请从 converters、CLI、插件注册和 tests 构造批量/流式/取消场景，修复错误隔离、临时资源和 MIME 判断；保持已有 Markdown 格式与命令行退出码。
+先把失败压缩成一个稳定夹具，再改实现；不要用重试、睡眠或禁用校验把问题藏起来。最终要能从测试输出看出状态、资源和错误传播都恢复正常，并说明为什么不会回归到相邻模块。

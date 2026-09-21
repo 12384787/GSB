@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：Rust
 
-请在已有的 embassy-rs/embassy 项目上迭代核心能力，不要重写项目。项目定位为：Modern embedded framework, using Rust and async.。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+这个问题在真实运行里很难抓，但我希望你把它当线上故障处理：
+仓库：embassy-rs/embassy（Rust）。项目原本是：Modern embedded framework, using Rust and async.。当前源码入口可从 .gitattributes, .github, .gitignore, .helix, .vscode, API-GUIDELINES.md, CONTRIBUTING.md, LICENSE-APACHE, LICENSE-CC-BY-SA, LICENSE-MIT, NOTICE.md, README.md 进入。
+为 Embassy executor 增加可组合的任务预算与超时诊断能力，要求不依赖分配器，并兼容现有 time、interrupt 和 embassy-sync 原语。设计任务取消、嵌套超时、低功耗唤醒、优先级反转检测及日志开关，补充 host 模拟器和至少一种真实 HAL 的测试，证明 API 和二进制体积没有无谓回归。
+先验证现有行为再扩展，新增能力要有降级和迁移方案。验收不仅看成功结果，还要检查权限、取消、恢复、性能和观测信息；把关键取舍写在变更说明里，确保后续维护者能复现问题和回滚。

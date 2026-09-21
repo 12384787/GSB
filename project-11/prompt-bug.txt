@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：Haskell
+任务难度：地狱
 
-请在已有的 nammayatri/nammayatri 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：A Direct-to-Driver open mobility platform powering the next-generation of mobility applications in India.。围绕真实入口（.claude,.clinerules .cursor,.cursorrules .envrc.backend,.envrc.frontend .gitattributes,.github .gitignore,.hlint.yaml .imgbotconfig,.psc-ide-port .vscode,Backend CLAUDE.md,INVOICE_GENERATION_IMPLEMENTATION.md LICENSE,NammaTagConcept.md README.md,buildtime-analysis crowdin.yml,crowdinTranslationGenerator.py crowdin_python_generator_configuration.json,docs flake.lock,flake.nix om.yaml,ondc_build_diff.patch toll-combinations,vira.hs）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+请接着当前仓库的实现往下排查，不要另起一套架构：
+仓库：nammayatri/nammayatri（Haskell）。项目原本是：A Direct-to-Driver open mobility platform powering the next-generation of mobility applications in India.。当前源码入口可从 .claude, .clinerules, .cursor, .cursorrules, .envrc.backend, .envrc.frontend, .gitattributes, .github, .gitignore, .hlint.yaml, .imgbotconfig, .psc-ide-port 进入。
+Namma Yatri 的行程状态在司机端离线、支付回调延迟和调度重试交错时，可能从 completed 回退到 searching，乘客和司机看到不同状态。请从 Haskell domain、服务接口和测试数据构造状态机反例，修复事件顺序、幂等键和持久化事务；必须验证退款、取消、重派和重复回调。
+请把修复前后的行为差异写进回归用例，尤其是乱序、重复、取消和旧输入；禁止删除断言、改掉公共契约或把并发问题粗暴改成全局串行。提交说明要给出根因和未覆盖风险。

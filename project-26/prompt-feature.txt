@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：Kotlin
 
-请在已有的 ankidroid/Anki-Android 项目上迭代核心能力，不要重写项目。项目定位为：AnkiDroid: Anki flashcards on Android. Your secret trick to achieve superhuman information retention.。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+我需要的是能合并进项目的修复/迭代，不是泛泛的方案说明：
+仓库：ankidroid/Anki-Android（Kotlin）。项目原本是：AnkiDroid: Anki flashcards on Android. Your secret trick to achieve superhuman information retention.。当前源码入口可从 .agents, .claude, .codecov.yml, .editorconfig, .git-blame-ignore-revs, .gitattributes, .github, .gitignore, .idea, .prettierignore, .prettierrc, .worktreeinclude 进入。
+为 AnkiDroid 增加可恢复的同步冲突工作台，按笔记字段、卡片调度和媒体附件展示本地/服务端差异并支持逐项选择。要求不破坏复习队列，处理离线编辑、重复同步、加密账户、权限和大集合性能，补齐 Room migration、同步协议和 UI 自动化测试。
+不要只交一个 happy path：把旧配置、升级中断、并发调用、部分成功和重复触发都纳入设计。实现要落在现有模块边界内，给出可检查的测试、日志/指标和回滚方式，并说明新增存储或协议如何兼容历史数据。

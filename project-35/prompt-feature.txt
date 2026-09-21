@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：TypeScript
 
-请在已有的 readest/readest 项目上迭代核心能力，不要重写项目。项目定位为：Readest is a modern, feature-rich ebook reader designed for avid readers offering seamless cross-platform access, powerful tools, and an intuitive interface to elevate your reading experience.。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+帮我直接按现有代码查这件事，先别急着改实现：
+仓库：readest/readest（TypeScript）。项目原本是：Readest is a modern, feature-rich ebook reader designed for avid readers offering seamless cross-platform access, powerful tools, and an intuitive interface to elevate your reading experience.。当前源码入口可从 .devcontainer, .dockerignore, .editorconfig, .github, .gitignore, .gitmodules, .husky, .vscode, .zed, CODE_OF_CONDUCT.md, CONTRIBUTING.md, Cargo.cef.lock 进入。
+给 Readest 增加跨格式统一的批注与高亮同步层，支持 EPUB/PDF、离线编辑、设备冲突、导入导出和按章节定位。要处理字体重排导致的锚点迁移、权限、加密书籍、失败重试、旧数据升级和大书性能，补齐 UI、存储、同步协议及端到端测试。
+这项迭代必须能在真实部署里收敛。请明确状态机、失败重试和幂等边界，补上接口/类型/文档变更以及至少一条端到端路径；不能通过复制一套平行实现、硬编码样例或牺牲旧 API 来完成。

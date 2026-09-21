@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：Python
+任务难度：地狱
 
-请在已有的 psf/requests 项目上修复一个真实的跨模块缺陷。项目定位：A simple, yet elegant, HTTP library.。源码根目录为 requests-main，真实入口包括：.coveragerc, .git-blame-ignore-revs, .github, .gitignore, .pre-commit-config.yaml, .readthedocs.yaml, AUTHORS.rst, HISTORY.md, LICENSE, MANIFEST.in, Makefile, NOTICE, README.md, docs, ext, pyproject.toml, requirements-dev.txt, setup.py, src, tests, tox.ini。请围绕请求/响应处理、连接生命周期、错误传播、取消/超时、状态边界或兼容性链路，先构造可重复的失败用例并定位触发步骤和根因，再做最小范围修复。补充正常、失败、边界和回归测试；不能删除测试、放宽断言、改变无关公共 API 或引入无关依赖。验收要求：原有测试保持通过，新增测试稳定复现修复前问题并证明修复后的行为，错误信息和资源释放可验证。
+帮我直接按现有代码查这件事，先别急着改实现：
+仓库：psf/requests（Python）。项目原本是：A simple, yet elegant, HTTP library.。当前源码入口可从 .coveragerc, .git-blame-ignore-revs, .github, .gitignore, .pre-commit-config.yaml, .readthedocs.yaml, AUTHORS.rst, HISTORY.md, LICENSE, MANIFEST.in, Makefile, NOTICE 进入。
+Requests 在流式响应读取中发生超时、重试和连接池复用时，旧 response 的 socket 可能被错误归还，下一请求读到脏状态。请从 sessions、adapters、models 和 tests 构造服务端半关闭、取消和重复读取场景，修复 close/release、异常链和重试边界；保持历史 API 与代理行为。
+先补一个修复前会失败的测试，再定位根因并做最小改动；不要删测试、放宽断言、硬编码结果或顺手重构无关模块。验收时同时跑原有回归、异常路径、并发/取消边界和兼容性检查，并在说明里写清触发条件、根因、修复影响面。

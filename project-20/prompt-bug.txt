@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：TypeScript
+任务难度：地狱
 
-请在已有的 mui/mui-x 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：MUI X: Build complex and data-rich applications using a growing list of advanced React components, like the Data Grid, Date and Time Pickers, Charts, and more!。围绕真实入口（.agents,.browserslistrc .circleci,.claude .editorconfig,.gitattributes .github,.gitignore .lintignore,.remarkrc.mjs .vale.ini,.vscode AGENTS.local.md.template,AGENTS.md CHANGELOG.md,CHANGELOG.v8.md CLAUDE.md,CONTRIBUTING.md README.md,SECURITY.md babel.config.mjs,bug-reproductions changelogOld,docs docsTech,eslint.config.mjs examples,lerna.json mui-env.d.ts,netlify.toml netlify,package.json packages,pnpm-lock.yaml pnpm-workspace.yaml,prettier.config.mjs renovate.json,scripts skills-lock.json,stylelint.config.mjs test,tsconfig.json vitest.config.mts,vitest.shared.mts）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+我需要的是能合并进项目的修复/迭代，不是泛泛的方案说明：
+仓库：mui/mui-x（TypeScript）。项目原本是：MUI X: Build complex and data-rich applications using a growing list of advanced React components, like the Data Grid, Date and Time Pickers, Charts, and more!。当前源码入口可从 .agents, .browserslistrc, .circleci, .claude, .editorconfig, .gitattributes, .github, .gitignore, .lintignore, .remarkrc.mjs, .vale.ini, .vscode 进入。
+MUI X 的 Data Grid 在服务端分页、虚拟滚动和列筛选同时切换时，旧请求返回会覆盖新结果，选择状态也跟着错位。请从 Data Grid、数据源、状态模型和测试构造乱序响应与列变更场景，修复请求代次、行 ID 映射和键盘交互；要保留 Pro/Premium 现有 API。
+实现以最小影响面为准，保留现有协议、错误类型和日志语义；用故障注入证明失败路径会收敛、资源会释放、重试不会放大副作用，最后跑一遍项目原有测试集。

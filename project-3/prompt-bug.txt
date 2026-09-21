@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：TypeScript
+任务难度：地狱
 
-请在已有的 Expensify/App 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：Welcome to New Expensify: a complete re-imagination of financial collaboration, centered around chat. Help us build the next generation of Expensify by sharing feedback and contributing to the code.。围绕真实入口（.buckconfig,.bun-version .bundle,.claude .env.example,.env.production .env.staging,.gitattributes .github,.gitignore .gitmodules,.imgbotconfig .java-version,.mcp.json .npmrc,.nvmrc .oxfmtrc.json,.ruby-version .storybook,.watchmanconfig .well-known,AGENTS.md CLA.md,CLAUDE.md CODE_OF_CONDUCT.md,Cloudflare_CA.crt Gemfile,Gemfile.lock LICENSE.md,Mobile-Expensify PR_REVIEW_GUIDELINES.md,README.md __mocks__,android assets,babel.config.js bunfig.toml,codecov.yml colors.json,config contributingGuides,cspell.json docs,eslint-plugin-local-rules eslint.config.mjs,evals fastlane,index.js ios,jest.config.j）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+请接着当前仓库的实现往下排查，不要另起一套架构：
+仓库：Expensify/App（TypeScript）。项目原本是：Welcome to New Expensify: a complete re-imagination of financial collaboration, centered around chat. Help us build the next generation of Expensify by sharing feedback and contributing to the code.。当前源码入口可从 .buckconfig, .bun-version, .bundle, .claude, .env.example, .env.production, .env.staging, .gitattributes, .github, .gitignore, .gitmodules, .imgbotconfig 进入。
+Expensify/App 的聊天式报销流程在离线编辑、网络恢复和多设备同步同时发生时，报告状态与本地草稿会互相覆盖。请从 src、server、modules、tests 的真实同步链路复现一个能稳定触发的冲突，定位队列顺序、乐观更新或重放逻辑的根因；修复时要覆盖附件上传失败、重复请求、权限变化和旧缓存升级，不能只改 UI 或放宽断言。
+请把修复前后的行为差异写进回归用例，尤其是乱序、重复、取消和旧输入；禁止删除断言、改掉公共契约或把并发问题粗暴改成全局串行。提交说明要给出根因和未覆盖风险。

@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：JavaScript
+任务难度：地狱
 
-请在已有的 handsontable/handsontable 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：JavaScript Data Grid / Data Table with a Spreadsheet Look & Feel. Works with React, Angular, and Vue. Supported by the Handsontable team ⚡。围绕真实入口（.ai,.changelogs .claude,.cursor .editorconfig,.eslintignore .eslintrc.js,.gitattributes .github,.gitignore .mcp.json,.npmrc .nvmrc,.worktreeinclude AGENTS.md,CHANGELOG.md CLAUDE.md,CODE_OF_CONDUCT.md CONTRIBUTING.md,LICENSE.txt README.md,babel.config.js bin,browser-targets.js context7.json,docs evals,examples handsontable-non-commercial-license.pdf,handsontable hot.config.js,lefthook.yml package.json,performance-tests pnpm-lock.yaml,pnpm-workspace.yaml resources,scripts sonar-project.properties,tests visual-tests,wrappers）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+帮我直接按现有代码查这件事，先别急着改实现：
+仓库：handsontable/handsontable（JavaScript）。项目原本是：JavaScript Data Grid / Data Table with a Spreadsheet Look & Feel. Works with React, Angular, and Vue. Supported by the Handsontable team ⚡。当前源码入口可从 .ai, .changelogs, .claude, .cursor, .editorconfig, .eslintignore, .eslintrc.js, .gitattributes, .github, .gitignore, .mcp.json, .npmrc 进入。
+Handsontable 在合并单元格、批量粘贴、撤销重做和异步校验叠加时，视图值与 data source 不一致。请从 core、plugins、React/Vue wrappers 和测试复现一次跨插件事务被拆开的情况，修复变更批次、selection 和 renderer 刷新顺序；验收大数据量和旧插件接口。
+先补一个修复前会失败的测试，再定位根因并做最小改动；不要删测试、放宽断言、硬编码结果或顺手重构无关模块。验收时同时跑原有回归、异常路径、并发/取消边界和兼容性检查，并在说明里写清触发条件、根因、修复影响面。

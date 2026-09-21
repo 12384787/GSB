@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：多语言
+任务难度：地狱
 
-请在已有的 firecrawl/firecrawl 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：。围绕真实入口（.gitattributes,.github .gitignore,.gitmodules AGENTS.md,CLAUDE.md CONTRIBUTING.md,LICENSE README.md,SELF_HOST.md apps,docker-compose.yaml examples,firecrawl-cli-skills firecrawl-cli,firecrawl-skills firecrawl-workflows,img skills）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+我需要的是能合并进项目的修复/迭代，不是泛泛的方案说明：
+仓库：firecrawl/firecrawl（多语言）。项目原本是：。当前源码入口可从 .gitattributes, .github, .gitignore, .gitmodules, AGENTS.md, CLAUDE.md, CONTRIBUTING.md, LICENSE, README.md, SELF_HOST.md, apps, docker-compose.yaml 进入。
+Firecrawl 的抓取任务在队列重试、页面流式解析和代理切换同时发生时，结果可能混入不同 URL 的内容，失败任务却被标记完成。请从 crawler、API、queue、extract 和测试构造重定向/超时/部分响应场景，修复任务隔离、取消和持久化；验收大页面与速率限制。
+实现以最小影响面为准，保留现有协议、错误类型和日志语义；用故障注入证明失败路径会收敛、资源会释放、重试不会放大副作用，最后跑一遍项目原有测试集。

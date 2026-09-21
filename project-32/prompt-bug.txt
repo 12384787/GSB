@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：Java
+任务难度：地狱
 
-请在已有的 kestra-io/kestra 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：Event Driven Orchestration & Scheduling Platform for Mission Critical Applications。围绕真实入口（.codespellrc,.devcontainer .editorconfig,.gitattributes .github,.gitignore .gitpod.yml,.pinact.yaml .prettierignore,AGENTS.md CLAUDE.md,Dockerfile Dockerfile.base,Dockerfile.pr LICENSE,Makefile README.md,SECURITY.md build-and-start-e2e-tests.sh,build.gradle charts,cli codecov.yml,core dev-tools,docker-compose-ci.yml docker-compose-dind.yml,docker-compose.yml docker,docs executor,gradle.properties gradle,gradlew gradlew.bat,indexer jdbc-h2,jdbc-mysql jdbc-postgres,jdbc jmh-benchmarks,lombok.config model,owasp-dependency-suppressions.xml platform,plugins processor,queue-jdbc queue,repository-mem）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+我需要的是能合并进项目的修复/迭代，不是泛泛的方案说明：
+仓库：kestra-io/kestra（Java）。项目原本是：Event Driven Orchestration & Scheduling Platform for Mission Critical Applications。当前源码入口可从 .codespellrc, .devcontainer, .editorconfig, .gitattributes, .github, .gitignore, .gitpod.yml, .pinact.yaml, .prettierignore, AGENTS.md, CLAUDE.md, Dockerfile 进入。
+Kestra 的 flow worker 在任务超时、重试和状态存储短暂不可用时，可能同时写入 SUCCESS 与 RETRYING，后续依赖任务被错误触发。请从 Java executor、storage、scheduler 和 UI/API 构造故障注入，修复状态机、幂等键和补偿；验收并发 worker、暂停恢复、权限和旧 flow。
+实现以最小影响面为准，保留现有协议、错误类型和日志语义；用故障注入证明失败路径会收敛、资源会释放、重试不会放大副作用，最后跑一遍项目原有测试集。

@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：JavaScript
+任务难度：地狱
 
-请在已有的 iamkun/dayjs 项目上修复一个真实的跨模块缺陷。项目定位：⏰ Day.js 2kB immutable date-time library alternative to Moment.js with the same modern API。源码根目录为 dayjs-dev，真实入口包括：.editorconfig, .eslintrc.json, .github, .gitignore, .npmignore, .releaserc, CHANGELOG.md, CONTRIBUTING.md, LICENSE, README.md, babel.config.js, build, docs, karma.sauce.conf.js, package-lock.json, package.json, patches, prettier.config.js, src, test, types。请围绕请求/响应处理、连接生命周期、错误传播、取消/超时、状态边界或兼容性链路，先构造可重复的失败用例并定位触发步骤和根因，再做最小范围修复。补充正常、失败、边界和回归测试；不能删除测试、放宽断言、改变无关公共 API 或引入无关依赖。验收要求：原有测试保持通过，新增测试稳定复现修复前问题并证明修复后的行为，错误信息和资源释放可验证。
+我需要的是能合并进项目的修复/迭代，不是泛泛的方案说明：
+仓库：iamkun/dayjs（JavaScript）。项目原本是：⏰ Day.js 2kB immutable date-time library alternative to Moment.js with the same modern API。当前源码入口可从 .editorconfig, .eslintrc.json, .github, .gitignore, .npmignore, .releaserc, CHANGELOG.md, CONTRIBUTING.md, LICENSE, README.md, babel.config.js, build 进入。
+Day.js 在 timezone、utc、locale 插件叠加后，跨 DST 边界的 startOf/endOf 与 format 结果依赖插件加载顺序，链式对象还可能被意外共享。请从 src、plugin、types 和 test 构造多个时区/年份/locale 组合，修复不可变性、偏移计算和类型声明；保持 Moment 兼容 API。
+实现以最小影响面为准，保留现有协议、错误类型和日志语义；用故障注入证明失败路径会收敛、资源会释放、重试不会放大副作用，最后跑一遍项目原有测试集。

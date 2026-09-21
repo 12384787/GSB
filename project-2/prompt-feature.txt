@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：Python
 
-请在已有的 langbot-app/LangBot 项目上迭代核心能力，不要重写项目。项目定位为：Production-grade platform for building agentic IM bots - 生产级多平台智能机器人开发平台/ Agent、知识库编排、插件系统 / Bots for Discord / Slack / LINE / Telegram / WeChat(企业微信, 企微智能机器人, 公众号) / 飞书 / 钉钉 / QQ / Matrix e.g. Integrated with ChatGPT(GPT), DeepSeek, Dify, n8n, Langflow, Coze, Claude, Gemini, GLM, Ollama, SiliconFlow, Moonshot, openclaw / hermes agent, deerflow。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+我需要的是能合并进项目的修复/迭代，不是泛泛的方案说明：
+仓库：langbot-app/LangBot（Python）。项目原本是：Production-grade platform for building agentic IM bots。当前源码入口可从 .dockerignore, .github, .gitignore, .mcp.json, .pre-commit-config.yaml, AGENTS.md, ARCHITECTURE.md, CLA.md, CLAUDE.md, CONTRIBUTING.md, Dockerfile, LICENSE 进入。
+给 LangBot 加一套可恢复的 Agent 工作流执行记录，让多平台会话、知识库检索、插件调用和流式回复可以在进程重启后续跑。需要设计版本化状态、敏感信息隔离、超时重试、人工取消、权限校验和旧配置兼容，不能把平台差异硬编码进主流程。补充跨适配器测试，并证明重复投递不会再次执行有副作用的插件。
+不要只交一个 happy path：把旧配置、升级中断、并发调用、部分成功和重复触发都纳入设计。实现要落在现有模块边界内，给出可检查的测试、日志/指标和回滚方式，并说明新增存储或协议如何兼容历史数据。

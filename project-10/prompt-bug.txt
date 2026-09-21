@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：Clojure
+任务难度：地狱
 
-请在已有的 metabase/metabase 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：The easy-to-use open source Business Intelligence and Embedded Analytics tool that lets everyone work with data :bar_chart:。围绕真实入口（.babel_cache,.claude .clj-kondo,.clj-surgeon.edn .cljfmt.edn,.coderabbit.yaml .codespellignore,.codespellrc .dependency-cruiser.cjs,.devcontainer .dir-locals.el,.dockerignore .editorconfig,.env.example .gitattributes,.gitconfig .github,.gitignore .husky,.loki .lsp,.lychee .lycheeignore,.mlc_config.json .nvmrc,.oxfmtrc.json .pre-commit-config.yaml,.prettierignore .prettierrc,.storybook .stylelintrc.json,.typedoc .vscode,CLAUDE.md Dockerfile,LICENSE-AGPL.txt LICENSE-EMBEDDING.txt,LICENSE-MCL.txt LICENSE.txt,README.md SECURITY.md,babel.config.json bb.edn,bin bun.lock,bunfig.toml codecov.yml,confi）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+这个问题在真实运行里很难抓，但我希望你把它当线上故障处理：
+仓库：metabase/metabase（Clojure）。项目原本是：The easy-to-use open source Business Intelligence and Embedded Analytics tool that lets everyone work with data :bar_chart:。当前源码入口可从 .babel_cache, .claude, .clj-kondo, .clj-surgeon.edn, .cljfmt.edn, .coderabbit.yaml, .codespellignore, .codespellrc, .dependency-cruiser.cjs, .devcontainer, .dir-locals.el, .dockerignore 进入。
+Metabase 的查询任务在数据库连接超时后进入重试，但任务状态、查询缓存和审计记录可能分别显示失败、运行中和成功。请围绕查询执行器、队列、缓存和 API 复现一次真实状态分裂，定位事务与异步回调的竞态；修复要覆盖用户取消、权限撤销、重复 webhook 和进程重启，不能简单关闭重试。
+先把失败压缩成一个稳定夹具，再改实现；不要用重试、睡眠或禁用校验把问题藏起来。最终要能从测试输出看出状态、资源和错误传播都恢复正常，并说明为什么不会回归到相邻模块。

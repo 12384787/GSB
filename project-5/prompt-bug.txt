@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：Vue
+任务难度：地狱
 
-请在已有的 Kuingsmile/PicList 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：An image upload and manage tool, base on PicGo。围绕真实入口（.cz-config.cjs,.editorconfig .gitattributes,.github .gitignore,.husky .prettierrc,.stylelintignore .stylelintrc.cjs,.vscode .winget,CHANGELOG.md CODE_OF_CONDUCT.md,CONTRIBUTING.md CONTRIBUTING_EN.md,FAQ.md FAQ_EN.md,LICENSE README.md,README_cn.md build,commitlint.config.cjs currentVersion.md,currentVersion_en.md electron-builder.json,electron.vite.config.js eslint.config.js,imgs package.json,renovate.json resources,scripts src,supported_format.md tests,tsconfig.json yarn.lock）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+帮我直接按现有代码查这件事，先别急着改实现：
+仓库：Kuingsmile/PicList（Vue）。项目原本是：An image upload and manage tool, base on PicGo。当前源码入口可从 .cz-config.cjs, .editorconfig, .gitattributes, .github, .gitignore, .husky, .prettierrc, .stylelintignore, .stylelintrc.cjs, .vscode, .winget, CHANGELOG.md 进入。
+PicList 在多图批量上传时，预签名 URL 过期或插件返回部分成功会让 UI 显示全部完成，但本地数据库和远端文件不一致。请从 Vue 页面、上传队列、插件适配和持久化代码构造复现，修复取消、重试、重复文件和失败回滚的边界；验收要覆盖拖拽批量、网络断开、刷新页面和历史记录恢复。
+先补一个修复前会失败的测试，再定位根因并做最小改动；不要删测试、放宽断言、硬编码结果或顺手重构无关模块。验收时同时跑原有回归、异常路径、并发/取消边界和兼容性检查，并在说明里写清触发条件、根因、修复影响面。

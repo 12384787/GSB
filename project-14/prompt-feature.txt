@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：TypeScript
 
-请在已有的 openobserve/openobserve 项目上迭代核心能力，不要重写项目。项目定位为：Open source observability platform for logs, metrics, traces, RUM, Session replay, pipelines, SLO and LLM observability. A sophisticated, simple and highly performant alternative to Datadog, Splunk, and Elasticsearch with 140x lower storage costs and single binary deployment.。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+我需要的是能合并进项目的修复/迭代，不是泛泛的方案说明：
+仓库：openobserve/openobserve（TypeScript）。项目原本是：Open source observability platform for logs, metrics, traces, RUM, Session replay, pipelines, SLO and LLM observability. A sophisticated, simple and highly performant alternative to Datadog, Splunk, and Elasticsearch with 140x lower storage costs and single binary deployment.。当前源码入口可从 .agents, .cargo, .claude, .claudeignore, .cursorignore, .devcontainer, .env.example, .gitattributes, .github, .gitignore, .typos.toml, CLAUDE.md 进入。
+给 OpenObserve 增加按租户可配置的摄取回放与死信队列，要求 logs、metrics、traces 和 pipeline 共用一致的 offset/重试语义。实现限流、schema 演进、敏感字段脱敏、重复批次去重、回放审计和查询可见性，补齐故障恢复、压测和 API 兼容测试。
+不要只交一个 happy path：把旧配置、升级中断、并发调用、部分成功和重复触发都纳入设计。实现要落在现有模块边界内，给出可检查的测试、日志/指标和回滚方式，并说明新增存储或协议如何兼容历史数据。

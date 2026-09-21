@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：TypeScript
+任务难度：地狱
 
-请在已有的 meshery/meshery 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：Meshery, the cloud native manager。围绕真实入口（.agents,.claude .dockerignore,.gitattributes .github,.gitignore .gitpod.yml,ADOPTERS.md AGENTS.md,CHANGELOG.md CLAUDE.md,CNAME CODE_OF_CONDUCT.md,CONTRIBUTING.md GOVERNANCE.md,LICENSE MAINTAINERS.md,Makefile README.md,ROADMAP.md SECURITY-INSIGHTS.yml,SECURITY.md VISION.answers.md,VISION.hypotheticals.md VISION.md,docs go.mod,go.sum install,mesheryctl models,provider-ui server,skills-lock.json ui）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+请接着当前仓库的实现往下排查，不要另起一套架构：
+仓库：meshery/meshery（TypeScript）。项目原本是：Meshery, the cloud native manager。当前源码入口可从 .agents, .claude, .dockerignore, .gitattributes, .github, .gitignore, .gitpod.yml, ADOPTERS.md, AGENTS.md, CHANGELOG.md, CLAUDE.md, CNAME 进入。
+Meshery 的模型同步、provider 连接和 UI 状态在 provider 断线重连时会互相覆盖，导致已删除模型重新出现在画布。请从 server、models、provider-ui 和 ui 的真实同步链路复现版本落后场景，修复事件顺序、缓存失效和权限检查；验收要包含并发编辑、断线补偿、回滚和旧 provider。
+请把修复前后的行为差异写进回归用例，尤其是乱序、重复、取消和旧输入；禁止删除断言、改掉公共契约或把并发问题粗暴改成全局串行。提交说明要给出根因和未覆盖风险。

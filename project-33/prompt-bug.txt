@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：JavaScript
+任务难度：地狱
 
-请在已有的 Stremio/stremio-web 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：Stremio - Freedom to Stream。围绕真实入口（.dockerignore,.github .gitignore,.nvmrc .well-known,CODE_OF_CONDUCT.md CONTRIBUTING.md,Dockerfile LICENSE.md,README.md assets,eslint.config.mjs http_server.js,manifest.json package.json,patches pnpm-lock.yaml,pnpm-workspace.yaml src,tests tsconfig.json,webpack.config.js）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+帮我直接按现有代码查这件事，先别急着改实现：
+仓库：Stremio/stremio-web（JavaScript）。项目原本是：Stremio。当前源码入口可从 .eslintrc, .github, .gitignore, Dockerfile, LICENSE.md, README.md, favicons, fonts, images, package-lock.json, package.json, screenshots 进入。
+Stremio Web 在 catalog 分页、stream 选择和播放历史同步同时更新时，旧请求会覆盖当前用户选择，播放器进入空状态。请从 web 状态、API client、player 和测试构造乱序/断网用例，修复请求取消、缓存键和恢复逻辑；验收电视端键盘导航与旧服务响应。
+先补一个修复前会失败的测试，再定位根因并做最小改动；不要删测试、放宽断言、硬编码结果或顺手重构无关模块。验收时同时跑原有回归、异常路径、并发/取消边界和兼容性检查，并在说明里写清触发条件、根因、修复影响面。

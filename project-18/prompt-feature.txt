@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：TypeScript
 
-请在已有的 getsentry/sentry-javascript 项目上迭代核心能力，不要重写项目。项目定位为：Official Sentry SDKs for JavaScript。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+我需要的是能合并进项目的修复/迭代，不是泛泛的方案说明：
+仓库：getsentry/sentry-javascript（TypeScript）。项目原本是：Official Sentry SDKs for JavaScript。当前源码入口可从 .agents, .claude, .craft.yml, .cursor, .editorconfig, .git-blame-ignore-revs, .github, .gitignore, .madgerc, .oxfmtrc.json, .oxlintrc.base.json, .oxlintrc.json 进入。
+为 sentry-javascript 增加可插拔的持久化事件队列，支持浏览器、Node 和 worker 的离线恢复、采样动态调整和优先级丢弃。需要兼顾 SDK 初始化顺序、隐私字段、source map、重试退避、并发 flush、旧 transport API 和包体积，补齐多运行时测试及迁移文档。
+不要只交一个 happy path：把旧配置、升级中断、并发调用、部分成功和重复触发都纳入设计。实现要落在现有模块边界内，给出可检查的测试、日志/指标和回滚方式，并说明新增存储或协议如何兼容历史数据。

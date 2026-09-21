@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：Rust
 
-请在已有的 AtalayaLabs/OxiCloud 项目上迭代核心能力，不要重写项目。项目定位为：☁️ Ultra-fast, secure & lightweight self-hosted cloud storage — your files, photos, calendars & contacts, all in one place. Built in Rust.。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+我需要的是能合并进项目的修复/迭代，不是泛泛的方案说明：
+仓库：AtalayaLabs/OxiCloud（Rust）。项目原本是：☁️ Ultra-fast, secure & lightweight self-hosted cloud storage — your files, photos, calendars & contacts, all in one place. Built in Rust.。当前源码入口可从 .cargo, .claudeignore, .dockerignore, .envrc, .gitattributes, .github, .gitignore, .stylelintrc.json, AGENTS.md, CLAUDE.md, CODEOWNERS, CODE_OF_CONDUCT.md 进入。
+给 OxiCloud 增加可验证的文件版本历史和回收站恢复能力，要求目录索引、对象存储、HTTP 条件请求和权限校验共同支持。处理大文件、并发重命名、过期恢复、配额统计、重复恢复和崩溃重启，保持旧下载 API 兼容；补齐 Rust 集成测试并给出迁移与清理策略。
+不要只交一个 happy path：把旧配置、升级中断、并发调用、部分成功和重复触发都纳入设计。实现要落在现有模块边界内，给出可检查的测试、日志/指标和回滚方式，并说明新增存储或协议如何兼容历史数据。

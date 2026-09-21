@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：Rust
+任务难度：地狱
 
-请在已有的 Oxen-AI/Oxen 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：Lightning fast data version control system for large repositories of data. Feels like git, pushes and pulls like oxen.。围绕真实入口（.cargo,.claude .coderabbit.yaml,.dockerignore .github,.gitignore .pre-commit-config.yaml,AGENTS.md CODE_OF_CONDUCT.md,CONTRIBUTING.md Cargo.lock,Cargo.toml CommandWorkflow.md,Dockerfile Dockerfile.dev,FileStructure.md LICENSE,MergeConflict.md Performance.md,README.md RELEASING.md,ReleaseNotes.md SelfHosting.md,TODO.md bacon.toml,benchmark bin,cli-test clippy.toml,crates data,docker-compose.yml docs,examples experiments,flake.lock flake.nix,images oxen-python,remote_repo.py rust-toolchain.toml,tool-versions.env traefik.yml）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+我需要的是能合并进项目的修复/迭代，不是泛泛的方案说明：
+仓库：Oxen-AI/Oxen（Rust）。项目原本是：Lightning fast data version control system for large repositories of data. Feels like git, pushes and pulls like oxen.。当前源码入口可从 .cargo, .claude, .coderabbit.yaml, .dockerignore, .github, .gitignore, .pre-commit-config.yaml, AGENTS.md, CODE_OF_CONDUCT.md, CONTRIBUTING.md, Cargo.lock, Cargo.toml 进入。
+Oxen 在大文件分块上传、版本提交和远端拉取交错时，索引可能指向未完成的 chunk，导致 clone 或 diff 读到半个对象。请沿 Rust core、CLI 和存储层写一个故障注入测试，检查并发锁、校验和、断点续传及失败清理；修复必须保证旧仓库可读、进程崩溃可恢复，不能简单串行化所有操作。
+实现以最小影响面为准，保留现有协议、错误类型和日志语义；用故障注入证明失败路径会收敛、资源会释放、重试不会放大副作用，最后跑一遍项目原有测试集。

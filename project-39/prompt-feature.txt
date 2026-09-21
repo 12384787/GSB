@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：Go
 
-请在已有的 coder/coder 项目上迭代核心能力，不要重写项目。项目定位为：Secure environments for developers and their agents。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+帮我直接按现有代码查这件事，先别急着改实现：
+仓库：coder/coder（Go）。项目原本是：Secure environments for developers and their agents。当前源码入口可从 .agents, .claude, .cursorrules, .devcontainer, .dockerignore, .editorconfig, .git-blame-ignore-revs, .gitattributes, .github, .gitignore, .golangci.yaml, .markdownlint-cli2.jsonc 进入。
+给 Coder 增加可恢复的 workspace 生命周期编排，支持创建、休眠、唤醒、升级、失败回滚和 agent 重新注册。要求 server、provisioner、agent、权限和审计共享版本化状态，处理并发操作、云端部分成功、凭据轮换、配额和旧 workspace 迁移，补齐故障注入与 API/CLI 测试。
+这项迭代必须能在真实部署里收敛。请明确状态机、失败重试和幂等边界，补上接口/类型/文档变更以及至少一条端到端路径；不能通过复制一套平行实现、硬编码样例或牺牲旧 API 来完成。

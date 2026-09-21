@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：多语言
+任务难度：地狱
 
-请在已有的 langflow-ai/langflow 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：。围绕真实入口（.agents,.coderabbit.yaml .composio.lock,.cursor .devcontainer,.dockerignore .env.example,.eslintrc.json .gitattributes,.github .gitignore,.pre-commit-config.yaml .release-artifacts,.secrets.baseline .vscode,.whitesource AGENTS-example.md,AGENTS.md BUNDLE_API.md,CLAUDE.md CODE_OF_CONDUCT.md,CONTRIBUTING.md DESIGN.md,DEVELOPMENT.md LICENSE,Makefile Makefile.frontend,README.md RELEASE.md,SECURITY.md ci-skip-analysis.md,codecov.yml deploy,docker docker_example,docs package-lock.json,package.json pyproject.toml,regressions render.yaml,scripts src,uv.lock wss-generated.config）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+我需要的是能合并进项目的修复/迭代，不是泛泛的方案说明：
+仓库：langflow-ai/langflow（多语言）。项目原本是：。当前源码入口可从 .agents, .coderabbit.yaml, .composio.lock, .cursor, .devcontainer, .dockerignore, .env.example, .eslintrc.json, .gitattributes, .github, .gitignore, .pre-commit-config.yaml 进入。
+Langflow 在组件 schema 热更新、图执行并发和流式输出取消同时发生时，旧节点配置会被新 schema 错误解释，执行结果还可能写错 run。请从 backend、custom components、execution、frontend 和 tests 复现，修复版本绑定、取消传播和持久化；保留已有 flow JSON。
+实现以最小影响面为准，保留现有协议、错误类型和日志语义；用故障注入证明失败路径会收敛、资源会释放、重试不会放大副作用，最后跑一遍项目原有测试集。

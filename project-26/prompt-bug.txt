@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：Kotlin
+任务难度：地狱
 
-请在已有的 ankidroid/Anki-Android 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：AnkiDroid: Anki flashcards on Android. Your secret trick to achieve superhuman information retention.。围绕真实入口（.agents,.claude .codecov.yml,.editorconfig .git-blame-ignore-revs,.gitattributes .github,.gitignore .idea,.prettierignore .prettierrc,.worktreeinclude AI_POLICY.md,AnkiDroid CLAUDE.md,CONTRIBUTING.md COPYING,LICENSES README.md,REUSE.toml SECURITY.md,anki-common api,baselineprofile build.gradle.kts,buildSrc common,compat docs,fastlane funding.json,gradle.properties gradle,gradlew gradlew.bat,jacocoSupport.gradle jitpack.yml,libanki lint-release.xml,lint-rules lint.gradle,pre-commit settings.gradle.kts,tools vbpd,widgets）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+这个问题在真实运行里很难抓，但我希望你把它当线上故障处理：
+仓库：ankidroid/Anki-Android（Kotlin）。项目原本是：AnkiDroid: Anki flashcards on Android. Your secret trick to achieve superhuman information retention.。当前源码入口可从 .agents, .claude, .codecov.yml, .editorconfig, .git-blame-ignore-revs, .gitattributes, .github, .gitignore, .idea, .prettierignore, .prettierrc, .worktreeinclude 进入。
+AnkiDroid 在复习队列重建、时区切换和同步冲突同时发生时，卡片 due 时间与调度器状态不一致，重启后会重复出题。请从 Kotlin scheduler、database、sync 和 UI 测试构造失败用例，修复事务、时钟和冲突合并；验收学习进度、媒体下载失败、旧数据库升级。
+先把失败压缩成一个稳定夹具，再改实现；不要用重试、睡眠或禁用校验把问题藏起来。最终要能从测试输出看出状态、资源和错误传播都恢复正常，并说明为什么不会回归到相邻模块。

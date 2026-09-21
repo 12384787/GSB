@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：Python
+任务难度：地狱
 
-请在已有的 pallets/flask 项目上修复一个真实的跨模块缺陷。项目定位：The Python micro framework for building web applications.。源码根目录为 flask-main，真实入口包括：.devcontainer, .editorconfig, .github, .gitignore, .pre-commit-config.yaml, .readthedocs.yaml, CHANGES.rst, LICENSE.txt, README.md, docs, examples, pyproject.toml, src, tests, uv.lock。请围绕请求/响应处理、连接生命周期、错误传播、取消/超时、状态边界或兼容性链路，先构造可重复的失败用例并定位触发步骤和根因，再做最小范围修复。补充正常、失败、边界和回归测试；不能删除测试、放宽断言、改变无关公共 API 或引入无关依赖。验收要求：原有测试保持通过，新增测试稳定复现修复前问题并证明修复后的行为，错误信息和资源释放可验证。
+请接着当前仓库的实现往下排查，不要另起一套架构：
+仓库：pallets/flask（Python）。项目原本是：The Python micro framework for building web applications.。当前源码入口可从 .devcontainer, .editorconfig, .github, .gitignore, .pre-commit-config.yaml, .readthedocs.yaml, CHANGES.rst, LICENSE.txt, README.md, docs, examples, pyproject.toml 进入。
+Flask 的 async view 在请求超时或客户端断开后，后台 task 仍可能写 response 或持有 request context，导致连接泄漏和偶发 RuntimeError。请从 src/flask、上下文管理、测试 client 和文档示例构造可重复并发用例，修复取消传播、上下文生命周期和错误转换；同步验证 WSGI、ASGI 适配及旧扩展。
+请把修复前后的行为差异写进回归用例，尤其是乱序、重复、取消和旧输入；禁止删除断言、改掉公共契约或把并发问题粗暴改成全局串行。提交说明要给出根因和未覆盖风险。

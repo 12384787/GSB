@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：JavaScript
 
-请在已有的 expressjs/express 项目上迭代一个生产级能力，不要重写项目。项目定位：Fast, unopinionated, minimalist web framework for node.。请基于真实入口（.editorconfig, .eslintignore, .eslintrc.yml, .github, .gitignore, .npmrc, History.md, LICENSE, Readme.md, examples）梳理现有调用链，增加一个需要跨模块协同的能力，同时处理公共 API 兼容、配置默认值、异常与取消、资源释放、并发/重试幂等、可观测性和文档测试。实现必须沿现有架构落点，补齐旧行为、新行为、失败回滚、重复执行和边界输入的测试，不得用硬编码或改测试来伪造通过。
+我需要的是能合并进项目的修复/迭代，不是泛泛的方案说明：
+仓库：expressjs/express（JavaScript）。项目原本是：Fast, unopinionated, minimalist web framework for node.。当前源码入口可从 .editorconfig, .eslintignore, .eslintrc.yml, .github, .gitignore, .npmrc, History.md, LICENSE, Readme.md, examples 进入。
+给 Express 增加结构化请求上下文与可组合超时策略，支持 router 层覆盖、流式响应、客户端断开、异步 middleware 和错误处理器。要定义 context 生命周期、取消信号、代理头信任、日志脱敏、旧插件兼容和性能边界，补齐回归测试、类型声明和迁移说明。
+不要只交一个 happy path：把旧配置、升级中断、并发调用、部分成功和重复触发都纳入设计。实现要落在现有模块边界内，给出可检查的测试、日志/指标和回滚方式，并说明新增存储或协议如何兼容历史数据。

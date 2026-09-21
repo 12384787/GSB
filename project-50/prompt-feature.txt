@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：Python
 
-请在已有的 github/spec-kit 项目上迭代核心能力，不要重写项目。项目定位为：💫 Toolkit to help you get started with Spec-Driven Development。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+我需要的是能合并进项目的修复/迭代，不是泛泛的方案说明：
+仓库：github/spec-kit（Python）。项目原本是：💫 Toolkit to help you get started with Spec-Driven Development。当前源码入口可从 .devcontainer, .editorconfig, .gitattributes, .github, .gitignore, .markdownlint-cli2.jsonc, .pre-commit-config.yaml, .specify, .zenodo.json, AGENTS.md, CHANGELOG.md, CITATION.cff 进入。
+给 Spec Kit 增加可恢复的规范变更迁移流程：当模板、命令或项目规范版本升级时，工具要先做差异预览、冲突检查和备份，再原子更新 spec/plan/tasks，并能回滚。需要贯通 CLI、templates、extensions、脚本和测试，处理并发命令、半完成目录、用户自定义模板、旧版本迁移与审计日志，补齐端到端夹具和失败注入测试。
+不要只交一个 happy path：把旧配置、升级中断、并发调用、部分成功和重复触发都纳入设计。实现要落在现有模块边界内，给出可检查的测试、日志/指标和回滚方式，并说明新增存储或协议如何兼容历史数据。

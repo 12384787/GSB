@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：TypeScript
 
-请在已有的 PDFCraftTool/pdfcraft 项目上迭代核心能力，不要重写项目。项目定位为：PDFCraft is a free, privacy-focused PDF toolkit that runs entirely in your browser. With 90+ professional tools, you can edit, convert, merge, split, and secure your PDF files without ever uploading them to a server.。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+这个问题在真实运行里很难抓，但我希望你把它当线上故障处理：
+仓库：PDFCraftTool/pdfcraft（TypeScript）。项目原本是：PDFCraft is a free, privacy-focused PDF toolkit that runs entirely in your browser. With 90+ professional tools, you can edit, convert, merge, split, and secure your PDF files without ever uploading them to a server.。当前源码入口可从 .dockerignore, .gitattributes, .github, .gitignore, .htaccess, DEPLOYMENT.md, Dockerfile, LICENSE, README.md, compare_locales.cjs, docker-compose.yml, extension 进入。
+给 PDFCraft 增加可恢复的批量 PDF 流水线，支持合并、旋转、压缩、加密和页级预览按步骤执行。要求 worker 分片、内存上限、取消/重试、密码输入不落盘、旧浏览器降级及导出一致性都可验证，并补充真实二进制夹具和端到端测试，不得把所有文件一次性读进主线程。
+先验证现有行为再扩展，新增能力要有降级和迁移方案。验收不仅看成功结果，还要检查权限、取消、恢复、性能和观测信息；把关键取舍写在变更说明里，确保后续维护者能复现问题和回滚。

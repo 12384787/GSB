@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：Go
 
-请在已有的 itchyny/gojq 项目上迭代核心能力，不要重写项目。项目定位为：Pure Go implementation of jq。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+请接着当前仓库的实现往下排查，不要另起一套架构：
+仓库：itchyny/gojq（Go）。项目原本是：Pure Go implementation of jq。当前源码入口可从 .dockerignore, .gitattributes, .github, .gitignore, CHANGELOG.md, Dockerfile, LICENSE, Makefile, README.md, _gojq, _tools, builtin.go 进入。
+给 gojq 增加可中断的流式查询计划缓存，支持重复执行同一过滤表达式而不重新解析，同时不改变 jq 语义。要处理输入 schema 变化、内存上限、并发调用、编译错误、stdin 背压和 CLI 诊断，补齐 benchmark、属性测试和兼容性测试，并明确缓存失效规则。
+先画出现有调用链和数据边界，再按项目惯用方式落地；新能力必须有失败回滚、重复执行、权限/兼容性和可观测性设计，不能用全局开关掩盖错误。补齐单元、集成或端到端测试、文档与迁移说明，并证明旧用例、新用例和异常恢复都能稳定通过。

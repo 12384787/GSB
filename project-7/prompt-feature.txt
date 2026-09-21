@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：TypeScript
 
-请在已有的 twentyhq/twenty 项目上迭代核心能力，不要重写项目。项目定位为：The open alternative to Salesforce, designed for AI.。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+帮我直接按现有代码查这件事，先别急着改实现：
+仓库：twentyhq/twenty（TypeScript）。项目原本是：The open alternative to Salesforce, designed for AI.。当前源码入口可从 .claude, .dockerignore, .gitattributes, .github, .gitignore, .mcp.json, .nvmrc, .oxfmtrc.jsonc, .vscode, .yarn, .yarnrc.yml, AGENTS.md 进入。
+为 Twenty 的活动流实现基于游标的实时分页协议，让联系人、公司、任务和自定义对象的新增/更新/删除能在首屏分页后稳定合并。需要处理租户权限、事件版本、断线补偿、重复推送、排序字段迁移和大租户性能，并同步更新 server、React 状态层、GraphQL/接口测试和文档。
+这项迭代必须能在真实部署里收敛。请明确状态机、失败重试和幂等边界，补上接口/类型/文档变更以及至少一条端到端路径；不能通过复制一套平行实现、硬编码样例或牺牲旧 API 来完成。

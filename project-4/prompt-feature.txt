@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：Rust
 
-请在已有的 Oxen-AI/Oxen 项目上迭代核心能力，不要重写项目。项目定位为：Lightning fast data version control system for large repositories of data. Feels like git, pushes and pulls like oxen.。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+这个问题在真实运行里很难抓，但我希望你把它当线上故障处理：
+仓库：Oxen-AI/Oxen（Rust）。项目原本是：Lightning fast data version control system for large repositories of data. Feels like git, pushes and pulls like oxen.。当前源码入口可从 .cargo, .claude, .coderabbit.yaml, .dockerignore, .github, .gitignore, .pre-commit-config.yaml, AGENTS.md, CODE_OF_CONDUCT.md, CONTRIBUTING.md, Cargo.lock, Cargo.toml 进入。
+给 Oxen 的数据版本库增加可中断的并行 GC/压缩流程，要求同时兼容正在进行的 commit、remote fetch 和大文件索引读取。需要定义对象可见性、租约、崩溃恢复、磁盘配额和 dry-run 语义，提供 CLI 状态与指标；用真实仓库生成多进程测试，证明压缩前后 hash、历史和并发写入都一致。
+先验证现有行为再扩展，新增能力要有降级和迁移方案。验收不仅看成功结果，还要检查权限、取消、恢复、性能和观测信息；把关键取舍写在变更说明里，确保后续维护者能复现问题和回滚。

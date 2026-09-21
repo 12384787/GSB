@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：Python
+任务难度：地狱
 
-请在已有的 langbot-app/LangBot 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：Production-grade platform for building agentic IM bots - 生产级多平台智能机器人开发平台/ Agent、知识库编排、插件系统 / Bots for Discord / Slack / LINE / Telegram / WeChat(企业微信, 企微智能机器人, 公众号) / 飞书 / 钉钉 / QQ / Matrix e.g. Integrated with ChatGPT(GPT), DeepSeek, Dify, n8n, Langflow, Coze, Claude, Gemini, GLM, Ollama, SiliconFlow, Moonshot, openclaw / hermes agent, deerflow。围绕真实入口（.dockerignore,.github .gitignore,.mcp.json .pre-commit-config.yaml,AGENTS.md ARCHITECTURE.md,CLA.md CLAUDE.md,CONTRIBUTING.md Dockerfile,LICENSE Makefile,README.md README_CN.md,README_ES.md README_FR.md,README_JP.md README_KO.md,README_RU.md README_TW.md,README_VI.md codecov.yml,docker docs,examples main.py,packaging pyproject.toml,pytest.ini res,run_tests.sh scripts,skills src,tests uv.lock,web）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+这个问题在真实运行里很难抓，但我希望你把它当线上故障处理：
+仓库：langbot-app/LangBot（Python）。项目原本是：Production-grade platform for building agentic IM bots。当前源码入口可从 .dockerignore, .github, .gitignore, .mcp.json, .pre-commit-config.yaml, AGENTS.md, ARCHITECTURE.md, CLA.md, CLAUDE.md, CONTRIBUTING.md, Dockerfile, LICENSE 进入。
+LangBot 在多平台事件进入 Agent、插件和知识库链路时，重试可能让同一条消息被回复两次，失败事件又无法准确恢复。请围绕 src、skills、web 和 tests 找到真实入口，模拟并发 webhook、流式输出中断、插件超时和会话切换，修复幂等键、状态落库与异常传播之间的不一致；必须保留 Discord、飞书等适配器的现有行为。
+先把失败压缩成一个稳定夹具，再改实现；不要用重试、睡眠或禁用校验把问题藏起来。最终要能从测试输出看出状态、资源和错误传播都恢复正常，并说明为什么不会回归到相邻模块。

@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：Rust
+任务难度：地狱
 
-请在已有的 embassy-rs/embassy 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：Modern embedded framework, using Rust and async.。围绕真实入口（.gitattributes,.github .gitignore,.helix .vscode,API-GUIDELINES.md CONTRIBUTING.md,LICENSE-APACHE LICENSE-CC-BY-SA,LICENSE-MIT NOTICE.md,README.md RELEASE.md,ci-nightly.sh ci-xtensa.sh,ci.sh cyw43-firmware,cyw43-pio cyw43,docs embassy-ambiq,embassy-boot-nrf embassy-boot-rp,embassy-boot-stm32 embassy-boot,embassy-crypto-rand embassy-crypto-rustcrypto,embassy-crypto-test embassy-crypto,embassy-embedded-hal embassy-executor-macros,embassy-executor-timer-queue embassy-executor,embassy-futures embassy-hal-internal,embassy-imxrt embassy-mcxa,embassy-microchip embassy-mspm0,embassy-net-adin1110 embas）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+我需要的是能合并进项目的修复/迭代，不是泛泛的方案说明：
+仓库：embassy-rs/embassy（Rust）。项目原本是：Modern embedded framework, using Rust and async.。当前源码入口可从 .gitattributes, .github, .gitignore, .helix, .vscode, API-GUIDELINES.md, CONTRIBUTING.md, LICENSE-APACHE, LICENSE-CC-BY-SA, LICENSE-MIT, NOTICE.md, README.md 进入。
+Embassy 的 async executor 在任务被取消、定时器到期和中断唤醒同时发生时，可能丢失 waker 或重复 poll，表现为低功耗设备偶发卡死。请从 executor、time driver 和示例测试构造最小可复现模型，检查 Rust 生命周期、临界区和唤醒顺序；修复要证明 no_std、不同硬件 feature 和高并发任务仍成立。
+实现以最小影响面为准，保留现有协议、错误类型和日志语义；用故障注入证明失败路径会收敛、资源会释放、重试不会放大副作用，最后跑一遍项目原有测试集。

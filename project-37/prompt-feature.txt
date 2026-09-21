@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：Rust
 
-请在已有的 nautechsystems/nautilus_trader 项目上迭代核心能力，不要重写项目。项目定位为：Production-grade Rust-native trading engine with deterministic event-driven architecture。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+请接着当前仓库的实现往下排查，不要另起一套架构：
+仓库：nautechsystems/nautilus_trader（Rust）。项目原本是：Production-grade Rust-native trading engine with deterministic event-driven architecture。当前源码入口可从 .cargo, .codespellrc, .config, .docker, .dockerignore, .env.example, .gitattributes, .github, .gitignore, .gitleaks.toml, .lycheeignore, .markdownlint.jsonc 进入。
+给 Nautilus Trader 增加可验证的事件重放与策略检查点机制，让交易引擎能从指定序列恢复并继续实时运行。需要处理多交易所时间戳、乱序行情、订单幂等、风控状态、资金快照、版本迁移和性能，补齐 property tests、回测/实盘一致性测试与审计输出。
+先画出现有调用链和数据边界，再按项目惯用方式落地；新能力必须有失败回滚、重复执行、权限/兼容性和可观测性设计，不能用全局开关掩盖错误。补齐单元、集成或端到端测试、文档与迁移说明，并证明旧用例、新用例和异常恢复都能稳定通过。

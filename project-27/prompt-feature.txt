@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：Python
 
-请在已有的 ultralytics/ultralytics 项目上迭代核心能力，不要重写项目。项目定位为：Ultralytics YOLO27, YOLO26, YOLO11, YOLOv8 — object detection, instance segmentation, semantic segmentation, image classification, pose estimation, object tracking。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+帮我直接按现有代码查这件事，先别急着改实现：
+仓库：ultralytics/ultralytics（Python）。项目原本是：Ultralytics YOLO27, YOLO26, YOLO11, YOLOv8 — object detection, instance segmentation, semantic segmentation, image classification, pose estimation, object tracking。当前源码入口可从 .dockerignore, .github, .gitignore, AGENTS.md, CITATION.cff, CLAUDE.md, CONTRIBUTING.md, LICENSE, README.md, README.zh-CN.md, docker, docs 进入。
+给 Ultralytics 增加可扩展的实验追踪后端抽象，统一记录训练、验证、推理、数据版本和模型导出，并支持断点恢复后继续写入同一实验。要求处理多 GPU、离线模式、敏感路径、并发 run、旧 results 格式和失败重试，补齐 CLI、Python API、mock 后端和性能测试。
+这项迭代必须能在真实部署里收敛。请明确状态机、失败重试和幂等边界，补上接口/类型/文档变更以及至少一条端到端路径；不能通过复制一套平行实现、硬编码样例或牺牲旧 API 来完成。

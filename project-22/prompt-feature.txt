@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：Python
 
-请在已有的 Checkmk/checkmk 项目上迭代核心能力，不要重写项目。项目定位为：Checkmk - Best-in-class infrastructure & application monitoring。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+我需要的是能合并进项目的修复/迭代，不是泛泛的方案说明：
+仓库：Checkmk/checkmk（Python）。项目原本是：Checkmk。当前源码入口可从 .aspect, .bazelignore, .bazeliskrc, .bazelrc, .bazelversion, .buildifier.json, .cargo, .clang-tidy, .clangd, .claude, .clippy.toml, .dockerignore 进入。
+给 Checkmk 增加按主机/服务维度的可解释告警抑制策略，支持维护窗口、依赖关系、短暂抖动和恢复证据展示。需要贯通 check engine、规则解析、inventory、agent 配置和 Web UI，处理配置版本、权限、批量更新、旧规则迁移并补齐单元/集成测试。
+不要只交一个 happy path：把旧配置、升级中断、并发调用、部分成功和重复触发都纳入设计。实现要落在现有模块边界内，给出可检查的测试、日志/指标和回滚方式，并说明新增存储或协议如何兼容历史数据。

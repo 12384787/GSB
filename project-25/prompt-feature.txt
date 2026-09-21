@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：TypeScript
 
-请在已有的 sanity-io/sanity 项目上迭代核心能力，不要重写项目。项目定位为：Sanity Studio – Rapidly configure content workspaces powered by structured content。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+请接着当前仓库的实现往下排查，不要另起一套架构：
+仓库：sanity-io/sanity（TypeScript）。项目原本是：Sanity Studio – Rapidly configure content workspaces powered by structured content。当前源码入口可从 .agents, .claude, .cursor, .editorconfig, .env.example, .envrc, .github, .gitignore, .oxfmtrc.json, .oxlintrc.json, .vscode, AGENTS.md 进入。
+给 Sanity Studio 增加可配置的表单变更审计面板，能追踪 patch、协作者、校验结果、草稿与发布版本，并支持按字段回滚。实现需贯通 schema、form、实时协作、权限和插件扩展，处理大文档性能、离线冲突、敏感字段和旧审计数据迁移，补齐 Studio 集成测试。
+先画出现有调用链和数据边界，再按项目惯用方式落地；新能力必须有失败回滚、重复执行、权限/兼容性和可观测性设计，不能用全局开关掩盖错误。补齐单元、集成或端到端测试、文档与迁移说明，并证明旧用例、新用例和异常恢复都能稳定通过。

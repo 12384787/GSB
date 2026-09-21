@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：Python
 
-请在已有的 ActivityWatch/activitywatch 项目上迭代核心能力，不要重写项目。项目定位为：The best free and open-source automated time tracker. Cross-platform, extensible, privacy-focused.。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+帮我直接按现有代码查这件事，先别急着改实现：
+仓库：ActivityWatch/activitywatch（Python）。项目原本是：The best free and open-source automated time tracker. Cross-platform, extensible, privacy-focused.。当前源码入口可从 .gitattributes, .github, .gitignore, .gitmodules, .tool-versions, CITATION.cff, CODE_OF_CONDUCT.md, CONTRIBUTING.md, LICENSE.txt, Makefile, README.md, SECURITY.md 进入。
+给 ActivityWatch 增加可编辑但可审计的活动合并/拆分流程，要求 watcher 原始事件不被破坏，server、数据库和 web 时间线能展示派生结果。处理时区/DST、重叠区间、权限、离线同步、撤销重做和大时间范围查询，补齐迁移、API、UI 和跨平台测试。
+这项迭代必须能在真实部署里收敛。请明确状态机、失败重试和幂等边界，补上接口/类型/文档变更以及至少一条端到端路径；不能通过复制一套平行实现、硬编码样例或牺牲旧 API 来完成。

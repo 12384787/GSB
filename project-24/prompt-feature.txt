@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：Python
 
-请在已有的 encode/httpx 项目上迭代一个生产级能力，不要重写项目。项目定位：A next generation HTTP client for Python. 🦋。请基于真实入口（.github, .gitignore, CHANGELOG.md, LICENSE.md, README.md, docs, httpx, mkdocs.yml, pyproject.toml, requirements.txt, scripts, tests）梳理现有调用链，增加一个需要跨模块协同的能力，同时处理公共 API 兼容、配置默认值、异常与取消、资源释放、并发/重试幂等、可观测性和文档测试。实现必须沿现有架构落点，补齐旧行为、新行为、失败回滚、重复执行和边界输入的测试，不得用硬编码或改测试来伪造通过。
+这个问题在真实运行里很难抓，但我希望你把它当线上故障处理：
+仓库：encode/httpx（Python）。项目原本是：A next generation HTTP client for Python. 🦋。当前源码入口可从 .github, .gitignore, CHANGELOG.md, LICENSE.md, README.md, docs, httpx, mkdocs.yml, pyproject.toml, requirements.txt, scripts, tests 进入。
+给 HTTPX 增加可观测的请求生命周期事件钩子，覆盖重定向、连接复用、HTTP/2 stream、代理、重试和流式响应，并保证 sync/async API 对称。要求定义事件顺序、敏感头脱敏、取消与超时、第三方 transport 兼容及性能开销，补齐 docs 和并发回归测试。
+先验证现有行为再扩展，新增能力要有降级和迁移方案。验收不仅看成功结果，还要检查权限、取消、恢复、性能和观测信息；把关键取舍写在变更说明里，确保后续维护者能复现问题和回滚。

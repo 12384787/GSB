@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：Go
+任务难度：地狱
 
-请在已有的 coder/coder 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：Secure environments for developers and their agents。围绕真实入口（.agents,.claude .cursorrules,.devcontainer .dockerignore,.editorconfig .git-blame-ignore-revs,.gitattributes .github,.gitignore .golangci.yaml,.markdownlint-cli2.jsonc .markdownlint.jsonc,.mcp.json .swaggo,.vale.ini .vscode,AGENTS.md CLAUDE.md,CODEOWNERS CODE_OF_CONDUCT.md,CONTRIBUTING.md LICENSE,LICENSE.enterprise Makefile,README.md SECURITY.md,agent aibridge,apiversion archive,biome.jsonc buildinfo,catalog-info.yaml cli,cmd coder.env,coderd codersdk,compose.dev.yaml compose.yaml,cryptorand docs,dogfood enterprise,examples flake.lock,flake.nix go.mod,go.sum helm,httpmw install.sh,mise.lock mi）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+请接着当前仓库的实现往下排查，不要另起一套架构：
+仓库：coder/coder（Go）。项目原本是：Secure environments for developers and their agents。当前源码入口可从 .agents, .claude, .cursorrules, .devcontainer, .dockerignore, .editorconfig, .git-blame-ignore-revs, .gitattributes, .github, .gitignore, .golangci.yaml, .markdownlint-cli2.jsonc 进入。
+Coder 的 workspace provision、agent 连接和 token 刷新在网络抖动时可能创建两个环境，数据库只记录其中一个，清理任务又误删正在使用的实例。请从 Go server、provisioner、agent 和 API 测试构造并发/重试，修复租约、幂等与回收边界；验收升级、暂停和权限撤销。
+请把修复前后的行为差异写进回归用例，尤其是乱序、重复、取消和旧输入；禁止删除断言、改掉公共契约或把并发问题粗暴改成全局串行。提交说明要给出根因和未覆盖风险。

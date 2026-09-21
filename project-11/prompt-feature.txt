@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：Haskell
 
-请在已有的 nammayatri/nammayatri 项目上迭代核心能力，不要重写项目。项目定位为：A Direct-to-Driver open mobility platform powering the next-generation of mobility applications in India.。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+帮我直接按现有代码查这件事，先别急着改实现：
+仓库：nammayatri/nammayatri（Haskell）。项目原本是：A Direct-to-Driver open mobility platform powering the next-generation of mobility applications in India.。当前源码入口可从 .claude, .clinerules, .cursor, .cursorrules, .envrc.backend, .envrc.frontend, .gitattributes, .github, .gitignore, .hlint.yaml, .imgbotconfig, .psc-ide-port 进入。
+为 Namma Yatri 增加一套事件溯源式行程审计能力，覆盖派单、接单、到达、完成、支付和退款，并能从历史重建当前状态。要求兼容现有 API、处理乱序/重复事件、隐私脱敏、分区恢复和人工纠正，补齐 domain property tests、服务集成测试和运营查询接口。
+这项迭代必须能在真实部署里收敛。请明确状态机、失败重试和幂等边界，补上接口/类型/文档变更以及至少一条端到端路径；不能通过复制一套平行实现、硬编码样例或牺牲旧 API 来完成。

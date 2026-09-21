@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：Python
+任务难度：地狱
 
-请在已有的 ActivityWatch/activitywatch 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：The best free and open-source automated time tracker. Cross-platform, extensible, privacy-focused.。围绕真实入口（.gitattributes,.github .gitignore,.gitmodules .tool-versions,CITATION.cff CODE_OF_CONDUCT.md,CONTRIBUTING.md LICENSE.txt,Makefile README.md,SECURITY.md aw-client,aw-core aw-notify,aw-qt aw-server,aw-server-rust aw-tauri,aw-watcher-afk aw-watcher-input,aw-watcher-window aw.spec,awatcher diagram.svg,gptme.toml poetry.lock,pyproject.toml scripts）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+请接着当前仓库的实现往下排查，不要另起一套架构：
+仓库：ActivityWatch/activitywatch（Python）。项目原本是：The best free and open-source automated time tracker. Cross-platform, extensible, privacy-focused.。当前源码入口可从 .gitattributes, .github, .gitignore, .gitmodules, .tool-versions, CITATION.cff, CODE_OF_CONDUCT.md, CONTRIBUTING.md, LICENSE.txt, Makefile, README.md, SECURITY.md 进入。
+ActivityWatch 的 watcher 在系统休眠、时区切换和网络恢复后上报活动，时间线会出现重叠区间或把未来事件写入过去。请从 watchers、aw-server、数据库和 web UI 复现时钟跳变与重复上报，修复时间归一化、批次幂等和 UI 聚合；验收跨平台、离线缓存和旧数据库。
+请把修复前后的行为差异写进回归用例，尤其是乱序、重复、取消和旧输入；禁止删除断言、改掉公共契约或把并发问题粗暴改成全局串行。提交说明要给出根因和未覆盖风险。

@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：JavaScript
 
-请在已有的 handsontable/handsontable 项目上迭代核心能力，不要重写项目。项目定位为：JavaScript Data Grid / Data Table with a Spreadsheet Look & Feel. Works with React, Angular, and Vue. Supported by the Handsontable team ⚡。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+请接着当前仓库的实现往下排查，不要另起一套架构：
+仓库：handsontable/handsontable（JavaScript）。项目原本是：JavaScript Data Grid / Data Table with a Spreadsheet Look & Feel. Works with React, Angular, and Vue. Supported by the Handsontable team ⚡。当前源码入口可从 .ai, .changelogs, .claude, .cursor, .editorconfig, .eslintignore, .eslintrc.js, .gitattributes, .github, .gitignore, .mcp.json, .npmrc 进入。
+给 Handsontable 增加可持久化的协作编辑事务层，让多人或多个 wrapper 实例能交换操作并解决冲突。需要兼容合并单元格、公式、撤销重做、异步校验、行列移动和许可功能边界，定义操作版本、断线补偿与性能上限，补齐 core 与各框架 wrapper 测试。
+先画出现有调用链和数据边界，再按项目惯用方式落地；新能力必须有失败回滚、重复执行、权限/兼容性和可观测性设计，不能用全局开关掩盖错误。补齐单元、集成或端到端测试、文档与迁移说明，并证明旧用例、新用例和异常恢复都能稳定通过。

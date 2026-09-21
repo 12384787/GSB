@@ -1,5 +1,7 @@
 任务类型：Bug 修复
-任务难度：困难
-语言/框架：C++
+任务难度：地狱
 
-请在已有的 openxla/xla 项目中排查并修复一个影响生产使用的跨模块缺陷。项目定位为：A machine learning compiler for GPUs, CPUs, and ML accelerators。围绕真实入口（.bant-macros,.bazelrc .bazelversion,.clang-format .clang-tidy,.clangd .github,.gitignore .kokoro,.pre-commit-config.yaml AUTHORS,BUILD.bazel CONTRIBUTING.md,LICENSE MODULE.bazel,README.md WORKSPACE,bazel_downloader.cfg build_tools,configure.py docs,opensource_only.files requirements_lock_3_11.txt,requirements_lock_3_12.txt tensorflow.bazelrc,third_party tools,warnings.bazelrc workspace0.bzl,workspace1.bzl workspace2.bzl,workspace3.bzl workspace4.bzl,xla）对应的核心链路，复现一个状态不一致、错误传播、并发边界、资源生命周期或兼容性问题；先记录触发步骤和根因，再做最小范围修复，不能绕过逻辑、删除测试或改变无关 API。补充覆盖正常、失败、边界和回归场景的测试，并验证错误信息、退出码或响应语义仍可诊断。
+帮我直接按现有代码查这件事，先别急着改实现：
+仓库：openxla/xla（C++）。项目原本是：A machine learning compiler for GPUs, CPUs, and ML accelerators。当前源码入口可从 .bant-macros, .bazelrc, .bazelversion, .clang-format, .clang-tidy, .clangd, .github, .gitignore, .kokoro, .pre-commit-config.yaml, AUTHORS, BUILD.bazel 进入。
+XLA 在动态 shape、编译缓存命中和多后端 fallback 同时发生时，生成的 executable 可能复用不兼容的 HLO，导致结果错误或设备内存泄漏。请从 compiler、runtime、service 和 tests 构造 shape/设备/并发组合，定位 cache key、生命周期和错误回滚；验收 CPU/GPU/TPU 路径及确定性。
+先补一个修复前会失败的测试，再定位根因并做最小改动；不要删测试、放宽断言、硬编码结果或顺手重构无关模块。验收时同时跑原有回归、异常路径、并发/取消边界和兼容性检查，并在说明里写清触发条件、根因、修复影响面。

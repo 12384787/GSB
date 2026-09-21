@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：Go
 
-请在已有的 grafana/loki 项目上迭代核心能力，不要重写项目。项目定位为：Like Prometheus, but for logs.。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+请接着当前仓库的实现往下排查，不要另起一套架构：
+仓库：grafana/loki（Go）。项目原本是：Like Prometheus, but for logs.。当前源码入口可从 .claude, .cursor, .devcontainer, .dockerignore, .gitattributes, .github, .gitignore, .gitmodules, .golangci.yml, .lychee.toml, .release-please-manifest.json, .vscode 进入。
+给 Loki 增加一个面向大范围 LogQL 查询的渐进式结果流能力，要求 frontend、querier、cache 和客户端协议一起工作。要处理旧客户端、分片顺序、背压、租户限流、断线重连、部分失败和可观测性；不能把数据一次性堆在内存里。补齐集成测试、配置迁移和降级开关，验证重复消费与中途取消都不会造成结果错乱。
+先画出现有调用链和数据边界，再按项目惯用方式落地；新能力必须有失败回滚、重复执行、权限/兼容性和可观测性设计，不能用全局开关掩盖错误。补齐单元、集成或端到端测试、文档与迁移说明，并证明旧用例、新用例和异常恢复都能稳定通过。

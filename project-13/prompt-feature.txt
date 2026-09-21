@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：TypeScript
 
-请在已有的 archestra-ai/archestra 项目上迭代核心能力，不要重写项目。项目定位为：Enterprise AI Platform with guardrails, MCP registry, gateway & orchestrator。设计并实现一个跨模块生产特性，必须兼顾已有配置兼容、状态/数据迁移、权限或边界校验、失败重试与幂等、可观测性以及旧行为兼容；先梳理现有调用链和数据模型，沿项目现有架构落地，补齐单元/集成测试、文档和降级路径。验收新旧用例、异常路径和重复执行结果，确保不引入无关改动。
+请接着当前仓库的实现往下排查，不要另起一套架构：
+仓库：archestra-ai/archestra（TypeScript）。项目原本是：Enterprise AI Platform with guardrails, MCP registry, gateway & orchestrator。当前源码入口可从 .agents, .claude, .codex, .github, .gitignore, AGENTS.md, CLAUDE.md, EXTERNAL_CONTRIBUTORS.md, LICENSE.md, LICENSE_AGPL, LICENSE_ENTERPRISE, README.md 进入。
+为 Archestra 增加带版本与审批状态的 MCP 工具发布流程，让 registry、gateway、guardrail 和 orchestrator 能灰度切换并快速回滚。需要处理 schema 兼容、密钥轮换、请求幂等、并发发布、审计追踪和离线恢复，补齐 API/集成测试及指标，证明旧客户端在发布期间仍能得到明确结果。
+先画出现有调用链和数据边界，再按项目惯用方式落地；新能力必须有失败回滚、重复执行、权限/兼容性和可观测性设计，不能用全局开关掩盖错误。补齐单元、集成或端到端测试、文档与迁移说明，并证明旧用例、新用例和异常恢复都能稳定通过。

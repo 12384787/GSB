@@ -1,5 +1,7 @@
 任务类型：Feature 迭代
 任务难度：地狱
-语言/框架：Python
 
-请在已有的 psf/requests 项目上迭代一个生产级能力，不要重写项目。项目定位：A simple, yet elegant, HTTP library.。请基于真实入口（.coveragerc, .git-blame-ignore-revs, .github, .gitignore, .pre-commit-config.yaml, .readthedocs.yaml, AUTHORS.rst, HISTORY.md, LICENSE, MANIFEST.in, Makefile, NOTICE, README.md, docs, ext, pyproject.toml, requirements-dev.txt, setup.py, src, tests, tox.ini）梳理现有调用链，增加一个需要跨模块协同的能力，同时处理公共 API 兼容、配置默认值、异常与取消、资源释放、并发/重试幂等、可观测性和文档测试。实现必须沿现有架构落点，补齐旧行为、新行为、失败回滚、重复执行和边界输入的测试，不得用硬编码或改测试来伪造通过。
+请接着当前仓库的实现往下排查，不要另起一套架构：
+仓库：psf/requests（Python）。项目原本是：A simple, yet elegant, HTTP library.。当前源码入口可从 .coveragerc, .git-blame-ignore-revs, .github, .gitignore, .pre-commit-config.yaml, .readthedocs.yaml, AUTHORS.rst, HISTORY.md, LICENSE, MANIFEST.in, Makefile, NOTICE 进入。
+给 Requests 增加可插拔的请求重试策略接口，能按方法幂等性、状态码、异常类型和响应体读取进度决定是否重试。要求兼容 Session、代理、stream、认证和第三方 adapter，定义退避、预算、取消与日志脱敏，补齐同步集成测试和向后兼容文档。
+先画出现有调用链和数据边界，再按项目惯用方式落地；新能力必须有失败回滚、重复执行、权限/兼容性和可观测性设计，不能用全局开关掩盖错误。补齐单元、集成或端到端测试、文档与迁移说明，并证明旧用例、新用例和异常恢复都能稳定通过。
